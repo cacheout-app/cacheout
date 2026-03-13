@@ -2,12 +2,12 @@ cask "cacheout" do
   # NOTE: version and sha256 are filled at release time after notarized DMG is produced.
   # Do NOT `brew install` from this file until a release artifact exists.
   version "2.0.0"
-  sha256 "RELEASE_SHA256_PLACEHOLDER"
+  sha256 "6de067232a27cdf2d46c20b6b8d5d135b8d2cb21199f13b9fe384ae7abb66942"
 
-  url "https://github.com/acebytes/cacheout/releases/download/v#{version}/Cacheout-#{version}.dmg"
+  url "https://github.com/cacheout-app/cacheout/releases/download/v#{version}/Cacheout-#{version}.dmg"
   name "Cacheout"
   desc "Developer cache cleaner & memory manager for macOS — reclaim disk space and manage system memory"
-  homepage "https://github.com/acebytes/cacheout"
+  homepage "https://github.com/cacheout-app/cacheout"
 
   depends_on macos: ">= :sonoma"
 

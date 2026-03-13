@@ -1,0 +1,96 @@
+name: Cacheout
+options:
+  deploymentTarget:
+    macOS: "14.0"
+  bundleIdPrefix: com.cacheout
+  xcodeVersion: "16.0"
+  groupSortPosition: top
+
+packages:
+  Sparkle:
+    url: https://github.com/sparkle-project/Sparkle
+    from: "2.6.0"
+
+targets:
+  Cacheout:
+    type: application
+    platform: macOS
+    sources:
+      - path: Sources/Cacheout
+        excludes:
+          - Resources
+      # Copy LaunchDaemon plist into Contents/Library/LaunchDaemons/
+      - path: Sources/Cacheout/Resources/com.cacheout.memhelper.plist
+        buildPhase:
+          copyFiles:
+            destination: wrapper
+            subpath: Contents/Library/LaunchDaemons
+      - path: Sources/Cacheout/Resources
+        excludes:
+          - com.cacheout.memhelper.plist
+        buildPhase: resources
+    dependencies:
+      - target: CacheoutShared
+      - target: CacheoutHelper
+        copy:
+          destination: wrapper
+          subpath: Contents/Library/LaunchDaemons
+      - package: Sparkle
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.cacheout.app
+        MACOSX_DEPLOYMENT_TARGET: "14.0"
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_CFBundleIconFile: Cacheout
+        INFOPLIST_KEY_LSUIElement: false
+        INFOPLIST_KEY_NSHighResolutionCapable: true
+    scheme:
+      testTargets: []
+
+  CKernelPrivate:
+    type: library.static
+    platform: macOS
+    sources:
+      - path: Sources/CKernelPrivate
+        headerVisibility: public
+    settings:
+      base:
+        MACOSX_DEPLOYMENT_TARGET: "14.0"
+        HEADER_SEARCH_PATHS: "$(SRCROOT)/Sources/CKernelPrivate/include"
+
+  CacheoutHelper:
+    type: tool
+    platform: macOS
+    sources:
+      - path: Sources/CacheoutHelper
+    dependencies:
+      - target: CacheoutShared
+      - target: CacheoutHelperLib
+      - target: CKernelPrivate
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.cacheout.memhelper
+        MACOSX_DEPLOYMENT_TARGET: "14.0"
+
+  CacheoutHelperLib:
+    type: library.static
+    platform: macOS
+    sources:
+      - path: Sources/CacheoutHelperLib
+    dependencies:
+      - target: CacheoutShared
+      - target: CKernelPrivate
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.cacheout.helperlib
+        MACOSX_DEPLOYMENT_TARGET: "14.0"
+
+  CacheoutShared:
+    type: library.static
+    platform: macOS
+    sources:
+      - path: Sources/CacheoutShared
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.cacheout.shared
+        MACOSX_DEPLOYMENT_TARGET: "14.0"

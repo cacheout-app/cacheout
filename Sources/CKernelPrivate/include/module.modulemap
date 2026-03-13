@@ -1,0 +1,4 @@
+module CKernelPrivate {
+    header "memorystatus_private.h"
+    export *
+}

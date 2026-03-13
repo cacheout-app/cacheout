@@ -1,0 +1,30 @@
+.DS_Store
+/.build
+/Packages
+xcuserdata/
+DerivedData/
+.swiftpm/xcode/package.xcworkspace/contents.xcworkspacedata
+.netrc
+.dev
+*.xcworkspace
+Cacheout.app/
+Cacheout.iconset/
+build/
+*.dmg
+.mcp.json
+
+# Internal dev tooling
+.flow/
+scripts/ralph/
+CLAUDE.md
+AGENTS.md
+_backups/
+_tmp_*
+.vscode/
+
+# Internal docs
+docs/v2/
+cacheout/docs/
+
+# Build artifacts
+dist/

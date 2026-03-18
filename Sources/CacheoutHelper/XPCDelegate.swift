@@ -290,10 +290,20 @@ private final class HelperService: NSObject, MemoryHelperProtocol {
             }
             guard result == 0 else { continue }
 
-            let nameBuffer = UnsafeMutablePointer<CChar>.allocate(capacity: Int(MAXCOMLEN) + 1)
-            defer { nameBuffer.deallocate() }
-            let nameLen = proc_name(pid, nameBuffer, UInt32(MAXCOMLEN + 1))
-            let name = nameLen > 0 ? String(cString: nameBuffer) : "?"
+            let name: String
+            let pathBuffer = UnsafeMutablePointer<CChar>.allocate(capacity: Int(MAXPATHLEN))
+            defer { pathBuffer.deallocate() }
+            let pathLen = proc_pidpath(pid, pathBuffer, UInt32(MAXPATHLEN))
+
+            if pathLen > 0 {
+                let fullPath = String(cString: pathBuffer)
+                name = (fullPath as NSString).lastPathComponent
+            } else {
+                let nameBuffer = UnsafeMutablePointer<CChar>.allocate(capacity: Int(MAXCOMLEN) + 1)
+                defer { nameBuffer.deallocate() }
+                let nameLen = proc_name(pid, nameBuffer, UInt32(MAXCOMLEN + 1))
+                name = nameLen > 0 ? String(cString: nameBuffer) : "?"
+            }
 
             var bsdInfo = proc_bsdinfo()
             proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &bsdInfo,
@@ -464,10 +474,20 @@ private final class HelperService: NSObject, MemoryHelperProtocol {
             }
             guard result == 0 else { continue }
 
-            let nameBuffer = UnsafeMutablePointer<CChar>.allocate(capacity: Int(MAXCOMLEN) + 1)
-            defer { nameBuffer.deallocate() }
-            let nameLen = proc_name(pid, nameBuffer, UInt32(MAXCOMLEN + 1))
-            let name = nameLen > 0 ? String(cString: nameBuffer) : "?"
+            let name: String
+            let pathBuffer = UnsafeMutablePointer<CChar>.allocate(capacity: Int(MAXPATHLEN))
+            defer { pathBuffer.deallocate() }
+            let pathLen = proc_pidpath(pid, pathBuffer, UInt32(MAXPATHLEN))
+
+            if pathLen > 0 {
+                let fullPath = String(cString: pathBuffer)
+                name = (fullPath as NSString).lastPathComponent
+            } else {
+                let nameBuffer = UnsafeMutablePointer<CChar>.allocate(capacity: Int(MAXCOMLEN) + 1)
+                defer { nameBuffer.deallocate() }
+                let nameLen = proc_name(pid, nameBuffer, UInt32(MAXCOMLEN + 1))
+                name = nameLen > 0 ? String(cString: nameBuffer) : "?"
+            }
 
             let leakIndicator: Double = info.ri_phys_footprint > 0
                 ? Double(info.ri_lifetime_max_phys_footprint) / Double(info.ri_phys_footprint)

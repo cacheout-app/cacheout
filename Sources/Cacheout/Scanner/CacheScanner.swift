@@ -70,9 +70,10 @@ actor CacheScanner {
         var itemCount = 0
 
         // Use allocatedSizeOfDirectory for actual disk usage (handles sparse files)
+        // ⚡ Bolt Optimization: Added .isRegularFileKey to prefetch properties to avoid O(N) disk I/O when reading resourceValues inside the loop
         guard let enumerator = fileManager.enumerator(
             at: url,
-            includingPropertiesForKeys: [.totalFileAllocatedSizeKey, .fileAllocatedSizeKey],
+            includingPropertiesForKeys: [.totalFileAllocatedSizeKey, .fileAllocatedSizeKey, .isRegularFileKey],
             options: [.skipsHiddenFiles, .skipsPackageDescendants]
         ) else {
             return (0, 0)

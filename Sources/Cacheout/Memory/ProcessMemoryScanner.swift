@@ -154,10 +154,21 @@ actor ProcessMemoryScanner {
         }
 
         // Get process name
-        let nameBuffer = UnsafeMutablePointer<CChar>.allocate(capacity: Int(MAXCOMLEN) + 1)
-        defer { nameBuffer.deallocate() }
-        let nameLen = proc_name(pid, nameBuffer, UInt32(MAXCOMLEN + 1))
-        let name = nameLen > 0 ? String(cString: nameBuffer) : "unknown"
+        let name: String
+        let pathBuffer = UnsafeMutablePointer<CChar>.allocate(capacity: Int(MAXPATHLEN))
+        defer { pathBuffer.deallocate() }
+        let pathLen = proc_pidpath(pid, pathBuffer, UInt32(MAXPATHLEN))
+
+        if pathLen > 0 {
+            let fullPath = String(cString: pathBuffer)
+            name = (fullPath as NSString).lastPathComponent
+        } else {
+            // Fallback to proc_name
+            let nameBuffer = UnsafeMutablePointer<CChar>.allocate(capacity: Int(MAXCOMLEN) + 1)
+            defer { nameBuffer.deallocate() }
+            let nameLen = proc_name(pid, nameBuffer, UInt32(MAXCOMLEN + 1))
+            name = nameLen > 0 ? String(cString: nameBuffer) : "unknown"
+        }
 
         let isRosetta = RosettaDetector.isTranslated(pid: pid)
 

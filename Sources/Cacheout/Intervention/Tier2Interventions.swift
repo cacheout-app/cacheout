@@ -236,7 +236,8 @@ public final class JetsamHWM: Intervention {
         // Step 4: Get foreground (active) app PIDs for denylist.
         // Only exclude truly active/frontmost apps, not all GUI apps.
         let foregroundPIDs = await MainActor.run {
-            Set(NSWorkspace.shared.runningApplications
+            // Bolt: use .lazy to avoid intermediate array allocations when initializing Set
+            Set(NSWorkspace.shared.runningApplications.lazy
                 .filter { $0.isActive }
                 .map { $0.processIdentifier })
         }

@@ -229,14 +229,26 @@ class CacheoutViewModel: ObservableObject {
         isDockerPruning = true
         defer { isDockerPruning = false }
 
+        // Common macOS Docker executable paths
+        let dockerPaths = [
+            "/usr/local/bin/docker",
+            "/opt/homebrew/bin/docker",
+            "/usr/bin/docker"
+        ]
+
+        guard let dockerPath = dockerPaths.first(where: { FileManager.default.fileExists(atPath: $0) }) else {
+            lastDockerPruneResult = "Docker not found"
+            diskInfo = DiskInfo.current()
+            return
+        }
+
         let process = Process()
         let pipe = Pipe()
-        process.executableURL = URL(fileURLWithPath: "/bin/bash")
-        process.arguments = ["-c", "docker system prune -f 2>&1"]
+        process.executableURL = URL(fileURLWithPath: dockerPath)
+        process.arguments = ["system", "prune", "-f"]
         process.standardOutput = pipe
         process.standardError = pipe
         process.environment = [
-            "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin",
             "HOME": FileManager.default.homeDirectoryForCurrentUser.path
         ]
 
@@ -266,7 +278,7 @@ class CacheoutViewModel: ObservableObject {
                 }
             }
         } catch {
-            lastDockerPruneResult = "Docker not found"
+            lastDockerPruneResult = "Docker prune failed"
         }
 
         // Refresh disk info after prune

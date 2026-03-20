@@ -76,8 +76,21 @@ struct ProcessesView: View {
                 }
             }
 
-            ForEach(Array(viewModel.topProcesses.enumerated()), id: \.element.pid) { index, process in
-                processRow(process, rank: index + 1)
+            if viewModel.topProcesses.isEmpty {
+                VStack(spacing: 8) {
+                    Image(systemName: "list.bullet.rectangle")
+                        .font(.largeTitle)
+                        .foregroundStyle(.tertiary)
+                    Text("No processes found")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .center)
+                .padding(.vertical, 24)
+            } else {
+                ForEach(Array(viewModel.topProcesses.enumerated()), id: \.element.pid) { index, process in
+                    processRow(process, rank: index + 1)
+                }
             }
         }
     }

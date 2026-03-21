@@ -1,0 +1,3 @@
+## 2024-05-24 - Avoid intermediate arrays when initializing Set with chained operations
+**Learning:** For performance-sensitive collection transformations involving chained operations like `filter` and `map`, utilize the `.lazy` property to create a lazy sequence and avoid the creation of intermediate arrays, particularly when initializing a `Set`.
+**Action:** Use `.lazy` when chaining `.filter` and `.map` before `Set` initialization to reduce memory allocations.

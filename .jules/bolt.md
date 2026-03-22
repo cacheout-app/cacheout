@@ -1,0 +1,3 @@
+## 2024-05-24 - [Avoid intermediate collections for Set initialization]
+**Learning:** [When initializing a `Set` from a collection transformation involving chained operations like `filter` and `map`, utilizing the `.lazy` property prevents the creation of intermediate arrays, avoiding unnecessary memory allocations.]
+**Action:** [Use `.lazy` for performance-sensitive collection transformations before initializing a `Set`.]

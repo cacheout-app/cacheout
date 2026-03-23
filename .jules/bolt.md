@@ -1,0 +1,3 @@
+## 2024-05-18 - Lazy Evaluation for Collection Operations
+**Learning:** For performance-sensitive collection transformations involving chained operations like `filter` and `map` in Swift, intermediate arrays are created at each step unless lazy evaluation is explicitly used. This increases memory footprint and overhead, especially in frequent or large operations.
+**Action:** When performing multiple chained higher-order functions (e.g., `filter { ... }.map { ... }`), utilize the `.lazy` property on the collection (e.g., `array.lazy.filter { ... }.map { ... }`) to avoid intermediate allocations and defer execution until the results are accessed or materialized into a final collection.

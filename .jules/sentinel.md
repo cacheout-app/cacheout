@@ -1,0 +1,4 @@
+## 2024-03-23 - Prevent Command Injection via Direct Process Execution
+**Vulnerability:** Execution of external commands (like `docker system prune -f 2>&1`) via shell wrappers like `/bin/bash -c` poses a command injection risk if user inputs are later appended to or formatted into the command string.
+**Learning:** Shell wrappers introduce unnecessary shell interpretation (e.g., globbing, splitting, redirection) which can be manipulated. Specifically, shell redirections like `2>&1` were used through `/bin/bash -c`.
+**Prevention:** Always prefer direct invocation of executables using `Process` with explicitly defined arguments and `process.executableURL = URL(fileURLWithPath: "/usr/bin/env")`. Shell redirections like `2>&1` should be replicated securely by assigning the same `Pipe()` instance to both `process.standardOutput` and `process.standardError`.

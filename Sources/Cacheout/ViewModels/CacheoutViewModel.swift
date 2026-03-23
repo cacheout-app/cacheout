@@ -231,8 +231,10 @@ class CacheoutViewModel: ObservableObject {
 
         let process = Process()
         let pipe = Pipe()
-        process.executableURL = URL(fileURLWithPath: "/bin/bash")
-        process.arguments = ["-c", "docker system prune -f 2>&1"]
+        // 🛡️ Sentinel: Mitigate command injection risk by avoiding /bin/bash shell wrapper.
+        // Direct executable invocation via env is more secure.
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = ["docker", "system", "prune", "-f"]
         process.standardOutput = pipe
         process.standardError = pipe
         process.environment = [

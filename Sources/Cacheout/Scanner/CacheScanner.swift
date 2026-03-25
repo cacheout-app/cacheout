@@ -26,13 +26,11 @@
 
 import Foundation
 
-actor CacheScanner {
-    private let fileManager = FileManager.default
-
+struct CacheScanner {
     func scanAll(_ categories: [CacheCategory]) async -> [ScanResult] {
         await withTaskGroup(of: ScanResult.self) { group in
             for category in categories {
-                group.addTask { await self.scanCategory(category) }
+                group.addTask { self.scanCategory(category) }
             }
             var results: [ScanResult] = []
             for await result in group {
@@ -42,7 +40,7 @@ actor CacheScanner {
         }
     }
 
-    func scanCategory(_ category: CacheCategory) async -> ScanResult {
+    func scanCategory(_ category: CacheCategory) -> ScanResult {
         let resolvedPaths = category.resolvedPaths
         guard !resolvedPaths.isEmpty else {
             return ScanResult(category: category, sizeBytes: 0, itemCount: 0, exists: false)
@@ -70,7 +68,7 @@ actor CacheScanner {
         var itemCount = 0
 
         // Use allocatedSizeOfDirectory for actual disk usage (handles sparse files)
-        guard let enumerator = fileManager.enumerator(
+        guard let enumerator = FileManager.default.enumerator(
             at: url,
             includingPropertiesForKeys: [.totalFileAllocatedSizeKey, .fileAllocatedSizeKey],
             options: [.skipsHiddenFiles, .skipsPackageDescendants]

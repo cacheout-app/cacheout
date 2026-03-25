@@ -28,9 +28,7 @@
 
 import Foundation
 
-actor NodeModulesScanner {
-    private let fileManager = FileManager.default
-
+struct NodeModulesScanner {
     /// Common directories where developers keep projects
     private static let searchRoots: [String] = [
         "Documents",
@@ -53,16 +51,16 @@ actor NodeModulesScanner {
     ]
 
     func scan(maxDepth: Int = 6) async -> [NodeModulesItem] {
-        let home = fileManager.homeDirectoryForCurrentUser
+        let home = FileManager.default.homeDirectoryForCurrentUser
         var allItems: [NodeModulesItem] = []
 
         // Scan each search root in parallel
         await withTaskGroup(of: [NodeModulesItem].self) { group in
             for root in Self.searchRoots {
                 let rootURL = home.appendingPathComponent(root)
-                guard fileManager.fileExists(atPath: rootURL.path) else { continue }
+                guard FileManager.default.fileExists(atPath: rootURL.path) else { continue }
                 group.addTask {
-                    await self.findNodeModules(in: rootURL, maxDepth: maxDepth)
+                    self.findNodeModules(in: rootURL, maxDepth: maxDepth)
                 }
             }
             for await items in group {
@@ -77,7 +75,7 @@ actor NodeModulesScanner {
             .sorted { $0.sizeBytes > $1.sizeBytes }
     }
 
-    private func findNodeModules(in directory: URL, maxDepth: Int, currentDepth: Int = 0) async -> [NodeModulesItem] {
+    private func findNodeModules(in directory: URL, maxDepth: Int, currentDepth: Int = 0) -> [NodeModulesItem] {
         guard currentDepth < maxDepth else { return [] }
 
         var results: [NodeModulesItem] = []
@@ -85,10 +83,10 @@ actor NodeModulesScanner {
 
         // Check if this directory contains node_modules
         var isDir: ObjCBool = false
-        if fileManager.fileExists(atPath: nodeModulesURL.path, isDirectory: &isDir), isDir.boolValue {
+        if FileManager.default.fileExists(atPath: nodeModulesURL.path, isDirectory: &isDir), isDir.boolValue {
             let size = directorySize(at: nodeModulesURL)
             if size > 0 {
-                let lastMod = try? fileManager.attributesOfItem(atPath: nodeModulesURL.path)[.modificationDate] as? Date
+                let lastMod = try? FileManager.default.attributesOfItem(atPath: nodeModulesURL.path)[.modificationDate] as? Date
                 let projectName = directory.lastPathComponent
                 results.append(NodeModulesItem(
                     projectName: projectName,
@@ -103,7 +101,7 @@ actor NodeModulesScanner {
         }
 
         // Recurse into subdirectories
-        guard let contents = try? fileManager.contentsOfDirectory(
+        guard let contents = try? FileManager.default.contentsOfDirectory(
             at: directory,
             includingPropertiesForKeys: [.isDirectoryKey],
             options: [.skipsHiddenFiles]
@@ -113,7 +111,7 @@ actor NodeModulesScanner {
             let name = item.lastPathComponent
             guard !Self.skipDirs.contains(name) else { continue }
             guard (try? item.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true else { continue }
-            let subResults = await findNodeModules(in: item, maxDepth: maxDepth, currentDepth: currentDepth + 1)
+            let subResults = self.findNodeModules(in: item, maxDepth: maxDepth, currentDepth: currentDepth + 1)
             results.append(contentsOf: subResults)
         }
 
@@ -122,7 +120,7 @@ actor NodeModulesScanner {
 
     private func directorySize(at url: URL) -> Int64 {
         var total: Int64 = 0
-        guard let enumerator = fileManager.enumerator(
+        guard let enumerator = FileManager.default.enumerator(
             at: url,
             includingPropertiesForKeys: [.totalFileAllocatedSizeKey],
             options: [.skipsHiddenFiles]

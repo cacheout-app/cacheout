@@ -114,7 +114,7 @@ class CacheoutViewModel: ObservableObject {
     }
 
     var totalRecoverable: Int64 {
-        scanResults.filter { !$0.isEmpty }.reduce(0) { $0 + $1.sizeBytes }
+        scanResults.lazy.filter { !$0.isEmpty }.reduce(0) { $0 + $1.sizeBytes }
     }
 
     var hasResults: Bool { !scanResults.isEmpty || !nodeModulesItems.isEmpty }
@@ -131,7 +131,7 @@ class CacheoutViewModel: ObservableObject {
     }
 
     var selectedNodeModulesSize: Int64 {
-        nodeModulesItems.filter(\.isSelected).reduce(0) { $0 + $1.sizeBytes }
+        nodeModulesItems.lazy.filter(\.isSelected).reduce(0) { $0 + $1.sizeBytes }
     }
 
     var formattedSelectedNodeModulesSize: String {

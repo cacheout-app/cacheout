@@ -1,0 +1,3 @@
+## 2024-03-25 - Making SwiftUI List Rows Fully Clickable with VoiceOver
+**Learning:** In SwiftUI, placing a Button (like a checkbox) inside an HStack only makes the button's bounds interactive, causing narrow hit targets that are hard to tap. VoiceOver also treats the row as separate fragmented elements by default. Simply wrapping the HStack in a Button isn't enough because empty space in the HStack won't be clickable.
+**Action:** Always wrap the entire row contents in a `Button`, apply `.contentShape(Rectangle())` to the contents to make empty space clickable, use `.buttonStyle(.plain)` on the Button to prevent unwanted text styling, and add `.accessibilityElement(children: .combine)` to create a unified VoiceOver experience.

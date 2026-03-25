@@ -1,0 +1,4 @@
+
+## 2024-05-24 - Swift Actor Isolation limits parallel synchronous I/O
+**Learning:** Using `actor` for parallel scanners (like `CacheScanner` and `NodeModulesScanner`) that launch background tasks with `withTaskGroup` severely limits concurrency if those tasks run synchronous file I/O operations directly on the actor. Because `actor` methods are strictly serialized, `group.addTask { await self.synchronousMethod() }` forces the synchronous work to execute one-by-one, destroying the intended parallelism of `withTaskGroup`.
+**Action:** For concurrent file system scanners that only rely on thread-safe dependencies (like `FileManager.default`) and don't maintain mutable internal state, use a `struct` instead of an `actor`. By making the inner scanning functions synchronous and isolated to the `Task` rather than an `actor` instance, the standard `TaskGroup` parallelism operates freely across CPU cores.

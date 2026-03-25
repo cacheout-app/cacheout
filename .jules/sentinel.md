@@ -1,0 +1,4 @@
+## 2024-05-24 - Prevent Command Injection in dockerPrune
+**Vulnerability:** Execution of a hardcoded shell command `docker system prune -f 2>&1` via `/bin/bash -c` wrapper.
+**Learning:** Using `/bin/bash -c` is unnecessary when a command and its arguments are known. Shell features like `2>&1` can be implemented securely in Swift by assigning the same `Pipe()` instance to both `process.standardOutput` and `process.standardError`. Furthermore, replacing absolute paths like `/bin/bash` with `/usr/bin/env bash` does not prevent command injection and relies on `PATH`, which is less secure than an absolute path to a trusted binary.
+**Prevention:** Use direct execution via `/usr/bin/env` with explicitly defined arguments (e.g., `["docker", "system", "prune", "-f"]`) to avoid shell wrappers entirely. When shell-specific features like pipelines or redirections are truly necessary, continue using `/bin/bash` with the absolute path rather than `/usr/bin/env bash`.

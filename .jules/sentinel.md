@@ -1,0 +1,4 @@
+## 2024-03-25 - Prevent Command Injection with Direct Binary Execution in Process
+**Vulnerability:** Execution of external commands using shell wrappers (e.g., `/bin/bash -c "docker system prune -f 2>&1"`) within `Process` objects.
+**Learning:** Shell wrappers expose the application to command injection vulnerabilities if user input or environmental variables are inadvertently included in the command string. Furthermore, features like shell redirection (`2>&1`) can be replicated safely without a shell wrapper.
+**Prevention:** Avoid shell wrappers (`/bin/bash -c`). Execute binaries directly using `Process` with explicitly defined arguments (e.g., `executableURL = URL(fileURLWithPath: "/usr/bin/env")` and `arguments = ["docker", "system", "prune", "-f"]`). Securely replicate shell redirection by assigning the same `Pipe()` instance to both `process.standardOutput` and `process.standardError`.

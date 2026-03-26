@@ -77,7 +77,13 @@ actor NodeModulesScanner {
             .sorted { $0.sizeBytes > $1.sizeBytes }
     }
 
-    private func findNodeModules(in directory: URL, maxDepth: Int, currentDepth: Int = 0) async -> [NodeModulesItem] {
+    // ⚡ Bolt: Performance Optimization
+    // Made `findNodeModules` and `directorySize` nonisolated.
+    // Previously, running these on the actor serialized the TaskGroup,
+    // eliminating parallelism because synchronous I/O blocked the actor's executor.
+    // By making them nonisolated, tasks run concurrently across threads.
+    // Expected impact: ~4x-8x faster node_modules scanning on multi-core Macs.
+    private nonisolated func findNodeModules(in directory: URL, maxDepth: Int, currentDepth: Int = 0) async -> [NodeModulesItem] {
         guard currentDepth < maxDepth else { return [] }
 
         var results: [NodeModulesItem] = []
@@ -120,7 +126,7 @@ actor NodeModulesScanner {
         return results
     }
 
-    private func directorySize(at url: URL) -> Int64 {
+    private nonisolated func directorySize(at url: URL) -> Int64 {
         var total: Int64 = 0
         guard let enumerator = fileManager.enumerator(
             at: url,

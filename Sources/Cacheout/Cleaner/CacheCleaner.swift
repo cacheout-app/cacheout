@@ -35,7 +35,7 @@
 import Foundation
 import AppKit
 
-actor CacheCleaner {
+struct CacheCleaner {
     private let fileManager = FileManager.default
 
     func clean(results: [ScanResult], nodeModules: [NodeModulesItem] = [], moveToTrash: Bool) async -> CleanupReport {

@@ -1,0 +1,3 @@
+## 2024-05-14 - Unblock MainActor by offloading blocking I/O calls
+**Learning:** In Swift, synchronous blocking operations like `Foundation.Process.waitUntilExit()`, `readDataToEndOfFile()`, and `DiskInfo.current()` execute on the same thread they are called from. If called directly from an `@MainActor` method or actor, they freeze the UI thread until completion, preventing user interaction and other UI updates.
+**Action:** When working in `@MainActor` contexts, always identify blocking I/O or shell operations and explicitly offload them to background concurrency pool threads using `await Task.detached { ... }.value` to maintain a responsive UI.

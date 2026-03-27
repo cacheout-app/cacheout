@@ -147,7 +147,8 @@ class CacheoutViewModel: ObservableObject {
     func scan() async {
         isScanning = true
         isNodeModulesScanning = true
-        diskInfo = DiskInfo.current()
+        // ⚡ Bolt: Offload blocking I/O (filesystem stats) from the @MainActor to keep UI responsive
+        diskInfo = await Task.detached { DiskInfo.current() }.value
 
         // Scan caches and node_modules in parallel
         async let cacheResults = scanner.scanAll(CacheCategory.allCategories)
@@ -229,48 +230,54 @@ class CacheoutViewModel: ObservableObject {
         isDockerPruning = true
         defer { isDockerPruning = false }
 
-        let process = Process()
-        let pipe = Pipe()
-        process.executableURL = URL(fileURLWithPath: "/bin/bash")
-        process.arguments = ["-c", "docker system prune -f 2>&1"]
-        process.standardOutput = pipe
-        process.standardError = pipe
-        process.environment = [
-            "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin",
-            "HOME": FileManager.default.homeDirectoryForCurrentUser.path
-        ]
+        // ⚡ Bolt: Offload blocking Process execution and Pipe reading from the @MainActor
+        // to prevent the UI from freezing while Docker prunes.
+        // Initialize Process inside the detached task to ensure Sendable safety.
+        lastDockerPruneResult = await Task.detached {
+            let process = Process()
+            let pipe = Pipe()
+            process.executableURL = URL(fileURLWithPath: "/bin/bash")
+            process.arguments = ["-c", "docker system prune -f 2>&1"]
+            process.standardOutput = pipe
+            process.standardError = pipe
+            process.environment = [
+                "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin",
+                "HOME": FileManager.default.homeDirectoryForCurrentUser.path
+            ]
 
-        do {
-            try process.run()
-            process.waitUntilExit()
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            let output = String(data: data, encoding: .utf8) ?? ""
+            do {
+                try process.run()
+                process.waitUntilExit()
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                let output = String(data: data, encoding: .utf8) ?? ""
 
-            if process.terminationStatus == 0 {
-                // Extract "Total reclaimed space:" line
-                if let line = output.components(separatedBy: "\n")
-                    .first(where: { $0.contains("reclaimed") }) {
-                    lastDockerPruneResult = line.trimmingCharacters(in: .whitespaces)
+                if process.terminationStatus == 0 {
+                    // Extract "Total reclaimed space:" line
+                    if let line = output.components(separatedBy: "\n")
+                        .first(where: { $0.contains("reclaimed") }) {
+                        return line.trimmingCharacters(in: .whitespaces)
+                    } else {
+                        return "Docker pruned successfully"
+                    }
                 } else {
-                    lastDockerPruneResult = "Docker pruned successfully"
+                    let lowerOutput = output.lowercased()
+                    if lowerOutput.contains("cannot connect") ||
+                       lowerOutput.contains("is the docker daemon running") ||
+                       lowerOutput.contains("connection refused") ||
+                       lowerOutput.contains("no such file or directory") {
+                        return "Docker must be running to prune"
+                    } else {
+                        return "Docker prune failed — is Docker running?"
+                    }
                 }
-            } else {
-                let lowerOutput = output.lowercased()
-                if lowerOutput.contains("cannot connect") ||
-                   lowerOutput.contains("is the docker daemon running") ||
-                   lowerOutput.contains("connection refused") ||
-                   lowerOutput.contains("no such file or directory") {
-                    lastDockerPruneResult = "Docker must be running to prune"
-                } else {
-                    lastDockerPruneResult = "Docker prune failed — is Docker running?"
-                }
+            } catch {
+                return "Docker not found"
             }
-        } catch {
-            lastDockerPruneResult = "Docker not found"
-        }
+        }.value
 
         // Refresh disk info after prune
-        diskInfo = DiskInfo.current()
+        // ⚡ Bolt: Offload blocking I/O from the @MainActor
+        diskInfo = await Task.detached { DiskInfo.current() }.value
     }
 
     func clean() async {

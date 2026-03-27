@@ -1,0 +1,4 @@
+## 2024-11-06 - Replacing Shell Wrapper with Direct Execution for Docker Prune
+**Vulnerability:** Execution of `docker system prune` via `/bin/bash -c` in `dockerPrune()` could potentially be susceptible to command injection if arguments are ever dynamically inserted, and generally violates the principle of least privilege by running an unnecessary shell.
+**Learning:** Shell redirections like `2>&1` can be securely replicated natively in Swift's `Process` by assigning the exact same `Pipe` instance to both `standardOutput` and `standardError` properties.
+**Prevention:** Avoid `/bin/bash -c` for external commands unless shell-specific features (like complex pipelines or globs) are strictly required. Use `/usr/bin/env` with direct arguments instead, and handle output redirection directly via the `Process` API.

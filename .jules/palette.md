@@ -1,0 +1,3 @@
+## 2024-05-24 - Large hit targets and VoiceOver for custom list rows
+**Learning:** In the custom SwiftUI list rows (like `CategoryRow` and `NodeModulesRow`), having only the checkbox icon as a `Button` results in a small hit target and a fragmented VoiceOver experience where each text element is read individually.
+**Action:** When creating clickable list rows, wrap the entire row contents (e.g., `HStack`) in a `Button`, apply `.contentShape(Rectangle())` to make empty space clickable, use `.buttonStyle(.plain)` to prevent unintended text styling, and add `.accessibilityElement(children: .combine)` to group the row's information into a single VoiceOver element.

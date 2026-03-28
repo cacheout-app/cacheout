@@ -26,7 +26,9 @@
 
 import Foundation
 
-actor CacheScanner {
+// Using struct instead of actor to prevent serialization of parallel tasks.
+// Since this component is stateless, struct allows true concurrency across threads.
+struct CacheScanner {
     private let fileManager = FileManager.default
 
     func scanAll(_ categories: [CacheCategory]) async -> [ScanResult] {

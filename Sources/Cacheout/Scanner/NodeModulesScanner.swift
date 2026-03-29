@@ -28,7 +28,7 @@
 
 import Foundation
 
-actor NodeModulesScanner {
+struct NodeModulesScanner {
     private let fileManager = FileManager.default
 
     /// Common directories where developers keep projects

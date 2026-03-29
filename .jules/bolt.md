@@ -1,0 +1,3 @@
+## 2024-05-14 - withTaskGroup Serialization Bug
+**Learning:** In Swift structured concurrency, using an `actor` to manage a `withTaskGroup` where tasks invoke synchronous, blocking I/O (like `FileManager` operations) directly on the actor's own methods inadvertently serializes the tasks on the actor's single executor, completely preventing the intended parallelism.
+**Action:** For stateless components interacting with thread-safe dependencies like `FileManager.default`, use `struct`s or explicitly `nonisolated` methods to allow tasks to execute genuinely concurrently across the cooperative thread pool.

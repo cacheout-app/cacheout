@@ -1,0 +1,3 @@
+## 2024-03-29 - Expand clickable hit targets in list rows
+**Learning:** List rows in this app's components (`CategoryRow`, `NodeModulesRow`) were using small button hit targets around checkboxes instead of row-wide hit targets, which leads to poor UX (hard to click) and a fragmented VoiceOver experience.
+**Action:** When creating clickable list rows in SwiftUI, wrap the entire row contents (e.g., `HStack`) in a `Button(action:)`, apply `.contentShape(Rectangle())` to make empty space clickable, use `.buttonStyle(.plain)` to prevent unintended generic styling, and add `.accessibilityElement(children: .combine)` to ensure screen readers read the row as a single descriptive element.

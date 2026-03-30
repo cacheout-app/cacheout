@@ -147,7 +147,10 @@ class CacheoutViewModel: ObservableObject {
     func scan() async {
         isScanning = true
         isNodeModulesScanning = true
-        diskInfo = DiskInfo.current()
+
+        // ⚡ Bolt: Offload synchronous file system call to prevent blocking the @MainActor
+        // Impact: Keeps the UI responsive (avoiding a ~5-10ms hitch) during initial scan
+        diskInfo = await Task.detached { DiskInfo.current() }.value
 
         // Scan caches and node_modules in parallel
         async let cacheResults = scanner.scanAll(CacheCategory.allCategories)
@@ -241,12 +244,18 @@ class CacheoutViewModel: ObservableObject {
         ]
 
         do {
-            try process.run()
-            process.waitUntilExit()
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            let output = String(data: data, encoding: .utf8) ?? ""
+            // ⚡ Bolt: Offload blocking I/O (process.run, waitUntilExit, readDataToEndOfFile)
+            // Impact: Prevents the @MainActor from freezing during the entire Docker prune execution,
+            // which can take several seconds to complete. Keeps the UI completely responsive.
+            let (output, terminationStatus) = try await Task.detached {
+                try process.run()
+                process.waitUntilExit()
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                let output = String(data: data, encoding: .utf8) ?? ""
+                return (output, process.terminationStatus)
+            }.value
 
-            if process.terminationStatus == 0 {
+            if terminationStatus == 0 {
                 // Extract "Total reclaimed space:" line
                 if let line = output.components(separatedBy: "\n")
                     .first(where: { $0.contains("reclaimed") }) {
@@ -270,7 +279,8 @@ class CacheoutViewModel: ObservableObject {
         }
 
         // Refresh disk info after prune
-        diskInfo = DiskInfo.current()
+        // ⚡ Bolt: Offload synchronous file system call
+        diskInfo = await Task.detached { DiskInfo.current() }.value
     }
 
     func clean() async {

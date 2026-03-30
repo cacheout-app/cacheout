@@ -1,13 +1,13 @@
 /// # CacheScanner — Parallel Cache Category Scanner
 ///
-/// An `actor` that scans all registered cache categories concurrently using
+/// A `struct` that scans all registered cache categories concurrently using
 /// Swift's structured concurrency (`TaskGroup`). Each category is scanned in
 /// its own child task for maximum parallelism.
 ///
 /// ## Thread Safety
 ///
-/// Uses the `actor` isolation model to ensure thread-safe access to internal state.
-/// All public methods are `async` and can be called from any concurrency context.
+/// Uses `struct` instead of `actor` to prevent inadvertently serializing
+/// synchronous `FileManager` operations inside the `TaskGroup`.
 ///
 /// ## Disk Size Calculation
 ///
@@ -26,7 +26,7 @@
 
 import Foundation
 
-actor CacheScanner {
+struct CacheScanner {
     private let fileManager = FileManager.default
 
     func scanAll(_ categories: [CacheCategory]) async -> [ScanResult] {

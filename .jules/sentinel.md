@@ -1,0 +1,4 @@
+## 2024-05-24 - String Interpolation in Shell Commands
+**Vulnerability:** Command injection vulnerability identified in `toolExists` within `CacheCategory.swift`, which utilized a shell wrapper (`/bin/bash -c`) with string interpolation to pass dynamic arguments: `shell("/usr/bin/which \(tool)")`.
+**Learning:** String interpolation combined with shell wrappers allows arbitrary command injection if the interpolated variable contains shell metacharacters. Even inside `toolExists`, where `requiresTool` inputs seemed controlled internally, the code pattern itself was inherently unsafe.
+**Prevention:** Avoid using shell wrappers (`/bin/bash -c`) and string interpolation for executing dynamic commands. Always use direct execution of the binary using `Process` with arguments safely separated into the `process.arguments` array.

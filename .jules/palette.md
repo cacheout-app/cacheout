@@ -1,0 +1,3 @@
+## 2024-03-30 - Expand Clickable Area of SwiftUI Rows
+**Learning:** In SwiftUI lists, small interactive elements (like an `Image` or small inner `Button` used as a checkbox) provide a poor target hit area. Furthermore, leaving empty spaces inside the row unclickable forces users to be overly precise.
+**Action:** Always wrap the entire row structure (e.g., `HStack`) in a `Button`, add `.contentShape(Rectangle())` to make white space interactive, use `.buttonStyle(.plain)` to prevent text styling changes, and add `.accessibilityElement(children: .combine)` to create a cohesive VoiceOver readout for the whole row.

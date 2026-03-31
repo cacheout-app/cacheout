@@ -1,0 +1,3 @@
+## 2024-05-28 - Main Thread Blocking in async @MainActor methods
+**Learning:** In Swift Concurrency, `async` methods on a `@MainActor` class execute on the main thread. If they perform synchronous blocking operations (like `DiskInfo.current()` which involves `URLResourceValues` I/O, or `Foundation.Process.waitUntilExit()`), they will block the UI and prevent other main actor tasks from running, even though they are inside an `async` function.
+**Action:** Always offload synchronous blocking operations from the main thread using `await Task.detached { ... }.value` when executing within a `@MainActor` context.

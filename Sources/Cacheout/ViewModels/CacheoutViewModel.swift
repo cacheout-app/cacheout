@@ -147,7 +147,7 @@ class CacheoutViewModel: ObservableObject {
     func scan() async {
         isScanning = true
         isNodeModulesScanning = true
-        diskInfo = DiskInfo.current()
+        diskInfo = await Task.detached { DiskInfo.current() }.value
 
         // Scan caches and node_modules in parallel
         async let cacheResults = scanner.scanAll(CacheCategory.allCategories)
@@ -241,21 +241,24 @@ class CacheoutViewModel: ObservableObject {
         ]
 
         do {
-            try process.run()
-            process.waitUntilExit()
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            let output = String(data: data, encoding: .utf8) ?? ""
+            let result = try await Task.detached { () -> (Int32, String) in
+                try process.run()
+                process.waitUntilExit()
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                let output = String(data: data, encoding: .utf8) ?? ""
+                return (process.terminationStatus, output)
+            }.value
 
-            if process.terminationStatus == 0 {
+            if result.0 == 0 {
                 // Extract "Total reclaimed space:" line
-                if let line = output.components(separatedBy: "\n")
+                if let line = result.1.components(separatedBy: "\n")
                     .first(where: { $0.contains("reclaimed") }) {
                     lastDockerPruneResult = line.trimmingCharacters(in: .whitespaces)
                 } else {
                     lastDockerPruneResult = "Docker pruned successfully"
                 }
             } else {
-                let lowerOutput = output.lowercased()
+                let lowerOutput = result.1.lowercased()
                 if lowerOutput.contains("cannot connect") ||
                    lowerOutput.contains("is the docker daemon running") ||
                    lowerOutput.contains("connection refused") ||
@@ -270,7 +273,7 @@ class CacheoutViewModel: ObservableObject {
         }
 
         // Refresh disk info after prune
-        diskInfo = DiskInfo.current()
+        diskInfo = await Task.detached { DiskInfo.current() }.value
     }
 
     func clean() async {

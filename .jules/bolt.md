@@ -1,0 +1,3 @@
+## 2024-05-24 - Offloading Blocking Tasks from @MainActor
+**Learning:** In Swift, synchronous, blocking operations like `Foundation.Process.waitUntilExit()`, `readDataToEndOfFile()`, and `DiskInfo.current()` will freeze the UI if executed within an `@MainActor` context (like a ViewModel).
+**Action:** Use `await Task.detached { ... }.value` to offload these blocking operations to a background thread, preventing UI unresponsiveness and adhering to structured concurrency best practices.

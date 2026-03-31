@@ -147,7 +147,7 @@ class CacheoutViewModel: ObservableObject {
     func scan() async {
         isScanning = true
         isNodeModulesScanning = true
-        diskInfo = DiskInfo.current()
+        diskInfo = await Task.detached { DiskInfo.current() }.value
 
         // Scan caches and node_modules in parallel
         async let cacheResults = scanner.scanAll(CacheCategory.allCategories)
@@ -241,10 +241,12 @@ class CacheoutViewModel: ObservableObject {
         ]
 
         do {
-            try process.run()
-            process.waitUntilExit()
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            let output = String(data: data, encoding: .utf8) ?? ""
+            let output: String = try await Task.detached {
+                try process.run()
+                process.waitUntilExit()
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                return String(data: data, encoding: .utf8) ?? ""
+            }.value
 
             if process.terminationStatus == 0 {
                 // Extract "Total reclaimed space:" line
@@ -270,7 +272,7 @@ class CacheoutViewModel: ObservableObject {
         }
 
         // Refresh disk info after prune
-        diskInfo = DiskInfo.current()
+        diskInfo = await Task.detached { DiskInfo.current() }.value
     }
 
     func clean() async {

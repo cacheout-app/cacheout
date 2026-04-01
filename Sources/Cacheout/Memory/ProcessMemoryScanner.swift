@@ -97,30 +97,38 @@ actor ProcessMemoryScanner {
     ///
     /// Returns the collected entries and the count of EPERM failures.
     private func scanPIDs(_ pids: [pid_t]) async -> (entries: [ProcessEntryDTO], epermCount: Int) {
-        // Chunk PIDs to cap concurrency at maxConcurrency.
-        let chunks = stride(from: 0, to: pids.count, by: maxConcurrency).map {
-            Array(pids[$0..<min($0 + maxConcurrency, pids.count)])
-        }
-
         var allEntries: [ProcessEntryDTO] = []
         var totalEperm = 0
 
-        for chunk in chunks {
-            await withTaskGroup(of: ScanPIDResult.self) { group in
-                for pid in chunk {
+        await withTaskGroup(of: ScanPIDResult.self) { group in
+            var activeTasks = 0
+            var pidIterator = pids.makeIterator()
+
+            // Enqueue initial batch of tasks up to maxConcurrency
+            while activeTasks < maxConcurrency, let pid = pidIterator.next() {
+                group.addTask { [self] in
+                    self.scanSinglePID(pid)
+                }
+                activeTasks += 1
+            }
+
+            // Process results and enqueue new tasks as old ones finish
+            for await result in group {
+                activeTasks -= 1
+                switch result {
+                case .success(let entry):
+                    allEntries.append(entry)
+                case .eperm:
+                    totalEperm += 1
+                case .otherError:
+                    break
+                }
+
+                if let pid = pidIterator.next() {
                     group.addTask { [self] in
                         self.scanSinglePID(pid)
                     }
-                }
-                for await result in group {
-                    switch result {
-                    case .success(let entry):
-                        allEntries.append(entry)
-                    case .eperm:
-                        totalEperm += 1
-                    case .otherError:
-                        break
-                    }
+                    activeTasks += 1
                 }
             }
         }

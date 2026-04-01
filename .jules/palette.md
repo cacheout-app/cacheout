@@ -1,0 +1,3 @@
+## 2024-05-24 - [SwiftUI Clickable List Rows]
+**Learning:** [In SwiftUI, applying `onTapGesture` or using a tiny `Button` (like a checkbox) inside an `HStack` limits the hit target to just that small element. This creates a poor user experience, especially for VoiceOver users, and requires precise clicking from mouse/trackpad users.]
+**Action:** [Wrap the entire `HStack` representing the row inside a `Button`. Use `.contentShape(Rectangle())` to ensure empty space within the `HStack` is clickable. Use `.buttonStyle(.plain)` to prevent default button styling from affecting the text. Enhance accessibility with `.accessibilityElement(children: .combine)` and adding `.accessibilityAddTraits(.isButton)` or `.accessibilityAddTraits(.isSelected)` based on state.]

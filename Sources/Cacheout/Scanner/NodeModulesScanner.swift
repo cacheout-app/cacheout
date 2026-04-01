@@ -1,6 +1,6 @@
 /// # NodeModulesScanner — Recursive node_modules Finder
 ///
-/// An `actor` that recursively searches common developer project directories
+/// A `struct` that recursively searches common developer project directories
 /// for `node_modules` folders. Designed to find abandoned or stale dependencies
 /// that consume significant disk space.
 ///
@@ -21,14 +21,15 @@
 ///
 /// ## Performance
 ///
-/// - Parallel scanning of root directories via `TaskGroup`
+/// - Parallel scanning of root directories via `TaskGroup` (using a stateless `struct`
+///   avoids actor serialization, unlocking true concurrent filesystem traversal)
 /// - Early termination when `node_modules` found (no deeper recursion)
 /// - Skip list eliminates most irrelevant directories
 /// - `maxDepth` cap prevents excessive filesystem traversal
 
 import Foundation
 
-actor NodeModulesScanner {
+struct NodeModulesScanner {
     private let fileManager = FileManager.default
 
     /// Common directories where developers keep projects

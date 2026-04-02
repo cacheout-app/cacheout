@@ -97,29 +97,36 @@ actor ProcessMemoryScanner {
     ///
     /// Returns the collected entries and the count of EPERM failures.
     private func scanPIDs(_ pids: [pid_t]) async -> (entries: [ProcessEntryDTO], epermCount: Int) {
-        // Chunk PIDs to cap concurrency at maxConcurrency.
-        let chunks = stride(from: 0, to: pids.count, by: maxConcurrency).map {
-            Array(pids[$0..<min($0 + maxConcurrency, pids.count)])
-        }
-
         var allEntries: [ProcessEntryDTO] = []
         var totalEperm = 0
 
-        for chunk in chunks {
-            await withTaskGroup(of: ScanPIDResult.self) { group in
-                for pid in chunk {
+        // Use an iterator to manage a sliding window of tasks, capping concurrency at maxConcurrency.
+        var pidIterator = pids.makeIterator()
+
+        await withTaskGroup(of: ScanPIDResult.self) { group in
+            // Enqueue initial set of tasks up to maxConcurrency
+            for _ in 0..<maxConcurrency {
+                if let pid = pidIterator.next() {
                     group.addTask { [self] in
                         self.scanSinglePID(pid)
                     }
                 }
-                for await result in group {
-                    switch result {
-                    case .success(let entry):
-                        allEntries.append(entry)
-                    case .eperm:
-                        totalEperm += 1
-                    case .otherError:
-                        break
+            }
+
+            // As each task completes, process its result and add a new task if available
+            for await result in group {
+                switch result {
+                case .success(let entry):
+                    allEntries.append(entry)
+                case .eperm:
+                    totalEperm += 1
+                case .otherError:
+                    break
+                }
+
+                if let pid = pidIterator.next() {
+                    group.addTask { [self] in
+                        self.scanSinglePID(pid)
                     }
                 }
             }

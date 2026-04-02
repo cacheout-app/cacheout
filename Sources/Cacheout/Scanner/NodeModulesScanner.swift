@@ -28,7 +28,12 @@
 
 import Foundation
 
-actor NodeModulesScanner {
+// ⚡ BOLT OPTIMIZATION:
+// Using `struct` instead of `actor` prevents task serialization.
+// An `actor` forces `withTaskGroup` tasks calling its methods to run sequentially
+// on its executor. Changing to a stateless `struct` allows `FileManager` heavy I/O
+// tasks to execute concurrently across threads.
+struct NodeModulesScanner {
     private let fileManager = FileManager.default
 
     /// Common directories where developers keep projects

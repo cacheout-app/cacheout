@@ -26,7 +26,12 @@
 
 import Foundation
 
-actor CacheScanner {
+// ⚡ BOLT OPTIMIZATION:
+// Using `struct` instead of `actor` prevents task serialization.
+// An `actor` forces `withTaskGroup` tasks calling its methods to run sequentially
+// on its executor. Changing to a stateless `struct` allows `FileManager` heavy I/O
+// tasks to execute concurrently across threads.
+struct CacheScanner {
     private let fileManager = FileManager.default
 
     func scanAll(_ categories: [CacheCategory]) async -> [ScanResult] {

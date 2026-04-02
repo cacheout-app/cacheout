@@ -474,14 +474,26 @@ public final class StatusSocket: @unchecked Sendable {
         }
 
         let expandedPath = (path as NSString).expandingTildeInPath
+        let standardizedPath = (expandedPath as NSString).standardizingPath
+
+        let allowedPrefix = URL(fileURLWithPath: FileManager.default.homeDirectoryForCurrentUser.path)
+            .appendingPathComponent(".cacheout").path + "/"
+
+        guard standardizedPath.hasPrefix(allowedPrefix) else {
+            sendSuccessResponse(fd: fd, data: [
+                "valid": false,
+                "errors": ["Path traversal detected or path outside allowed directory: \(standardizedPath)"],
+            ] as [String: Any])
+            return
+        }
 
         // lstat to reject symlinks to special files, FIFOs, devices, etc.
         var sb = Darwin.stat()
-        let statResult: Int32 = lstat(expandedPath, &sb)
+        let statResult: Int32 = lstat(standardizedPath, &sb)
         guard statResult == 0 else {
             sendSuccessResponse(fd: fd, data: [
                 "valid": false,
-                "errors": ["File not found: \(expandedPath)"],
+                "errors": ["File not found: \(standardizedPath)"],
             ] as [String: Any])
             return
         }
@@ -490,7 +502,7 @@ public final class StatusSocket: @unchecked Sendable {
         guard (sb.st_mode & S_IFMT) == S_IFREG else {
             sendSuccessResponse(fd: fd, data: [
                 "valid": false,
-                "errors": ["Not a regular file: \(expandedPath)"],
+                "errors": ["Not a regular file: \(standardizedPath)"],
             ] as [String: Any])
             return
         }

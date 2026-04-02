@@ -1,0 +1,3 @@
+## 2025-04-02 - TaskGroup Static Chunking vs Sliding Window
+**Learning:** In Swift structured concurrency, processing high-volume tasks (like hundreds of PIDs in `ProcessMemoryScanner`) using `withTaskGroup` with static chunking limits throughput due to tail latency (waiting for the slowest task in a chunk to complete before starting the next chunk).
+**Action:** Instead of chunking arrays, use a sliding window approach with `makeIterator()`. Enqueue the initial max concurrency limit, and add a new task immediately as each `await group.next()` completes, maintaining maximum continuous throughput.

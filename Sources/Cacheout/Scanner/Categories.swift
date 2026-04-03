@@ -66,7 +66,11 @@ extension CacheCategory {
             riskLevel: .review,
             rebuildNote: "Recreated when you use Simulator. Run 'xcrun simctl delete unavailable' for targeted cleanup.",
             defaultSelected: false,
-            cleanCommand: "xcrun simctl shutdown all 2>/dev/null; xcrun simctl delete unavailable 2>/dev/null; xcrun simctl erase all 2>/dev/null"
+            cleanSteps: [
+                ["xcrun", "simctl", "shutdown", "all"],
+                ["xcrun", "simctl", "delete", "unavailable"],
+                ["xcrun", "simctl", "erase", "all"]
+            ]
         ),        CacheCategory(
             name: "Swift PM Cache",
             slug: "swift_pm_cache",
@@ -84,9 +88,19 @@ extension CacheCategory {
             icon: "leaf.fill",
             discovery: [
                 .probed(
-                    command: "pod cache list --short 2>/dev/null | head -1 | sed 's|/[^/]*$||'",
+                    executable: "pod",
+                    arguments: ["cache", "list", "--short"],
                     requiresTool: "pod",
-                    fallbacks: ["Library/Caches/CocoaPods"]
+                    fallbacks: ["Library/Caches/CocoaPods"],
+                    transform: { output in
+                        // Equivalent to `head -1 | sed 's|/[^/]*$||'`
+                        let firstLine = output.components(separatedBy: "\n").first ?? ""
+                        let components = firstLine.components(separatedBy: "/")
+                        if components.count > 1 {
+                            return components.dropLast().joined(separator: "/")
+                        }
+                        return firstLine.trimmingCharacters(in: .whitespacesAndNewlines)
+                    }
                 )
             ],
             riskLevel: .safe,
@@ -105,7 +119,8 @@ extension CacheCategory {
             icon: "mug.fill",
             discovery: [
                 .probed(
-                    command: "brew --cache 2>/dev/null",
+                    executable: "brew",
+                    arguments: ["--cache"],
                     requiresTool: "brew",
                     fallbacks: ["Library/Caches/Homebrew"]
                 )
@@ -126,7 +141,8 @@ extension CacheCategory {
             icon: "shippingbox.fill",
             discovery: [
                 .probed(
-                    command: "npm config get cache 2>/dev/null",
+                    executable: "npm",
+                    arguments: ["config", "get", "cache"],
                     requiresTool: "npm",
                     fallbacks: [".npm/_cacache", ".npm"]
                 )
@@ -141,7 +157,8 @@ extension CacheCategory {
             icon: "link",
             discovery: [
                 .probed(
-                    command: "yarn cache dir 2>/dev/null",
+                    executable: "yarn",
+                    arguments: ["cache", "dir"],
                     requiresTool: "yarn",
                     fallbacks: ["Library/Caches/Yarn"]
                 )
@@ -157,7 +174,8 @@ extension CacheCategory {
             icon: "archivebox.fill",
             discovery: [
                 .probed(
-                    command: "pnpm store path 2>/dev/null",
+                    executable: "pnpm",
+                    arguments: ["store", "path"],
                     requiresTool: "pnpm",
                     fallbacks: ["Library/pnpm/store", ".local/share/pnpm/store"]
                 )
@@ -173,9 +191,11 @@ extension CacheCategory {
             icon: "hare.fill",
             discovery: [
                 .probed(
-                    command: "echo dummy", // bun doesn't have a cache-dir command
+                    executable: "echo",
+                    arguments: ["dummy"], // bun doesn't have a cache-dir command
                     requiresTool: "bun",
-                    fallbacks: [".bun/install/cache"]
+                    fallbacks: [".bun/install/cache"],
+                    transform: { _ in return nil } // Force fallback behavior
                 )
             ],
             riskLevel: .safe,
@@ -189,9 +209,11 @@ extension CacheCategory {
             icon: "wrench.and.screwdriver.fill",
             discovery: [
                 .probed(
-                    command: "echo dummy",
+                    executable: "echo",
+                    arguments: ["dummy"],
                     requiresTool: "node",
-                    fallbacks: ["Library/Caches/node-gyp"]
+                    fallbacks: ["Library/Caches/node-gyp"],
+                    transform: { _ in return nil } // Force fallback behavior
                 )
             ],
             riskLevel: .safe,
@@ -219,7 +241,8 @@ extension CacheCategory {
             icon: "puzzlepiece.fill",
             discovery: [
                 .probed(
-                    command: "pip3 cache dir 2>/dev/null || python3 -m pip cache dir 2>/dev/null",
+                    executable: "python3",
+                    arguments: ["-m", "pip", "cache", "dir"],
                     requiresTool: nil, // python3 is always on macOS
                     fallbacks: ["Library/Caches/pip", "Library/Caches/pip-tools"]
                 )
@@ -235,7 +258,8 @@ extension CacheCategory {
             icon: "bolt.fill",
             discovery: [
                 .probed(
-                    command: "uv cache dir 2>/dev/null",
+                    executable: "uv",
+                    arguments: ["cache", "dir"],
                     requiresTool: "uv",
                     fallbacks: [".cache/uv"]
                 )
@@ -280,12 +304,14 @@ extension CacheCategory {
             icon: "cube.fill",
             discovery: [
                 .probed(
-                    command: "echo dummy",
+                    executable: "echo",
+                    arguments: ["dummy"],
                     requiresTool: "docker",
                     fallbacks: [
                         "Library/Containers/com.docker.docker/Data/vms/0/data",
                         "Library/Containers/com.docker.docker/Data"
-                    ]
+                    ],
+                    transform: { _ in return nil } // Force fallback behavior
                 )
             ],
             riskLevel: .caution,

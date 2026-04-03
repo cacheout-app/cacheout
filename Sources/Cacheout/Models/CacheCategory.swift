@@ -24,9 +24,9 @@
 ///
 /// ### Custom Clean Commands
 ///
-/// Some categories (like Simulator Devices) require a specialized cleanup command
-/// instead of simple file deletion. The `cleanCommand` property holds an optional
-/// shell command that the `CacheCleaner` runs via `/bin/bash -c` with a 30-second timeout.
+/// Some categories (like Simulator Devices) require specialized cleanup steps
+/// instead of simple file deletion. The `cleanSteps` property holds optional
+/// commands that the `CacheCleaner` runs directly with a 30-second timeout.
 
 import Foundation
 
@@ -59,10 +59,10 @@ enum PathDiscovery: Hashable {
     /// Always checked via FileManager.fileExists.
     case staticPath(String)
 
-    /// Run a shell command that outputs the cache path on stdout.
+    /// Run a direct process that outputs the cache path on stdout.
     /// Falls back to `fallbacks` if the command fails or path doesn't exist.
     /// The `requiresTool` is checked via `/usr/bin/which` before probing.
-    case probed(command: String, requiresTool: String?, fallbacks: [String])
+    case probed(executable: String, arguments: [String], requiresTool: String?, fallbacks: [String], transform: ((String) -> String?)? = nil)
 
     /// Absolute path (not relative to home). Used for system-level paths
     /// that live outside ~/
@@ -80,10 +80,10 @@ struct CacheCategory: Identifiable, Hashable {
     let rebuildNote: String
     let defaultSelected: Bool
 
-    /// Optional shell command to run for cleanup instead of deleting files.
-    /// When set, the cleaner runs this command instead of rm/trash.
-    /// The command runs via /bin/bash -c.
-    let cleanCommand: String?
+    /// Optional structured steps to run for cleanup instead of deleting files.
+    /// When set, the cleaner runs these steps sequentially instead of rm/trash.
+    /// Commands are run via direct execution, bypassing the shell.
+    let cleanSteps: [[String]]?
 
     func hash(into hasher: inout Hasher) { hasher.combine(id) }
     static func == (lhs: CacheCategory, rhs: CacheCategory) -> Bool { lhs.id == rhs.id }
@@ -104,14 +104,14 @@ struct CacheCategory: Identifiable, Hashable {
         self.riskLevel = riskLevel
         self.rebuildNote = rebuildNote
         self.defaultSelected = defaultSelected
-        self.cleanCommand = nil
+        self.cleanSteps = nil
     }
 
     /// Full init with discovery and optional clean command
     init(
         name: String, slug: String, description: String, icon: String,
         discovery: [PathDiscovery], riskLevel: RiskLevel, rebuildNote: String,
-        defaultSelected: Bool, cleanCommand: String? = nil
+        defaultSelected: Bool, cleanSteps: [[String]]? = nil
     ) {
         self.name = name
         self.slug = slug
@@ -121,7 +121,7 @@ struct CacheCategory: Identifiable, Hashable {
         self.riskLevel = riskLevel
         self.rebuildNote = rebuildNote
         self.defaultSelected = defaultSelected
-        self.cleanCommand = cleanCommand
+        self.cleanSteps = cleanSteps
     }
 
     // MARK: - Path Resolution
@@ -146,14 +146,15 @@ struct CacheCategory: Identifiable, Hashable {
                     results.append(url)
                 }
 
-            case .probed(let command, let requiresTool, let fallbacks):
+            case .probed(let executable, let arguments, let requiresTool, let fallbacks, let transform):
                 // Check if required tool is installed
                 if let tool = requiresTool, !toolExists(tool) {
                     continue
                 }
 
                 // Try the probe command
-                if let probedPath = runProbe(command),
+                if let probedOutput = runProbe(executable: executable, arguments: arguments),
+                   let probedPath = transform?(probedOutput) ?? defaultTransform(probedOutput),
                    directoryExists(at: URL(fileURLWithPath: probedPath)) {
                     results.append(URL(fileURLWithPath: probedPath))
                     continue
@@ -186,23 +187,26 @@ struct CacheCategory: Identifiable, Hashable {
     }
 
     private func toolExists(_ tool: String) -> Bool {
-        let result = shell("/usr/bin/which \(tool)")
+        let result = runCommand(executable: "which", arguments: [tool])
         return result != nil && !result!.isEmpty
     }
 
-    private func runProbe(_ command: String) -> String? {
-        guard let output = shell(command) else { return nil }
+    private func defaultTransform(_ output: String) -> String? {
         let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
     }
 
-    /// Run a shell command with a 2-second timeout. Returns stdout or nil.
-    private func shell(_ command: String) -> String? {
+    private func runProbe(executable: String, arguments: [String]) -> String? {
+        return runCommand(executable: executable, arguments: arguments)
+    }
+
+    /// Run a process directly with a 2-second timeout. Returns stdout or nil.
+    private func runCommand(executable: String, arguments: [String]) -> String? {
         let process = Process()
         let pipe = Pipe()
 
-        process.executableURL = URL(fileURLWithPath: "/bin/bash")
-        process.arguments = ["-c", command]
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = [executable] + arguments
         process.standardOutput = pipe
         process.standardError = FileHandle.nullDevice
         process.environment = [
@@ -234,5 +238,35 @@ struct CacheCategory: Identifiable, Hashable {
 
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         return String(data: data, encoding: .utf8)
+    }
+}
+
+// Equality and Hashable ignores closures, which is fine since they're only in PathDiscovery.probed
+extension PathDiscovery {
+    static func == (lhs: PathDiscovery, rhs: PathDiscovery) -> Bool {
+        switch (lhs, rhs) {
+        case let (.staticPath(l), .staticPath(r)): return l == r
+        case let (.absolutePath(l), .absolutePath(r)): return l == r
+        case let (.probed(le, la, lr, lf, _), .probed(re, ra, rr, rf, _)):
+            return le == re && la == ra && lr == rr && lf == rf
+        default: return false
+        }
+    }
+
+    func hash(into hasher: inout Hasher) {
+        switch self {
+        case .staticPath(let path):
+            hasher.combine(0)
+            hasher.combine(path)
+        case .absolutePath(let path):
+            hasher.combine(1)
+            hasher.combine(path)
+        case .probed(let executable, let arguments, let requiresTool, let fallbacks, _):
+            hasher.combine(2)
+            hasher.combine(executable)
+            hasher.combine(arguments)
+            hasher.combine(requiresTool)
+            hasher.combine(fallbacks)
+        }
     }
 }

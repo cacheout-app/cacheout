@@ -1,0 +1,3 @@
+## 2024-05-24 - SwiftUI List Row Hit Targets & Accessibility
+**Learning:** In SwiftUI, list rows containing interactive elements (like a small checkbox) and descriptive text often have poor UX because users expect the entire row to be clickable. Screen readers also treat the text and the button as separate elements, cluttering navigation.
+**Action:** Wrap the entire row contents (e.g., `HStack`) in a `Button`, apply `.contentShape(Rectangle())` to make empty space clickable, use `.buttonStyle(.plain)` to avoid unwanted styling, and add `.accessibilityElement(children: .combine)` along with `.accessibilityAddTraits(.isSelected)` to unify the VoiceOver experience.

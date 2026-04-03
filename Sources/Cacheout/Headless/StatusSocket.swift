@@ -474,14 +474,24 @@ public final class StatusSocket: @unchecked Sendable {
         }
 
         let expandedPath = (path as NSString).expandingTildeInPath
+        let standardizedPath = URL(fileURLWithPath: expandedPath).standardized.path
+        let allowedPrefix = NSHomeDirectory().appending("/.cacheout/")
+
+        guard standardizedPath.hasPrefix(allowedPrefix) else {
+            sendSuccessResponse(fd: fd, data: [
+                "valid": false,
+                "errors": ["Path traversal detected: file must be inside ~/.cacheout/"],
+            ] as [String: Any])
+            return
+        }
 
         // lstat to reject symlinks to special files, FIFOs, devices, etc.
         var sb = Darwin.stat()
-        let statResult: Int32 = lstat(expandedPath, &sb)
+        let statResult: Int32 = lstat(standardizedPath, &sb)
         guard statResult == 0 else {
             sendSuccessResponse(fd: fd, data: [
                 "valid": false,
-                "errors": ["File not found: \(expandedPath)"],
+                "errors": ["File not found: \(standardizedPath)"],
             ] as [String: Any])
             return
         }
@@ -490,7 +500,7 @@ public final class StatusSocket: @unchecked Sendable {
         guard (sb.st_mode & S_IFMT) == S_IFREG else {
             sendSuccessResponse(fd: fd, data: [
                 "valid": false,
-                "errors": ["Not a regular file: \(expandedPath)"],
+                "errors": ["Not a regular file: \(standardizedPath)"],
             ] as [String: Any])
             return
         }
@@ -505,7 +515,7 @@ public final class StatusSocket: @unchecked Sendable {
         }
 
         do {
-            let fileData = try Data(contentsOf: URL(fileURLWithPath: expandedPath))
+            let fileData = try Data(contentsOf: URL(fileURLWithPath: standardizedPath))
             let errors = AutopilotConfigValidator.validate(data: fileData)
             sendSuccessResponse(fd: fd, data: [
                 "valid": errors.isEmpty,

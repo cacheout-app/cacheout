@@ -1,0 +1,3 @@
+## 2024-06-18 - Sliding Window withTaskGroup over Static Chunking
+**Learning:** In Swift structured concurrency, processing high-volume tasks using `withTaskGroup` with static chunking (e.g. creating chunks of array elements) limits throughput due to tail latency. The execution pauses while waiting for the slowest task in the current chunk before starting the next chunk.
+**Action:** Use a sliding window approach with an iterator instead of static chunking. Populate the `withTaskGroup` with the initial `maxConcurrency` tasks, then continuously loop over `group` results with `for await`, adding a new task from the iterator each time one completes to maintain maximum parallel execution.

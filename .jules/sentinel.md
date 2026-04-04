@@ -1,0 +1,4 @@
+## 2024-05-24 - Secure Process Execution for docker system prune
+**Vulnerability:** Use of shell wrapper `/bin/bash -c "docker system prune -f 2>&1"` for external command execution. While no dynamic input is passed in this specific case, using a shell wrapper for fixed commands is an anti-pattern that violates defense-in-depth principles and increases the attack surface (e.g., if PATH or environment was manipulated).
+**Learning:** Shell redirections like `2>&1` can be implemented securely in Foundation.Process without needing a shell by assigning the same `Pipe()` object to both `standardOutput` and `standardError`.
+**Prevention:** Always execute binary commands directly via `Process` (e.g., `/usr/bin/env docker`) using the `.arguments` array rather than wrapping them in a shell command string.

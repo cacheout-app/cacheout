@@ -28,7 +28,7 @@
 
 import Foundation
 
-actor NodeModulesScanner {
+struct NodeModulesScanner {
     private let fileManager = FileManager.default
 
     /// Common directories where developers keep projects
@@ -62,7 +62,7 @@ actor NodeModulesScanner {
                 let rootURL = home.appendingPathComponent(root)
                 guard fileManager.fileExists(atPath: rootURL.path) else { continue }
                 group.addTask {
-                    await self.findNodeModules(in: rootURL, maxDepth: maxDepth)
+                    self.findNodeModules(in: rootURL, maxDepth: maxDepth)
                 }
             }
             for await items in group {
@@ -77,7 +77,7 @@ actor NodeModulesScanner {
             .sorted { $0.sizeBytes > $1.sizeBytes }
     }
 
-    private func findNodeModules(in directory: URL, maxDepth: Int, currentDepth: Int = 0) async -> [NodeModulesItem] {
+    private func findNodeModules(in directory: URL, maxDepth: Int, currentDepth: Int = 0) -> [NodeModulesItem] {
         guard currentDepth < maxDepth else { return [] }
 
         var results: [NodeModulesItem] = []
@@ -113,7 +113,7 @@ actor NodeModulesScanner {
             let name = item.lastPathComponent
             guard !Self.skipDirs.contains(name) else { continue }
             guard (try? item.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true else { continue }
-            let subResults = await findNodeModules(in: item, maxDepth: maxDepth, currentDepth: currentDepth + 1)
+            let subResults = findNodeModules(in: item, maxDepth: maxDepth, currentDepth: currentDepth + 1)
             results.append(contentsOf: subResults)
         }
 

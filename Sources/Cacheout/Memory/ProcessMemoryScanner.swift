@@ -97,30 +97,35 @@ actor ProcessMemoryScanner {
     ///
     /// Returns the collected entries and the count of EPERM failures.
     private func scanPIDs(_ pids: [pid_t]) async -> (entries: [ProcessEntryDTO], epermCount: Int) {
-        // Chunk PIDs to cap concurrency at maxConcurrency.
-        let chunks = stride(from: 0, to: pids.count, by: maxConcurrency).map {
-            Array(pids[$0..<min($0 + maxConcurrency, pids.count)])
-        }
-
+        // Use a sliding window to cap concurrency at maxConcurrency.
+        // This avoids the tail-latency of chunking where we wait for the slowest task in a chunk.
         var allEntries: [ProcessEntryDTO] = []
+        allEntries.reserveCapacity(pids.count)
         var totalEperm = 0
 
-        for chunk in chunks {
-            await withTaskGroup(of: ScanPIDResult.self) { group in
-                for pid in chunk {
-                    group.addTask { [self] in
-                        self.scanSinglePID(pid)
-                    }
+        await withTaskGroup(of: ScanPIDResult.self) { group in
+            var pidIterator = pids.makeIterator()
+
+            // Seed the group with up to maxConcurrency tasks
+            for _ in 0..<maxConcurrency {
+                if let pid = pidIterator.next() {
+                    group.addTask { [self] in self.scanSinglePID(pid) }
                 }
-                for await result in group {
-                    switch result {
-                    case .success(let entry):
-                        allEntries.append(entry)
-                    case .eperm:
-                        totalEperm += 1
-                    case .otherError:
-                        break
-                    }
+            }
+
+            // As each task finishes, add a new one until we run out of PIDs
+            for await result in group {
+                switch result {
+                case .success(let entry):
+                    allEntries.append(entry)
+                case .eperm:
+                    totalEperm += 1
+                case .otherError:
+                    break
+                }
+
+                if let nextPID = pidIterator.next() {
+                    group.addTask { [self] in self.scanSinglePID(nextPID) }
                 }
             }
         }

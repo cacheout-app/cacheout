@@ -186,8 +186,22 @@ struct CacheCategory: Identifiable, Hashable {
     }
 
     private func toolExists(_ tool: String) -> Bool {
-        let result = shell("/usr/bin/which \(tool)")
-        return result != nil && !result!.isEmpty
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = ["which", tool]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        process.environment = [
+            "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin"
+        ]
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+            return process.terminationStatus == 0
+        } catch {
+            return false
+        }
     }
 
     private func runProbe(_ command: String) -> String? {

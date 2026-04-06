@@ -28,7 +28,13 @@
 
 import Foundation
 
-actor NodeModulesScanner {
+// ⚡ Bolt Optimization:
+// Changed from `actor` to `struct` to prevent task serialization. This component
+// is stateless (only holds thread-safe FileManager.default). In an actor, child
+// tasks in `withTaskGroup` calling methods on `self` are forced to run sequentially.
+// As a struct, the recursive filesystem traversals can run truly concurrently
+// across multiple threads, drastically reducing scan time for deep hierarchies.
+struct NodeModulesScanner {
     private let fileManager = FileManager.default
 
     /// Common directories where developers keep projects

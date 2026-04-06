@@ -26,7 +26,14 @@
 
 import Foundation
 
-actor CacheScanner {
+// ⚡ Bolt Optimization:
+// Changed from `actor` to `struct` because this component is stateless and only
+// interacts with thread-safe dependencies (FileManager.default).
+// Using an actor with `withTaskGroup` where child tasks invoke methods on `self`
+// causes the tasks to serialize on the actor's context, destroying parallelism.
+// As a struct, the child tasks can now execute concurrently across threads,
+// significantly improving scan throughput for large file systems.
+struct CacheScanner {
     private let fileManager = FileManager.default
 
     func scanAll(_ categories: [CacheCategory]) async -> [ScanResult] {

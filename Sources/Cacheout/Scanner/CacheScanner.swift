@@ -26,7 +26,7 @@
 
 import Foundation
 
-actor CacheScanner {
+struct CacheScanner {
     private let fileManager = FileManager.default
 
     func scanAll(_ categories: [CacheCategory]) async -> [ScanResult] {

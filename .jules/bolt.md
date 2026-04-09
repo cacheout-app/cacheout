@@ -1,0 +1,3 @@
+## 2024-04-09 - Batch @Published array updates to prevent UI stuttering
+**Learning:** In SwiftUI `ObservableObject` view models, mutating individual elements of a `@Published` array property inside a loop triggers a UI update notification (`objectWillChange`) for every single change. For collections of value types (structs), this causes severe unnecessary UI recalculations and unresponsiveness during multi-select operations (like selecting 50+ node_modules directories).
+**Action:** Utilize functional methods like `map` to transform the entire collection and batch updates into a single property assignment. This significantly reduces unnecessary UI recalculations and improves responsiveness.

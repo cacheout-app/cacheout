@@ -172,14 +172,23 @@ class CacheoutViewModel: ObservableObject {
     }
 
     func selectAllSafe() {
-        for i in scanResults.indices where scanResults[i].category.riskLevel == .safe && !scanResults[i].isEmpty {
-            scanResults[i].isSelected = true
+        // ⚡ Bolt Optimization: Using `.map` batches updates to a single `objectWillChange` trigger
+        // instead of O(N) triggers caused by looping over indices of a @Published array.
+        scanResults = scanResults.map { result in
+            var modified = result
+            if result.category.riskLevel == .safe && !result.isEmpty {
+                modified.isSelected = true
+            }
+            return modified
         }
     }
 
     func deselectAll() {
-        for i in scanResults.indices {
-            scanResults[i].isSelected = false
+        // ⚡ Bolt Optimization: Batch update single UI render
+        scanResults = scanResults.map { result in
+            var modified = result
+            modified.isSelected = false
+            return modified
         }
         deselectAllNodeModules()
     }
@@ -193,17 +202,32 @@ class CacheoutViewModel: ObservableObject {
     }
 
     func selectStaleNodeModules() {
-        for i in nodeModulesItems.indices where nodeModulesItems[i].isStale {
-            nodeModulesItems[i].isSelected = true
+        // ⚡ Bolt Optimization: Batch update single UI render
+        nodeModulesItems = nodeModulesItems.map { item in
+            var modified = item
+            if item.isStale {
+                modified.isSelected = true
+            }
+            return modified
         }
     }
 
     func selectAllNodeModules() {
-        for i in nodeModulesItems.indices { nodeModulesItems[i].isSelected = true }
+        // ⚡ Bolt Optimization: Batch update single UI render
+        nodeModulesItems = nodeModulesItems.map { item in
+            var modified = item
+            modified.isSelected = true
+            return modified
+        }
     }
 
     func deselectAllNodeModules() {
-        for i in nodeModulesItems.indices { nodeModulesItems[i].isSelected = false }
+        // ⚡ Bolt Optimization: Batch update single UI render
+        nodeModulesItems = nodeModulesItems.map { item in
+            var modified = item
+            modified.isSelected = false
+            return modified
+        }
     }
 
     /// Menu bar label: show free GB in the tray

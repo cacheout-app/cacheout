@@ -1,0 +1,3 @@
+## YYYY-MM-DD - [Title]
+**Learning:** In SwiftUI `ObservableObject` view models, mutating individual elements of a `@Published` array property inside a loop triggers a UI update notification for every change. For collections of value types (structs), utilize functional methods like `map` to batch updates into a single property assignment, significantly reducing unnecessary UI recalculations and improving responsiveness.
+**Action:** Replace `for i in array.indices { array[i].prop = val }` with `array = array.map { var copy = $0; copy.prop = val; return copy }` to avoid multiple `objectWillChange` triggers.

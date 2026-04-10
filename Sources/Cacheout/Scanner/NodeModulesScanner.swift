@@ -28,7 +28,8 @@
 
 import Foundation
 
-actor NodeModulesScanner {
+// Performance: Uses struct instead of actor to prevent withTaskGroup tasks from being serialized, allowing true concurrent scanning.
+struct NodeModulesScanner {
     private let fileManager = FileManager.default
 
     /// Common directories where developers keep projects

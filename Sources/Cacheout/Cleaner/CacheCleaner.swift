@@ -35,7 +35,8 @@
 import Foundation
 import AppKit
 
-actor CacheCleaner {
+// Performance: Uses struct instead of actor as it has no mutable state, enabling true concurrency.
+struct CacheCleaner {
     private let fileManager = FileManager.default
 
     func clean(results: [ScanResult], nodeModules: [NodeModulesItem] = [], moveToTrash: Bool) async -> CleanupReport {

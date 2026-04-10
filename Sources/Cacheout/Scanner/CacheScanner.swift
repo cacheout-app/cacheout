@@ -26,7 +26,8 @@
 
 import Foundation
 
-actor CacheScanner {
+// Performance: Uses struct instead of actor to prevent withTaskGroup tasks from being serialized, allowing true concurrent scanning.
+struct CacheScanner {
     private let fileManager = FileManager.default
 
     func scanAll(_ categories: [CacheCategory]) async -> [ScanResult] {

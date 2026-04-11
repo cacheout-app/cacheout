@@ -1,0 +1,3 @@
+## 2025-02-14 - Expanded Hit Targets and Accessibility for List Rows
+**Learning:** In SwiftUI, placing a small button (like a checkbox) inside an HStack row forces users to click exactly on the small icon, which is poor UX for lists. Additionally, VoiceOver reads each text element in the row separately unless combined.
+**Action:** Wrap the entire HStack in a `Button`, use `.contentShape(Rectangle())` to make the entire row clickable (including empty space), apply `.buttonStyle(.plain)`, and use `.accessibilityElement(children: .combine)` with `.accessibilityAddTraits(.isSelected)` to provide a single, informative VoiceOver element.

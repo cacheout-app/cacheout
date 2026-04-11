@@ -172,14 +172,23 @@ class CacheoutViewModel: ObservableObject {
     }
 
     func selectAllSafe() {
-        for i in scanResults.indices where scanResults[i].category.riskLevel == .safe && !scanResults[i].isEmpty {
-            scanResults[i].isSelected = true
+        // Optimization: Batch @Published updates to avoid multiple UI view redraws
+        // Mutating individual elements of a @Published array inside a loop triggers a UI update for each change.
+        scanResults = scanResults.map { result in
+            var newResult = result
+            if result.category.riskLevel == .safe && !result.isEmpty {
+                newResult.isSelected = true
+            }
+            return newResult
         }
     }
 
     func deselectAll() {
-        for i in scanResults.indices {
-            scanResults[i].isSelected = false
+        // Optimization: Batch @Published updates to avoid multiple UI view redraws
+        scanResults = scanResults.map { result in
+            var newResult = result
+            newResult.isSelected = false
+            return newResult
         }
         deselectAllNodeModules()
     }
@@ -193,17 +202,32 @@ class CacheoutViewModel: ObservableObject {
     }
 
     func selectStaleNodeModules() {
-        for i in nodeModulesItems.indices where nodeModulesItems[i].isStale {
-            nodeModulesItems[i].isSelected = true
+        // Optimization: Batch @Published updates to avoid multiple UI view redraws
+        nodeModulesItems = nodeModulesItems.map { item in
+            var newItem = item
+            if item.isStale {
+                newItem.isSelected = true
+            }
+            return newItem
         }
     }
 
     func selectAllNodeModules() {
-        for i in nodeModulesItems.indices { nodeModulesItems[i].isSelected = true }
+        // Optimization: Batch @Published updates to avoid multiple UI view redraws
+        nodeModulesItems = nodeModulesItems.map { item in
+            var newItem = item
+            newItem.isSelected = true
+            return newItem
+        }
     }
 
     func deselectAllNodeModules() {
-        for i in nodeModulesItems.indices { nodeModulesItems[i].isSelected = false }
+        // Optimization: Batch @Published updates to avoid multiple UI view redraws
+        nodeModulesItems = nodeModulesItems.map { item in
+            var newItem = item
+            newItem.isSelected = false
+            return newItem
+        }
     }
 
     /// Menu bar label: show free GB in the tray

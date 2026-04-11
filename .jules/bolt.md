@@ -1,0 +1,5 @@
+## 2024-04-11 - Optimize view model collection updates
+
+**Learning:** In SwiftUI `ObservableObject` view models, mutating individual elements of a `@Published` array property inside a `for` loop triggers a UI update notification for *every single change*. For collections of value types (structs), utilizing functional methods like `map` to batch updates into a single property assignment significantly reduces unnecessary UI recalculations and improves responsiveness. However, because `.map` creates a new array and looks like a performance degradation in standard Swift compared to in-place mutation, explicit comments are necessary to prevent future developers from "optimizing" it back to a `for` loop.
+
+**Action:** When updating multiple elements in a `@Published` collection in SwiftUI, use `.map` to batch the update into a single assignment. Always accompany this pattern with a `// PERFORMANCE:` comment explicitly explaining that this is a SwiftUI-specific optimization to prevent O(N) view re-renders.

@@ -97,29 +97,37 @@ actor ProcessMemoryScanner {
     ///
     /// Returns the collected entries and the count of EPERM failures.
     private func scanPIDs(_ pids: [pid_t]) async -> (entries: [ProcessEntryDTO], epermCount: Int) {
-        // Chunk PIDs to cap concurrency at maxConcurrency.
-        let chunks = stride(from: 0, to: pids.count, by: maxConcurrency).map {
-            Array(pids[$0..<min($0 + maxConcurrency, pids.count)])
-        }
-
         var allEntries: [ProcessEntryDTO] = []
         var totalEperm = 0
 
-        for chunk in chunks {
-            await withTaskGroup(of: ScanPIDResult.self) { group in
-                for pid in chunk {
+        // Use a sliding window iterator to cap concurrency at maxConcurrency
+        // while avoiding tail latency from static chunking.
+        await withTaskGroup(of: ScanPIDResult.self) { group in
+            var pidIterator = pids.makeIterator()
+
+            // Seed the group with up to maxConcurrency tasks
+            for _ in 0..<maxConcurrency {
+                if let pid = pidIterator.next() {
                     group.addTask { [self] in
                         self.scanSinglePID(pid)
                     }
                 }
-                for await result in group {
-                    switch result {
-                    case .success(let entry):
-                        allEntries.append(entry)
-                    case .eperm:
-                        totalEperm += 1
-                    case .otherError:
-                        break
+            }
+
+            // As each task completes, process the result and add a new task if available
+            for await result in group {
+                switch result {
+                case .success(let entry):
+                    allEntries.append(entry)
+                case .eperm:
+                    totalEperm += 1
+                case .otherError:
+                    break
+                }
+
+                if let nextPid = pidIterator.next() {
+                    group.addTask { [self] in
+                        self.scanSinglePID(nextPid)
                     }
                 }
             }

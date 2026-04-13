@@ -1,0 +1,3 @@
+## 2025-02-18 - SwiftUI CategoryRow Hit Target and Accessibility
+**Learning:** Wrapping an entire row (`HStack`) in a single `Button` and applying `.contentShape(Rectangle())` dramatically increases the clickable hit target compared to just making a single small element (like a checkbox) clickable. Additionally, combining this with `.accessibilityElement(children: .combine)` and state-appropriate traits (`.accessibilityAddTraits([.isSelected])`) creates a unified and much more intuitive experience for VoiceOver users, treating the row as a single selectable item.
+**Action:** Always wrap entire list rows in `Button`s with `.contentShape(Rectangle())` when the row represents a selectable or actionable item, rather than placing individual small buttons inside the row.

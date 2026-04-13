@@ -1,0 +1,3 @@
+## 2024-04-13 - Batch @Published array mutations
+**Learning:** In SwiftUI `ObservableObject` view models, mutating individual elements of a `@Published` array property inside a loop triggers a UI update notification for every change. This can cause severe performance issues when selecting/deselecting large lists.
+**Action:** For collections of value types (structs), always utilize functional methods like `.map` to batch updates into a single property assignment, significantly reducing unnecessary UI recalculations. Always add comments explaining this optimization to prevent future developers from 'optimizing' it back to a standard `for` loop, as `.map` can appear slower in standard Swift contexts.

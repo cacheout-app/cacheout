@@ -1,0 +1,3 @@
+## 2024-05-18 - Batch Updates for SwiftUI @Published Collections
+**Learning:** Mutating individual elements of a `@Published` array property inside a loop triggers a UI update notification for *every* change. For collections of value types (structs), this causes O(N) view re-evaluations when performing bulk operations like "Select All", leading to significant UI stutter.
+**Action:** Use functional methods like `.map` to batch updates. Transform the array and assign it back to the `@Published` property in a single operation, resulting in exactly one UI update notification. Always add a comment explaining this optimization so it isn't "refactored" back to a loop.

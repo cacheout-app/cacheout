@@ -1,0 +1,3 @@
+## 2026-04-14 - Making SwiftUI List Rows Accessible
+**Learning:** In custom SwiftUI list rows, if only a small element (like a checkbox) is the interactive `Button`, VoiceOver fails to group the row's text content logically with the action, and the tap target is too small.
+**Action:** Wrap the entire row's contents (`HStack`) in a `Button`, apply `.contentShape(Rectangle())` to make empty space clickable, use `.buttonStyle(.plain)` to prevent default styling changes, and add `.accessibilityElement(children: .combine)` with `.accessibilityAddTraits(.isSelected)` to present a unified, stateful element to screen readers.

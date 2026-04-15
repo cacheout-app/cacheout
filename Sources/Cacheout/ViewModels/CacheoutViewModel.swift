@@ -172,14 +172,26 @@ class CacheoutViewModel: ObservableObject {
     }
 
     func selectAllSafe() {
-        for i in scanResults.indices where scanResults[i].category.riskLevel == .safe && !scanResults[i].isEmpty {
-            scanResults[i].isSelected = true
+        // Optimization: Use .map to batch array updates instead of a loop.
+        // Mutating individual elements of a @Published array inside a loop
+        // triggers a UI update for every single change. This reduces it to one.
+        scanResults = scanResults.map { result in
+            var r = result
+            if r.category.riskLevel == .safe && !r.isEmpty {
+                r.isSelected = true
+            }
+            return r
         }
     }
 
     func deselectAll() {
-        for i in scanResults.indices {
-            scanResults[i].isSelected = false
+        // Optimization: Use .map to batch array updates instead of a loop.
+        // Mutating individual elements of a @Published array inside a loop
+        // triggers a UI update for every single change. This reduces it to one.
+        scanResults = scanResults.map { result in
+            var r = result
+            r.isSelected = false
+            return r
         }
         deselectAllNodeModules()
     }
@@ -193,17 +205,32 @@ class CacheoutViewModel: ObservableObject {
     }
 
     func selectStaleNodeModules() {
-        for i in nodeModulesItems.indices where nodeModulesItems[i].isStale {
-            nodeModulesItems[i].isSelected = true
+        // Optimization: Use .map to batch array updates instead of a loop.
+        nodeModulesItems = nodeModulesItems.map { item in
+            var m = item
+            if m.isStale {
+                m.isSelected = true
+            }
+            return m
         }
     }
 
     func selectAllNodeModules() {
-        for i in nodeModulesItems.indices { nodeModulesItems[i].isSelected = true }
+        // Optimization: Use .map to batch array updates instead of a loop.
+        nodeModulesItems = nodeModulesItems.map { item in
+            var m = item
+            m.isSelected = true
+            return m
+        }
     }
 
     func deselectAllNodeModules() {
-        for i in nodeModulesItems.indices { nodeModulesItems[i].isSelected = false }
+        // Optimization: Use .map to batch array updates instead of a loop.
+        nodeModulesItems = nodeModulesItems.map { item in
+            var m = item
+            m.isSelected = false
+            return m
+        }
     }
 
     /// Menu bar label: show free GB in the tray

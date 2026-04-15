@@ -1,0 +1,3 @@
+## 2024-05-18 - Clickable SwiftUI List Rows
+**Learning:** In SwiftUI lists, using an icon-only button inside an `HStack` limits the clickable target to the icon itself. Wrapping the entire `HStack` in a `Button` with `.contentShape(Rectangle())` makes the whole row an interactive target, vastly improving usability, while `.accessibilityElement(children: .combine)` and `.accessibilityAddTraits(.isSelected)` provide a proper VoiceOver experience.
+**Action:** When creating toggleable list rows in SwiftUI, make the entire row clickable and add `.accessibilityElement(children: .combine)` for unified screen reader announcements.

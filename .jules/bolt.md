@@ -1,0 +1,3 @@
+## 2024-10-24 - Batching @Published Array Mutations
+**Learning:** Mutating individual elements of a `@Published` array property inside a loop triggers a UI update notification for every single change. This causes significant main thread blocking and stuttering during bulk selection operations on large lists (like selecting all `node_modules`).
+**Action:** Use functional `.map` reassignments instead of iterative loop mutations for arrays of value types to batch updates into a single property assignment and trigger only one UI update. Always add comments explaining this optimization to prevent regressions.

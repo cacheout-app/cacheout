@@ -1,0 +1,3 @@
+## 2024-05-23 - Expanding hit targets and VoiceOver support in SwiftUI lists
+**Learning:** In SwiftUI lists, clicking empty space often does nothing unless explicitly configured. Small checkboxes make interactions difficult, and default VoiceOver can be disjointed when a row has multiple text elements.
+**Action:** Wrap the entire list row `HStack` in a `Button`, use `.contentShape(Rectangle())` to make empty space clickable, apply `.buttonStyle(.plain)` to prevent unintended styling, and add `.accessibilityElement(children: .combine)` along with `.accessibilityAddTraits(.isSelected)` to create a cohesive VoiceOver experience.

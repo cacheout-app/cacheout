@@ -91,6 +91,12 @@ class CacheoutViewModel: ObservableObject {
     private let nodeModulesScanner = NodeModulesScanner()
     private let cleaner = CacheCleaner()
 
+    private let byteCountFormatter: ByteCountFormatter = {
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .file
+        return formatter
+    }()
+
     init() {
         let storedInterval = UserDefaults.standard.double(forKey: "cacheout.scanIntervalMinutes")
         self.scanIntervalMinutes = storedInterval > 0 ? storedInterval : 30
@@ -110,7 +116,7 @@ class CacheoutViewModel: ObservableObject {
     }
 
     var formattedSelectedSize: String {
-        ByteCountFormatter.string(fromByteCount: selectedSize, countStyle: .file)
+        byteCountFormatter.string(fromByteCount: selectedSize)
     }
 
     var totalRecoverable: Int64 {
@@ -127,7 +133,7 @@ class CacheoutViewModel: ObservableObject {
     }
 
     var formattedNodeModulesTotal: String {
-        ByteCountFormatter.string(fromByteCount: nodeModulesTotal, countStyle: .file)
+        byteCountFormatter.string(fromByteCount: nodeModulesTotal)
     }
 
     var selectedNodeModulesSize: Int64 {
@@ -135,13 +141,13 @@ class CacheoutViewModel: ObservableObject {
     }
 
     var formattedSelectedNodeModulesSize: String {
-        ByteCountFormatter.string(fromByteCount: selectedNodeModulesSize, countStyle: .file)
+        byteCountFormatter.string(fromByteCount: selectedNodeModulesSize)
     }
 
     var totalSelectedSize: Int64 { selectedSize + selectedNodeModulesSize }
 
     var formattedTotalSelectedSize: String {
-        ByteCountFormatter.string(fromByteCount: totalSelectedSize, countStyle: .file)
+        byteCountFormatter.string(fromByteCount: totalSelectedSize)
     }
 
     func scan() async {

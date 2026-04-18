@@ -1,0 +1,3 @@
+## 2024-04-18 - Expensive Formatter Allocations
+**Learning:** Found multiple usages of `ByteCountFormatter.string(fromByteCount:countStyle:)` and `ISO8601DateFormatter()` inside models, computed properties (which are accessed frequently on UI rendering), and CLI processing loops. Instantiating these formatters in Swift is computationally expensive and avoiding repeated allocations using static properties significantly improves UI and application performance.
+**Action:** Store and reuse these formatters as static properties on types, especially when accessed frequently in loops or computed properties used by UI components.

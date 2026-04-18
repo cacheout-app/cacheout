@@ -38,6 +38,13 @@ import AppKit
 actor CacheCleaner {
     private let fileManager = FileManager.default
 
+    private let iso8601Formatter = ISO8601DateFormatter()
+    private let byteCountFormatter: ByteCountFormatter = {
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .file
+        return formatter
+    }()
+
     func clean(results: [ScanResult], nodeModules: [NodeModulesItem] = [], moveToTrash: Bool) async -> CleanupReport {
         var cleaned: [(category: String, bytesFreed: Int64)] = []
         var errors: [(category: String, error: String)] = []
@@ -160,9 +167,8 @@ actor CacheCleaner {
         try? FileManager.default.createDirectory(at: logDir, withIntermediateDirectories: true)
 
         let logFile = logDir.appendingPathComponent("cleanup.log")
-        let formatter = ISO8601DateFormatter()
-        let size = ByteCountFormatter.string(fromByteCount: bytesFreed, countStyle: .file)
-        let entry = "[\(formatter.string(from: Date()))] Cleaned \(category): \(size)\n"
+        let size = byteCountFormatter.string(fromByteCount: bytesFreed)
+        let entry = "[\(iso8601Formatter.string(from: Date()))] Cleaned \(category): \(size)\n"
 
         if let handle = try? FileHandle(forWritingTo: logFile) {
             handle.seekToEndOfFile()

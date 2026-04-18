@@ -39,6 +39,12 @@ struct MenuBarView: View {
     @EnvironmentObject var viewModel: CacheoutViewModel
     @Environment(\.openWindow) private var openWindow
 
+    private static let byteCountFormatter: ByteCountFormatter = {
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .file
+        return formatter
+    }()
+
     var body: some View {
         VStack(spacing: 0) {
             // Header with disk gauge
@@ -148,9 +154,8 @@ struct MenuBarView: View {
         HStack {
             statPill(
                 label: "Recoverable",
-                value: ByteCountFormatter.string(
-                    fromByteCount: viewModel.totalRecoverable,
-                    countStyle: .file
+                value: Self.byteCountFormatter.string(
+                    fromByteCount: viewModel.totalRecoverable
                 ),
                 color: .orange
             )

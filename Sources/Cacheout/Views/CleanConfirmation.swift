@@ -103,6 +103,12 @@ struct CleanupReportSheet: View {
     let report: CleanupReport
     @Environment(\.dismiss) private var dismiss
 
+    private static let byteCountFormatter: ByteCountFormatter = {
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .file
+        return formatter
+    }()
+
     var body: some View {
         VStack(spacing: 16) {
             Image(systemName: "checkmark.circle.fill")
@@ -122,7 +128,7 @@ struct CleanupReportSheet: View {
                         HStack {
                             Text(item.category)
                             Spacer()
-                            Text(ByteCountFormatter.string(fromByteCount: item.bytesFreed, countStyle: .file))
+                            Text(Self.byteCountFormatter.string(fromByteCount: item.bytesFreed))
                                 .foregroundStyle(.secondary)
                         }
                         .font(.caption)

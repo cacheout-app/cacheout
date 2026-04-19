@@ -54,6 +54,13 @@ class CacheoutViewModel: ObservableObject {
     @Published var nodeModulesItems: [NodeModulesItem] = []
     @Published var isNodeModulesScanning = false
 
+    // Cache formatter to avoid expensive allocations in high-frequency computed properties
+    private let byteFormatter: ByteCountFormatter = {
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .file
+        return formatter
+    }()
+
     /// Increments on every completed scan — views can use .task(id:) to react
     @Published var scanGeneration: Int = 0
 
@@ -110,7 +117,7 @@ class CacheoutViewModel: ObservableObject {
     }
 
     var formattedSelectedSize: String {
-        ByteCountFormatter.string(fromByteCount: selectedSize, countStyle: .file)
+        byteFormatter.string(fromByteCount: selectedSize)
     }
 
     var totalRecoverable: Int64 {
@@ -127,7 +134,7 @@ class CacheoutViewModel: ObservableObject {
     }
 
     var formattedNodeModulesTotal: String {
-        ByteCountFormatter.string(fromByteCount: nodeModulesTotal, countStyle: .file)
+        byteFormatter.string(fromByteCount: nodeModulesTotal)
     }
 
     var selectedNodeModulesSize: Int64 {
@@ -135,13 +142,13 @@ class CacheoutViewModel: ObservableObject {
     }
 
     var formattedSelectedNodeModulesSize: String {
-        ByteCountFormatter.string(fromByteCount: selectedNodeModulesSize, countStyle: .file)
+        byteFormatter.string(fromByteCount: selectedNodeModulesSize)
     }
 
     var totalSelectedSize: Int64 { selectedSize + selectedNodeModulesSize }
 
     var formattedTotalSelectedSize: String {
-        ByteCountFormatter.string(fromByteCount: totalSelectedSize, countStyle: .file)
+        byteFormatter.string(fromByteCount: totalSelectedSize)
     }
 
     func scan() async {
@@ -172,14 +179,24 @@ class CacheoutViewModel: ObservableObject {
     }
 
     func selectAllSafe() {
-        for i in scanResults.indices where scanResults[i].category.riskLevel == .safe && !scanResults[i].isEmpty {
-            scanResults[i].isSelected = true
+        // Optimization: Use .map instead of a for loop to modify the array.
+        // This creates a single assignment to the @Published property, preventing
+        // multiple individual UI update notifications per modified element.
+        scanResults = scanResults.map { item in
+            var mutableItem = item
+            if mutableItem.category.riskLevel == .safe && !mutableItem.isEmpty {
+                mutableItem.isSelected = true
+            }
+            return mutableItem
         }
     }
 
     func deselectAll() {
-        for i in scanResults.indices {
-            scanResults[i].isSelected = false
+        // Optimization: Batch UI updates into a single assignment via .map
+        scanResults = scanResults.map { item in
+            var mutableItem = item
+            mutableItem.isSelected = false
+            return mutableItem
         }
         deselectAllNodeModules()
     }
@@ -193,17 +210,32 @@ class CacheoutViewModel: ObservableObject {
     }
 
     func selectStaleNodeModules() {
-        for i in nodeModulesItems.indices where nodeModulesItems[i].isStale {
-            nodeModulesItems[i].isSelected = true
+        // Optimization: Batch UI updates into a single assignment via .map
+        nodeModulesItems = nodeModulesItems.map { item in
+            var mutableItem = item
+            if mutableItem.isStale {
+                mutableItem.isSelected = true
+            }
+            return mutableItem
         }
     }
 
     func selectAllNodeModules() {
-        for i in nodeModulesItems.indices { nodeModulesItems[i].isSelected = true }
+        // Optimization: Batch UI updates into a single assignment via .map
+        nodeModulesItems = nodeModulesItems.map { item in
+            var mutableItem = item
+            mutableItem.isSelected = true
+            return mutableItem
+        }
     }
 
     func deselectAllNodeModules() {
-        for i in nodeModulesItems.indices { nodeModulesItems[i].isSelected = false }
+        // Optimization: Batch UI updates into a single assignment via .map
+        nodeModulesItems = nodeModulesItems.map { item in
+            var mutableItem = item
+            mutableItem.isSelected = false
+            return mutableItem
+        }
     }
 
     /// Menu bar label: show free GB in the tray

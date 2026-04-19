@@ -172,14 +172,23 @@ class CacheoutViewModel: ObservableObject {
     }
 
     func selectAllSafe() {
-        for i in scanResults.indices where scanResults[i].category.riskLevel == .safe && !scanResults[i].isEmpty {
-            scanResults[i].isSelected = true
+        // PERFORMANCE: Using .map reassigns the array once, triggering a single UI update.
+        // Mutating elements in a loop would trigger a UI update per element.
+        scanResults = scanResults.map { result in
+            var updated = result
+            if result.category.riskLevel == .safe && !result.isEmpty {
+                updated.isSelected = true
+            }
+            return updated
         }
     }
 
     func deselectAll() {
-        for i in scanResults.indices {
-            scanResults[i].isSelected = false
+        // PERFORMANCE: Batch updates via .map to avoid O(N) UI recalculations
+        scanResults = scanResults.map { result in
+            var updated = result
+            updated.isSelected = false
+            return updated
         }
         deselectAllNodeModules()
     }
@@ -193,17 +202,32 @@ class CacheoutViewModel: ObservableObject {
     }
 
     func selectStaleNodeModules() {
-        for i in nodeModulesItems.indices where nodeModulesItems[i].isStale {
-            nodeModulesItems[i].isSelected = true
+        // PERFORMANCE: Batch updates via .map to avoid O(N) UI recalculations
+        nodeModulesItems = nodeModulesItems.map { item in
+            var updated = item
+            if item.isStale {
+                updated.isSelected = true
+            }
+            return updated
         }
     }
 
     func selectAllNodeModules() {
-        for i in nodeModulesItems.indices { nodeModulesItems[i].isSelected = true }
+        // PERFORMANCE: Batch updates via .map to avoid O(N) UI recalculations
+        nodeModulesItems = nodeModulesItems.map { item in
+            var updated = item
+            updated.isSelected = true
+            return updated
+        }
     }
 
     func deselectAllNodeModules() {
-        for i in nodeModulesItems.indices { nodeModulesItems[i].isSelected = false }
+        // PERFORMANCE: Batch updates via .map to avoid O(N) UI recalculations
+        nodeModulesItems = nodeModulesItems.map { item in
+            var updated = item
+            updated.isSelected = false
+            return updated
+        }
     }
 
     /// Menu bar label: show free GB in the tray

@@ -220,7 +220,10 @@ struct CacheCategory: Identifiable, Hashable {
         let deadline = DispatchTime.now() + .seconds(2)
         let group = DispatchGroup()
         group.enter()
+
+        var outputData = Data()
         DispatchQueue.global().async {
+            outputData = pipe.fileHandleForReading.readDataToEndOfFile()
             process.waitUntilExit()
             group.leave()
         }
@@ -232,7 +235,6 @@ struct CacheCategory: Identifiable, Hashable {
 
         guard process.terminationStatus == 0 else { return nil }
 
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        return String(data: data, encoding: .utf8)
+        return String(data: outputData, encoding: .utf8)
     }
 }

@@ -1,0 +1,3 @@
+## 2024-05-17 - SwiftUI @Published Array Update Optimization
+**Learning:** Mutating elements of a `@Published` array property inside a loop triggers a UI update notification for every change. This can cause significant main thread blocking and unnecessary UI recalculations (O(N) rendering passes).
+**Action:** For collections of value types (structs), use functional methods like `.map` to create an updated array and then assign it back to the property in a single batch. This limits UI updates to a single pass. Always add comments explaining this to prevent future developers from un-optimizing it to a standard `for` loop.

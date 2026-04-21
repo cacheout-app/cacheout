@@ -1,0 +1,3 @@
+## 2024-05-24 - Interactive List Rows UX & VoiceOver
+**Learning:** Having standalone checkboxes in list rows forces small hit targets and fragments the VoiceOver reading experience (each element read separately).
+**Action:** When creating clickable list rows in SwiftUI, wrap the entire row contents (e.g., HStack) in a Button, apply `.contentShape(Rectangle())` to make empty space clickable, use `.buttonStyle(.plain)` to prevent unintended text styling, and add `.accessibilityElement(children: .combine)` along with state-appropriate traits like `.accessibilityAddTraits(.isSelected)` for optimal UX and VoiceOver support.

@@ -216,11 +216,14 @@ struct CacheCategory: Identifiable, Hashable {
             return nil
         }
 
+        var data = Data()
         // 2-second timeout to prevent hanging on interactive prompts
         let deadline = DispatchTime.now() + .seconds(2)
         let group = DispatchGroup()
         group.enter()
         DispatchQueue.global().async {
+            // Defense in depth: Read before waiting to prevent deadlock if buffer fills
+            data = pipe.fileHandleForReading.readDataToEndOfFile()
             process.waitUntilExit()
             group.leave()
         }
@@ -232,7 +235,6 @@ struct CacheCategory: Identifiable, Hashable {
 
         guard process.terminationStatus == 0 else { return nil }
 
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
         return String(data: data, encoding: .utf8)
     }
 }

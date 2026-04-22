@@ -242,8 +242,8 @@ class CacheoutViewModel: ObservableObject {
 
         do {
             try process.run()
-            process.waitUntilExit()
             let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
             let output = String(data: data, encoding: .utf8) ?? ""
 
             if process.terminationStatus == 0 {

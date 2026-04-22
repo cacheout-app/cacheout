@@ -1,0 +1,4 @@
+## 2024-06-25 - Expand clickable hit targets in SwiftUI list rows
+
+**Learning:** When creating clickable list rows with checkboxes in SwiftUI, nesting a small `Button` inside an `HStack` limits the hit target strictly to the icon, requiring precise clicks. VoiceOver also struggles if elements are separate.
+**Action:** Wrap the entire row contents (e.g., `HStack`) in a `Button(action: ...)`, use `.contentShape(Rectangle())` to make the empty space clickable, apply `.buttonStyle(.plain)` to prevent text highlighting, and use `.accessibilityElement(children: .combine)` along with `.accessibilityAddTraits(.isSelected)` for a complete accessibility experience.

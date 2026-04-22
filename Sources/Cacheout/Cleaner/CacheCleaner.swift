@@ -13,11 +13,11 @@
 ///   Items appear in Finder's Trash and can be recovered. Requires `@MainActor`
 ///   because `trashItem` interacts with the Finder process.
 ///
-/// ## Custom Clean Commands
+/// ## Custom Clean Steps
 ///
-/// Categories with a `cleanCommand` (e.g., Simulator Devices) bypass file deletion
-/// entirely. The command runs via `/bin/bash -c` with a 30-second timeout and a
-/// restricted `PATH` environment. If the command times out, the process is terminated
+/// Categories with `cleanSteps` (e.g., Simulator Devices) bypass file deletion
+/// entirely. The steps run via `/usr/bin/env` with a 30-second timeout and a
+/// restricted `PATH` environment. If a step times out, the process is terminated
 /// and an error is reported.
 ///
 /// ## Cleanup Logging
@@ -46,10 +46,10 @@ actor CacheCleaner {
         for result in results where result.isSelected && !result.isEmpty {
             var categoryFreed: Int64 = 0
 
-            // If the category has a custom clean command, run it instead of deleting files
-            if let command = result.category.cleanCommand {
+            // If the category has custom clean steps, run them instead of deleting files
+            if let steps = result.category.cleanSteps {
                 do {
-                    try runCleanCommand(command)
+                    try runCleanSteps(steps)
                     categoryFreed = result.sizeBytes
                 } catch {
                     errors.append((result.category.name, error.localizedDescription))
@@ -96,37 +96,41 @@ actor CacheCleaner {
         return CleanupReport(cleaned: cleaned, errors: errors)
     }
 
-    /// Run a custom clean command via /bin/bash with a 30-second timeout.
-    private func runCleanCommand(_ command: String) throws {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/bin/bash")
-        process.arguments = ["-c", command]
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
-        process.environment = [
-            "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin",
-            "HOME": FileManager.default.homeDirectoryForCurrentUser.path
-        ]
+    /// Run custom clean steps securely via /usr/bin/env with a 30-second timeout per step.
+    private func runCleanSteps(_ steps: [[String]]) throws {
+        for step in steps {
+            guard !step.isEmpty else { continue }
 
-        try process.run()
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+            process.arguments = step
+            process.standardOutput = FileHandle.nullDevice
+            process.standardError = FileHandle.nullDevice
+            process.environment = [
+                "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin",
+                "HOME": FileManager.default.homeDirectoryForCurrentUser.path
+            ]
 
-        let deadline = DispatchTime.now() + .seconds(30)
-        let group = DispatchGroup()
-        group.enter()
-        DispatchQueue.global().async {
-            process.waitUntilExit()
-            group.leave()
-        }
+            try process.run()
 
-        if group.wait(timeout: deadline) == .timedOut {
-            process.terminate()
-            throw NSError(domain: "CacheCleaner", code: -1,
-                          userInfo: [NSLocalizedDescriptionKey: "Clean command timed out after 30s"])
-        }
+            let deadline = DispatchTime.now() + .seconds(30)
+            let group = DispatchGroup()
+            group.enter()
+            DispatchQueue.global().async {
+                process.waitUntilExit()
+                group.leave()
+            }
 
-        guard process.terminationStatus == 0 else {
-            throw NSError(domain: "CacheCleaner", code: Int(process.terminationStatus),
-                          userInfo: [NSLocalizedDescriptionKey: "Clean command exited with status \(process.terminationStatus)"])
+            if group.wait(timeout: deadline) == .timedOut {
+                process.terminate()
+                throw NSError(domain: "CacheCleaner", code: -1,
+                              userInfo: [NSLocalizedDescriptionKey: "Clean step timed out after 30s: \(step.joined(separator: " "))"])
+            }
+
+            guard process.terminationStatus == 0 else {
+                throw NSError(domain: "CacheCleaner", code: Int(process.terminationStatus),
+                              userInfo: [NSLocalizedDescriptionKey: "Clean step exited with status \(process.terminationStatus): \(step.joined(separator: " "))"])
+            }
         }
     }
 

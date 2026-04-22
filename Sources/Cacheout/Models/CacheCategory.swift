@@ -22,11 +22,11 @@
 ///   Probe commands have a 2-second timeout to prevent hanging.
 /// - **absolutePath**: A fixed absolute filesystem path (e.g., `/tmp/caches`).
 ///
-/// ### Custom Clean Commands
+/// ### Custom Clean Steps
 ///
-/// Some categories (like Simulator Devices) require a specialized cleanup command
-/// instead of simple file deletion. The `cleanCommand` property holds an optional
-/// shell command that the `CacheCleaner` runs via `/bin/bash -c` with a 30-second timeout.
+/// Some categories (like Simulator Devices) require a specialized cleanup process
+/// instead of simple file deletion. The `cleanSteps` property holds optional
+/// structured command steps that the `CacheCleaner` runs securely with a 30-second timeout.
 
 import Foundation
 
@@ -80,10 +80,10 @@ struct CacheCategory: Identifiable, Hashable {
     let rebuildNote: String
     let defaultSelected: Bool
 
-    /// Optional shell command to run for cleanup instead of deleting files.
-    /// When set, the cleaner runs this command instead of rm/trash.
-    /// The command runs via /bin/bash -c.
-    let cleanCommand: String?
+    /// Optional structured commands to run for cleanup instead of deleting files.
+    /// When set, the cleaner runs these commands instead of rm/trash.
+    /// Each inner array represents a command and its arguments, executed via /usr/bin/env.
+    let cleanSteps: [[String]]?
 
     func hash(into hasher: inout Hasher) { hasher.combine(id) }
     static func == (lhs: CacheCategory, rhs: CacheCategory) -> Bool { lhs.id == rhs.id }
@@ -104,14 +104,14 @@ struct CacheCategory: Identifiable, Hashable {
         self.riskLevel = riskLevel
         self.rebuildNote = rebuildNote
         self.defaultSelected = defaultSelected
-        self.cleanCommand = nil
+        self.cleanSteps = nil
     }
 
-    /// Full init with discovery and optional clean command
+    /// Full init with discovery and optional clean steps
     init(
         name: String, slug: String, description: String, icon: String,
         discovery: [PathDiscovery], riskLevel: RiskLevel, rebuildNote: String,
-        defaultSelected: Bool, cleanCommand: String? = nil
+        defaultSelected: Bool, cleanSteps: [[String]]? = nil
     ) {
         self.name = name
         self.slug = slug
@@ -121,7 +121,7 @@ struct CacheCategory: Identifiable, Hashable {
         self.riskLevel = riskLevel
         self.rebuildNote = rebuildNote
         self.defaultSelected = defaultSelected
-        self.cleanCommand = cleanCommand
+        self.cleanSteps = cleanSteps
     }
 
     // MARK: - Path Resolution

@@ -66,7 +66,11 @@ extension CacheCategory {
             riskLevel: .review,
             rebuildNote: "Recreated when you use Simulator. Run 'xcrun simctl delete unavailable' for targeted cleanup.",
             defaultSelected: false,
-            cleanCommand: "xcrun simctl shutdown all 2>/dev/null; xcrun simctl delete unavailable 2>/dev/null; xcrun simctl erase all 2>/dev/null"
+            cleanSteps: [
+                ["xcrun", "simctl", "shutdown", "all"],
+                ["xcrun", "simctl", "delete", "unavailable"],
+                ["xcrun", "simctl", "erase", "all"]
+            ]
         ),        CacheCategory(
             name: "Swift PM Cache",
             slug: "swift_pm_cache",

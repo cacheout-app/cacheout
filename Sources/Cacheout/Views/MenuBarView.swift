@@ -148,9 +148,8 @@ struct MenuBarView: View {
         HStack {
             statPill(
                 label: "Recoverable",
-                value: ByteCountFormatter.string(
-                    fromByteCount: viewModel.totalRecoverable,
-                    countStyle: .file
+                value: Formatters.byteCountFormatter.string(
+                    fromByteCount: viewModel.totalRecoverable
                 ),
                 color: .orange
             )

@@ -275,7 +275,7 @@ struct CLIHandler {
             [
                 "category": item.category,
                 "bytes_freed": item.bytesFreed,
-                "freed_human": ByteCountFormatter.string(fromByteCount: item.bytesFreed, countStyle: .file),
+                "freed_human": Formatters.byteCountFormatter.string(fromByteCount: item.bytesFreed),
                 "success": true,
             ]
         }
@@ -336,7 +336,7 @@ struct CLIHandler {
                 cleaned.append([
                     "name": result.category.name,
                     "bytes_freed": freed,
-                    "freed_human": ByteCountFormatter.string(fromByteCount: freed, countStyle: .file),
+                    "freed_human": Formatters.byteCountFormatter.string(fromByteCount: freed),
                 ])
             }
         }
@@ -345,7 +345,7 @@ struct CLIHandler {
             "target_gb": targetGB,
             "target_met": freedSoFar >= targetBytes,
             "total_freed_bytes": freedSoFar,
-            "total_freed": ByteCountFormatter.string(fromByteCount: freedSoFar, countStyle: .file),
+            "total_freed": Formatters.byteCountFormatter.string(fromByteCount: freedSoFar),
             "dry_run": dryRun,
             "cleaned": cleaned,
         ] as [String: Any])
@@ -386,7 +386,7 @@ struct CLIHandler {
                     name: \(result.category.name)
                     risk: \(result.category.riskLevel.rawValue)
                     size: \(result.formattedSize)
-                    tagged: \(ISO8601DateFormatter().string(from: Date()))
+                    tagged: \(Formatters.iso8601.string(from: Date()))
                     """
                 try? markerContent.write(to: marker, atomically: true, encoding: .utf8)
 

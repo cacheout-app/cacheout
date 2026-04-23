@@ -160,9 +160,8 @@ actor CacheCleaner {
         try? FileManager.default.createDirectory(at: logDir, withIntermediateDirectories: true)
 
         let logFile = logDir.appendingPathComponent("cleanup.log")
-        let formatter = ISO8601DateFormatter()
-        let size = ByteCountFormatter.string(fromByteCount: bytesFreed, countStyle: .file)
-        let entry = "[\(formatter.string(from: Date()))] Cleaned \(category): \(size)\n"
+        let size = Formatters.byteCountFormatter.string(fromByteCount: bytesFreed)
+        let entry = "[\(Formatters.iso8601.string(from: Date()))] Cleaned \(category): \(size)\n"
 
         if let handle = try? FileHandle(forWritingTo: logFile) {
             handle.seekToEndOfFile()

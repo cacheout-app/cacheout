@@ -122,7 +122,7 @@ struct CleanupReportSheet: View {
                         HStack {
                             Text(item.category)
                             Spacer()
-                            Text(ByteCountFormatter.string(fromByteCount: item.bytesFreed, countStyle: .file))
+                            Text(Formatters.byteCountFormatter.string(fromByteCount: item.bytesFreed))
                                 .foregroundStyle(.secondary)
                         }
                         .font(.caption)

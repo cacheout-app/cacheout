@@ -38,7 +38,7 @@ struct ScanResult: Identifiable {
     }
 
     var formattedSize: String {
-        ByteCountFormatter.string(fromByteCount: sizeBytes, countStyle: .file)
+        Formatters.byteCountFormatter.string(fromByteCount: sizeBytes)
     }
 
     var isEmpty: Bool { !exists || sizeBytes == 0 }
@@ -49,6 +49,6 @@ struct CleanupReport {
     let errors: [(category: String, error: String)]
     var totalFreed: Int64 { cleaned.reduce(0) { $0 + $1.bytesFreed } }
     var formattedTotal: String {
-        ByteCountFormatter.string(fromByteCount: totalFreed, countStyle: .file)
+        Formatters.byteCountFormatter.string(fromByteCount: totalFreed)
     }
 }

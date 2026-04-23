@@ -1,0 +1,3 @@
+## 2026-04-23 - Optimize Foundation Formatter Allocations
+**Learning:** Instantiating `DateFormatter`, `ISO8601DateFormatter`, and `ByteCountFormatter` in Foundation is computationally expensive. For performance optimization, store and reuse these formatters as private properties (instance for actors/classes, static for structs) to avoid the overhead of repeated allocations in high-frequency methods.
+**Action:** Centralize shared Foundation formatters (e.g., `ByteCountFormatter` and `ISO8601DateFormatter`) in a shared model/enum (e.g., `Formatters`) to avoid performance overhead from repeated instantiations.

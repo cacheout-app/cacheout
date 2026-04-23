@@ -83,7 +83,7 @@ struct CacheCategory: Identifiable, Hashable {
     /// Optional shell command to run for cleanup instead of deleting files.
     /// When set, the cleaner runs this command instead of rm/trash.
     /// The command runs via /bin/bash -c.
-    let cleanCommand: String?
+    let cleanSteps: [[String]]?
 
     func hash(into hasher: inout Hasher) { hasher.combine(id) }
     static func == (lhs: CacheCategory, rhs: CacheCategory) -> Bool { lhs.id == rhs.id }
@@ -104,14 +104,14 @@ struct CacheCategory: Identifiable, Hashable {
         self.riskLevel = riskLevel
         self.rebuildNote = rebuildNote
         self.defaultSelected = defaultSelected
-        self.cleanCommand = nil
+        self.cleanSteps = nil
     }
 
     /// Full init with discovery and optional clean command
     init(
         name: String, slug: String, description: String, icon: String,
         discovery: [PathDiscovery], riskLevel: RiskLevel, rebuildNote: String,
-        defaultSelected: Bool, cleanCommand: String? = nil
+        defaultSelected: Bool, cleanSteps: [[String]]? = nil
     ) {
         self.name = name
         self.slug = slug
@@ -121,7 +121,7 @@ struct CacheCategory: Identifiable, Hashable {
         self.riskLevel = riskLevel
         self.rebuildNote = rebuildNote
         self.defaultSelected = defaultSelected
-        self.cleanCommand = cleanCommand
+        self.cleanSteps = cleanSteps
     }
 
     // MARK: - Path Resolution

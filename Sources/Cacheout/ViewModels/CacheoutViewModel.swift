@@ -171,15 +171,26 @@ class CacheoutViewModel: ObservableObject {
         }
     }
 
+    // MARK: - Optimization Note
+    // For @Published arrays of structs, using `.map` to batch updates into a single
+    // assignment prevents triggering UI update notifications for every single element change.
+    // Do not convert these to standard `for` loops as it severely impacts rendering performance.
+
     func selectAllSafe() {
-        for i in scanResults.indices where scanResults[i].category.riskLevel == .safe && !scanResults[i].isEmpty {
-            scanResults[i].isSelected = true
+        scanResults = scanResults.map { result in
+            var modified = result
+            if modified.category.riskLevel == .safe && !modified.isEmpty {
+                modified.isSelected = true
+            }
+            return modified
         }
     }
 
     func deselectAll() {
-        for i in scanResults.indices {
-            scanResults[i].isSelected = false
+        scanResults = scanResults.map { result in
+            var modified = result
+            modified.isSelected = false
+            return modified
         }
         deselectAllNodeModules()
     }
@@ -193,17 +204,29 @@ class CacheoutViewModel: ObservableObject {
     }
 
     func selectStaleNodeModules() {
-        for i in nodeModulesItems.indices where nodeModulesItems[i].isStale {
-            nodeModulesItems[i].isSelected = true
+        nodeModulesItems = nodeModulesItems.map { item in
+            var modified = item
+            if modified.isStale {
+                modified.isSelected = true
+            }
+            return modified
         }
     }
 
     func selectAllNodeModules() {
-        for i in nodeModulesItems.indices { nodeModulesItems[i].isSelected = true }
+        nodeModulesItems = nodeModulesItems.map { item in
+            var modified = item
+            modified.isSelected = true
+            return modified
+        }
     }
 
     func deselectAllNodeModules() {
-        for i in nodeModulesItems.indices { nodeModulesItems[i].isSelected = false }
+        nodeModulesItems = nodeModulesItems.map { item in
+            var modified = item
+            modified.isSelected = false
+            return modified
+        }
     }
 
     /// Menu bar label: show free GB in the tray

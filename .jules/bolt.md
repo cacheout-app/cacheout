@@ -1,0 +1,3 @@
+## 2025-02-05 - Optimize Foundation Formatters and Array Iteration
+**Learning:** Calling `ByteCountFormatter.string(fromByteCount:countStyle:)` repeatedly (e.g. in loops or computed properties triggered by UI updates) creates a new Foundation formatter instance each time, which is computationally expensive. Similarly, `ISO8601DateFormatter()` instantiation is slow. Also, using `.filter {}.reduce(0) {}` creates intermediate arrays which allocates memory unnecessarily.
+**Action:** Extract formatters into static/shared instances to reuse them. For arrays, integrate conditions into `reduce(0) { condition ? $0 + $1 : $0 }` or use lazy filtering.

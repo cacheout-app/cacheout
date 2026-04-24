@@ -42,6 +42,13 @@ import SwiftUI
 
 @MainActor
 class CacheoutViewModel: ObservableObject {
+    // MARK: - Formatters
+    private let byteFormatter: ByteCountFormatter = {
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .file
+        return formatter
+    }()
+
     @Published var scanResults: [ScanResult] = []
     @Published var isScanning = false
     @Published var isCleaning = false
@@ -106,15 +113,19 @@ class CacheoutViewModel: ObservableObject {
     }
 
     var selectedSize: Int64 {
-        selectedResults.reduce(0) { $0 + $1.sizeBytes }
+        scanResults.reduce(0) { $1.isSelected ? $0 + $1.sizeBytes : $0 }
     }
 
     var formattedSelectedSize: String {
-        ByteCountFormatter.string(fromByteCount: selectedSize, countStyle: .file)
+        byteFormatter.string(fromByteCount: selectedSize)
     }
 
     var totalRecoverable: Int64 {
-        scanResults.filter { !$0.isEmpty }.reduce(0) { $0 + $1.sizeBytes }
+        scanResults.reduce(0) { $1.isEmpty ? $0 : $0 + $1.sizeBytes }
+    }
+
+    var formattedTotalRecoverable: String {
+        byteFormatter.string(fromByteCount: totalRecoverable)
     }
 
     var hasResults: Bool { !scanResults.isEmpty || !nodeModulesItems.isEmpty }
@@ -127,21 +138,21 @@ class CacheoutViewModel: ObservableObject {
     }
 
     var formattedNodeModulesTotal: String {
-        ByteCountFormatter.string(fromByteCount: nodeModulesTotal, countStyle: .file)
+        byteFormatter.string(fromByteCount: nodeModulesTotal)
     }
 
     var selectedNodeModulesSize: Int64 {
-        nodeModulesItems.filter(\.isSelected).reduce(0) { $0 + $1.sizeBytes }
+        nodeModulesItems.reduce(0) { $1.isSelected ? $0 + $1.sizeBytes : $0 }
     }
 
     var formattedSelectedNodeModulesSize: String {
-        ByteCountFormatter.string(fromByteCount: selectedNodeModulesSize, countStyle: .file)
+        byteFormatter.string(fromByteCount: selectedNodeModulesSize)
     }
 
     var totalSelectedSize: Int64 { selectedSize + selectedNodeModulesSize }
 
     var formattedTotalSelectedSize: String {
-        ByteCountFormatter.string(fromByteCount: totalSelectedSize, countStyle: .file)
+        byteFormatter.string(fromByteCount: totalSelectedSize)
     }
 
     func scan() async {

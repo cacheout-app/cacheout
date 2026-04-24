@@ -28,6 +28,12 @@ struct ScanResult: Identifiable {
     let exists: Bool
     var isSelected: Bool
 
+    private static let byteFormatter: ByteCountFormatter = {
+        let f = ByteCountFormatter()
+        f.countStyle = .file
+        return f
+    }()
+
     init(category: CacheCategory, sizeBytes: Int64, itemCount: Int, exists: Bool) {
         self.id = category.id
         self.category = category
@@ -38,17 +44,23 @@ struct ScanResult: Identifiable {
     }
 
     var formattedSize: String {
-        ByteCountFormatter.string(fromByteCount: sizeBytes, countStyle: .file)
+        Self.byteFormatter.string(fromByteCount: sizeBytes)
     }
 
     var isEmpty: Bool { !exists || sizeBytes == 0 }
 }
 
 struct CleanupReport {
+    private static let byteFormatter: ByteCountFormatter = {
+        let f = ByteCountFormatter()
+        f.countStyle = .file
+        return f
+    }()
+
     let cleaned: [(category: String, bytesFreed: Int64)]
     let errors: [(category: String, error: String)]
     var totalFreed: Int64 { cleaned.reduce(0) { $0 + $1.bytesFreed } }
     var formattedTotal: String {
-        ByteCountFormatter.string(fromByteCount: totalFreed, countStyle: .file)
+        Self.byteFormatter.string(fromByteCount: totalFreed)
     }
 }

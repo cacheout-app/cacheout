@@ -1,0 +1,4 @@
+## 2024-04-24 - Replace shell execution with direct Process for which check
+**Vulnerability:** The `toolExists` method in `Sources/Cacheout/Models/CacheCategory.swift` used an insecure `shell` helper which interpolated string arguments (e.g., `shell("/usr/bin/which \(tool)")`). While `tool` string origins are mostly static within the codebase, this pattern risks Command Injection if ever exposed to user input.
+**Learning:** Shell string interpolation should never be used, especially in security-sensitive or generic library code. Relying on `2>/dev/null` inside `/bin/bash -c` is also an anti-pattern.
+**Prevention:** Always use the `Foundation.Process` API directly when interacting with external commands, passing arguments securely via the `arguments` array and suppressing output natively via `FileHandle.nullDevice` to prevent the shell from parsing or expanding the strings.

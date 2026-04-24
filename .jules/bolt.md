@@ -1,0 +1,3 @@
+## 2025-04-24 - Batch Updates for @Published Arrays
+**Learning:** Mutating individual elements of a `@Published` array property inside a loop triggers a UI update notification for every change, causing severe performance bottlenecks during bulk operations in SwiftUI.
+**Action:** Use functional methods like `.map` to batch updates into a single property assignment when modifying multiple elements of a `@Published` collection of value types. Always document this to prevent regression to `for` loops by others assuming `.map` is slower in standard contexts.

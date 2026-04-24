@@ -27,6 +27,12 @@ struct CleanConfirmationSheet: View {
     @EnvironmentObject var viewModel: CacheoutViewModel
     @Environment(\.dismiss) private var dismiss
 
+    fileprivate static let byteFormatter: ByteCountFormatter = {
+        let f = ByteCountFormatter()
+        f.countStyle = .file
+        return f
+    }()
+
     var body: some View {
         VStack(spacing: 16) {
             Image(systemName: "trash.circle.fill")
@@ -122,7 +128,7 @@ struct CleanupReportSheet: View {
                         HStack {
                             Text(item.category)
                             Spacer()
-                            Text(ByteCountFormatter.string(fromByteCount: item.bytesFreed, countStyle: .file))
+                            Text(CleanConfirmationSheet.byteFormatter.string(fromByteCount: item.bytesFreed))
                                 .foregroundStyle(.secondary)
                         }
                         .font(.caption)

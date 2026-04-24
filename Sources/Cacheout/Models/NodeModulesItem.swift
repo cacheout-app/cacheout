@@ -26,8 +26,14 @@ struct NodeModulesItem: Identifiable, Hashable {
     let lastModified: Date?
     var isSelected: Bool = false
 
+    private static let byteFormatter: ByteCountFormatter = {
+        let f = ByteCountFormatter()
+        f.countStyle = .file
+        return f
+    }()
+
     var formattedSize: String {
-        ByteCountFormatter.string(fromByteCount: sizeBytes, countStyle: .file)
+        Self.byteFormatter.string(fromByteCount: sizeBytes)
     }
 
     var daysSinceModified: Int? {

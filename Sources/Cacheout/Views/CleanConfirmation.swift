@@ -100,6 +100,13 @@ struct CleanConfirmationSheet: View {
 }
 
 struct CleanupReportSheet: View {
+    // ⚡ Bolt: Cache Foundation formatters to prevent allocation overhead
+    fileprivate static let byteFormatter: ByteCountFormatter = {
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .file
+        return formatter
+    }()
+
     let report: CleanupReport
     @Environment(\.dismiss) private var dismiss
 
@@ -122,7 +129,7 @@ struct CleanupReportSheet: View {
                         HStack {
                             Text(item.category)
                             Spacer()
-                            Text(ByteCountFormatter.string(fromByteCount: item.bytesFreed, countStyle: .file))
+                            Text(Self.byteFormatter.string(fromByteCount: item.bytesFreed))
                                 .foregroundStyle(.secondary)
                         }
                         .font(.caption)

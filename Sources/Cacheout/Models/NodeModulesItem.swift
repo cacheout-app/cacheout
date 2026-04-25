@@ -18,6 +18,13 @@
 import Foundation
 
 struct NodeModulesItem: Identifiable, Hashable {
+    // ⚡ Bolt: Cache Foundation formatters to prevent allocation overhead
+    private static let byteFormatter: ByteCountFormatter = {
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .file
+        return formatter
+    }()
+
     let id = UUID()
     let projectName: String
     let projectPath: URL
@@ -27,7 +34,7 @@ struct NodeModulesItem: Identifiable, Hashable {
     var isSelected: Bool = false
 
     var formattedSize: String {
-        ByteCountFormatter.string(fromByteCount: sizeBytes, countStyle: .file)
+        Self.byteFormatter.string(fromByteCount: sizeBytes)
     }
 
     var daysSinceModified: Int? {

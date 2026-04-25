@@ -1,0 +1,3 @@
+## 2024-05-14 - Make list rows fully clickable and accessible
+**Learning:** Wrapping SwiftUI list rows entirely in a `Button` with `.contentShape(Rectangle())` (to make empty space clickable), `.buttonStyle(.plain)` (to prevent default blue text styling), and using `.accessibilityElement(children: .combine)` alongside state-appropriate traits like `.accessibilityAddTraits(.isSelected)` significantly improves both hit targets and VoiceOver support.
+**Action:** Always wrap entire rows in a button for list selections instead of just a checkbox to maximize the hit area and provide a unified VoiceOver element.

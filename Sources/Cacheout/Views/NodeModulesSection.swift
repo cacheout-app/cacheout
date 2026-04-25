@@ -120,44 +120,47 @@ struct NodeModulesRow: View {
     let onToggle: () -> Void
 
     var body: some View {
-        HStack(spacing: 10) {
-            Button(action: onToggle) {
+        Button(action: onToggle) {
+            HStack(spacing: 10) {
                 Image(systemName: item.isSelected ? "checkmark.circle.fill" : "circle")
                     .font(.title3)
                     .foregroundStyle(item.isSelected ? .purple : .secondary)
+
+                Image(systemName: "shippingbox.fill")
+                    .foregroundStyle(.purple.opacity(0.7))
+                    .frame(width: 20)
+
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(item.projectName)
+                        .font(.body.weight(.medium))
+                    Text(item.projectPath.path.replacingOccurrences(of: FileManager.default.homeDirectoryForCurrentUser.path, with: "~"))
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+
+                Spacer()
+
+                // Stale badge
+                if let badge = item.staleBadge {
+                    Text(badge)
+                        .font(.caption2.weight(.semibold))
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 2)
+                        .background(Color.orange.opacity(0.15), in: Capsule())
+                        .foregroundStyle(.orange)
+                }
+
+                Text(item.formattedSize)
+                    .font(.body.monospacedDigit())
             }
-            .buttonStyle(.plain)
-
-            Image(systemName: "shippingbox.fill")
-                .foregroundStyle(.purple.opacity(0.7))
-                .frame(width: 20)
-
-            VStack(alignment: .leading, spacing: 1) {
-                Text(item.projectName)
-                    .font(.body.weight(.medium))
-                Text(item.projectPath.path.replacingOccurrences(of: FileManager.default.homeDirectoryForCurrentUser.path, with: "~"))
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-            }
-
-            Spacer()
-
-            // Stale badge
-            if let badge = item.staleBadge {
-                Text(badge)
-                    .font(.caption2.weight(.semibold))
-                    .padding(.horizontal, 5)
-                    .padding(.vertical, 2)
-                    .background(Color.orange.opacity(0.15), in: Capsule())
-                    .foregroundStyle(.orange)
-            }
-
-            Text(item.formattedSize)
-                .font(.body.monospacedDigit())
+            .padding(.vertical, 4)
+            .padding(.horizontal, 10)
+            .contentShape(Rectangle())
         }
-        .padding(.vertical, 4)
-        .padding(.horizontal, 10)
+        .buttonStyle(.plain)
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(item.isSelected ? .isSelected : [])
     }
 }

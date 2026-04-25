@@ -69,6 +69,14 @@ import Foundation
 /// When the binary is invoked as `Cacheout --cli <command> [--format json]`,
 /// it runs headlessly and outputs structured data to stdout.
 struct CLIHandler {
+    // ⚡ Bolt: Cache Foundation formatters to prevent allocation overhead
+    private static let byteFormatter: ByteCountFormatter = {
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .file
+        return formatter
+    }()
+
+    private static let isoFormatter = ISO8601DateFormatter()
 
     enum Command: String, CaseIterable {
         case version
@@ -275,7 +283,7 @@ struct CLIHandler {
             [
                 "category": item.category,
                 "bytes_freed": item.bytesFreed,
-                "freed_human": ByteCountFormatter.string(fromByteCount: item.bytesFreed, countStyle: .file),
+                "freed_human": Self.byteFormatter.string(fromByteCount: item.bytesFreed),
                 "success": true,
             ]
         }
@@ -336,7 +344,7 @@ struct CLIHandler {
                 cleaned.append([
                     "name": result.category.name,
                     "bytes_freed": freed,
-                    "freed_human": ByteCountFormatter.string(fromByteCount: freed, countStyle: .file),
+                    "freed_human": Self.byteFormatter.string(fromByteCount: freed),
                 ])
             }
         }
@@ -345,7 +353,7 @@ struct CLIHandler {
             "target_gb": targetGB,
             "target_met": freedSoFar >= targetBytes,
             "total_freed_bytes": freedSoFar,
-            "total_freed": ByteCountFormatter.string(fromByteCount: freedSoFar, countStyle: .file),
+            "total_freed": Self.byteFormatter.string(fromByteCount: freedSoFar),
             "dry_run": dryRun,
             "cleaned": cleaned,
         ] as [String: Any])
@@ -386,7 +394,7 @@ struct CLIHandler {
                     name: \(result.category.name)
                     risk: \(result.category.riskLevel.rawValue)
                     size: \(result.formattedSize)
-                    tagged: \(ISO8601DateFormatter().string(from: Date()))
+                    tagged: \(Self.isoFormatter.string(from: Date()))
                     """
                 try? markerContent.write(to: marker, atomically: true, encoding: .utf8)
 

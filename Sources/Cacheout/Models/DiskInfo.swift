@@ -22,6 +22,13 @@
 import Foundation
 
 struct DiskInfo {
+    // ⚡ Bolt: Cache Foundation formatters to prevent allocation overhead
+    private static let byteFormatter: ByteCountFormatter = {
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .file
+        return formatter
+    }()
+
     let totalSpace: Int64
     let freeSpace: Int64
     let usedSpace: Int64
@@ -32,15 +39,15 @@ struct DiskInfo {
     }
 
     var formattedTotal: String {
-        ByteCountFormatter.string(fromByteCount: totalSpace, countStyle: .file)
+        Self.byteFormatter.string(fromByteCount: totalSpace)
     }
 
     var formattedFree: String {
-        ByteCountFormatter.string(fromByteCount: freeSpace, countStyle: .file)
+        Self.byteFormatter.string(fromByteCount: freeSpace)
     }
 
     var formattedUsed: String {
-        ByteCountFormatter.string(fromByteCount: usedSpace, countStyle: .file)
+        Self.byteFormatter.string(fromByteCount: usedSpace)
     }
 
     static func current() -> DiskInfo? {

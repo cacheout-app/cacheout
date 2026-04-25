@@ -36,6 +36,15 @@ import Foundation
 import AppKit
 
 actor CacheCleaner {
+    // ⚡ Bolt: Cache Foundation formatters to prevent allocation overhead
+    private let byteFormatter: ByteCountFormatter = {
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .file
+        return formatter
+    }()
+
+    private let isoFormatter = ISO8601DateFormatter()
+
     private let fileManager = FileManager.default
 
     func clean(results: [ScanResult], nodeModules: [NodeModulesItem] = [], moveToTrash: Bool) async -> CleanupReport {
@@ -160,9 +169,8 @@ actor CacheCleaner {
         try? FileManager.default.createDirectory(at: logDir, withIntermediateDirectories: true)
 
         let logFile = logDir.appendingPathComponent("cleanup.log")
-        let formatter = ISO8601DateFormatter()
-        let size = ByteCountFormatter.string(fromByteCount: bytesFreed, countStyle: .file)
-        let entry = "[\(formatter.string(from: Date()))] Cleaned \(category): \(size)\n"
+        let size = byteFormatter.string(fromByteCount: bytesFreed)
+        let entry = "[\(isoFormatter.string(from: Date()))] Cleaned \(category): \(size)\n"
 
         if let handle = try? FileHandle(forWritingTo: logFile) {
             handle.seekToEndOfFile()

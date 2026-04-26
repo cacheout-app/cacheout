@@ -172,14 +172,23 @@ class CacheoutViewModel: ObservableObject {
     }
 
     func selectAllSafe() {
-        for i in scanResults.indices where scanResults[i].category.riskLevel == .safe && !scanResults[i].isEmpty {
-            scanResults[i].isSelected = true
+        // PERFORMANCE: Map and reassign to trigger a single @Published UI update notification
+        // rather than mutating in a loop which causes O(N) re-renders.
+        scanResults = scanResults.map { item in
+            var copy = item
+            if copy.category.riskLevel == .safe && !copy.isEmpty {
+                copy.isSelected = true
+            }
+            return copy
         }
     }
 
     func deselectAll() {
-        for i in scanResults.indices {
-            scanResults[i].isSelected = false
+        // PERFORMANCE: Map and reassign to batch @Published array updates.
+        scanResults = scanResults.map { item in
+            var copy = item
+            copy.isSelected = false
+            return copy
         }
         deselectAllNodeModules()
     }
@@ -193,17 +202,32 @@ class CacheoutViewModel: ObservableObject {
     }
 
     func selectStaleNodeModules() {
-        for i in nodeModulesItems.indices where nodeModulesItems[i].isStale {
-            nodeModulesItems[i].isSelected = true
+        // PERFORMANCE: Map and reassign to batch @Published array updates.
+        nodeModulesItems = nodeModulesItems.map { item in
+            var copy = item
+            if copy.isStale {
+                copy.isSelected = true
+            }
+            return copy
         }
     }
 
     func selectAllNodeModules() {
-        for i in nodeModulesItems.indices { nodeModulesItems[i].isSelected = true }
+        // PERFORMANCE: Map and reassign to batch @Published array updates.
+        nodeModulesItems = nodeModulesItems.map { item in
+            var copy = item
+            copy.isSelected = true
+            return copy
+        }
     }
 
     func deselectAllNodeModules() {
-        for i in nodeModulesItems.indices { nodeModulesItems[i].isSelected = false }
+        // PERFORMANCE: Map and reassign to batch @Published array updates.
+        nodeModulesItems = nodeModulesItems.map { item in
+            var copy = item
+            copy.isSelected = false
+            return copy
+        }
     }
 
     /// Menu bar label: show free GB in the tray

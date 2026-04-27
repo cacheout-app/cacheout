@@ -1,0 +1,24 @@
+--- Sources/Cacheout/ViewModels/CacheoutViewModel.swift
++++ Sources/Cacheout/ViewModels/CacheoutViewModel.swift
+@@ -43,6 +43,7 @@
+ @MainActor
+ class CacheoutViewModel: ObservableObject {
++    // Cacheout Bolt: Cached ByteCountFormatter to prevent expensive object allocation on every property access
+     private let byteFormatter: ByteCountFormatter = {
+         let formatter = ByteCountFormatter()
+         formatter.countStyle = .file
+@@ -118,6 +119,7 @@
+     }
+
+     var totalRecoverable: Int64 {
++        // Cacheout Bolt: Combined filter & reduce prevents intermediate array allocations, saving memory overhead in large scans
+         scanResults.reduce(0) { !$1.isEmpty ? $0 + $1.sizeBytes : $0 }
+     }
+
+@@ -134,6 +136,7 @@
+     }
+
+     var selectedNodeModulesSize: Int64 {
++        // Cacheout Bolt: Avoids creating a temporary filtered array before reducing
+         nodeModulesItems.reduce(0) { $1.isSelected ? $0 + $1.sizeBytes : $0 }
+     }

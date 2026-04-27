@@ -1,0 +1,3 @@
+## 2024-05-24 - Expand list row hit targets and improve VoiceOver experience
+**Learning:** List rows in SwiftUI applications often have small hit targets if only the checkbox or a small portion is made a button, creating disjointed and repetitive reading by VoiceOver.
+**Action:** When creating clickable list rows, wrap the entire row contents (e.g., `HStack`) in a `Button`, apply `.contentShape(Rectangle())` to make empty space clickable, use `.buttonStyle(.plain)` to prevent unintended text styling, and add `.accessibilityElement(children: .combine)` along with state-appropriate traits like `.accessibilityAddTraits(.isSelected)`.

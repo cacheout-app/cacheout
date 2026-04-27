@@ -1,0 +1,4 @@
+## 2024-04-27 - Command Injection Risk in Shell Interpolation
+**Vulnerability:** The `toolExists` method in `Sources/Cacheout/Models/CacheCategory.swift` used insecure string interpolation inside a shell command execution (`shell("/usr/bin/which \(tool)")`). While the current usage of `tool` parameter might be controlled, it represented a structural command injection risk if untrusted input were ever passed to it.
+**Learning:** Using `/bin/bash -c` combined with string interpolation in Swift is dangerous because shell metacharacters inside the interpolated string are evaluated by the shell.
+**Prevention:** Always use the `Foundation.Process` API directly to execute external binaries. Set `executableURL` to the specific binary path (e.g., `/usr/bin/which`) and pass arguments via the `arguments` array, which bypasses the shell interpreter entirely.

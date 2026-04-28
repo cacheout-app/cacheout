@@ -100,6 +100,12 @@ struct CleanConfirmationSheet: View {
 }
 
 struct CleanupReportSheet: View {
+    fileprivate static let byteFormatter: ByteCountFormatter = {
+        let f = ByteCountFormatter()
+        f.countStyle = .file
+        return f
+    }()
+
     let report: CleanupReport
     @Environment(\.dismiss) private var dismiss
 
@@ -122,7 +128,7 @@ struct CleanupReportSheet: View {
                         HStack {
                             Text(item.category)
                             Spacer()
-                            Text(ByteCountFormatter.string(fromByteCount: item.bytesFreed, countStyle: .file))
+                            Text(Self.byteFormatter.string(fromByteCount: item.bytesFreed))
                                 .foregroundStyle(.secondary)
                         }
                         .font(.caption)

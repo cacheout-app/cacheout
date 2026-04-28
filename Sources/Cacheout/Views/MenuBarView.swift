@@ -36,6 +36,12 @@ import SwiftUI
 
 /// Compact menubar popover showing disk status and quick-clean options.
 struct MenuBarView: View {
+    fileprivate static let byteFormatter: ByteCountFormatter = {
+        let f = ByteCountFormatter()
+        f.countStyle = .file
+        return f
+    }()
+
     @EnvironmentObject var viewModel: CacheoutViewModel
     @Environment(\.openWindow) private var openWindow
 
@@ -148,9 +154,8 @@ struct MenuBarView: View {
         HStack {
             statPill(
                 label: "Recoverable",
-                value: ByteCountFormatter.string(
-                    fromByteCount: viewModel.totalRecoverable,
-                    countStyle: .file
+                value: Self.byteFormatter.string(
+                    fromByteCount: viewModel.totalRecoverable
                 ),
                 color: .orange
             )

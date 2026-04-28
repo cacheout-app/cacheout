@@ -1,0 +1,3 @@
+## 2024-05-14 - Optimize array mutations in SwiftUI ObservableObjects
+**Learning:** Mutating elements of a `@Published` array property inside a loop triggers a UI update notification for every change. This can lead to significant performance overhead when iterating over collections, causing many redundant re-renders.
+**Action:** Replace `for` loops that mutate multiple elements in a `@Published` array with functional methods like `.map` to batch updates into a single property assignment. Add comments explaining this optimization to prevent future developers from 'optimizing' it back to a standard `for` loop, as `.map` can appear slower in standard Swift contexts.

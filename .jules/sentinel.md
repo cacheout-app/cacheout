@@ -1,0 +1,4 @@
+## 2024-04-28 - Insecure Shell Interpolation Pattern
+**Vulnerability:** Defense-in-depth risk where helper methods used string interpolation inside shell commands (e.g., `shell("/usr/bin/which \(tool)")`), creating a shell injection vector if inputs are dynamic.
+**Learning:** The project's custom `shell(_:)` method passes raw strings to `/bin/bash -c`. Any interpolated variable is evaluated by bash, which is unsafe.
+**Prevention:** Use direct `Process` instantiation, passing arguments as an array (`process.arguments = [tool]`) and suppressing output securely by assigning `FileHandle.nullDevice` to `standardOutput` and `standardError`. Evaluate `process.terminationStatus == 0` for success.

@@ -18,6 +18,12 @@
 import Foundation
 
 struct NodeModulesItem: Identifiable, Hashable {
+    private static let byteFormatter: ByteCountFormatter = {
+        let f = ByteCountFormatter()
+        f.countStyle = .file
+        return f
+    }()
+
     let id = UUID()
     let projectName: String
     let projectPath: URL
@@ -27,7 +33,7 @@ struct NodeModulesItem: Identifiable, Hashable {
     var isSelected: Bool = false
 
     var formattedSize: String {
-        ByteCountFormatter.string(fromByteCount: sizeBytes, countStyle: .file)
+        Self.byteFormatter.string(fromByteCount: sizeBytes)
     }
 
     var daysSinceModified: Int? {

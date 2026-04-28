@@ -42,6 +42,12 @@ import SwiftUI
 
 @MainActor
 class CacheoutViewModel: ObservableObject {
+    private let byteFormatter: ByteCountFormatter = {
+        let f = ByteCountFormatter()
+        f.countStyle = .file
+        return f
+    }()
+
     @Published var scanResults: [ScanResult] = []
     @Published var isScanning = false
     @Published var isCleaning = false
@@ -110,7 +116,7 @@ class CacheoutViewModel: ObservableObject {
     }
 
     var formattedSelectedSize: String {
-        ByteCountFormatter.string(fromByteCount: selectedSize, countStyle: .file)
+        byteFormatter.string(fromByteCount: selectedSize)
     }
 
     var totalRecoverable: Int64 {
@@ -127,7 +133,7 @@ class CacheoutViewModel: ObservableObject {
     }
 
     var formattedNodeModulesTotal: String {
-        ByteCountFormatter.string(fromByteCount: nodeModulesTotal, countStyle: .file)
+        byteFormatter.string(fromByteCount: nodeModulesTotal)
     }
 
     var selectedNodeModulesSize: Int64 {
@@ -135,13 +141,13 @@ class CacheoutViewModel: ObservableObject {
     }
 
     var formattedSelectedNodeModulesSize: String {
-        ByteCountFormatter.string(fromByteCount: selectedNodeModulesSize, countStyle: .file)
+        byteFormatter.string(fromByteCount: selectedNodeModulesSize)
     }
 
     var totalSelectedSize: Int64 { selectedSize + selectedNodeModulesSize }
 
     var formattedTotalSelectedSize: String {
-        ByteCountFormatter.string(fromByteCount: totalSelectedSize, countStyle: .file)
+        byteFormatter.string(fromByteCount: totalSelectedSize)
     }
 
     func scan() async {

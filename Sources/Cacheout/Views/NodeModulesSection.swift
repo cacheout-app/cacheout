@@ -120,15 +120,13 @@ struct NodeModulesRow: View {
     let onToggle: () -> Void
 
     var body: some View {
-        HStack(spacing: 10) {
-            Button(action: onToggle) {
+        Button(action: onToggle) {
+            HStack(spacing: 10) {
                 Image(systemName: item.isSelected ? "checkmark.circle.fill" : "circle")
                     .font(.title3)
                     .foregroundStyle(item.isSelected ? .purple : .secondary)
-            }
-            .buttonStyle(.plain)
 
-            Image(systemName: "shippingbox.fill")
+                Image(systemName: "shippingbox.fill")
                 .foregroundStyle(.purple.opacity(0.7))
                 .frame(width: 20)
 
@@ -157,7 +155,12 @@ struct NodeModulesRow: View {
             Text(item.formattedSize)
                 .font(.body.monospacedDigit())
         }
+        .contentShape(Rectangle())
         .padding(.vertical, 4)
         .padding(.horizontal, 10)
+        }
+        .buttonStyle(.plain)
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(item.isSelected ? [.isSelected] : [])
     }
 }

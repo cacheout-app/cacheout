@@ -24,17 +24,14 @@ struct CategoryRow: View {
     let onToggle: () -> Void
 
     var body: some View {
-        HStack(spacing: 12) {
-            // Checkbox
-            Button(action: onToggle) {
+        Button(action: onToggle) {
+            HStack(spacing: 12) {
+                // Checkbox
                 Image(systemName: result.isSelected ? "checkmark.circle.fill" : "circle")
                     .font(.title3)
                     .foregroundStyle(result.isSelected ? .blue : .secondary)
-            }
-            .buttonStyle(.plain)
-            .disabled(result.isEmpty)
 
-            // Icon
+                // Icon
             Image(systemName: result.category.icon)
                 .font(.title3)
                 .frame(width: 24)
@@ -70,9 +67,15 @@ struct CategoryRow: View {
                 RiskBadge(level: result.category.riskLevel)
             }
         }
+        .contentShape(Rectangle())
         .padding(.vertical, 6)
         .padding(.horizontal, 10)
         .opacity(result.isEmpty ? 0.5 : 1)
+        }
+        .buttonStyle(.plain)
+        .disabled(result.isEmpty)
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(result.isSelected ? [.isSelected] : [])
     }
 
     private var iconColor: Color {

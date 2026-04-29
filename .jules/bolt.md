@@ -1,0 +1,3 @@
+## 2024-05-24 - Batching UI Updates for @Published Arrays
+**Learning:** Mutating individual elements of a `@Published` array inside a loop (e.g., `scanResults[i].isSelected = true`) triggers a UI update notification for every single change, causing an O(N) cascade of unnecessary recalculations and rendering overhead in SwiftUI.
+**Action:** For collections of value types (structs), use functional methods like `.map` to create a new array with all updates applied, and assign it back to the property in a single operation. This batches the updates into a single UI refresh. Always add comments explaining this optimization to prevent future developers from 'optimizing' it back to a standard `for` loop.

@@ -194,7 +194,7 @@ notarize_dmg() {
         echo "   First, store your credentials:"
         echo "   xcrun notarytool store-credentials notarytool-profile \\"
         echo "     --apple-id YOUR_APPLE_ID \\"
-        echo "     --team-id ECVPS3B8SM \\"
+        echo "     --team-id YOUR_TEAM_ID \\"
         echo "     --password APP_SPECIFIC_PASSWORD"
         echo ""
         echo "   Generate an app-specific password at: https://appleid.apple.com"

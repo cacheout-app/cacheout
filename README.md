@@ -4,6 +4,12 @@ A free, open-source macOS utility that helps developers reclaim disk space by sc
 
 Built for developers on space-constrained Macs (especially the 256GB M4 Mac Mini), Cacheout finds and removes caches from Xcode, Docker, npm, Yarn, Homebrew, browsers, and more — typically recovering 20-60GB.
 
+<p align="center">
+  <img src="docs/img/cacheout-main.png" alt="Cacheout main window showing cache scan results" width="280">
+  <img src="docs/img/cacheout-cleanup-complete.png" alt="Cleanup complete dialog showing freed space" width="280">
+  <img src="docs/img/cacheout-after-cleanup.png" alt="Cacheout after cleanup showing reclaimed space" width="280">
+</p>
+
 ## Features
 
 - **15 built-in cache categories** — Xcode, Docker, npm, Yarn, pnpm, Homebrew, Playwright, CocoaPods, Swift PM, Gradle, browser caches, VS Code, Electron, pip

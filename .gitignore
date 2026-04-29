@@ -26,5 +26,11 @@ _tmp_*
 docs/v2/
 cacheout/docs/
 
+# Design source / promotional images (not app resources)
+screenshot*.png
+menubar-icon-source.png
+menubar-icon.PNG
+cacheout-optimized.png
+
 # Build artifacts
 dist/

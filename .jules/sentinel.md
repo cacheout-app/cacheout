@@ -1,4 +1,0 @@
-## 2026-04-02 - Prevent Path Traversal in File I/O
-**Vulnerability:** The `StatusSocket` daemon accepted user-provided file paths for configuration validation (`handleValidateConfig`) without checking if the resolved path escaped the intended directory scope. This allowed local file inclusion and path traversal attacks (e.g., `../../../../../etc/passwd`) because `expandingTildeInPath` does not resolve parent directory (`..`) components.
-**Learning:** In Swift, relying solely on `expandingTildeInPath` or `lstat` to validate user-supplied file paths is insufficient. Parent directory references must be resolved to their canonical absolute paths before any security boundaries can be enforced.
-**Prevention:** Always use `(path as NSString).standardizingPath` to resolve `..` components and follow up with a prefix check (`hasPrefix(allowedDirectoryPath)`) to ensure the normalized path strictly resides within the expected security boundary.

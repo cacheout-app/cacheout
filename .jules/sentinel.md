@@ -1,4 +1,4 @@
-## 2024-04-03 - Path Traversal in Config Validation
-**Vulnerability:** Arbitrary file read in daemon UNIX socket via path traversal
-**Learning:** `expandingTildeInPath` alone does not sandbox against path traversal sequences (like `../../etc/shadow`).
-**Prevention:** Always use `.standardized` to resolve traversal sequences and validate boundaries using `.hasPrefix()` with a trailing slash against the allowed canonical directory.
+## 2024-04-03 - Shell Wrapper Vulnerability
+**Vulnerability:** Use of `/bin/bash -c` in `Process` invocations creates latent command injection vulnerabilities and decreases security.
+**Learning:** Shell redirections like `2>&1` tempt developers to use shell wrappers, but these can be securely replicated natively in Swift using identical `Pipe()` instances.
+**Prevention:** Use `/usr/bin/env <tool>` with explicitly defined arguments instead of a shell wrapper. To redirect `stderr` to `stdout`, assign the same `Pipe()` to `process.standardOutput` and `process.standardError`.

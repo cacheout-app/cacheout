@@ -110,11 +110,11 @@ class CacheoutViewModel: ObservableObject {
     }
 
     var formattedSelectedSize: String {
-        ByteCountFormatter.string(fromByteCount: selectedSize, countStyle: .file)
+        ByteCountFormatter.sharedFile.string(fromByteCount: selectedSize)
     }
 
     var totalRecoverable: Int64 {
-        scanResults.filter { !$0.isEmpty }.reduce(0) { $0 + $1.sizeBytes }
+        scanResults.reduce(0) { !$1.isEmpty ? $0 + $1.sizeBytes : $0 }
     }
 
     var hasResults: Bool { !scanResults.isEmpty || !nodeModulesItems.isEmpty }
@@ -127,7 +127,7 @@ class CacheoutViewModel: ObservableObject {
     }
 
     var formattedNodeModulesTotal: String {
-        ByteCountFormatter.string(fromByteCount: nodeModulesTotal, countStyle: .file)
+        ByteCountFormatter.sharedFile.string(fromByteCount: nodeModulesTotal)
     }
 
     var selectedNodeModulesSize: Int64 {
@@ -135,13 +135,13 @@ class CacheoutViewModel: ObservableObject {
     }
 
     var formattedSelectedNodeModulesSize: String {
-        ByteCountFormatter.string(fromByteCount: selectedNodeModulesSize, countStyle: .file)
+        ByteCountFormatter.sharedFile.string(fromByteCount: selectedNodeModulesSize)
     }
 
     var totalSelectedSize: Int64 { selectedSize + selectedNodeModulesSize }
 
     var formattedTotalSelectedSize: String {
-        ByteCountFormatter.string(fromByteCount: totalSelectedSize, countStyle: .file)
+        ByteCountFormatter.sharedFile.string(fromByteCount: totalSelectedSize)
     }
 
     func scan() async {

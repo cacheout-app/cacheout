@@ -1,0 +1,4 @@
+## 2026-04-30 - Prevent Shell Injection with Foundation.Process
+**Vulnerability:** Command injection risk from using string interpolation in the custom `shell(_:)` method (e.g., `shell("/usr/bin/which \(tool)")`), which executes raw strings via `/bin/bash -c`.
+**Learning:** The custom `shell(_:)` method does not sanitize inputs, making any interpolated string a potential vector for shell metacharacter injection.
+**Prevention:** Avoid string interpolation with `shell(_:)`. Use `Foundation.Process` directly with an arguments array (e.g., `process.arguments = [tool]`) to safely pass variables to executables.

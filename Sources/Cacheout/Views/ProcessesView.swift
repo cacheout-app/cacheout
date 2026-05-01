@@ -165,6 +165,8 @@ struct ProcessesView: View {
                 .font(.callout)
                 .foregroundStyle(.secondary)
         }
+        .accessibilityLabel("Actions for \(process.name)")
+        .help("Process Actions")
         .menuStyle(.borderlessButton)
         .fixedSize()
     }

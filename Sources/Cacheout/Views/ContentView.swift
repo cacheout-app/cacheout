@@ -235,6 +235,7 @@ struct ContentView: View {
                 .buttonStyle(.borderedProminent)
                 .tint(.red)
                 .disabled(!viewModel.hasSelection || viewModel.isCleaning)
+                .help(viewModel.hasSelection ? "Clean selected items" : "Select items to clean")
             }
             .padding(.horizontal)
             .padding(.vertical, 10)

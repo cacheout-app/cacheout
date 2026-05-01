@@ -27,7 +27,7 @@ struct NodeModulesItem: Identifiable, Hashable {
     var isSelected: Bool = false
 
     var formattedSize: String {
-        ByteCountFormatter.string(fromByteCount: sizeBytes, countStyle: .file)
+        ByteCountFormatter.sharedFile.string(fromByteCount: sizeBytes)
     }
 
     var daysSinceModified: Int? {

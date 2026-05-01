@@ -32,15 +32,15 @@ struct DiskInfo {
     }
 
     var formattedTotal: String {
-        ByteCountFormatter.string(fromByteCount: totalSpace, countStyle: .file)
+        ByteCountFormatter.sharedFile.string(fromByteCount: totalSpace)
     }
 
     var formattedFree: String {
-        ByteCountFormatter.string(fromByteCount: freeSpace, countStyle: .file)
+        ByteCountFormatter.sharedFile.string(fromByteCount: freeSpace)
     }
 
     var formattedUsed: String {
-        ByteCountFormatter.string(fromByteCount: usedSpace, countStyle: .file)
+        ByteCountFormatter.sharedFile.string(fromByteCount: usedSpace)
     }
 
     static func current() -> DiskInfo? {

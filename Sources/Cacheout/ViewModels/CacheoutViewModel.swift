@@ -114,7 +114,8 @@ class CacheoutViewModel: ObservableObject {
     }
 
     var totalRecoverable: Int64 {
-        scanResults.filter { !$0.isEmpty }.reduce(0) { $0 + $1.sizeBytes }
+        // Optimize: Combine filter & reduce into a single pass to eliminate intermediate arrays
+        scanResults.reduce(0) { !$1.isEmpty ? $0 + $1.sizeBytes : $0 }
     }
 
     var hasResults: Bool { !scanResults.isEmpty || !nodeModulesItems.isEmpty }
@@ -131,7 +132,8 @@ class CacheoutViewModel: ObservableObject {
     }
 
     var selectedNodeModulesSize: Int64 {
-        nodeModulesItems.filter(\.isSelected).reduce(0) { $0 + $1.sizeBytes }
+        // Optimize: Combine filter & reduce into a single pass to eliminate intermediate arrays
+        nodeModulesItems.reduce(0) { $1.isSelected ? $0 + $1.sizeBytes : $0 }
     }
 
     var formattedSelectedNodeModulesSize: String {
@@ -172,15 +174,21 @@ class CacheoutViewModel: ObservableObject {
     }
 
     func selectAllSafe() {
-        for i in scanResults.indices where scanResults[i].category.riskLevel == .safe && !scanResults[i].isEmpty {
-            scanResults[i].isSelected = true
+        // Optimize: Batch updates in local copy to trigger only one UI update
+        var updated = scanResults
+        for i in updated.indices where updated[i].category.riskLevel == .safe && !updated[i].isEmpty {
+            updated[i].isSelected = true
         }
+        scanResults = updated
     }
 
     func deselectAll() {
-        for i in scanResults.indices {
-            scanResults[i].isSelected = false
+        // Optimize: Batch updates in local copy to trigger only one UI update
+        var updated = scanResults
+        for i in updated.indices {
+            updated[i].isSelected = false
         }
+        scanResults = updated
         deselectAllNodeModules()
     }
 
@@ -193,17 +201,26 @@ class CacheoutViewModel: ObservableObject {
     }
 
     func selectStaleNodeModules() {
-        for i in nodeModulesItems.indices where nodeModulesItems[i].isStale {
-            nodeModulesItems[i].isSelected = true
+        // Optimize: Batch updates in local copy to trigger only one UI update
+        var updated = nodeModulesItems
+        for i in updated.indices where updated[i].isStale {
+            updated[i].isSelected = true
         }
+        nodeModulesItems = updated
     }
 
     func selectAllNodeModules() {
-        for i in nodeModulesItems.indices { nodeModulesItems[i].isSelected = true }
+        // Optimize: Batch updates in local copy to trigger only one UI update
+        var updated = nodeModulesItems
+        for i in updated.indices { updated[i].isSelected = true }
+        nodeModulesItems = updated
     }
 
     func deselectAllNodeModules() {
-        for i in nodeModulesItems.indices { nodeModulesItems[i].isSelected = false }
+        // Optimize: Batch updates in local copy to trigger only one UI update
+        var updated = nodeModulesItems
+        for i in updated.indices { updated[i].isSelected = false }
+        nodeModulesItems = updated
     }
 
     /// Menu bar label: show free GB in the tray

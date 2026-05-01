@@ -1,0 +1,3 @@
+## 2025-05-01 - [Shared Formatters Overhead]
+**Learning:** `ByteCountFormatter` and `ISO8601DateFormatter` allocation inside computed properties and loops creates unnecessary overhead in Swift, particularly in SwiftUI views and ViewModels, as a new instance is created on every call. `ByteCountFormatter.string(fromByteCount:countStyle:)` class method also creates an instance. In addition, the pattern `.filter { ... }.reduce(0) { ... }` creates an intermediate array, which causes unnecessary overhead.
+**Action:** Use shared cached formatter instances (`ByteCountFormatter.sharedFile.string(fromByteCount:)` and `ISO8601DateFormatter.shared.string(from:)`). Use `lazy.filter` or direct `.reduce` for existence checks or accumulations.

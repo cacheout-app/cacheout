@@ -1,0 +1,7 @@
+## 2024-05-02 - Array Allocation in Prefix-Filter Pattern
+**Learning:** In Swift, combining `.prefix()` with `.filter()` on an Array (e.g., `Array(pids.prefix(count)).filter { ... }` or `Array(pids.prefix(count).filter { ... })`) allocates intermediate arrays. Using `.lazy` doesn't fully bypass allocation if immediately wrapped in an `Array()` initializer, but `.filter` itself does an allocation if called on the prefix slice.
+**Action:** When filtering a prefix slice into a new array, use `.lazy.filter` to avoid the intermediate allocation of the filtered slice if it's chained further, or just recognize that it reduces overhead. Wait, the actual pattern in `ProcessMemoryScanner.swift` is `Array(pids.prefix(Int(actualCount)).filter { $0 > 0 })` which evaluates `filter` on an `ArraySlice`, creating an intermediate `[pid_t]` before passing it to `Array()`. It's better to use `.lazy.filter` or directly initialize using the `Array(slice.filter)` which is already an array? Actually `slice.filter` returns `[pid_t]`. The `Array()` wrapper is redundant and causes a copy.
+
+## 2024-05-02 - Batched Updates to @Published Arrays
+**Learning:** In SwiftUI `ObservableObject` view models, mutating individual elements of a `@Published` array property inside a loop triggers a UI update notification (`objectWillChange.send()`) for every change.
+**Action:** Always batch updates by modifying a local copy of the array and then reassigning it to the `@Published` property (e.g., `var copy = items; copy.forEach { ... }; items = copy`), producing only a single update.

@@ -172,15 +172,19 @@ class CacheoutViewModel: ObservableObject {
     }
 
     func selectAllSafe() {
-        for i in scanResults.indices where scanResults[i].category.riskLevel == .safe && !scanResults[i].isEmpty {
-            scanResults[i].isSelected = true
+        var results = scanResults
+        for i in results.indices where results[i].category.riskLevel == .safe && !results[i].isEmpty {
+            results[i].isSelected = true
         }
+        scanResults = results
     }
 
     func deselectAll() {
-        for i in scanResults.indices {
-            scanResults[i].isSelected = false
+        var results = scanResults
+        for i in results.indices {
+            results[i].isSelected = false
         }
+        scanResults = results
         deselectAllNodeModules()
     }
 
@@ -193,17 +197,23 @@ class CacheoutViewModel: ObservableObject {
     }
 
     func selectStaleNodeModules() {
-        for i in nodeModulesItems.indices where nodeModulesItems[i].isStale {
-            nodeModulesItems[i].isSelected = true
+        var items = nodeModulesItems
+        for i in items.indices where items[i].isStale {
+            items[i].isSelected = true
         }
+        nodeModulesItems = items
     }
 
     func selectAllNodeModules() {
-        for i in nodeModulesItems.indices { nodeModulesItems[i].isSelected = true }
+        var items = nodeModulesItems
+        for i in items.indices { items[i].isSelected = true }
+        nodeModulesItems = items
     }
 
     func deselectAllNodeModules() {
-        for i in nodeModulesItems.indices { nodeModulesItems[i].isSelected = false }
+        var items = nodeModulesItems
+        for i in items.indices { items[i].isSelected = false }
+        nodeModulesItems = items
     }
 
     /// Menu bar label: show free GB in the tray

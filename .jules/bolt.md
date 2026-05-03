@@ -1,0 +1,3 @@
+## 2024-05-03 - Avoid Intermediate Array Allocations in Swift
+**Learning:** In Swift, calling `.filter` on an `ArraySlice` (like from `.prefix()`) directly returns a new `Array`. Wrapping this result in an `Array()` initializer is redundant and causes an unnecessary secondary array allocation. Additionally, chaining `.filter { ... }.reduce(0) { ... }` creates an intermediate array.
+**Action:** Remove redundant `Array()` wrappers around `ArraySlice.filter` results. Integrate filter conditions directly into the `reduce` closure (e.g., `.reduce(0) { $1.condition ? $0 + $1.value : $0 }`) to eliminate the intermediate array allocation.

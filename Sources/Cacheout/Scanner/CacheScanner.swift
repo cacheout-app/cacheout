@@ -42,7 +42,7 @@ actor CacheScanner {
         }
     }
 
-    func scanCategory(_ category: CacheCategory) async -> ScanResult {
+    nonisolated func scanCategory(_ category: CacheCategory) async -> ScanResult {
         let resolvedPaths = category.resolvedPaths
         guard !resolvedPaths.isEmpty else {
             return ScanResult(category: category, sizeBytes: 0, itemCount: 0, exists: false)
@@ -65,7 +65,7 @@ actor CacheScanner {
         )
     }
 
-    private func directorySize(at url: URL) -> (Int64, Int) {
+    nonisolated private func directorySize(at url: URL) -> (Int64, Int) {
         var totalSize: Int64 = 0
         var itemCount = 0
 

@@ -164,6 +164,8 @@ struct ProcessesView: View {
             Image(systemName: "ellipsis.circle")
                 .font(.callout)
                 .foregroundStyle(.secondary)
+                .accessibilityLabel("Process Actions")
+                .help("Process Actions")
         }
         .menuStyle(.borderlessButton)
         .fixedSize()

@@ -251,6 +251,7 @@ struct MenuBarView: View {
             } label: {
                 Image(systemName: "macwindow")
                     .font(.caption)
+                    .accessibilityLabel("Open full window")
             }
             .buttonStyle(.bordered)
             .help("Open full window")

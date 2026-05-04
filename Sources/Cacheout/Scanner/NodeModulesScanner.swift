@@ -62,7 +62,7 @@ actor NodeModulesScanner {
                 let rootURL = home.appendingPathComponent(root)
                 guard fileManager.fileExists(atPath: rootURL.path) else { continue }
                 group.addTask {
-                    await self.findNodeModules(in: rootURL, maxDepth: maxDepth)
+                    await self.findNodeModules(in: rootURL, fileManager: self.fileManager, maxDepth: maxDepth)
                 }
             }
             for await items in group {
@@ -77,18 +77,18 @@ actor NodeModulesScanner {
             .sorted { $0.sizeBytes > $1.sizeBytes }
     }
 
-    private func findNodeModules(in directory: URL, maxDepth: Int, currentDepth: Int = 0) async -> [NodeModulesItem] {
+    nonisolated private func findNodeModules(in directory: URL, fileManager: FileManager, maxDepth: Int, currentDepth: Int = 0) async -> [NodeModulesItem] {
         guard currentDepth < maxDepth else { return [] }
 
         var results: [NodeModulesItem] = []
         let nodeModulesURL = directory.appendingPathComponent("node_modules")
 
         // Check if this directory contains node_modules
-        var isDir: ObjCBool = false
-        if fileManager.fileExists(atPath: nodeModulesURL.path, isDirectory: &isDir), isDir.boolValue {
-            let size = directorySize(at: nodeModulesURL)
+        if let values = try? nodeModulesURL.resourceValues(forKeys: [.isDirectoryKey, .contentModificationDateKey]),
+           values.isDirectory == true {
+            let size = directorySize(at: nodeModulesURL, fileManager: fileManager)
             if size > 0 {
-                let lastMod = try? fileManager.attributesOfItem(atPath: nodeModulesURL.path)[.modificationDate] as? Date
+                let lastMod = values.contentModificationDate
                 let projectName = directory.lastPathComponent
                 results.append(NodeModulesItem(
                     projectName: projectName,
@@ -113,14 +113,14 @@ actor NodeModulesScanner {
             let name = item.lastPathComponent
             guard !Self.skipDirs.contains(name) else { continue }
             guard (try? item.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true else { continue }
-            let subResults = await findNodeModules(in: item, maxDepth: maxDepth, currentDepth: currentDepth + 1)
+            let subResults = await findNodeModules(in: item, fileManager: fileManager, maxDepth: maxDepth, currentDepth: currentDepth + 1)
             results.append(contentsOf: subResults)
         }
 
         return results
     }
 
-    private func directorySize(at url: URL) -> Int64 {
+    nonisolated private func directorySize(at url: URL, fileManager: FileManager) -> Int64 {
         var total: Int64 = 0
         guard let enumerator = fileManager.enumerator(
             at: url,

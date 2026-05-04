@@ -77,7 +77,8 @@ actor NodeModulesScanner {
             .sorted { $0.sizeBytes > $1.sizeBytes }
     }
 
-    private func findNodeModules(in directory: URL, maxDepth: Int, currentDepth: Int = 0) async -> [NodeModulesItem] {
+    nonisolated private func findNodeModules(in directory: URL, maxDepth: Int, currentDepth: Int = 0) async -> [NodeModulesItem] {
+        let fileManager = FileManager.default
         guard currentDepth < maxDepth else { return [] }
 
         var results: [NodeModulesItem] = []
@@ -120,7 +121,8 @@ actor NodeModulesScanner {
         return results
     }
 
-    private func directorySize(at url: URL) -> Int64 {
+    nonisolated private func directorySize(at url: URL) -> Int64 {
+        let fileManager = FileManager.default
         var total: Int64 = 0
         guard let enumerator = fileManager.enumerator(
             at: url,

@@ -100,6 +100,7 @@ actor CacheCleaner {
 
     /// Run a custom clean command via /usr/bin/env with a 30-second timeout.
     private func runCleanCommand(_ args: [String]) throws {
+        guard !args.isEmpty else { return }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
         process.arguments = args

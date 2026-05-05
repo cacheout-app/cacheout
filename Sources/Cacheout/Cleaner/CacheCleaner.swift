@@ -46,10 +46,12 @@ actor CacheCleaner {
         for result in results where result.isSelected && !result.isEmpty {
             var categoryFreed: Int64 = 0
 
-            // If the category has a custom clean command, run it instead of deleting files
-            if let command = result.category.cleanCommand {
+            // If the category has custom clean commands, run them sequentially instead of deleting files
+            if let commands = result.category.cleanCommands {
                 do {
-                    try runCleanCommand(command)
+                    for command in commands {
+                        try runCleanCommand(command)
+                    }
                     categoryFreed = result.sizeBytes
                 } catch {
                     errors.append((result.category.name, error.localizedDescription))
@@ -96,11 +98,11 @@ actor CacheCleaner {
         return CleanupReport(cleaned: cleaned, errors: errors)
     }
 
-    /// Run a custom clean command via /bin/bash with a 30-second timeout.
-    private func runCleanCommand(_ command: String) throws {
+    /// Run a custom clean command via /usr/bin/env with a 30-second timeout.
+    private func runCleanCommand(_ args: [String]) throws {
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/bin/bash")
-        process.arguments = ["-c", command]
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = args
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
         process.environment = [

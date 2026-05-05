@@ -61,8 +61,9 @@ actor NodeModulesScanner {
             for root in Self.searchRoots {
                 let rootURL = home.appendingPathComponent(root)
                 guard fileManager.fileExists(atPath: rootURL.path) else { continue }
+                let fm = fileManager
                 group.addTask {
-                    await self.findNodeModules(in: rootURL, maxDepth: maxDepth)
+                    await self.findNodeModules(in: rootURL, maxDepth: maxDepth, fileManager: fm)
                 }
             }
             for await items in group {
@@ -77,25 +78,23 @@ actor NodeModulesScanner {
             .sorted { $0.sizeBytes > $1.sizeBytes }
     }
 
-    private func findNodeModules(in directory: URL, maxDepth: Int, currentDepth: Int = 0) async -> [NodeModulesItem] {
+    private nonisolated func findNodeModules(in directory: URL, maxDepth: Int, currentDepth: Int = 0, fileManager: FileManager) async -> [NodeModulesItem] {
         guard currentDepth < maxDepth else { return [] }
 
         var results: [NodeModulesItem] = []
         let nodeModulesURL = directory.appendingPathComponent("node_modules")
 
-        // Check if this directory contains node_modules
-        var isDir: ObjCBool = false
-        if fileManager.fileExists(atPath: nodeModulesURL.path, isDirectory: &isDir), isDir.boolValue {
-            let size = directorySize(at: nodeModulesURL)
+        // Check if this directory contains node_modules using a single syscall
+        if let values = try? nodeModulesURL.resourceValues(forKeys: [.isDirectoryKey, .contentModificationDateKey]), values.isDirectory == true {
+            let size = directorySize(at: nodeModulesURL, fileManager: fileManager)
             if size > 0 {
-                let lastMod = try? fileManager.attributesOfItem(atPath: nodeModulesURL.path)[.modificationDate] as? Date
                 let projectName = directory.lastPathComponent
                 results.append(NodeModulesItem(
                     projectName: projectName,
                     projectPath: directory,
                     nodeModulesPath: nodeModulesURL,
                     sizeBytes: size,
-                    lastModified: lastMod
+                    lastModified: values.contentModificationDate
                 ))
             }
             // Don't recurse into projects that have node_modules — they won't have nested projects
@@ -113,14 +112,14 @@ actor NodeModulesScanner {
             let name = item.lastPathComponent
             guard !Self.skipDirs.contains(name) else { continue }
             guard (try? item.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true else { continue }
-            let subResults = await findNodeModules(in: item, maxDepth: maxDepth, currentDepth: currentDepth + 1)
+            let subResults = await findNodeModules(in: item, maxDepth: maxDepth, currentDepth: currentDepth + 1, fileManager: fileManager)
             results.append(contentsOf: subResults)
         }
 
         return results
     }
 
-    private func directorySize(at url: URL) -> Int64 {
+    private nonisolated func directorySize(at url: URL, fileManager: FileManager) -> Int64 {
         var total: Int64 = 0
         guard let enumerator = fileManager.enumerator(
             at: url,

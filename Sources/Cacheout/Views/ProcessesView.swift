@@ -167,6 +167,7 @@ struct ProcessesView: View {
         }
         .menuStyle(.borderlessButton)
         .fixedSize()
+        .accessibilityLabel("Process Actions")
     }
 
     private func requestConfirmation(

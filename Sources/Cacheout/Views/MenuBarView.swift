@@ -254,6 +254,7 @@ struct MenuBarView: View {
             }
             .buttonStyle(.bordered)
             .help("Open full window")
+            .accessibilityLabel("Open full window")
         }
     }
 

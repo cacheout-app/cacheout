@@ -88,7 +88,7 @@ actor ProcessMemoryScanner {
         let actualCount = proc_listallpids(&pids, bufferBytes)
         guard actualCount > 0 else { return [] }
 
-        return Array(pids.prefix(Int(actualCount)).filter { $0 > 0 })
+        return pids.prefix(Int(actualCount)).filter { $0 > 0 }
     }
 
     // MARK: - Unprivileged Scan

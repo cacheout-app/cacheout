@@ -724,69 +724,62 @@ public final class SnapshotCleanup: Intervention {
         let stdoutHandle = stdoutPipe.fileHandleForReading
         let stderrHandle = stderrPipe.fileHandleForReading
 
-        // Set termination handler BEFORE run (pitfall).
-        // Shared flag so terminationHandler maps post-timeout exits to .timeout.
         let timedOutFlag = AtomicFlag()
 
         return try await withCheckedThrowingContinuation { continuation in
             let resumer = ThrowingOnceResumer(continuation)
 
             process.terminationHandler = { proc in
-                // If the timeout task already fired, map any exit to .timeout
-                // to avoid reporting a misleading SIGTERM/SIGKILL status.
                 if timedOutFlag.value {
                     resumer.resume(with: .failure(SnapshotError.timeout))
-                    return
                 }
-
-                let data = stdoutHandle.readDataToEndOfFile()
-                let output = String(data: data, encoding: .utf8) ?? ""
-
-                // Check terminationStatus — non-zero indicates failure.
-                if proc.terminationStatus != 0 {
-                    let errData = stderrHandle.readDataToEndOfFile()
-                    let errOutput = String(data: errData, encoding: .utf8) ?? "unknown"
-                    resumer.resume(with: .failure(SnapshotError.listFailed(
-                        status: proc.terminationStatus, stderr: errOutput)))
-                    return
-                }
-
-                // tmutil output lines like "com.apple.TimeMachine.2024-01-15-123456.local"
-                // Extract the date portion.
-                let dates = output.components(separatedBy: .newlines)
-                    .compactMap { line -> String? in
-                        let trimmed = line.trimmingCharacters(in: .whitespaces)
-                        // Extract date from "com.apple.TimeMachine.YYYY-MM-DD-HHMMSS.local"
-                        guard trimmed.hasPrefix("com.apple.TimeMachine.") else { return nil }
-                        let stripped = trimmed
-                            .replacingOccurrences(of: "com.apple.TimeMachine.", with: "")
-                            .replacingOccurrences(of: ".local", with: "")
-                        return stripped.isEmpty ? nil : stripped
-                    }
-
-                resumer.resume(with: .success(dates))
             }
 
             do {
                 try process.run()
             } catch {
                 resumer.resume(with: .failure(error))
+                return
             }
 
-            // Timeout for listing; terminate and escalate to SIGKILL if needed.
             Task {
                 try? await Task.sleep(nanoseconds: UInt64(SnapshotCleanup.listTimeoutSeconds * 1_000_000_000))
                 guard process.isRunning else { return }
                 timedOutFlag.set()
                 process.terminate()
-                // Wait 2s for graceful exit, then force-kill.
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
                 if process.isRunning {
                     kill(process.processIdentifier, SIGKILL)
-                    // Wait for child to be reaped before resuming.
                     process.waitUntilExit()
                 }
                 resumer.resume(with: .failure(SnapshotError.timeout))
+            }
+
+            DispatchQueue.global().async {
+                let stdoutData = stdoutHandle.readDataToEndOfFile()
+                let stderrData = stderrHandle.readDataToEndOfFile()
+                process.waitUntilExit()
+
+                if timedOutFlag.value { return }
+
+                if process.terminationStatus != 0 {
+                    let errOutput = String(data: stderrData, encoding: .utf8) ?? "unknown"
+                    resumer.resume(with: .failure(SnapshotError.listFailed(
+                        status: process.terminationStatus, stderr: errOutput)))
+                    return
+                }
+
+                let output = String(data: stdoutData, encoding: .utf8) ?? ""
+                let dates = output.components(separatedBy: .newlines)
+                    .compactMap { line -> String? in
+                        let trimmed = line.trimmingCharacters(in: .whitespaces)
+                        guard trimmed.hasPrefix("com.apple.TimeMachine.") else { return nil }
+                        let stripped = trimmed
+                            .replacingOccurrences(of: "com.apple.TimeMachine.", with: "")
+                            .replacingOccurrences(of: ".local", with: "")
+                        return stripped.isEmpty ? nil : stripped
+                    }
+                resumer.resume(with: .success(dates))
             }
         }
     }

@@ -12,3 +12,8 @@
 **Vulnerability:** A process can block (deadlock) when its stdout/stderr pipe fills before the parent reads it, because the child blocks on `write()` while the parent blocks on `waitUntilExit()`.
 **Learning:** `pipe.fileHandleForReading.readDataToEndOfFile()` after `process.waitUntilExit()` is the deadlock pattern. Default macOS pipe buffer is ~64KB.
 **Prevention:** Read the pipe before/concurrently-with waiting for exit. The simplest pattern is to perform the read inside the same background queue that calls `waitUntilExit()`, capturing the bytes for the caller to use after the dispatch group resolves.
+
+## 2024-05-01 - Avoid pipe deadlock by reading pipes before process termination
+**Vulnerability:** A process execution deadlock pattern existed where `pipe.fileHandleForReading.readDataToEndOfFile()` was called after `process.waitUntilExit()`, or when standard output was read inside a `terminationHandler`.
+**Learning:** If the pipe's buffer fills (e.g. ~64KB), the child process blocks on `write()`, while the parent blocks on `waitUntilExit()` or waiting for the `terminationHandler` to fire, creating a deadlock.
+**Prevention:** Refactor process execution to read pipes before `waitUntilExit()` or synchronously inside a concurrent context/background queue before joining the execution flow.

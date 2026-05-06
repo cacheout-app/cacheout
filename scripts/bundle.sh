@@ -4,9 +4,9 @@
 #
 # Usage:
 #   ./scripts/bundle.sh              Build unsigned .app (testing)
-#   ./scripts/bundle.sh --direct     Build signed DMG for distribution
-#   ./scripts/bundle.sh --notarize   Notarize an existing DMG
-#   ./scripts/bundle.sh --release    Build + sign + DMG + notarize (full pipeline)
+#   ./scripts/bundle.sh --direct     Build signed DMG for distribution (no notarization)
+#   ./scripts/bundle.sh --notarize   Full pipeline: build + sign + DMG + notarize
+#   ./scripts/bundle.sh --release    Alias for --notarize
 
 set -e
 set -o pipefail
@@ -53,10 +53,29 @@ create_bundle() {
     rm -rf "$DEST_DIR/$APP_BUNDLE"
     mkdir -p "$DEST_DIR/$APP_BUNDLE/Contents/MacOS"
     mkdir -p "$DEST_DIR/$APP_BUNDLE/Contents/Resources"
-    
+    mkdir -p "$DEST_DIR/$APP_BUNDLE/Contents/Frameworks"
+
     # Copy executable
     cp "$BUILD_DIR/$APP_NAME" "$DEST_DIR/$APP_BUNDLE/Contents/MacOS/$APP_NAME"
-    
+
+    # Bundle Sparkle.framework (linked by SPM) into Contents/Frameworks
+    if [ -d "$BUILD_DIR/Sparkle.framework" ]; then
+        ditto "$BUILD_DIR/Sparkle.framework" "$DEST_DIR/$APP_BUNDLE/Contents/Frameworks/Sparkle.framework"
+        echo "   ✓ Sparkle.framework bundled"
+    else
+        echo "❌ Sparkle.framework not found in $BUILD_DIR"
+        exit 1
+    fi
+
+    # The SPM-built binary has @loader_path rpath but no @executable_path/../Frameworks.
+    # Add the standard Frameworks rpath so dyld finds @rpath/Sparkle.framework at runtime.
+    if ! otool -l "$DEST_DIR/$APP_BUNDLE/Contents/MacOS/$APP_NAME" \
+        | grep -A2 LC_RPATH | grep -q "@executable_path/../Frameworks"; then
+        install_name_tool -add_rpath "@executable_path/../Frameworks" \
+            "$DEST_DIR/$APP_BUNDLE/Contents/MacOS/$APP_NAME"
+        echo "   ✓ Added @executable_path/../Frameworks rpath"
+    fi
+
     # Copy icon
     if [ -f "$PROJECT_DIR/Cacheout.icns" ]; then
         cp "$PROJECT_DIR/Cacheout.icns" "$DEST_DIR/$APP_BUNDLE/Contents/Resources/Cacheout.icns"
@@ -105,15 +124,39 @@ PLIST
     
     echo -n "APPL????" > "$DEST_DIR/$APP_BUNDLE/Contents/PkgInfo"
     
-    # Sign
+    # Sign — Sparkle.framework (and its inner XPC services / Updater.app) MUST be
+    # signed before the outer app, with hardened runtime when using a Developer ID.
+    # Per Sparkle's sandboxing docs (https://sparkle-project.org/documentation/sandboxing/),
+    # Downloader.xpc must be re-signed with --preserve-metadata=entitlements (Sparkle 2.6+);
+    # the other inner items do NOT use that flag.
+    local SPARKLE="$DEST_DIR/$APP_BUNDLE/Contents/Frameworks/Sparkle.framework"
     if [ -n "$SIGN_CERT" ]; then
-        echo "🔐 Signing with: $SIGN_CERT"
+        echo "🔐 Signing Sparkle inner components with: $SIGN_CERT"
+        # Downloader.xpc keeps its entitlements (network / sandbox in some Sparkle builds)
+        if [ -e "$SPARKLE/Versions/B/XPCServices/Downloader.xpc" ]; then
+            codesign --force --options runtime \
+                --preserve-metadata=entitlements \
+                --sign "$SIGN_CERT" \
+                "$SPARKLE/Versions/B/XPCServices/Downloader.xpc"
+        fi
+        # Other inner items: standard re-sign, no entitlements to preserve
+        for inner in \
+            "$SPARKLE/Versions/B/XPCServices/Installer.xpc" \
+            "$SPARKLE/Versions/B/Updater.app" \
+            "$SPARKLE/Versions/B/Autoupdate"; do
+            if [ -e "$inner" ]; then
+                codesign --force --options runtime --sign "$SIGN_CERT" "$inner"
+            fi
+        done
+        codesign --force --options runtime --sign "$SIGN_CERT" "$SPARKLE"
+
+        echo "🔐 Signing app with: $SIGN_CERT"
         codesign --force --options runtime \
             --sign "$SIGN_CERT" \
             "$DEST_DIR/$APP_BUNDLE"
-        
+
         echo "🔍 Verifying signature..."
-        codesign --verify --verbose "$DEST_DIR/$APP_BUNDLE"
+        codesign --verify --deep --strict --verbose=2 "$DEST_DIR/$APP_BUNDLE"
     else
         echo "🔓 Ad-hoc signing (no certificate)..."
         codesign --force --deep --sign - "$DEST_DIR/$APP_BUNDLE"
@@ -228,14 +271,13 @@ case "${1:-}" in
         echo "To notarize (required for Gatekeeper):"
         echo "  ./scripts/bundle.sh --notarize"
         ;;
-    
-    --notarize)
-        notarize_dmg
-        ;;
-    
-    --release)
+
+    --notarize|--release)
+        # --notarize now performs the full pipeline (build + sign + DMG + notarize).
+        # --release is kept as an alias for the same operation.
         if [ -z "$DEVID_CERT" ]; then
             echo "❌ Developer ID Application certificate required!"
+            echo "   Found in Keychain? Check: security find-identity -v -p codesigning"
             exit 1
         fi
         build_release
@@ -257,8 +299,8 @@ case "${1:-}" in
         echo "🚀 To run:  open $DEST_DIR/$APP_BUNDLE"
         echo ""
         echo "Distribution options:"
-        echo "  ./scripts/bundle.sh --direct    Build signed DMG"
-        echo "  ./scripts/bundle.sh --notarize  Notarize existing DMG"
-        echo "  ./scripts/bundle.sh --release   Full pipeline (build+sign+DMG+notarize)"
+        echo "  ./scripts/bundle.sh --direct    Build signed DMG (no notarization)"
+        echo "  ./scripts/bundle.sh --notarize  Full pipeline: build + sign + DMG + notarize"
+        echo "  ./scripts/bundle.sh --release   Alias for --notarize"
         ;;
 esac

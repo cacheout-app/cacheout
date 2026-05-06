@@ -126,12 +126,21 @@ PLIST
     
     # Sign — Sparkle.framework (and its inner XPC services / Updater.app) MUST be
     # signed before the outer app, with hardened runtime when using a Developer ID.
+    # Per Sparkle's sandboxing docs (https://sparkle-project.org/documentation/sandboxing/),
+    # Downloader.xpc must be re-signed with --preserve-metadata=entitlements (Sparkle 2.6+);
+    # the other inner items do NOT use that flag.
     local SPARKLE="$DEST_DIR/$APP_BUNDLE/Contents/Frameworks/Sparkle.framework"
     if [ -n "$SIGN_CERT" ]; then
         echo "🔐 Signing Sparkle inner components with: $SIGN_CERT"
-        # Inner sub-bundles first (XPC services, Updater.app, Autoupdate)
+        # Downloader.xpc keeps its entitlements (network / sandbox in some Sparkle builds)
+        if [ -e "$SPARKLE/Versions/B/XPCServices/Downloader.xpc" ]; then
+            codesign --force --options runtime \
+                --preserve-metadata=entitlements \
+                --sign "$SIGN_CERT" \
+                "$SPARKLE/Versions/B/XPCServices/Downloader.xpc"
+        fi
+        # Other inner items: standard re-sign, no entitlements to preserve
         for inner in \
-            "$SPARKLE/Versions/B/XPCServices/Downloader.xpc" \
             "$SPARKLE/Versions/B/XPCServices/Installer.xpc" \
             "$SPARKLE/Versions/B/Updater.app" \
             "$SPARKLE/Versions/B/Autoupdate"; do

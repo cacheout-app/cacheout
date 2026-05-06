@@ -53,10 +53,29 @@ create_bundle() {
     rm -rf "$DEST_DIR/$APP_BUNDLE"
     mkdir -p "$DEST_DIR/$APP_BUNDLE/Contents/MacOS"
     mkdir -p "$DEST_DIR/$APP_BUNDLE/Contents/Resources"
-    
+    mkdir -p "$DEST_DIR/$APP_BUNDLE/Contents/Frameworks"
+
     # Copy executable
     cp "$BUILD_DIR/$APP_NAME" "$DEST_DIR/$APP_BUNDLE/Contents/MacOS/$APP_NAME"
-    
+
+    # Bundle Sparkle.framework (linked by SPM) into Contents/Frameworks
+    if [ -d "$BUILD_DIR/Sparkle.framework" ]; then
+        ditto "$BUILD_DIR/Sparkle.framework" "$DEST_DIR/$APP_BUNDLE/Contents/Frameworks/Sparkle.framework"
+        echo "   ✓ Sparkle.framework bundled"
+    else
+        echo "❌ Sparkle.framework not found in $BUILD_DIR"
+        exit 1
+    fi
+
+    # The SPM-built binary has @loader_path rpath but no @executable_path/../Frameworks.
+    # Add the standard Frameworks rpath so dyld finds @rpath/Sparkle.framework at runtime.
+    if ! otool -l "$DEST_DIR/$APP_BUNDLE/Contents/MacOS/$APP_NAME" \
+        | grep -A2 LC_RPATH | grep -q "@executable_path/../Frameworks"; then
+        install_name_tool -add_rpath "@executable_path/../Frameworks" \
+            "$DEST_DIR/$APP_BUNDLE/Contents/MacOS/$APP_NAME"
+        echo "   ✓ Added @executable_path/../Frameworks rpath"
+    fi
+
     # Copy icon
     if [ -f "$PROJECT_DIR/Cacheout.icns" ]; then
         cp "$PROJECT_DIR/Cacheout.icns" "$DEST_DIR/$APP_BUNDLE/Contents/Resources/Cacheout.icns"
@@ -105,15 +124,30 @@ PLIST
     
     echo -n "APPL????" > "$DEST_DIR/$APP_BUNDLE/Contents/PkgInfo"
     
-    # Sign
+    # Sign — Sparkle.framework (and its inner XPC services / Updater.app) MUST be
+    # signed before the outer app, with hardened runtime when using a Developer ID.
+    local SPARKLE="$DEST_DIR/$APP_BUNDLE/Contents/Frameworks/Sparkle.framework"
     if [ -n "$SIGN_CERT" ]; then
-        echo "🔐 Signing with: $SIGN_CERT"
+        echo "🔐 Signing Sparkle inner components with: $SIGN_CERT"
+        # Inner sub-bundles first (XPC services, Updater.app, Autoupdate)
+        for inner in \
+            "$SPARKLE/Versions/B/XPCServices/Downloader.xpc" \
+            "$SPARKLE/Versions/B/XPCServices/Installer.xpc" \
+            "$SPARKLE/Versions/B/Updater.app" \
+            "$SPARKLE/Versions/B/Autoupdate"; do
+            if [ -e "$inner" ]; then
+                codesign --force --options runtime --sign "$SIGN_CERT" "$inner"
+            fi
+        done
+        codesign --force --options runtime --sign "$SIGN_CERT" "$SPARKLE"
+
+        echo "🔐 Signing app with: $SIGN_CERT"
         codesign --force --options runtime \
             --sign "$SIGN_CERT" \
             "$DEST_DIR/$APP_BUNDLE"
-        
+
         echo "🔍 Verifying signature..."
-        codesign --verify --verbose "$DEST_DIR/$APP_BUNDLE"
+        codesign --verify --deep --strict --verbose=2 "$DEST_DIR/$APP_BUNDLE"
     else
         echo "🔓 Ad-hoc signing (no certificate)..."
         codesign --force --deep --sign - "$DEST_DIR/$APP_BUNDLE"

@@ -4,9 +4,9 @@
 #
 # Usage:
 #   ./scripts/bundle.sh              Build unsigned .app (testing)
-#   ./scripts/bundle.sh --direct     Build signed DMG for distribution
-#   ./scripts/bundle.sh --notarize   Notarize an existing DMG
-#   ./scripts/bundle.sh --release    Build + sign + DMG + notarize (full pipeline)
+#   ./scripts/bundle.sh --direct     Build signed DMG for distribution (no notarization)
+#   ./scripts/bundle.sh --notarize   Full pipeline: build + sign + DMG + notarize
+#   ./scripts/bundle.sh --release    Alias for --notarize
 
 set -e
 set -o pipefail
@@ -262,14 +262,13 @@ case "${1:-}" in
         echo "To notarize (required for Gatekeeper):"
         echo "  ./scripts/bundle.sh --notarize"
         ;;
-    
-    --notarize)
-        notarize_dmg
-        ;;
-    
-    --release)
+
+    --notarize|--release)
+        # --notarize now performs the full pipeline (build + sign + DMG + notarize).
+        # --release is kept as an alias for the same operation.
         if [ -z "$DEVID_CERT" ]; then
             echo "❌ Developer ID Application certificate required!"
+            echo "   Found in Keychain? Check: security find-identity -v -p codesigning"
             exit 1
         fi
         build_release
@@ -291,8 +290,8 @@ case "${1:-}" in
         echo "🚀 To run:  open $DEST_DIR/$APP_BUNDLE"
         echo ""
         echo "Distribution options:"
-        echo "  ./scripts/bundle.sh --direct    Build signed DMG"
-        echo "  ./scripts/bundle.sh --notarize  Notarize existing DMG"
-        echo "  ./scripts/bundle.sh --release   Full pipeline (build+sign+DMG+notarize)"
+        echo "  ./scripts/bundle.sh --direct    Build signed DMG (no notarization)"
+        echo "  ./scripts/bundle.sh --notarize  Full pipeline: build + sign + DMG + notarize"
+        echo "  ./scripts/bundle.sh --release   Alias for --notarize"
         ;;
 esac

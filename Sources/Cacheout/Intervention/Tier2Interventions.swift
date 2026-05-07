@@ -731,7 +731,26 @@ public final class SnapshotCleanup: Intervention {
         return try await withCheckedThrowingContinuation { continuation in
             let resumer = ThrowingOnceResumer(continuation)
 
+            var stdOutData = Data()
+            var stdErrData = Data()
+            let readGroup = DispatchGroup()
+
+            readGroup.enter()
+            DispatchQueue.global().async {
+                stdOutData = stdoutHandle.readDataToEndOfFile()
+                readGroup.leave()
+            }
+
+            readGroup.enter()
+            DispatchQueue.global().async {
+                stdErrData = stderrHandle.readDataToEndOfFile()
+                readGroup.leave()
+            }
+
             process.terminationHandler = { proc in
+                // Wait for readers to finish reading the buffered output
+                readGroup.wait()
+
                 // If the timeout task already fired, map any exit to .timeout
                 // to avoid reporting a misleading SIGTERM/SIGKILL status.
                 if timedOutFlag.value {
@@ -739,13 +758,11 @@ public final class SnapshotCleanup: Intervention {
                     return
                 }
 
-                let data = stdoutHandle.readDataToEndOfFile()
-                let output = String(data: data, encoding: .utf8) ?? ""
+                let output = String(data: stdOutData, encoding: .utf8) ?? ""
 
                 // Check terminationStatus — non-zero indicates failure.
                 if proc.terminationStatus != 0 {
-                    let errData = stderrHandle.readDataToEndOfFile()
-                    let errOutput = String(data: errData, encoding: .utf8) ?? "unknown"
+                    let errOutput = String(data: stdErrData, encoding: .utf8) ?? "unknown"
                     resumer.resume(with: .failure(SnapshotError.listFailed(
                         status: proc.terminationStatus, stderr: errOutput)))
                     return

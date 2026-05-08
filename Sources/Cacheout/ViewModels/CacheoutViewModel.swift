@@ -54,6 +54,9 @@ class CacheoutViewModel: ObservableObject {
     @Published var nodeModulesItems: [NodeModulesItem] = []
     @Published var isNodeModulesScanning = false
 
+    private var scanResultIndexMap: [UUID: Int] = [:]
+    private var nodeModulesIndexMap: [UUID: Int] = [:]
+
     /// Increments on every completed scan — views can use .task(id:) to react
     @Published var scanGeneration: Int = 0
 
@@ -154,9 +157,11 @@ class CacheoutViewModel: ObservableObject {
         async let nmResults = nodeModulesScanner.scan()
 
         scanResults = await cacheResults
+        scanResultIndexMap = scanResults.enumerated().reduce(into: [:]) { $0[$1.element.id] = $1.offset }
         isScanning = false
 
         nodeModulesItems = await nmResults
+        nodeModulesIndexMap = nodeModulesItems.enumerated().reduce(into: [:]) { $0[$1.element.id] = $1.offset }
         isNodeModulesScanning = false
 
         // Track scan completion for reactive UI updates
@@ -166,7 +171,9 @@ class CacheoutViewModel: ObservableObject {
     }
 
     func toggleSelection(for id: UUID) {
-        if let index = scanResults.firstIndex(where: { $0.id == id }) {
+        if let index = scanResultIndexMap[id], index < scanResults.count, scanResults[index].id == id {
+            scanResults[index].isSelected.toggle()
+        } else if let index = scanResults.firstIndex(where: { $0.id == id }) {
             scanResults[index].isSelected.toggle()
         }
     }
@@ -191,7 +198,9 @@ class CacheoutViewModel: ObservableObject {
     // MARK: - Node Modules selection
 
     func toggleNodeModulesSelection(for id: UUID) {
-        if let i = nodeModulesItems.firstIndex(where: { $0.id == id }) {
+        if let i = nodeModulesIndexMap[id], i < nodeModulesItems.count, nodeModulesItems[i].id == id {
+            nodeModulesItems[i].isSelected.toggle()
+        } else if let i = nodeModulesItems.firstIndex(where: { $0.id == id }) {
             nodeModulesItems[i].isSelected.toggle()
         }
     }

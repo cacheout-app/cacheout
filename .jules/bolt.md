@@ -21,3 +21,7 @@
 ## 2026-03-19 - FileManager Enumerator Pre-fetching
 **Learning:** Any property requested via `resourceValues(forKeys:)` inside a `FileManager.enumerator` loop must also be in `includingPropertiesForKeys` — otherwise `URL.resourceValues` falls back to a synchronous `stat()` per file, turning bulk reads into O(N) disk I/O.
 **Action:** Keep the keys array passed to `resourceValues(forKeys:)` a subset of the prefetch list passed to `FileManager.enumerator(at:includingPropertiesForKeys:)`.
+
+## 2024-06-25 - O(1) Index Maps for @Published Array Toggles
+**Learning:** When toggling the selection state of an item within a massive `@Published` array (like `nodeModulesItems`), sequentially searching for the element's index via `firstIndex(where:)` causes O(n) CPU latency on every user click.
+**Action:** Replace `firstIndex(where:)` with an O(1) dictionary-based index map (`[UUID: Int]`). Rebuild the dictionary via `enumerated().reduce(into: [:])` immediately after the main array is fully populated (e.g., after a scan operation completes), and include a defensive boundary and ID check fallback for robustness.

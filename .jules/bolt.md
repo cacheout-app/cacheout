@@ -21,3 +21,7 @@
 ## 2026-03-19 - FileManager Enumerator Pre-fetching
 **Learning:** Any property requested via `resourceValues(forKeys:)` inside a `FileManager.enumerator` loop must also be in `includingPropertiesForKeys` — otherwise `URL.resourceValues` falls back to a synchronous `stat()` per file, turning bulk reads into O(N) disk I/O.
 **Action:** Keep the keys array passed to `resourceValues(forKeys:)` a subset of the prefetch list passed to `FileManager.enumerator(at:includingPropertiesForKeys:)`.
+
+## 2024-05-18 - Dictionary overhead vs O(n) array lookups
+**Learning:** Avoid replacing O(n) `firstIndex(where:)` searches with O(1) dictionary-based index maps for SwiftUI `@Published` arrays if the collection is small, the interaction is infrequent, or the map requires frequent reconstruction (e.g., on every scan). The O(n) map construction overhead (allocating memory and hashing every UUID) will outweigh the lookup benefits.
+**Action:** When evaluating lookup optimizations, explicitly weigh the frequency of the lookup against the frequency of the dataset being rebuilt. Use index maps only for large, long-lived datasets with extremely frequent, hot-path lookups.

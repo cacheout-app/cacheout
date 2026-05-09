@@ -336,7 +336,8 @@ extension WebhookAlerter.WebhookConfig {
     public static func parse(from json: [String: Any]) -> WebhookAlerter.WebhookConfig? {
         guard let webhook = json["webhook"] as? [String: Any],
               let urlStr = webhook["url"] as? String,
-              let url = URL(string: urlStr) else {
+              let url = URL(string: urlStr),
+              url.scheme?.lowercased() == "https" else {
             return nil
         }
         let format = webhook["format"] as? String ?? "generic"

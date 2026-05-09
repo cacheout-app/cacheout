@@ -58,6 +58,10 @@ struct NodeModulesSection: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            .accessibilityLabel("Project node modules")
+            .accessibilityValue(isExpanded ? "Expanded" : "Collapsed")
+            .accessibilityAddTraits(.isButton)
+            .help(isExpanded ? "Collapse node_modules section" : "Expand node_modules section")
 
             if isExpanded && viewModel.isNodeModulesScanning {
                 HStack {

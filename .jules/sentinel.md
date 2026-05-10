@@ -17,3 +17,7 @@
 **Vulnerability:** Webhook configuration allowed unencrypted `http` URLs, exposing sensitive system metrics and alerts to interception.
 **Learning:** Validation in `StatusSocket.swift` permitted both `http` and `https`, and `WebhookAlerter.swift` didn't validate the scheme at all during parsing, potentially allowing insecure data transmission.
 **Prevention:** Consistently enforce the `https` scheme requirement in both configuration validation (`AutopilotConfigValidator`) and active parsing (`WebhookConfig.parse`) to ensure secure data transit.
+
+## 2024-05-18 - Process Deadlock in CacheoutViewModel.runCleanCommand
+**Vulnerability:** `process.waitUntilExit()` was called before reading `pipe.fileHandleForReading` when executing `docker system prune` in `CacheoutViewModel.swift`. A specific instance of the 2024-04-22 pattern.
+**Prevention:** Same as 2024-04-22 — read the pipe before calling `waitUntilExit()`, or prefer `try fileHandle.readToEnd()`.

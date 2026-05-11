@@ -20,18 +20,6 @@ private enum XPCResult<T> {
     case failed(String)
 }
 
-private final class LockedData: @unchecked Sendable {
-    private var _data = Data()
-    private let lock = NSLock()
-
-    var data: Data { lock.withLock { _data } }
-
-    func append(_ newData: Data) {
-        lock.withLock { _data.append(newData) }
-    }
-}
-
-
 /// Thread-safe once-box for resuming a continuation exactly once.
 /// Uses an unfair lock for minimal overhead in the XPC callback path.
 private final class OnceResumer<T>: @unchecked Sendable {
@@ -758,14 +746,6 @@ public final class SnapshotCleanup: Intervention {
             process.terminationHandler = { proc in
                 stdoutHandle.readabilityHandler = nil
                 stderrHandle.readabilityHandler = nil
-
-                // Read remaining data to avoid truncation
-                if let remaining = try? stdoutHandle.readToEnd() {
-                    stdoutData.append(remaining)
-                }
-                if let remaining = try? stderrHandle.readToEnd() {
-                    stderrData.append(remaining)
-                }
 
                 if timedOutFlag.value {
                     resumer.resume(with: .failure(SnapshotError.timeout))

@@ -106,10 +106,16 @@ struct NodeModulesSection: View {
             }
 
             if isExpanded && !viewModel.isNodeModulesScanning && viewModel.nodeModulesItems.isEmpty {
-                Text("No node_modules directories found")
-                    .font(.caption)
-                    .foregroundStyle(.tertiary)
-                    .padding(.vertical, 8)
+                VStack(spacing: 8) {
+                    Image(systemName: "shippingbox")
+                        .font(.largeTitle)
+                        .foregroundStyle(.tertiary)
+                    Text("No node_modules directories found")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .center)
+                .padding(.vertical, 24)
             }
         }
     }

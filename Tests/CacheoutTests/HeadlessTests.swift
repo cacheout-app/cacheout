@@ -564,6 +564,18 @@ final class AutopilotConfigValidatorTests: XCTestCase {
         XCTAssertTrue(errors.contains { $0.contains("timeout_s must be 1-60") })
     }
 
+    func testWebhookHttpSchemeRejected() {
+        let json = """
+        {
+            "version": 1,
+            "enabled": true,
+            "webhook": {"url": "http://example.com/hook", "format": "generic", "timeout_s": 10}
+        }
+        """.data(using: .utf8)!
+        let errors = AutopilotConfigValidator.validate(data: json)
+        XCTAssertTrue(errors.contains { $0.contains("https scheme") })
+    }
+
     func testTelegramMissingFields() {
         let json = """
         {

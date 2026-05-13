@@ -552,6 +552,18 @@ final class AutopilotConfigValidatorTests: XCTestCase {
         XCTAssertTrue(errors.contains { $0.contains("unsupported format") })
     }
 
+    func testWebhookHTTPRejected() {
+        let json = """
+        {
+            "version": 1,
+            "enabled": true,
+            "webhook": {"url": "http://x.com", "format": "generic", "timeout_s": 5}
+        }
+        """.data(using: .utf8)!
+        let errors = AutopilotConfigValidator.validate(data: json)
+        XCTAssertTrue(errors.contains { $0.contains("must use https scheme") })
+    }
+
     func testWebhookTimeoutOutOfRange() {
         let json = """
         {

@@ -21,3 +21,7 @@
 ## 2026-03-19 - FileManager Enumerator Pre-fetching
 **Learning:** Any property requested via `resourceValues(forKeys:)` inside a `FileManager.enumerator` loop must also be in `includingPropertiesForKeys` — otherwise `URL.resourceValues` falls back to a synchronous `stat()` per file, turning bulk reads into O(N) disk I/O.
 **Action:** Keep the keys array passed to `resourceValues(forKeys:)` a subset of the prefetch list passed to `FileManager.enumerator(at:includingPropertiesForKeys:)`.
+
+## 2024-05-15 - Dictionary initialization performance with reduce(into:)
+**Learning:** Standard `for` loop dictionary insertions in Swift can trigger repeated mutation and Copy-On-Write (COW) overhead. Standard `.map` implementations create intermediate array allocations.
+**Action:** For efficient and safe initialization of dictionaries/index maps, use `reduce(into: [:])`. This avoids intermediate array allocations and prevents COW overhead by passing the accumulator as an `inout` reference.

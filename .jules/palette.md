@@ -9,3 +9,6 @@
 ## 2024-05-24 - Empty States in Process Lists
 **Learning:** Users can misinterpret an empty dynamic list (like processes) as a broken UI or a frozen app if there's no visual feedback indicating that the list is intentionally empty.
 **Action:** Always provide a clear, empty state with an icon and brief text for dynamic lists that might temporarily yield no results, preventing user confusion.
+## 2024-05-14 - Dynamic Button Labels and Helpful Tooltips
+**Learning:** Adding dynamic labels and `.help()` tooltips to buttons provides immediate feedback during async operations and explains the required state when disabled, significantly improving accessibility.
+**Action:** Always use dynamic labels for async tasks (e.g. 'Scanning...') and `.help()` modifiers to clarify disabled states or required conditions.

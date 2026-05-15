@@ -222,7 +222,7 @@ struct ContentView: View {
                 Button {
                     Task { await viewModel.scan() }
                 } label: {
-                    Label("Scan", systemImage: "arrow.clockwise")
+                    Label(viewModel.isScanning ? "Scanning..." : "Scan", systemImage: "arrow.clockwise")
                 }
                 .disabled(viewModel.isScanning)
 
@@ -230,11 +230,12 @@ struct ContentView: View {
                 Button {
                     viewModel.showCleanConfirmation = true
                 } label: {
-                    Label("Clean Selected", systemImage: "trash")
+                    Label(viewModel.isCleaning ? "Cleaning..." : "Clean Selected", systemImage: "trash")
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(.red)
                 .disabled(!viewModel.hasSelection || viewModel.isCleaning)
+                .help(!viewModel.hasSelection ? "Select items to clean" : "")
             }
             .padding(.horizontal)
             .padding(.vertical, 10)

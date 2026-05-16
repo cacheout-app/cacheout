@@ -64,7 +64,7 @@ actor CacheCleaner {
                         if moveToTrash {
                             try await trashDirectory(url)
                         } else {
-                            try removeContents(of: url)
+                            try await removeContents(of: url, fileManager: fileManager)
                         }
                         categoryFreed += result.sizeBytes
                     } catch {
@@ -133,12 +133,30 @@ actor CacheCleaner {
         }
     }
 
-    private func removeContents(of url: URL) throws {
+    nonisolated private func removeContents(of url: URL, fileManager: FileManager) async throws {
         let contents = try fileManager.contentsOfDirectory(
             at: url, includingPropertiesForKeys: nil
         )
-        for item in contents {
-            try fileManager.removeItem(at: item)
+
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            var iterator = contents.makeIterator()
+            let maxConcurrency = 8
+
+            for _ in 0..<maxConcurrency {
+                if let item = iterator.next() {
+                    group.addTask {
+                        try fileManager.removeItem(at: item)
+                    }
+                }
+            }
+
+            for try await _ in group {
+                if let nextItem = iterator.next() {
+                    group.addTask {
+                        try fileManager.removeItem(at: nextItem)
+                    }
+                }
+            }
         }
     }
 

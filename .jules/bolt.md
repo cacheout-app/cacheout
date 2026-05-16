@@ -21,3 +21,7 @@
 ## 2026-03-19 - FileManager Enumerator Pre-fetching
 **Learning:** Any property requested via `resourceValues(forKeys:)` inside a `FileManager.enumerator` loop must also be in `includingPropertiesForKeys` — otherwise `URL.resourceValues` falls back to a synchronous `stat()` per file, turning bulk reads into O(N) disk I/O.
 **Action:** Keep the keys array passed to `resourceValues(forKeys:)` a subset of the prefetch list passed to `FileManager.enumerator(at:includingPropertiesForKeys:)`.
+
+## 2025-06-01 - TaskGroup Sliding Window for FileManager operations
+**Learning:** Sequential file deletion using `FileManager.removeItem` in a loop creates a severe bottleneck for cache directories containing many subdirectories (like Xcode DerivedData). Because `FileManager.default` is thread-safe, non-isolated file operations can be run concurrently on background threads to significantly speed up IO-bound cleanups.
+**Action:** Use `withThrowingTaskGroup` with a sliding window iterator and `maxConcurrency` limit to perform `removeItem` operations in parallel, passing an injected `FileManager` instance to a `nonisolated` method to avoid actor executor serialization.

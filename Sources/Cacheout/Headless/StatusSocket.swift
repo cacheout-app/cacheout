@@ -708,8 +708,8 @@ public enum AutopilotConfigValidator {
             if let urlStr = webhook["url"] as? String {
                 if let url = URL(string: urlStr) {
                     let scheme = url.scheme?.lowercased() ?? ""
-                    if scheme != "http" && scheme != "https" {
-                        errors.append("webhook: url must use http or https scheme, got '\(scheme)'")
+                    if scheme != "https" {
+                        errors.append("webhook: url must use https scheme for security, got '\(scheme)'")
                     }
                     if url.host == nil || url.host?.isEmpty == true {
                         errors.append("webhook: url must be an absolute URL with a host")

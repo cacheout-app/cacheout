@@ -64,7 +64,7 @@ actor CacheCleaner {
                         if moveToTrash {
                             try await trashDirectory(url)
                         } else {
-                            try removeContents(of: url)
+                            try await removeContents(of: url, fileManager: fileManager)
                         }
                         categoryFreed += result.sizeBytes
                     } catch {
@@ -133,12 +133,33 @@ actor CacheCleaner {
         }
     }
 
-    private func removeContents(of url: URL) throws {
+    nonisolated private func removeContents(of url: URL, fileManager: FileManager) async throws {
         let contents = try fileManager.contentsOfDirectory(
             at: url, includingPropertiesForKeys: nil
         )
-        for item in contents {
-            try fileManager.removeItem(at: item)
+
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            // Limit concurrency to avoid overloading the system and cooperative thread pool
+            let maxConcurrency = 8
+            var iterator = contents.makeIterator()
+
+            for _ in 0..<maxConcurrency {
+                if let item = iterator.next() {
+                    group.addTask {
+                        try fileManager.removeItem(at: item)
+                    }
+                }
+            }
+
+            // As each task completes, add a new one, keeping the active task count at maxConcurrency.
+            // If any task throws an error, the for-await loop will rethrow it, implicitly cancelling remaining tasks (fail-fast behavior).
+            for try await _ in group {
+                if let item = iterator.next() {
+                    group.addTask {
+                        try fileManager.removeItem(at: item)
+                    }
+                }
+            }
         }
     }
 

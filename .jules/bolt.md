@@ -21,3 +21,7 @@
 ## 2026-03-19 - FileManager Enumerator Pre-fetching
 **Learning:** Any property requested via `resourceValues(forKeys:)` inside a `FileManager.enumerator` loop must also be in `includingPropertiesForKeys` — otherwise `URL.resourceValues` falls back to a synchronous `stat()` per file, turning bulk reads into O(N) disk I/O.
 **Action:** Keep the keys array passed to `resourceValues(forKeys:)` a subset of the prefetch list passed to `FileManager.enumerator(at:includingPropertiesForKeys:)`.
+
+## 2024-05-30 - DispatchQueue.concurrentPerform Thread Starvation
+**Learning:** Do not use `DispatchQueue.concurrentPerform` inside an `actor` or `async` context in Swift. It is a synchronous, blocking call that will lock a thread in the limited cooperative thread pool until all iterations finish, causing system-wide thread starvation. Furthermore, do not wrap large numbers of blocking I/O calls in `Task.detached` within a loop, as this allocates excessive tasks and causes overhead.
+**Action:** To parallelize bulk I/O operations (e.g., `FileManager.removeItem` loops) inside an actor, mark the method as `nonisolated async throws` and use a `withThrowingTaskGroup`. Implement a sliding window iterator (e.g., `maxConcurrency` of 8) and inject `FileManager` to safely parallelize the blocking calls without overloading the thread pool.

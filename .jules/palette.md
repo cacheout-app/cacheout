@@ -9,3 +9,7 @@
 ## 2024-05-24 - Empty States in Process Lists
 **Learning:** Users can misinterpret an empty dynamic list (like processes) as a broken UI or a frozen app if there's no visual feedback indicating that the list is intentionally empty.
 **Action:** Always provide a clear, empty state with an icon and brief text for dynamic lists that might temporarily yield no results, preventing user confusion.
+
+## 2024-05-25 - Dynamic Button Labels and Contextual Disabled Help
+**Learning:** In async operations or disabled button states, static text like "Clean Selected" leaves the user guessing why a button is disabled (e.g. no selection) or if an action is currently running.
+**Action:** Use conditional labels (e.g., `viewModel.isScanning ? "Scanning..." : "Scan"`) and add `.help()` tooltips explaining exactly why a button is disabled (e.g. "Select items to clean") to provide immediate, clear feedback.

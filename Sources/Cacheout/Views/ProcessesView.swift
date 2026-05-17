@@ -180,6 +180,7 @@ struct ProcessesView: View {
         }
         .menuStyle(.borderlessButton)
         .fixedSize()
+        .help("Process Actions")
         .accessibilityLabel("Process Actions")
     }
 

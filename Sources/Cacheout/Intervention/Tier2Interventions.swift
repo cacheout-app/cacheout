@@ -226,10 +226,9 @@ public final class JetsamHWM: Intervention {
         }
 
         // Step 3: Build priority lookup by PID (keep first entry per PID to avoid trap on duplicates).
-        var priorityByPID: [pid_t: JetsamPriorityEntryDTO] = [:]
-        for entry in priorities {
-            if priorityByPID[entry.pid] == nil {
-                priorityByPID[entry.pid] = entry
+        let priorityByPID: [pid_t: JetsamPriorityEntryDTO] = priorities.reduce(into: [:]) { dict, entry in
+            if dict[entry.pid] == nil {
+                dict[entry.pid] = entry
             }
         }
 

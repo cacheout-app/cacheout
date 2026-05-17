@@ -21,3 +21,7 @@
 ## 2026-03-19 - FileManager Enumerator Pre-fetching
 **Learning:** Any property requested via `resourceValues(forKeys:)` inside a `FileManager.enumerator` loop must also be in `includingPropertiesForKeys` — otherwise `URL.resourceValues` falls back to a synchronous `stat()` per file, turning bulk reads into O(N) disk I/O.
 **Action:** Keep the keys array passed to `resourceValues(forKeys:)` a subset of the prefetch list passed to `FileManager.enumerator(at:includingPropertiesForKeys:)`.
+
+## 2025-05-15 - Bulk I/O Parallelization
+**Learning:** `FileManager.removeItem` inside a standard loop operates sequentially, causing bulk cache deletions to be slow. Because it's a synchronous blocking operation, running it directly inside an actor context can exhaust the cooperative thread pool.
+**Action:** Parallelize bulk I/O operations using `withThrowingTaskGroup` and a sliding window iterator. Run the task group inside a `nonisolated` actor method, and wrap synchronous calls like `removeItem` in `Task.detached { ... }.value` to prevent thread exhaustion.

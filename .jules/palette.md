@@ -13,3 +13,7 @@
 ## 2024-05-25 - Tooltips on Icon-only Controls
 **Learning:** While `.accessibilityLabel` is required for VoiceOver users on icon-only controls, sighted mouse users can also struggle to understand the purpose of these controls without visual feedback.
 **Action:** Always add a `.help()` modifier to icon-only controls in SwiftUI to provide a hover tooltip for mouse users, complementing the `.accessibilityLabel()` for screen reader users.
+
+## 2024-05-25 - Dynamic Labels and Disabled State Tooltips
+**Learning:** Users can feel confused when a primary button is disabled without explanation or when a long-running action lacks immediate inline text feedback on the button itself.
+**Action:** In SwiftUI, enhance button accessibility and UX by adding `.help()` tooltips to explain the required state when disabled, and using dynamic labels (e.g., 'Scanning...') to provide immediate feedback during async operations.

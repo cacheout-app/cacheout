@@ -4,6 +4,12 @@ All notable changes to Cacheout will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.1.2] - 2026-05-17
+
+### Fixed
+
+- Menubar icon now uses the correct master artwork. The previous PNGs were a faint outline that effectively rendered invisible at 18×18 in template mode. Re-generated `MenuBarIcon{,@2x,Template,Template@2x}.png` from `Resources/menubar-icon-master.PNG` so the Cacheout "C" actually appears in the menubar.
+
 ## [2.1.1] - 2026-05-17
 
 ### Fixed

@@ -12,3 +12,8 @@
 **Vulnerability:** A process can block (deadlock) when its stdout/stderr pipe fills before the parent reads it, because the child blocks on `write()` while the parent blocks on `waitUntilExit()`.
 **Learning:** `pipe.fileHandleForReading.readDataToEndOfFile()` after `process.waitUntilExit()` is the deadlock pattern. Default macOS pipe buffer is ~64KB.
 **Prevention:** Read the pipe before/concurrently-with waiting for exit. The simplest pattern is to perform the read inside the same background queue that calls `waitUntilExit()`, capturing the bytes for the caller to use after the dispatch group resolves.
+
+## 2024-05-17 - Webhook URLs allowed unencrypted HTTP scheme
+**Vulnerability:** Webhook configuration allowed `http://` URLs for sending alerts.
+**Learning:** Sending daemon alerts over unencrypted HTTP exposes potentially sensitive system status and internal metrics to network interception (Man-in-the-Middle attacks).
+**Prevention:** Always enforce secure channels (`https://`) when configuring external webhooks, both at the validation layer and the parsing layer.

@@ -21,3 +21,7 @@
 ## 2026-03-19 - FileManager Enumerator Pre-fetching
 **Learning:** Any property requested via `resourceValues(forKeys:)` inside a `FileManager.enumerator` loop must also be in `includingPropertiesForKeys` — otherwise `URL.resourceValues` falls back to a synchronous `stat()` per file, turning bulk reads into O(N) disk I/O.
 **Action:** Keep the keys array passed to `resourceValues(forKeys:)` a subset of the prefetch list passed to `FileManager.enumerator(at:includingPropertiesForKeys:)`.
+
+## 2024-05-18 - FileManager Enumerator Parallelization and Thread Pool Exhaustion
+**Learning:** Sequential `FileManager.removeItem` calls inside a loop execute synchronously, causing O(N) blocking disk I/O. When parallelizing such bulk I/O operations using `withThrowingTaskGroup` in a `nonisolated` actor method (which runs on the global cooperative thread pool), wrapping the blocking `removeItem` calls in `Task.detached { ... }.value` does not actually prevent cooperative thread pool exhaustion, because `Task.detached` also uses the same cooperative pool.
+**Action:** Parallelize bulk file deletion using `withThrowingTaskGroup` with a sliding window iterator to cap concurrency (e.g., `maxConcurrency` = 8) to avoid swamping the disk queue and cooperative thread pool. In `nonisolated` methods, simply calling synchronous blocking operations inside `group.addTask` is acceptable as long as concurrency is tightly bounded, but realize that it still consumes cooperative threads.

@@ -35,12 +35,16 @@ build_release() {
     echo "🏗️  Building release binary (universal)..."
     cd "$PROJECT_DIR"
     swift build -c release 2>&1
-    
+
     if [ ! -f "$BUILD_DIR/$APP_NAME" ]; then
         echo "❌ Build failed - executable not found"
         exit 1
     fi
-    
+    if [ ! -f "$BUILD_DIR/CacheoutHelper" ]; then
+        echo "❌ Build failed - CacheoutHelper executable not found at $BUILD_DIR/CacheoutHelper"
+        exit 1
+    fi
+
     echo "✅ Build complete"
 }
 
@@ -81,7 +85,35 @@ create_bundle() {
         cp "$PROJECT_DIR/Cacheout.icns" "$DEST_DIR/$APP_BUNDLE/Contents/Resources/Cacheout.icns"
         echo "   ✓ Icon embedded"
     fi
-    
+
+    # Copy menubar icon resources. Bundle.main.image(forResource:) at
+    # CacheoutApp.swift expects these directly in Contents/Resources/ — the
+    # SPM-managed Cacheout_Cacheout.bundle is not searched. Without these the
+    # menubar item falls through to the SF Symbol fallback, and on some setups
+    # appears blank entirely.
+    local MENUBAR_RES_SRC="$PROJECT_DIR/Sources/Cacheout/Resources"
+    for png in MenuBarIcon.png MenuBarIcon@2x.png MenuBarIconTemplate.png MenuBarIconTemplate@2x.png; do
+        if [ -f "$MENUBAR_RES_SRC/$png" ]; then
+            cp "$MENUBAR_RES_SRC/$png" "$DEST_DIR/$APP_BUNDLE/Contents/Resources/$png"
+        fi
+    done
+    echo "   ✓ Menubar icon PNGs embedded"
+
+    # Bundle the privileged helper daemon at Contents/Library/LaunchDaemons/.
+    # SMAppService.daemon(plistName:) registers from this path, so without it
+    # the install-helper onboarding flow fails silently and autopilot is
+    # unavailable in --daemon mode.
+    local HELPER_BIN="$BUILD_DIR/CacheoutHelper"
+    local HELPER_PLIST="$MENUBAR_RES_SRC/com.cacheout.memhelper.plist"
+    if [ -f "$HELPER_BIN" ] && [ -f "$HELPER_PLIST" ]; then
+        mkdir -p "$DEST_DIR/$APP_BUNDLE/Contents/Library/LaunchDaemons"
+        cp "$HELPER_BIN" "$DEST_DIR/$APP_BUNDLE/Contents/Library/LaunchDaemons/CacheoutHelper"
+        cp "$HELPER_PLIST" "$DEST_DIR/$APP_BUNDLE/Contents/Library/LaunchDaemons/com.cacheout.memhelper.plist"
+        echo "   ✓ CacheoutHelper daemon + plist bundled"
+    else
+        echo "⚠️  CacheoutHelper not found at $HELPER_BIN — onboarding install-helper flow will fail"
+    fi
+
     # Create Info.plist
     cat > "$DEST_DIR/$APP_BUNDLE/Contents/Info.plist" << PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -149,6 +181,14 @@ PLIST
             fi
         done
         codesign --force --options runtime --sign "$SIGN_CERT" "$SPARKLE"
+
+        # Sign the privileged helper before the outer app — codesign --verify
+        # walks the bundle and will fail if any nested Mach-O isn't signed.
+        local HELPER="$DEST_DIR/$APP_BUNDLE/Contents/Library/LaunchDaemons/CacheoutHelper"
+        if [ -e "$HELPER" ]; then
+            echo "🔐 Signing CacheoutHelper..."
+            codesign --force --options runtime --sign "$SIGN_CERT" "$HELPER"
+        fi
 
         echo "🔐 Signing app with: $SIGN_CERT"
         codesign --force --options runtime \

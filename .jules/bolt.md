@@ -25,3 +25,9 @@
 ## 2024-05-25 - Efficient Dictionary Initialization
 **Learning:** Building a dictionary via a standard `for` loop by inserting elements one by one can cause unnecessary overhead due to repeated mutations. `reduce(into: [:])` is highly optimized in Swift to build collections without creating intermediate copies.
 **Action:** Use `reduce(into: [:])` when constructing a dictionary from an array, particularly when uniqueness checks or transformations are required.
+## 2024-05-18 - Cooperative Thread Pool Exhaustion in Bulk I/O
+**Learning:** In Swift Concurrency, executing synchronous blocking operations like `FileManager.removeItem` inside a `TaskGroup` without isolation can quickly exhaust the limited cooperative thread pool (which has threads equal to CPU cores), leading to system-wide deadlock or starvation.
+**Action:** When parallelizing synchronous blocking I/O calls, wrap them in `Task.detached { ... }.value` to escape the cooperative pool and execute on a background queue, and control concurrency with a sliding window iterator.
+## 2024-05-18 - Escaping Cooperative Thread Pool
+**Learning:** `Task.detached` executes on the global cooperative thread pool and does *not* safely offload synchronous blocking I/O. Using it with concurrent groups can still exhaust the thread pool.
+**Action:** To truly move blocking work (like `FileManager.removeItem`) off the cooperative thread pool in Swift Concurrency, wrap the execution in `withCheckedThrowingContinuation` and dispatch to a background GCD queue (e.g., `DispatchQueue.global(qos: .userInitiated).async`).

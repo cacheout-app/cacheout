@@ -64,7 +64,7 @@ actor CacheCleaner {
                         if moveToTrash {
                             try await trashDirectory(url)
                         } else {
-                            try removeContents(of: url)
+                            try await removeContents(of: url, fileManager: fileManager)
                         }
                         categoryFreed += result.sizeBytes
                     } catch {
@@ -86,7 +86,18 @@ actor CacheCleaner {
                 if moveToTrash {
                     try await trashItem(item.nodeModulesPath)
                 } else {
-                    try fileManager.removeItem(at: item.nodeModulesPath)
+                    let path = item.nodeModulesPath
+                    let fm = fileManager
+                    try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                        DispatchQueue.global(qos: .userInitiated).async {
+                            do {
+                                try fm.removeItem(at: path)
+                                continuation.resume()
+                            } catch {
+                                continuation.resume(throwing: error)
+                            }
+                        }
+                    }
                 }
                 cleaned.append(("node_modules: \(item.projectName)", item.sizeBytes))
                 logCleanup(category: "node_modules/\(item.projectName)", bytesFreed: item.sizeBytes)
@@ -133,12 +144,48 @@ actor CacheCleaner {
         }
     }
 
-    private func removeContents(of url: URL) throws {
+    nonisolated private func removeContents(of url: URL, fileManager: FileManager) async throws {
         let contents = try fileManager.contentsOfDirectory(
             at: url, includingPropertiesForKeys: nil
         )
-        for item in contents {
-            try fileManager.removeItem(at: item)
+
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            var iterator = contents.makeIterator()
+            let maxConcurrency = 8
+
+            for _ in 0..<maxConcurrency {
+                if let item = iterator.next() {
+                    group.addTask {
+                        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                            DispatchQueue.global(qos: .userInitiated).async {
+                                do {
+                                    try fileManager.removeItem(at: item)
+                                    continuation.resume()
+                                } catch {
+                                    continuation.resume(throwing: error)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            for try await _ in group {
+                if let item = iterator.next() {
+                    group.addTask {
+                        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                            DispatchQueue.global(qos: .userInitiated).async {
+                                do {
+                                    try fileManager.removeItem(at: item)
+                                    continuation.resume()
+                                } catch {
+                                    continuation.resume(throwing: error)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 

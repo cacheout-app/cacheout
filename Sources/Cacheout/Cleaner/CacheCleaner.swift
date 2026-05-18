@@ -64,7 +64,7 @@ actor CacheCleaner {
                         if moveToTrash {
                             try await trashDirectory(url)
                         } else {
-                            try removeContents(of: url)
+                            try await removeContents(of: url, fileManager: fileManager)
                         }
                         categoryFreed += result.sizeBytes
                     } catch {
@@ -133,12 +133,36 @@ actor CacheCleaner {
         }
     }
 
-    private func removeContents(of url: URL) throws {
+    // ⚡ Bolt Optimization: Parallelize bulk I/O operations using a sliding window TaskGroup
+    // and Task.detached to prevent cooperative thread pool exhaustion.
+    nonisolated private func removeContents(of url: URL, fileManager: FileManager) async throws {
         let contents = try fileManager.contentsOfDirectory(
             at: url, includingPropertiesForKeys: nil
         )
-        for item in contents {
-            try fileManager.removeItem(at: item)
+
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            let maxConcurrency = 8
+            var iterator = contents.makeIterator()
+
+            for _ in 0..<maxConcurrency {
+                if let item = iterator.next() {
+                    group.addTask {
+                        try await Task.detached {
+                            try fileManager.removeItem(at: item)
+                        }.value
+                    }
+                }
+            }
+
+            for try await _ in group {
+                if let item = iterator.next() {
+                    group.addTask {
+                        try await Task.detached {
+                            try fileManager.removeItem(at: item)
+                        }.value
+                    }
+                }
+            }
         }
     }
 

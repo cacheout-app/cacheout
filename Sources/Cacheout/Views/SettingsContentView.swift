@@ -122,14 +122,18 @@ struct SettingsContentView: View {
                         Task { await viewModel.dockerPrune() }
                     } label: {
                         if viewModel.isDockerPruning {
-                            ProgressView()
-                                .scaleEffect(0.7)
-                                .frame(width: 16, height: 16)
+                            HStack(spacing: 6) {
+                                ProgressView()
+                                    .scaleEffect(0.5)
+                                    .frame(width: 12, height: 12)
+                                Text("Pruning...")
+                            }
                         } else {
                             Label("Prune", systemImage: "cube.transparent")
                         }
                     }
                     .disabled(viewModel.isDockerPruning)
+                    .help(viewModel.isDockerPruning ? "Pruning in progress" : "Run Docker system prune")
                 }
 
                 if let result = viewModel.lastDockerPruneResult {

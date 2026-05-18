@@ -26,3 +26,7 @@
 **Vulnerability:** Calling `open(2)` without `O_CLOEXEC` causes the file descriptor to leak to child processes, and passing Swift `String` paths implicitly to C functions can result in unsafe filesystem representations.
 **Learning:** Child processes inheriting the PID lock file descriptor could prevent the lock from being released. Using `withUnsafeFileSystemRepresentation` is the only safe way to bridge file paths to POSIX APIs.
 **Prevention:** Always include `O_CLOEXEC` when opening files with POSIX APIs, and use `URL(fileURLWithPath:).withUnsafeFileSystemRepresentation` to obtain the correct C-string pointer.
+## 2024-05-28 - Process Output Pipe Deadlock
+**Vulnerability:** Reading stdout/stderr pipes synchronously inside `terminationHandler` creates a deadlock vulnerability if output exceeds the 64KB OS pipe buffer.
+**Learning:** The process will block indefinitely trying to write to the full pipe and never terminate, so the `terminationHandler` is never called.
+**Prevention:** Drain both stdout and stderr pipes concurrently while the process runs using `FileHandle.readabilityHandler` and `NSLock`.

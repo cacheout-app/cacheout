@@ -26,3 +26,7 @@
 **Vulnerability:** Calling `open(2)` without `O_CLOEXEC` causes the file descriptor to leak to child processes, and passing Swift `String` paths implicitly to C functions can result in unsafe filesystem representations.
 **Learning:** Child processes inheriting the PID lock file descriptor could prevent the lock from being released. Using `withUnsafeFileSystemRepresentation` is the only safe way to bridge file paths to POSIX APIs.
 **Prevention:** Always include `O_CLOEXEC` when opening files with POSIX APIs, and use `URL(fileURLWithPath:).withUnsafeFileSystemRepresentation` to obtain the correct C-string pointer.
+## 2024-05-19 - Secure Log File Creation
+**Vulnerability:** Cache cleanup logs and directories were created with default, overly permissive access modes, potentially allowing unauthorized local access to cleanup history.
+**Learning:** Default `FileHandle` and `try? Data.write` operations do not enforce strict POSIX permissions at the moment of file creation, leaving a brief or persistent window of exposure.
+**Prevention:** Always use `open(2)` with `O_CREAT | O_CLOEXEC` and a restrictive mode (`S_IRUSR | S_IWUSR`) when generating sensitive files, and explicitly provide `.posixPermissions` when creating directories.

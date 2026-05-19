@@ -34,6 +34,7 @@
 
 import Foundation
 import AppKit
+import Darwin
 
 actor CacheCleaner {
     private let fileManager = FileManager.default
@@ -160,18 +161,35 @@ actor CacheCleaner {
     private func logCleanup(category: String, bytesFreed: Int64) {
         let logDir = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".cacheout")
-        try? FileManager.default.createDirectory(at: logDir, withIntermediateDirectories: true)
+
+        try? FileManager.default.createDirectory(
+            at: logDir,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        try? FileManager.default.setAttributes(
+            [.posixPermissions: 0o700],
+            ofItemAtPath: logDir.path
+        )
 
         let logFile = logDir.appendingPathComponent("cleanup.log")
         let size = ByteCountFormatter.sharedFile.string(fromByteCount: bytesFreed)
         let entry = "[\(ISO8601DateFormatter.shared.string(from: Date()))] Cleaned \(category): \(size)\n"
 
-        if let handle = try? FileHandle(forWritingTo: logFile) {
-            handle.seekToEndOfFile()
-            handle.write(entry.data(using: .utf8) ?? Data())
-            handle.closeFile()
-        } else {
-            try? entry.write(to: logFile, atomically: true, encoding: .utf8)
+        let fd = logFile.withUnsafeFileSystemRepresentation { pathPtr -> Int32 in
+            guard let ptr = pathPtr else { return -1 }
+            return open(ptr, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, S_IRUSR | S_IWUSR)
+        }
+
+        if fd >= 0 {
+            if let data = entry.data(using: .utf8) {
+                data.withUnsafeBytes { ptr in
+                    if let baseAddress = ptr.baseAddress {
+                        _ = write(fd, baseAddress, ptr.count)
+                    }
+                }
+            }
+            close(fd)
         }
     }
 }

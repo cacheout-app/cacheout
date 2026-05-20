@@ -64,7 +64,7 @@ actor CacheCleaner {
                         if moveToTrash {
                             try await trashDirectory(url)
                         } else {
-                            try removeContents(of: url)
+                            try await removeContents(of: url)
                         }
                         categoryFreed += result.sizeBytes
                     } catch {
@@ -133,12 +133,51 @@ actor CacheCleaner {
         }
     }
 
-    private func removeContents(of url: URL) throws {
-        let contents = try fileManager.contentsOfDirectory(
+    private func removeContents(of url: URL) async throws {
+        let currentFileManager = self.fileManager
+        let contents = try currentFileManager.contentsOfDirectory(
             at: url, includingPropertiesForKeys: nil
         )
-        for item in contents {
-            try fileManager.removeItem(at: item)
+        // ⚡ Bolt Optimization: Parallelize bulk I/O operations (FileManager.removeItem).
+        // Uses a sliding window TaskGroup to delete up to 8 files concurrently.
+        // Synchronous blocking calls are explicitly dispatched to a background GCD queue
+        // to prevent thread pool exhaustion/deadlock.
+        // Expected Impact: Significantly faster deletion of large cache directories with many files.
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            var iterator = contents.makeIterator()
+            let maxConcurrency = 8
+            for _ in 0..<maxConcurrency {
+                if let item = iterator.next() {
+                    group.addTask {
+                        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                            DispatchQueue.global(qos: .userInitiated).async {
+                                do {
+                                    try currentFileManager.removeItem(at: item)
+                                    continuation.resume()
+                                } catch {
+                                    continuation.resume(throwing: error)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            for try await _ in group {
+                if let item = iterator.next() {
+                    group.addTask {
+                        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                            DispatchQueue.global(qos: .userInitiated).async {
+                                do {
+                                    try currentFileManager.removeItem(at: item)
+                                    continuation.resume()
+                                } catch {
+                                    continuation.resume(throwing: error)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 

@@ -25,3 +25,6 @@
 ## 2024-05-25 - Efficient Dictionary Initialization
 **Learning:** Building a dictionary via a standard `for` loop by inserting elements one by one can cause unnecessary overhead due to repeated mutations. `reduce(into: [:])` is highly optimized in Swift to build collections without creating intermediate copies.
 **Action:** Use `reduce(into: [:])` when constructing a dictionary from an array, particularly when uniqueness checks or transformations are required.
+## 2024-05-20 - Parallelizing bulk I/O operations with TaskGroup
+**Learning:** To optimize bulk I/O operations (e.g., FileManager.removeItem loops) in Swift, parallelizing them using Task.detached is not enough as it does NOT escape the cooperative thread pool.
+**Action:** Use withThrowingTaskGroup combined with a sliding window iterator and to prevent thread pool exhaustion/deadlock, wrap synchronous blocking calls in withCheckedThrowingContinuation and explicitly dispatch them to a background GCD queue (e.g., DispatchQueue.global(qos: .userInitiated).async).

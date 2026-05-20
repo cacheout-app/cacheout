@@ -160,7 +160,12 @@ actor CacheCleaner {
     private func logCleanup(category: String, bytesFreed: Int64) {
         let logDir = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".cacheout")
-        try? FileManager.default.createDirectory(at: logDir, withIntermediateDirectories: true)
+        try? FileManager.default.createDirectory(
+            at: logDir,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: logDir.path)
 
         let logFile = logDir.appendingPathComponent("cleanup.log")
         let size = ByteCountFormatter.sharedFile.string(fromByteCount: bytesFreed)

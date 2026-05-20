@@ -26,3 +26,7 @@
 **Vulnerability:** Calling `open(2)` without `O_CLOEXEC` causes the file descriptor to leak to child processes, and passing Swift `String` paths implicitly to C functions can result in unsafe filesystem representations.
 **Learning:** Child processes inheriting the PID lock file descriptor could prevent the lock from being released. Using `withUnsafeFileSystemRepresentation` is the only safe way to bridge file paths to POSIX APIs.
 **Prevention:** Always include `O_CLOEXEC` when opening files with POSIX APIs, and use `URL(fileURLWithPath:).withUnsafeFileSystemRepresentation` to obtain the correct C-string pointer.
+## 2024-06-03 - Unrestricted Permissions on Automatically Created Directories
+**Vulnerability:** The `~/.cacheout` log directory was created without explicit restrictive permissions.
+**Learning:** Directories created via `FileManager.default.createDirectory` without explicit `.posixPermissions` attributes inherit the user's default umask, potentially allowing other local users to read sensitive files. Furthermore, because `createDirectory` only applies attributes on newly created directories, `setAttributes` must be used afterward to ensure pre-existing directories are also secured.
+**Prevention:** Always specify `attributes: [.posixPermissions: 0o700]` when creating directories that store sensitive user information, and follow it up with a `setAttributes` call to harden any pre-existing directories.

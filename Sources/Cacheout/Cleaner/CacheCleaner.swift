@@ -64,7 +64,7 @@ actor CacheCleaner {
                         if moveToTrash {
                             try await trashDirectory(url)
                         } else {
-                            try removeContents(of: url)
+                            try await removeContents(of: url)
                         }
                         categoryFreed += result.sizeBytes
                     } catch {
@@ -133,12 +133,46 @@ actor CacheCleaner {
         }
     }
 
-    private func removeContents(of url: URL) throws {
+    /// ⚡ Bolt Optimization: Removes directory contents in parallel using a sliding-window TaskGroup.
+    /// Synchronous `removeItem` calls are explicitly dispatched to a GCD queue (`DispatchQueue.global`)
+    /// and wrapped in a Continuation. This prevents them from blocking threads in Swift's limited
+    /// cooperative thread pool, avoiding thread starvation during high-volume I/O.
+    private func removeContents(of url: URL) async throws {
         let contents = try fileManager.contentsOfDirectory(
             at: url, includingPropertiesForKeys: nil
         )
-        for item in contents {
-            try fileManager.removeItem(at: item)
+        let currentFileManager = self.fileManager
+
+        let removeItemTask: @Sendable (URL) async throws -> Void = { item in
+            try await withCheckedThrowingContinuation { continuation in
+                DispatchQueue.global(qos: .userInitiated).async {
+                    do {
+                        try currentFileManager.removeItem(at: item)
+                        continuation.resume(returning: ())
+                    } catch {
+                        continuation.resume(throwing: error)
+                    }
+                }
+            }
+        }
+
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            let maxConcurrency = 8
+            var index = 0
+
+            while index < min(maxConcurrency, contents.count) {
+                let item = contents[index]
+                group.addTask { try await removeItemTask(item) }
+                index += 1
+            }
+
+            while try await group.next() != nil {
+                if index < contents.count {
+                    let item = contents[index]
+                    group.addTask { try await removeItemTask(item) }
+                    index += 1
+                }
+            }
         }
     }
 

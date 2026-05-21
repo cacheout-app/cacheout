@@ -966,8 +966,14 @@ public actor DaemonMode: StatusSocket.DataSource {
             return
         }
 
-        // Enforce 0600 permissions
-        chmod(path, 0o600)
+        // Enforce 0600 permissions safely to avoid TOCTOU symlink attacks
+        let fd = open(path, O_RDONLY | O_NOFOLLOW)
+        if fd >= 0 {
+            fchmod(fd, 0o600)
+            close(fd)
+        } else {
+            logger.error("Failed to safely open config for permissions check at \(path, privacy: .public)")
+        }
 
         // Read file
         guard let data = FileManager.default.contents(atPath: path) else {

@@ -64,7 +64,7 @@ actor CacheCleaner {
                         if moveToTrash {
                             try await trashDirectory(url)
                         } else {
-                            try removeContents(of: url)
+                            try await removeContents(of: url)
                         }
                         categoryFreed += result.sizeBytes
                     } catch {
@@ -133,12 +133,46 @@ actor CacheCleaner {
         }
     }
 
-    private func removeContents(of url: URL) throws {
+    private func removeContents(of url: URL) async throws {
         let contents = try fileManager.contentsOfDirectory(
             at: url, includingPropertiesForKeys: nil
         )
-        for item in contents {
-            try fileManager.removeItem(at: item)
+        let currentFileManager = self.fileManager
+
+        // ⚡ Bolt Optimization: Parallelize bulk file deletion using a TaskGroup with a sliding window.
+        // Synchronous disk I/O is offloaded to a GCD background queue to avoid thread pool exhaustion.
+        let maxConcurrency = 8
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            var iterator = contents.makeIterator()
+
+            for _ in 0..<maxConcurrency {
+                if let item = iterator.next() {
+                    group.addTask {
+                        try await Self.removeItemConcurrently(at: item, fileManager: currentFileManager)
+                    }
+                }
+            }
+
+            while try await group.next() != nil {
+                if let nextItem = iterator.next() {
+                    group.addTask {
+                        try await Self.removeItemConcurrently(at: nextItem, fileManager: currentFileManager)
+                    }
+                }
+            }
+        }
+    }
+
+    nonisolated private static func removeItemConcurrently(at url: URL, fileManager: FileManager) async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            DispatchQueue.global(qos: .userInitiated).async {
+                do {
+                    try fileManager.removeItem(at: url)
+                    continuation.resume()
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
         }
     }
 

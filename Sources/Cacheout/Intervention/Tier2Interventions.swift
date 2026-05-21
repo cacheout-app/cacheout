@@ -730,7 +730,34 @@ public final class SnapshotCleanup: Intervention {
         return try await withCheckedThrowingContinuation { continuation in
             let resumer = ThrowingOnceResumer(continuation)
 
+            let group = DispatchGroup()
+
+            var stdoutData = Data()
+            var stderrData = Data()
+            let lock = NSLock()
+
+            group.enter()
+            DispatchQueue.global().async {
+                let data = stdoutHandle.readDataToEndOfFile()
+                lock.lock()
+                stdoutData = data
+                lock.unlock()
+                group.leave()
+            }
+
+            group.enter()
+            DispatchQueue.global().async {
+                let data = stderrHandle.readDataToEndOfFile()
+                lock.lock()
+                stderrData = data
+                lock.unlock()
+                group.leave()
+            }
+
             process.terminationHandler = { proc in
+                // Wait for background reads to complete
+                group.wait()
+
                 // If the timeout task already fired, map any exit to .timeout
                 // to avoid reporting a misleading SIGTERM/SIGKILL status.
                 if timedOutFlag.value {
@@ -738,13 +765,18 @@ public final class SnapshotCleanup: Intervention {
                     return
                 }
 
-                let data = stdoutHandle.readDataToEndOfFile()
-                let output = String(data: data, encoding: .utf8) ?? ""
+                let finalStdout: Data
+                let finalStderr: Data
+                lock.lock()
+                finalStdout = stdoutData
+                finalStderr = stderrData
+                lock.unlock()
+
+                let output = String(data: finalStdout, encoding: .utf8) ?? ""
 
                 // Check terminationStatus — non-zero indicates failure.
                 if proc.terminationStatus != 0 {
-                    let errData = stderrHandle.readDataToEndOfFile()
-                    let errOutput = String(data: errData, encoding: .utf8) ?? "unknown"
+                    let errOutput = String(data: finalStderr, encoding: .utf8) ?? "unknown"
                     resumer.resume(with: .failure(SnapshotError.listFailed(
                         status: proc.terminationStatus, stderr: errOutput)))
                     return

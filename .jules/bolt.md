@@ -28,3 +28,6 @@
 ## 2025-10-24 - Bulk Disk I/O Parallelization and Thread Pool Deadlocks
 **Learning:** Attempting to parallelize synchronous bulk I/O operations (like `FileManager.removeItem` loops) using just `TaskGroup` or `Task.detached` can exhaust the Swift cooperative thread pool and cause deadlocks, because `Task.detached` does NOT escape the thread pool.
 **Action:** To optimize bulk I/O operations, parallelize them using `withThrowingTaskGroup` combined with a sliding window iterator (e.g., `maxConcurrency` of 8). Wrap synchronous blocking calls in `withCheckedThrowingContinuation` and explicitly dispatch them to a background GCD queue (e.g., `DispatchQueue.global(qos: .userInitiated).async`) to prevent thread pool starvation.
+## 2024-05-24 - Array Allocation and Short-Circuiting in SwiftUI
+**Learning:** Checking `.isEmpty` on a computed property that wraps an eager `.filter` causes an unnecessary O(N) allocation. Eager `.filter` followed by `.reduce` also forces intermediate memory allocation, which is particularly expensive for computed properties used in SwiftUI views.
+**Action:** Always use `.contains(where:)` to short-circuit existence checks, and chain `.lazy.filter` before `.reduce` to iterate over elements without allocating temporary arrays.

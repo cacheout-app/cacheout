@@ -17,3 +17,6 @@
 ## 2024-05-25 - Dynamic Labels and Disabled State Tooltips
 **Learning:** Users can feel confused when a primary button is disabled without explanation or when a long-running action lacks immediate inline text feedback on the button itself.
 **Action:** In SwiftUI, enhance button accessibility and UX by adding `.help()` tooltips to explain the required state when disabled, and using dynamic labels (e.g., 'Scanning...') to provide immediate feedback during async operations.
+## 2024-05-26 - Custom Section Header Buttons Accessibility
+**Learning:** Custom section header buttons with mixed content (icons and text) are read poorly by VoiceOver without specific modifiers. VoiceOver reads the individual components instead of a unified element with a state.
+**Action:** Always apply `.accessibilityElement(children: .combine)` and provide an explicit `.accessibilityLabel`, dynamic `.accessibilityValue` (e.g., 'Expanded' or 'Collapsed'), and an `.accessibilityHint` to ensure VoiceOver correctly reads them as a unified interactive element and conveys their current state.

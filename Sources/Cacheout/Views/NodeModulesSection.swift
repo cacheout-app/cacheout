@@ -58,6 +58,10 @@ struct NodeModulesSection: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel("Project node_modules, \(viewModel.nodeModulesItems.count) found, total size \(viewModel.formattedNodeModulesTotal)")
+            .accessibilityValue(isExpanded ? "Expanded" : "Collapsed")
+            .accessibilityHint("Double tap to toggle section")
 
             if isExpanded && viewModel.isNodeModulesScanning {
                 HStack {

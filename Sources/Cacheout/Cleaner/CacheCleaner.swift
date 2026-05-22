@@ -80,18 +80,30 @@ actor CacheCleaner {
             logCleanup(category: result.category.name, bytesFreed: categoryFreed)
         }
 
-        // Clean selected node_modules
-        for item in nodeModules where item.isSelected {
-            do {
-                if moveToTrash {
+        // Clean selected node_modules.
+        // Move-to-Trash stays sequential because trashItem is @MainActor and the
+        // Finder serializes Trash operations anyway. Permanent delete is parallelized
+        // with the same sliding-window pattern as removeContents(of:).
+        let selectedNodeModules = nodeModules.filter { $0.isSelected }
+        if moveToTrash {
+            for item in selectedNodeModules {
+                do {
                     try await trashItem(item.nodeModulesPath)
-                } else {
-                    try fileManager.removeItem(at: item.nodeModulesPath)
+                    cleaned.append(("node_modules: \(item.projectName)", item.sizeBytes))
+                    logCleanup(category: "node_modules/\(item.projectName)", bytesFreed: item.sizeBytes)
+                } catch {
+                    errors.append(("node_modules: \(item.projectName)", error.localizedDescription))
                 }
-                cleaned.append(("node_modules: \(item.projectName)", item.sizeBytes))
-                logCleanup(category: "node_modules/\(item.projectName)", bytesFreed: item.sizeBytes)
-            } catch {
-                errors.append(("node_modules: \(item.projectName)", error.localizedDescription))
+            }
+        } else {
+            let results = await removeNodeModulesConcurrently(items: selectedNodeModules)
+            for (item, error) in results {
+                if let error {
+                    errors.append(("node_modules: \(item.projectName)", error.localizedDescription))
+                } else {
+                    cleaned.append(("node_modules: \(item.projectName)", item.sizeBytes))
+                    logCleanup(category: "node_modules/\(item.projectName)", bytesFreed: item.sizeBytes)
+                }
             }
         }
 
@@ -160,6 +172,55 @@ actor CacheCleaner {
                     }
                 }
             }
+        }
+    }
+
+    /// Parallel per-item deletion with isolated error handling. Each result preserves
+    /// its input ordering so callers can build consistent cleaned/errors arrays.
+    private func removeNodeModulesConcurrently(
+        items: [NodeModulesItem]
+    ) async -> [(item: NodeModulesItem, error: Error?)] {
+        guard !items.isEmpty else { return [] }
+        let currentFileManager = self.fileManager
+        let maxConcurrency = 8
+
+        return await withTaskGroup(
+            of: (Int, Error?).self,
+            returning: [(item: NodeModulesItem, error: Error?)].self
+        ) { group in
+            var iterator = items.indices.makeIterator()
+
+            for _ in 0..<min(maxConcurrency, items.count) {
+                guard let index = iterator.next() else { break }
+                let path = items[index].nodeModulesPath
+                group.addTask {
+                    do {
+                        try await Self.removeItemConcurrently(at: path, fileManager: currentFileManager)
+                        return (index, nil)
+                    } catch {
+                        return (index, error)
+                    }
+                }
+            }
+
+            var results = Array<(item: NodeModulesItem, error: Error?)?>(repeating: nil, count: items.count)
+
+            while let (index, error) = await group.next() {
+                results[index] = (items[index], error)
+                if let nextIndex = iterator.next() {
+                    let path = items[nextIndex].nodeModulesPath
+                    group.addTask {
+                        do {
+                            try await Self.removeItemConcurrently(at: path, fileManager: currentFileManager)
+                            return (nextIndex, nil)
+                        } catch {
+                            return (nextIndex, error)
+                        }
+                    }
+                }
+            }
+
+            return results.compactMap { $0 }
         }
     }
 

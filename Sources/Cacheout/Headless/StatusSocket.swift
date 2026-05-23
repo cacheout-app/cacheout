@@ -109,7 +109,19 @@ public final class StatusSocket: @unchecked Sendable {
         try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true, attributes: [
             .posixPermissions: 0o700
         ])
-        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir)
+
+        // Safely set directory permissions using open(2) and fchmod(2)
+        // to prevent TOCTOU symlink attacks where an attacker swaps the directory.
+        let success = URL(fileURLWithPath: dir).withUnsafeFileSystemRepresentation { pathPtr -> Bool in
+            guard let ptr = pathPtr else { return false }
+            let fd = open(ptr, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+            guard fd >= 0 else { return false }
+            defer { close(fd) }
+            return fchmod(fd, S_IRWXU) == 0
+        }
+        if !success {
+            throw StatusSocketError.socketCreationFailed(errno)
+        }
 
         // Remove stale socket if present
         unlink(socketPath)
@@ -157,6 +169,8 @@ public final class StatusSocket: @unchecked Sendable {
         }
 
         // Verify socket permissions are 0600
+        // (Note: The parent directory is strictly 0700, protecting against symlink planting.
+        // We cannot use open(2) on a socket file on macOS, so we rely on umask and chmod).
         do {
             let attrs = try FileManager.default.attributesOfItem(atPath: socketPath)
             if let perms = attrs[.posixPermissions] as? Int, perms != 0o600 {

@@ -17,3 +17,6 @@
 ## 2024-05-25 - Dynamic Labels and Disabled State Tooltips
 **Learning:** Users can feel confused when a primary button is disabled without explanation or when a long-running action lacks immediate inline text feedback on the button itself.
 **Action:** In SwiftUI, enhance button accessibility and UX by adding `.help()` tooltips to explain the required state when disabled, and using dynamic labels (e.g., 'Scanning...') to provide immediate feedback during async operations.
+## 2024-05-24 - Add helpful context to disabled UI states
+**Learning:** Buttons disabled during async operations or when preconditions aren't met can leave users confused. Adding `.help()` tooltips effectively explains *why* a button is disabled, improving discoverability and VoiceOver context. Dynamic labels (e.g., 'Scanning...' vs 'Scan') also provide immediate visual feedback.
+**Action:** When implementing disabled states for buttons, especially for async tasks, always include a `.help()` modifier to explain the required state or current operation, and consider dynamic labels for immediate feedback.

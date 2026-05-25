@@ -118,7 +118,12 @@ class CacheoutViewModel: ObservableObject {
     }
 
     var hasResults: Bool { !scanResults.isEmpty || !nodeModulesItems.isEmpty }
-    var hasSelection: Bool { !selectedResults.isEmpty || selectedNodeModulesSize > 0 }
+    var hasSelection: Bool {
+        // ⚡ Bolt Optimization: Use contains(where:) to short-circuit evaluation instead of
+        // allocating an intermediate filtered array (!selectedResults.isEmpty) or computing
+        // the total size of all selected items (selectedNodeModulesSize > 0). O(1) early exit vs O(N).
+        scanResults.contains(where: \.isSelected) || nodeModulesItems.contains(where: \.isSelected)
+    }
 
     // MARK: - Node Modules computed properties
 

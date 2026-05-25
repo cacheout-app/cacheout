@@ -154,7 +154,8 @@ struct MenuBarView: View {
             Spacer()
             statPill(
                 label: "Categories",
-                value: "\(viewModel.scanResults.filter { !$0.isEmpty }.count)",
+                // ⚡ Bolt Optimization: Use reduce instead of filter.count to avoid intermediate array allocation
+                value: "\(viewModel.scanResults.reduce(0) { $0 + (!$1.isEmpty ? 1 : 0) })",
                 color: .blue
             )
         }
@@ -178,7 +179,8 @@ struct MenuBarView: View {
 
     private var topCategories: some View {
         let top = viewModel.scanResults
-            .filter { !$0.isEmpty }
+            // ⚡ Bolt Optimization: Use lazy.filter to avoid intermediate array allocation before sorting
+            .lazy.filter { !$0.isEmpty }
             .sorted { $0.sizeBytes > $1.sizeBytes }
             .prefix(5)
 

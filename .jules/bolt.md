@@ -28,3 +28,7 @@
 ## 2025-10-24 - Bulk Disk I/O Parallelization and Thread Pool Starvation
 **Learning:** Both `withTaskGroup` and `Task.detached` schedule their work on Swift's cooperative thread pool, which has only as many threads as the CPU has cores. Running synchronous blocking I/O (like `FileManager.removeItem`) directly inside such tasks ties up cooperative threads — when every thread is parked in a syscall there is nothing left to advance other Swift Concurrency work, which manifests as starvation and (with self-referential `await` chains) outright deadlock. `Task.detached` does not help here: "detached" means unstructured/independent, not "off the cooperative pool."
 **Action:** To parallelize bulk blocking I/O, combine a sliding-window `withThrowingTaskGroup` (e.g., `maxConcurrency` of 8) with a per-item handoff to a GCD queue: wrap the blocking call in `withCheckedThrowingContinuation` and dispatch it via `DispatchQueue.global(qos: .userInitiated).async { ... continuation.resume(...) }`. The cooperative-pool task only `await`s the continuation, so it never holds a thread while the syscall runs.
+
+## 2024-05-25 - Avoid Eager Array Allocation on Filter
+**Learning:** Using `array.filter { ... }.isEmpty` or `array.filter { ... }.count` evaluates eagerly, allocating an intermediate array and taking O(N) time and memory, which can cause significant UI thread overhead in SwiftUI.
+**Action:** Use `.contains(where:)` to short circuit for existence checks. Use `.lazy.filter { ... }.count` or `.reduce(0)` to count without allocating an intermediate array.

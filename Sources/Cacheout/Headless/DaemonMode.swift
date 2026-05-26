@@ -966,8 +966,16 @@ public actor DaemonMode: StatusSocket.DataSource {
             return
         }
 
-        // Enforce 0600 permissions
-        chmod(path, 0o600)
+        // Enforce 0600 permissions safely to prevent TOCTOU symlink attack
+        let url = URL(fileURLWithPath: path)
+        url.withUnsafeFileSystemRepresentation { cPath in
+            guard let cPath = cPath else { return }
+            let fd = open(cPath, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+            if fd >= 0 {
+                fchmod(fd, 0o600)
+                close(fd)
+            }
+        }
 
         // Read file
         guard let data = FileManager.default.contents(atPath: path) else {

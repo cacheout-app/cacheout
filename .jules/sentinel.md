@@ -31,3 +31,7 @@
 **Vulnerability:** External shell command executed in `listLocalSnapshots()` triggered a deadlock when `tmutil` output exceeded 64KB, because stdout and stderr were read synchronously inside the process termination handler.
 **Learning:** In Swift, reading from a process pipe synchronously inside a `terminationHandler` can result in a permanent deadlock if the child blocks writing to a full pipe, preventing it from exiting.
 **Prevention:** Asynchronously drain pipes continuously while the process is running using background queues.
+## 2025-01-20 - Fix TOCTOU vulnerability when enforcing file permissions
+**Vulnerability:** A TOCTOU vulnerability existed in `DaemonMode.swift` when enforcing 0600 permissions on the `autopilot.json` file. The code used `chmod(path)` followed by `FileManager.default.contents(atPath: path)`, which is susceptible to a symlink attack.
+**Learning:** Using `chmod()` or `FileManager.default.setAttributes()` on paths that may be untrusted is dangerous due to TOCTOU symlink races.
+**Prevention:** Obtain a file descriptor securely using `open()` with `O_NOFOLLOW | O_CLOEXEC` to prevent following symlinks, and then use `fchmod()` to enforce file permissions directly on the file descriptor.

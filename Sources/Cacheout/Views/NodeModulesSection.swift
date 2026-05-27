@@ -58,6 +58,9 @@ struct NodeModulesSection: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            .accessibilityElement(children: .combine)
+            .accessibilityValue(isExpanded ? "Expanded" : "Collapsed")
+            .accessibilityHint("Double tap to toggle visibility of project directories")
 
             if isExpanded && viewModel.isNodeModulesScanning {
                 HStack {

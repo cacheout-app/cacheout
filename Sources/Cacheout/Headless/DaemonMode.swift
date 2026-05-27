@@ -966,11 +966,28 @@ public actor DaemonMode: StatusSocket.DataSource {
             return
         }
 
-        // Enforce 0600 permissions
-        chmod(path, 0o600)
+        // Safely open the file, preventing TOCTOU symlink attacks
+        // Enforce O_NOFOLLOW to avoid resolving symlinks, O_CLOEXEC to prevent FD leaks
+        let fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        guard fd >= 0 else {
+            let status = ConfigStatus(
+                generation: nextGeneration,
+                lastReload: Date(),
+                status: .error,
+                error: "Failed to open config file securely"
+            )
+            await daemon.setConfigStatus(status)
+            await refreshHelperState(autopilotEnabled: nil)
+            logger.error("Failed to safely open autopilot config at \(path, privacy: .public)")
+            return
+        }
 
-        // Read file
-        guard let data = FileManager.default.contents(atPath: path) else {
+        // Enforce 0600 permissions securely using the file descriptor
+        fchmod(fd, 0o600)
+
+        // Read file from the secure file descriptor
+        let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+        guard let data = try? handle.readToEnd() else {
             let status = ConfigStatus(
                 generation: nextGeneration,
                 lastReload: Date(),

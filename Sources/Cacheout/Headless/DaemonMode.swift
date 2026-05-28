@@ -967,10 +967,28 @@ public actor DaemonMode: StatusSocket.DataSource {
         }
 
         // Enforce 0600 permissions
-        chmod(path, 0o600)
+        // 🛡️ Sentinel: Fix TOCTOU vulnerability by using open() with O_NOFOLLOW
+        // and applying permissions via fchmod() on the file descriptor.
+        let fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        guard fd >= 0 else {
+            let status = ConfigStatus(
+                generation: nextGeneration,
+                lastReload: Date(),
+                status: .error,
+                error: "Failed to read config file (open failed)"
+            )
+            await daemon.setConfigStatus(status)
+            await refreshHelperState(autopilotEnabled: nil)
+            logger.error("Failed to safely open autopilot config at \(path, privacy: .public)")
+            return
+        }
+
+        fchmod(fd, 0o600)
+
+        let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
 
         // Read file
-        guard let data = FileManager.default.contents(atPath: path) else {
+        guard let data = try? handle.readToEnd() else {
             let status = ConfigStatus(
                 generation: nextGeneration,
                 lastReload: Date(),

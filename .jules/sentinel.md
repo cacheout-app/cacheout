@@ -31,3 +31,7 @@
 **Vulnerability:** External shell command executed in `listLocalSnapshots()` triggered a deadlock when `tmutil` output exceeded 64KB, because stdout and stderr were read synchronously inside the process termination handler.
 **Learning:** In Swift, reading from a process pipe synchronously inside a `terminationHandler` can result in a permanent deadlock if the child blocks writing to a full pipe, preventing it from exiting.
 **Prevention:** Asynchronously drain pipes continuously while the process is running using background queues.
+## 2025-01-20 - TOCTOU vulnerability in configuration file handling
+**Vulnerability:** A Time-of-Check to Time-of-Use (TOCTOU) vulnerability existed in `DaemonMode.swift` where `chmod(path, 0o600)` was called followed by `FileManager.default.contents(atPath: path)`.
+**Learning:** This approach left a small window where an attacker could replace the configuration file with a symlink to another file, causing `chmod` to alter the permissions of an unintended file and the application to read arbitrary data.
+**Prevention:** To avoid TOCTOU symlink vulnerabilities when enforcing file permissions, use `open()` with `O_NOFOLLOW` and `O_CLOEXEC` to get a file descriptor safely, then use `fchmod()` to change permissions, and wrap the descriptor in `FileHandle` to read the data securely.

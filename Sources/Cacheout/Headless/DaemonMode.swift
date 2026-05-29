@@ -967,7 +967,15 @@ public actor DaemonMode: StatusSocket.DataSource {
         }
 
         // Enforce 0600 permissions
-        chmod(path, 0o600)
+        // Use O_NOFOLLOW + fchmod to prevent TOCTOU symlink attacks.
+        URL(fileURLWithPath: path).withUnsafeFileSystemRepresentation { pathPtr in
+            guard let pathPtr = pathPtr else { return }
+            let fd = open(pathPtr, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+            if fd >= 0 {
+                fchmod(fd, 0o600)
+                close(fd)
+            }
+        }
 
         // Read file
         guard let data = FileManager.default.contents(atPath: path) else {

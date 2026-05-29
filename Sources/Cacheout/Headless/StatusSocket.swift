@@ -156,16 +156,6 @@ public final class StatusSocket: @unchecked Sendable {
             throw StatusSocketError.bindFailed(errno)
         }
 
-        // Verify socket permissions are 0600
-        do {
-            let attrs = try FileManager.default.attributesOfItem(atPath: socketPath)
-            if let perms = attrs[.posixPermissions] as? Int, perms != 0o600 {
-                try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: socketPath)
-            }
-        } catch {
-            // Best effort — umask should have set it correctly
-        }
-
         // Listen
         guard listen(fd, 16) == 0 else {
             close(fd)

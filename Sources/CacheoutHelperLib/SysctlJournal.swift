@@ -310,11 +310,15 @@ public final class SysctlJournal {
             // Write to temp file (non-atomic — we control the rename ourselves).
             try data.write(to: tmpURL)
 
-            // Set permissions to 0600 (root-only) on temp file before rename.
-            try FileManager.default.setAttributes(
-                [.posixPermissions: 0o600],
-                ofItemAtPath: tmpURL.path
-            )
+            // Set permissions to 0600 (root-only) on temp file before rename securely to prevent TOCTOU symlink attacks.
+            tmpURL.withUnsafeFileSystemRepresentation { pathPtr in
+                guard let ptr = pathPtr else { return }
+                let fd = open(ptr, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+                if fd >= 0 {
+                    fchmod(fd, 0o600)
+                    close(fd)
+                }
+            }
 
             // Atomic rename(2) — atomicity on APFS/HFS+.
             if rename(tmpURL.path, url.path) != 0 {

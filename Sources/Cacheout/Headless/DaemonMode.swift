@@ -966,20 +966,29 @@ public actor DaemonMode: StatusSocket.DataSource {
             return
         }
 
-        // Enforce 0600 permissions
-        chmod(path, 0o600)
+        // Safely open file, preventing TOCTOU symlink attacks, and enforce 0600 permissions
+        let configURL = URL(fileURLWithPath: path)
+        var fileData: Data? = nil
+        configURL.withUnsafeFileSystemRepresentation { pathPtr in
+            guard let pathPtr = pathPtr else { return }
+            let fd = open(pathPtr, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+            if fd >= 0 {
+                fchmod(fd, 0o600)
+                let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+                fileData = try? handle.readToEnd()
+            }
+        }
 
-        // Read file
-        guard let data = FileManager.default.contents(atPath: path) else {
+        guard let data = fileData else {
             let status = ConfigStatus(
                 generation: nextGeneration,
                 lastReload: Date(),
                 status: .error,
-                error: "Failed to read config file"
+                error: "Failed to read config file securely (possible symlink)"
             )
             await daemon.setConfigStatus(status)
             await refreshHelperState(autopilotEnabled: nil)
-            logger.error("Failed to read autopilot config at \(path, privacy: .public)")
+            logger.error("Failed to securely read autopilot config at \(path, privacy: .public)")
             return
         }
 

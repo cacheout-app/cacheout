@@ -966,11 +966,21 @@ public actor DaemonMode: StatusSocket.DataSource {
             return
         }
 
-        // Enforce 0600 permissions
-        chmod(path, 0o600)
+        // Safely enforce 0600 permissions and read file (prevent TOCTOU symlink attacks)
+        let fileURL = URL(fileURLWithPath: path)
+        let data = try? fileURL.withUnsafeFileSystemRepresentation { pathPtr -> Data? in
+            guard let pathPtr = pathPtr else { return nil }
+            // open with O_NOFOLLOW to reject symlinks, O_CLOEXEC to prevent FD leaks
+            let fd = open(pathPtr, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+            guard fd >= 0 else { return nil }
 
-        // Read file
-        guard let data = FileManager.default.contents(atPath: path) else {
+            fchmod(fd, 0o600)
+
+            let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+            return try handle.readToEnd()
+        }
+
+        guard let data = data else {
             let status = ConfigStatus(
                 generation: nextGeneration,
                 lastReload: Date(),

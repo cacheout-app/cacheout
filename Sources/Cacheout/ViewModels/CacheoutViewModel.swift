@@ -106,7 +106,9 @@ class CacheoutViewModel: ObservableObject {
     }
 
     var selectedSize: Int64 {
-        selectedResults.reduce(0) { $0 + $1.sizeBytes }
+        // ⚡ Bolt: Optimized by using .lazy.filter before .reduce to prevent intermediate array allocation
+        // Expected Impact: Reduces memory churn and array allocation overhead on UI updates
+        scanResults.lazy.filter(\.isSelected).reduce(0) { $0 + $1.sizeBytes }
     }
 
     var formattedSelectedSize: String {

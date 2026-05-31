@@ -288,17 +288,21 @@ public actor DaemonMode: StatusSocket.DataSource {
 
         // Ensure state directory exists with 0700 permissions.
         // createDirectory only sets attributes on newly created dirs, so we
-        // explicitly chmod afterward to harden pre-existing directories.
+        // explicitly fchmod afterward to harden pre-existing directories without TOCTOU.
         do {
             try FileManager.default.createDirectory(
                 at: config.stateDir,
                 withIntermediateDirectories: true,
                 attributes: [.posixPermissions: 0o700]
             )
-            try FileManager.default.setAttributes(
-                [.posixPermissions: 0o700],
-                ofItemAtPath: config.stateDir.path
-            )
+            config.stateDir.withUnsafeFileSystemRepresentation { pathPtr in
+                guard let pathPtr = pathPtr else { return }
+                let fd = open(pathPtr, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+                if fd >= 0 {
+                    fchmod(fd, 0o700)
+                    close(fd)
+                }
+            }
         } catch {
             logger.error("Failed to create/secure state directory: \(error.localizedDescription, privacy: .public)")
             Foundation.exit(1)

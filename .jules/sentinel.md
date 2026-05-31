@@ -31,3 +31,8 @@
 **Vulnerability:** External shell command executed in `listLocalSnapshots()` triggered a deadlock when `tmutil` output exceeded 64KB, because stdout and stderr were read synchronously inside the process termination handler.
 **Learning:** In Swift, reading from a process pipe synchronously inside a `terminationHandler` can result in a permanent deadlock if the child blocks writing to a full pipe, preventing it from exiting.
 **Prevention:** Asynchronously drain pipes continuously while the process is running using background queues.
+
+## 2024-05-21 - TOCTOU Symlink Vulnerability in Socket/File Permissions
+**Vulnerability:** Enforcing socket or file permissions using `FileManager.default.setAttributes()` introduces a Time-of-Check to Time-of-Use (TOCTOU) vulnerability where an attacker could replace the socket or file with a symlink before permissions are applied.
+**Learning:** On macOS/Darwin, sockets cannot be opened with `open()`, making `open(O_NOFOLLOW)` and `fchmod()` impossible for sockets. Symlinks can redirect permission changes to critical files.
+**Prevention:** Do not use `FileManager.default.setAttributes()` to secure sockets or temp files. Instead, secure the parent directory first (`0700`) and set `umask()` appropriately before calling `socket()` and `bind()` (or `open()` for files) to inherit correct permissions atomically.

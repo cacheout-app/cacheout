@@ -104,12 +104,20 @@ public final class StatusSocket: @unchecked Sendable {
 
         // Ensure directory exists with 0700 permissions.
         // createDirectory only sets attributes on newly created dirs, so we
-        // explicitly chmod afterward to harden pre-existing directories.
+        // explicitly fchmod afterward to harden pre-existing directories without TOCTOU.
         let dir = (socketPath as NSString).deletingLastPathComponent
         try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true, attributes: [
             .posixPermissions: 0o700
         ])
-        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir)
+        let dirUrl = URL(fileURLWithPath: dir)
+        dirUrl.withUnsafeFileSystemRepresentation { pathPtr in
+            guard let pathPtr = pathPtr else { return }
+            let fd = open(pathPtr, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+            if fd >= 0 {
+                fchmod(fd, 0o700)
+                close(fd)
+            }
+        }
 
         // Remove stale socket if present
         unlink(socketPath)
@@ -154,16 +162,6 @@ public final class StatusSocket: @unchecked Sendable {
         guard bindResult == 0 else {
             close(fd)
             throw StatusSocketError.bindFailed(errno)
-        }
-
-        // Verify socket permissions are 0600
-        do {
-            let attrs = try FileManager.default.attributesOfItem(atPath: socketPath)
-            if let perms = attrs[.posixPermissions] as? Int, perms != 0o600 {
-                try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: socketPath)
-            }
-        } catch {
-            // Best effort — umask should have set it correctly
         }
 
         // Listen

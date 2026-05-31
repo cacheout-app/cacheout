@@ -308,13 +308,10 @@ public final class SysctlJournal {
             let data = try PropertyListEncoder().encode(state)
 
             // Write to temp file (non-atomic — we control the rename ourselves).
+            // Set umask to ensure the temp file is created with 0600 permissions.
+            let oldUmask = umask(0o077)
+            defer { umask(oldUmask) }
             try data.write(to: tmpURL)
-
-            // Set permissions to 0600 (root-only) on temp file before rename.
-            try FileManager.default.setAttributes(
-                [.posixPermissions: 0o600],
-                ofItemAtPath: tmpURL.path
-            )
 
             // Atomic rename(2) — atomicity on APFS/HFS+.
             if rename(tmpURL.path, url.path) != 0 {

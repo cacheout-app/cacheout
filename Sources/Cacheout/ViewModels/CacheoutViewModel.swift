@@ -106,7 +106,8 @@ class CacheoutViewModel: ObservableObject {
     }
 
     var selectedSize: Int64 {
-        selectedResults.reduce(0) { $0 + $1.sizeBytes }
+        // ⚡ Bolt Optimization: Chain .lazy.filter before .reduce to prevent intermediate array allocations
+        scanResults.lazy.filter(\.isSelected).reduce(0) { $0 + $1.sizeBytes }
     }
 
     var formattedSelectedSize: String {
@@ -118,7 +119,10 @@ class CacheoutViewModel: ObservableObject {
     }
 
     var hasResults: Bool { !scanResults.isEmpty || !nodeModulesItems.isEmpty }
-    var hasSelection: Bool { !selectedResults.isEmpty || selectedNodeModulesSize > 0 }
+    var hasSelection: Bool {
+        // ⚡ Bolt Optimization: Use .contains(where:) to short-circuit evaluation instead of checking .isEmpty on filtered arrays
+        scanResults.contains(where: \.isSelected) || nodeModulesItems.contains(where: \.isSelected)
+    }
 
     // MARK: - Node Modules computed properties
 

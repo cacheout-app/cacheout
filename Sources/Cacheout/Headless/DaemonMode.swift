@@ -966,20 +966,35 @@ public actor DaemonMode: StatusSocket.DataSource {
             return
         }
 
-        // Enforce 0600 permissions
-        chmod(path, 0o600)
+        // Safely open, enforce 0600 permissions, and read to avoid TOCTOU
+        let data: Data
+        do {
+            var openErrno: Int32 = 0
+            let fd = URL(fileURLWithPath: path).withUnsafeFileSystemRepresentation { pathPtr -> Int32 in
+                guard let ptr = pathPtr else { return -1 }
+                let result = open(ptr, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+                if result < 0 {
+                    openErrno = errno
+                }
+                return result
+            }
+            guard fd >= 0 else {
+                throw POSIXError(POSIXErrorCode(rawValue: openErrno) ?? .EIO)
+            }
+            fchmod(fd, 0o600)
 
-        // Read file
-        guard let data = FileManager.default.contents(atPath: path) else {
+            let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+            data = try handle.readToEnd() ?? Data()
+        } catch {
             let status = ConfigStatus(
                 generation: nextGeneration,
                 lastReload: Date(),
                 status: .error,
-                error: "Failed to read config file"
+                error: "Failed to securely read config file"
             )
             await daemon.setConfigStatus(status)
             await refreshHelperState(autopilotEnabled: nil)
-            logger.error("Failed to read autopilot config at \(path, privacy: .public)")
+            logger.error("Failed to securely read autopilot config at \(path, privacy: .public): \(error.localizedDescription)")
             return
         }
 

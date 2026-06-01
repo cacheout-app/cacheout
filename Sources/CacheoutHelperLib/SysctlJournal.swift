@@ -307,14 +307,30 @@ public final class SysctlJournal {
         do {
             let data = try PropertyListEncoder().encode(state)
 
-            // Write to temp file (non-atomic — we control the rename ourselves).
-            try data.write(to: tmpURL)
+            // Remove any stale temp file from a previous crash before using O_EXCL
+            try? FileManager.default.removeItem(at: tmpURL)
 
-            // Set permissions to 0600 (root-only) on temp file before rename.
-            try FileManager.default.setAttributes(
-                [.posixPermissions: 0o600],
-                ofItemAtPath: tmpURL.path
-            )
+            // Write to temp file securely using POSIX open to prevent TOCTOU.
+            try tmpURL.withUnsafeFileSystemRepresentation { pathPtr in
+                guard let pathPtr = pathPtr else {
+                    throw NSError(domain: NSPOSIXErrorDomain, code: Int(ENOENT), userInfo: nil)
+                }
+
+                // Securely create file without global side effects
+                let fd = open(pathPtr, O_CREAT | O_WRONLY | O_EXCL | O_CLOEXEC, 0o600)
+                guard fd != -1 else {
+                    throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno), userInfo: nil)
+                }
+
+                let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+                if #available(macOS 10.15.4, *) {
+                    try handle.write(contentsOf: data)
+                    try handle.close()
+                } else {
+                    handle.write(data)
+                    handle.closeFile()
+                }
+            }
 
             // Atomic rename(2) — atomicity on APFS/HFS+.
             if rename(tmpURL.path, url.path) != 0 {

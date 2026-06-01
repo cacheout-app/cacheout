@@ -307,14 +307,20 @@ public final class SysctlJournal {
         do {
             let data = try PropertyListEncoder().encode(state)
 
-            // Write to temp file (non-atomic — we control the rename ourselves).
-            try data.write(to: tmpURL)
+            // Safely write to temp file with 0600 permissions using POSIX open
+            // This is thread-safe and prevents TOCTOU vulnerabilities compared to setAttributes
+            let fd = tmpURL.withUnsafeFileSystemRepresentation { pathPtr in
+                guard let ptr = pathPtr else { return Int32(-1) }
+                return open(ptr, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, S_IRUSR | S_IWUSR)
+            }
+            guard fd >= 0 else {
+                logger.error("Failed to create temp file: errno \(errno, privacy: .public)")
+                return false
+            }
 
-            // Set permissions to 0600 (root-only) on temp file before rename.
-            try FileManager.default.setAttributes(
-                [.posixPermissions: 0o600],
-                ofItemAtPath: tmpURL.path
-            )
+            let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+            try handle.write(contentsOf: data)
+            try handle.close()
 
             // Atomic rename(2) — atomicity on APFS/HFS+.
             if rename(tmpURL.path, url.path) != 0 {

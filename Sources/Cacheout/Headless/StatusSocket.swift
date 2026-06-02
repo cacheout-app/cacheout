@@ -2,6 +2,7 @@
 // Unix domain socket server for the headless daemon.
 
 import CacheoutShared
+import Darwin
 import Foundation
 import os
 
@@ -102,14 +103,20 @@ public final class StatusSocket: @unchecked Sendable {
             throw StatusSocketError.pathTooLong(socketPath.utf8.count, max: Self.maxSocketPathLength)
         }
 
-        // Ensure directory exists with 0700 permissions.
-        // createDirectory only sets attributes on newly created dirs, so we
-        // explicitly chmod afterward to harden pre-existing directories.
+        // Ensure directory exists with 0700 permissions securely (avoiding TOCTOU).
         let dir = (socketPath as NSString).deletingLastPathComponent
         try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true, attributes: [
             .posixPermissions: 0o700
         ])
-        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir)
+        let dirURL = URL(fileURLWithPath: dir)
+        let dirFd = dirURL.withUnsafeFileSystemRepresentation { pathPtr in
+            guard let pathPtr = pathPtr else { return Int32(-1) }
+            return open(pathPtr, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        }
+        if dirFd >= 0 {
+            fchmod(dirFd, 0o700)
+            close(dirFd)
+        }
 
         // Remove stale socket if present
         unlink(socketPath)

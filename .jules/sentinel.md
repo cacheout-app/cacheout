@@ -31,3 +31,7 @@
 **Vulnerability:** External shell command executed in `listLocalSnapshots()` triggered a deadlock when `tmutil` output exceeded 64KB, because stdout and stderr were read synchronously inside the process termination handler.
 **Learning:** In Swift, reading from a process pipe synchronously inside a `terminationHandler` can result in a permanent deadlock if the child blocks writing to a full pipe, preventing it from exiting.
 **Prevention:** Asynchronously drain pipes continuously while the process is running using background queues.
+## 2024-05-24 - Secure File and Directory Creation in Swift
+**Vulnerability:** TOCTOU vulnerability in log directory and file creation allowing malicious users to elevate privileges via symlinks before permissions are applied.
+**Learning:** Default Swift file and directory creation methods rely on the global umask and do not guarantee safe file descriptors, leaving a window between creation and applying attributes where an attacker can replace the target with a symlink.
+**Prevention:** Use `FileManager.default.createDirectory` with `.posixPermissions` for new directories, and `open(2)` with `O_NOFOLLOW | O_CLOEXEC` plus `fchmod` for existing directories. For files, use `open(2)` with `O_CREAT | O_WRONLY | O_EXCL | O_CLOEXEC` wrapped in a `FileHandle`.

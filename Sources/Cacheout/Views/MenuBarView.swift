@@ -154,7 +154,8 @@ struct MenuBarView: View {
             Spacer()
             statPill(
                 label: "Categories",
-                value: "\(viewModel.scanResults.filter { !$0.isEmpty }.count)",
+                // ⚡ Bolt Optimization: Use .lazy.filter before .count to prevent intermediate array allocation
+                value: "\(viewModel.scanResults.lazy.filter { !$0.isEmpty }.count)",
                 color: .blue
             )
         }

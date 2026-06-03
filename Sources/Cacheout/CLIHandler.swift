@@ -304,8 +304,9 @@ struct CLIHandler {
         var freedSoFar: Int64 = 0
         var cleaned: [[String: Any]] = []
 
+        // ⚡ Bolt Optimization: Use .lazy to avoid intermediate array allocation before sorting
         let sortedResults = allResults
-            .filter { $0.exists && $0.sizeBytes > 0 }
+            .lazy.filter { $0.exists && $0.sizeBytes > 0 }
             .sorted { a, b in
                 let riskOrder: [RiskLevel: Int] = [.safe: 0, .review: 1, .caution: 2]
                 let aOrder = riskOrder[a.category.riskLevel] ?? 99

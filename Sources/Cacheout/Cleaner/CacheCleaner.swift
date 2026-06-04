@@ -32,6 +32,7 @@
 /// The returned `CleanupReport` contains both successful cleanups and errors,
 /// allowing the UI to display partial results.
 
+import Darwin
 import Foundation
 import AppKit
 
@@ -261,12 +262,14 @@ actor CacheCleaner {
         let size = ByteCountFormatter.sharedFile.string(fromByteCount: bytesFreed)
         let entry = "[\(ISO8601DateFormatter.shared.string(from: Date()))] Cleaned \(category): \(size)\n"
 
-        if let handle = try? FileHandle(forWritingTo: logFile) {
-            handle.seekToEndOfFile()
+        // Securely open or create the log file, preventing TOCTOU symlink attacks
+        logFile.withUnsafeFileSystemRepresentation { pathPtr in
+            guard let pathPtr = pathPtr else { return }
+            let fd = open(pathPtr, O_CREAT | O_WRONLY | O_APPEND | O_NOFOLLOW | O_CLOEXEC, 0o644)
+            guard fd >= 0 else { return }
+            let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
             handle.write(entry.data(using: .utf8) ?? Data())
-            handle.closeFile()
-        } else {
-            try? entry.write(to: logFile, atomically: true, encoding: .utf8)
+            try? handle.close()
         }
     }
 }

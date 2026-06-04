@@ -31,3 +31,7 @@
 **Vulnerability:** External shell command executed in `listLocalSnapshots()` triggered a deadlock when `tmutil` output exceeded 64KB, because stdout and stderr were read synchronously inside the process termination handler.
 **Learning:** In Swift, reading from a process pipe synchronously inside a `terminationHandler` can result in a permanent deadlock if the child blocks writing to a full pipe, preventing it from exiting.
 **Prevention:** Asynchronously drain pipes continuously while the process is running using background queues.
+## 2024-05-24 - TOCTOU Symlink Vulnerability in High-Level File APIs
+**Vulnerability:** Found `FileHandle(forWritingTo:)` and `String.write(to:atomically:)` being used for log file writes, which follow symlinks by default and expose the application to TOCTOU symlink attacks.
+**Learning:** High-level file APIs in Swift do not prevent symlink following, making them dangerous when operating in potentially untrusted directories like user home directories.
+**Prevention:** Use POSIX `open(2)` with flags `O_CREAT | O_WRONLY | O_APPEND | O_NOFOLLOW | O_CLOEXEC` to explicitly refuse symlinks, then wrap the resulting file descriptor in a `FileHandle`.

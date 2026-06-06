@@ -208,6 +208,7 @@ struct ContentView: View {
                     }
                     .menuStyle(.borderlessButton)
                     .fixedSize()
+                    .accessibilityLabel("Selection Options")
 
                     if viewModel.hasSelection {
                         Text("Selected: \(viewModel.formattedTotalSelectedSize)")

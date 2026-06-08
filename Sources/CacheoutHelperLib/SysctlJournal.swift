@@ -307,14 +307,33 @@ public final class SysctlJournal {
         do {
             let data = try PropertyListEncoder().encode(state)
 
-            // Write to temp file (non-atomic — we control the rename ourselves).
-            try data.write(to: tmpURL)
+            // Securely create temp file with 0600 permissions to prevent TOCTOU vulnerability.
+            try? FileManager.default.removeItem(at: tmpURL)
+            let fd = tmpURL.withUnsafeFileSystemRepresentation { pathPtr -> Int32 in
+                guard let pathPtr = pathPtr else { return -1 }
+                return open(pathPtr, O_CREAT | O_WRONLY | O_EXCL | O_CLOEXEC, 0o600)
+            }
 
-            // Set permissions to 0600 (root-only) on temp file before rename.
-            try FileManager.default.setAttributes(
-                [.posixPermissions: 0o600],
-                ofItemAtPath: tmpURL.path
-            )
+            guard fd != -1 else {
+                let err = String(cString: strerror(errno))
+                logger.error("open(2) failed to create secure temp file: \(err, privacy: .public)")
+                return false
+            }
+
+            let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+            do {
+                if #available(macOS 10.15.4, *) {
+                    try handle.write(contentsOf: data)
+                    try handle.close()
+                } else {
+                    handle.write(data)
+                    handle.closeFile()
+                }
+            } catch {
+                logger.error("Failed to write to secure temp file: \(error.localizedDescription, privacy: .public)")
+                try? FileManager.default.removeItem(at: tmpURL)
+                return false
+            }
 
             // Atomic rename(2) — atomicity on APFS/HFS+.
             if rename(tmpURL.path, url.path) != 0 {

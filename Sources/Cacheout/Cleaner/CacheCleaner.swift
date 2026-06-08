@@ -34,6 +34,7 @@
 
 import Foundation
 import AppKit
+import Darwin
 
 actor CacheCleaner {
     private let fileManager = FileManager.default
@@ -261,12 +262,18 @@ actor CacheCleaner {
         let size = ByteCountFormatter.sharedFile.string(fromByteCount: bytesFreed)
         let entry = "[\(ISO8601DateFormatter.shared.string(from: Date()))] Cleaned \(category): \(size)\n"
 
-        if let handle = try? FileHandle(forWritingTo: logFile) {
-            handle.seekToEndOfFile()
+        logFile.withUnsafeFileSystemRepresentation { pathPtr -> Void in
+            guard let pathPtr = pathPtr else { return }
+            let fd = open(pathPtr, O_CREAT | O_WRONLY | O_APPEND | O_NOFOLLOW | O_CLOEXEC, 0o644)
+            guard fd != -1 else { return }
+
+            let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
             handle.write(entry.data(using: .utf8) ?? Data())
-            handle.closeFile()
-        } else {
-            try? entry.write(to: logFile, atomically: true, encoding: .utf8)
+            if #available(macOS 10.15.4, *) {
+                try? handle.close()
+            } else {
+                handle.closeFile()
+            }
         }
     }
 }

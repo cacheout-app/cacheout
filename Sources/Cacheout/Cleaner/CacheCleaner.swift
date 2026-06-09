@@ -261,12 +261,19 @@ actor CacheCleaner {
         let size = ByteCountFormatter.sharedFile.string(fromByteCount: bytesFreed)
         let entry = "[\(ISO8601DateFormatter.shared.string(from: Date()))] Cleaned \(category): \(size)\n"
 
-        if let handle = try? FileHandle(forWritingTo: logFile) {
-            handle.seekToEndOfFile()
+        let fd = logFile.withUnsafeFileSystemRepresentation { pathPtr -> Int32 in
+            guard let pathPtr = pathPtr else { return -1 }
+            return open(pathPtr, O_CREAT | O_WRONLY | O_APPEND | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        }
+
+        if fd >= 0 {
+            let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
             handle.write(entry.data(using: .utf8) ?? Data())
-            handle.closeFile()
-        } else {
-            try? entry.write(to: logFile, atomically: true, encoding: .utf8)
+            if #available(macOS 10.15.4, *) {
+                try? handle.close()
+            } else {
+                handle.closeFile()
+            }
         }
     }
 }

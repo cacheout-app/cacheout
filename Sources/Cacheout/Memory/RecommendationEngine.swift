@@ -205,10 +205,9 @@ struct RecommendationEngine {
         }
 
         // rosetta_detected
-        let rosettaProcesses = scanResult.processes.filter {
-            $0.isRosetta && $0.physFootprint >= Self.rosettaMinFootprint
-        }
-        for proc in rosettaProcesses {
+        // ⚡ Bolt Optimization: Using a `where` clause on the `for` loop instead of an eager `.filter`
+        // prevents the allocation of an intermediate array, saving memory churn when scanning hundreds of processes.
+        for proc in scanResult.processes where proc.isRosetta && proc.physFootprint >= Self.rosettaMinFootprint {
             let footprintGB = Double(proc.physFootprint) / (1024 * 1024 * 1024)
             recommendations.append(Recommendation(
                 type: .rosettaDetected,
@@ -223,8 +222,9 @@ struct RecommendationEngine {
         }
 
         // agent_memory_pressure
-        let agents = AgentDetector.agentProcesses(from: scanResult.processes)
-        for agent in agents where agent.physFootprint >= Self.agentMinFootprint {
+        // ⚡ Bolt Optimization: Checking `isAgent` in the `where` clause rather than running an eager `.filter`
+        // prevents an intermediate array allocation.
+        for agent in scanResult.processes where AgentDetector.isAgent(agent) && agent.physFootprint >= Self.agentMinFootprint {
             let footprintGB = Double(agent.physFootprint) / (1024 * 1024 * 1024)
             recommendations.append(Recommendation(
                 type: .agentMemoryPressure,

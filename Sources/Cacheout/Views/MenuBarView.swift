@@ -154,7 +154,8 @@ struct MenuBarView: View {
             Spacer()
             statPill(
                 label: "Categories",
-                value: "\(viewModel.scanResults.filter { !$0.isEmpty }.count)",
+                // ⚡ Bolt Optimization: Using `.lazy.filter` before `.count` prevents Swift from allocating an intermediate array.
+                value: "\(viewModel.scanResults.lazy.filter { !$0.isEmpty }.count)",
                 color: .blue
             )
         }
@@ -177,7 +178,10 @@ struct MenuBarView: View {
     // MARK: - Top Categories
 
     private var topCategories: some View {
+        // ⚡ Bolt Optimization: Chaining `.lazy.filter` before `.sorted` avoids allocating an intermediate array
+        // during SwiftUI render passes, reducing unnecessary heap allocations.
         let top = viewModel.scanResults
+            .lazy
             .filter { !$0.isEmpty }
             .sorted { $0.sizeBytes > $1.sizeBytes }
             .prefix(5)

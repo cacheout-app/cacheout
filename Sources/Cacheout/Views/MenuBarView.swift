@@ -214,11 +214,12 @@ struct MenuBarView: View {
             Button {
                 Task { await viewModel.scan() }
             } label: {
-                Label("Scan", systemImage: "arrow.clockwise")
+                Label(viewModel.isScanning ? "Scanning..." : "Scan", systemImage: "arrow.clockwise")
                     .font(.caption.weight(.medium))
             }
             .buttonStyle(.bordered)
             .disabled(viewModel.isScanning)
+            .help(viewModel.isScanning ? "Scan in progress" : "Scan for caches")
 
             if viewModel.isScanning {
                 ProgressView()
@@ -241,6 +242,7 @@ struct MenuBarView: View {
             .buttonStyle(.borderedProminent)
             .tint(Color(red: 0.85, green: 0.45, blue: 0.1)) // burnt orange — readable white text
             .disabled(viewModel.totalRecoverable == 0 || viewModel.isCleaning)
+            .help(viewModel.isCleaning ? "Cleanup in progress" : (viewModel.totalRecoverable == 0 ? "No recoverable caches found" : "Quick clean recoverable items"))
 
             // Open main window
             Button {
@@ -282,12 +284,13 @@ struct MenuBarView: View {
             Button {
                 Task { await viewModel.dockerPrune() }
             } label: {
-                Text("Run")
+                Text(viewModel.isDockerPruning ? "Running..." : "Run")
                     .font(.caption2.weight(.medium))
             }
             .buttonStyle(.bordered)
             .controlSize(.mini)
             .disabled(viewModel.isDockerPruning)
+            .help(viewModel.isDockerPruning ? "Docker prune in progress" : "Run docker system prune")
         }
     }
 

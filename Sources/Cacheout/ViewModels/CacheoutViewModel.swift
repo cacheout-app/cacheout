@@ -118,7 +118,7 @@ class CacheoutViewModel: ObservableObject {
     }
 
     var hasResults: Bool { !scanResults.isEmpty || !nodeModulesItems.isEmpty }
-    var hasSelection: Bool { !selectedResults.isEmpty || selectedNodeModulesSize > 0 }
+    var hasSelection: Bool { scanResults.contains(where: \.isSelected) || nodeModulesItems.contains(where: \.isSelected) }
 
     // MARK: - Node Modules computed properties
 

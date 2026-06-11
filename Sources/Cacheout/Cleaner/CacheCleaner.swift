@@ -34,6 +34,7 @@
 
 import Foundation
 import AppKit
+import Darwin
 
 actor CacheCleaner {
     private let fileManager = FileManager.default
@@ -260,13 +261,22 @@ actor CacheCleaner {
         let logFile = logDir.appendingPathComponent("cleanup.log")
         let size = ByteCountFormatter.sharedFile.string(fromByteCount: bytesFreed)
         let entry = "[\(ISO8601DateFormatter.shared.string(from: Date()))] Cleaned \(category): \(size)\n"
+        let data = entry.data(using: .utf8) ?? Data()
 
-        if let handle = try? FileHandle(forWritingTo: logFile) {
-            handle.seekToEndOfFile()
-            handle.write(entry.data(using: .utf8) ?? Data())
-            handle.closeFile()
-        } else {
-            try? entry.write(to: logFile, atomically: true, encoding: .utf8)
+        _ = logFile.withUnsafeFileSystemRepresentation { pathPtr -> Int32 in
+            guard let ptr = pathPtr else { return -1 }
+            let fd = open(ptr, O_CREAT | O_WRONLY | O_APPEND | O_NOFOLLOW | O_CLOEXEC, 0o600)
+            if fd != -1 {
+                let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+                if #available(macOS 10.15.4, *) {
+                    try? handle.write(contentsOf: data)
+                    try? handle.close()
+                } else {
+                    handle.write(data)
+                    handle.closeFile()
+                }
+            }
+            return fd
         }
     }
 }

@@ -106,7 +106,9 @@ class CacheoutViewModel: ObservableObject {
     }
 
     var selectedSize: Int64 {
-        selectedResults.reduce(0) { $0 + $1.sizeBytes }
+        // ⚡ Bolt Optimization: Use .lazy.filter to avoid allocating an intermediate array.
+        // Expected impact: Reduces memory churn during SwiftUI view updates when selections change.
+        scanResults.lazy.filter(\.isSelected).reduce(0) { $0 + $1.sizeBytes }
     }
 
     var formattedSelectedSize: String {
@@ -118,7 +120,10 @@ class CacheoutViewModel: ObservableObject {
     }
 
     var hasResults: Bool { !scanResults.isEmpty || !nodeModulesItems.isEmpty }
-    var hasSelection: Bool { !selectedResults.isEmpty || selectedNodeModulesSize > 0 }
+    // ⚡ Bolt Optimization: Replace !selectedResults.isEmpty with scanResults.contains(where: \.isSelected)
+    // to avoid eager array allocation and short-circuit evaluation.
+    // Expected impact: Reduces O(N) allocation to O(1) early exit when checking selection state.
+    var hasSelection: Bool { scanResults.contains(where: \.isSelected) || selectedNodeModulesSize > 0 }
 
     // MARK: - Node Modules computed properties
 

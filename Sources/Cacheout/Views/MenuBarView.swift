@@ -154,7 +154,9 @@ struct MenuBarView: View {
             Spacer()
             statPill(
                 label: "Categories",
-                value: "\(viewModel.scanResults.filter { !$0.isEmpty }.count)",
+                // ⚡ Bolt Optimization: Add .lazy to avoid allocating an intermediate array before counting.
+                // Expected impact: Prevents a temporary array allocation during MenuBarView render.
+                value: "\(viewModel.scanResults.lazy.filter { !$0.isEmpty }.count)",
                 color: .blue
             )
         }
@@ -177,7 +179,10 @@ struct MenuBarView: View {
     // MARK: - Top Categories
 
     private var topCategories: some View {
+        // ⚡ Bolt Optimization: Add .lazy to prevent an intermediate array allocation before sorting.
+        // Expected impact: Reduces memory overhead during top category calculation.
         let top = viewModel.scanResults
+            .lazy
             .filter { !$0.isEmpty }
             .sorted { $0.sizeBytes > $1.sizeBytes }
             .prefix(5)

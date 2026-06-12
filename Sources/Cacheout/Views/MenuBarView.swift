@@ -219,6 +219,7 @@ struct MenuBarView: View {
             }
             .buttonStyle(.bordered)
             .disabled(viewModel.isScanning)
+            .help(viewModel.isScanning ? "Scan in progress" : "Scan for caches")
 
             if viewModel.isScanning {
                 ProgressView()
@@ -241,6 +242,7 @@ struct MenuBarView: View {
             .buttonStyle(.borderedProminent)
             .tint(Color(red: 0.85, green: 0.45, blue: 0.1)) // burnt orange — readable white text
             .disabled(viewModel.totalRecoverable == 0 || viewModel.isCleaning)
+            .help(viewModel.isCleaning ? "Cleanup in progress" : (viewModel.totalRecoverable == 0 ? "Nothing to clean" : "Quick clean recoverable items"))
 
             // Open main window
             Button {
@@ -288,6 +290,7 @@ struct MenuBarView: View {
             .buttonStyle(.bordered)
             .controlSize(.mini)
             .disabled(viewModel.isDockerPruning)
+            .help(viewModel.isDockerPruning ? "Pruning in progress" : "Run Docker prune")
         }
     }
 

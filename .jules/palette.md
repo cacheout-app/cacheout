@@ -17,3 +17,6 @@
 ## 2024-05-25 - Dynamic Labels and Disabled State Tooltips
 **Learning:** Users can feel confused when a primary button is disabled without explanation or when a long-running action lacks immediate inline text feedback on the button itself.
 **Action:** In SwiftUI, enhance button accessibility and UX by adding `.help()` tooltips to explain the required state when disabled, and using dynamic labels (e.g., 'Scanning...') to provide immediate feedback during async operations.
+## 2024-06-13 - Accessibility for Collapsible Sections
+**Learning:** Custom SwiftUI buttons functioning as DisclosureGroups (collapsible sections) rely on visual cues (like chevrons) and lack implicit state readout. They require explicit `.accessibilityValue` to announce their expanded/collapsed state to VoiceOver users.
+**Action:** When building custom collapsible sections, always group the button contents and explicitly provide an `.accessibilityValue` based on the expanded state.

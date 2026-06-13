@@ -31,3 +31,7 @@
 **Vulnerability:** External shell command executed in `listLocalSnapshots()` triggered a deadlock when `tmutil` output exceeded 64KB, because stdout and stderr were read synchronously inside the process termination handler.
 **Learning:** In Swift, reading from a process pipe synchronously inside a `terminationHandler` can result in a permanent deadlock if the child blocks writing to a full pipe, preventing it from exiting.
 **Prevention:** Asynchronously drain pipes continuously while the process is running using background queues.
+## 2026-06-13 - TOCTOU Vulnerability in File Creation
+**Vulnerability:** Found insecure file creation using `Data.write(to:)` followed by `FileManager.default.setAttributes()`, creating a Time-Of-Check to Time-Of-Use window where the file is created with global umask permissions before being restricted.
+**Learning:** `Data.write(to:)` creates files using the process's default umask. For privileged daemons, this exposes temporary files to unprivileged users before permissions are tightened.
+**Prevention:** Use POSIX `open()` with `O_CREAT | O_WRONLY | O_EXCL | O_CLOEXEC` flags and explicitly set the target mode (e.g., `0600`), then wrap the returned file descriptor in a `FileHandle`.

@@ -154,7 +154,8 @@ struct MenuBarView: View {
             Spacer()
             statPill(
                 label: "Categories",
-                value: "\(viewModel.scanResults.filter { !$0.isEmpty }.count)",
+                // PERF: Use .lazy.filter before .count to prevent intermediate array allocation
+                value: "\(viewModel.scanResults.lazy.filter { !$0.isEmpty }.count)",
                 color: .blue
             )
         }
@@ -177,7 +178,9 @@ struct MenuBarView: View {
     // MARK: - Top Categories
 
     private var topCategories: some View {
+        // PERF: Chain .lazy.filter before .sorted() to prevent intermediate array allocation
         let top = viewModel.scanResults
+            .lazy
             .filter { !$0.isEmpty }
             .sorted { $0.sizeBytes > $1.sizeBytes }
             .prefix(5)

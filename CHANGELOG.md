@@ -4,6 +4,24 @@ All notable changes to Cacheout will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.1.4] - 2026-06-15
+
+### Security
+
+- **`SysctlJournal` no longer leaves the journal temp file world-readable during the umask window.** The previous `Data.write(to:)` + `setAttributes(0o600)` sequence created the file under the process's default umask before tightening permissions. Now uses POSIX `open(O_CREAT | O_WRONLY | O_EXCL | O_CLOEXEC, 0o600)` so the file is born with the right mode and never observable to other local users. (#396)
+- **`CacheCleaner` cleanup log is no longer vulnerable to TOCTOU symlink attacks.** `FileHandle(forWritingTo:)` and the `String.write(to:atomically:)` fallback both follow symlinks. Replaced with `open(O_CREAT | O_WRONLY | O_APPEND | O_NOFOLLOW | O_CLOEXEC, 0o600)`; the log directory is also explicitly created `0o700`. (#391)
+- **`StatusSocket` hardened against directory symlink swaps and `validate_config` file swaps.** Directory chmod now uses `open(O_NOFOLLOW | O_DIRECTORY) + fchmod` instead of path-based `setAttributes`. Post-bind verification `lstat`s the socket path and refuses to start if it isn't `S_IFSOCK`. `handleValidateConfig` opens with `O_NOFOLLOW | O_CLOEXEC` once, `fstat`s the fd for type + size, and reads from the fd with a hard byte cap — closes the `lstat → Data(contentsOf:)` window where a swap could bypass the size cap or `S_IFREG` check. (#397)
+
+### Changed
+
+- **Lazy-filter `.count` in MenuBarView and CleanConfirmation** to avoid allocating intermediate arrays just to take a count. Minor allocator pressure win in views that re-render frequently. (#393)
+
+### UX / Accessibility
+
+- **Disabled-state tooltips on MenuBar buttons** (Scan, Quick Clean, Docker Prune) — `.help()` strings explain why each is disabled (in-progress, nothing to clean, etc.) instead of leaving the user to guess. (#379)
+- **Docker Prune button** in Settings now shows inline "Pruning…" text alongside the spinner and gets a `.help()` tooltip explaining the action. (#263)
+- **`NodeModulesSection` header** announces expanded/collapsed state to VoiceOver via `.accessibilityValue`. (#394)
+
 ## [2.1.3] - 2026-05-22
 
 ### Fixed

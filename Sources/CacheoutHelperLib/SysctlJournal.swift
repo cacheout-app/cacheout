@@ -307,14 +307,35 @@ public final class SysctlJournal {
         do {
             let data = try PropertyListEncoder().encode(state)
 
-            // Write to temp file (non-atomic — we control the rename ourselves).
-            try data.write(to: tmpURL)
+            // Remove any stale temp file to prevent O_EXCL from failing
+            try? FileManager.default.removeItem(at: tmpURL)
 
-            // Set permissions to 0600 (root-only) on temp file before rename.
-            try FileManager.default.setAttributes(
-                [.posixPermissions: 0o600],
-                ofItemAtPath: tmpURL.path
-            )
+            // Write to temp file securely (non-atomic — we control the rename ourselves).
+            // O_CREAT | O_WRONLY | O_EXCL | O_CLOEXEC to refuse symlinks and enforce 0600 at creation
+            let fd = tmpURL.withUnsafeFileSystemRepresentation { pathPtr -> Int32 in
+                guard let pathPtr = pathPtr else { return -1 }
+                return open(pathPtr, O_CREAT | O_WRONLY | O_EXCL | O_CLOEXEC, 0o600)
+            }
+            if fd < 0 {
+                let err = String(cString: strerror(errno))
+                logger.error("Failed to securely open temp file: \(err, privacy: .public)")
+                return false
+            }
+
+            let fileHandle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+            do {
+                if #available(macOS 10.15.4, *) {
+                    try fileHandle.write(contentsOf: data)
+                    try fileHandle.close()
+                } else {
+                    fileHandle.write(data)
+                    fileHandle.closeFile()
+                }
+            } catch {
+                logger.error("Failed to write to temp file: \(error.localizedDescription, privacy: .public)")
+                try? FileManager.default.removeItem(at: tmpURL)
+                return false
+            }
 
             // Atomic rename(2) — atomicity on APFS/HFS+.
             if rename(tmpURL.path, url.path) != 0 {

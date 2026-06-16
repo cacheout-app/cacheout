@@ -31,7 +31,13 @@
 **Vulnerability:** External shell command executed in `listLocalSnapshots()` triggered a deadlock when `tmutil` output exceeded 64KB, because stdout and stderr were read synchronously inside the process termination handler.
 **Learning:** In Swift, reading from a process pipe synchronously inside a `terminationHandler` can result in a permanent deadlock if the child blocks writing to a full pipe, preventing it from exiting.
 **Prevention:** Asynchronously drain pipes continuously while the process is running using background queues.
-## 2026-05-02 - Insecure File Write TOCTOU Vulnerability via Symlink
+
+## 2026-05-02 - Insecure File Creation and TOCTOU Vulnerability
+**Vulnerability:** File creation using `Data.write(to:)` combined with a subsequent `FileManager.default.setAttributes` to secure permissions created a Time-of-Check to Time-of-Use (TOCTOU) vulnerability where the file existed momentarily with default permissions before being locked down.
+**Learning:** `Data.write(to:)` creates files using the process's default umask. Restricting permissions after creation leaves a window where unauthorized local users could access or modify the file, which is critical for root-owned temp files or sensitive data.
+**Prevention:** Avoid `Data.write(to:)` for sensitive files. Use POSIX `open()` with flags `O_CREAT | O_WRONLY | O_EXCL | O_CLOEXEC` and explicitly specify secure mode permissions (e.g., `0o600`) at the moment of creation. Wrap the resulting file descriptor in a `FileHandle`.
+
 **Vulnerability:** `FileHandle(forWritingTo:)` and `String.write(to:atomically:)` follow symlinks by default, making logging susceptible to a Time-of-Check Time-of-Use (TOCTOU) symlink attack.
 **Learning:** High-level Swift file writing APIs do not natively protect against malicious symlinks in untrusted directories, potentially allowing unintended files to be overwritten or appended to.
 **Prevention:** Always use POSIX `open(2)` with `O_CREAT | O_WRONLY | O_APPEND | O_NOFOLLOW | O_CLOEXEC` to securely refuse symlink traversal, then wrap the resulting file descriptor in a `FileHandle`. Ensure directories are also securely created using `.posixPermissions`.
+

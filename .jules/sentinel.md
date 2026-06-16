@@ -31,7 +31,14 @@
 **Vulnerability:** External shell command executed in `listLocalSnapshots()` triggered a deadlock when `tmutil` output exceeded 64KB, because stdout and stderr were read synchronously inside the process termination handler.
 **Learning:** In Swift, reading from a process pipe synchronously inside a `terminationHandler` can result in a permanent deadlock if the child blocks writing to a full pipe, preventing it from exiting.
 **Prevention:** Asynchronously drain pipes continuously while the process is running using background queues.
+
 ## 2024-06-05 - TOCTOU Vulnerability via chmod and symlinks
 **Vulnerability:** Used `chmod(path, 0o600)` and `FileManager.default.contents(atPath:)` which follow symlinks, creating a TOCTOU symlink attack vulnerability.
 **Learning:** Functions that operate on string paths (like `chmod`) resolve symlinks, which allows attackers to modify the permissions of arbitrary files if the path is swapped for a symlink before execution.
 **Prevention:** Always use `open()` with `O_NOFOLLOW | O_CLOEXEC` to get a file descriptor, apply permissions using `fchmod()`, and read from it via `FileHandle`.
+
+## 2026-05-02 - Insecure File Write TOCTOU Vulnerability via Symlink
+**Vulnerability:** `FileHandle(forWritingTo:)` and `String.write(to:atomically:)` follow symlinks by default, making logging susceptible to a Time-of-Check Time-of-Use (TOCTOU) symlink attack.
+**Learning:** High-level Swift file writing APIs do not natively protect against malicious symlinks in untrusted directories, potentially allowing unintended files to be overwritten or appended to.
+**Prevention:** Always use POSIX `open(2)` with `O_CREAT | O_WRONLY | O_APPEND | O_NOFOLLOW | O_CLOEXEC` to securely refuse symlink traversal, then wrap the resulting file descriptor in a `FileHandle`. Ensure directories are also securely created using `.posixPermissions`.
+

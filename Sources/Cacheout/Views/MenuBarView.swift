@@ -154,7 +154,8 @@ struct MenuBarView: View {
             Spacer()
             statPill(
                 label: "Categories",
-                value: "\(viewModel.scanResults.filter { !$0.isEmpty }.count)",
+                // ⚡ Bolt: Use .lazy.filter to prevent intermediate array allocation for .count
+                value: "\(viewModel.scanResults.lazy.filter { !$0.isEmpty }.count)",
                 color: .blue
             )
         }
@@ -177,7 +178,9 @@ struct MenuBarView: View {
     // MARK: - Top Categories
 
     private var topCategories: some View {
+        // ⚡ Bolt: Chain .lazy before .filter and .sorted to avoid intermediate array allocation
         let top = viewModel.scanResults
+            .lazy
             .filter { !$0.isEmpty }
             .sorted { $0.sizeBytes > $1.sizeBytes }
             .prefix(5)
@@ -219,6 +222,7 @@ struct MenuBarView: View {
             }
             .buttonStyle(.bordered)
             .disabled(viewModel.isScanning)
+            .help(viewModel.isScanning ? "Scan in progress" : "Scan for caches")
 
             if viewModel.isScanning {
                 ProgressView()
@@ -241,6 +245,7 @@ struct MenuBarView: View {
             .buttonStyle(.borderedProminent)
             .tint(Color(red: 0.85, green: 0.45, blue: 0.1)) // burnt orange — readable white text
             .disabled(viewModel.totalRecoverable == 0 || viewModel.isCleaning)
+            .help(viewModel.isCleaning ? "Cleanup in progress" : (viewModel.totalRecoverable == 0 ? "Nothing to clean" : "Quick clean recoverable items"))
 
             // Open main window
             Button {
@@ -288,6 +293,7 @@ struct MenuBarView: View {
             .buttonStyle(.bordered)
             .controlSize(.mini)
             .disabled(viewModel.isDockerPruning)
+            .help(viewModel.isDockerPruning ? "Pruning in progress" : "Run Docker prune")
         }
     }
 

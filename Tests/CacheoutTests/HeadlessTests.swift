@@ -908,6 +908,36 @@ final class StatusSocketIntegrationTests: XCTestCase {
         XCTAssertFalse((data["errors"] as? [String])?.isEmpty ?? true)
     }
 
+    func testSocketValidateConfigRejectsSymlink() async throws {
+        let tmpDir = try makeShortTmpDir()
+        defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+        // Real config file lives outside the symlink path.
+        let realConfigPath = tmpDir.appendingPathComponent("real.json")
+        try #"{"version": 1, "enabled": true}"#
+            .write(to: realConfigPath, atomically: true, encoding: .utf8)
+
+        // Symlink at the path the client requests — open(O_NOFOLLOW) must refuse.
+        let symlinkPath = tmpDir.appendingPathComponent("autopilot.json").path
+        try FileManager.default.createSymbolicLink(atPath: symlinkPath,
+                                                   withDestinationPath: realConfigPath.path)
+
+        let socketPath = tmpDir.appendingPathComponent("status.sock").path
+        let socket = StatusSocket(socketPath: socketPath, dataSource: MockDataSource())
+        try socket.start()
+        defer { socket.stop() }
+
+        let vcJSON = "{\"cmd\":\"validate_config\",\"path\":\"\(symlinkPath)\"}\n"
+        let response = try sendSocketCommand(vcJSON, to: socketPath)
+        let json = try JSONSerialization.jsonObject(with: response.data(using: .utf8)!) as! [String: Any]
+        XCTAssertEqual(json["ok"] as? Bool, true)
+        let data = json["data"] as! [String: Any]
+        XCTAssertEqual(data["valid"] as? Bool, false, "Symlink path should not validate as a real config")
+        let errors = (data["errors"] as? [String]) ?? []
+        XCTAssertTrue(errors.contains(where: { $0.contains("symlink") }),
+                      "Expected a symlink-refusal error, got: \(errors)")
+    }
+
     func testSocketUnknownCommand() async throws {
         let tmpDir = try makeShortTmpDir()
         defer { try? FileManager.default.removeItem(at: tmpDir) }

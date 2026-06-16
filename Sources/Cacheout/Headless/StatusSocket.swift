@@ -105,11 +105,20 @@ public final class StatusSocket: @unchecked Sendable {
         // Ensure directory exists with 0700 permissions.
         // createDirectory only sets attributes on newly created dirs, so we
         // explicitly chmod afterward to harden pre-existing directories.
+        // Use O_NOFOLLOW | O_DIRECTORY + fchmod on the resulting fd so a
+        // concurrent symlink swap at `dir` can't redirect the chmod target.
         let dir = (socketPath as NSString).deletingLastPathComponent
         try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true, attributes: [
             .posixPermissions: 0o700
         ])
-        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir)
+        let dirFd = open(dir, O_RDONLY | O_NOFOLLOW | O_DIRECTORY | O_CLOEXEC)
+        guard dirFd >= 0 else {
+            throw StatusSocketError.directoryHardeningFailed(errno)
+        }
+        defer { close(dirFd) }
+        guard fchmod(dirFd, 0o700) == 0 else {
+            throw StatusSocketError.directoryHardeningFailed(errno)
+        }
 
         // Remove stale socket if present
         unlink(socketPath)
@@ -156,14 +165,23 @@ public final class StatusSocket: @unchecked Sendable {
             throw StatusSocketError.bindFailed(errno)
         }
 
-        // Verify socket permissions are 0600
-        do {
-            let attrs = try FileManager.default.attributesOfItem(atPath: socketPath)
-            if let perms = attrs[.posixPermissions] as? Int, perms != 0o600 {
-                try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: socketPath)
-            }
-        } catch {
-            // Best effort — umask should have set it correctly
+        // Verify the bound socket is what we expect: a regular socket file, not a
+        // symlink swapped in between `unlink` and `bind`. `lstat` doesn't follow
+        // symlinks; `fchmodat(AT_SYMLINK_NOFOLLOW)` won't either.
+        var sockStat = Darwin.stat()
+        guard lstat(socketPath, &sockStat) == 0 else {
+            close(fd)
+            unlink(socketPath)
+            throw StatusSocketError.bindFailed(errno)
+        }
+        guard (sockStat.st_mode & S_IFMT) == S_IFSOCK else {
+            close(fd)
+            unlink(socketPath)
+            throw StatusSocketError.unexpectedSocketType
+        }
+        if (sockStat.st_mode & 0o777) != 0o600 {
+            // umask should have set 0600; defense-in-depth chmod via no-follow.
+            _ = fchmodat(AT_FDCWD, socketPath, 0o600, AT_SYMLINK_NOFOLLOW)
         }
 
         // Listen
@@ -475,18 +493,33 @@ public final class StatusSocket: @unchecked Sendable {
 
         let expandedPath = (path as NSString).expandingTildeInPath
 
-        // lstat to reject symlinks to special files, FIFOs, devices, etc.
-        var sb = Darwin.stat()
-        let statResult: Int32 = lstat(expandedPath, &sb)
-        guard statResult == 0 else {
+        // Open with O_NOFOLLOW + O_CLOEXEC so a symlink at the final path
+        // component is rejected up front and we hold a stable fd for the rest
+        // of the checks — no path resolution happens between type/size check
+        // and read, closing the lstat → open TOCTOU window.
+        let fileFd = open(expandedPath, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        guard fileFd >= 0 else {
+            let err = errno
+            let reason = err == ELOOP ? "Refusing to follow symlink: \(expandedPath)"
+                                      : "File not found: \(expandedPath)"
             sendSuccessResponse(fd: fd, data: [
                 "valid": false,
-                "errors": ["File not found: \(expandedPath)"],
+                "errors": [reason],
+            ] as [String: Any])
+            return
+        }
+        defer { close(fileFd) }
+
+        // fstat on the open fd — the kernel can't be tricked by a later swap.
+        var sb = Darwin.stat()
+        guard fstat(fileFd, &sb) == 0 else {
+            sendSuccessResponse(fd: fd, data: [
+                "valid": false,
+                "errors": ["Failed to stat file: \(expandedPath)"],
             ] as [String: Any])
             return
         }
 
-        // Only accept regular files (reject FIFOs, devices, directories, sockets)
         guard (sb.st_mode & S_IFMT) == S_IFREG else {
             sendSuccessResponse(fd: fd, data: [
                 "valid": false,
@@ -495,7 +528,6 @@ public final class StatusSocket: @unchecked Sendable {
             return
         }
 
-        // Enforce size cap to prevent memory exhaustion
         guard sb.st_size <= maxConfigFileSize else {
             sendSuccessResponse(fd: fd, data: [
                 "valid": false,
@@ -504,19 +536,32 @@ public final class StatusSocket: @unchecked Sendable {
             return
         }
 
-        do {
-            let fileData = try Data(contentsOf: URL(fileURLWithPath: expandedPath))
-            let errors = AutopilotConfigValidator.validate(data: fileData)
-            sendSuccessResponse(fd: fd, data: [
-                "valid": errors.isEmpty,
-                "errors": errors,
-            ] as [String: Any])
-        } catch {
-            sendSuccessResponse(fd: fd, data: [
-                "valid": false,
-                "errors": ["Failed to read file: \(error.localizedDescription)"],
-            ] as [String: Any])
+        // Read from the fd with a hard byte cap. fstat'd size is advisory only —
+        // the read loop is the load-bearing limit.
+        var fileData = Data()
+        fileData.reserveCapacity(Int(sb.st_size))
+        var buffer = [UInt8](repeating: 0, count: 8192)
+        let cap = Int(maxConfigFileSize)
+        while fileData.count < cap {
+            let n = buffer.withUnsafeMutableBufferPointer { buf -> ssize_t in
+                read(fileFd, buf.baseAddress, min(buf.count, cap - fileData.count))
+            }
+            if n < 0 {
+                sendSuccessResponse(fd: fd, data: [
+                    "valid": false,
+                    "errors": ["Failed to read file: errno \(errno)"],
+                ] as [String: Any])
+                return
+            }
+            if n == 0 { break }
+            fileData.append(buffer, count: n)
         }
+
+        let errors = AutopilotConfigValidator.validate(data: fileData)
+        sendSuccessResponse(fd: fd, data: [
+            "valid": errors.isEmpty,
+            "errors": errors,
+        ] as [String: Any])
     }
 
     // MARK: - Response Helpers
@@ -565,6 +610,8 @@ public enum StatusSocketError: LocalizedError {
     case socketCreationFailed(Int32)
     case bindFailed(Int32)
     case listenFailed(Int32)
+    case directoryHardeningFailed(Int32)
+    case unexpectedSocketType
 
     public var errorDescription: String? {
         switch self {
@@ -576,6 +623,10 @@ public enum StatusSocketError: LocalizedError {
             return "Failed to bind socket: errno \(err)"
         case .listenFailed(let err):
             return "Failed to listen on socket: errno \(err)"
+        case .directoryHardeningFailed(let err):
+            return "Failed to harden socket directory permissions: errno \(err)"
+        case .unexpectedSocketType:
+            return "Refused to start: socket path was replaced by a non-socket file"
         }
     }
 }

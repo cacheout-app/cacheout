@@ -41,3 +41,7 @@
 **Learning:** High-level Swift file writing APIs do not natively protect against malicious symlinks in untrusted directories, potentially allowing unintended files to be overwritten or appended to.
 **Prevention:** Always use POSIX `open(2)` with `O_CREAT | O_WRONLY | O_APPEND | O_NOFOLLOW | O_CLOEXEC` to securely refuse symlink traversal, then wrap the resulting file descriptor in a `FileHandle`. Ensure directories are also securely created using `.posixPermissions`.
 
+## 2026-05-03 - Insecure Permissions Enforcement and TOCTOU Vulnerability
+**Vulnerability:** Directly calling `chmod(path, ...)` on a path to enforce permissions is vulnerable to Time-of-Check Time-of-Use (TOCTOU) symlink attacks because `chmod` follows symlinks.
+**Learning:** An attacker could replace the target file with a symlink to a sensitive file just before `chmod` executes, altering permissions on the sensitive file instead.
+**Prevention:** To safely apply permissions, obtain a file descriptor using `open()` with `O_RDONLY | O_NOFOLLOW | O_CLOEXEC` and apply permissions using `fchmod()` on the descriptor.

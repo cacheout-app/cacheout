@@ -967,7 +967,16 @@ public actor DaemonMode: StatusSocket.DataSource {
         }
 
         // Enforce 0600 permissions
-        chmod(path, 0o600)
+        let url = URL(fileURLWithPath: path)
+        _ = url.withUnsafeFileSystemRepresentation { pathPtr -> Int32 in
+            guard let pathPtr = pathPtr else { return -1 }
+            let fd = open(pathPtr, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+            if fd >= 0 {
+                fchmod(fd, 0o600)
+                close(fd)
+            }
+            return 0
+        }
 
         // Read file
         guard let data = FileManager.default.contents(atPath: path) else {

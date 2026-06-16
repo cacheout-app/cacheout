@@ -21,3 +21,6 @@
 ## 2024-05-26 - Accessibility for Custom Collapsible Sections
 **Learning:** Custom buttons functioning as collapsible sections (like DisclosureGroups) rely on visual cues and lack implicit state readout.
 **Action:** Explicitly add an `.accessibilityValue` (e.g., `isExpanded ? "Expanded" : "Collapsed"`) to announce their state to VoiceOver users.
+## 2024-05-27 - Dashboard Stat Grouping
+**Learning:** VoiceOver users have to swipe multiple times to hear a single statistic if its label and value are separate text elements in a dashboard card. This creates a fragmented and tedious reading experience.
+**Action:** Always apply `.accessibilityElement(children: .combine)` to SwiftUI stat cards or metric views that group a title and a value, ensuring they are read out as a single cohesive piece of information.

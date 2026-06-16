@@ -25,3 +25,15 @@
 ## 2024-05-18 - Dictionary overhead vs O(n) array lookups
 **Learning:** Avoid replacing O(n) `firstIndex(where:)` searches with O(1) dictionary-based index maps for SwiftUI `@Published` arrays if the collection is small, the interaction is infrequent, or the map requires frequent reconstruction (e.g., on every scan). The O(n) map construction overhead (allocating memory and hashing every UUID) will outweigh the lookup benefits.
 **Action:** When evaluating lookup optimizations, explicitly weigh the frequency of the lookup against the frequency of the dataset being rebuilt. Use index maps only for large, long-lived datasets with extremely frequent, hot-path lookups.
+
+## 2024-05-25 - Efficient Dictionary Initialization
+**Learning:** Building a dictionary via a standard `for` loop by inserting elements one by one can cause unnecessary overhead due to repeated mutations. `reduce(into: [:])` is highly optimized in Swift to build collections without creating intermediate copies.
+**Action:** Use `reduce(into: [:])` when constructing a dictionary from an array, particularly when uniqueness checks or transformations are required.
+## 2025-10-24 - Bulk Disk I/O Parallelization and Thread Pool Starvation
+**Learning:** Both `withTaskGroup` and `Task.detached` schedule their work on Swift's cooperative thread pool, which has only as many threads as the CPU has cores. Running synchronous blocking I/O (like `FileManager.removeItem`) directly inside such tasks ties up cooperative threads — when every thread is parked in a syscall there is nothing left to advance other Swift Concurrency work, which manifests as starvation and (with self-referential `await` chains) outright deadlock. `Task.detached` does not help here: "detached" means unstructured/independent, not "off the cooperative pool."
+**Action:** To parallelize bulk blocking I/O, combine a sliding-window `withThrowingTaskGroup` (e.g., `maxConcurrency` of 8) with a per-item handoff to a GCD queue: wrap the blocking call in `withCheckedThrowingContinuation` and dispatch it via `DispatchQueue.global(qos: .userInitiated).async { ... continuation.resume(...) }`. The cooperative-pool task only `await`s the continuation, so it never holds a thread while the syscall runs.
+
+## 2024-05-30 - SwiftUI ForEach and Lazy Collections
+**Learning:** In SwiftUI, avoid using `.lazy.filter` directly inside a `ForEach` loop, as `ForEach` requires the data to conform to `RandomAccessCollection`, which `LazyFilterSequence` does not. Eagerly compute the filtered array before passing it to the `ForEach` view builder.
+**Action:** When optimizing SwiftUI views, only apply `.lazy.filter` to properties where you immediately consume the sequence (e.g., calling `.count`, `.reduce`, or `.sorted()`). For data bound to a `ForEach` list, continue using standard eager `.filter`.
+

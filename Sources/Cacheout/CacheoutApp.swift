@@ -149,32 +149,34 @@ struct CacheoutApp: App {
         }
     }
 
-    /// Custom menubar icon — uses the template image from Resources,
-    /// with a warning badge overlay when disk usage is critical.
+    // Menubar icon. Loads the multi-rep TIFF from the bundle and marks it as
+    // a template so AppKit tints it to match the menubar appearance (black on
+    // light, white on dark/translucent). Falls back to an SF Symbol if the
+    // bundled image is missing.
+    //
+    // Why a TIFF + Image(nsImage:) rather than Image("name"):
+    //   - Image("MenuBarIconTemplate") loaded from loose PNG pairs renders
+    //     visibly but does NOT carry the template flag through to
+    //     NSStatusItem.button, so on a dark menubar the icon stays black and
+    //     reads as invisible against the wallpaper.
+    //   - A proper multi-rep TIFF (1x + 2x merged via `tiffutil -cathidpicheck`,
+    //     the same format Xcode's actool used to emit) loaded via
+    //     Bundle.main.image() yields an NSImage whose isTemplate=true is
+    //     respected by the status button.
     @ViewBuilder
     private var menuBarIconView: some View {
-        let img = Image(nsImage: menuBarNSImage)
-        if let pct = viewModel.diskInfo?.usedPercentage, pct > 0.95 {
-            img.overlay(alignment: .bottomTrailing) {
-                Image(systemName: "exclamationmark.circle.fill")
-                    .font(.system(size: 8, weight: .bold))
-            }
-        } else {
-            img
-        }
+        Image(nsImage: Self.cachedMenuBarImage)
+            .accessibilityLabel("Cacheout")
     }
 
-    /// Load the template image from the bundle, falling back to SF Symbol
-    private var menuBarNSImage: NSImage {
+    private static let cachedMenuBarImage: NSImage = {
         if let img = Bundle.main.image(forResource: "MenuBarIconTemplate") {
             img.isTemplate = true
-            img.size = NSSize(width: 18, height: 18)
             return img
         }
-        // Fallback: SF Symbol
         return NSImage(systemSymbolName: "externaldrive.fill", accessibilityDescription: "Cacheout")
             ?? NSImage()
-    }
+    }()
 
     // MARK: - Helper registration
 

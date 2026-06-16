@@ -34,6 +34,7 @@
 
 import Foundation
 import AppKit
+import Darwin
 
 actor CacheCleaner {
     private let fileManager = FileManager.default
@@ -64,7 +65,7 @@ actor CacheCleaner {
                         if moveToTrash {
                             try await trashDirectory(url)
                         } else {
-                            try removeContents(of: url)
+                            try await removeContents(of: url)
                         }
                         categoryFreed += result.sizeBytes
                     } catch {
@@ -80,18 +81,30 @@ actor CacheCleaner {
             logCleanup(category: result.category.name, bytesFreed: categoryFreed)
         }
 
-        // Clean selected node_modules
-        for item in nodeModules where item.isSelected {
-            do {
-                if moveToTrash {
+        // Clean selected node_modules.
+        // Move-to-Trash stays sequential because trashItem is @MainActor and the
+        // Finder serializes Trash operations anyway. Permanent delete is parallelized
+        // with the same sliding-window pattern as removeContents(of:).
+        let selectedNodeModules = nodeModules.filter { $0.isSelected }
+        if moveToTrash {
+            for item in selectedNodeModules {
+                do {
                     try await trashItem(item.nodeModulesPath)
-                } else {
-                    try fileManager.removeItem(at: item.nodeModulesPath)
+                    cleaned.append(("node_modules: \(item.projectName)", item.sizeBytes))
+                    logCleanup(category: "node_modules/\(item.projectName)", bytesFreed: item.sizeBytes)
+                } catch {
+                    errors.append(("node_modules: \(item.projectName)", error.localizedDescription))
                 }
-                cleaned.append(("node_modules: \(item.projectName)", item.sizeBytes))
-                logCleanup(category: "node_modules/\(item.projectName)", bytesFreed: item.sizeBytes)
-            } catch {
-                errors.append(("node_modules: \(item.projectName)", error.localizedDescription))
+            }
+        } else {
+            let results = await removeNodeModulesConcurrently(items: selectedNodeModules)
+            for (item, error) in results {
+                if let error {
+                    errors.append(("node_modules: \(item.projectName)", error.localizedDescription))
+                } else {
+                    cleaned.append(("node_modules: \(item.projectName)", item.sizeBytes))
+                    logCleanup(category: "node_modules/\(item.projectName)", bytesFreed: item.sizeBytes)
+                }
             }
         }
 
@@ -133,12 +146,95 @@ actor CacheCleaner {
         }
     }
 
-    private func removeContents(of url: URL) throws {
+    private func removeContents(of url: URL) async throws {
         let contents = try fileManager.contentsOfDirectory(
             at: url, includingPropertiesForKeys: nil
         )
-        for item in contents {
-            try fileManager.removeItem(at: item)
+        let currentFileManager = self.fileManager
+
+        // ⚡ Bolt Optimization: Parallelize bulk file deletion using a TaskGroup with a sliding window.
+        // Synchronous disk I/O is offloaded to a GCD background queue to avoid thread pool exhaustion.
+        let maxConcurrency = 8
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            var iterator = contents.makeIterator()
+
+            for _ in 0..<maxConcurrency {
+                if let item = iterator.next() {
+                    group.addTask {
+                        try await Self.removeItemConcurrently(at: item, fileManager: currentFileManager)
+                    }
+                }
+            }
+
+            while try await group.next() != nil {
+                if let nextItem = iterator.next() {
+                    group.addTask {
+                        try await Self.removeItemConcurrently(at: nextItem, fileManager: currentFileManager)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Parallel per-item deletion with isolated error handling. Each result preserves
+    /// its input ordering so callers can build consistent cleaned/errors arrays.
+    private func removeNodeModulesConcurrently(
+        items: [NodeModulesItem]
+    ) async -> [(item: NodeModulesItem, error: Error?)] {
+        guard !items.isEmpty else { return [] }
+        let currentFileManager = self.fileManager
+        let maxConcurrency = 8
+
+        return await withTaskGroup(
+            of: (Int, Error?).self,
+            returning: [(item: NodeModulesItem, error: Error?)].self
+        ) { group in
+            var iterator = items.indices.makeIterator()
+
+            for _ in 0..<min(maxConcurrency, items.count) {
+                guard let index = iterator.next() else { break }
+                let path = items[index].nodeModulesPath
+                group.addTask {
+                    do {
+                        try await Self.removeItemConcurrently(at: path, fileManager: currentFileManager)
+                        return (index, nil)
+                    } catch {
+                        return (index, error)
+                    }
+                }
+            }
+
+            var results = Array<(item: NodeModulesItem, error: Error?)?>(repeating: nil, count: items.count)
+
+            while let (index, error) = await group.next() {
+                results[index] = (items[index], error)
+                if let nextIndex = iterator.next() {
+                    let path = items[nextIndex].nodeModulesPath
+                    group.addTask {
+                        do {
+                            try await Self.removeItemConcurrently(at: path, fileManager: currentFileManager)
+                            return (nextIndex, nil)
+                        } catch {
+                            return (nextIndex, error)
+                        }
+                    }
+                }
+            }
+
+            return results.compactMap { $0 }
+        }
+    }
+
+    nonisolated private static func removeItemConcurrently(at url: URL, fileManager: FileManager) async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            DispatchQueue.global(qos: .userInitiated).async {
+                do {
+                    try fileManager.removeItem(at: url)
+                    continuation.resume()
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
         }
     }
 
@@ -160,18 +256,28 @@ actor CacheCleaner {
     private func logCleanup(category: String, bytesFreed: Int64) {
         let logDir = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".cacheout")
-        try? FileManager.default.createDirectory(at: logDir, withIntermediateDirectories: true)
+        try? FileManager.default.createDirectory(at: logDir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
 
         let logFile = logDir.appendingPathComponent("cleanup.log")
         let size = ByteCountFormatter.sharedFile.string(fromByteCount: bytesFreed)
         let entry = "[\(ISO8601DateFormatter.shared.string(from: Date()))] Cleaned \(category): \(size)\n"
 
-        if let handle = try? FileHandle(forWritingTo: logFile) {
-            handle.seekToEndOfFile()
-            handle.write(entry.data(using: .utf8) ?? Data())
-            handle.closeFile()
+        let fd = logFile.withUnsafeFileSystemRepresentation { pathPtr -> Int32 in
+            guard let pathPtr = pathPtr else { return -1 }
+            return open(pathPtr, O_CREAT | O_WRONLY | O_APPEND | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        }
+
+        guard fd != -1 else { return }
+
+        let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+        let data = entry.data(using: .utf8) ?? Data()
+
+        if #available(macOS 10.15.4, *) {
+            try? handle.write(contentsOf: data)
+            try? handle.close()
         } else {
-            try? entry.write(to: logFile, atomically: true, encoding: .utf8)
+            handle.write(data)
+            handle.closeFile()
         }
     }
 }

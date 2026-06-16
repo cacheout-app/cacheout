@@ -353,8 +353,11 @@ public actor DaemonMode: StatusSocket.DataSource {
     private func acquirePIDLock() -> Bool {
         let pidPath = pidFilePath
 
-        // Open (or create) the PID file with 0600 permissions
-        let fd = open(pidPath, O_WRONLY | O_CREAT, 0o600)
+        // Open (or create) the PID file with 0600 permissions safely
+        let fd = URL(fileURLWithPath: pidPath).withUnsafeFileSystemRepresentation { pathPtr in
+            guard let ptr = pathPtr else { return Int32(-1) }
+            return open(ptr, O_WRONLY | O_CREAT | O_CLOEXEC, S_IRUSR | S_IWUSR)
+        }
         guard fd >= 0 else {
             logger.error("Failed to open PID file: errno \(errno)")
             return false

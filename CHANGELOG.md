@@ -4,6 +4,67 @@ All notable changes to Cacheout will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.1.3] - 2026-05-22
+
+### Fixed
+
+- **Menubar icon now renders correctly on dark and translucent menubars.** v2.1.2 swapped in the master artwork but the icon still read as invisible on dark backgrounds — loose `@1x`/`@2x` PNG pairs loaded via `Bundle.main.image(forResource:)` produce an `NSImage` whose `isTemplate` flag is silently dropped by `NSStatusItem.button`, so AppKit was painting the black master in black on a black menubar. Switched the bundled assets to multi-rep TIFFs (`tiffutil -cathidpicheck`, the same format Xcode's actool emitted for v2.0.0). TIFF-backed `NSImage`s propagate `isTemplate` through to the status button and AppKit tints the icon to match the menubar appearance.
+
+### Changed
+
+- `node_modules` permanent-delete now parallelizes with the same sliding-window `TaskGroup` (max 8) + GCD handoff pattern used by `removeContents(of:)` in #275. Move-to-Trash stays sequential because `trashItem` is `@MainActor` and Finder serializes Trash ops anyway. Per-item failures are isolated — one bad `node_modules` entry no longer poisons the rest of the batch.
+- `Tests/CacheoutTests/CacheCleanerTests.swift` added: round-trip tests for the parallel deletion paths (large fan-out, isolated failures, empty-dir no-op, parent-dir preservation, unselected skip).
+
+## [2.1.2] - 2026-05-17
+
+### Fixed
+
+- Menubar icon now uses the correct master artwork. The previous PNGs were a faint outline that effectively rendered invisible at 18×18 in template mode. Re-generated `MenuBarIcon{,@2x,Template,Template@2x}.png` from `Resources/menubar-icon-master.PNG` so the Cacheout "C" actually appears in the menubar.
+
+## [2.1.1] - 2026-05-17
+
+### Fixed
+
+- **Menubar icon now displays again.** The custom `MenuBarIconTemplate.png` resources weren't being copied into `Contents/Resources/` by `scripts/bundle.sh`, so `Bundle.main.image(forResource:)` couldn't find them and the menubar item rendered blank for some users. Bundle script now copies both regular and `@2x` variants for both `MenuBarIcon` and `MenuBarIconTemplate`.
+- **Privileged helper daemon is now bundled at `Contents/Library/LaunchDaemons/`.** `scripts/bundle.sh` was not copying the `CacheoutHelper` executable or `com.cacheout.memhelper.plist` into the app, which silently broke the install-helper onboarding flow and `--daemon` autopilot. The helper is now signed before the outer app so `codesign --verify --deep --strict` passes.
+
+## [2.1.0] - 2026-05-17
+
+### Added
+
+- Sparkle.framework now bundled inside `Cacheout.app/Contents/Frameworks/` with the correct `@executable_path/../Frameworks` rpath — future releases can auto-update via Sparkle without manual reinstall.
+- Inner XPC services (`Downloader.xpc`, `Installer.xpc`), `Updater.app`, and `Autoupdate` are re-signed in the correct inner→outer order with `--options runtime`; `Downloader.xpc` re-signs preserve entitlements for Sparkle 2.6+ sandbox compatibility.
+- `./scripts/bundle.sh --notarize` (and `--release` alias) now runs the full pipeline: build, sign, DMG, notarize, staple.
+- Dynamic button labels on the Scan/Clean buttons (`Scanning…` / `Cleaning…`) with `.help()` tooltips explaining disabled states.
+- `.help()` tooltip on the per-process ellipsis menu in the Processes view.
+- Visual empty state for the node_modules section (centered icon + callout, replacing the plain text).
+- Accessibility labels on icon-only controls so VoiceOver reads meaningful names instead of "Button".
+- Empty state for the Processes view.
+
+### Changed
+
+- `runCleanCommand` in `CacheoutViewModel` now reads the process pipe before calling `waitUntilExit()`, eliminating a deadlock when `docker system prune` output exceeds the ~64KB pipe buffer.
+- `JetsamHWM` priority map now built with `reduce(into:)` instead of a mutating for-loop, removing copy-on-write overhead.
+- `ProcessMemoryScanner` uses a sliding-window TaskGroup for bounded concurrency.
+- Scanner TaskGroups marked `nonisolated` so subtasks actually parallelize off the actor executor.
+- Shared `ByteCountFormatter` / `ISO8601DateFormatter` instances instead of per-call allocations; `.lazy.filter` before `.reduce` to avoid intermediate arrays.
+- Batched `@Published` array mutations to a single assignment so SwiftUI re-renders once per scan.
+- `CacheScanner` enumerator now prefetches `.isRegularFileKey` so `URL.resourceValues` avoids a fallback `stat()` per file.
+- `NodeModulesScanner` is now truly concurrent and issues fewer syscalls.
+- Blocking I/O (process waits, `URLResourceValues` reads) is now offloaded via `Task.detached` so async @MainActor methods no longer stall the UI.
+- `runningApplications` filtered with `.lazy` to skip an intermediate array allocation.
+
+### Fixed
+
+- Webhook URLs are now validated as `https` in both `AutopilotConfigValidator` and `WebhookConfig.parse`. `http://` webhooks are rejected.
+- PID lock acquisition in daemon mode now opens with `O_CLOEXEC` and uses `withUnsafeFileSystemRepresentation`, preventing the lock fd from leaking into child processes.
+- Defense-in-depth fix for process pipe deadlock during process execution (reads pipes before/concurrently-with `waitUntilExit()`).
+- Command injection vulnerability in `runCleanCommand`: shell strings replaced with `Foundation.Process` + arguments array.
+- Command injection in `CacheCategory.toolExists`: `/bin/bash -c` interpolation replaced with `/usr/bin/env <tool>` invocation, restoring the explicit `PATH`/`HOME` environment so the macOS GUI launch context resolves Homebrew tools correctly.
+- Docker pruning refactored to use `/usr/bin/env docker` instead of hardcoded `/usr/local/bin/docker` so Apple Silicon `/opt/homebrew/bin` users actually run it.
+- Guard against empty arguments in `runCleanCommand`.
+- Process names no longer display as "unknown" in the main process list.
+
 ## [1.0.0] - 2026-01-01
 
 ### Added

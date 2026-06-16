@@ -32,3 +32,6 @@
 ## 2024-05-30 - SwiftUI ForEach and Lazy Collections
 **Learning:** In SwiftUI, avoid using `.lazy.filter` directly inside a `ForEach` loop, as `ForEach` requires the data to conform to `RandomAccessCollection`, which `LazyFilterSequence` does not. Eagerly compute the filtered array before passing it to the `ForEach` view builder.
 **Action:** When optimizing SwiftUI views, only apply `.lazy.filter` to properties where you immediately consume the sequence (e.g., calling `.count`, `.reduce`, or `.sorted()`). For data bound to a `ForEach` list, continue using standard eager `.filter`.
+## 2024-05-30 - Short-circuiting Computed Properties in SwiftUI
+**Learning:** In SwiftUI ViewModels, calculating boolean properties (like `hasSelection`) eagerly allocated intermediate arrays and evaluated entire sums just to check for emptiness (`!array.filter(...).isEmpty` or `array.reduce(...) > 0`). This causes unnecessary memory churn and O(N) CPU operations during frequent redraws.
+**Action:** Replace eager array filtering and full map reductions with `.contains(where:)` to allow short-circuit evaluation. This changes the complexity from O(N) to an O(1) best-case, skipping full traversal as soon as the first match is found.

@@ -36,7 +36,8 @@ struct CleanConfirmationSheet: View {
             Text("Clean Selected Caches?")
                 .font(.title2.bold())
 
-            Text("This will remove \(viewModel.formattedTotalSelectedSize) from \(viewModel.selectedResults.count + viewModel.nodeModulesItems.filter(\.isSelected).count) items.")
+            // ⚡ Bolt: Use .lazy.filter for .count to avoid allocating an intermediate array
+            Text("This will remove \(viewModel.formattedTotalSelectedSize) from \(viewModel.selectedResults.count + viewModel.nodeModulesItems.lazy.filter(\.isSelected).count) items.")
                 .font(.body)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)

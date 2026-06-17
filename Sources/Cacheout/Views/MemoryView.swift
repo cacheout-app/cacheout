@@ -148,6 +148,7 @@ struct MemoryView: View {
             .padding(8)
             .background(.quaternary.opacity(0.3))
             .clipShape(RoundedRectangle(cornerRadius: 6))
+            .accessibilityElement(children: .combine)
         }
     }
 
@@ -170,6 +171,7 @@ struct MemoryView: View {
         .padding(8)
         .background(.quaternary.opacity(0.3))
         .clipShape(RoundedRectangle(cornerRadius: 6))
+        .accessibilityElement(children: .combine)
     }
 
     // MARK: - Loading State

@@ -4,6 +4,21 @@ All notable changes to Cacheout will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.1.5] - 2026-06-16
+
+### Security
+
+- **`DaemonMode` config load no longer susceptible to chmod/read TOCTOU.** The previous path-based `chmod(path, 0o600)` followed by `FileManager.contents(atPath:)` could be redirected by a symlink swap between the two calls — an attacker with write access to the directory could trick the daemon into chmod'ing or reading an arbitrary file. Now opens the config with `open(O_RDONLY | O_NOFOLLOW | O_CLOEXEC)` once, applies `fchmod(0o600)` to the resulting descriptor, and reads via `FileHandle.readToEnd()`. Both the permission change and the read happen on the same fd so the kernel can't be tricked into operating on a substituted path. (#346 — deferred from v2.1.4 due to a release-window merge conflict)
+
+### Changed
+
+- **`CacheoutViewModel.selectedSize`** now uses `scanResults.lazy.filter(\.isSelected)` instead of materializing `selectedResults` to compute a sum — saves the intermediate array allocation on every recomputation.
+- **`CacheoutViewModel.hasSelection`** uses `contains(where:)` on both `scanResults` and `nodeModulesItems` instead of comparing `selectedNodeModulesSize > 0`, which previously forced a full `reduce` over `nodeModulesItems` just to check whether *any* item was selected. Now short-circuits on the first match. (#404)
+
+### UX / Accessibility
+
+- **Memory dashboard stat cards** are now read as a single coherent item by VoiceOver. Added `.accessibilityElement(children: .combine)` to the two stat-card views in `MemoryView` so the title and value announce together instead of forcing the user to swipe through each text element separately. (#401)
+
 ## [2.1.4] - 2026-06-15
 
 ### Security

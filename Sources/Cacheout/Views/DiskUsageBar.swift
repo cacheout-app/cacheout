@@ -46,6 +46,7 @@ struct DiskUsageBar: View {
                     .foregroundStyle(diskInfo.usedPercentage > 0.9 ? .red : .secondary)
             }
         }
+        .accessibilityElement(children: .combine)
         .padding()
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
     }

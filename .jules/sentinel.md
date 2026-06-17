@@ -48,3 +48,8 @@
 **Learning:** High-level Swift file writing APIs do not natively protect against malicious symlinks in untrusted directories, potentially allowing unintended files to be overwritten or appended to.
 **Prevention:** Always use POSIX `open(2)` with `O_CREAT | O_WRONLY | O_APPEND | O_NOFOLLOW | O_CLOEXEC` to securely refuse symlink traversal, then wrap the resulting file descriptor in a `FileHandle`. Ensure directories are also securely created using `.posixPermissions`.
 
+
+## 2026-05-03 - Insecure File Modification TOCTOU Vulnerability via Symlink
+**Vulnerability:** Used `FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: ...)` which follows symlinks, creating a TOCTOU symlink attack vulnerability.
+**Learning:** High-level APIs like `setAttributes` resolve symlinks, allowing an attacker to swap a directory for a symlink and modify permissions of arbitrary files if the swap occurs immediately before the call.
+**Prevention:** Always use POSIX `open(2)` with `O_RDONLY | O_NOFOLLOW | O_DIRECTORY | O_CLOEXEC` to get a file descriptor safely and apply permissions using `fchmod()`.

@@ -295,10 +295,17 @@ public actor DaemonMode: StatusSocket.DataSource {
                 withIntermediateDirectories: true,
                 attributes: [.posixPermissions: 0o700]
             )
-            try FileManager.default.setAttributes(
-                [.posixPermissions: 0o700],
-                ofItemAtPath: config.stateDir.path
-            )
+            let fd = config.stateDir.withUnsafeFileSystemRepresentation { pathPtr -> Int32 in
+                guard let pathPtr = pathPtr else { return -1 }
+                return open(pathPtr, O_RDONLY | O_NOFOLLOW | O_DIRECTORY | O_CLOEXEC)
+            }
+            guard fd >= 0 else {
+                throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno), userInfo: nil)
+            }
+            defer { close(fd) }
+            guard fchmod(fd, 0o700) == 0 else {
+                throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno), userInfo: nil)
+            }
         } catch {
             logger.error("Failed to create/secure state directory: \(error.localizedDescription, privacy: .public)")
             Foundation.exit(1)

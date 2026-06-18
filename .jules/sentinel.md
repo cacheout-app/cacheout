@@ -48,3 +48,7 @@
 **Learning:** High-level Swift file writing APIs do not natively protect against malicious symlinks in untrusted directories, potentially allowing unintended files to be overwritten or appended to.
 **Prevention:** Always use POSIX `open(2)` with `O_CREAT | O_WRONLY | O_APPEND | O_NOFOLLOW | O_CLOEXEC` to securely refuse symlink traversal, then wrap the resulting file descriptor in a `FileHandle`. Ensure directories are also securely created using `.posixPermissions`.
 
+## 2026-05-03 - TOCTOU Vulnerability via FileManager.setAttributes
+**Vulnerability:** Used `FileManager.default.setAttributes` to apply permissions (`0o700`) to the state directory after creation.
+**Learning:** High-level Swift APIs like `FileManager.default.setAttributes` operate on string paths and follow symlinks by default. This makes them susceptible to Time-of-Check Time-of-Use (TOCTOU) symlink attacks, similarly to C `chmod()`.
+**Prevention:** Avoid `FileManager.default.setAttributes` for securing permissions on directories or sensitive files. Always use `withUnsafeFileSystemRepresentation`, `open()` with `O_NOFOLLOW | O_CLOEXEC`, and `fchmod()`.

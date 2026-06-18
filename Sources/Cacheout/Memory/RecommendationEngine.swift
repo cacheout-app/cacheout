@@ -205,10 +205,7 @@ struct RecommendationEngine {
         }
 
         // rosetta_detected
-        let rosettaProcesses = scanResult.processes.filter {
-            $0.isRosetta && $0.physFootprint >= Self.rosettaMinFootprint
-        }
-        for proc in rosettaProcesses {
+        for proc in scanResult.processes where proc.isRosetta && proc.physFootprint >= Self.rosettaMinFootprint {
             let footprintGB = Double(proc.physFootprint) / (1024 * 1024 * 1024)
             recommendations.append(Recommendation(
                 type: .rosettaDetected,
@@ -223,8 +220,7 @@ struct RecommendationEngine {
         }
 
         // agent_memory_pressure
-        let agents = AgentDetector.agentProcesses(from: scanResult.processes)
-        for agent in agents where agent.physFootprint >= Self.agentMinFootprint {
+        for agent in scanResult.processes where AgentDetector.isAgent(agent) && agent.physFootprint >= Self.agentMinFootprint {
             let footprintGB = Double(agent.physFootprint) / (1024 * 1024 * 1024)
             recommendations.append(Recommendation(
                 type: .agentMemoryPressure,

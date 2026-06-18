@@ -32,3 +32,6 @@
 ## 2024-05-30 - SwiftUI ForEach and Lazy Collections
 **Learning:** In SwiftUI, avoid using `.lazy.filter` directly inside a `ForEach` loop, as `ForEach` requires the data to conform to `RandomAccessCollection`, which `LazyFilterSequence` does not. Eagerly compute the filtered array before passing it to the `ForEach` view builder.
 **Action:** When optimizing SwiftUI views, only apply `.lazy.filter` to properties where you immediately consume the sequence (e.g., calling `.count`, `.reduce`, or `.sorted()`). For data bound to a `ForEach` list, continue using standard eager `.filter`.
+## 2025-04-13 - Loop Filtering and Intermediate Allocations
+**Learning:** In Swift, using `.filter` before a `for` loop eagerly allocates a new intermediate array, causing unnecessary memory churn and processing overhead, especially during frequent operations like system monitoring.
+**Action:** Use `for ... where` clauses instead of eagerly filtering the collection prior to the loop (e.g., `for item in array where condition { ... }`). This prevents the allocation of intermediate arrays and improves efficiency.

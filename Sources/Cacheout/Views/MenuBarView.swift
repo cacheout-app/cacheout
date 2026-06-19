@@ -173,6 +173,7 @@ struct MenuBarView: View {
         .frame(maxWidth: .infinity)
         .padding(.vertical, 6)
         .background(color.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+        .accessibilityElement(children: .combine)
     }
 
     // MARK: - Top Categories

@@ -289,16 +289,22 @@ public actor DaemonMode: StatusSocket.DataSource {
         // Ensure state directory exists with 0700 permissions.
         // createDirectory only sets attributes on newly created dirs, so we
         // explicitly chmod afterward to harden pre-existing directories.
+        // Use O_NOFOLLOW | O_DIRECTORY + fchmod on the resulting fd so a
+        // concurrent symlink swap at `stateDir` can't redirect the chmod target.
         do {
             try FileManager.default.createDirectory(
                 at: config.stateDir,
                 withIntermediateDirectories: true,
                 attributes: [.posixPermissions: 0o700]
             )
-            try FileManager.default.setAttributes(
-                [.posixPermissions: 0o700],
-                ofItemAtPath: config.stateDir.path
-            )
+            let dirFd = open(config.stateDir.path, O_RDONLY | O_NOFOLLOW | O_DIRECTORY | O_CLOEXEC)
+            guard dirFd >= 0 else {
+                throw NSError(domain: "DaemonMode", code: Int(errno))
+            }
+            defer { close(dirFd) }
+            guard fchmod(dirFd, 0o700) == 0 else {
+                throw NSError(domain: "DaemonMode", code: Int(errno))
+            }
         } catch {
             logger.error("Failed to create/secure state directory: \(error.localizedDescription, privacy: .public)")
             Foundation.exit(1)

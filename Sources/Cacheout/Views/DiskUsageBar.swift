@@ -48,6 +48,7 @@ struct DiskUsageBar: View {
         }
         .padding()
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+        .accessibilityElement(children: .combine)
     }
 
     private var barColor: Color {

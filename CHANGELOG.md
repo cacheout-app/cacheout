@@ -4,6 +4,20 @@ All notable changes to Cacheout will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.1.6] - 2026-06-19
+
+### Security
+
+- **`DaemonMode` state-directory permissions are no longer settable via symlink swap.** The daemon hardens its state directory (`~/Library/Application Support/Cacheout` or `--state-dir`) by chmod'ing it to `0o700` after `createDirectory` — but the previous `FileManager.setAttributes(ofItemAtPath:)` follows symlinks, so an attacker with write access to the parent could swap the directory for a symlink between the two calls and redirect the chmod. Now opens the directory with `open(O_RDONLY | O_NOFOLLOW | O_DIRECTORY | O_CLOEXEC)` and applies `fchmod(0o700)` to the resulting descriptor — the kernel can't be tricked into chmod'ing somewhere else. Distinct from v2.1.5's #346, which fixed a different chmod site on the config-reload path. (#410)
+
+### Changed
+
+- **`RecommendationEngine` recommendation loops** now use `for proc in scanResult.processes where condition` instead of `scanResult.processes.filter { ... }.forEach`. Avoids two intermediate array allocations on every recommendation pass — runs on the daemon hot path, so the saving compounds at the long-running-daemon scale. (#407)
+
+### UX / Accessibility
+
+- **Disk-usage bar and MenuBar stat pills** now read as single coherent items in VoiceOver. Added `.accessibilityElement(children: .combine)` at the outermost modifier position on `DiskUsageBar`'s outer frame and on `MenuBarView`'s `statPill` so the entire visible card announces together instead of forcing the user to swipe through each text element. (#409)
+
 ## [2.1.5] - 2026-06-16
 
 ### Security

@@ -1,3 +1,86 @@
+# 🛡️ Sentinel — security learning log
+
+Read `.jules/README.md` first. Then re-read the **FIXED SITES** and
+**ANTI-PATTERNS** sections below before considering any PR. Most Sentinel
+PRs in the last 60 days have been closed as duplicates of these.
+
+## ✅ FIXED SITES — do not re-propose
+
+Each row is a security finding that has been verified hardened in main.
+**If your candidate PR touches the same file:line or the same pattern,
+the issue is already fixed.** Stop.
+
+| File | Line(s) | Pattern fixed | By |
+|---|---|---|---|
+| `Sources/CacheoutHelperLib/SysctlJournal.swift` | journal temp file write | `Data.write` + `setAttributes` → `open(O_CREAT \| O_EXCL \| O_CLOEXEC, 0o600)` | #396 |
+| `Sources/Cacheout/Cleaner/CacheCleaner.swift` | `logCleanup` log dir/file | `FileHandle(forWritingTo:)` → `open(O_NOFOLLOW \| O_APPEND \| O_CLOEXEC, 0o600)`, log dir created 0o700 | #391 |
+| `Sources/Cacheout/Headless/StatusSocket.swift` | `start()` dir chmod | `setAttributes(stateDir, 0o700)` → `open(O_NOFOLLOW \| O_DIRECTORY) + fchmod` | #397 |
+| `Sources/Cacheout/Headless/StatusSocket.swift` | `start()` post-bind verify | path-based `attributesOfItem` → `lstat` + refuse if not `S_IFSOCK`; `fchmodat(AT_SYMLINK_NOFOLLOW)` | #397 |
+| `Sources/Cacheout/Headless/StatusSocket.swift` | `handleValidateConfig` | `lstat` + `Data(contentsOf:)` → `open(O_NOFOLLOW \| O_CLOEXEC) + fstat + read(fd)` with byte cap | #397 |
+| `Sources/Cacheout/Headless/DaemonMode.swift` | config reload (~ line 972) | `chmod(path, 0o600)` + `FileManager.contents(atPath:)` → `open(O_NOFOLLOW \| O_CLOEXEC) + fchmod + readToEnd` | #346 |
+| `Sources/Cacheout/Headless/DaemonMode.swift` | stateDir hardening (~ line 298) | `setAttributes([.posixPermissions: 0o700], ofItemAtPath: config.stateDir.path)` → `open(O_NOFOLLOW \| O_DIRECTORY \| O_CLOEXEC) + fchmod` | #410 |
+| `Sources/Cacheout/Intervention/Tier2Interventions.swift` | `listLocalSnapshots()` | pipe-buffer deadlock fix: read pipe concurrently with `waitUntilExit()` | #274 |
+| `Sources/Cacheout/Intervention/Tier2Interventions.swift` | `dockerPrune()` | same pipe-buffer pattern as above | #236 |
+| `Sources/Cacheout/ViewModels/CacheoutViewModel.swift` | `runCleanCommand` | same pipe-buffer pattern | merged pre-v2.1.0 |
+| `Sources/Cacheout/Headless/...` (PID lock fd) | `open(2)` for PID lock | added `O_CLOEXEC`, switched to `withUnsafeFileSystemRepresentation` | #248 |
+| `Sources/Cacheout/Headless/...` (webhook URL) | webhook `url` field | `AutopilotConfigValidator` + `WebhookConfig.parse` now require `https` | #260 |
+
+**Before opening any Sentinel PR**, grep the candidate file and confirm
+none of these patterns are already present at your candidate site:
+
+```sh
+# Generic check — does the file already use fd-based secure I/O?
+grep -nE "O_NOFOLLOW|O_CLOEXEC|fchmod|withUnsafeFileSystemRepresentation" <candidate-file>
+```
+
+## 🚫 ANTI-PATTERNS — these PRs will be rejected
+
+1. **Raw `open(path, ...)` without `withUnsafeFileSystemRepresentation`.**
+   The 2024-05-08 learning below (File Descriptor Leak and Unsafe Path
+   Bridging) is non-negotiable. Even a PR that "fixes" a TOCTOU but uses
+   `open(config.stateDir.path, …)` will be rejected for violating the
+   path-bridging rule.
+
+2. **Replacing `chmod` without also fixing a path-based read that follows.**
+   If the original code is `chmod(path); FileManager.contents(atPath: path)`,
+   replacing only the chmod leaves the read TOCTOU window open. A correct
+   fix uses `open(O_NOFOLLOW)` once, then `fchmod` + `readToEnd` on the
+   same fd. (See #346 / #400-#402 closure reasoning.)
+
+3. **Re-fixing the `setAttributes(stateDir, 0o700)` line in DaemonMode.swift.**
+   Fixed in #410. Stop opening new PRs for this. If you believe the fix is
+   inadequate, comment on the canonical PR rather than opening a new one.
+
+4. **Closing the umask window on socket bind.** `StatusSocket.start()` sets
+   `umask(0o077)` *before* `bind()`, so the socket is born 0o600 atomically.
+   The trailing chmod is a defensive backstop, not the primary control. PRs
+   that propose "fixing" this as if it were a primary vulnerability are
+   misreading the code.
+
+5. **Proposing `Data.write(to:)` replacements in files that already use
+   `open(O_CREAT | O_EXCL | O_CLOEXEC)`.** Check first.
+
+6. **"Fixed insecure file creation permissions" with no specific file or
+   line in the title.** Title must name the file or function. Generic
+   titles read as a re-run of an earlier PR template and get closed
+   without review.
+
+## Quality requirements for security PRs
+
+- Title format: `🛡️ Sentinel: [SEVERITY] <verb> <specific-issue> in <File.swift>`
+- Body must include: the specific call site (`File.swift:line`), the threat
+  model (who attacks, what they need, what they get), the patched snippet.
+- Use `URL(fileURLWithPath:).withUnsafeFileSystemRepresentation { ptr in ... }`
+  for any C-string path argument, **always**.
+- Always `defer { close(fd) }` immediately after an `open` that succeeds.
+- Always thread errno through to a useful error (`String(cString: strerror(errno))`
+  or a typed Error).
+- Always update this file with an entry under `## Learning log`.
+
+---
+
+## Learning log
+
 ## 2026-04-30 - Command Injection Vulnerability via String Interpolation in Custom Shell Methods
 **Vulnerability:** Found `let result = shell("/usr/bin/which \(tool)")` and `runCleanCommand(command)` executing commands using `/bin/bash -c` with raw string interpolation.
 **Learning:** This exposes the app to command injection if `tool` or `command` is influenced by user input or malformed configurations.
@@ -37,13 +120,12 @@
 **Learning:** Functions that operate on string paths (like `chmod`) resolve symlinks, which allows attackers to modify the permissions of arbitrary files if the path is swapped for a symlink before execution.
 **Prevention:** Always use `open()` with `O_NOFOLLOW | O_CLOEXEC` to get a file descriptor, apply permissions using `fchmod()`, and read from it via `FileHandle`.
 
-## 2026-05-02 - Insecure File Write TOCTOU Vulnerability via Symlink
-
 ## 2026-05-02 - Insecure File Creation and TOCTOU Vulnerability
 **Vulnerability:** File creation using `Data.write(to:)` combined with a subsequent `FileManager.default.setAttributes` to secure permissions created a Time-of-Check to Time-of-Use (TOCTOU) vulnerability where the file existed momentarily with default permissions before being locked down.
 **Learning:** `Data.write(to:)` creates files using the process's default umask. Restricting permissions after creation leaves a window where unauthorized local users could access or modify the file, which is critical for root-owned temp files or sensitive data.
 **Prevention:** Avoid `Data.write(to:)` for sensitive files. Use POSIX `open()` with flags `O_CREAT | O_WRONLY | O_EXCL | O_CLOEXEC` and explicitly specify secure mode permissions (e.g., `0o600`) at the moment of creation. Wrap the resulting file descriptor in a `FileHandle`.
 
+## 2026-05-02 - Insecure File Write TOCTOU Vulnerability via Symlink
 **Vulnerability:** `FileHandle(forWritingTo:)` and `String.write(to:atomically:)` follow symlinks by default, making logging susceptible to a Time-of-Check Time-of-Use (TOCTOU) symlink attack.
 **Learning:** High-level Swift file writing APIs do not natively protect against malicious symlinks in untrusted directories, potentially allowing unintended files to be overwritten or appended to.
 **Prevention:** Always use POSIX `open(2)` with `O_CREAT | O_WRONLY | O_APPEND | O_NOFOLLOW | O_CLOEXEC` to securely refuse symlink traversal, then wrap the resulting file descriptor in a `FileHandle`. Ensure directories are also securely created using `.posixPermissions`.
@@ -51,4 +133,4 @@
 ## 2026-05-03 - TOCTOU Vulnerability via FileManager.setAttributes
 **Vulnerability:** Used `FileManager.default.setAttributes` to apply permissions (`0o700`) to the state directory after creation.
 **Learning:** High-level Swift APIs like `FileManager.default.setAttributes` operate on string paths and follow symlinks by default. This makes them susceptible to Time-of-Check Time-of-Use (TOCTOU) symlink attacks, similarly to C `chmod()`.
-**Prevention:** Avoid `FileManager.default.setAttributes` for securing permissions on directories or sensitive files. Always use `withUnsafeFileSystemRepresentation`, `open()` with `O_NOFOLLOW | O_CLOEXEC`, and `fchmod()`.
+**Prevention:** Avoid `FileManager.default.setAttributes` for securing permissions on directories or sensitive files. Always use `withUnsafeFileSystemRepresentation`, `open()` with `O_NOFOLLOW | O_DIRECTORY | O_CLOEXEC`, and `fchmod()`.

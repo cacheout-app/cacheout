@@ -295,10 +295,22 @@ public actor DaemonMode: StatusSocket.DataSource {
                 withIntermediateDirectories: true,
                 attributes: [.posixPermissions: 0o700]
             )
-            try FileManager.default.setAttributes(
-                [.posixPermissions: 0o700],
-                ofItemAtPath: config.stateDir.path
-            )
+            // SECURITY: Use open with O_NOFOLLOW and fchmod to prevent TOCTOU symlink attacks
+            // when setting permissions on the state directory.
+            struct SecureOperationError: Error {}
+            let dirFd = config.stateDir.withUnsafeFileSystemRepresentation { pathPtr -> Int32 in
+                guard let pathPtr = pathPtr else { return -1 }
+                return open(pathPtr, O_RDONLY | O_NOFOLLOW | O_DIRECTORY | O_CLOEXEC)
+            }
+            if dirFd >= 0 {
+                if fchmod(dirFd, 0o700) != 0 {
+                    close(dirFd)
+                    throw SecureOperationError()
+                }
+                close(dirFd)
+            } else {
+                throw SecureOperationError()
+            }
         } catch {
             logger.error("Failed to create/secure state directory: \(error.localizedDescription, privacy: .public)")
             Foundation.exit(1)

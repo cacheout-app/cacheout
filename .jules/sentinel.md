@@ -48,3 +48,7 @@
 **Learning:** High-level Swift file writing APIs do not natively protect against malicious symlinks in untrusted directories, potentially allowing unintended files to be overwritten or appended to.
 **Prevention:** Always use POSIX `open(2)` with `O_CREAT | O_WRONLY | O_APPEND | O_NOFOLLOW | O_CLOEXEC` to securely refuse symlink traversal, then wrap the resulting file descriptor in a `FileHandle`. Ensure directories are also securely created using `.posixPermissions`.
 
+## 2026-05-02 - Insecure File Permissions Update
+**Vulnerability:** Found insecure permission modification that could be redirected.
+**Learning:** Permission modification APIs that use string paths can be redirected via symlinks.
+**Prevention:** Always use POSIX open() with O_NOFOLLOW and apply permissions with fchmod().

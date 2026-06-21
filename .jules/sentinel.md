@@ -134,6 +134,11 @@ grep -nE "O_NOFOLLOW|O_CLOEXEC|fchmod|withUnsafeFileSystemRepresentation" <candi
 **Vulnerability:** Used `FileManager.default.setAttributes` to apply permissions (`0o700`) to the state directory after creation.
 **Learning:** High-level Swift APIs like `FileManager.default.setAttributes` operate on string paths and follow symlinks by default. This makes them susceptible to Time-of-Check Time-of-Use (TOCTOU) symlink attacks, similarly to C `chmod()`.
 **Prevention:** Avoid `FileManager.default.setAttributes` for securing permissions on directories or sensitive files. Always use `withUnsafeFileSystemRepresentation`, `open()` with `O_NOFOLLOW | O_DIRECTORY | O_CLOEXEC`, and `fchmod()`.
+## 2024-05-09 - Missing O_NOFOLLOW in open() Calls
+**Vulnerability:** Insecure file creation due to missing O_NOFOLLOW flag.
+**Learning:** Using `open()` with `O_CREAT` but without `O_NOFOLLOW` and `O_EXCL` allows an attacker to conduct a TOCTOU symlink attack to truncate or overwrite unintended target files.
+**Prevention:** Always combine `O_CREAT` with `O_NOFOLLOW` when creating files, and prefer explicit octal permissions like `0o600` over bitmasks.
+
 ## 2024-06-20 - Unsafe Path Bridging in StatusSocket
 **Vulnerability:** Calling `open(2)` with raw Swift `String` paths in `StatusSocket.swift` creates an unsafe filesystem representation.
 **Learning:** Passing Swift `String` paths implicitly to C functions can result in memory issues or incorrect path resolution if the string is not null-terminated or is moved in memory.

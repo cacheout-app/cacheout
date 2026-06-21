@@ -15,6 +15,7 @@ struct CheckForUpdatesButton: View {
             checkForUpdatesViewModel.checkForUpdates()
         }
         .disabled(!checkForUpdatesViewModel.canCheckForUpdates)
+        .help(checkForUpdatesViewModel.canCheckForUpdates ? "Check for updates" : "Update checking is currently unavailable")
     }
 }
 

@@ -364,9 +364,9 @@ public actor DaemonMode: StatusSocket.DataSource {
         let pidPath = pidFilePath
 
         // Open (or create) the PID file with 0600 permissions safely
-        let fd = URL(fileURLWithPath: pidPath).withUnsafeFileSystemRepresentation { pathPtr in
+        let fd = URL(fileURLWithPath: pidPath).withUnsafeFileSystemRepresentation { pathPtr -> Int32 in
             guard let ptr = pathPtr else { return Int32(-1) }
-            return open(ptr, O_WRONLY | O_CREAT | O_CLOEXEC, S_IRUSR | S_IWUSR)
+            return open(ptr, O_WRONLY | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0o600)
         }
         guard fd >= 0 else {
             logger.error("Failed to open PID file: errno \(errno)")

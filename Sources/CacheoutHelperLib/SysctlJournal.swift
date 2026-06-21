@@ -360,15 +360,13 @@ public final class SysctlJournal {
     /// `rollbackAll()` does not restore an intermediate value.
     private func revertStaleEntries() {
         let now = Date()
-        var firstStaleIndex: [String: Int] = [:]
-
         // Identify stale, un-rolled-back entries.
-        for i in state.entries.indices {
-            guard !state.entries[i].rolledBack else { continue }
+        let firstStaleIndex: [String: Int] = state.entries.indices.reduce(into: [:]) { dict, i in
+            guard !state.entries[i].rolledBack else { return }
             let age = now.timeIntervalSince(state.entries[i].timestamp)
-            guard age > Self.maxEntryAge else { continue }
-            if firstStaleIndex[state.entries[i].name] == nil {
-                firstStaleIndex[state.entries[i].name] = i
+            guard age > Self.maxEntryAge else { return }
+            if dict[state.entries[i].name] == nil {
+                dict[state.entries[i].name] = i
             }
         }
 
@@ -426,11 +424,10 @@ public final class SysctlJournal {
     @discardableResult
     private func performRollback() -> Bool {
         // Collect the first un-rolled-back entry per sysctl name.
-        var firstEntryIndex: [String: Int] = [:]
-        for i in state.entries.indices {
-            guard !state.entries[i].rolledBack else { continue }
-            if firstEntryIndex[state.entries[i].name] == nil {
-                firstEntryIndex[state.entries[i].name] = i
+        let firstEntryIndex: [String: Int] = state.entries.indices.reduce(into: [:]) { dict, i in
+            guard !state.entries[i].rolledBack else { return }
+            if dict[state.entries[i].name] == nil {
+                dict[state.entries[i].name] = i
             }
         }
 

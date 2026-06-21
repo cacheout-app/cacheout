@@ -138,3 +138,8 @@ grep -nE "O_NOFOLLOW|O_CLOEXEC|fchmod|withUnsafeFileSystemRepresentation" <candi
 **Vulnerability:** Insecure file creation due to missing O_NOFOLLOW flag.
 **Learning:** Using `open()` with `O_CREAT` but without `O_NOFOLLOW` and `O_EXCL` allows an attacker to conduct a TOCTOU symlink attack to truncate or overwrite unintended target files.
 **Prevention:** Always combine `O_CREAT` with `O_NOFOLLOW` when creating files, and prefer explicit octal permissions like `0o600` over bitmasks.
+
+## 2024-06-20 - Unsafe Path Bridging in StatusSocket
+**Vulnerability:** Calling `open(2)` with raw Swift `String` paths in `StatusSocket.swift` creates an unsafe filesystem representation.
+**Learning:** Passing Swift `String` paths implicitly to C functions can result in memory issues or incorrect path resolution if the string is not null-terminated or is moved in memory.
+**Prevention:** Always use `URL(fileURLWithPath:).withUnsafeFileSystemRepresentation` to obtain the correct C-string pointer when bridging file paths to POSIX APIs.

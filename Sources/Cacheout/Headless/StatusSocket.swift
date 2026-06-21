@@ -111,7 +111,10 @@ public final class StatusSocket: @unchecked Sendable {
         try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true, attributes: [
             .posixPermissions: 0o700
         ])
-        let dirFd = open(dir, O_RDONLY | O_NOFOLLOW | O_DIRECTORY | O_CLOEXEC)
+        let dirFd = URL(fileURLWithPath: dir).withUnsafeFileSystemRepresentation { pathPtr -> Int32 in
+            guard let pathPtr = pathPtr else { return -1 }
+            return open(pathPtr, O_RDONLY | O_NOFOLLOW | O_DIRECTORY | O_CLOEXEC)
+        }
         guard dirFd >= 0 else {
             throw StatusSocketError.directoryHardeningFailed(errno)
         }
@@ -497,7 +500,10 @@ public final class StatusSocket: @unchecked Sendable {
         // component is rejected up front and we hold a stable fd for the rest
         // of the checks — no path resolution happens between type/size check
         // and read, closing the lstat → open TOCTOU window.
-        let fileFd = open(expandedPath, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        let fileFd = URL(fileURLWithPath: expandedPath).withUnsafeFileSystemRepresentation { pathPtr -> Int32 in
+            guard let pathPtr = pathPtr else { return -1 }
+            return open(pathPtr, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        }
         guard fileFd >= 0 else {
             let err = errno
             let reason = err == ELOOP ? "Refusing to follow symlink: \(expandedPath)"

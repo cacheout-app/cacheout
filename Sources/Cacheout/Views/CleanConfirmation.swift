@@ -53,6 +53,7 @@ struct CleanConfirmationSheet: View {
                             .foregroundStyle(.secondary)
                     }
                     .font(.caption)
+                    .accessibilityElement(children: .combine)
                 }
 
                 // Node modules
@@ -66,6 +67,7 @@ struct CleanConfirmationSheet: View {
                             .foregroundStyle(.secondary)
                     }
                     .font(.caption)
+                    .accessibilityElement(children: .combine)
                 }
             }
             .padding()
@@ -127,6 +129,7 @@ struct CleanupReportSheet: View {
                                 .foregroundStyle(.secondary)
                         }
                         .font(.caption)
+                        .accessibilityElement(children: .combine)
                     }
                 }
                 .padding()

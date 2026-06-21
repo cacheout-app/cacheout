@@ -4,6 +4,21 @@ All notable changes to Cacheout will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.1.7] - 2026-06-20
+
+### Security
+
+- **`DaemonMode` PID file is no longer susceptible to a symlink-swap overwrite.** The daemon created its PID file with `open(O_WRONLY | O_CREAT | O_CLOEXEC)` — without `O_NOFOLLOW`, an attacker with write access to the parent directory could plant a symlink at the PID path and redirect the open to truncate or overwrite an arbitrary file. Now opens with `O_NOFOLLOW` and an explicit `0o600` mode so the kernel refuses to follow a symlink at the final component. (#416)
+- **`StatusSocket` POSIX path bridging hardened.** The `open(2)` calls in `StatusSocket.swift` (state-directory hardening and config-validation read) now bridge their paths through `URL(fileURLWithPath:).withUnsafeFileSystemRepresentation` instead of passing Swift `String`s directly, bringing both call sites in line with the project's path-bridging standard. (#417)
+
+### Changed
+
+- **`SysctlJournal` stale-entry and rollback index maps** now build via `reduce(into:)` over `state.entries.indices` instead of incremental `for`-loop mutation. Behavior-preserving cleanup of `revertStaleEntries()` and `performRollback()`. (#414)
+
+### UX / Accessibility
+
+- **Check For Updates button** now carries a `.help()` tooltip that explains why it is disabled when update checking is unavailable (e.g. no appcast), removing ambiguity around the greyed-out control. (#415)
+
 ## [2.1.6] - 2026-06-19
 
 ### Security

@@ -117,6 +117,7 @@ struct NodeModulesSection: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .center)
                 .padding(.vertical, 24)
+                .accessibilityElement(children: .combine)
             }
         }
     }

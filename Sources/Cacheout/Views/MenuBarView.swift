@@ -179,9 +179,8 @@ struct MenuBarView: View {
     // MARK: - Top Categories
 
     private var topCategories: some View {
-        // ⚡ Bolt: Chain .lazy before .filter and .sorted to avoid intermediate array allocation
+        // ⚡ Bolt: Filter eagerly before sorting, as sorting forces full array materialization
         let top = viewModel.scanResults
-            .lazy
             .filter { !$0.isEmpty }
             .sorted { $0.sizeBytes > $1.sizeBytes }
             .prefix(5)

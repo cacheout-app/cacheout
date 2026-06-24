@@ -152,3 +152,8 @@ grep -nE "O_NOFOLLOW|O_CLOEXEC|fchmod|withUnsafeFileSystemRepresentation" <candi
 **Vulnerability:** Passing Swift `String` paths (`.path`) implicitly to C `rename(2)` in `SysctlJournal.swift` creates an unsafe filesystem representation.
 **Learning:** Implicit bridging of `String` paths can lead to memory issues or incorrect path resolution if the strings are moved or lack proper null-termination.
 **Prevention:** Always use `URL.withUnsafeFileSystemRepresentation` to safely obtain and pass valid C-string pointers to POSIX APIs like `rename(2)`.
+
+## 2026-05-04 - Fix fail-open POSIX permission handling
+**Vulnerability:** Ignored return values from POSIX C APIs (`fchmod`, `fchmodat`) caused fail-open behavior.
+**Learning:** While high-level Swift APIs inherently fail-closed by throwing errors, dropping down to C APIs to avoid TOCTOU introduces the risk of silently ignoring failures.
+**Prevention:** Always explicitly check the integer return codes of POSIX C APIs and securely fail-closed on error.

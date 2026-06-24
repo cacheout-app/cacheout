@@ -981,7 +981,10 @@ public actor DaemonMode: StatusSocket.DataSource {
             guard let pathPtr = pathPtr else { return nil }
             let fd = open(pathPtr, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
             guard fd >= 0 else { return nil }
-            fchmod(fd, 0o600)
+            guard fchmod(fd, 0o600) == 0 else {
+                close(fd)
+                return nil
+            }
             let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
             return try? handle.readToEnd()
         }

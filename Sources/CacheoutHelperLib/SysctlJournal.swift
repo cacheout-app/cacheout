@@ -311,10 +311,10 @@ public final class SysctlJournal {
             try? FileManager.default.removeItem(at: tmpURL)
 
             // Write to temp file securely (non-atomic — we control the rename ourselves).
-            // O_CREAT | O_WRONLY | O_EXCL | O_CLOEXEC to refuse symlinks and enforce 0600 at creation
+            // O_CREAT | O_WRONLY | O_EXCL | O_CLOEXEC | O_NOFOLLOW to refuse symlinks and enforce 0600 at creation
             let fd = tmpURL.withUnsafeFileSystemRepresentation { pathPtr -> Int32 in
                 guard let pathPtr = pathPtr else { return -1 }
-                return open(pathPtr, O_CREAT | O_WRONLY | O_EXCL | O_CLOEXEC, 0o600)
+                return open(pathPtr, O_CREAT | O_WRONLY | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0o600)
             }
             if fd < 0 {
                 let err = String(cString: strerror(errno))

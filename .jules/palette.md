@@ -98,3 +98,6 @@ grep -nE "accessibilityLabel|accessibilityValue|accessibilityAddTraits" <candida
 ## 2024-05-27 - Dashboard Stat Grouping
 **Learning:** VoiceOver users have to swipe multiple times to hear a single statistic if its label and value are separate text elements in a dashboard card. This creates a fragmented and tedious reading experience.
 **Action:** Always apply `.accessibilityElement(children: .combine)` to SwiftUI stat cards or metric views that group a title and a value. Apply it at the OUTERMOST modifier position (after `.padding()` and `.background()`) so the entire visible card is one element. Applying it inside the chrome is a common mistake.
+## 2024-05-28 - Unified Empty States
+**Learning:** Empty state views containing both an icon and text fragments are read by VoiceOver as disjointed statements, reducing clarity.
+**Action:** Apply `.accessibilityElement(children: .combine)` to containers (e.g., `VStack`) wrapping empty state views to ensure VoiceOver announces the empty state as a single unified message.

@@ -190,6 +190,7 @@ struct ContentView: View {
                 .foregroundStyle(.tertiary)
             Spacer()
         }
+        .accessibilityElement(children: .combine)
     }
 
     // MARK: - Bottom Bar

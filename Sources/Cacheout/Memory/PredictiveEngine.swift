@@ -15,7 +15,6 @@
 /// engine.recordAvailableMB(mb, at: timestamp)
 /// // Query predictions:
 /// let tte = engine.predictTimeToExhaustion()
-/// let growers = await engine.detectHighGrowthProcesses()
 /// ```
 
 import CacheoutShared
@@ -197,14 +196,12 @@ actor PredictiveEngine {
     /// This is NOT leak detection -- it identifies processes with sustained growth
     /// that are currently at or near their maximum footprint.
     ///
-    /// - Parameter processes: Process entries to evaluate.
-    /// - Returns: Processes matching high-growth criteria.
-    func detectHighGrowthProcesses(from processes: [ProcessEntryDTO]) -> [ProcessEntryDTO] {
-        processes.filter { entry in
-            entry.leakIndicator < Self.highGrowthMaxLeakIndicator
-                && entry.leakIndicator > 0  // Exclude zero (no footprint data)
-                && entry.physFootprint > Self.highGrowthMinFootprint
-        }
+    /// - Parameter entry: The process entry to evaluate.
+    /// - Returns: True if the process matches high-growth criteria.
+    static func isHighGrowthProcess(_ entry: ProcessEntryDTO) -> Bool {
+        entry.leakIndicator < Self.highGrowthMaxLeakIndicator
+            && entry.leakIndicator > 0  // Exclude zero (no footprint data)
+            && entry.physFootprint > Self.highGrowthMinFootprint
     }
 
     // MARK: - Process Scan Cache

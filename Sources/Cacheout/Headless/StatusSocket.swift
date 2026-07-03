@@ -184,7 +184,11 @@ public final class StatusSocket: @unchecked Sendable {
         }
         if (sockStat.st_mode & 0o777) != 0o600 {
             // umask should have set 0600; defense-in-depth chmod via no-follow.
-            _ = fchmodat(AT_FDCWD, socketPath, 0o600, AT_SYMLINK_NOFOLLOW)
+            guard fchmodat(AT_FDCWD, socketPath, 0o600, AT_SYMLINK_NOFOLLOW) == 0 else {
+                close(fd)
+                unlink(socketPath)
+                throw StatusSocketError.bindFailed(errno)
+            }
         }
 
         // Listen

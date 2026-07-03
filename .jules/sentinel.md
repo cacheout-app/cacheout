@@ -143,3 +143,7 @@ grep -nE "O_NOFOLLOW|O_CLOEXEC|fchmod|withUnsafeFileSystemRepresentation" <candi
 **Vulnerability:** Calling `open(2)` with raw Swift `String` paths in `StatusSocket.swift` creates an unsafe filesystem representation.
 **Learning:** Passing Swift `String` paths implicitly to C functions can result in memory issues or incorrect path resolution if the string is not null-terminated or is moved in memory.
 **Prevention:** Always use `URL(fileURLWithPath:).withUnsafeFileSystemRepresentation` to obtain the correct C-string pointer when bridging file paths to POSIX APIs.
+## 2026-05-04 - Fail-Open Security Vulnerability via Ignored fchmodat Error
+**Vulnerability:** Ignored the return value of `fchmodat(AT_FDCWD, socketPath, 0o600, AT_SYMLINK_NOFOLLOW)` by using `_ =`.
+**Learning:** `fchmodat` on Apple platforms returns `ENOTSUP` (errno 95) if the target is a symlink when the `AT_SYMLINK_NOFOLLOW` flag is used. While this inherently prevents a TOCTOU symlink traversal, the permission change fails completely. Ignoring the error results in a fail-open scenario where the target might maintain insecure permissions (e.g. 0o777).
+**Prevention:** Always verify the return value of POSIX C API calls like `fchmodat` and explicitly fail-closed (e.g., throw an error) if the operation fails, rather than silently ignoring the error and proceeding with potentially insecure state.

@@ -143,3 +143,7 @@ grep -nE "O_NOFOLLOW|O_CLOEXEC|fchmod|withUnsafeFileSystemRepresentation" <candi
 **Vulnerability:** Calling `open(2)` with raw Swift `String` paths in `StatusSocket.swift` creates an unsafe filesystem representation.
 **Learning:** Passing Swift `String` paths implicitly to C functions can result in memory issues or incorrect path resolution if the string is not null-terminated or is moved in memory.
 **Prevention:** Always use `URL(fileURLWithPath:).withUnsafeFileSystemRepresentation` to obtain the correct C-string pointer when bridging file paths to POSIX APIs.
+## 2026-06-21 - Ignored fchmod Return Value Leading to Fail-Open File Read
+**Vulnerability:** In `DaemonMode.swift`, the `fchmod(fd, 0o600)` return value was ignored when reading a file descriptor, allowing the daemon to proceed reading potentially untrusted files if the permission change failed.
+**Learning:** When refactoring throwing Swift APIs to use POSIX C APIs, ignoring the C API failure (e.g. `fchmod`) introduces fail-open security regressions where critical security measures are bypassed silently.
+**Prevention:** Always check the return values of POSIX C APIs like `fchmod` and fail closed (e.g., return `nil`, throw an error, and close the file descriptor) if the operation fails.

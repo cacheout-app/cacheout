@@ -23,9 +23,4 @@ enum AgentDetector {
     static func isAgent(_ process: ProcessEntryDTO) -> Bool {
         knownAgentNames.contains(process.name)
     }
-
-    /// Filter processes to only known AI agents.
-    static func agentProcesses(from processes: [ProcessEntryDTO]) -> [ProcessEntryDTO] {
-        processes.filter { isAgent($0) }
-    }
 }

@@ -277,15 +277,24 @@ public final class SysctlJournal {
 
     private func loadState() {
         let url = URL(fileURLWithPath: path)
-        guard FileManager.default.fileExists(atPath: path) else {
+
+        // Read securely avoiding TOCTOU symlink traversal
+        let data: Data? = url.withUnsafeFileSystemRepresentation { pathPtr in
+            guard let pathPtr = pathPtr else { return nil }
+            let fd = open(pathPtr, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+            guard fd >= 0 else { return nil }
+            let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+            return try? handle.readToEnd()
+        }
+
+        guard let validData = data else {
             state = JournalState(entries: [], shutdownClean: true,
                                  lastHeartbeat: ProcessInfo.processInfo.systemUptime)
             return
         }
 
         do {
-            let data = try Data(contentsOf: url)
-            state = try PropertyListDecoder().decode(JournalState.self, from: data)
+            state = try PropertyListDecoder().decode(JournalState.self, from: validData)
         } catch {
             // Corruption: log and re-create (don't crash).
             logger.error("Journal corrupt, re-creating: \(error.localizedDescription, privacy: .public)")

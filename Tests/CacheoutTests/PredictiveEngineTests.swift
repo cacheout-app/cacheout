@@ -212,55 +212,31 @@ final class PredictiveEngineTests: XCTestCase {
     func testExcludesProcessBelowFootprintThreshold() async {
         let engine = PredictiveEngine(scanProvider: StubScanProvider())
 
-        let processes = [
-            makeProcess(name: "small", physFootprint: 400 * 1024 * 1024, leakIndicator: 1.0),
-        ]
-
-        XCTAssertFalse(
-            engine.isHighGrowthProcess(processes[0]),
-            "Process below 500MB should be excluded"
-        )
+        let process = makeProcess(name: "small", physFootprint: 400 * 1024 * 1024, leakIndicator: 1.0)
+        XCTAssertFalse(engine.isHighGrowthProcess(process), "Process below 500MB should be excluded")
     }
 
     func testExcludesProcessWithHighLeakIndicator() async {
         let engine = PredictiveEngine(scanProvider: StubScanProvider())
 
-        let processes = [
-            makeProcess(name: "shrunk", physFootprint: 1024 * 1024 * 1024, leakIndicator: 1.5),
-        ]
-
-        XCTAssertFalse(
-            engine.isHighGrowthProcess(processes[0]),
-            "Process with leakIndicator 1.5 should be excluded"
-        )
+        let process = makeProcess(name: "shrunk", physFootprint: 1024 * 1024 * 1024, leakIndicator: 1.5)
+        XCTAssertFalse(engine.isHighGrowthProcess(process), "Process with leakIndicator 1.5 should be excluded")
     }
 
     func testBoundaryLeakIndicator() async {
         let engine = PredictiveEngine(scanProvider: StubScanProvider())
 
         // leakIndicator exactly at 1.05 should be excluded (< 1.05 required)
-        let processes = [
-            makeProcess(name: "boundary", physFootprint: 600 * 1024 * 1024, leakIndicator: 1.05),
-        ]
-
-        XCTAssertFalse(
-            engine.isHighGrowthProcess(processes[0]),
-            "leakIndicator exactly 1.05 should be excluded (strict < check)"
-        )
+        let process = makeProcess(name: "boundary", physFootprint: 600 * 1024 * 1024, leakIndicator: 1.05)
+        XCTAssertFalse(engine.isHighGrowthProcess(process), "leakIndicator exactly 1.05 should be excluded (strict < check)")
     }
 
     func testExcludesZeroLeakIndicator() async {
         let engine = PredictiveEngine(scanProvider: StubScanProvider())
 
         // leakIndicator 0 means no footprint data
-        let processes = [
-            makeProcess(name: "no-data", physFootprint: 600 * 1024 * 1024, leakIndicator: 0.0),
-        ]
-
-        XCTAssertFalse(
-            engine.isHighGrowthProcess(processes[0]),
-            "Zero leakIndicator should be excluded"
-        )
+        let process = makeProcess(name: "no-data", physFootprint: 600 * 1024 * 1024, leakIndicator: 0.0)
+        XCTAssertFalse(engine.isHighGrowthProcess(process), "Zero leakIndicator should be excluded")
     }
 
     func testDetectsMultipleHighGrowthProcesses() async {
@@ -402,7 +378,6 @@ final class PredictiveEngineTests: XCTestCase {
     func testConcurrentAccess() async {
         let engine = PredictiveEngine(scanProvider: StubScanProvider())
         let base = Date()
-        let probe = makeProcess(name: "probe", physFootprint: 600 * 1024 * 1024, leakIndicator: 1.0)
 
         await withTaskGroup(of: Void.self) { group in
             // Writers
@@ -418,7 +393,7 @@ final class PredictiveEngineTests: XCTestCase {
             for _ in 0..<50 {
                 group.addTask {
                     _ = await engine.predictTimeToExhaustion()
-                    _ = engine.isHighGrowthProcess(probe)
+                    _ = engine.isHighGrowthProcess(makeProcess(name: "test", physFootprint: 100, leakIndicator: 1.0))
                     _ = await engine.sampleCount
                 }
             }

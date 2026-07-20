@@ -393,7 +393,7 @@ final class PredictiveEngineTests: XCTestCase {
             for _ in 0..<50 {
                 group.addTask {
                     _ = await engine.predictTimeToExhaustion()
-                    _ = engine.isHighGrowthProcess(makeProcess(name: "test", physFootprint: 100, leakIndicator: 1.0))
+                    _ = engine.isHighGrowthProcess(self.makeProcess(name: "test", physFootprint: 100, leakIndicator: 1.0))
                     _ = await engine.sampleCount
                 }
             }

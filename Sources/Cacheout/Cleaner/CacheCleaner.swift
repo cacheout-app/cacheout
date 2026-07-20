@@ -269,9 +269,6 @@ actor CacheCleaner {
         let size = ByteCountFormatter.sharedFile.string(fromByteCount: bytesFreed)
         let entry = "[\(ISO8601DateFormatter.shared.string(from: Date()))] Cleaned \(category): \(size)\n"
 
-        // Open the log relative to the verified directory fd so a concurrent
-        // rename/symlink swap of ~/.cacheout after the checks above cannot
-        // redirect the append to another location.
         let fd = openat(dirFd, "cleanup.log", O_CREAT | O_WRONLY | O_APPEND | O_NOFOLLOW | O_CLOEXEC, 0o600)
 
         guard fd != -1 else { return }

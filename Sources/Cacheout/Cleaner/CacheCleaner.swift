@@ -258,14 +258,18 @@ actor CacheCleaner {
             .appendingPathComponent(".cacheout")
         try? FileManager.default.createDirectory(at: logDir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
 
-        let logFile = logDir.appendingPathComponent("cleanup.log")
+        let dirFd = logDir.withUnsafeFileSystemRepresentation { pathPtr -> Int32 in
+            guard let pathPtr = pathPtr else { return -1 }
+            return open(pathPtr, O_RDONLY | O_NOFOLLOW | O_DIRECTORY | O_CLOEXEC)
+        }
+        guard dirFd >= 0 else { return }
+        defer { close(dirFd) }
+        guard fchmod(dirFd, 0o700) == 0 else { return }
+
         let size = ByteCountFormatter.sharedFile.string(fromByteCount: bytesFreed)
         let entry = "[\(ISO8601DateFormatter.shared.string(from: Date()))] Cleaned \(category): \(size)\n"
 
-        let fd = logFile.withUnsafeFileSystemRepresentation { pathPtr -> Int32 in
-            guard let pathPtr = pathPtr else { return -1 }
-            return open(pathPtr, O_CREAT | O_WRONLY | O_APPEND | O_NOFOLLOW | O_CLOEXEC, 0o600)
-        }
+        let fd = openat(dirFd, "cleanup.log", O_CREAT | O_WRONLY | O_APPEND | O_NOFOLLOW | O_CLOEXEC, 0o600)
 
         guard fd != -1 else { return }
 

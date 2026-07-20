@@ -347,7 +347,13 @@ public final class SysctlJournal {
             }
 
             // Atomic rename(2) — atomicity on APFS/HFS+.
-            if rename(tmpURL.path, url.path) != 0 {
+            let renamed = tmpURL.withUnsafeFileSystemRepresentation { tmpPtr -> Int32 in
+                url.withUnsafeFileSystemRepresentation { urlPtr -> Int32 in
+                    guard let tmpPtr = tmpPtr, let urlPtr = urlPtr else { return -1 }
+                    return rename(tmpPtr, urlPtr)
+                }
+            }
+            if renamed != 0 {
                 let err = String(cString: strerror(errno))
                 logger.error("rename(2) failed: \(err, privacy: .public)")
                 try? FileManager.default.removeItem(at: tmpURL)

@@ -147,3 +147,8 @@ grep -nE "O_NOFOLLOW|O_CLOEXEC|fchmod|withUnsafeFileSystemRepresentation" <candi
 **Vulnerability:** Checked for file existence using `FileManager.default.fileExists(atPath:)` and subsequently read its contents using `Data(contentsOf:)`, which follows symlinks.
 **Learning:** High-level Swift APIs like `Data(contentsOf:)` operate on string paths and follow symlinks by default. This creates a TOCTOU (Time-Of-Check Time-Of-Use) window where an attacker could swap the target file for a symlink between the check and read operations.
 **Prevention:** Avoid separating file existence checks from read operations. Use a single, secure POSIX `open()` call with `O_RDONLY | O_NOFOLLOW | O_CLOEXEC` to atomically open the file and refuse symlinks, then read from the resulting file descriptor.
+
+## 2026-05-04 - Unsafe Path Bridging for rename in SysctlJournal
+**Vulnerability:** Passing Swift `String` paths (`.path`) implicitly to C `rename(2)` in `SysctlJournal.swift` creates an unsafe filesystem representation.
+**Learning:** Implicit bridging of `String` paths can lead to memory issues or incorrect path resolution if the strings are moved or lack proper null-termination.
+**Prevention:** Always use `URL.withUnsafeFileSystemRepresentation` to safely obtain and pass valid C-string pointers to POSIX APIs like `rename(2)`.

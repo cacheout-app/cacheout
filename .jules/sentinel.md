@@ -157,3 +157,8 @@ grep -nE "O_NOFOLLOW|O_CLOEXEC|fchmod|withUnsafeFileSystemRepresentation" <candi
 **Vulnerability:** Ignored return values from POSIX C APIs (`fchmod`, `fchmodat`) caused fail-open behavior.
 **Learning:** While high-level Swift APIs inherently fail-closed by throwing errors, dropping down to C APIs to avoid TOCTOU introduces the risk of silently ignoring failures.
 **Prevention:** Always explicitly check the integer return codes of POSIX C APIs and securely fail-closed on error.
+
+## 2026-05-04 - Unsafe Path Bridging via String implicitly cast to C-String
+**Vulnerability:** Calling `fchmodat` passing a raw Swift `String` path (`socketPath`).
+**Learning:** Passing Swift `String` paths implicitly to C functions can result in memory issues or incorrect path resolution because it does not guarantee null-termination or stable memory lifetime across the C function call.
+**Prevention:** Always use `URL(fileURLWithPath:).withUnsafeFileSystemRepresentation` to safely obtain a stable C-string pointer when bridging file paths to POSIX APIs.

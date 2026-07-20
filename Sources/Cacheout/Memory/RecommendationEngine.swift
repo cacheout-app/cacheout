@@ -189,8 +189,7 @@ struct RecommendationEngine {
         }
 
         // high_growth_process
-        let highGrowth = await predictiveEngine.detectHighGrowthProcesses(from: scanResult.processes)
-        for proc in highGrowth {
+        for proc in scanResult.processes where predictiveEngine.isHighGrowthProcess(proc) {
             let footprintGB = Double(proc.physFootprint) / (1024 * 1024 * 1024)
             recommendations.append(Recommendation(
                 type: .highGrowthProcess,

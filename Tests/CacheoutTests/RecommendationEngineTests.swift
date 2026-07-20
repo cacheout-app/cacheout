@@ -79,7 +79,7 @@ final class AgentDetectorTests: XCTestCase {
             makeProcess(name: "Safari", physFootprint: 2048),
             makeProcess(name: "claude", physFootprint: 512),
         ]
-        let agents = AgentDetector.agentProcesses(from: processes)
+        let agents = processes.filter(AgentDetector.isAgent)
         XCTAssertEqual(agents.count, 2)
         XCTAssertEqual(Set(agents.map(\.name)), Set(["ollama", "claude"]))
     }

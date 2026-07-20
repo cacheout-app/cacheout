@@ -143,3 +143,7 @@ grep -nE "O_NOFOLLOW|O_CLOEXEC|fchmod|withUnsafeFileSystemRepresentation" <candi
 **Vulnerability:** Calling `open(2)` with raw Swift `String` paths in `StatusSocket.swift` creates an unsafe filesystem representation.
 **Learning:** Passing Swift `String` paths implicitly to C functions can result in memory issues or incorrect path resolution if the string is not null-terminated or is moved in memory.
 **Prevention:** Always use `URL(fileURLWithPath:).withUnsafeFileSystemRepresentation` to obtain the correct C-string pointer when bridging file paths to POSIX APIs.
+## 2024-06-21 - TOCTOU Vulnerability via Data(contentsOf:)
+**Vulnerability:** Checked for file existence using `FileManager.default.fileExists(atPath:)` and subsequently read its contents using `Data(contentsOf:)`, which follows symlinks.
+**Learning:** High-level Swift APIs like `Data(contentsOf:)` operate on string paths and follow symlinks by default. This creates a TOCTOU (Time-Of-Check Time-Of-Use) window where an attacker could swap the target file for a symlink between the check and read operations.
+**Prevention:** Avoid separating file existence checks from read operations. Use a single, secure POSIX `open()` call with `O_RDONLY | O_NOFOLLOW | O_CLOEXEC` to atomically open the file and refuse symlinks, then read from the resulting file descriptor.

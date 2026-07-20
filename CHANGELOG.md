@@ -4,6 +4,26 @@ All notable changes to Cacheout will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.1.8] - 2026-07-20
+
+### Security
+
+- **`SysctlJournal.loadState` no longer susceptible to a check/read symlink swap.** The journal load used `FileManager.fileExists` followed by `Data(contentsOf:)` — both path-based and symlink-following, leaving a TOCTOU window where an attacker with write access to the state directory could swap in a symlink and have the helper read an arbitrary file. Now opens once with `open(O_RDONLY | O_NOFOLLOW | O_CLOEXEC)` and reads from the descriptor. (#445)
+- **`CacheCleaner.logCleanup` writes are anchored to a verified directory descriptor.** The `~/.cacheout` log directory is now opened with `O_NOFOLLOW | O_DIRECTORY | O_CLOEXEC` and hardened with `fchmod(0o700)`, and `cleanup.log` is created via `openat` relative to that same descriptor — so a rename/symlink swap of the directory between verification and append can no longer redirect the log write. (#423)
+- **POSIX permission calls now fail closed.** The `fchmod` in `DaemonMode.loadConfig` and the defense-in-depth `fchmodat` in `StatusSocket.start()` had their return values ignored — a silent failure left the file at its prior mode. Both are now checked and abort their operation (nil config / socket teardown + throw) on failure. (#422)
+- **`StatusSocket` `fchmodat` and `SysctlJournal` `rename(2)` bridge paths safely.** Both call sites now pass their paths through `URL(fileURLWithPath:).withUnsafeFileSystemRepresentation` instead of implicit Swift `String` bridging, in line with the project's path-bridging standard. (#433, #444)
+- **`SysctlJournal.flushState` temp-file open adds `O_NOFOLLOW`.** Defense-in-depth alongside the existing `O_CREAT | O_EXCL`, which already refuses symlinks at the final component. (#427)
+
+### Changed
+
+- **High-growth process detection is now a reusable predicate.** `PredictiveEngine.detectHighGrowthProcesses(from:)` became `isHighGrowthProcess(_:)`, the `high_growth_process` recommendation loop uses `for-where` instead of building an intermediate filtered array, and the dead `AgentDetector.agentProcesses(from:)` was removed. Tests updated to exercise the new surface. (#440)
+- **`MenuBarView.topCategories` drops a pointless `.lazy`.** Sorting materializes the sequence anyway; filtering eagerly first is clearer and no slower. (#420)
+
+### UX / Accessibility
+
+- **Empty states read as one coherent announcement in VoiceOver.** Added `.accessibilityElement(children: .combine)` to the empty-state stacks in `ContentView`, `NodeModulesSection`, and `ProcessesView`, so the icon and explanatory text announce together instead of as disjointed swipe stops. (#419)
+- **Clean-confirmation rows announce coherently.** The caption rows in `CleanConfirmationSheet` (selected results, node_modules items) and `CleanupReportSheet` (cleaned entries) are combined into single accessibility elements. (#418)
+
 ## [2.1.7] - 2026-06-20
 
 ### Security

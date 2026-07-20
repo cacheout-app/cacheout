@@ -347,8 +347,8 @@ public final class SysctlJournal {
             }
 
             // Atomic rename(2) — atomicity on APFS/HFS+.
-            let renamed = tmpURL.withUnsafeFileSystemRepresentation { tmpPtr in
-                url.withUnsafeFileSystemRepresentation { urlPtr in
+            let renamed = tmpURL.withUnsafeFileSystemRepresentation { tmpPtr -> Int32 in
+                url.withUnsafeFileSystemRepresentation { urlPtr -> Int32 in
                     guard let tmpPtr = tmpPtr, let urlPtr = urlPtr else { return -1 }
                     return rename(tmpPtr, urlPtr)
                 }

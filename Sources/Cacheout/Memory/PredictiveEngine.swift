@@ -15,7 +15,7 @@
 /// engine.recordAvailableMB(mb, at: timestamp)
 /// // Query predictions:
 /// let tte = engine.predictTimeToExhaustion()
-/// let growers = await engine.detectHighGrowthProcesses()
+/// let growers = scanResult.processes.filter { engine.isHighGrowthProcess($0) }
 /// ```
 
 import CacheoutShared

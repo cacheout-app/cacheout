@@ -4,6 +4,16 @@ All notable changes to Cacheout will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.1.9] - 2026-07-20
+
+### Fixed
+
+- **`--cli memory-stats` and `--cli recommendations` no longer hang.** CLI mode parked the main thread on a `DispatchSemaphore` and never drained the main dispatch queue, so the `MainActor.run` hop inside `MemoryMonitor.start()` could never execute — a mutual deadlock present since v2.0.0. CLI mode now uses the same `dispatchMain()` pattern as daemon mode.
+- **`--cli version` reports the real app version.** The handler emitted a hardcoded `"2.0.0"`; it now reads `CFBundleShortVersionString` (stamped from the `VERSION` file by `bundle.sh`), with a compiled fallback for unbundled binaries.
+- **`--cli install-helper` works on a first-time install.** Modern macOS reports `SMAppService.Status.notFound` for a daemon that has simply never been registered (no BackgroundTaskManagement record), even when the helper plist is embedded — the CLI treated that as "plist missing" and refused to call `register()`, so a first install could never succeed. The status check now verifies the embedded plist on disk and treats "plist present, no BTM record" as not-registered. Additionally, when invoked via the Homebrew symlink (`/opt/homebrew/bin/cacheout`), the process re-execs through the resolved bundle binary so `Bundle.main` points at the real app bundle.
+- **`--daemon` startup failures are no longer silent.** State-directory hardening failures, PID-lock conflicts, and status-socket errors printed only to the unified log and exited 1 with no terminal output; they now emit actionable messages to stderr — including a hint when the socket path exceeds the 104-byte `sockaddr_un` limit.
+- **`--cli clean` rejects unknown slugs.** Unknown category slugs previously produced a silent empty success; they now return an `INVALID_ARGUMENTS` error naming the bad slug(s). Documented in PROTOCOL.md.
+
 ## [2.1.8] - 2026-07-20
 
 ### Security

@@ -167,6 +167,9 @@ Cleans the specified cache categories by slug.
 - `<slugs...>` -- One or more category slugs (from `scan` output)
 - `--dry-run` -- Preview what would be cleaned without deleting
 
+Slugs that do not match any known category cause an `INVALID_ARGUMENTS` error
+naming the unknown slug(s); no cleaning is performed in that case.
+
 **Output schema:**
 
 ```json

@@ -53,6 +53,20 @@ public final class HelperInstaller {
         SMAppService.daemon(plistName: Self.plistName)
     }
 
+    /// Whether the helper plist is actually embedded in the running app bundle.
+    ///
+    /// Needed to disambiguate `SMAppService.Status.notFound`: on modern macOS,
+    /// smd reports `.notFound` (BackgroundTaskManagement "record not found")
+    /// for a daemon that has simply never been registered, even when the plist
+    /// exists and was parsed. Only a missing file is truly "not found".
+    private static var embeddedPlistExists: Bool {
+        FileManager.default.fileExists(
+            atPath: Bundle.main.bundleURL
+                .appendingPathComponent("Contents/Library/LaunchDaemons")
+                .appendingPathComponent(plistName).path
+        )
+    }
+
     // MARK: - Init
 
     public init() {}
@@ -69,7 +83,11 @@ public final class HelperInstaller {
         case .requiresApproval:
             return .requiresApproval
         case .notFound:
-            return .notFound
+            // smd reports .notFound for a never-registered daemon (no BTM
+            // record) even when the plist is embedded. Treat that case as
+            // .notRegistered so installIfNeeded() proceeds to register(),
+            // which is what creates the BTM record in the first place.
+            return Self.embeddedPlistExists ? .notRegistered : .notFound
         @unknown default:
             logger.warning("Unknown SMAppService status; treating as notRegistered")
             return .notRegistered

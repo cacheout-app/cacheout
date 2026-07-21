@@ -11,8 +11,8 @@
 ///
 /// - **CLI mode** (`--cli`): Runs headlessly without any UI. Outputs structured JSON
 ///   to stdout. Useful for scripting, MCP server integration, and automation.
-///   Uses a `DispatchSemaphore` to keep the process alive until the async CLI handler
-///   completes, since there's no run loop in headless mode.
+///   Uses `dispatchMain()` to keep the main queue draining (MainActor work must
+///   run there) until the async CLI handler exits the process.
 ///
 /// - **Daemon mode** (`--daemon`): Runs as a long-lived headless daemon that monitors
 ///   memory and exposes a Unix domain socket for status queries. State files are stored
@@ -110,15 +110,18 @@ if CommandLine.arguments.contains("--daemon") {
     }
     dispatchMain()
 } else if CLIHandler.shouldHandleCLI() {
-    // CLI mode: run headless without a SwiftUI app or run loop.
-    // The semaphore blocks the main thread until the async handler finishes,
-    // preventing the process from exiting prematurely.
-    let semaphore = DispatchSemaphore(value: 0)
+    // CLI mode: run headless without a SwiftUI app.
+    // Use dispatchMain() (not a semaphore) so the main dispatch queue keeps
+    // draining: MainActor work (e.g. MemoryMonitor.start()'s observer install)
+    // is scheduled on the main queue, and blocking the main thread on a
+    // semaphore would deadlock commands like memory-stats/recommendations.
+    // CLIHandler.run() terminates the process via Foundation.exit(); the
+    // explicit exit below is a safety net.
     Task {
         await CLIHandler.run()
-        semaphore.signal()
+        Foundation.exit(0)
     }
-    semaphore.wait()
+    dispatchMain()
 } else {
     // GUI mode: launch the full SwiftUI application lifecycle.
     CacheoutApp.main()

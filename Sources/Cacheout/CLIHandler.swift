@@ -186,11 +186,24 @@ struct CLIHandler {
 
     // MARK: - Version
 
+    /// Fallback version for unbundled binaries (e.g. `.build/release/Cacheout`),
+    /// where there is no Info.plist to read. Keep in sync with the VERSION file
+    /// at the repo root when cutting a release.
+    private static let fallbackVersion = "2.1.8"
+
+    /// App version: read from the bundle's Info.plist (stamped from the VERSION
+    /// file by scripts/bundle.sh), falling back to the compiled constant when
+    /// running as an unbundled binary.
+    private static var appVersion: String {
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+            ?? fallbackVersion
+    }
+
     private static func handleVersion() {
         let helperEnabled = HelperInstaller().status == .enabled
         let capabilities = Command.allCases.map(\.rawValue)
         outputJSON([
-            "version": "2.0.0",
+            "version": appVersion,
             "schema_version": 2,
             "mode": "cli",
             "app": "Cacheout",
@@ -240,6 +253,13 @@ struct CLIHandler {
     }
 
     private static func handleClean(slugs: [String], dryRun: Bool) async {
+        let knownSlugs = Set(CacheCategory.allCategories.map(\.slug))
+        let unknown = slugs.filter { !knownSlugs.contains($0) }
+        guard unknown.isEmpty else {
+            exitWithError(code: "INVALID_ARGUMENTS",
+                          message: "Unknown category slug(s): \(unknown.joined(separator: ", ")). Use 'scan' to list valid slugs.")
+        }
+
         let scanner = CacheScanner()
         let allResults = await scanner.scanAll(CacheCategory.allCategories)
 
@@ -569,11 +589,51 @@ struct CLIHandler {
 
     // MARK: - Helper Install/Uninstall
 
+    /// Re-exec through the real bundled binary when invoked via a symlink.
+    ///
+    /// The Homebrew cask exposes the CLI as a symlink
+    /// (`/opt/homebrew/bin/cacheout` -> `Cacheout.app/Contents/MacOS/Cacheout`).
+    /// When launched through that symlink, `Bundle.main` resolves to the
+    /// symlink's directory rather than the app bundle, so
+    /// `SMAppService.daemon(plistName:)` cannot find the embedded helper plist
+    /// and reports `.notFound` even though the app is properly bundled.
+    ///
+    /// If the running executable is not inside an `.app` bundle but resolves
+    /// (through symlinks) to a binary that is, replace the process image with
+    /// the resolved binary so SMAppService sees the real bundle. No-ops for
+    /// direct bundled invocations and for unbundled `.build` binaries.
+    private static func reexecResolvedBundleBinaryIfNeeded() {
+        // Main bundle already points at an .app — nothing to fix.
+        guard !Bundle.main.bundlePath.hasSuffix(".app") else { return }
+
+        // Get the path this process was exec'd with (may be a symlink).
+        var capacity = UInt32(MAXPATHLEN)
+        var buffer = [CChar](repeating: 0, count: Int(capacity))
+        if _NSGetExecutablePath(&buffer, &capacity) != 0 {
+            // Buffer too small — capacity now holds the required size.
+            buffer = [CChar](repeating: 0, count: Int(capacity))
+            guard _NSGetExecutablePath(&buffer, &capacity) == 0 else { return }
+        }
+        let execPath = URL(fileURLWithPath: String(cString: buffer)).standardizedFileURL.path
+        let resolved = URL(fileURLWithPath: execPath).resolvingSymlinksInPath().path
+        guard resolved != execPath, resolved.contains(".app/Contents/MacOS/") else { return }
+
+        // Replace the process image; argv[0] becomes the resolved path so the
+        // re-exec'd process' Bundle.main is the real app bundle.
+        var argv: [UnsafeMutablePointer<CChar>?] = CommandLine.arguments.map { strdup($0) }
+        argv[0] = strdup(resolved)
+        argv.append(nil)
+        execv(resolved, argv)
+        // execv only returns on failure — continue and let SMAppService report.
+        printError("Warning: failed to re-exec bundled binary at \(resolved): errno \(errno)")
+    }
+
     /// Register the privileged helper daemon.
     /// Only works from a bundled app context where the plist is embedded at
     /// `Contents/Library/LaunchDaemons/`. Running from `.build/release/Cacheout`
     /// will report the helper as unavailable (not a crash).
     private static func handleInstallHelper() {
+        reexecResolvedBundleBinaryIfNeeded()
         let installer = HelperInstaller()
         let currentStatus = installer.status
 
@@ -631,6 +691,7 @@ struct CLIHandler {
 
     /// Unregister the privileged helper daemon.
     private static func handleUninstallHelper() {
+        reexecResolvedBundleBinaryIfNeeded()
         let installer = HelperInstaller()
         let currentStatus = installer.status
 

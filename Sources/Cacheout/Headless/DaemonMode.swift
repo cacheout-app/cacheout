@@ -281,6 +281,13 @@ public actor DaemonMode: StatusSocket.DataSource {
         logger.info("Daemon started successfully (PID: \(ProcessInfo.processInfo.processIdentifier))")
     }
 
+    /// Write a fatal startup error to stderr so terminal users see an
+    /// actionable message before the daemon exits. Mirrors the os_log entry,
+    /// which is invisible when running `--daemon` interactively.
+    private static func printStartupError(_ message: String) {
+        FileHandle.standardError.write(("cacheout --daemon: \(message)\n").data(using: .utf8)!)
+    }
+
     /// Set up daemon infrastructure: state dir, PID lock, socket, signal handlers.
     /// Hooks must be set before calling this method.
     private func setup() async {
@@ -311,12 +318,18 @@ public actor DaemonMode: StatusSocket.DataSource {
             }
         } catch {
             logger.error("Failed to create/secure state directory: \(error.localizedDescription, privacy: .public)")
+            Self.printStartupError(
+                "Failed to create/secure state directory '\(config.stateDir.path)': "
+                + "\(error.localizedDescription)")
             Foundation.exit(1)
         }
 
         // PID lock
         guard acquirePIDLock() else {
             logger.error("Another daemon instance is already running")
+            Self.printStartupError(
+                "Another daemon instance is already running (PID lock held at "
+                + "\(pidFilePath)). Stop it or use a different --state-dir.")
             Foundation.exit(1)
         }
 
@@ -331,6 +344,11 @@ public actor DaemonMode: StatusSocket.DataSource {
             statusSocket = socket
         } catch {
             logger.error("Failed to start status socket: \(error.localizedDescription, privacy: .public)")
+            Self.printStartupError(
+                "Failed to start status socket at \(socketPath): "
+                + "\(error.localizedDescription) "
+                + "(hint: sockaddr_un limits socket paths to ~104 bytes — "
+                + "use a shorter --state-dir path)")
             cleanupAndExit(code: 1)
         }
 

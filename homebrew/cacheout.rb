@@ -9,7 +9,7 @@ cask "cacheout" do
   desc "Developer cache cleaner & memory manager for macOS — reclaim disk space and manage system memory"
   homepage "https://github.com/cacheout-app/cacheout"
 
-  depends_on macos: ">= :sonoma"
+  depends_on macos: :sonoma
 
   app "Cacheout.app"
 

@@ -162,3 +162,7 @@ grep -nE "O_NOFOLLOW|O_CLOEXEC|fchmod|withUnsafeFileSystemRepresentation" <candi
 **Vulnerability:** Calling `fchmodat` passing a raw Swift `String` path (`socketPath`).
 **Learning:** Passing Swift `String` paths implicitly to C functions can result in memory issues or incorrect path resolution because it does not guarantee null-termination or stable memory lifetime across the C function call.
 **Prevention:** Always use `URL(fileURLWithPath:).withUnsafeFileSystemRepresentation` to safely obtain a stable C-string pointer when bridging file paths to POSIX APIs.
+## 2026-05-05 - TOCTOU Vulnerability via String(contentsOfFile:)
+**Vulnerability:** Used `String(contentsOfFile:)` to read the PID lock file in Daemon mode.
+**Learning:** High-level Swift APIs like `String(contentsOfFile:)` follow symlinks by default, making them susceptible to a Time-of-Check Time-of-Use (TOCTOU) symlink attack when reading untrusted paths.
+**Prevention:** Avoid high-level Swift file reading APIs for files that may be tampered with. Instead, use POSIX `open()` with `O_RDONLY | O_NOFOLLOW | O_CLOEXEC` to get a file descriptor, wrap it in a `FileHandle`, and read using `readToEnd()`.

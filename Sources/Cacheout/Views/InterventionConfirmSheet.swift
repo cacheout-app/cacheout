@@ -74,6 +74,7 @@ struct InterventionConfirmSheet: View {
                 Text("Estimated reclamation: \(confirmation.estimate)")
                     .font(.body)
             }
+            .accessibilityElement(children: .combine)
 
             // Risk
             HStack(alignment: .top) {
@@ -86,6 +87,7 @@ struct InterventionConfirmSheet: View {
             }
             .padding()
             .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+            .accessibilityElement(children: .combine)
 
             // Buttons
             HStack(spacing: 12) {

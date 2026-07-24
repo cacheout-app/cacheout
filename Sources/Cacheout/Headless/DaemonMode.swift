@@ -417,7 +417,16 @@ public actor DaemonMode: StatusSocket.DataSource {
     }
 
     private func readPIDFile(_ path: String) -> pid_t? {
-        guard let contents = try? String(contentsOfFile: path, encoding: .utf8) else {
+        let data: Data? = URL(fileURLWithPath: path).withUnsafeFileSystemRepresentation { pathPtr in
+            guard let pathPtr = pathPtr else { return nil }
+            let fd = open(pathPtr, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+            guard fd >= 0 else { return nil }
+            defer { close(fd) }
+
+            let handle = FileHandle(fileDescriptor: fd)
+            return try? handle.readToEnd()
+        }
+        guard let data = data, let contents = String(data: data, encoding: .utf8) else {
             return nil
         }
         return pid_t(contents.trimmingCharacters(in: .whitespacesAndNewlines))

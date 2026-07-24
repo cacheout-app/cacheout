@@ -102,3 +102,6 @@ grep -nE "accessibilityLabel|accessibilityValue|accessibilityAddTraits" <candida
 ## 2024-05-28 - Grouping Empty State Information
 **Learning:** When displaying an empty state comprising multiple elements (e.g., an icon and several lines of text), VoiceOver reads them sequentially as disjointed items. This can be confusing and fails to convey the unified message that the list or page is empty.
 **Action:** Apply `.accessibilityElement(children: .combine)` to the container (e.g., `VStack`) wrapping the empty state content to group the information logically, providing screen reader users with immediate context.
+## 2024-05-29 - Grouping Risk Warnings and Alerts
+**Learning:** When an `HStack` or other container groups an icon and descriptive text for a risk warning or alert, VoiceOver reads the elements sequentially as fragmented messages, reducing the impact of the warning.
+**Action:** Apply `.accessibilityElement(children: .combine)` at the outermost modifier position (after layout modifiers like `.padding()` and `.background()`) of the container to prevent VoiceOver from reading the elements sequentially as fragmented messages.

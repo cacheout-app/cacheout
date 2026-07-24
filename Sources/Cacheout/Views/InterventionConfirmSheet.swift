@@ -86,6 +86,7 @@ struct InterventionConfirmSheet: View {
             }
             .padding()
             .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+            .accessibilityElement(children: .combine)
 
             // Buttons
             HStack(spacing: 12) {

@@ -388,6 +388,68 @@ final class ScanPresentationTests: XCTestCase {
         XCTAssertEqual(viewModel.scanGeneration, 0)
     }
 
+    @MainActor
+    func testScanRefusedWhileCleaning() async {
+        let viewModel = makeViewModel()
+        viewModel.isCleaning = true
+
+        await viewModel.scan(trigger: .userInitiated)
+
+        XCTAssertFalse(viewModel.hasScanned,
+                       "scanning during a cleanup would publish results mid-deletion")
+        XCTAssertFalse(viewModel.shouldAutoRescan,
+                       "auto-rescan must also hold off during cleanup")
+    }
+
+    @MainActor
+    func testSmartCleanExcludesManuallySelectedPartiallyDenied() async throws {
+        // Real fixture payloads: the assertion is on the FILESYSTEM — a
+        // manually selected .partiallyDenied category must survive Quick
+        // Clean untouched (R18: the auto path excludes it).
+        let safeRoot = base.appendingPathComponent("safe-cache")
+        let partialRoot = base.appendingPathComponent("partial-cache")
+        try fm.createDirectory(at: safeRoot, withIntermediateDirectories: true)
+        try fm.createDirectory(at: partialRoot, withIntermediateDirectories: true)
+        let safePayload = safeRoot.appendingPathComponent("data.bin")
+        let partialPayload = partialRoot.appendingPathComponent("data.bin")
+        try Data(repeating: 0xAB, count: 4096).write(to: safePayload)
+        try Data(repeating: 0xAB, count: 4096).write(to: partialPayload)
+
+        func fixtureCategory(_ name: String, at url: URL) -> CacheCategory {
+            CacheCategory(
+                name: name, slug: name, description: "test", icon: "trash",
+                discovery: [.absolutePath(url.path)],
+                riskLevel: .safe, rebuildNote: "", defaultSelected: false
+            )
+        }
+
+        let viewModel = makeViewModel()
+        viewModel.moveToTrash = false  // permanent delete, fixture-contained
+        let safe = ScanResult(
+            category: fixtureCategory("safe-measured", at: safeRoot),
+            state: .measured, exactBytes: 4096, estimatedUpToBytes: 0,
+            itemCount: 1, scanError: nil
+        )
+        var partial = ScanResult(
+            category: fixtureCategory("partial-denied", at: partialRoot),
+            state: .partiallyDenied, exactBytes: 4096, estimatedUpToBytes: 0,
+            itemCount: 1,
+            scanError: ScanError(kind: .permissionDenied, message: "partial")
+        )
+        partial.isSelected = true  // manual selection made BEFORE Quick Clean
+        viewModel.scanResults = [safe, partial]
+
+        await viewModel.smartClean()
+
+        let report = try XCTUnwrap(viewModel.lastReport)
+        XCTAssertEqual(report.entries.map(\.category), ["safe-measured"],
+                       "Quick Clean acts on the auto-selected safe set only")
+        XCTAssertTrue(fm.fileExists(atPath: partialPayload.path),
+                      "a manually selected .partiallyDenied category must NOT ride into the auto path (R18)")
+        XCTAssertFalse(fm.fileExists(atPath: safePayload.path),
+                       "the auto-selected safe category IS cleaned")
+    }
+
     // MARK: - node_modules issues in the view model (R14) + TCC gating (R9)
 
     @MainActor

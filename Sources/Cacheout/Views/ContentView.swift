@@ -232,8 +232,8 @@ struct ContentView: View {
                 } label: {
                     Label(viewModel.isAnyScanInProgress ? "Scanning..." : "Scan", systemImage: "arrow.clockwise")
                 }
-                .disabled(viewModel.isAnyScanInProgress)
-                .help(viewModel.isAnyScanInProgress ? "Scan in progress" : "Scan for caches")
+                .disabled(viewModel.isAnyScanInProgress || viewModel.isCleaning)
+                .help(viewModel.isAnyScanInProgress ? "Scan in progress" : (viewModel.isCleaning ? "Cleanup in progress" : "Scan for caches"))
 
                 // Clean button
                 Button {

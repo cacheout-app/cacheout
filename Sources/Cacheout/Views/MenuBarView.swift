@@ -253,8 +253,8 @@ struct MenuBarView: View {
                     .font(.caption.weight(.medium))
             }
             .buttonStyle(.bordered)
-            .disabled(viewModel.isAnyScanInProgress)
-            .help(viewModel.isAnyScanInProgress ? "Scan in progress" : "Scan for caches")
+            .disabled(viewModel.isAnyScanInProgress || viewModel.isCleaning)
+            .help(viewModel.isAnyScanInProgress ? "Scan in progress" : (viewModel.isCleaning ? "Cleanup in progress" : "Scan for caches"))
 
             if viewModel.isAnyScanInProgress {
                 ProgressView()

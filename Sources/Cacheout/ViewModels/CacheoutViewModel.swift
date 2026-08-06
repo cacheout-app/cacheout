@@ -107,7 +107,7 @@ class CacheoutViewModel: ObservableObject {
 
     /// Whether the menubar should trigger an auto-rescan (no results or stale data)
     var shouldAutoRescan: Bool {
-        if isAnyScanInProgress { return false }
+        if isAnyScanInProgress || isCleaning { return false }
         if !hasResults { return true }
         guard let last = lastScanDate else { return true }
         return Date().timeIntervalSince(last) > scanIntervalMinutes * 60
@@ -210,8 +210,10 @@ class CacheoutViewModel: ObservableObject {
     func scan(trigger: ScanTrigger = .userInitiated) async {
         // Re-entrancy guard (R11): correctness must not depend on button
         // state — an overlapping scan would race two writers over the same
-        // published arrays while the node_modules phase is still running.
-        guard !isAnyScanInProgress else { return }
+        // published arrays while the node_modules phase is still running,
+        // and scanning DURING a cleanup would publish results mid-deletion.
+        // (clean()'s own post-cleanup rescan runs after isCleaning clears.)
+        guard !isAnyScanInProgress && !isCleaning else { return }
         isScanning = true
         isNodeModulesScanning = true
         diskInfo = await Task.detached { DiskInfo.current() }.value
@@ -308,8 +310,13 @@ class CacheoutViewModel: ObservableObject {
         return String(format: "%.0fGB", freeGB)
     }
 
-    /// Quick clean: auto-select all safe categories, clean, deselect
+    /// Quick clean: a PURE auto path (R18). Any manual selections —
+    /// including a deliberately toggled `.partiallyDenied` category or
+    /// node_modules items — are cleared first, so Quick Clean acts on
+    /// exactly the auto-selected safe `.measured` set and nothing rides
+    /// along.
     func smartClean() async {
+        deselectAll()
         selectAllSafe()
         await clean()
         // Re-scan updates are handled inside clean()

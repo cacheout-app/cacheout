@@ -57,11 +57,29 @@ final class NodeModulesScannerTests: XCTestCase {
         return total
     }
 
-    private func makeScanner(roots: [URL]? = nil) -> NodeModulesScanner {
+    private func makeScanner(
+        roots: [URL]? = nil,
+        provider: FileSystemIdentityProvider = FileSystemIdentityProvider()
+    ) -> NodeModulesScanner {
         NodeModulesScanner(
             home: fixtureHome,
-            searchRoots: roots ?? [container]
+            searchRoots: roots ?? [container],
+            provider: provider
         )
+    }
+
+    /// Forces `.failed` lstat probes for exact paths — hermetic stand-in for
+    /// metadata failures that chmod tricks cannot reproduce deterministically.
+    private final class FailingProbeProvider: FileSystemIdentityProvider {
+        var failingPaths: Set<String> = []
+        var failErrno: Int32 = EACCES
+
+        override func probeKind(of url: URL) -> KindProbe {
+            if failingPaths.contains(url.path) {
+                return .failed(errno: failErrno)
+            }
+            return super.probeKind(of: url)
+        }
     }
 
     /// `container/<project>/node_modules` with one visible payload file;
@@ -220,6 +238,48 @@ final class NodeModulesScannerTests: XCTestCase {
                        "the denial is a classified, visible outcome error")
     }
 
+    func testDescentMetadataFailureIsClassifiedNotSilentlySkipped() async throws {
+        // A listed entry whose lstat fails must surface as a classified
+        // issue, never be silently treated as "not a directory" (D6).
+        let project = container.appendingPathComponent("projM")
+        let boom = project.appendingPathComponent("boom")
+        try mkdir(boom)
+
+        let provider = FailingProbeProvider()
+        // Foundation lists children with canonical (/private-resolved) URL
+        // spellings — the probe sees that spelling, so fail on it.
+        let canonicalBoom = provider.canonicalize(boom)
+        provider.failingPaths = [canonicalBoom.path]
+
+        let outcome = await makeScanner(provider: provider).scan()
+
+        XCTAssertTrue(outcome.items.isEmpty)
+        XCTAssertEqual(outcome.errors.map(\.kind), [.permissionDenied])
+        XCTAssertEqual(outcome.errors.first?.url, canonicalBoom)
+    }
+
+    func testCandidateMetadataFailureIsClassifiedNotTreatedAsNotFound() async throws {
+        // node_modules exists and holds bytes, but its lstat probe fails:
+        // that is a recorded issue and NO item — not a silent "not found".
+        let project = container.appendingPathComponent("projC")
+        let nm = project.appendingPathComponent("node_modules")
+        try mkdir(nm)
+        try writeFile(nm.appendingPathComponent("payload.js"), bytes: 4_096)
+
+        let provider = FailingProbeProvider()
+        // Foundation lists children with canonical (/private-resolved) URL
+        // spellings — the candidate probe sees that spelling.
+        let canonicalNM = provider.canonicalize(nm)
+        provider.failingPaths = [canonicalNM.path]
+
+        let outcome = await makeScanner(provider: provider).scan()
+
+        XCTAssertTrue(outcome.items.isEmpty,
+                      "an unprobeable candidate must not be sized or returned")
+        XCTAssertEqual(outcome.errors.map(\.kind), [.permissionDenied])
+        XCTAssertEqual(outcome.errors.first?.url, canonicalNM)
+    }
+
     func testUnreadableSubtreeDuringRecursionIsClassifiedNotSwallowed() async throws {
         try XCTSkipIf(geteuid() == 0, "root ignores permission bits")
         let locked = container.appendingPathComponent("locked-dir")
@@ -231,7 +291,12 @@ final class NodeModulesScannerTests: XCTestCase {
 
         let outcome = await makeScanner().scan()
 
-        XCTAssertEqual(outcome.errors.map(\.kind), [.permissionDenied],
+        // Two classified captures where the old code swallowed both (D6):
+        // the candidate lstat probe inside the unreadable dir (EACCES) and
+        // the failed directory listing itself.
+        XCTAssertFalse(outcome.errors.isEmpty,
                        "the old try?-swallow becomes a real classified capture (D6)")
+        XCTAssertTrue(outcome.errors.allSatisfy { $0.kind == .permissionDenied },
+                      "unexpected classification: \(outcome.errors)")
     }
 }

@@ -150,8 +150,15 @@ actor NodeModulesScanner {
                 }
 
                 // lstat gate: an escaping-symlink search root is NEVER
-                // traversed — its real target may sit anywhere.
-                guard provider.kind(of: root) == .directory else {
+                // traversed — its real target may sit anywhere. A root we
+                // cannot even lstat is a classified, visible failure (D6).
+                switch provider.probeKind(of: root) {
+                case .kind(.directory):
+                    break
+                case .failed(let code):
+                    allIssues.append(Self.issue(forFailedProbe: root, errno: code))
+                    continue
+                case .kind, .absent:
                     allIssues.append(NodeModulesScanIssue(
                         url: root, kind: .symlinkRoot,
                         detail: "search root is not a real directory"
@@ -203,8 +210,14 @@ actor NodeModulesScanner {
         // Candidate gate (lstat, no-follow): only a REAL directory is a find.
         // A symlink candidate is never sized and never returned — `.scanRoot`
         // resolves roots by design, so an unchecked symlink would enumerate
-        // its external target.
-        if provider.kind(of: candidate) == .directory {
+        // its external target. `.absent` is the normal "no node_modules here"
+        // case and stays silent; a FAILED probe is a classified, recorded
+        // issue, never a silent "not found" (D6/R14).
+        let candidateProbe = provider.probeKind(of: candidate)
+        if case .failed(let code) = candidateProbe {
+            outcome.errors.append(Self.issue(forFailedProbe: candidate, errno: code))
+        }
+        if candidateProbe == .kind(.directory) {
             let report = sizer.measure(at: candidate, mode: .scanRoot)
 
             // A denied node_modules root (or partially denied tree) is a
@@ -253,8 +266,18 @@ actor NodeModulesScanner {
             let name = item.lastPathComponent
             guard !skipDirs.contains(name) else { continue }
             // lstat gate before EVERY manual descent: a symlinked directory
-            // is never followed.
-            guard provider.kind(of: item) == .directory else { continue }
+            // is never followed. A listed entry whose metadata cannot be read
+            // is a classified, recorded issue (D6); `.absent` is a benign
+            // mid-scan deletion race.
+            switch provider.probeKind(of: item) {
+            case .kind(.directory):
+                break
+            case .failed(let code):
+                outcome.errors.append(Self.issue(forFailedProbe: item, errno: code))
+                continue
+            case .kind, .absent:
+                continue
+            }
             let sub = await findNodeModules(
                 in: item,
                 originContainer: originContainer,
@@ -282,5 +305,13 @@ actor NodeModulesScanner {
         return NodeModulesScanIssue(
             url: denial.url, kind: kind, detail: denial.detail
         )
+    }
+
+    /// Classify a failed `lstat` probe by errno (EPERM → TCC, EACCES → BSD
+    /// permissions) — same taxonomy as the sizer's denial classification.
+    private static func issue(
+        forFailedProbe url: URL, errno code: Int32
+    ) -> NodeModulesScanIssue {
+        issue(from: DirectorySizer.denial(forFailedProbe: url, errno: code))
     }
 }

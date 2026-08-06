@@ -100,17 +100,42 @@ class FileSystemIdentityProvider {
         return mountedOn == url.path
     }
 
-    /// File kind at `url` (no-follow): a symlink reports `.symlink` regardless
-    /// of what it points at.
-    func kind(of url: URL) -> FileKind? {
+    /// Errno-aware kind probe result: distinguishes "nothing there" (the
+    /// callers' silent-skip case) from a real metadata failure that must be
+    /// recorded, never swallowed (D6).
+    enum KindProbe: Equatable {
+        case kind(FileKind)
+        /// ENOENT/ENOTDIR — the path simply is not there.
+        case absent
+        /// `lstat` failed for a reason other than absence (EACCES, EIO, …).
+        case failed(errno: Int32)
+    }
+
+    /// `lstat`-based kind probe at `url` (no-follow), with errno retained on
+    /// failure. This is the override point for tests; `kind(of:)` derives
+    /// from it so overrides flow through.
+    func probeKind(of url: URL) -> KindProbe {
         var st = stat()
-        guard lstat(url.path, &st) == 0 else { return nil }
-        switch st.st_mode & S_IFMT {
-        case S_IFREG: return .regularFile
-        case S_IFDIR: return .directory
-        case S_IFLNK: return .symlink
-        default: return .other
+        guard lstat(url.path, &st) == 0 else {
+            let code = errno
+            return (code == ENOENT || code == ENOTDIR)
+                ? .absent
+                : .failed(errno: code)
         }
+        switch st.st_mode & S_IFMT {
+        case S_IFREG: return .kind(.regularFile)
+        case S_IFDIR: return .kind(.directory)
+        case S_IFLNK: return .kind(.symlink)
+        default: return .kind(.other)
+        }
+    }
+
+    /// File kind at `url` (no-follow): a symlink reports `.symlink` regardless
+    /// of what it points at. `nil` collapses both "absent" and "failed" —
+    /// callers that must distinguish (D6 classification) use `probeKind(of:)`.
+    final func kind(of url: URL) -> FileKind? {
+        if case .kind(let kind) = probeKind(of: url) { return kind }
+        return nil
     }
 
     // MARK: - Canonicalization

@@ -157,6 +157,34 @@ final class DirectorySizerTests: XCTestCase {
         XCTAssertEqual(report.itemCount, 2)
     }
 
+    /// Forces `.failed` lstat probes for exact paths.
+    private final class FailingProbeProvider: FileSystemIdentityProvider {
+        var failingPaths: Set<String> = []
+
+        override func probeKind(of url: URL) -> KindProbe {
+            if failingPaths.contains(url.path) {
+                return .failed(errno: EACCES)
+            }
+            return super.probeKind(of: url)
+        }
+    }
+
+    func testDeletionTargetMetadataFailureIsRecordedDenial() throws {
+        // A leaf that cannot even be lstat'ed is a classified denial, never
+        // a silent zero (D6).
+        let file = try writeFile(base.appendingPathComponent("unprobeable.bin"), bytes: 4_096)
+        let provider = FailingProbeProvider()
+        // .deletionTarget resolves ancestors first (/var/folders → /private/
+        // var/folders), so the probe sees the RESOLVED spelling of the leaf.
+        provider.failingPaths = [provider.resolveTargetKeepingLeaf(file).path]
+
+        let report = makeSizer(provider: provider).measure(at: file, mode: .deletionTarget)
+
+        XCTAssertEqual(report.measuredBytes, 0)
+        XCTAssertEqual(report.denials.map(\.kind), [.permission])
+        XCTAssertTrue(report.claims.isEmpty)
+    }
+
     func testDeletionTargetFifoIsZeroWithRecordedSkip() throws {
         let fifoURL = base.appendingPathComponent("pipe")
         guard mkfifo(fifoURL.path, 0o644) == 0 else {

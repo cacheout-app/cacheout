@@ -163,24 +163,28 @@ struct DirectorySizer {
         knownInodes: Set<FileSystemIdentityProvider.Identity>
     ) -> SizeReport {
         var report = SizeReport()
-        switch provider.kind(of: resolved) {
-        case .none:
-            // Absent: 0 bytes, no denials — ENOENT on a deletion child means
+        switch provider.probeKind(of: resolved) {
+        case .absent:
+            // 0 bytes, no denials — ENOENT on a deletion child means
             // "already gone" (the caller's skip case); a missing scan root is
             // the scanner's `.missing`/`.empty` derivation input.
             break
-        case .symlink:
+        case .failed(let code):
+            // A leaf we cannot even lstat is a classified, recorded denial —
+            // never a silent zero (D6).
+            report.denials.append(Self.denial(forFailedProbe: resolved, errno: code))
+        case .kind(.symlink):
             // 0 bytes, NEVER walked: deleting a symlink removes the link only.
             break
-        case .regularFile:
+        case .kind(.regularFile):
             var claimed = Set<FileSystemIdentityProvider.Identity>()
             recordRegularFile(
                 resolved, knownInodes: knownInodes,
                 claimedInodes: &claimed, report: &report
             )
-        case .directory:
+        case .kind(.directory):
             report = enumerateTree(at: resolved, knownInodes: knownInodes)
-        case .other:
+        case .kind(.other):
             report.skippedSpecialFiles.append(resolved)
         }
         return report
@@ -366,6 +370,21 @@ struct DirectorySizer {
             }
         }
         return SizeDenial(url: url, kind: kind, detail: nsError.localizedDescription)
+    }
+
+    /// Classify a raw failed `lstat` probe by errno: EPERM is TCC, EACCES is
+    /// BSD permissions, anything else a metadata failure.
+    static func denial(forFailedProbe url: URL, errno code: Int32) -> SizeDenial {
+        let kind: SizeDenial.Kind
+        switch code {
+        case EPERM: kind = .tcc
+        case EACCES: kind = .permission
+        default: kind = .metadata
+        }
+        return SizeDenial(
+            url: url, kind: kind,
+            detail: "lstat failed: \(String(cString: strerror(code)))"
+        )
     }
 }
 

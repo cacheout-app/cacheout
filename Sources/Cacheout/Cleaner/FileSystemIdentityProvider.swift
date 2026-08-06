@@ -38,7 +38,10 @@ class FileSystemIdentityProvider {
     }
 
     /// What kind of filesystem object sits at a URL (via `lstat`, no-follow).
-    enum FileKind {
+    /// (Explicitly `Equatable` for documentation's sake — `KindProbe`'s
+    /// synthesized conformance and callers' `==` checks rely on it, though
+    /// associated-value-free enums conform automatically.)
+    enum FileKind: Equatable {
         case regularFile
         case directory
         case symlink

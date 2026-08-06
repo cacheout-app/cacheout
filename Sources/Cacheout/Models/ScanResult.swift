@@ -19,11 +19,11 @@
 ///   bytes that MAY be freed). `sizeBytes` is retained as their compatibility
 ///   sum — existing UI/CLI callers keep working unchanged.
 ///
-/// fn-1.3 consumes `state` for deletion refusal; fn-1.4 builds selection
-/// defaults and presentation (`statusLabel`, GUI, scan JSON) on top. The
-/// selection default here intentionally preserves the pre-state behavior
-/// (`defaultSelected && exists && sizeBytes > 0`) — reworking selection for
-/// the denied states is fn-1.4's task.
+/// fn-1.3 consumes `state` for deletion refusal; fn-1.4 owns what sits on
+/// top: selection defaults (`.denied` unselectable, `.partiallyDenied` never
+/// auto-selected — R18), the presentation `statusLabel` (R6), the D8
+/// disclosure (`DiskSpaceCaveat`), and the scan-JSON wire mapping
+/// (`ScanError.Kind.wireString`, reused by fn-1.5).
 ///
 /// ## CleanupReport
 ///
@@ -37,7 +37,8 @@
 /// and a run where nothing succeeded never claims success.
 ///
 /// `cleaned`/`totalFreed`/`formattedTotal` remain as a compatibility surface
-/// for pre-split callers (CLI JSON until fn-1.5, the GUI sheet until fn-1.4).
+/// for pre-split callers (CLI JSON until fn-1.5 — the GUI sheet migrated to
+/// `entries`/`headline` in fn-1.4).
 
 import Foundation
 
@@ -72,6 +73,43 @@ struct ScanError: Equatable {
 
     let kind: Kind
     let message: String
+
+    /// Deep link to System Settings → Privacy & Security → Full Disk Access —
+    /// the user-side remedy for TCC denials (R9). Anchor verified on macOS
+    /// 15.x: the `com.apple.preference.security` pane still routes
+    /// `Privacy_AllFiles` to the Full Disk Access list.
+    static let fullDiskAccessSettingsURL =
+        URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")!
+}
+
+extension ScanError.Kind {
+    /// Stable wire string for CLI JSON (`scan_error.kind`). Hand-written
+    /// mapping because the enum deliberately carries no raw value (fn-1.4);
+    /// fn-1.5's clean JSON reuses it. Renaming a case must not silently
+    /// change the wire format.
+    var wireString: String {
+        switch self {
+        case .admissionRefused: return "admission_refused"
+        case .tccDenied: return "tcc_denied"
+        case .permissionDenied: return "permission_denied"
+        case .other: return "other"
+        }
+    }
+}
+
+/// D8 honesty disclosure (fn-1.4, R8): scan totals can overcount what
+/// deletion actually returns. Shown beside every recoverable-bytes total
+/// (`CacheoutViewModel.totalRecoverable`) and in the clean-confirmation
+/// sheet.
+enum DiskSpaceCaveat {
+    /// Discloses BOTH mechanisms: APFS clones (invisible to any public API)
+    /// and files hardlinked across categories (each walk counts its own
+    /// link; within-walk dedupe cannot see the other category's copy).
+    static let overcount = """
+        Sizes can overcount: APFS clones share storage invisibly, and files \
+        hardlinked across categories are counted in each — actual space \
+        freed may be less.
+        """
 }
 
 struct ScanResult: Identifiable {
@@ -110,11 +148,20 @@ struct ScanResult: Identifiable {
         self.estimatedUpToBytes = estimatedUpToBytes
         self.itemCount = itemCount
         self.scanError = scanError
-        // Pre-state selection rule preserved verbatim; fn-1.4 owns the
-        // denied-state selection behavior.
-        self.isSelected = category.defaultSelected
-            && state != .missing
-            && (exactBytes + estimatedUpToBytes) > 0
+        // Selection defaults (fn-1.4, R18): `.denied` is unselectable —
+        // nothing was measurable and the cleaner refuses it regardless.
+        // `.partiallyDenied` is NEVER auto-selected (its size is a floor,
+        // not a promise) but stays manually toggleable in the UI. The sum
+        // is inlined because `sizeBytes` is computed and unusable before
+        // initialization completes.
+        switch state {
+        case .denied, .partiallyDenied:
+            self.isSelected = false
+        case .missing, .empty, .measured:
+            self.isSelected = category.defaultSelected
+                && state != .missing
+                && (exactBytes + estimatedUpToBytes) > 0
+        }
     }
 
     /// Compatibility initializer for pre-state callers (fixtures/tests):
@@ -138,6 +185,26 @@ struct ScanResult: Identifiable {
     }
 
     var isEmpty: Bool { !exists || sizeBytes == 0 }
+
+    /// Presentation label for the non-measured states (fn-1.4, R6). SwiftUI
+    /// views are not unit-testable, so this model property is the assertion
+    /// surface: the four labels are pairwise distinct — a TCC denial must
+    /// never read as "Not found" (the silent-8.0K field case, D6). `nil` for
+    /// `.measured`, where the row shows the category description instead.
+    var statusLabel: String? {
+        switch state {
+        case .measured:
+            return nil
+        case .missing:
+            return "Not found"
+        case .empty:
+            return "Nothing to clean"
+        case .partiallyDenied:
+            return "Partially unreadable — measured bytes only"
+        case .denied:
+            return "Access denied — not scanned"
+        }
+    }
 }
 
 struct CleanupReport {
@@ -161,6 +228,15 @@ struct CleanupReport {
         let estimatedUpToBytes: Int64
         /// Compatibility sum for pre-split callers.
         var bytesFreed: Int64 { exactBytes + estimatedUpToBytes }
+
+        /// Component-derived row text (fn-1.4, R16): "X", "X + up to Y
+        /// more", or "up to Z" — never a single number that launders
+        /// estimates into certainty.
+        var componentSummary: String {
+            CleanupReport.componentPhrase(
+                exact: exactBytes, estimatedUpTo: estimatedUpToBytes
+            )
+        }
     }
 
     let disposal: Disposal
@@ -172,21 +248,42 @@ struct CleanupReport {
     /// Pure sum of entry `estimatedUpToBytes` — no other math (R16).
     var totalEstimatedUpTo: Int64 { entries.reduce(0) { $0 + $1.estimatedUpToBytes } }
 
-    /// Mode-driven one-line summary (R11): permanent → "Freed N", trash →
-    /// "Moved N to Trash — empty Trash to reclaim". Never a success claim
-    /// when nothing succeeded.
+    /// Mode-driven one-line summary (R11), component-derived (R16, fn-1.4):
+    /// permanent → "Freed X" / "Freed X + up to Y more" / "Freed up to Z";
+    /// trash → the same amount phrase inside "Moved … to Trash — empty
+    /// Trash to reclaim". Never a success claim when nothing succeeded.
     var headline: String {
         guard !entries.isEmpty else {
             return errors.isEmpty
                 ? "Nothing to clean"
                 : "Nothing cleaned — every item failed"
         }
+        let amount = Self.componentPhrase(
+            exact: totalFreedExact, estimatedUpTo: totalEstimatedUpTo
+        )
         switch disposal {
         case .permanent:
-            return "Freed \(formattedTotal)"
+            return "Freed \(amount)"
         case .trash:
-            return "Moved \(formattedTotal) to Trash — empty Trash to reclaim"
+            return "Moved \(amount) to Trash — empty Trash to reclaim"
         }
+    }
+
+    /// R16 amount phrase, derived from the split components — exact bytes
+    /// are stated plainly, hardlinked/command estimates are always hedged:
+    /// - estimates absent → "X"
+    /// - both present → "X + up to Y more"
+    /// - exact zero → "up to Z"
+    static func componentPhrase(exact: Int64, estimatedUpTo: Int64) -> String {
+        let format = ByteCountFormatter.sharedFile
+        guard estimatedUpTo > 0 else {
+            return format.string(fromByteCount: exact)
+        }
+        guard exact > 0 else {
+            return "up to \(format.string(fromByteCount: estimatedUpTo))"
+        }
+        return "\(format.string(fromByteCount: exact))"
+            + " + up to \(format.string(fromByteCount: estimatedUpTo)) more"
     }
 
     // MARK: Compatibility surface (pre-split callers)

@@ -280,6 +280,29 @@ final class NodeModulesScannerTests: XCTestCase {
         XCTAssertEqual(outcome.errors.first?.url, canonicalNM)
     }
 
+    // MARK: - TCC-protected root gating (R9, fn-1.4)
+
+    func testProtectedRootSkippedWhenExcludedIncludedWhenUserInitiated() async throws {
+        // Matched by basename — a fixture root named "Documents" behaves
+        // exactly like the real `~/Documents`.
+        let docs = base.appendingPathComponent("Documents")
+        let dep = docs.appendingPathComponent("proj/node_modules/dep")
+        try mkdir(dep)
+        try writeFile(dep.appendingPathComponent("index.js"))
+
+        let scanner = makeScanner(roots: [docs])
+
+        let automatic = await scanner.scan(includeProtectedRoots: false)
+        XCTAssertTrue(automatic.items.isEmpty,
+                      "an automatic scan must never enumerate a TCC-prompting root")
+        XCTAssertTrue(automatic.errors.isEmpty,
+                      "a policy skip is not a scan problem — deliberately silent")
+
+        let userInitiated = await scanner.scan(includeProtectedRoots: true)
+        XCTAssertEqual(userInitiated.items.map(\.projectName), ["proj"],
+                       "user-initiated scans include protected roots")
+    }
+
     func testUnreadableSubtreeDuringRecursionIsClassifiedNotSwallowed() async throws {
         try XCTSkipIf(geteuid() == 0, "root ignores permission bits")
         let locked = container.appendingPathComponent("locked-dir")

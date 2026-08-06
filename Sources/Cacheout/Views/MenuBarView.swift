@@ -94,9 +94,11 @@ struct MenuBarView: View {
             // scanGeneration increments on each scan, so this re-fires when data changes
         }
         .task {
-            // Auto-scan on popover open if stale (no results or >5 min old)
+            // Auto-scan on popover open if stale (no results or >5 min old).
+            // `.automatic` skips TCC-protected roots — opening the popover
+            // must never fire a macOS privacy prompt (fn-1.4, R9).
             if viewModel.shouldAutoRescan {
-                await viewModel.scan()
+                await viewModel.scan(trigger: .automatic)
             }
         }
     }
@@ -151,6 +153,8 @@ struct MenuBarView: View {
                 value: ByteCountFormatter.sharedFile.string(fromByteCount: viewModel.totalRecoverable),
                 color: .orange
             )
+            // D8 disclosure beside the recoverable total (fn-1.4, R8)
+            .help(viewModel.overcountCaveat)
             Spacer()
             statPill(
                 label: "Categories",
@@ -181,9 +185,13 @@ struct MenuBarView: View {
     private var topCategories: some View {
         // ⚡ Bolt: Filter eagerly before sorting, as sorting forces full array materialization
         let top = viewModel.scanResults
-            .filter { !$0.isEmpty }
+            .filter { !$0.isEmpty && $0.state != .denied }
             .sorted { $0.sizeBytes > $1.sizeBytes }
             .prefix(5)
+        // Denied categories are appended VISIBLY after the size ranking —
+        // denial is information and must never be hidden by a size sort
+        // where "nothing measurable" reads as 0 bytes (fn-1.4, R18/D6).
+        let denied = viewModel.scanResults.filter { $0.state == .denied }
 
         return VStack(spacing: 0) {
             ForEach(Array(top)) { result in
@@ -205,6 +213,29 @@ struct MenuBarView: View {
                 }
                 .padding(.horizontal, 14)
                 .padding(.vertical, 5)
+            }
+
+            ForEach(denied) { result in
+                HStack(spacing: 8) {
+                    Image(systemName: "lock.fill")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .frame(width: 18)
+
+                    Text(result.category.name)
+                        .font(.caption)
+                        .lineLimit(1)
+
+                    Spacer()
+
+                    Text(result.statusLabel ?? "Access denied")
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
+                        .lineLimit(1)
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 5)
+                .accessibilityElement(children: .combine)
             }
         }
     }
@@ -244,8 +275,10 @@ struct MenuBarView: View {
             }
             .buttonStyle(.borderedProminent)
             .tint(Color(red: 0.85, green: 0.45, blue: 0.1)) // burnt orange — readable white text
-            .disabled(viewModel.totalRecoverable == 0 || viewModel.isCleaning)
-            .help(viewModel.isCleaning ? "Cleanup in progress" : (viewModel.totalRecoverable == 0 ? "Nothing to clean" : "Quick clean recoverable items"))
+            // Disabled while scanning (R11): cleaning against a half-built
+            // result set would act on stale selections.
+            .disabled(viewModel.totalRecoverable == 0 || viewModel.isCleaning || viewModel.isScanning)
+            .help(viewModel.isCleaning ? "Cleanup in progress" : (viewModel.isScanning ? "Scan in progress" : (viewModel.totalRecoverable == 0 ? "Nothing to clean" : "Quick clean recoverable items")))
 
             // Open main window
             Button {

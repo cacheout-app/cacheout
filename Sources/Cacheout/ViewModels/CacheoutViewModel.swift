@@ -40,6 +40,19 @@
 import Foundation
 import SwiftUI
 
+/// What set a scan in motion (fn-1.4, R9). TCC-protected search roots
+/// (Documents, Desktop, …) are enumerated ONLY for `.userInitiated` scans —
+/// a background refresh must never be the thing that fires a macOS privacy
+/// prompt.
+enum ScanTrigger: Equatable {
+    /// The user explicitly asked (Scan button, Quick Clean, confirmed
+    /// cleanup). Protected roots are included; macOS may prompt once.
+    case userInitiated
+    /// Popover/tab auto-rescan or any other background refresh. Protected
+    /// roots are skipped entirely.
+    case automatic
+}
+
 @MainActor
 class CacheoutViewModel: ObservableObject {
     @Published var scanResults: [ScanResult] = []
@@ -53,6 +66,12 @@ class CacheoutViewModel: ObservableObject {
 
     @Published var nodeModulesItems: [NodeModulesItem] = []
     @Published var isNodeModulesScanning = false
+
+    /// Classified problems from the last node_modules scan (fn-1.4, R14) —
+    /// a denied `~/Documents` search root must be VISIBLE here, never an
+    /// empty section. GUI-only surfacing: the CLI does not expose
+    /// node_modules at all until fn-2.
+    @Published var nodeModulesScanIssues: [NodeModulesScanIssue] = []
 
     /// Increments on every completed scan — views can use .task(id:) to react
     @Published var scanGeneration: Int = 0
@@ -87,11 +106,27 @@ class CacheoutViewModel: ObservableObject {
         return Date().timeIntervalSince(last) > scanIntervalMinutes * 60
     }
 
-    private let scanner = CacheScanner()
-    private let nodeModulesScanner = NodeModulesScanner()
-    private let cleaner = CacheCleaner()
+    private let scanner: CacheScanner
+    private let nodeModulesScanner: NodeModulesScanner
+    private let cleaner: CacheCleaner
+    private let categories: [CacheCategory]
 
-    init() {
+    /// - Parameters:
+    ///   - scanner/nodeModulesScanner/cleaner: injectable for hermetic tests
+    ///     (fixture homes and search roots — zero real-`$HOME` reads);
+    ///     production uses the defaults.
+    ///   - categories: the category registry to scan; tests pass fixtures.
+    init(
+        scanner: CacheScanner = CacheScanner(),
+        nodeModulesScanner: NodeModulesScanner = NodeModulesScanner(),
+        cleaner: CacheCleaner = CacheCleaner(),
+        categories: [CacheCategory] = CacheCategory.allCategories
+    ) {
+        self.scanner = scanner
+        self.nodeModulesScanner = nodeModulesScanner
+        self.cleaner = cleaner
+        self.categories = categories
+
         let storedInterval = UserDefaults.standard.double(forKey: "cacheout.scanIntervalMinutes")
         self.scanIntervalMinutes = storedInterval > 0 ? storedInterval : 30
 
@@ -115,7 +150,24 @@ class CacheoutViewModel: ObservableObject {
     }
 
     var totalRecoverable: Int64 {
-        scanResults.lazy.filter { !$0.isEmpty }.reduce(0) { $0 + $1.sizeBytes }
+        // `.denied` contributes nothing by construction (nothing was
+        // measurable); the explicit filter keeps that true even if a future
+        // state carries bytes it cannot promise (R18).
+        scanResults.lazy
+            .filter { !$0.isEmpty && $0.state != .denied }
+            .reduce(0) { $0 + $1.sizeBytes }
+    }
+
+    /// D8 disclosure shown beside every recoverable/removable total (R8):
+    /// APFS clones and cross-category hardlinks make scan totals a ceiling,
+    /// not a promise.
+    nonisolated var overcountCaveat: String { DiskSpaceCaveat.overcount }
+
+    /// True when the current selection includes a `.partiallyDenied`
+    /// category — the confirmation sheet must warn that its size covers
+    /// measured bytes only (R18).
+    var hasPartiallyDeniedSelection: Bool {
+        scanResults.contains { $0.isSelected && $0.state == .partiallyDenied }
     }
 
     var hasResults: Bool { !scanResults.isEmpty || !nodeModulesItems.isEmpty }
@@ -148,21 +200,26 @@ class CacheoutViewModel: ObservableObject {
         ByteCountFormatter.sharedFile.string(fromByteCount: totalSelectedSize)
     }
 
-    func scan() async {
+    func scan(trigger: ScanTrigger = .userInitiated) async {
         isScanning = true
         isNodeModulesScanning = true
         diskInfo = await Task.detached { DiskInfo.current() }.value
 
-        // Scan caches and node_modules in parallel
-        async let cacheResults = scanner.scanAll(CacheCategory.allCategories)
-        async let nmResults = nodeModulesScanner.scan()
+        // Scan caches and node_modules in parallel. TCC gating (R9):
+        // protected search roots are enumerated only when the user asked.
+        async let cacheResults = scanner.scanAll(categories)
+        async let nmResults = nodeModulesScanner.scan(
+            includeProtectedRoots: trigger == .userInitiated
+        )
 
         scanResults = await cacheResults
         isScanning = false
 
-        // fn-1.4 surfaces the outcome's classified errors in the UI; until
-        // then only the items are consumed here.
-        nodeModulesItems = await nmResults.items
+        let outcome = await nmResults
+        nodeModulesItems = outcome.items
+        // Classified scan problems are information, not noise (R14/D6) — a
+        // denied search root surfaces in the section, never as "found none".
+        nodeModulesScanIssues = outcome.errors
         isNodeModulesScanning = false
 
         // Track scan completion for reactive UI updates
@@ -173,13 +230,24 @@ class CacheoutViewModel: ObservableObject {
 
     func toggleSelection(for id: UUID) {
         if let index = scanResults.firstIndex(where: { $0.id == id }) {
+            // `.denied` is unselectable (R18): nothing was measurable and
+            // the cleaner refuses it regardless — the checkbox must not
+            // pretend otherwise. `.partiallyDenied` stays manually
+            // toggleable; the confirmation sheet carries the warning.
+            guard scanResults[index].state != .denied else { return }
             scanResults[index].isSelected.toggle()
         }
     }
 
     func selectAllSafe() {
         var results = scanResults
-        for i in results.indices where results[i].category.riskLevel == .safe && !results[i].isEmpty {
+        // R18: only cleanly `.measured` categories are auto-selected.
+        // `.partiallyDenied` is never auto-selected (smart-clean's auto
+        // path goes through here) and `.denied` is unselectable.
+        for i in results.indices
+        where results[i].category.riskLevel == .safe
+            && results[i].state == .measured
+            && !results[i].isEmpty {
             results[i].isSelected = true
         }
         scanResults = results

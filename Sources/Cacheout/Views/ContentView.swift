@@ -120,8 +120,10 @@ struct ContentView: View {
             // TabView re-runs .task each time a tab reappears.
             // Use hasScanned (not hasResults) so a scan that found zero items
             // is not repeated on every tab switch.
+            // `.automatic`: opening a tab is not consent to a TCC prompt —
+            // protected roots wait for an explicit Scan (fn-1.4, R9).
             guard !viewModel.hasScanned && !viewModel.isScanning else { return }
-            await viewModel.scan()
+            await viewModel.scan(trigger: .automatic)
         }
     }
 
@@ -163,8 +165,12 @@ struct ContentView: View {
                     }
                 }
 
-                // Node modules section
-                if !viewModel.nodeModulesItems.isEmpty || viewModel.isNodeModulesScanning {
+                // Node modules section — also shown when the scan produced
+                // only classified issues (a denied search root must be
+                // visible, never an empty section — R14/D6).
+                if !viewModel.nodeModulesItems.isEmpty
+                    || viewModel.isNodeModulesScanning
+                    || !viewModel.nodeModulesScanIssues.isEmpty {
                     Divider().padding(.horizontal)
                     NodeModulesSection()
                 }
@@ -236,8 +242,10 @@ struct ContentView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(.red)
-                .disabled(!viewModel.hasSelection || viewModel.isCleaning)
-                .help(viewModel.isCleaning ? "Cleanup in progress" : (!viewModel.hasSelection ? "Select at least one item to clean" : "Clean selected items"))
+                // Disabled while scanning (R11): confirming against a
+                // half-built result set would clean stale selections.
+                .disabled(!viewModel.hasSelection || viewModel.isCleaning || viewModel.isScanning)
+                .help(viewModel.isCleaning ? "Cleanup in progress" : (viewModel.isScanning ? "Scan in progress" : (!viewModel.hasSelection ? "Select at least one item to clean" : "Clean selected items")))
             }
             .padding(.horizontal)
             .padding(.vertical, 10)

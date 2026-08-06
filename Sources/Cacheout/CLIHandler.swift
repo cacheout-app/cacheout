@@ -235,21 +235,46 @@ struct CLIHandler {
         let scanner = CacheScanner()
         let results = await scanner.scanAll(CacheCategory.allCategories)
 
-        let items: [[String: Any]] = results.map { result in
-            [
-                "slug": result.category.slug,
-                "name": result.category.name,
-                "size_bytes": result.sizeBytes,
-                "size_human": result.formattedSize,
-                "item_count": result.itemCount,
-                "exists": result.exists,
-                "risk_level": result.category.riskLevel.rawValue.lowercased(),
-                "description": result.category.description,
-                "rebuild_note": result.category.rebuildNote,
-            ]
-        }
+        outputJSON(results.map { scanItemJSON(for: $0) })
+    }
 
-        outputJSON(items)
+    /// Actionable remedy emitted with TCC-denied scan errors (fn-1.4, R9):
+    /// a CLI process is denied SILENTLY by macOS — no prompt ever appears —
+    /// so the JSON must say what to do about it.
+    static let tccGrantHint = "macOS denied access without prompting (TCC). "
+        + "Grant Full Disk Access to this binary (or your terminal) in "
+        + "System Settings > Privacy & Security > Full Disk Access, then rescan."
+
+    /// One category's scan JSON (fn-1.4, R6/R16). Additive on schema v2:
+    /// `state`, `exact_bytes`, `estimated_up_to_bytes` always present
+    /// (`size_bytes` stays the compatibility sum); `scan_error` (plus
+    /// `grant_hint` for TCC denials) present only when the scan was
+    /// impeded — a clean category carries neither key.
+    static func scanItemJSON(for result: ScanResult) -> [String: Any] {
+        var item: [String: Any] = [
+            "slug": result.category.slug,
+            "name": result.category.name,
+            "size_bytes": result.sizeBytes,
+            "size_human": result.formattedSize,
+            "item_count": result.itemCount,
+            "exists": result.exists,
+            "risk_level": result.category.riskLevel.rawValue.lowercased(),
+            "description": result.category.description,
+            "rebuild_note": result.category.rebuildNote,
+            "state": result.state.rawValue,
+            "exact_bytes": result.exactBytes,
+            "estimated_up_to_bytes": result.estimatedUpToBytes,
+        ]
+        if let scanError = result.scanError {
+            item["scan_error"] = [
+                "kind": scanError.kind.wireString,
+                "message": scanError.message,
+            ] as [String: Any]
+            if scanError.kind == .tccDenied {
+                item["grant_hint"] = tccGrantHint
+            }
+        }
+        return item
     }
 
     private static func handleClean(slugs: [String], dryRun: Bool) async {

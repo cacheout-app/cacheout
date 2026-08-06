@@ -106,6 +106,15 @@ actor NodeModulesScanner {
         "Library", ".cache", ".npm", ".yarn",
     ]
 
+    /// Search-root folder names macOS gates behind a TCC consent prompt.
+    /// Enumerating one of these from a fresh install is what fires the
+    /// "Cacheout would like to access your Documents folder" dialog — so
+    /// they are walked only on user-initiated scans (fn-1.4, R9). Matched
+    /// by basename so injected fixture roots behave identically.
+    static let tccProtectedRootNames: Set<String> = [
+        "Documents", "Desktop", "Downloads",
+    ]
+
     /// The default container roots for `home` — the single source
     /// `CacheCleaner` shares so delete-time `admitContainer` accepts exactly
     /// the roots discovery used (fn-1.3).
@@ -131,7 +140,16 @@ actor NodeModulesScanner {
         )
     }
 
-    func scan(maxDepth: Int = 6) async -> NodeModulesScanOutcome {
+    /// - Parameters:
+    ///   - maxDepth: recursion bound below each search root.
+    ///   - includeProtectedRoots: when false (automatic/background scans),
+    ///     TCC-prompting roots (`tccProtectedRootNames`) are skipped
+    ///     entirely — deliberately silent, a policy skip is not a scan
+    ///     problem (R9). User-initiated scans pass true.
+    func scan(
+        maxDepth: Int = 6,
+        includeProtectedRoots: Bool = true
+    ) async -> NodeModulesScanOutcome {
         var allItems: [NodeModulesItem] = []
         var allIssues: [NodeModulesScanIssue] = []
 
@@ -142,6 +160,12 @@ actor NodeModulesScanner {
         // Scan each admitted search root in parallel
         await withTaskGroup(of: NodeModulesScanOutcome.self) { group in
             for root in searchRoots {
+                // TCC gating (R9): a background rescan must never be the
+                // thing that fires a macOS privacy prompt.
+                if !includeProtectedRoots,
+                   Self.tccProtectedRootNames.contains(root.lastPathComponent) {
+                    continue
+                }
                 guard currentFileManager.fileExists(atPath: root.path) else { continue }
 
                 // Container admission BEFORE any traversal (R19).

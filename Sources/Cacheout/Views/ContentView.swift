@@ -122,7 +122,7 @@ struct ContentView: View {
             // is not repeated on every tab switch.
             // `.automatic`: opening a tab is not consent to a TCC prompt —
             // protected roots wait for an explicit Scan (fn-1.4, R9).
-            guard !viewModel.hasScanned && !viewModel.isScanning else { return }
+            guard !viewModel.hasScanned && !viewModel.isAnyScanInProgress else { return }
             await viewModel.scan(trigger: .automatic)
         }
     }
@@ -225,14 +225,15 @@ struct ContentView: View {
 
                 Spacer()
 
-                // Scan button
+                // Scan button — disabled until BOTH scan phases finish
+                // (node_modules keeps running after the cache phase, R11)
                 Button {
                     Task { await viewModel.scan() }
                 } label: {
-                    Label(viewModel.isScanning ? "Scanning..." : "Scan", systemImage: "arrow.clockwise")
+                    Label(viewModel.isAnyScanInProgress ? "Scanning..." : "Scan", systemImage: "arrow.clockwise")
                 }
-                .disabled(viewModel.isScanning)
-                .help(viewModel.isScanning ? "Scan in progress" : "Scan for caches")
+                .disabled(viewModel.isAnyScanInProgress)
+                .help(viewModel.isAnyScanInProgress ? "Scan in progress" : "Scan for caches")
 
                 // Clean button
                 Button {
@@ -242,10 +243,11 @@ struct ContentView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(.red)
-                // Disabled while scanning (R11): confirming against a
-                // half-built result set would clean stale selections.
-                .disabled(!viewModel.hasSelection || viewModel.isCleaning || viewModel.isScanning)
-                .help(viewModel.isCleaning ? "Cleanup in progress" : (viewModel.isScanning ? "Scan in progress" : (!viewModel.hasSelection ? "Select at least one item to clean" : "Clean selected items")))
+                // Disabled while ANY scan phase runs (R11): confirming
+                // against a half-built result set would clean stale
+                // selections (the model guard in clean() backs this up).
+                .disabled(!viewModel.hasSelection || viewModel.isCleaning || viewModel.isAnyScanInProgress)
+                .help(viewModel.isCleaning ? "Cleanup in progress" : (viewModel.isAnyScanInProgress ? "Scan in progress" : (!viewModel.hasSelection ? "Select at least one item to clean" : "Clean selected items")))
             }
             .padding(.horizontal)
             .padding(.vertical, 10)

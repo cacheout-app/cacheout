@@ -344,6 +344,50 @@ final class ScanPresentationTests: XCTestCase {
         )
     }
 
+    // MARK: - Whole-window scan guards (R11)
+
+    @MainActor
+    func testIsAnyScanInProgressCoversBothPhases() {
+        let viewModel = makeViewModel()
+        XCTAssertFalse(viewModel.isAnyScanInProgress)
+
+        // The cache phase clears `isScanning` while node_modules keeps
+        // running 10–30s longer — the whole window must read as scanning.
+        viewModel.isNodeModulesScanning = true
+        XCTAssertTrue(viewModel.isAnyScanInProgress)
+        XCTAssertFalse(viewModel.shouldAutoRescan,
+                       "an in-flight scan must never trigger an auto-rescan")
+
+        viewModel.isNodeModulesScanning = false
+        viewModel.isScanning = true
+        XCTAssertTrue(viewModel.isAnyScanInProgress)
+    }
+
+    @MainActor
+    func testCleanRefusedWhileNodeModulesPhaseStillRunning() async {
+        let viewModel = makeViewModel()
+        viewModel.isNodeModulesScanning = true  // cache phase already done
+
+        await viewModel.clean()
+
+        XCTAssertNil(viewModel.lastReport,
+                     "clean must not run against a half-built result set (R11)")
+        XCTAssertFalse(viewModel.showCleanupReport)
+        XCTAssertFalse(viewModel.isCleaning)
+    }
+
+    @MainActor
+    func testScanReentrancyRefusedWhileAnyPhaseRunning() async {
+        let viewModel = makeViewModel()
+        viewModel.isNodeModulesScanning = true
+
+        await viewModel.scan(trigger: .userInitiated)
+
+        XCTAssertFalse(viewModel.hasScanned,
+                       "an overlapping scan must be refused, not raced")
+        XCTAssertEqual(viewModel.scanGeneration, 0)
+    }
+
     // MARK: - node_modules issues in the view model (R14) + TCC gating (R9)
 
     @MainActor

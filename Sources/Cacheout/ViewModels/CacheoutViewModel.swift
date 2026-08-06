@@ -99,9 +99,16 @@ class CacheoutViewModel: ObservableObject {
         didSet { UserDefaults.standard.set(launchAtLogin, forKey: "cacheout.launchAtLogin") }
     }
 
+    /// True while ANY phase of a scan is still running (R11). The cache
+    /// phase finishes first and clears `isScanning`; node_modules can run
+    /// 10–30s longer — scan/clean controls and model guards must cover the
+    /// WHOLE window, or a clean could act on a half-built result set.
+    var isAnyScanInProgress: Bool { isScanning || isNodeModulesScanning }
+
     /// Whether the menubar should trigger an auto-rescan (no results or stale data)
     var shouldAutoRescan: Bool {
-        if !hasResults && !isScanning { return true }
+        if isAnyScanInProgress { return false }
+        if !hasResults { return true }
         guard let last = lastScanDate else { return true }
         return Date().timeIntervalSince(last) > scanIntervalMinutes * 60
     }
@@ -201,6 +208,10 @@ class CacheoutViewModel: ObservableObject {
     }
 
     func scan(trigger: ScanTrigger = .userInitiated) async {
+        // Re-entrancy guard (R11): correctness must not depend on button
+        // state — an overlapping scan would race two writers over the same
+        // published arrays while the node_modules phase is still running.
+        guard !isAnyScanInProgress else { return }
         isScanning = true
         isNodeModulesScanning = true
         diskInfo = await Task.detached { DiskInfo.current() }.value
@@ -361,6 +372,10 @@ class CacheoutViewModel: ObservableObject {
     }
 
     func clean() async {
+        // Guard at the model, not just the buttons (R11): cleaning while
+        // any scan phase is still running would act on a half-built result
+        // set (node_modules may still be populating).
+        guard !isCleaning && !isAnyScanInProgress else { return }
         isCleaning = true
         let selectedNM = nodeModulesItems.filter(\.isSelected)
         let report = await cleaner.clean(

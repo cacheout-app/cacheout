@@ -244,7 +244,8 @@ struct MenuBarView: View {
 
     private var actionBar: some View {
         HStack(spacing: 8) {
-            // Rescan
+            // Rescan — disabled until BOTH scan phases finish (the
+            // node_modules phase outlives `isScanning`, R11)
             Button {
                 Task { await viewModel.scan() }
             } label: {
@@ -252,10 +253,10 @@ struct MenuBarView: View {
                     .font(.caption.weight(.medium))
             }
             .buttonStyle(.bordered)
-            .disabled(viewModel.isScanning)
-            .help(viewModel.isScanning ? "Scan in progress" : "Scan for caches")
+            .disabled(viewModel.isAnyScanInProgress)
+            .help(viewModel.isAnyScanInProgress ? "Scan in progress" : "Scan for caches")
 
-            if viewModel.isScanning {
+            if viewModel.isAnyScanInProgress {
                 ProgressView()
                     .scaleEffect(0.6)
                     .frame(width: 16, height: 16)
@@ -275,10 +276,10 @@ struct MenuBarView: View {
             }
             .buttonStyle(.borderedProminent)
             .tint(Color(red: 0.85, green: 0.45, blue: 0.1)) // burnt orange — readable white text
-            // Disabled while scanning (R11): cleaning against a half-built
-            // result set would act on stale selections.
-            .disabled(viewModel.totalRecoverable == 0 || viewModel.isCleaning || viewModel.isScanning)
-            .help(viewModel.isCleaning ? "Cleanup in progress" : (viewModel.isScanning ? "Scan in progress" : (viewModel.totalRecoverable == 0 ? "Nothing to clean" : "Quick clean recoverable items")))
+            // Disabled while ANY scan phase runs (R11): cleaning against a
+            // half-built result set would act on stale selections.
+            .disabled(viewModel.totalRecoverable == 0 || viewModel.isCleaning || viewModel.isAnyScanInProgress)
+            .help(viewModel.isCleaning ? "Cleanup in progress" : (viewModel.isAnyScanInProgress ? "Scan in progress" : (viewModel.totalRecoverable == 0 ? "Nothing to clean" : "Quick clean recoverable items")))
 
             // Open main window
             Button {

@@ -34,3 +34,6 @@ cacheout-optimized.png
 
 # Build artifacts
 dist/
+
+# Claude Code agent worktrees (session-local)
+.claude/worktrees/

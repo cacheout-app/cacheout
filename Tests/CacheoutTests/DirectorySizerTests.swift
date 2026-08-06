@@ -160,10 +160,11 @@ final class DirectorySizerTests: XCTestCase {
     /// Forces `.failed` lstat probes for exact paths.
     private final class FailingProbeProvider: FileSystemIdentityProvider {
         var failingPaths: Set<String> = []
+        var failErrno: Int32 = EACCES
 
         override func probeKind(of url: URL) -> KindProbe {
             if failingPaths.contains(url.path) {
-                return .failed(errno: EACCES)
+                return .failed(errno: failErrno)
             }
             return super.probeKind(of: url)
         }
@@ -183,6 +184,31 @@ final class DirectorySizerTests: XCTestCase {
         XCTAssertEqual(report.measuredBytes, 0)
         XCTAssertEqual(report.denials.map(\.kind), [.permission])
         XCTAssertTrue(report.claims.isEmpty)
+    }
+
+    func testEnumeratedItemProbeFailureKeepsErrnoClassification() throws {
+        // A walk item whose lstat fails must keep its errno classification
+        // (EACCES → permission, EPERM → TCC), never collapse to a generic
+        // metadata failure (D6/R6).
+        let root = base.appendingPathComponent("classified-walk")
+        try mkdir(root)
+        let visible = try writeFile(root.appendingPathComponent("visible.bin"), bytes: 4_096)
+        let blocked = try writeFile(root.appendingPathComponent("blocked.bin"), bytes: 8_192)
+
+        let provider = FailingProbeProvider()
+        // The enumerator yields canonical (/private-resolved) spellings.
+        provider.failingPaths = [provider.canonicalize(blocked).path]
+
+        provider.failErrno = EACCES
+        let eaccesReport = makeSizer(provider: provider).measure(at: root, mode: .scanRoot)
+        XCTAssertEqual(eaccesReport.denials.map(\.kind), [.permission])
+        XCTAssertEqual(eaccesReport.exactAllocatedBytes, allocated(visible),
+                       "the readable sibling still measures")
+
+        provider.failErrno = EPERM
+        let epermReport = makeSizer(provider: provider).measure(at: root, mode: .scanRoot)
+        XCTAssertEqual(epermReport.denials.map(\.kind), [.tcc])
+        XCTAssertEqual(epermReport.exactAllocatedBytes, allocated(visible))
     }
 
     func testDeletionTargetFifoIsZeroWithRecordedSkip() throws {

@@ -229,11 +229,18 @@ struct DirectorySizer {
 
         while let next = enumerator.nextObject() {
             guard let itemURL = next as? URL else { continue }
-            guard let kind = provider.kind(of: itemURL) else {
-                report.denials.append(SizeDenial(
-                    url: itemURL, kind: .metadata,
-                    detail: "lstat failed mid-walk"
-                ))
+            let kind: FileSystemIdentityProvider.FileKind
+            switch provider.probeKind(of: itemURL) {
+            case .kind(let probed):
+                kind = probed
+            case .absent:
+                // Deleted between enumeration and probe — a benign mid-walk
+                // race, not a denial.
+                continue
+            case .failed(let code):
+                // Classified by errno (EPERM → TCC, EACCES → permission) —
+                // never collapsed into a generic metadata failure (D6).
+                report.denials.append(Self.denial(forFailedProbe: itemURL, errno: code))
                 continue
             }
 

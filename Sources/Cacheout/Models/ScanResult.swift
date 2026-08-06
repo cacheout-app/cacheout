@@ -27,11 +27,17 @@
 ///
 /// ## CleanupReport
 ///
-/// Returned by `CacheCleaner.clean()` after a cleanup operation. Contains two arrays:
-/// - `cleaned`: Successfully cleaned items with bytes freed per category.
-/// - `errors`: Failed items with error descriptions per category.
+/// Returned by `CacheCleaner.clean()` after a cleanup operation (fn-1.3,
+/// R11/R16). Entries carry SPLIT byte components: `exactBytes` (measured
+/// unique-inode bytes whose deletion verifiably freed them) and
+/// `estimatedUpToBytes` (hardlinked or command-freed bytes that MAY be
+/// freed). Aggregates are pure sums of the entry components. The report also
+/// carries its `disposal` mode, and `headline` derives from it — a Trash run
+/// never claims "Freed" (the bytes return only when the Trash is emptied),
+/// and a run where nothing succeeded never claims success.
 ///
-/// Provides `totalFreed` (sum of all freed bytes) and a formatted string version.
+/// `cleaned`/`totalFreed`/`formattedTotal` remain as a compatibility surface
+/// for pre-split callers (CLI JSON until fn-1.5, the GUI sheet until fn-1.4).
 
 import Foundation
 
@@ -135,9 +141,60 @@ struct ScanResult: Identifiable {
 }
 
 struct CleanupReport {
-    let cleaned: [(category: String, bytesFreed: Int64)]
+    /// What the operation did with the bytes. Rendering must never claim
+    /// "Freed" for a Trash run — trashed bytes come back only when the
+    /// Trash is emptied (R11).
+    enum Disposal: Equatable {
+        case permanent
+        case trash
+    }
+
+    /// One cleaned category (or node_modules item) with split components
+    /// (R16). A partially-failed category still yields ONE entry carrying
+    /// only the bytes its successful children measured.
+    struct Entry {
+        let category: String
+        /// Measured bytes on unique inodes — deletion verifiably freed them.
+        let exactBytes: Int64
+        /// Hardlinked bytes (freed only if every other link goes too) and
+        /// command-category bytes (nothing measures what a command frees).
+        let estimatedUpToBytes: Int64
+        /// Compatibility sum for pre-split callers.
+        var bytesFreed: Int64 { exactBytes + estimatedUpToBytes }
+    }
+
+    let disposal: Disposal
+    let entries: [Entry]
     let errors: [(category: String, error: String)]
-    var totalFreed: Int64 { cleaned.reduce(0) { $0 + $1.bytesFreed } }
+
+    /// Pure sum of entry `exactBytes` — no other math (R16).
+    var totalFreedExact: Int64 { entries.reduce(0) { $0 + $1.exactBytes } }
+    /// Pure sum of entry `estimatedUpToBytes` — no other math (R16).
+    var totalEstimatedUpTo: Int64 { entries.reduce(0) { $0 + $1.estimatedUpToBytes } }
+
+    /// Mode-driven one-line summary (R11): permanent → "Freed N", trash →
+    /// "Moved N to Trash — empty Trash to reclaim". Never a success claim
+    /// when nothing succeeded.
+    var headline: String {
+        guard !entries.isEmpty else {
+            return errors.isEmpty
+                ? "Nothing to clean"
+                : "Nothing cleaned — every item failed"
+        }
+        switch disposal {
+        case .permanent:
+            return "Freed \(formattedTotal)"
+        case .trash:
+            return "Moved \(formattedTotal) to Trash — empty Trash to reclaim"
+        }
+    }
+
+    // MARK: Compatibility surface (pre-split callers)
+
+    var cleaned: [(category: String, bytesFreed: Int64)] {
+        entries.map { ($0.category, $0.bytesFreed) }
+    }
+    var totalFreed: Int64 { totalFreedExact + totalEstimatedUpTo }
     var formattedTotal: String {
         ByteCountFormatter.sharedFile.string(fromByteCount: totalFreed)
     }

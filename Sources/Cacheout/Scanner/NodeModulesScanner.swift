@@ -106,6 +106,13 @@ actor NodeModulesScanner {
         "Library", ".cache", ".npm", ".yarn",
     ]
 
+    /// The default container roots for `home` — the single source
+    /// `CacheCleaner` shares so delete-time `admitContainer` accepts exactly
+    /// the roots discovery used (fn-1.3).
+    static func defaultSearchRoots(home: URL) -> [URL] {
+        searchRootNames.map { home.appendingPathComponent($0) }
+    }
+
     /// - Parameters:
     ///   - home: home the default search roots resolve against (injectable).
     ///   - searchRoots: explicit container roots (tests); nil uses the
@@ -116,8 +123,7 @@ actor NodeModulesScanner {
         searchRoots: [URL]? = nil,
         provider: FileSystemIdentityProvider = FileSystemIdentityProvider()
     ) {
-        let roots = searchRoots
-            ?? Self.searchRootNames.map { home.appendingPathComponent($0) }
+        let roots = searchRoots ?? Self.defaultSearchRoots(home: home)
         self.searchRoots = roots
         self.provider = provider
         self.pathGuard = PathGuard(

@@ -160,7 +160,9 @@ class CacheoutViewModel: ObservableObject {
         scanResults = await cacheResults
         isScanning = false
 
-        nodeModulesItems = await nmResults
+        // fn-1.4 surfaces the outcome's classified errors in the UI; until
+        // then only the items are consumed here.
+        nodeModulesItems = await nmResults.items
         isNodeModulesScanning = false
 
         // Track scan completion for reactive UI updates

@@ -1,38 +1,92 @@
 /// # NodeModulesScanner — Recursive node_modules Finder
 ///
-/// An `actor` that recursively searches common developer project directories
-/// for `node_modules` folders. Designed to find abandoned or stale dependencies
-/// that consume significant disk space.
+/// An `actor` that recursively searches configured developer project
+/// directories for `node_modules` folders. Designed to find abandoned or
+/// stale dependencies that consume significant disk space.
+///
+/// ## Safety model (fn-1.2, R19)
+///
+/// This scanner's recursion is MANUAL — it is not the Foundation enumerator
+/// and gets none of the enumerator's symlink guarantees. Three lstat gates
+/// close the escape vectors:
+///
+/// 1. **Search roots** are admitted through `PathGuard.admitContainer(_:)`
+///    (configured containers only) AND must themselves be real directories —
+///    a symlink search root is never traversed.
+/// 2. **Every manual descent** re-checks `provider.kind(of:) == .directory`
+///    (lstat, no-follow) — a nested symlink to an external tree is never
+///    followed.
+/// 3. **Every `node_modules` CANDIDATE** is lstat-checked before it is sized
+///    or returned — a symlink candidate handed to the sizer's `.scanRoot`
+///    mode would enumerate its external target, so it is never sized and
+///    never returned.
 ///
 /// ## Search Strategy
 ///
-/// 1. Scans predefined root directories (`Documents`, `Developer`, `Projects`, etc.)
-///    in parallel using `TaskGroup`.
+/// 1. Scans the search roots in parallel using `TaskGroup`.
 /// 2. Recursively descends into subdirectories up to `maxDepth` (default: 6).
-/// 3. When a `node_modules` directory is found, calculates its size and records it
-///    **without recursing further** (projects with node_modules won't have nested projects).
-/// 4. Skips noise directories (`.git`, `.build`, `DerivedData`, etc.) for performance.
+///    Hidden directories ARE traversed (D3 — a 23G `.claude/worktrees` field
+///    case was invisible purely because the dir is hidden); the skip list and
+///    depth bound keep the walk tame.
+/// 3. When a real `node_modules` directory is found, it is sized via the
+///    shared `DirectorySizer` (hidden files included — pnpm keeps ~all bytes
+///    under `.pnpm`) and recorded **without recursing further**.
+/// 4. Skips noise directories (`.git`, `.build`, `DerivedData`, etc.).
+///
+/// ## Outcome
+///
+/// `scan` returns a `NodeModulesScanOutcome`: discovered items (each carrying
+/// its origin-container provenance, R14) plus classified non-fatal errors —
+/// a denied `node_modules` root or an unreadable subtree is a visible,
+/// classified issue (D6), never a silent skip.
 ///
 /// ## Deduplication
 ///
-/// Results are deduplicated by absolute path (using `Set<String>` insertion) to handle
-/// cases where search roots overlap (e.g., `~/Documents/Code` and `~/Code` pointing
-/// to the same location via symlinks).
-///
-/// ## Performance
-///
-/// - Parallel scanning of root directories via `TaskGroup`
-/// - Early termination when `node_modules` found (no deeper recursion)
-/// - Skip list eliminates most irrelevant directories
-/// - `maxDepth` cap prevents excessive filesystem traversal
+/// Results are deduplicated by absolute path (using `Set<String>` insertion)
+/// to handle overlapping search roots, then sorted by size descending.
 
 import Foundation
 
+// MARK: - Outcome types
+
+/// A classified, non-fatal problem encountered during a node_modules scan.
+struct NodeModulesScanIssue: Equatable {
+    enum Kind: Equatable {
+        /// `PathGuard.admitContainer` refused the search root — not one of
+        /// the configured containers; never traversed.
+        case containerRefused
+        /// The search root is a symlink (or otherwise not a real directory)
+        /// — never traversed.
+        case symlinkRoot
+        /// macOS TCC (privacy) denial — EPERM under the Cocoa error.
+        case tccDenied
+        /// BSD permission denial — EACCES.
+        case permissionDenied
+        /// Enumeration or metadata failure that is not a permission problem.
+        case unreadable
+    }
+
+    let url: URL
+    let kind: Kind
+    let detail: String
+}
+
+/// What a node_modules scan produced: items plus classified errors.
+struct NodeModulesScanOutcome {
+    var items: [NodeModulesItem]
+    var errors: [NodeModulesScanIssue]
+}
+
+// MARK: - Scanner
+
 actor NodeModulesScanner {
     private let fileManager = FileManager.default
+    private let searchRoots: [URL]
+    private let provider: FileSystemIdentityProvider
+    private let pathGuard: PathGuard
 
     /// Common directories where developers keep projects
-    private static let searchRoots: [String] = [
+    private static let searchRootNames: [String] = [
         "Documents",
         "Developer",
         "Projects",
@@ -52,87 +106,181 @@ actor NodeModulesScanner {
         "Library", ".cache", ".npm", ".yarn",
     ]
 
-    func scan(maxDepth: Int = 6) async -> [NodeModulesItem] {
-        let home = fileManager.homeDirectoryForCurrentUser
-        var allItems: [NodeModulesItem] = []
-        let currentFileManager = self.fileManager
+    /// - Parameters:
+    ///   - home: home the default search roots resolve against (injectable).
+    ///   - searchRoots: explicit container roots (tests); nil uses the
+    ///     default home-relative list.
+    ///   - provider: identity provider shared with `PathGuard` and the sizer.
+    init(
+        home: URL = FileManager.default.homeDirectoryForCurrentUser,
+        searchRoots: [URL]? = nil,
+        provider: FileSystemIdentityProvider = FileSystemIdentityProvider()
+    ) {
+        let roots = searchRoots
+            ?? Self.searchRootNames.map { home.appendingPathComponent($0) }
+        self.searchRoots = roots
+        self.provider = provider
+        self.pathGuard = PathGuard(
+            home: home, containerRoots: roots, provider: provider
+        )
+    }
 
-        // Scan each search root in parallel
-        await withTaskGroup(of: [NodeModulesItem].self) { group in
-            for root in Self.searchRoots {
-                let rootURL = home.appendingPathComponent(root)
-                guard currentFileManager.fileExists(atPath: rootURL.path) else { continue }
+    func scan(maxDepth: Int = 6) async -> NodeModulesScanOutcome {
+        var allItems: [NodeModulesItem] = []
+        var allIssues: [NodeModulesScanIssue] = []
+
+        let currentFileManager = self.fileManager
+        let provider = self.provider
+        let sizer = DirectorySizer(provider: provider)
+
+        // Scan each admitted search root in parallel
+        await withTaskGroup(of: NodeModulesScanOutcome.self) { group in
+            for root in searchRoots {
+                guard currentFileManager.fileExists(atPath: root.path) else { continue }
+
+                // Container admission BEFORE any traversal (R19).
+                do {
+                    _ = try pathGuard.admitContainer(root)
+                } catch {
+                    allIssues.append(NodeModulesScanIssue(
+                        url: root, kind: .containerRefused,
+                        detail: error.localizedDescription
+                    ))
+                    continue
+                }
+
+                // lstat gate: an escaping-symlink search root is NEVER
+                // traversed — its real target may sit anywhere.
+                guard provider.kind(of: root) == .directory else {
+                    allIssues.append(NodeModulesScanIssue(
+                        url: root, kind: .symlinkRoot,
+                        detail: "search root is not a real directory"
+                    ))
+                    continue
+                }
+
                 group.addTask {
-                    await Self.findNodeModules(in: rootURL, fileManager: currentFileManager, skipDirs: Self.skipDirs, maxDepth: maxDepth)
+                    await Self.findNodeModules(
+                        in: root,
+                        originContainer: root,
+                        fileManager: currentFileManager,
+                        provider: provider,
+                        sizer: sizer,
+                        skipDirs: Self.skipDirs,
+                        maxDepth: maxDepth
+                    )
                 }
             }
-            for await items in group {
-                allItems.append(contentsOf: items)
+            for await outcome in group {
+                allItems.append(contentsOf: outcome.items)
+                allIssues.append(contentsOf: outcome.errors)
             }
         }
 
         // Deduplicate by path and sort by size
         var seen = Set<String>()
-        return allItems
+        let items = allItems
             .filter { seen.insert($0.nodeModulesPath.path).inserted }
             .sorted { $0.sizeBytes > $1.sizeBytes }
+        return NodeModulesScanOutcome(items: items, errors: allIssues)
     }
 
-    private static func findNodeModules(in directory: URL, fileManager: FileManager, skipDirs: Set<String>, maxDepth: Int, currentDepth: Int = 0) async -> [NodeModulesItem] {
-        guard currentDepth < maxDepth else { return [] }
+    private static func findNodeModules(
+        in directory: URL,
+        originContainer: URL,
+        fileManager: FileManager,
+        provider: FileSystemIdentityProvider,
+        sizer: DirectorySizer,
+        skipDirs: Set<String>,
+        maxDepth: Int,
+        currentDepth: Int = 0
+    ) async -> NodeModulesScanOutcome {
+        var outcome = NodeModulesScanOutcome(items: [], errors: [])
+        guard currentDepth < maxDepth else { return outcome }
 
-        var results: [NodeModulesItem] = []
-        let nodeModulesURL = directory.appendingPathComponent("node_modules")
+        let candidate = directory.appendingPathComponent("node_modules")
 
-        // Check if this directory contains node_modules
-        if let values = try? nodeModulesURL.resourceValues(forKeys: [.isDirectoryKey, .contentModificationDateKey]), values.isDirectory == true {
-            let size = directorySize(at: nodeModulesURL, fileManager: fileManager)
+        // Candidate gate (lstat, no-follow): only a REAL directory is a find.
+        // A symlink candidate is never sized and never returned — `.scanRoot`
+        // resolves roots by design, so an unchecked symlink would enumerate
+        // its external target.
+        if provider.kind(of: candidate) == .directory {
+            let report = sizer.measure(at: candidate, mode: .scanRoot)
+
+            // A denied node_modules root (or partially denied tree) is a
+            // classified, visible outcome error (R14/D6).
+            for denial in report.denials {
+                outcome.errors.append(Self.issue(from: denial))
+            }
+
+            let size = report.measuredBytes
             if size > 0 {
-                let projectName = directory.lastPathComponent
-                results.append(NodeModulesItem(
-                    projectName: projectName,
+                let modified = (try? candidate.resourceValues(
+                    forKeys: [.contentModificationDateKey]
+                ))?.contentModificationDate
+                outcome.items.append(NodeModulesItem(
+                    projectName: directory.lastPathComponent,
                     projectPath: directory,
-                    nodeModulesPath: nodeModulesURL,
+                    nodeModulesPath: candidate,
                     sizeBytes: size,
-                    lastModified: values.contentModificationDate
+                    lastModified: modified,
+                    originContainer: originContainer
                 ))
             }
-            // Don't recurse into projects that have node_modules — they won't have nested projects
-            return results
+            // Don't recurse into projects that have node_modules — they won't
+            // have nested projects.
+            return outcome
         }
 
-        // Recurse into subdirectories
-        guard let contents = try? fileManager.contentsOfDirectory(
-            at: directory,
-            includingPropertiesForKeys: [.isDirectoryKey],
-            options: [.skipsHiddenFiles]
-        ) else { return results }
+        // Recurse into subdirectories. Hidden directories are deliberately
+        // NOT skipped (D3); the skip list and maxDepth bound the walk.
+        let contents: [URL]
+        do {
+            contents = try fileManager.contentsOfDirectory(
+                at: directory,
+                includingPropertiesForKeys: [.isDirectoryKey],
+                options: []
+            )
+        } catch {
+            // Real capture, never a silent skip (D6).
+            outcome.errors.append(
+                Self.issue(from: DirectorySizer.classifyDenial(error, at: directory))
+            )
+            return outcome
+        }
 
         for item in contents {
             let name = item.lastPathComponent
             guard !skipDirs.contains(name) else { continue }
-            guard (try? item.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true else { continue }
-            let subResults = await findNodeModules(in: item, fileManager: fileManager, skipDirs: skipDirs, maxDepth: maxDepth, currentDepth: currentDepth + 1)
-            results.append(contentsOf: subResults)
+            // lstat gate before EVERY manual descent: a symlinked directory
+            // is never followed.
+            guard provider.kind(of: item) == .directory else { continue }
+            let sub = await findNodeModules(
+                in: item,
+                originContainer: originContainer,
+                fileManager: fileManager,
+                provider: provider,
+                sizer: sizer,
+                skipDirs: skipDirs,
+                maxDepth: maxDepth,
+                currentDepth: currentDepth + 1
+            )
+            outcome.items.append(contentsOf: sub.items)
+            outcome.errors.append(contentsOf: sub.errors)
         }
 
-        return results
+        return outcome
     }
 
-    private static func directorySize(at url: URL, fileManager: FileManager) -> Int64 {
-        var total: Int64 = 0
-        guard let enumerator = fileManager.enumerator(
-            at: url,
-            includingPropertiesForKeys: [.totalFileAllocatedSizeKey],
-            options: [.skipsHiddenFiles]
-        ) else { return 0 }
-
-        for case let fileURL as URL in enumerator {
-            if let values = try? fileURL.resourceValues(forKeys: [.totalFileAllocatedSizeKey]),
-               let size = values.totalFileAllocatedSize {
-                total += Int64(size)
-            }
+    private static func issue(from denial: SizeDenial) -> NodeModulesScanIssue {
+        let kind: NodeModulesScanIssue.Kind
+        switch denial.kind {
+        case .tcc: kind = .tccDenied
+        case .permission: kind = .permissionDenied
+        case .metadata, .other: kind = .unreadable
         }
-        return total
+        return NodeModulesScanIssue(
+            url: denial.url, kind: kind, detail: denial.detail
+        )
     }
 }

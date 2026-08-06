@@ -4,30 +4,52 @@
 /// Swift's structured concurrency (`TaskGroup`). Each category is scanned in
 /// its own child task for maximum parallelism.
 ///
-/// ## Thread Safety
+/// ## Scan-time admission (R19)
 ///
-/// Uses the `actor` isolation model to ensure thread-safe access to internal state.
-/// All public methods are `async` and can be called from any concurrency context.
+/// Every resolved root is admitted through `PathGuard` against the category's
+/// OWN `CategoryAdmissionPolicy` BEFORE it is measured. A refused root is
+/// NEVER enumerated — refusal becomes a classified `ScanError` on the result
+/// (`.denied`-family), not a walk. This is what keeps untrusted `.probed`
+/// stdout from ever steering a filesystem walk (or, later, a deletion): the
+/// probe's output must independently match the category's declared roots.
 ///
-/// ## Disk Size Calculation
+/// ## Sizing
 ///
-/// Uses `totalFileAllocatedSize` (via `URLResourceValues`) instead of plain file size.
-/// This correctly reports actual disk usage for:
-/// - **Sparse files**: Docker's disk image can appear as 60GB but only use 20GB on disk.
-/// - **Compressed files**: APFS-compressed files report their actual allocation.
+/// All measurement goes through the shared `DirectorySizer` (D7) in
+/// `.scanRoot` mode — hidden files and bundle descendants included (D2/D3),
+/// enumerator errors classified and recorded (D6), hardlinked bytes split
+/// into `estimatedUpToBytes` (D8 mitigation), mount boundaries respected.
 ///
-/// The enumerator skips hidden files and package descendants for performance,
-/// which is appropriate since cache directories rarely contain meaningful hidden files.
+/// ## State derivation
+///
+/// The scanner — not the UI — derives `ScanState`: no resolved paths →
+/// `.missing`; admission refusals or walk denials with nothing measured →
+/// `.denied`; with something measured → `.partiallyDenied`; clean walk of an
+/// empty tree → `.empty`; otherwise `.measured`.
 ///
 /// ## Results Ordering
 ///
-/// Results are sorted by size descending so the largest categories appear first
-/// in the UI, helping users prioritize cleanup.
+/// Results are sorted by size descending so the largest categories appear
+/// first in the UI, helping users prioritize cleanup.
 
 import Foundation
 
 actor CacheScanner {
-    private let fileManager = FileManager.default
+
+    private let home: URL
+    private let provider: FileSystemIdentityProvider
+
+    /// - Parameters:
+    ///   - home: home directory admission policies are anchored to
+    ///     (injectable — tests pass a fixture home; production the real one).
+    ///   - provider: identity provider shared with `PathGuard` and the sizer.
+    init(
+        home: URL = FileManager.default.homeDirectoryForCurrentUser,
+        provider: FileSystemIdentityProvider = FileSystemIdentityProvider()
+    ) {
+        self.home = home
+        self.provider = provider
+    }
 
     func scanAll(_ categories: [CacheCategory]) async -> [ScanResult] {
         await withTaskGroup(of: ScanResult.self) { group in
@@ -45,57 +67,79 @@ actor CacheScanner {
     nonisolated func scanCategory(_ category: CacheCategory) async -> ScanResult {
         let resolvedPaths = category.resolvedPaths
         guard !resolvedPaths.isEmpty else {
-            return ScanResult(category: category, sizeBytes: 0, itemCount: 0, exists: false)
+            return ScanResult(
+                category: category, state: .missing,
+                exactBytes: 0, estimatedUpToBytes: 0,
+                itemCount: 0, scanError: nil
+            )
         }
 
-        var totalSize: Int64 = 0
-        var totalItems = 0
+        let policy = CategoryAdmissionPolicy(category: category, home: home)
+        let pathGuard = PathGuard(home: home, provider: provider)
+        let sizer = DirectorySizer(provider: provider)
+
+        var exact: Int64 = 0
+        var estimated: Int64 = 0
+        var items = 0
+        var denials: [SizeDenial] = []
+        var refusals: [Error] = []
 
         for url in resolvedPaths {
-            let (size, count) = directorySize(at: url)
-            totalSize += size
-            totalItems += count
+            let admitted: AdmittedRoot
+            do {
+                admitted = try pathGuard.admitDeletionRoot(url, policy: policy)
+            } catch {
+                // Refused roots are NEVER walked (R19) — the refusal is the
+                // scan outcome for this root.
+                refusals.append(error)
+                continue
+            }
+
+            let report = sizer.measure(at: admitted.resolvedURL, mode: .scanRoot)
+            exact += report.exactAllocatedBytes
+            estimated += report.estimatedUpToBytes
+            items += report.itemCount
+            denials.append(contentsOf: report.denials)
+        }
+
+        let measuredAnything = items > 0 || (exact + estimated) > 0
+        let state: ScanState
+        let scanError: ScanError?
+        if !refusals.isEmpty || !denials.isEmpty {
+            state = measuredAnything ? .partiallyDenied : .denied
+            scanError = Self.deriveScanError(refusals: refusals, denials: denials)
+        } else if !measuredAnything {
+            state = .empty
+            scanError = nil
+        } else {
+            state = .measured
+            scanError = nil
         }
 
         return ScanResult(
-            category: category,
-            sizeBytes: totalSize,
-            itemCount: totalItems,
-            exists: true
+            category: category, state: state,
+            exactBytes: exact, estimatedUpToBytes: estimated,
+            itemCount: items, scanError: scanError
         )
     }
 
-    nonisolated private func directorySize(at url: URL) -> (Int64, Int) {
-        var totalSize: Int64 = 0
-        var itemCount = 0
-
-        // Use allocatedSizeOfDirectory for actual disk usage (handles sparse files)
-        // ⚡ Bolt Optimization: Added .isRegularFileKey to prefetch properties to avoid O(N) disk I/O when reading resourceValues inside the loop
-        guard let enumerator = fileManager.enumerator(
-            at: url,
-            includingPropertiesForKeys: [.totalFileAllocatedSizeKey, .fileAllocatedSizeKey, .isRegularFileKey],
-            options: [.skipsHiddenFiles, .skipsPackageDescendants]
-        ) else {
-            return (0, 0)
+    /// First admission refusal wins (it means a root was never walked at
+    /// all); otherwise the first classified walk denial.
+    static func deriveScanError(
+        refusals: [Error], denials: [SizeDenial]
+    ) -> ScanError? {
+        if let refusal = refusals.first {
+            return ScanError(
+                kind: .admissionRefused,
+                message: refusal.localizedDescription
+            )
         }
-
-        for case let fileURL as URL in enumerator {
-            do {
-                let values = try fileURL.resourceValues(forKeys: [
-                    .totalFileAllocatedSizeKey,
-                    .fileAllocatedSizeKey,
-                    .isRegularFileKey
-                ])
-                if values.isRegularFile == true {
-                    // totalFileAllocatedSize accounts for sparse files
-                    let size = Int64(values.totalFileAllocatedSize ?? values.fileAllocatedSize ?? 0)
-                    totalSize += size
-                    itemCount += 1
-                }
-            } catch {
-                continue
-            }
+        if let denial = denials.first {
+            return ScanError(
+                kind: denial.kind.scanErrorKind,
+                message: "\(denial.url.path): \(denial.detail)"
+            )
         }
-        return (totalSize, itemCount)
+        return nil
     }
 }

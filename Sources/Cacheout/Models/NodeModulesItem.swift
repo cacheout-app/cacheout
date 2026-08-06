@@ -24,7 +24,29 @@ struct NodeModulesItem: Identifiable, Hashable {
     let nodeModulesPath: URL
     let sizeBytes: Int64
     let lastModified: Date?
+    /// The configured search root (container) this item was discovered under
+    /// — origin provenance (R14). Nil only for items constructed outside a
+    /// scan (fixtures/tests); the scanner always populates it.
+    let originContainer: URL?
     var isSelected: Bool = false
+
+    init(
+        projectName: String,
+        projectPath: URL,
+        nodeModulesPath: URL,
+        sizeBytes: Int64,
+        lastModified: Date?,
+        originContainer: URL? = nil,
+        isSelected: Bool = false
+    ) {
+        self.projectName = projectName
+        self.projectPath = projectPath
+        self.nodeModulesPath = nodeModulesPath
+        self.sizeBytes = sizeBytes
+        self.lastModified = lastModified
+        self.originContainer = originContainer
+        self.isSelected = isSelected
+    }
 
     var formattedSize: String {
         ByteCountFormatter.sharedFile.string(fromByteCount: sizeBytes)

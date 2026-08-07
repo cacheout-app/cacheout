@@ -40,8 +40,9 @@ actor CacheScanner {
     private let provider: FileSystemIdentityProvider
 
     /// - Parameters:
-    ///   - home: home directory admission policies are anchored to
-    ///     (injectable — tests pass a fixture home; production the real one).
+    ///   - home: home directory BOTH path discovery and admission policies
+    ///     are anchored to (injectable — tests pass a fixture home;
+    ///     production the real one).
     ///   - provider: identity provider shared with `PathGuard` and the sizer.
     init(
         home: URL = FileManager.default.homeDirectoryForCurrentUser,
@@ -65,7 +66,10 @@ actor CacheScanner {
     }
 
     nonisolated func scanCategory(_ category: CacheCategory) async -> ScanResult {
-        let resolvedPaths = category.resolvedPaths
+        // Discovery and admission MUST anchor to the same home — resolving
+        // against the real account home while admitting against an injected
+        // one would refuse every home-relative root and defeat the seam.
+        let resolvedPaths = category.resolvedPaths(home: home)
         guard !resolvedPaths.isEmpty else {
             return ScanResult(
                 category: category, state: .missing,

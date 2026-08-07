@@ -246,25 +246,62 @@ final class ScanPresentationTests: XCTestCase {
 
     func testHeadlineDerivesFromComponentsPerDisposal() {
         let format = ByteCountFormatter.sharedFile
-        let entry = CleanupReport.Entry(
-            category: "c", exactBytes: 4096, estimatedUpToBytes: 2048
-        )
         let phrase = "\(format.string(fromByteCount: 4096)) + up to \(format.string(fromByteCount: 2048)) more"
 
-        let permanent = CleanupReport(disposal: .permanent, entries: [entry], errors: [])
+        let permanent = CleanupReport(
+            disposal: .permanent,
+            entries: [CleanupReport.Entry(
+                category: "c", exactBytes: 4096, estimatedUpToBytes: 2048,
+                disposal: .permanent
+            )],
+            errors: []
+        )
         XCTAssertEqual(permanent.headline, "Freed \(phrase)")
 
-        let trashed = CleanupReport(disposal: .trash, entries: [entry], errors: [])
+        let trashed = CleanupReport(
+            disposal: .trash,
+            entries: [CleanupReport.Entry(
+                category: "c", exactBytes: 4096, estimatedUpToBytes: 2048,
+                disposal: .trash
+            )],
+            errors: []
+        )
         XCTAssertEqual(trashed.headline,
                        "Moved \(phrase) to Trash — empty Trash to reclaim")
 
         let estimateOnly = CleanupReport(
             disposal: .permanent,
-            entries: [CleanupReport.Entry(category: "c", exactBytes: 0, estimatedUpToBytes: 2048)],
+            entries: [CleanupReport.Entry(
+                category: "c", exactBytes: 0, estimatedUpToBytes: 2048,
+                disposal: .permanent
+            )],
             errors: []
         )
         XCTAssertEqual(estimateOnly.headline,
                        "Freed up to \(format.string(fromByteCount: 2048))")
+
+        // P2: a Trash-mode run mixing a trashed category with a
+        // command-erased one renders both parts — command bytes are never
+        // claimed recoverable from the Trash.
+        let mixed = CleanupReport(
+            disposal: .trash,
+            entries: [
+                CleanupReport.Entry(
+                    category: "cache", exactBytes: 4096, estimatedUpToBytes: 0,
+                    disposal: .trash
+                ),
+                CleanupReport.Entry(
+                    category: "sim", exactBytes: 0, estimatedUpToBytes: 2048,
+                    disposal: .permanent
+                ),
+            ],
+            errors: []
+        )
+        XCTAssertEqual(
+            mixed.headline,
+            "Freed up to \(format.string(fromByteCount: 2048)); "
+                + "moved \(format.string(fromByteCount: 4096)) to Trash — empty Trash to reclaim"
+        )
 
         let allFailed = CleanupReport(
             disposal: .permanent, entries: [], errors: [("c", "boom")]
@@ -275,7 +312,8 @@ final class ScanPresentationTests: XCTestCase {
 
     func testEntryComponentSummaryMatchesPhrase() {
         let entry = CleanupReport.Entry(
-            category: "c", exactBytes: 8192, estimatedUpToBytes: 1024
+            category: "c", exactBytes: 8192, estimatedUpToBytes: 1024,
+            disposal: .permanent
         )
         XCTAssertEqual(
             entry.componentSummary,

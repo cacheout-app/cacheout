@@ -23,7 +23,9 @@
 /// heading derive from `report.entries`/`report.errors`, and the amount line
 /// is `report.headline` — disposal-aware and component-derived ("Freed X",
 /// "+ up to Y more", "up to Z"). Per-entry rows render
-/// `Entry.componentSummary`, never a single laundered total.
+/// `Entry.componentSummary`, never a single laundered total, and carry
+/// `report.rowAnnotation(for:)` when a Trash-mode run contains a
+/// command-erased entry whose bytes are NOT in the Trash (P2).
 
 import SwiftUI
 
@@ -94,6 +96,15 @@ struct CleanConfirmationSheet: View {
                     .foregroundStyle(.orange)
             }
 
+            // P2: command-backed categories execute regardless of the
+            // Move-to-Trash toggle — with Trash mode on, the sheet must not
+            // let the user believe those items will be recoverable.
+            if viewModel.moveToTrash && viewModel.hasCommandBackedSelection {
+                Label("Some selected items clean via commands and are always erased permanently — they will not appear in the Trash", systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
+
             // R18: explicit selection of a partially denied category is
             // allowed, but the sheet must say what the number means.
             if viewModel.hasPartiallyDeniedSelection {
@@ -150,11 +161,20 @@ struct CleanupReportSheet: View {
             if !report.entries.isEmpty {
                 VStack(alignment: .leading, spacing: 4) {
                     ForEach(report.entries, id: \.category) { entry in
-                        HStack {
-                            Text(entry.category)
-                            Spacer()
-                            Text(entry.componentSummary)
-                                .foregroundStyle(.secondary)
+                        VStack(alignment: .leading, spacing: 1) {
+                            HStack {
+                                Text(entry.category)
+                                Spacer()
+                                Text(entry.componentSummary)
+                                    .foregroundStyle(.secondary)
+                            }
+                            // P2 honesty marker: in a Trash run, a
+                            // command-erased entry put nothing in the Trash.
+                            if let note = report.rowAnnotation(for: entry) {
+                                Text(note)
+                                    .font(.caption2)
+                                    .foregroundStyle(.orange)
+                            }
                         }
                         .font(.caption)
                         .accessibilityElement(children: .combine)

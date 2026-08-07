@@ -204,6 +204,39 @@ final class PathGuardTests: XCTestCase {
         XCTAssertTrue(admitted.viaSiblingDrift)
     }
 
+    func testVersionChildOfDeclaredRootAdmitted() throws {
+        let pathGuard = makeGuard()
+
+        // Production pnpm shape: Categories declares the unversioned store
+        // root as the probed fallback, while `pnpm store path` returns the
+        // versioned child below it (`…/pnpm/store/v10`).
+        let store = fixtureHome.appendingPathComponent(".local/share/pnpm/store")
+        let v10 = store.appendingPathComponent("v10")
+        try mkdir(v10)
+        let policy = driftPolicy([".local/share/pnpm/store"])
+
+        let admitted = try pathGuard.admitDeletionRoot(v10, policy: policy)
+        XCTAssertTrue(admitted.viaSiblingDrift)
+        XCTAssertEqual(admitted.requestedURL, v10)
+
+        // The declared root itself still admits exactly, not via drift.
+        let exact = try pathGuard.admitDeletionRoot(store, policy: policy)
+        XCTAssertFalse(exact.viaSiblingDrift)
+
+        // Named (non-version) children stay refused — the child shape admits
+        // pure-version basenames only.
+        let files = store.appendingPathComponent("files")
+        try mkdir(files)
+        assertRefused(files, policy: policy, guard: pathGuard,
+                      message: "(named child of declared root)")
+
+        // Grandchildren stay refused — one component below the root only.
+        let deep = v10.appendingPathComponent("files")
+        try mkdir(deep)
+        assertRefused(deep, policy: policy, guard: pathGuard,
+                      message: "(grandchild of declared root)")
+    }
+
     func testVersionStemExtraction() {
         XCTAssertEqual(PathGuard.versionStem(of: "v10"), "")
         XCTAssertEqual(PathGuard.versionStem(of: "v11"), "")

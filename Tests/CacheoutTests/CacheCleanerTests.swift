@@ -231,6 +231,44 @@ final class CacheCleanerTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: tmp.path))
     }
 
+    // MARK: - Injected-home path resolution (hermetic seam)
+
+    func testStaticPathCategoryResolvesUnderInjectedHomeForCleaning() async throws {
+        // The cleaner must resolve `.staticPath` roots against ITS injected
+        // home — the same home its admission policy and PathGuard root at.
+        // Resolving against the real account home would either find nothing
+        // or refuse the real home's tree against a fixture-rooted policy.
+        let home = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let cacheDir = home.appendingPathComponent("Library/Caches/fixture-static")
+        try FileManager.default.createDirectory(
+            at: cacheDir, withIntermediateDirectories: true
+        )
+        try writeFile(cacheDir.appendingPathComponent("stale.bin"))
+
+        let category = CacheCategory(
+            name: "static-under-home", slug: "static-under-home",
+            description: "test", icon: "trash",
+            discovery: [.staticPath("Library/Caches/fixture-static")],
+            riskLevel: .safe, rebuildNote: "", defaultSelected: true
+        )
+
+        let cleaner = CacheCleaner(home: home)
+        let report = await cleaner.clean(
+            results: [makeScanResult(category: category)],
+            moveToTrash: false
+        )
+
+        XCTAssertTrue(report.errors.isEmpty, "unexpected errors: \(report.errors)")
+        XCTAssertEqual(report.entries.count, 1)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: cacheDir.path),
+                      "category root survives — contents mode")
+        XCTAssertEqual(
+            try FileManager.default.contentsOfDirectory(atPath: cacheDir.path), [],
+            "children under the injected-home-resolved root must be deleted"
+        )
+    }
+
     // MARK: - node_modules parallel deletion
 
     func testCleanNodeModulesParallelDeleteRemovesAll() async throws {
@@ -893,6 +931,8 @@ final class CacheCleanerTests: XCTestCase {
         XCTAssertEqual(recorder.urls.count, 2, "the two good children still get trashed")
         XCTAssertEqual(report.entries.first?.exactBytes, expected)
         XCTAssertEqual(report.disposal, .trash)
+        XCTAssertEqual(report.entries.first?.disposal, .trash,
+                       "path-based categories honor the Trash mode per entry")
     }
 
     // MARK: - Hardlink ordering matrix (R8)
@@ -1145,13 +1185,16 @@ final class CacheCleanerTests: XCTestCase {
     // MARK: - Disposal-mode headlines (R11)
 
     func testHeadlinesAreModeDrivenAndHonest() {
-        let entry = CleanupReport.Entry(
-            category: "c", exactBytes: 4096, estimatedUpToBytes: 0
+        let erasedEntry = CleanupReport.Entry(
+            category: "c", exactBytes: 4096, estimatedUpToBytes: 0, disposal: .permanent
         )
-        let permanent = CleanupReport(disposal: .permanent, entries: [entry], errors: [])
+        let trashedEntry = CleanupReport.Entry(
+            category: "c", exactBytes: 4096, estimatedUpToBytes: 0, disposal: .trash
+        )
+        let permanent = CleanupReport(disposal: .permanent, entries: [erasedEntry], errors: [])
         XCTAssertTrue(permanent.headline.hasPrefix("Freed "))
 
-        let trashed = CleanupReport(disposal: .trash, entries: [entry], errors: [])
+        let trashed = CleanupReport(disposal: .trash, entries: [trashedEntry], errors: [])
         XCTAssertFalse(trashed.headline.contains("Freed"),
                        "a Trash run must never claim bytes were freed")
         XCTAssertTrue(trashed.headline.contains("Moved"))
@@ -1164,6 +1207,70 @@ final class CacheCleanerTests: XCTestCase {
         XCTAssertFalse(allFailed.headline.contains("Freed"),
                        "no success claim when everything failed")
         XCTAssertFalse(allFailed.headline.contains("Moved"))
+    }
+
+    // MARK: - Per-entry disposal honesty (P2)
+
+    func testTrashRunWithOnlyCommandErasedEntryNeverClaimsTrash() {
+        // A Trash-mode run whose only entry was command-erased: the argv put
+        // nothing in the Trash, so the headline must not promise reclaim.
+        let commandEntry = CleanupReport.Entry(
+            category: "sim", exactBytes: 0, estimatedUpToBytes: 2048, disposal: .permanent
+        )
+        let report = CleanupReport(disposal: .trash, entries: [commandEntry], errors: [])
+        XCTAssertTrue(report.headline.hasPrefix("Freed "))
+        XCTAssertFalse(report.headline.contains("Trash"),
+                       "command-erased bytes must never be claimed recoverable from the Trash")
+        XCTAssertEqual(report.rowAnnotation(for: commandEntry),
+                       "erased permanently — not in Trash")
+    }
+
+    func testMixedDisposalHeadlineRendersBothPartsAndAnnotatesRows() {
+        let trashedEntry = CleanupReport.Entry(
+            category: "cache", exactBytes: 4096, estimatedUpToBytes: 0, disposal: .trash
+        )
+        let commandEntry = CleanupReport.Entry(
+            category: "sim", exactBytes: 0, estimatedUpToBytes: 2048, disposal: .permanent
+        )
+        let report = CleanupReport(
+            disposal: .trash, entries: [trashedEntry, commandEntry], errors: []
+        )
+        XCTAssertTrue(report.headline.contains("Freed"),
+                      "the command-erased part renders as freed, not trashed")
+        XCTAssertTrue(report.headline.contains("moved"))
+        XCTAssertTrue(report.headline.contains("empty Trash to reclaim"))
+        XCTAssertNil(report.rowAnnotation(for: trashedEntry),
+                     "an entry matching the requested mode carries no marker")
+        XCTAssertNotNil(report.rowAnnotation(for: commandEntry))
+
+        // A fully-permanent run annotates nothing — every row did what the
+        // mode said.
+        let permanentRun = CleanupReport(
+            disposal: .permanent, entries: [commandEntry], errors: []
+        )
+        XCTAssertNil(permanentRun.rowAnnotation(for: commandEntry))
+    }
+
+    func testCommandCategoryReportsPermanentDisposalInTrashRun() async throws {
+        let cmdRoot = try makeTempDir("cmd-trash-run")
+        defer { try? FileManager.default.removeItem(at: cmdRoot) }
+        let category = makeCategory(
+            at: [cmdRoot], name: "cat-cmd", cleanCommands: [["/usr/bin/true"]]
+        )
+
+        let cleaner = CacheCleaner()
+        let report = await cleaner.clean(
+            results: [makeScanResult(category: category, size: 2048)],
+            moveToTrash: true
+        )
+
+        XCTAssertTrue(report.errors.isEmpty, "unexpected errors: \(report.errors)")
+        XCTAssertEqual(report.disposal, .trash,
+                       "the report keeps the REQUESTED mode")
+        XCTAssertEqual(report.entries.first?.disposal, .permanent,
+                       "a command-backed category erases permanently even in a Trash run (P2)")
+        XCTAssertFalse(report.headline.contains("Trash"),
+                       "the sheet must not claim command-erased bytes can be reclaimed by emptying the Trash")
     }
 
     // MARK: - Trash mode end-to-end via seam

@@ -670,4 +670,61 @@ final class CacheScannerDerivationTests: XCTestCase {
                        "no byte of the refused tree may have been measured")
         XCTAssertEqual(result.itemCount, 0)
     }
+
+    // MARK: - Injected-home path resolution (hermetic seam)
+
+    func testStaticPathResolvesAndAdmitsUnderInjectedHome() async throws {
+        // Discovery must anchor to the INJECTED home, not the real account
+        // home — otherwise a `.staticPath` category under a fixture home is
+        // reported `.missing` (or the real home's tree is refused against a
+        // policy rooted at the fixture home), defeating the hermetic seam.
+        let cacheDir = fixtureHome
+            .appendingPathComponent("Library/Caches/fixture-static")
+        try mkdir(cacheDir)
+        let payload = try writeFile(
+            cacheDir.appendingPathComponent("payload.bin"), bytes: 6_000
+        )
+
+        let category = CacheCategory(
+            name: "static-under-home", slug: "static-under-home",
+            description: "test", icon: "trash",
+            discovery: [.staticPath("Library/Caches/fixture-static")],
+            riskLevel: .safe, rebuildNote: "", defaultSelected: true
+        )
+
+        let result = await makeScanner().scanCategory(category)
+
+        XCTAssertEqual(
+            result.state, .measured,
+            "static path must resolve AND admit under the injected home — "
+            + "got \(result.state) (\(String(describing: result.scanError)))"
+        )
+        XCTAssertEqual(result.exactBytes, allocated(payload))
+    }
+
+    func testProbedRelativeFallbackResolvesUnderInjectedHome() async throws {
+        // A failed probe's home-RELATIVE fallback must anchor to the same
+        // injected home the admission policy roots at.
+        let fallbackDir = fixtureHome
+            .appendingPathComponent("Library/Caches/fixture-fallback")
+        try mkdir(fallbackDir)
+        let payload = try writeFile(
+            fallbackDir.appendingPathComponent("payload.bin"), bytes: 4_096
+        )
+
+        let category = CacheCategory(
+            name: "probed-fallback", slug: "probed-fallback",
+            description: "test", icon: "trash",
+            discovery: [.probed(
+                command: "false", requiresTool: nil,
+                fallbacks: ["Library/Caches/fixture-fallback"]
+            )],
+            riskLevel: .safe, rebuildNote: "", defaultSelected: true
+        )
+
+        let result = await makeScanner().scanCategory(category)
+
+        XCTAssertEqual(result.state, .measured)
+        XCTAssertEqual(result.exactBytes, allocated(payload))
+    }
 }

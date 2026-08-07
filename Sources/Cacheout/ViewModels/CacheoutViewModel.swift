@@ -177,6 +177,14 @@ class CacheoutViewModel: ObservableObject {
         scanResults.contains { $0.isSelected && $0.state == .partiallyDenied }
     }
 
+    /// True when the current selection includes a command-backed category —
+    /// its clean commands execute regardless of the Move-to-Trash toggle and
+    /// erase permanently, so the confirmation sheet must say so whenever
+    /// Trash mode is on (P2).
+    var hasCommandBackedSelection: Bool {
+        scanResults.contains { $0.isSelected && $0.category.cleanCommands != nil }
+    }
+
     var hasResults: Bool { !scanResults.isEmpty || !nodeModulesItems.isEmpty }
     var hasSelection: Bool {
         // ⚡ Bolt: Use .contains(where:) for O(1) best-case short-circuiting instead of .isEmpty on filtered array or reducing total size
@@ -207,7 +215,11 @@ class CacheoutViewModel: ObservableObject {
         ByteCountFormatter.sharedFile.string(fromByteCount: totalSelectedSize)
     }
 
-    func scan(trigger: ScanTrigger = .userInitiated) async {
+    /// No default trigger — every caller must classify itself (R9). A
+    /// defaulted `.userInitiated` let timer-driven refreshes inherit TCC
+    /// consent silently; making the argument mandatory turns a
+    /// misclassified new call site into a compile error.
+    func scan(trigger: ScanTrigger) async {
         // Re-entrancy guard (R11): correctness must not depend on button
         // state — an overlapping scan would race two writers over the same
         // published arrays while the node_modules phase is still running,
@@ -394,7 +406,9 @@ class CacheoutViewModel: ObservableObject {
         isCleaning = false
         showCleanupReport = true
 
-        // Rescan to update sizes
-        await scan()
+        // Rescan to update sizes. `.userInitiated`: a confirmed cleanup is
+        // explicit user action (see ScanTrigger), and the refresh must see
+        // the same roots the results being updated came from.
+        await scan(trigger: .userInitiated)
     }
 }

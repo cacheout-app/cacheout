@@ -795,7 +795,7 @@ struct CLIHandler {
             if result.state == .denied {
                 let kind = result.scanError?.kind.wireString ?? "other"
                 let message = result.scanError?.message ?? "access denied at scan time"
-                for url in result.category.resolvedPaths {
+                for url in result.category.resolvedPaths(home: home) {
                     refused.append([
                         "slug": result.category.slug,
                         "path": url.path,
@@ -806,7 +806,8 @@ struct CLIHandler {
             }
 
             let policy = CategoryAdmissionPolicy(category: result.category, home: home)
-            for url in result.category.resolvedPaths {
+            // Resolution anchors to the same injected home the policy does.
+            for url in result.category.resolvedPaths(home: home) {
                 // Admission BEFORE any write — a refusal skips the root and
                 // is reported, never silently swallowed.
                 do {

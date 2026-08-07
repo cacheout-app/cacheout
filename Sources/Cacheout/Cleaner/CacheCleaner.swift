@@ -268,6 +268,9 @@ actor CacheCleaner {
         entries.append(contentsOf: nodeModulesOutcome.entries)
         errors.append(contentsOf: nodeModulesOutcome.errors)
 
+        // Report-level disposal is the REQUESTED mode; each entry carries
+        // what actually happened (command-backed entries stay `.permanent`
+        // even in a Trash run).
         return CleanupReport(
             disposal: moveToTrash ? .trash : .permanent,
             entries: entries,
@@ -285,8 +288,9 @@ actor CacheCleaner {
 
         // Every resolved root must pass admission BEFORE any argv runs — a
         // probed root that drifted outside the category's policy blocks the
-        // whole command set (R17).
-        for url in result.category.resolvedPaths {
+        // whole command set (R17). Resolution anchors to the same injected
+        // home the policy does.
+        for url in result.category.resolvedPaths(home: home) {
             do {
                 let admitted = try pathGuard.admitDeletionRoot(url, policy: policy)
                 logDriftAdmission(admitted, category: name)
@@ -309,13 +313,17 @@ actor CacheCleaner {
         }
 
         // Nothing measures what a command frees: exact 0, estimated =
-        // pre-scan measured size (R16).
+        // pre-scan measured size (R16). Disposal is ALWAYS `.permanent`:
+        // the argv ran regardless of the Move-to-Trash toggle and placed
+        // nothing in the Trash — reporting `.trash` would falsely promise
+        // the bytes are recoverable by emptying it.
         logCleanup(category: name, bytesFreed: result.sizeBytes)
         guard result.sizeBytes > 0 else { return (nil, []) }
         return (
             CleanupReport.Entry(
                 category: name, exactBytes: 0,
-                estimatedUpToBytes: result.sizeBytes
+                estimatedUpToBytes: result.sizeBytes,
+                disposal: .permanent
             ),
             []
         )
@@ -335,7 +343,8 @@ actor CacheCleaner {
         var exact: Int64 = 0
         var estimated: Int64 = 0
 
-        for url in result.category.resolvedPaths {
+        // Resolution anchors to the same injected home the policy does.
+        for url in result.category.resolvedPaths(home: home) {
             let admitted: AdmittedRoot
             do {
                 admitted = try pathGuard.admitDeletionRoot(url, policy: policy)
@@ -385,7 +394,8 @@ actor CacheCleaner {
         guard exact + estimated > 0 else { return (nil, errors) }
         return (
             CleanupReport.Entry(
-                category: name, exactBytes: exact, estimatedUpToBytes: estimated
+                category: name, exactBytes: exact, estimatedUpToBytes: estimated,
+                disposal: moveToTrash ? .trash : .permanent
             ),
             errors
         )
@@ -573,7 +583,8 @@ actor CacheCleaner {
             entries.append(CleanupReport.Entry(
                 category: label,
                 exactBytes: accepted.exactBytes,
-                estimatedUpToBytes: accepted.estimatedUpToBytes
+                estimatedUpToBytes: accepted.estimatedUpToBytes,
+                disposal: moveToTrash ? .trash : .permanent
             ))
             logCleanup(
                 category: "node_modules/\(item.projectName)",

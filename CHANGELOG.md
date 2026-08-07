@@ -46,7 +46,8 @@ now 3 and destructive commands require `--confirm`. Coordinate MCP updates with
 - **PathGuard + FileSystemIdentityProvider (D4).** Every deletion root,
   contained child, cleanCommand root, and node_modules item passes a single
   admission chokepoint before anything is removed: category-scoped root
-  admission with a constrained version-drift sibling rule, a deny list
+  admission with a constrained version-drift rule (one-component sibling or
+  pure-version child of a declared root), a deny list
   (`/`, volume roots, `$HOME`, protected first-level home children),
   inode-identity checks, two-signal mount-boundary detection, and cross-device
   refusal. Refusals are reported and logged, never silently skipped.

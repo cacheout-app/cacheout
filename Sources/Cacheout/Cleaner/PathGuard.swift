@@ -8,13 +8,17 @@
 ///    admitted ONLY against the requesting category's own
 ///    `CategoryAdmissionPolicy` — the exact declared roots from all three
 ///    path-bearing discovery kinds (`.staticPath`, `.absolutePath`, `.probed`
-///    fallbacks), or a one-component version-drift SIBLING of a static/probed
-///    root (same parent, basename matching the declared stem modulo a trailing
-///    version suffix: `store/v11` is fine when `v10` was declared). Drift is a
-///    constrained sibling rule, never a parent grant — the parent of
-///    `~/Library/Caches/Homebrew` is the whole cache namespace and the parent
-///    of `~/.npm` is `$HOME` itself. `.absolutePath` roots admit exactly, no
-///    drift.
+///    fallbacks), or a constrained version drift of a static/probed root in
+///    one of two shapes: a one-component SIBLING (same parent, basename
+///    matching the declared stem modulo a trailing version suffix:
+///    `store/v11` is fine when `v10` was declared) or a pure-version CHILD
+///    directly below the declared root (`store/v10` when `store` was
+///    declared — probes like `pnpm store path` return the versioned store
+///    below the declared fallback, and the child is strictly inside a root
+///    already admissible in full). Drift is never a parent grant — the
+///    parent of `~/Library/Caches/Homebrew` is the whole cache namespace and
+///    the parent of `~/.npm` is `$HOME` itself. `.absolutePath` roots admit
+///    exactly, no drift.
 /// 2. **Containers** (`admitContainer`): the configured node_modules search
 ///    roots, and only those. Deliberately split from deletion roots — a
 ///    search root like `~/Documents` is a valid place to LOOK for
@@ -51,8 +55,9 @@ struct CategoryAdmissionPolicy {
         /// Declared location (home-relative entries already resolved against
         /// the injectable home).
         let url: URL
-        /// Version-drift siblings allowed? True for `.staticPath` and
-        /// `.probed` fallbacks; false for `.absolutePath` (exact only).
+        /// Version drift (one-component sibling or pure-version child)
+        /// allowed? True for `.staticPath` and `.probed` fallbacks; false
+        /// for `.absolutePath` (exact only).
         let allowsSiblingDrift: Bool
     }
 
@@ -63,7 +68,8 @@ struct CategoryAdmissionPolicy {
     }
 
     /// Derive a policy from a category's discovery entries. Mirrors
-    /// `CacheCategory.resolvedPaths` path construction: `.staticPath` and
+    /// `CacheCategory.resolvedPaths(home:)` path construction — both anchor
+    /// to the SAME injected home: `.staticPath` and
     /// non-`/`-prefixed probed fallbacks are home-relative; `.probed` COMMAND
     /// output contributes nothing (probe stdout is untrusted — it must be
     /// admitted against the declared roots like any other candidate).
@@ -219,7 +225,7 @@ final class PathGuard {
                 )
             }
             if declared.allowsSiblingDrift,
-               isVersionDriftSibling(resolved, ofDeclared: declaredResolved) {
+               isVersionDrift(resolved, ofDeclared: declaredResolved) {
                 return AdmittedRoot(
                     requestedURL: url,
                     resolvedURL: resolved,
@@ -351,19 +357,36 @@ final class PathGuard {
         return resolved
     }
 
-    // MARK: - Sibling drift rule
+    // MARK: - Version drift rule
 
-    /// One-component version-drift sibling: same parent (by inode identity)
-    /// and same basename STEM after stripping a trailing version suffix from
-    /// each side. `store/v11` matches declared `store/v10` (both stems empty,
-    /// same parent); `~/.ssh` never matches `~/.npm` (stems differ);
-    /// DerivedData never matches an npm root (parents differ).
-    private func isVersionDriftSibling(
+    /// Constrained one-component version drift, two shapes:
+    ///
+    /// - **Sibling**: same parent (by inode identity) and same basename STEM
+    ///   after stripping a trailing version suffix from each side.
+    ///   `store/v11` matches declared `store/v10` (both stems empty, same
+    ///   parent); `~/.ssh` never matches `~/.npm` (stems differ); DerivedData
+    ///   never matches an npm root (parents differ).
+    /// - **Version child**: the candidate's parent IS the declared root and
+    ///   the candidate's basename is purely a version (`v10`, `3.1` — stem
+    ///   empty after stripping). Probes return this shape: `pnpm store path`
+    ///   yields `…/pnpm/store/v10` while the declared fallback is
+    ///   `…/pnpm/store`. The child is strictly inside a root already
+    ///   admissible in full, so this grants nothing new; named children
+    ///   (`store/files`) and deeper descendants stay refused.
+    private func isVersionDrift(
         _ candidate: URL, ofDeclared declared: URL
     ) -> Bool {
         guard candidate.pathComponents.count > 1,
               declared.pathComponents.count > 1 else { return false }
         let candidateParent = candidate.deletingLastPathComponent()
+
+        // Version child: parent is the declared root itself, basename is
+        // purely a version suffix.
+        if provider.sameLocation(candidateParent, declared) {
+            return Self.versionStem(of: candidate.lastPathComponent).isEmpty
+        }
+
+        // Sibling: same parent as the declared root, same stem.
         let declaredParent = declared.deletingLastPathComponent()
         guard provider.sameLocation(candidateParent, declaredParent) else {
             return false

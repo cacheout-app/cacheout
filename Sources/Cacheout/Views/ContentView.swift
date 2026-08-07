@@ -228,7 +228,7 @@ struct ContentView: View {
                 // Scan button — disabled until BOTH scan phases finish
                 // (node_modules keeps running after the cache phase, R11)
                 Button {
-                    Task { await viewModel.scan() }
+                    Task { await viewModel.scan(trigger: .userInitiated) }
                 } label: {
                     Label(viewModel.isAnyScanInProgress ? "Scanning..." : "Scan", systemImage: "arrow.clockwise")
                 }

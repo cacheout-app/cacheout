@@ -248,12 +248,16 @@ containment.
 ### Why category-scoped admission with a sibling rule, not an allowlist of parents?
 
 A category may delete ONLY its own declared roots (static, probed, and
-absolute discovery kinds) plus a one-component sibling whose basename matches
-a declared stem modulo a trailing version suffix (`store/v11` is admissible
-when `v10` is declared — cache directories version-drift). There is no
-recursive parent grant: the parent of `~/Library/Caches/Homebrew` is the whole
-cache namespace, and the parent of `~/.npm` is `$HOME`. A probed path is
-untrusted stdout and passes the same admission as everything else.
+absolute discovery kinds) plus a constrained version drift: a one-component
+sibling whose basename matches a declared stem modulo a trailing version
+suffix (`store/v11` is admissible when `v10` is declared — cache directories
+version-drift), or a pure-version child directly below a declared root
+(`store/v10` when `store` is declared — `pnpm store path` reports the
+versioned store below its declared fallback, and the child is strictly inside
+a root already admissible in full). There is no recursive parent grant: the
+parent of `~/Library/Caches/Homebrew` is the whole cache namespace, and the
+parent of `~/.npm` is `$HOME`. A probed path is untrusted stdout and passes
+the same admission as everything else.
 
 ### Why two canonicalization rules?
 

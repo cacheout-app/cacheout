@@ -247,7 +247,7 @@ struct MenuBarView: View {
             // Rescan — disabled until BOTH scan phases finish (the
             // node_modules phase outlives `isScanning`, R11)
             Button {
-                Task { await viewModel.scan() }
+                Task { await viewModel.scan(trigger: .userInitiated) }
             } label: {
                 Label("Scan", systemImage: "arrow.clockwise")
                     .font(.caption.weight(.medium))

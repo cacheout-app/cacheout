@@ -32,9 +32,13 @@
 /// unique-inode bytes whose deletion verifiably freed them) and
 /// `estimatedUpToBytes` (hardlinked or command-freed bytes that MAY be
 /// freed). Aggregates are pure sums of the entry components. The report also
-/// carries its `disposal` mode, and `headline` derives from it — a Trash run
-/// never claims "Freed" (the bytes return only when the Trash is emptied),
-/// and a run where nothing succeeded never claims success.
+/// carries its REQUESTED `disposal` mode, and each entry carries what
+/// ACTUALLY happened to its bytes — command-backed categories erase
+/// permanently regardless of the Move-to-Trash toggle. `headline` derives
+/// from the entry disposals: a Trash run never claims "Freed" for trashed
+/// bytes (they return only when the Trash is emptied), command-erased bytes
+/// are never claimed recoverable from the Trash, and a run where nothing
+/// succeeded never claims success.
 ///
 /// The pre-split compatibility surface (`cleaned`/`totalFreed`/
 /// `formattedTotal`) was retired in fn-1.5 once the CLI JSON moved onto the
@@ -226,6 +230,11 @@ struct CleanupReport {
         /// Hardlinked bytes (freed only if every other link goes too) and
         /// command-category bytes (nothing measures what a command frees).
         let estimatedUpToBytes: Int64
+        /// What ACTUALLY happened to this entry's bytes — not the requested
+        /// mode. Command-backed categories run their argv regardless of the
+        /// Move-to-Trash toggle and place nothing in the Trash, so their
+        /// entries stay `.permanent` even in a Trash run.
+        let disposal: Disposal
         /// Compatibility sum for pre-split callers.
         var bytesFreed: Int64 { exactBytes + estimatedUpToBytes }
 
@@ -239,6 +248,9 @@ struct CleanupReport {
         }
     }
 
+    /// The REQUESTED disposal mode for the run. Entries carry what actually
+    /// happened — a command-backed entry is `.permanent` even when the run
+    /// requested `.trash`, and `rowAnnotation(for:)` surfaces that mismatch.
     let disposal: Disposal
     let entries: [Entry]
     let errors: [(category: String, error: String)]
@@ -248,25 +260,48 @@ struct CleanupReport {
     /// Pure sum of entry `estimatedUpToBytes` — no other math (R16).
     var totalEstimatedUpTo: Int64 { entries.reduce(0) { $0 + $1.estimatedUpToBytes } }
 
-    /// Mode-driven one-line summary (R11), component-derived (R16, fn-1.4):
-    /// permanent → "Freed X" / "Freed X + up to Y more" / "Freed up to Z";
-    /// trash → the same amount phrase inside "Moved … to Trash — empty
-    /// Trash to reclaim". Never a success claim when nothing succeeded.
+    /// Entry-disposal-driven one-line summary (R11), component-derived
+    /// (R16, fn-1.4): permanent entries → "Freed X" / "Freed X + up to Y
+    /// more" / "Freed up to Z"; trashed entries → the same amount phrase
+    /// inside "Moved … to Trash — empty Trash to reclaim"; a mixed run
+    /// renders both parts. Derives from what each entry ACTUALLY did, never
+    /// the requested mode — trashed bytes are never claimed "Freed", and
+    /// command-erased bytes are never claimed recoverable from the Trash.
+    /// Never a success claim when nothing succeeded.
     var headline: String {
         guard !entries.isEmpty else {
             return errors.isEmpty
                 ? "Nothing to clean"
                 : "Nothing cleaned — every item failed"
         }
-        let amount = Self.componentPhrase(
-            exact: totalFreedExact, estimatedUpTo: totalEstimatedUpTo
-        )
-        switch disposal {
-        case .permanent:
-            return "Freed \(amount)"
-        case .trash:
-            return "Moved \(amount) to Trash — empty Trash to reclaim"
+        let erased = entries.filter { $0.disposal == .permanent }
+        let trashed = entries.filter { $0.disposal == .trash }
+        if trashed.isEmpty {
+            return "Freed \(Self.amountPhrase(for: erased))"
         }
+        let moved =
+            "\(Self.amountPhrase(for: trashed)) to Trash — empty Trash to reclaim"
+        if erased.isEmpty {
+            return "Moved \(moved)"
+        }
+        return "Freed \(Self.amountPhrase(for: erased)); moved \(moved)"
+    }
+
+    /// Row-level honesty marker: in a Trash-mode run, an entry whose bytes
+    /// were erased permanently (command-backed categories) must say so —
+    /// nothing of it sits in the Trash. `nil` whenever the entry's actual
+    /// disposal matches the requested mode.
+    func rowAnnotation(for entry: Entry) -> String? {
+        guard disposal == .trash, entry.disposal == .permanent else { return nil }
+        return "erased permanently — not in Trash"
+    }
+
+    /// R16 amount phrase over a subset of entries (one disposal's worth).
+    private static func amountPhrase(for subset: [Entry]) -> String {
+        componentPhrase(
+            exact: subset.reduce(0) { $0 + $1.exactBytes },
+            estimatedUpTo: subset.reduce(0) { $0 + $1.estimatedUpToBytes }
+        )
     }
 
     /// R16 amount phrase, derived from the split components — exact bytes

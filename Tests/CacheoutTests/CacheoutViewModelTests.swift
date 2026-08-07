@@ -556,6 +556,82 @@ final class CacheoutViewModelTests: XCTestCase {
         XCTAssertTrue(viewModel.selectedItemKeys.isEmpty)
     }
 
+    // MARK: - Displayable output: issue-only scans must render (R14/D6)
+
+    @MainActor
+    func testIssueOnlyScanOutputIsDisplayable() throws {
+        let runtime = try makeRuntime([])
+        let viewModel = CacheoutViewModel(runtime: runtime)
+        XCTAssertFalse(viewModel.hasDisplayableScanOutput,
+                       "nothing scanned yet — the empty state may show")
+
+        // Zero items, one classified issue: the results list must mount so
+        // the denied root renders — never the empty state.
+        seed(viewModel, scanner: "nmx", items: [], errors: [
+            ScanIssue(url: base.appendingPathComponent("Documents"),
+                      kind: .permissionDenied, detail: "denied"),
+        ])
+        XCTAssertFalse(viewModel.hasResults, "no items anywhere")
+        XCTAssertTrue(viewModel.hasDisplayableScanOutput,
+                      "an issue-only scan is displayable output (R14/D6)")
+    }
+
+    @MainActor
+    func testFirstEventMalformedWithNoPriorItemsIsDisplayable() async throws {
+        // A scanner whose FIRST outcome is malformed has no prior items to
+        // retain — the fail-closed refusal must still be visible.
+        let foreign = ScanOutcome(
+            items: [perItem(scanner: "other", id: "f1")], errors: []
+        )
+        let runtime = try makeRuntime([
+            FixtureScanner(id: "mal") { foreign }
+        ])
+        let viewModel = CacheoutViewModel(runtime: runtime)
+
+        await viewModel.scan(trigger: .automatic)
+
+        XCTAssertFalse(viewModel.hasResults)
+        XCTAssertNotNil(viewModel.malformedIssuesByScannerID["mal"])
+        XCTAssertTrue(viewModel.hasDisplayableScanOutput,
+                      "a fail-closed refusal is only fail-closed if it is visible")
+    }
+
+    // MARK: - Quick Clean gate reads the policy (b) surface
+
+    @MainActor
+    func testAutomaticCleanableSizeFollowsPolicyBAcrossScanners() throws {
+        let runtime = try makeRuntime([])
+        let viewModel = CacheoutViewModel(runtime: runtime)
+
+        // Recoverable bytes exist (review-risk category + ineligible safe
+        // per-item rows), but policy (b) would select NOTHING — the Quick
+        // Clean gate must read as "nothing to clean".
+        seed(viewModel, scanner: CategoryScanner.registeredID, items: [
+            aggregate(slug: "review_cat", state: .measured, exact: 4096,
+                      items: 1, risk: .review, defaultSelected: false),
+        ])
+        seed(viewModel, scanner: "nmx", items: [
+            perItem(scanner: "nmx", id: "safe_ineligible", risk: .safe,
+                    automaticCleanEligible: false),
+        ])
+        XCTAssertGreaterThan(viewModel.totalRecoverable, 0)
+        XCTAssertEqual(viewModel.automaticCleanableSize, 0)
+        XCTAssertFalse(viewModel.hasAutomaticCleanableItems,
+                       "bytes policy (b) will not touch must not light Quick Clean")
+
+        // A safe ELIGIBLE item on a NON-category scanner keeps Quick Clean
+        // live even with zero category bytes — the auto path is
+        // registry-wide, not category-scoped.
+        seed(viewModel, scanner: CategoryScanner.registeredID, items: [])
+        seed(viewModel, scanner: "eligible", items: [
+            perItem(scanner: "eligible", id: "safe_ok", bytes: 2048,
+                    risk: .safe, automaticCleanEligible: true),
+        ])
+        XCTAssertEqual(viewModel.totalRecoverable, 0, "no category bytes")
+        XCTAssertEqual(viewModel.automaticCleanableSize, 2048)
+        XCTAssertTrue(viewModel.hasAutomaticCleanableItems)
+    }
+
     // MARK: - Totals: three FROZEN scopes through the one shared helper
 
     @MainActor

@@ -95,8 +95,10 @@ struct ContentView: View {
                     .padding(.horizontal)
             }
 
-            // Results list
-            if viewModel.hasResults {
+            // Results list — gated on DISPLAYABLE output, not just items:
+            // an issue-only scan (denied roots, malformed outcome) must
+            // render its warnings, never the empty state (R14/D6).
+            if viewModel.hasDisplayableScanOutput {
                 resultsList
             } else if !viewModel.isAnyScanInProgress {
                 emptyState

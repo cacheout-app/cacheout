@@ -228,6 +228,17 @@ class CacheoutViewModel: ObservableObject {
         outcomesByScannerID.values.contains { !$0.items.isEmpty }
     }
 
+    /// What the results list gates on: items OR classified issues OR a
+    /// malformed-outcome surface. An issue-only scan (every root denied,
+    /// zero items) and a first-event malformed scanner both MUST render —
+    /// a denied search root is information, never an empty state (R14/D6),
+    /// and a fail-closed refusal is only fail-closed if it is visible.
+    var hasDisplayableScanOutput: Bool {
+        hasResults
+            || outcomesByScannerID.values.contains { !$0.errors.isEmpty }
+            || !malformedIssuesByScannerID.isEmpty
+    }
+
     var hasSelection: Bool { !selectedItemKeys.isEmpty }
 
     // MARK: - Derived rows (views render these, logic stays testable here)
@@ -383,6 +394,23 @@ class CacheoutViewModel: ObservableObject {
     var hasCautionSelection: Bool {
         selectedItems.contains { $0.risk == .caution }
     }
+
+    /// Bytes Quick Clean would actually act on — the SAME policy (b)
+    /// predicate `selectAllSafe` applies, across every scanner, through the
+    /// one shared helper. The menubar's Quick Clean gate reads THIS, not
+    /// `totalRecoverable`: that total is category-scoped by frozen contract,
+    /// while the auto path is registry-wide — a safe eligible item on a
+    /// future per-item scanner must keep Quick Clean live even when category
+    /// bytes are zero (and bytes that policy (b) will not touch must not
+    /// light the button).
+    var automaticCleanableSize: Int64 {
+        aggregateBytes(
+            scannerScope: { _ in true },
+            include: Self.safeAutoSelectable
+        )
+    }
+
+    var hasAutomaticCleanableItems: Bool { automaticCleanableSize > 0 }
 
     // MARK: - Scanning
 

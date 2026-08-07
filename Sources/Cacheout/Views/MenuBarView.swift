@@ -278,9 +278,12 @@ struct MenuBarView: View {
             .buttonStyle(.borderedProminent)
             .tint(Color(red: 0.85, green: 0.45, blue: 0.1)) // burnt orange — readable white text
             // Disabled while ANY scan phase runs (R11): cleaning against a
-            // half-built result set would act on stale selections.
-            .disabled(viewModel.totalRecoverable == 0 || viewModel.isCleaning || viewModel.isAnyScanInProgress)
-            .help(viewModel.isCleaning ? "Cleanup in progress" : (viewModel.isAnyScanInProgress ? "Scan in progress" : (viewModel.totalRecoverable == 0 ? "Nothing to clean" : "Quick clean recoverable items")))
+            // half-built result set would act on stale selections. The
+            // "nothing to clean" gate reads the policy (b) surface — the
+            // exact set Quick Clean acts on — not the category-scoped
+            // recoverable total (fn-2.4).
+            .disabled(!viewModel.hasAutomaticCleanableItems || viewModel.isCleaning || viewModel.isAnyScanInProgress)
+            .help(viewModel.isCleaning ? "Cleanup in progress" : (viewModel.isAnyScanInProgress ? "Scan in progress" : (!viewModel.hasAutomaticCleanableItems ? "Nothing to clean" : "Quick clean recoverable items")))
 
             // Open main window
             Button {

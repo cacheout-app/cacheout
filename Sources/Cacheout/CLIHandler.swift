@@ -129,7 +129,20 @@ struct CLIHandler {
             await handleClean(slugs: slugs, dryRun: isDryRun, confirmed: isConfirmed)
 
         case .smartClean:
-            let targetGB = extractFloat(from: args, after: cliIndex + 1) ?? 5.0
+            // An ABSENT target defaults to 5.0; a PRESENT but malformed one
+            // is a usage error — silently defaulting would let
+            // `smart-clean garbage --confirm` delete 5 GB the caller never
+            // asked for. (Range/finiteness is validated in the handler.)
+            let targetGB: Double
+            if let raw = extractPositionalArg(from: args, after: cliIndex + 1) {
+                guard let parsed = Double(raw) else {
+                    exitWithError(code: "INVALID_ARGUMENTS",
+                                  message: "smart-clean target must be a number of GB, got: \(raw)")
+                }
+                targetGB = parsed
+            } else {
+                targetGB = 5.0
+            }
             await handleSmartClean(targetGB: targetGB, dryRun: isDryRun, confirmed: isConfirmed)
 
         case .spotlight:
@@ -324,6 +337,23 @@ struct CLIHandler {
         return confirmed ? .proceed : .refuseUnconfirmed
     }
 
+    /// The exit-code decision for a completed destructive run (R5), pure so
+    /// the whole matrix is unit-testable: TOTAL failure — exit 1
+    /// `CLEAN_FAILED` — iff at least one category was attempted, every
+    /// attempt failed, AND nothing was freed. Anything else (all-success,
+    /// nothing attempted, mixed flags, or bytes freed despite every flag
+    /// failing) is exit 0 with per-item `success` flags. Derived from the
+    /// per-category flags plus the freed components — never from
+    /// `entries.isEmpty`, which zero-byte successes also produce.
+    static func cleanRunIsTotalFailure(
+        successFlags: [Bool], freedExact: Int64, freedEstimated: Int64
+    ) -> Bool {
+        !successFlags.isEmpty
+            && successFlags.allSatisfy { !$0 }
+            && freedExact == 0
+            && freedEstimated == 0
+    }
+
     private static let rootRefusalMessage = "clean and smart-clean refuse to run as root (euid 0): "
         + "cache categories resolve against a user home, and deletion with root "
         + "privileges would bypass every filesystem permission backstop. Re-run as the login user."
@@ -513,10 +543,11 @@ struct CLIHandler {
             // errored and nothing was freed — exits 1 CLEAN_FAILED with an
             // empty stdout. Partial success stays exit 0 with per-item
             // `success` flags.
-            let anyProgress = report.totalFreedExact + report.totalEstimatedUpTo > 0
-            let allFailed = !results.isEmpty
-                && results.allSatisfy { ($0["success"] as? Bool) == false }
-            if allFailed && !anyProgress {
+            if cleanRunIsTotalFailure(
+                successFlags: results.map { ($0["success"] as? Bool) ?? false },
+                freedExact: report.totalFreedExact,
+                freedEstimated: report.totalEstimatedUpTo
+            ) {
                 exitWithError(code: "CLEAN_FAILED",
                               message: "No requested category could be cleaned",
                               details: ["results": results])
@@ -560,6 +591,15 @@ struct CLIHandler {
     /// cleaned, but its estimated bytes never mark `target_met`. Pure (no
     /// I/O, no re-walk) so the loop decision is unit-testable; drives both
     /// the dry-run payload and the `CONFIRMATION_REQUIRED` plan.
+    ///
+    /// The plan must describe EVERYTHING the confirmed run may touch: the
+    /// real loop advances on DELETE-TIME bytes, so when an early category
+    /// shrinks or partially fails, later candidates are cleaned too.
+    /// Candidates past the projected target-met point are therefore listed
+    /// with action `clean_if_needed` — deleted only if earlier categories
+    /// under-deliver — with projected `bytes_freed` 0 and their would-free
+    /// components intact. Projected totals and `target_met` count the
+    /// unconditional entries only.
     static func smartCleanPlan(
         results: [ScanResult], targetBytes: Int64
     ) -> (entries: [[String: Any]], totalExact: Int64, totalEstimated: Int64, targetMet: Bool) {
@@ -567,24 +607,27 @@ struct CLIHandler {
         var estimated: Int64 = 0
         var entries: [[String: Any]] = []
         for result in smartCleanCandidates(results) {
-            if freedExact >= targetBytes { break }
-            freedExact += result.exactBytes
-            estimated += result.estimatedUpToBytes
+            // Plan shape parity with `clean` (PROTOCOL.md details.plan):
+            // every candidate passed the `.measured` filter, so the derived
+            // action is "clean" — derived, not hardcoded, so the two
+            // commands cannot drift — until the projection meets the
+            // target, after which candidates become conditional fallbacks.
+            let isFallback = freedExact >= targetBytes
+            let projectedExact = isFallback ? 0 : result.exactBytes
+            let projectedEstimated = isFallback ? 0 : result.estimatedUpToBytes
+            freedExact += projectedExact
+            estimated += projectedEstimated
             entries.append([
                 "slug": result.category.slug,
                 "name": result.category.name,
-                // Plan shape parity with `clean` (PROTOCOL.md details.plan):
-                // every candidate passed the `.measured` filter, so the
-                // derived action is always "clean" — derived, not hardcoded,
-                // so the two commands cannot drift.
                 "state": result.state.rawValue,
-                "action": cleanPlanAction(for: result),
-                "bytes_freed": result.exactBytes,
+                "action": isFallback ? "clean_if_needed" : cleanPlanAction(for: result),
+                "bytes_freed": projectedExact,
                 "exact_bytes": result.exactBytes,
                 "estimated_up_to_bytes": result.estimatedUpToBytes,
                 "freed_human": CleanupReport.componentPhrase(
-                    exact: result.exactBytes,
-                    estimatedUpTo: result.estimatedUpToBytes
+                    exact: projectedExact,
+                    estimatedUpTo: projectedEstimated
                 ),
             ])
         }
@@ -650,7 +693,6 @@ struct CLIHandler {
             var freedExactSoFar: Int64 = 0
             var estimatedSoFar: Int64 = 0
             var cleaned: [[String: Any]] = []
-            var attempted = 0
 
             for result in smartCleanCandidates(allResults) {
                 // Only exact (delete-time measured, unique-inode) bytes
@@ -664,7 +706,6 @@ struct CLIHandler {
                 let estimated = report.totalEstimatedUpTo
                 freedExactSoFar += exact
                 estimatedSoFar += estimated
-                attempted += 1
 
                 let errs = report.errors.map(\.error)
                 var item: [String: Any] = [
@@ -688,9 +729,11 @@ struct CLIHandler {
             // errored and nothing was freed — exits 1 CLEAN_FAILED. An empty
             // candidate list is a SUCCESS (nothing eligible), and partial
             // failure stays exit 0 with per-item `success` flags.
-            let allFailed = attempted > 0
-                && cleaned.allSatisfy { ($0["success"] as? Bool) == false }
-            if allFailed && freedExactSoFar == 0 && estimatedSoFar == 0 {
+            if cleanRunIsTotalFailure(
+                successFlags: cleaned.map { ($0["success"] as? Bool) ?? false },
+                freedExact: freedExactSoFar,
+                freedEstimated: estimatedSoFar
+            ) {
                 exitWithError(code: "CLEAN_FAILED",
                               message: "No eligible category could be cleaned",
                               details: ["cleaned": cleaned, "target_gb": targetGB])
@@ -769,7 +812,10 @@ struct CLIHandler {
                     continue
                 }
 
-                // 1. Write Finder comment via xattr
+                // 1. Write Finder comment via xattr — outcome captured, not
+                // swallowed: a root is only reported "tagged" when at least
+                // one discovery mechanism actually landed.
+                var xattrWritten = false
                 let comment = "cacheout-managed: \(result.category.slug)"
                 let commentData = try? PropertyListSerialization.data(
                     fromPropertyList: comment, format: .binary, options: 0
@@ -778,8 +824,10 @@ struct CLIHandler {
                     data.withUnsafeBytes { bytes in
                         url.withUnsafeFileSystemRepresentation { path in
                             guard let path = path else { return }
-                            setxattr(path, "com.apple.metadata:kMDItemFinderComment",
-                                     bytes.baseAddress, data.count, 0, 0)
+                            xattrWritten = setxattr(
+                                path, "com.apple.metadata:kMDItemFinderComment",
+                                bytes.baseAddress, data.count, 0, 0
+                            ) == 0
                         }
                     }
                 }
@@ -793,12 +841,26 @@ struct CLIHandler {
                     size: \(result.formattedSize)
                     tagged: \(ISO8601DateFormatter.shared.string(from: Date()))
                     """
-                try? markerContent.write(to: marker, atomically: true, encoding: .utf8)
+                let markerWritten = (try? markerContent.write(
+                    to: marker, atomically: true, encoding: .utf8
+                )) != nil
+
+                guard xattrWritten || markerWritten else {
+                    refused.append([
+                        "slug": result.category.slug,
+                        "path": url.path,
+                        "reason": "metadata writes failed: neither the Finder-comment "
+                            + "xattr nor the .cacheout-managed marker could be written",
+                    ])
+                    continue
+                }
 
                 tagged.append([
                     "slug": result.category.slug,
                     "path": url.path,
                     "size": result.formattedSize,
+                    "xattr_written": xattrWritten,
+                    "marker_written": markerWritten,
                 ])
             }
         }
@@ -1297,12 +1359,6 @@ struct CLIHandler {
             i += 1
         }
         return slugs
-    }
-
-    private static func extractFloat(from args: [String], after index: Int) -> Double? {
-        let nextIndex = index + 1
-        guard nextIndex < args.count else { return nil }
-        return Double(args[nextIndex])
     }
 
     /// Parse `--top N` flag from args after the command position.

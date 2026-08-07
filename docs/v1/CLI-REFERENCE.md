@@ -235,13 +235,17 @@ Cacheout --cli smart-clean 10.0 --dry-run
 3. Sorts by risk level (Safe first), then by size descending
 4. Cleans categories until target bytes are freed or all eligible categories
    are exhausted — only EXACT bytes advance the target; estimated
-   (hardlinked/command) bytes never mark `target_met`
+   (hardlinked/command) bytes never mark `target_met`. Because the real loop
+   advances on delete-time bytes, plan/dry-run output lists every eligible
+   candidate: entries past the projected target-met point carry
+   `action: "clean_if_needed"` (cleaned only if earlier categories
+   under-deliver) with projected `bytes_freed` 0
 
 **Options:**
 
 | Argument | Description | Default |
 |----------|-------------|---------|
-| `<targetGB>` | Amount of space to free in GB — must be finite, non-negative, and at most 10^9 (`nan`/`inf` refused with `INVALID_ARGUMENTS`) | `5.0` |
+| `<targetGB>` | Amount of space to free in GB — must be numeric, finite, non-negative, and at most 10^9; a present but malformed value is refused with `INVALID_ARGUMENTS`, never silently defaulted | `5.0` (when absent) |
 | `--confirm` | Actually delete | Off (refuses) |
 | `--dry-run` | Preview without deleting (uses scan-time exact components, no re-walk) | Off |
 
@@ -287,14 +291,20 @@ Cacheout --cli spotlight
 3. Writes a `.cacheout-managed` marker file inside each admitted cache
    directory
 
+Write outcomes are captured per directory (`xattr_written` /
+`marker_written`); a root where BOTH writes fail is reported in `refused`
+(`metadata writes failed: ...`), never claimed as tagged.
+
 **Output:**
 ```json
 {
   "directories": [
     {
+      "marker_written": true,
       "path": "/Users/you/Library/Developer/Xcode/DerivedData",
       "size": "5 GB",
-      "slug": "xcode_derived_data"
+      "slug": "xcode_derived_data",
+      "xattr_written": true
     }
   ],
   "marker_hint": "mdfind -name .cacheout-managed",

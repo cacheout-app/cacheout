@@ -285,7 +285,7 @@ final class CLIGateTests: XCTestCase {
         XCTAssertEqual(plan.entries[0]["action"] as? String, "clean")
     }
 
-    func testSmartCleanPlanStopsOnceExactTargetMet() {
+    func testSmartCleanPlanMarksPostTargetCandidatesAsConditionalFallbacks() {
         // Same risk tier — ordering is by compatibility size descending:
         // links (10 GB estimated), exact6 (6 GB exact), small (4 KB).
         let hardlinkHeavy = makeResult(
@@ -305,11 +305,58 @@ final class CLIGateTests: XCTestCase {
         )
 
         XCTAssertTrue(plan.targetMet)
-        XCTAssertEqual(plan.totalExact, 6 * gb)
+        XCTAssertEqual(plan.totalExact, 6 * gb,
+                       "projected totals count the unconditional entries only")
         XCTAssertEqual(
-            plan.entries.map { $0["slug"] as? String }, ["links", "exact6"],
-            "the loop stops once EXACT bytes meet the target — 'small' is never touched"
+            plan.entries.map { $0["slug"] as? String }, ["links", "exact6", "small"],
+            "every eligible candidate is DISCLOSED — the real loop advances on "
+            + "delete-time bytes and may reach 'small' if an earlier category under-delivers"
         )
+        XCTAssertEqual(
+            plan.entries.map { $0["action"] as? String },
+            ["clean", "clean", "clean_if_needed"],
+            "candidates past the projected target-met point are conditional fallbacks"
+        )
+        // The fallback projects zero freed bytes but keeps its would-free
+        // components intact.
+        XCTAssertEqual(plan.entries[2]["bytes_freed"] as? Int64, 0)
+        XCTAssertEqual(plan.entries[2]["exact_bytes"] as? Int64, 4096)
+    }
+
+    // MARK: - Exit decision: total vs partial failure (R5)
+
+    func testCleanTotalFailureExitDecisionMatrix() {
+        // No-op run (nothing requested/attempted) is a success.
+        XCTAssertFalse(CLIHandler.cleanRunIsTotalFailure(
+            successFlags: [], freedExact: 0, freedEstimated: 0
+        ))
+        // All succeeded.
+        XCTAssertFalse(CLIHandler.cleanRunIsTotalFailure(
+            successFlags: [true, true], freedExact: 4096, freedEstimated: 0
+        ))
+        // Zero-byte success (vacuous rows) is still a success.
+        XCTAssertFalse(CLIHandler.cleanRunIsTotalFailure(
+            successFlags: [true], freedExact: 0, freedEstimated: 0
+        ))
+        // PARTIAL: one failed beside one success — exit 0 with flags.
+        XCTAssertFalse(CLIHandler.cleanRunIsTotalFailure(
+            successFlags: [false, true], freedExact: 0, freedEstimated: 0
+        ))
+        // PARTIAL: every flag failed but bytes were freed (a category can
+        // carry an entry AND errors) — exit 0.
+        XCTAssertFalse(CLIHandler.cleanRunIsTotalFailure(
+            successFlags: [false, false], freedExact: 4096, freedEstimated: 0
+        ))
+        XCTAssertFalse(CLIHandler.cleanRunIsTotalFailure(
+            successFlags: [false, false], freedExact: 0, freedEstimated: 4096
+        ))
+        // TOTAL: everything failed, nothing freed — exit 1 CLEAN_FAILED.
+        XCTAssertTrue(CLIHandler.cleanRunIsTotalFailure(
+            successFlags: [false], freedExact: 0, freedEstimated: 0
+        ))
+        XCTAssertTrue(CLIHandler.cleanRunIsTotalFailure(
+            successFlags: [false, false], freedExact: 0, freedEstimated: 0
+        ))
     }
 
     // MARK: - Spotlight admission gate
@@ -340,6 +387,8 @@ final class CLIGateTests: XCTestCase {
         XCTAssertEqual(payload["tagged_count"] as? Int, 1)
         let tagged = try XCTUnwrap(payload["directories"] as? [[String: Any]])
         XCTAssertEqual(tagged.map { $0["slug"] as? String }, ["cache-a"])
+        XCTAssertEqual(tagged[0]["marker_written"] as? Bool, true,
+                       "write outcomes are captured, never assumed")
         XCTAssertTrue(
             fm.fileExists(atPath: cacheRoot.appendingPathComponent(".cacheout-managed").path),
             "the admitted root IS tagged"
@@ -380,6 +429,34 @@ final class CLIGateTests: XCTestCase {
         XCTAssertFalse(
             fm.fileExists(atPath: deniedRoot.appendingPathComponent(".cacheout-managed").path),
             "a .denied root gets NO writes — `exists` alone would have let it through"
+        )
+    }
+
+    func testSpotlightReportsRootWhereNoMetadataWriteLanded() throws {
+        try XCTSkipIf(geteuid() == 0, "root ignores permission bits")
+        // Read-only root: admission succeeds, but neither the xattr nor the
+        // marker can be written — the payload must not claim it was tagged.
+        let readOnlyRoot = base.appendingPathComponent("readonly-cache")
+        try fm.createDirectory(at: readOnlyRoot, withIntermediateDirectories: true)
+        try fm.setAttributes([.posixPermissions: 0o555], ofItemAtPath: readOnlyRoot.path)
+        defer {
+            try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: readOnlyRoot.path)
+        }
+        let result = makeResult(
+            state: .measured,
+            category: makeCategory(name: "readonly-cat", path: readOnlyRoot.path),
+            exact: 4096, items: 1
+        )
+
+        let payload = CLIHandler.spotlightPayload(for: [result], home: fixtureHome)
+
+        XCTAssertEqual(payload["tagged_count"] as? Int, 0,
+                       "a root where no metadata write landed is not 'tagged'")
+        let refused = try XCTUnwrap(payload["refused"] as? [[String: Any]])
+        XCTAssertEqual(refused.count, 1)
+        XCTAssertTrue(
+            try XCTUnwrap(refused[0]["reason"] as? String).contains("metadata writes failed"),
+            "the failure is reported, not swallowed"
         )
     }
 }
@@ -497,8 +574,9 @@ final class CLIGateFramingTests: XCTestCase {
         for entry in plan {
             XCTAssertNotNil(entry["state"],
                             "smart-clean plan entries share the clean plan shape (PROTOCOL.md)")
-            XCTAssertEqual(entry["action"] as? String, "clean",
-                           "every smart-clean candidate is a cleanly-measured category")
+            let action = entry["action"] as? String
+            XCTAssertTrue(action == "clean" || action == "clean_if_needed",
+                          "smart-clean plan actions are clean/clean_if_needed, got: \(action ?? "nil")")
         }
         XCTAssertNotNil(details["target_gb"])
     }
@@ -525,5 +603,20 @@ final class CLIGateFramingTests: XCTestCase {
         let envelope = try parseErrorEnvelope(run.stderr)
         let error = try XCTUnwrap(envelope["error"] as? [String: Any])
         XCTAssertEqual(error["code"] as? String, "INVALID_ARGUMENTS")
+    }
+
+    func testSmartCleanRejectsMalformedTarget() throws {
+        // A PRESENT but non-numeric target must never silently default to
+        // 5.0 — that would let `smart-clean garbage --confirm` delete 5 GB
+        // the caller never asked for. (Still read-only here: the parse
+        // error exits before any scan.)
+        let run = try runCLI(["--cli", "smart-clean", "garbage"])
+
+        XCTAssertEqual(run.exitCode, 1)
+        XCTAssertEqual(run.stdout, "")
+        let envelope = try parseErrorEnvelope(run.stderr)
+        let error = try XCTUnwrap(envelope["error"] as? [String: Any])
+        XCTAssertEqual(error["code"] as? String, "INVALID_ARGUMENTS")
+        XCTAssertTrue(((error["message"] as? String) ?? "").contains("garbage"))
     }
 }

@@ -243,7 +243,7 @@ under `details`:
 | `command` | string | `"clean"` or `"smart-clean"` |
 | `plan` | object[] | One entry per requested slug (scan-time components — no re-walk) |
 | `plan[].state` | string | The scan state (see `scan`) |
-| `plan[].action` | string | What the confirmed run would do: `"clean"`, `"clean_with_warning"` (`partiallyDenied` — measured bytes only), `"refuse"` (`denied`), or `"skip"` (missing/empty) |
+| `plan[].action` | string | What the confirmed run would do: `"clean"`, `"clean_with_warning"` (`partiallyDenied` — measured bytes only), `"refuse"` (`denied`), or `"skip"` (missing/empty). Smart-clean plans additionally use `"clean_if_needed"` for eligible fallback candidates past the projected target-met point — deleted only if earlier categories free fewer delete-time bytes than their scan-time exact components |
 | `plan[].exact_bytes` | integer | Scan-time exact component |
 | `plan[].estimated_up_to_bytes` | integer | Scan-time estimated component |
 | `plan[].warning` | string | Present for `partiallyDenied` entries |
@@ -351,9 +351,11 @@ as `clean` (the `CONFIRMATION_REQUIRED` details carry `"command":
 "smart-clean"`, `target_gb`, the `plan`, and the projected `target_met`).
 
 **Arguments:**
-- `<gb>` -- Target gigabytes to free (floating point; default 5.0). Must be
-  finite, non-negative, and at most 10^9 — anything else (including `nan`
-  and `inf`) is refused with `INVALID_ARGUMENTS` before any scan or gate
+- `<gb>` -- Target gigabytes to free (floating point). ABSENT defaults to
+  5.0; a PRESENT but non-numeric value is refused with `INVALID_ARGUMENTS`
+  (never silently defaulted). Must be finite, non-negative, and at most
+  10^9 — anything else (including `nan` and `inf`) is refused with
+  `INVALID_ARGUMENTS` before any scan or gate
 - `--confirm` -- Actually delete
 - `--dry-run` -- Preview without deleting (needs no `--confirm`)
 
@@ -367,6 +369,14 @@ tier.
 delete-time measured unique-inode bytes on a real run, scan-time exact
 components on a dry run (no re-walk). A hardlink-heavy category may be
 cleaned, but its `estimated_up_to_bytes` never mark the target met.
+
+**Fallback disclosure (schema 3):** because the real loop advances on
+DELETE-TIME bytes, an early category that shrinks or partially fails causes
+later candidates to be cleaned too. The plan and dry-run output therefore
+list EVERY eligible candidate: entries past the projected target-met point
+carry `action: "clean_if_needed"` with projected `bytes_freed` 0 and their
+would-free components intact. Projected totals and `target_met` count the
+unconditional (`"clean"`) entries only.
 
 **Output schema:**
 
@@ -404,7 +414,7 @@ cleaned, but its `estimated_up_to_bytes` never mark the target met.
 | `cleaned[].slug` | string | yes | Category slug |
 | `cleaned[].name` | string | yes | Category name |
 | `cleaned[].state` | string | dry run only | Scan state (plan shape — always `"measured"`, candidates are filtered to it) |
-| `cleaned[].action` | string | dry run only | Plan action (always `"clean"` for eligible candidates) |
+| `cleaned[].action` | string | dry run only | Plan action: `"clean"`, or `"clean_if_needed"` for fallback candidates past the projected target-met point |
 | `cleaned[].bytes_freed` | integer | yes | Exact bytes freed (== `exact_bytes`) |
 | `cleaned[].exact_bytes` | integer | yes | Exact component |
 | `cleaned[].estimated_up_to_bytes` | integer | yes | Estimated component |
@@ -435,7 +445,9 @@ never written to; refusals are reported in the additive `refused` array.
     {
       "slug": "xcode_derived_data",
       "path": "/Users/user/Library/Developer/Xcode/DerivedData",
-      "size": "15 GB"
+      "size": "15 GB",
+      "xattr_written": true,
+      "marker_written": true
     }
   ],
   "refused_count": 1,
@@ -453,16 +465,18 @@ never written to; refusals are reported in the additive `refused` array.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `tagged_count` | integer | yes | Number of directories tagged |
+| `tagged_count` | integer | yes | Number of directories tagged (at least one metadata write landed) |
 | `directories` | object[] | yes | List of tagged directories |
 | `directories[].slug` | string | yes | Category slug |
 | `directories[].path` | string | yes | Absolute filesystem path |
 | `directories[].size` | string | yes | Human-readable size |
+| `directories[].xattr_written` | boolean | yes | Whether the Finder-comment xattr write succeeded (schema 3) |
+| `directories[].marker_written` | boolean | yes | Whether the `.cacheout-managed` marker write succeeded (schema 3) |
 | `refused_count` | integer | yes | Number of roots refused (schema 3) |
-| `refused` | object[] | yes | Roots skipped without any write: guard refusals and scan-denied roots (schema 3) |
+| `refused` | object[] | yes | Roots that got no effective write: guard refusals, scan-denied roots, and roots where BOTH metadata writes failed (schema 3) |
 | `refused[].slug` | string | yes | Category slug |
 | `refused[].path` | string | yes | Refused root path |
-| `refused[].reason` | string | yes | Why — a guard refusal message or `scan denied (<kind>): <message>` |
+| `refused[].reason` | string | yes | Why — a guard refusal message, `scan denied (<kind>): <message>`, or `metadata writes failed: ...` |
 | `query_hint` | string | yes | Example mdfind query for xattr-based discovery |
 | `marker_hint` | string | yes | Example mdfind query for marker-file discovery |
 

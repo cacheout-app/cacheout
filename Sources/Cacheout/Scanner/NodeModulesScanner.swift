@@ -595,11 +595,17 @@ extension NodeModulesScanner: SpaceScanner {
 
     /// The display spelling the section row renders today: the project path,
     /// home-shortened to `~` (anchored to the scanner's injected home so
-    /// hermetic fixtures behave like the real account home).
+    /// hermetic fixtures behave like the real account home). Shortening
+    /// requires a PATH-COMPONENT boundary — a sibling that merely
+    /// string-prefixes the home path (`/Users/d-other` vs `/Users/d`) must
+    /// never render as `~-other/…`, least of all beside a destructive
+    /// `.removeItem` action (review r1).
     private static func displayPath(of url: URL, home: URL) -> String {
         let path = url.path
         let homePath = home.path
-        guard path.hasPrefix(homePath) else { return path }
-        return "~" + path.dropFirst(homePath.count)
+        if path == homePath { return "~" }
+        let prefix = homePath.hasSuffix("/") ? homePath : homePath + "/"
+        guard path.hasPrefix(prefix) else { return path }
+        return "~/" + path.dropFirst(prefix.count)
     }
 }

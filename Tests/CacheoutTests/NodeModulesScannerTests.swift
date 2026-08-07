@@ -647,6 +647,43 @@ final class NodeModulesScannerTests: XCTestCase {
                        "display url is the RESOLVED spelling")
     }
 
+    func testDisplayPathShorteningRequiresComponentBoundary() async throws {
+        // A sibling that merely string-prefixes the home path must NOT
+        // shorten (/Users/d-other beside /Users/d — review r1): the full
+        // path renders, never "~-sibling/…".
+        let sibling = base.appendingPathComponent("home-sibling")
+        let dep = sibling.appendingPathComponent("proj/node_modules/dep")
+        try mkdir(dep)
+        try writeFile(dep.appendingPathComponent("index.js"))
+
+        let outside = await protocolScan(
+            NodeModulesScanner(home: fixtureHome, searchRoots: [sibling])
+        )
+        let outsideItem = try XCTUnwrap(outside.items.first)
+        XCTAssertFalse(outsideItem.declaredDisplayPath.hasPrefix("~"),
+                       "no boundary, no shortening: "
+                        + outsideItem.declaredDisplayPath)
+        XCTAssertTrue(
+            outsideItem.declaredDisplayPath.hasSuffix("home-sibling/proj"),
+            outsideItem.declaredDisplayPath
+        )
+
+        // A genuine descendant of home shortens at the component boundary.
+        // Home is injected in its canonical spelling because Foundation
+        // lists descendants canonically (/private-resolved).
+        let canonicalHome = FileSystemIdentityProvider().canonicalize(fixtureHome)
+        let code = canonicalHome.appendingPathComponent("Code")
+        let dep2 = code.appendingPathComponent("proj2/node_modules/dep")
+        try mkdir(dep2)
+        try writeFile(dep2.appendingPathComponent("index.js"))
+
+        let inside = await protocolScan(
+            NodeModulesScanner(home: canonicalHome, searchRoots: [code])
+        )
+        let insideItem = try XCTUnwrap(inside.items.first)
+        XCTAssertEqual(insideItem.declaredDisplayPath, "~/Code/proj2")
+    }
+
     func testRootScanRecordMappingAcrossAllFourCandidateStates() async throws {
         try XCTSkipIf(geteuid() == 0, "root ignores permission bits")
         // empty

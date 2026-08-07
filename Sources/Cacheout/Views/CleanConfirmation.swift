@@ -6,15 +6,22 @@
 /// - Total size and item count to be cleaned
 /// - The D8 overcount caveat (fn-1.4, R8): APFS clones and cross-category
 ///   hardlinks mean the total is a ceiling, not a promise
-/// - Itemized list of selected categories and node_modules with individual sizes
+/// - ONE unified itemization (fn-2.5): every selected item — category
+///   aggregates and per-item scanner rows alike — through a single
+///   `ConfirmationRowModel` ForEach, each row rendering its `evidence`
+///   string (epic contract: evidence is first-class in this sheet)
 /// - Move-to-Trash toggle (recoverable vs. permanent deletion)
 /// - Warning banner when "Caution" risk-level items are selected
+/// - The `.commands` disclosure (fn-2.5/P2): when command-backed items are
+///   selected, `viewModel.commandsTrashDisclosure` names EXACTLY those
+///   items — their cleanup commands run regardless of the toggle and place
+///   nothing in the Trash
 /// - Warning banner when a `.partiallyDenied` category is selected (R18):
 ///   unreadable contents — measured bytes only
 /// - Cancel and Confirm buttons (confirm triggers cleanup and dismisses)
 ///
-/// The sheet is limited to 200px height for the item list to prevent overflow
-/// on machines with many selected categories.
+/// The item list scrolls inside a 200px cap to prevent overflow on machines
+/// with many selected items.
 ///
 /// ## CleanupReportSheet
 ///
@@ -22,10 +29,15 @@
 /// Success is claimed only when something actually succeeded: the icon and
 /// heading derive from `report.entries`/`report.errors`, and the amount line
 /// is `report.headline` — disposal-aware and component-derived ("Freed X",
-/// "+ up to Y more", "up to Z"). Per-entry rows render
-/// `Entry.componentSummary`, never a single laundered total, and carry
-/// `report.rowAnnotation(for:)` when a Trash-mode run contains a
-/// command-erased entry whose bytes are NOT in the Trash (P2).
+/// "+ up to Y more", "up to Z"). Entries render grouped per scanner
+/// (fn-2.5): `report.scannerSections` pairs each scanner's rollup header
+/// with its entry rows. Rows render `Entry.componentSummary`, never a single
+/// laundered total, and carry `report.rowAnnotation(for:)` when a Trash-mode
+/// run contains a command-erased entry whose bytes are NOT in the Trash
+/// (P2). Failed items render from the SELF-CONTAINED
+/// `CleanupReport.ItemError` records alone (`report.errorLines`) — a failed
+/// item may no longer exist in any post-clean rescan, so nothing is ever
+/// looked up.
 
 import SwiftUI
 
@@ -53,36 +65,34 @@ struct CleanConfirmationSheet: View {
                 .foregroundStyle(.tertiary)
                 .multilineTextAlignment(.center)
 
-            VStack(alignment: .leading, spacing: 4) {
-                // Category aggregates keep their category icon; identity by
-                // composite ItemKey (fn-2.4).
-                ForEach(viewModel.selectedCategoryRows) { row in
-                    HStack {
-                        Image(systemName: row.result.category.icon)
-                            .frame(width: 20)
-                        Text(row.result.category.name)
-                        Spacer()
-                        Text(row.result.formattedSize)
-                            .foregroundStyle(.secondary)
+            // ONE unified itemization (fn-2.5): aggregates and per-item
+            // scanner rows through the same ForEach, identity by composite
+            // ItemKey, each row carrying its evidence string.
+            ScrollView {
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach(viewModel.confirmationRows) { row in
+                        VStack(alignment: .leading, spacing: 1) {
+                            HStack {
+                                Image(systemName: row.icon)
+                                    .frame(width: 20)
+                                Text(row.label)
+                                Spacer()
+                                Text(row.formattedSize)
+                                    .foregroundStyle(.secondary)
+                            }
+                            // Evidence is first-class in the sheet (epic
+                            // contract) — the "why is this safe to remove"
+                            // line the follow-on scanner epics rest on.
+                            Text(row.evidence)
+                                .font(.caption2)
+                                .foregroundStyle(.tertiary)
+                                .padding(.leading, 24)
+                        }
+                        .font(.caption)
+                        .accessibilityElement(children: .combine)
                     }
-                    .font(.caption)
-                    .accessibilityElement(children: .combine)
                 }
-
-                // Per-item scanner rows, "scanner: item" labelled (renders
-                // "node_modules: <project>" exactly as before).
-                ForEach(viewModel.selectedItems.filter { $0.scannerID != CategoryScanner.registeredID }, id: \.key) { item in
-                    HStack {
-                        Image(systemName: "shippingbox.fill")
-                            .frame(width: 20)
-                        Text("\(item.scannerID): \(item.displayName)")
-                        Spacer()
-                        Text(ByteCountFormatter.sharedFile.string(fromByteCount: item.allocatedBytes))
-                            .foregroundStyle(.secondary)
-                    }
-                    .font(.caption)
-                    .accessibilityElement(children: .combine)
-                }
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
             .padding()
             .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
@@ -97,11 +107,15 @@ struct CleanConfirmationSheet: View {
                     .foregroundStyle(.orange)
             }
 
-            // P2: command-backed categories execute regardless of the
-            // Move-to-Trash toggle — with Trash mode on, the sheet must not
-            // let the user believe those items will be recoverable.
-            if viewModel.moveToTrash && viewModel.hasCommandBackedSelection {
-                Label("Some selected items clean via commands and are always erased permanently — they will not appear in the Trash", systemImage: "exclamationmark.triangle.fill")
+            // P2 + fn-2.5: command-backed items execute their cleanup
+            // commands regardless of the Move-to-Trash toggle. The
+            // disclosure names EXACTLY those items (never their deletion-
+            // cleaned neighbors) and renders whenever any are selected —
+            // strictly more disclosure than fn-1.4's Trash-mode-only
+            // banner, and it informs the toggle decision either way. The
+            // toggle itself stays.
+            if let disclosure = viewModel.commandsTrashDisclosure {
+                Label(disclosure, systemImage: "exclamationmark.triangle.fill")
                     .font(.caption)
                     .foregroundStyle(.orange)
             }
@@ -160,25 +174,44 @@ struct CleanupReportSheet: View {
                 .multilineTextAlignment(.center)
 
             if !report.entries.isEmpty {
-                VStack(alignment: .leading, spacing: 4) {
-                    ForEach(report.entries, id: \.key) { entry in
-                        VStack(alignment: .leading, spacing: 1) {
+                // Per-scanner rollup rendering (fn-2.5): one section per
+                // scanner in first-appearance order — a rollup header (pure
+                // sums, same R16 component phrase as the rows) above that
+                // scanner's entry rows.
+                VStack(alignment: .leading, spacing: 8) {
+                    ForEach(report.scannerSections, id: \.scannerID) { section in
+                        VStack(alignment: .leading, spacing: 2) {
                             HStack {
-                                Text(entry.displayName)
+                                Text(section.scannerID)
+                                    .font(.caption.bold())
                                 Spacer()
-                                Text(entry.componentSummary)
+                                Text(section.rollup.componentSummary)
+                                    .font(.caption.bold())
                                     .foregroundStyle(.secondary)
                             }
-                            // P2 honesty marker: in a Trash run, a
-                            // command-erased entry put nothing in the Trash.
-                            if let note = report.rowAnnotation(for: entry) {
-                                Text(note)
-                                    .font(.caption2)
-                                    .foregroundStyle(.orange)
+                            .accessibilityElement(children: .combine)
+
+                            ForEach(section.entries, id: \.key) { entry in
+                                VStack(alignment: .leading, spacing: 1) {
+                                    HStack {
+                                        Text(entry.displayName)
+                                        Spacer()
+                                        Text(entry.componentSummary)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    // P2 honesty marker: in a Trash run, a
+                                    // command-erased entry put nothing in
+                                    // the Trash.
+                                    if let note = report.rowAnnotation(for: entry) {
+                                        Text(note)
+                                            .font(.caption2)
+                                            .foregroundStyle(.orange)
+                                    }
+                                }
+                                .font(.caption)
+                                .accessibilityElement(children: .combine)
                             }
                         }
-                        .font(.caption)
-                        .accessibilityElement(children: .combine)
                     }
                 }
                 .padding()
@@ -191,10 +224,12 @@ struct CleanupReportSheet: View {
                         .font(.caption.bold())
                         .foregroundStyle(.red)
                     // Self-contained `ItemError` records (fn-2.3) render
-                    // without any item lookup; positional identity because
-                    // one item may carry several error lines.
-                    ForEach(Array(report.errors.enumerated()), id: \.offset) { _, item in
-                        Text("\(item.displayName): \(item.message)")
+                    // through `errorLines` — NO item lookup, ever: a failed
+                    // item may have vanished from any post-clean rescan.
+                    // Positional identity because one item may carry
+                    // several error lines.
+                    ForEach(Array(report.errorLines.enumerated()), id: \.offset) { _, line in
+                        Text(line)
                             .font(.caption)
                             .foregroundStyle(.red)
                     }

@@ -76,6 +76,26 @@ struct CategoryRowModel: Identifiable {
     var id: ItemKey { key }
 }
 
+/// One selected item in the clean-confirmation sheet's UNIFIED itemization
+/// (fn-2.5): category aggregates and per-item scanner rows flow through ONE
+/// row shape, and every row carries its item's `evidence` string — evidence
+/// is first-class in the sheet (epic contract; the surface fn-3/fn-4/fn-5
+/// deletion safety rests on). List identity is the composite `key`.
+struct ConfirmationRowModel: Identifiable {
+    let key: ItemKey
+    /// SF Symbol — the registered category icon for aggregates, a generic
+    /// container icon for per-item scanner rows.
+    let icon: String
+    /// Aggregates: the category name; per-item rows: "scanner: item"
+    /// (preserves the pre-unification "node_modules: <project>" labelling).
+    let label: String
+    let formattedSize: String
+    /// Rendered under the row verbatim. Aggregates carry description-grade
+    /// evidence (the category description) — honest, never padded.
+    let evidence: String
+    var id: ItemKey { key }
+}
+
 /// One per-item scanner's section (every scanner except the aggregate
 /// category adapter): header identity, its items in outcome order, its
 /// root/scanner-level issues (including a synthesized `malformedOutcome`
@@ -268,8 +288,43 @@ class CacheoutViewModel: ObservableObject {
         }
     }
 
-    var selectedCategoryRows: [CategoryRowModel] {
-        categoryRows.filter { $0.result.isSelected }
+    /// The confirmation sheet's unified itemization (fn-2.5): ONE row shape
+    /// over `selectedItems` in presentation order — aggregates and per-item
+    /// scanner rows through the same derivation, each carrying its evidence
+    /// string.
+    var confirmationRows: [ConfirmationRowModel] {
+        Self.confirmationRows(for: selectedItems)
+    }
+
+    /// Pure derivation behind `confirmationRows` — static so XCTest asserts
+    /// on it without a runtime (SwiftUI bodies are assertion-dead).
+    nonisolated static func confirmationRows(
+        for selectedItems: [ReclaimableItem]
+    ) -> [ConfirmationRowModel] {
+        selectedItems.map { item in
+            let icon: String
+            let label: String
+            switch item.admission {
+            case .category(let category):
+                // Aggregate rows keep their registered category icon and
+                // name (the admission descriptor carries the category —
+                // runtime-validated provenance, same source `categoryRows`
+                // trusts).
+                icon = category.icon
+                label = category.name
+            case .containerItem:
+                icon = "shippingbox.fill"
+                label = "\(item.scannerID): \(item.displayName)"
+            }
+            return ConfirmationRowModel(
+                key: item.key,
+                icon: icon,
+                label: label,
+                formattedSize: ByteCountFormatter.sharedFile
+                    .string(fromByteCount: item.allocatedBytes),
+                evidence: item.evidence
+            )
+        }
     }
 
     /// The category scanner emits no outcome-level errors by design; this
@@ -387,6 +442,34 @@ class CacheoutViewModel: ObservableObject {
     /// Trash mode is on (P2).
     var hasCommandBackedSelection: Bool {
         selectedItems.contains { if case .commands = $0.action { return true } else { return false } }
+    }
+
+    /// The `.commands` Move-to-Trash disclosure the confirmation sheet
+    /// renders when non-nil (fn-2.5, epic contract): `nil` when NO selected
+    /// item cleans via commands; otherwise a string naming ONLY the
+    /// command-backed items by display name — their argv runs regardless of
+    /// the Trash toggle and places nothing in the Trash (P2), so the sheet
+    /// must say exactly which items the toggle does not cover. Items cleaned
+    /// by deletion are never named.
+    var commandsTrashDisclosure: String? {
+        Self.commandsTrashDisclosure(selectedItems: selectedItems)
+    }
+
+    /// Pure derivation behind `commandsTrashDisclosure` — static so XCTest
+    /// asserts on it without a runtime.
+    nonisolated static func commandsTrashDisclosure(
+        selectedItems: [ReclaimableItem]
+    ) -> String? {
+        let names = selectedItems
+            .filter { if case .commands = $0.action { return true } else { return false } }
+            .map(\.displayName)
+        guard !names.isEmpty else { return nil }
+        if names.count == 1 {
+            return "\(names[0]) runs its own cleanup command — "
+                + "Move to Trash does not apply to it"
+        }
+        return "\(names.joined(separator: ", ")) run their own cleanup "
+            + "commands — Move to Trash does not apply to them"
     }
 
     /// True when the current selection includes a caution-risk item (the

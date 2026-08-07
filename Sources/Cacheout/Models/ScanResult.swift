@@ -298,6 +298,25 @@ struct CleanupReport {
         /// How many entries contributed to this rollup.
         let entryCount: Int
         var bytesFreed: Int64 { exactBytes + estimatedUpToBytes }
+
+        /// Component-derived rollup text for the report sheet's section
+        /// header (fn-2.5) — the same R16 phrase entry rows use, never a
+        /// single number that launders estimates into certainty.
+        var componentSummary: String {
+            CleanupReport.componentPhrase(
+                exact: exactBytes, estimatedUpTo: estimatedUpToBytes
+            )
+        }
+    }
+
+    /// One scanner's slice of the report for rollup rendering (fn-2.5): its
+    /// rollup sums plus its entries in report order. PURE derivation — the
+    /// grouping is exactly `scannerRollups`' (by `scannerID`, first-
+    /// appearance order); nothing is stored twice.
+    struct ScannerSection {
+        let rollup: ScannerRollup
+        let entries: [Entry]
+        var scannerID: String { rollup.scannerID }
     }
 
     /// The REQUESTED disposal mode for the run. Entries carry what actually
@@ -334,6 +353,27 @@ struct CleanupReport {
                 entryCount: sum.count
             )
         }
+    }
+
+    /// The report sheet's per-scanner sections (fn-2.5): each scanner's
+    /// rollup paired with its entries, preserving entry order within each
+    /// section and `scannerRollups`' first-appearance section order.
+    var scannerSections: [ScannerSection] {
+        scannerRollups.map { rollup in
+            ScannerSection(
+                rollup: rollup,
+                entries: entries.filter { $0.scannerID == rollup.scannerID }
+            )
+        }
+    }
+
+    /// Report error lines rendered from the SELF-CONTAINED `ItemError`
+    /// records ALONE (fn-2.5, epic contract): a failed item may no longer
+    /// exist in any post-clean rescan, so this NEVER looks an item up —
+    /// `key` correlates, it does not fetch. Positional identity in the view
+    /// because one item may carry several error lines.
+    var errorLines: [String] {
+        errors.map { "\($0.displayName): \($0.message)" }
     }
 
     /// Entry-disposal-driven one-line summary (R11), component-derived

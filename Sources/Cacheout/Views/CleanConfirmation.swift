@@ -4,9 +4,13 @@
 ///
 /// A modal sheet presented before cleanup begins. Shows:
 /// - Total size and item count to be cleaned
+/// - The D8 overcount caveat (fn-1.4, R8): APFS clones and cross-category
+///   hardlinks mean the total is a ceiling, not a promise
 /// - Itemized list of selected categories and node_modules with individual sizes
 /// - Move-to-Trash toggle (recoverable vs. permanent deletion)
 /// - Warning banner when "Caution" risk-level items are selected
+/// - Warning banner when a `.partiallyDenied` category is selected (R18):
+///   unreadable contents — measured bytes only
 /// - Cancel and Confirm buttons (confirm triggers cleanup and dismisses)
 ///
 /// The sheet is limited to 200px height for the item list to prevent overflow
@@ -14,12 +18,14 @@
 ///
 /// ## CleanupReportSheet
 ///
-/// A modal sheet presented after cleanup completes. Shows:
-/// - Green checkmark with "Cleanup Complete!" heading
-/// - Total freed space
-/// - Per-category breakdown of freed bytes
-/// - Error section (if any items failed) with red-highlighted messages
-/// - Done button to dismiss
+/// A modal sheet presented after cleanup completes (fn-1.4, R11/R16).
+/// Success is claimed only when something actually succeeded: the icon and
+/// heading derive from `report.entries`/`report.errors`, and the amount line
+/// is `report.headline` — disposal-aware and component-derived ("Freed X",
+/// "+ up to Y more", "up to Z"). Per-entry rows render
+/// `Entry.componentSummary`, never a single laundered total, and carry
+/// `report.rowAnnotation(for:)` when a Trash-mode run contains a
+/// command-erased entry whose bytes are NOT in the Trash (P2).
 
 import SwiftUI
 
@@ -40,6 +46,12 @@ struct CleanConfirmationSheet: View {
             Text("This will remove \(viewModel.formattedTotalSelectedSize) from \(viewModel.selectedResults.count + viewModel.nodeModulesItems.lazy.filter(\.isSelected).count) items.")
                 .font(.body)
                 .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+
+            // D8 disclosure (R8): the total is a ceiling, not a promise.
+            Text(viewModel.overcountCaveat)
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
                 .multilineTextAlignment(.center)
 
             VStack(alignment: .leading, spacing: 4) {
@@ -84,6 +96,23 @@ struct CleanConfirmationSheet: View {
                     .foregroundStyle(.orange)
             }
 
+            // P2: command-backed categories execute regardless of the
+            // Move-to-Trash toggle — with Trash mode on, the sheet must not
+            // let the user believe those items will be recoverable.
+            if viewModel.moveToTrash && viewModel.hasCommandBackedSelection {
+                Label("Some selected items clean via commands and are always erased permanently — they will not appear in the Trash", systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
+
+            // R18: explicit selection of a partially denied category is
+            // allowed, but the sheet must say what the number means.
+            if viewModel.hasPartiallyDeniedSelection {
+                Label("Some selected items have unreadable contents — measured bytes only", systemImage: "lock.trianglebadge.exclamationmark")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
+
             HStack(spacing: 12) {
                 Button("Cancel") { dismiss() }
                     .keyboardShortcut(.cancelAction)
@@ -106,27 +135,46 @@ struct CleanupReportSheet: View {
     let report: CleanupReport
     @Environment(\.dismiss) private var dismiss
 
+    /// Something was actually cleaned — the only condition under which the
+    /// sheet may claim success (R11).
+    private var succeeded: Bool { !report.entries.isEmpty }
+    private var allFailed: Bool { report.entries.isEmpty && !report.errors.isEmpty }
+
     var body: some View {
         VStack(spacing: 16) {
-            Image(systemName: "checkmark.circle.fill")
+            Image(systemName: allFailed ? "xmark.circle.fill" : (succeeded ? "checkmark.circle.fill" : "circle.dashed"))
                 .font(.system(size: 48))
-                .foregroundStyle(.green)
+                .foregroundStyle(allFailed ? .red : (succeeded ? .green : .secondary))
 
-            Text("Cleanup Complete!")
+            Text(allFailed ? "Cleanup Failed" : (succeeded ? "Cleanup Complete!" : "Nothing to Clean"))
                 .font(.title2.bold())
 
-            Text("Freed \(report.formattedTotal)")
+            // Disposal-aware, component-derived amount line (R11/R16):
+            // "Freed X [+ up to Y more]" or "Moved … to Trash — empty
+            // Trash to reclaim"; never a success claim when nothing
+            // succeeded.
+            Text(report.headline)
                 .font(.title3)
                 .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
 
-            if !report.cleaned.isEmpty {
+            if !report.entries.isEmpty {
                 VStack(alignment: .leading, spacing: 4) {
-                    ForEach(report.cleaned, id: \.category) { item in
-                        HStack {
-                            Text(item.category)
-                            Spacer()
-                            Text(ByteCountFormatter.sharedFile.string(fromByteCount: item.bytesFreed))
-                                .foregroundStyle(.secondary)
+                    ForEach(report.entries, id: \.category) { entry in
+                        VStack(alignment: .leading, spacing: 1) {
+                            HStack {
+                                Text(entry.category)
+                                Spacer()
+                                Text(entry.componentSummary)
+                                    .foregroundStyle(.secondary)
+                            }
+                            // P2 honesty marker: in a Trash run, a
+                            // command-erased entry put nothing in the Trash.
+                            if let note = report.rowAnnotation(for: entry) {
+                                Text(note)
+                                    .font(.caption2)
+                                    .foregroundStyle(.orange)
+                            }
                         }
                         .font(.caption)
                         .accessibilityElement(children: .combine)

@@ -42,9 +42,12 @@ Sources/Cacheout/
 ├── Scanner/
 │   ├── CacheScanner.swift              # Parallel category scanner (actor)
 │   ├── Categories.swift                # 25+ category definitions
+│   ├── DirectorySizer.swift            # Single sizing routine (split components + inode claims)
 │   └── NodeModulesScanner.swift        # Recursive node_modules finder (actor)
 ├── Cleaner/
-│   └── CacheCleaner.swift              # File deletion/trash handler (actor)
+│   ├── CacheCleaner.swift              # Guarded deletion/trash + InodeAccountingRegistry (actors)
+│   ├── FileSystemIdentityProvider.swift # realpath/lstat identity: (st_dev, st_ino), st_nlink, mounts
+│   └── PathGuard.swift                 # Deletion/container admission chokepoint (D4)
 ├── ViewModels/
 │   └── CacheoutViewModel.swift         # Central @MainActor view model
 ├── Views/
@@ -71,9 +74,10 @@ Three actors provide thread-safe business logic:
 
 | Actor | Purpose | Key Methods |
 |-------|---------|-------------|
-| `CacheScanner` | Parallel category scanning | `scanAll()`, `scanCategory()`, `directorySize()` |
-| `NodeModulesScanner` | Recursive node_modules discovery | `scan()`, `findNodeModules()` |
-| `CacheCleaner` | File deletion and logging | `clean()`, `runCleanCommand()` |
+| `CacheScanner` | Parallel category scanning (sizing delegated to `DirectorySizer`) | `scanAll()`, `scanCategory()` |
+| `NodeModulesScanner` | Recursive node_modules discovery | `scan(maxDepth:includeProtectedRoots:)` |
+| `CacheCleaner` | Guarded deletion, freed-bytes accounting, logging | `clean()`, `runCleanCommand()` |
+| `InodeAccountingRegistry` | Per-operation claim-based freed-bytes settlement | `registerObservations(_:)`, `acceptSuccessful(_:)` |
 
 ### MainActor
 
@@ -153,20 +157,25 @@ CacheoutViewModel.clean()
     ▼
 CacheCleaner.clean(results:nodeModules:moveToTrash:)
     │
+    ├── Scan-state refusal: `.denied` refused even if force-selected
+    │
     ├── For each selected category:
-    │   ├── Has cleanCommand? ──► runCleanCommand() via /bin/bash
-    │   └── No cleanCommand?
-    │       ├── moveToTrash? ──► FileManager.trashItem()
-    │       └── permanent?   ──► FileManager.removeItem()
-    │   └── logCleanup() ──► ~/.cacheout/cleanup.log
+    │   ├── PathGuard.admitDeletionRoot() — refusal ► errors + log, root skipped
+    │   ├── Has cleanCommands? ──► admit every resolved root, then
+    │   │                          runCleanCommand() argv via /usr/bin/env
+    │   └── No cleanCommands? For each child (validateContainedChild):
+    │       ├── measure (.deletionTarget) ──► registerObservations(claims)
+    │       ├── moveToTrash? ──► FileManager.trashItem()   (unresolved URL)
+    │       │   permanent?   ──► FileManager.removeItem()  (unresolved URL)
+    │       └── success ──► acceptSuccessful(token) ──► exact/estimated bytes
+    │   └── logCleanup() ──► ~/.cacheout/cleanup.log (successes AND refusals)
     │
     ├── For each selected node_modules:
-    │   ├── moveToTrash? ──► FileManager.trashItem()
-    │   └── permanent?   ──► FileManager.removeItem()
-    │   └── logCleanup()
+    │   ├── PathGuard.admitContainer() + validateRemovableItem()
+    │   └── measure ► register ► delete ► accept (same two-phase settlement)
     │
     ▼
-CleanupReport { cleaned: [...], errors: [...] }
+CleanupReport { disposal, entries: [Entry(exact + estimatedUpTo)], errors }
     │
     ▼
 CleanupReportSheet (modal)
@@ -225,6 +234,74 @@ Separating them allows the cache scan to complete quickly (2-5s) while the
 node_modules scan continues in the background (10-30s), providing faster
 initial results to the user.
 
+### Why a single admission chokepoint (PathGuard)?
+
+Every destructive path — category roots, contained children, node_modules
+items, cleanCommands roots — asks `PathGuard` "may I delete this URL?" before
+anything runs. Guarding each call site separately is how deletion bugs ship:
+one forgotten site is enough. The chokepoint also enforces a deny list that no
+policy can override (`/`, volume roots, `$HOME`, protected first-level home
+children), checked by inode identity rather than string comparison — three
+spellings of `$HOME` share one inode, and `hasPrefix` on paths is not
+containment.
+
+### Why category-scoped admission with a sibling rule, not an allowlist of parents?
+
+A category may delete ONLY its own declared roots (static, probed, and
+absolute discovery kinds) plus a constrained version drift: a one-component
+sibling whose basename matches a declared stem modulo a trailing version
+suffix (`store/v11` is admissible when `v10` is declared — cache directories
+version-drift), or a pure-version child directly below a declared root
+(`store/v10` when `store` is declared — `pnpm store path` reports the
+versioned store below its declared fallback, and the child is strictly inside
+a root already admissible in full). There is no recursive parent grant: the
+parent of `~/Library/Caches/Homebrew` is the whole cache namespace, and the
+parent of `~/.npm` is `$HOME`. A probed path is untrusted stdout and passes
+the same admission as everything else.
+
+### Why two canonicalization rules?
+
+Roots are resolved fully with `realpath(3)` — a symlink root is judged and
+walked by its real location, so an inadmissible target can't hide behind a
+link. Deletion-target *leaves* are never resolved: only the deepest existing
+ancestor is canonicalized, and deletion uses the unresolved URL — removing a
+symlink child deletes the link, never its target.
+(`URL.resolvingSymlinksInPath()` is not used for admission decisions: it is
+lexically wrong past a symlink and misses `/private` aliasing.)
+
+### Why does DirectorySizer have two modes?
+
+`.scanRoot` (scan time, post-admission: root fully resolved, then enumerated)
+and `.deletionTarget` (delete time: `lstat` the leaf FIRST — symlink → 0 bytes
+and never walked; regular file → its own allocated size; directory →
+enumerated). One routine serves both so scan and clean can never disagree
+about what a byte is (D7), and every walk reports split components: exact
+unique-inode bytes vs estimated hardlinked bytes.
+
+### Why two signals for volume-root detection?
+
+A mount boundary is detected by BOTH a device-id change AND a `statfs(2)`
+mount-root check. A unified APFS volume group presents ONE `st_dev` across `/`
+and `/System/Volumes/Data` (the firmlink), so device comparison alone is blind
+to exactly the boundary that matters most on modern macOS. The sizer refuses
+to cross detected boundaries; the guard refuses cross-device targets.
+
+### Why claim-based two-phase freed-bytes accounting?
+
+Deleting one hardlink frees nothing while other links survive — and the
+deletion *decrements* the survivor's `st_nlink`, so classification observed
+after a sibling's deletion lies. The `InodeAccountingRegistry` actor
+(`Sources/Cacheout/Cleaner/CacheCleaner.swift`) settles this with two atomic
+methods: `registerObservations(_:) -> RegisteredChild` records claims
+(canonical byte value + hardlink classification, sticky once observed
+hardlinked by anyone) immediately after measurement and BEFORE deletion;
+`acceptSuccessful(_:) -> AcceptedByteComponents` transfers each claimed
+inode's canonical bytes exactly once, only after successful deletion. Failed
+deletions accept nothing, but their registrations remain for successful
+siblings to transfer — no ordering of measure/delete/fail across children can
+double-count, lose, or reclassify bytes. Hardlinked bytes are always reported
+as estimates, never exact.
+
 ### Why no Core Data or SQLite?
 
 Scan results are ephemeral — they reflect current filesystem state and become
@@ -245,6 +322,16 @@ to defer update checks until a signed appcast URL is configured in Info.plist.
 
 - **No admin privileges**: Only accesses user-space directories (`~/Library/`, `~/.`)
 - **No network access**: No analytics, telemetry, or phoning home
+- **PathGuard admission on every destructive path**: category roots, contained
+  children, node_modules items, and cleanCommands roots are admitted against
+  category-scoped policies plus an inode-identity deny list (`/`, volume
+  roots, `$HOME`, protected first-level home children) before anything is
+  deleted; the parent chain is re-validated immediately before each
+  destructive call, and refusals are reported and logged
+- **TCC-respecting scans**: privacy-protected roots (Documents / Desktop /
+  Downloads) are enumerated only on user-initiated scans, with usage strings
+  in the Info.plist; the CLI surfaces denials as `scan_error` + `grant_hint`
+  instead of reading zero
 - **Sandboxed shell commands**: Probe commands run with a restricted PATH and 2s timeout
-- **Clean commands**: Run with 30s timeout and restricted PATH
+- **Clean commands**: argv arrays run directly via `/usr/bin/env` (never a shell) with 30s timeout and restricted PATH, after every resolved root passes admission
 - **Notification guard**: UNUserNotificationCenter calls guarded by bundleIdentifier check

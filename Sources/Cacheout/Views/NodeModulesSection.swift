@@ -15,6 +15,11 @@
 /// - Scanning: Shows progress indicator with search message
 /// - Empty: Shows "No node_modules directories found"
 /// - Populated: Shows list with selection controls
+/// - Issues (fn-1.4, R14/D6): classified scan problems render as a warning
+///   block — a TCC-denied `~/Documents` search root is VISIBLE information
+///   ("access denied", with a System Settings link), never an empty
+///   section. GUI-only surfacing: the CLI does not expose node_modules
+///   until fn-2.
 ///
 /// ## NodeModulesRow
 ///
@@ -71,6 +76,13 @@ struct NodeModulesSection: View {
                 .padding(.vertical, 8)
             }
 
+            // Classified scan problems (R14/D6): a denied search root is
+            // information, never a silent skip.
+            if isExpanded && !viewModel.isNodeModulesScanning
+                && !viewModel.nodeModulesScanIssues.isEmpty {
+                issuesBlock
+            }
+
             if isExpanded && !viewModel.nodeModulesItems.isEmpty {
                 // Quick actions
                 HStack(spacing: 12) {
@@ -106,7 +118,11 @@ struct NodeModulesSection: View {
                 }
             }
 
-            if isExpanded && !viewModel.isNodeModulesScanning && viewModel.nodeModulesItems.isEmpty {
+            // "Found none" is claimed only when the scan had no classified
+            // problems — a denied root is NOT "nothing there" (R14/D6).
+            if isExpanded && !viewModel.isNodeModulesScanning
+                && viewModel.nodeModulesItems.isEmpty
+                && viewModel.nodeModulesScanIssues.isEmpty {
                 VStack(spacing: 8) {
                     Image(systemName: "shippingbox")
                         .font(.largeTitle)
@@ -119,6 +135,53 @@ struct NodeModulesSection: View {
                 .padding(.vertical, 24)
                 .accessibilityElement(children: .combine)
             }
+        }
+    }
+
+    // MARK: - Scan issues
+
+    private var issuesBlock: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            ForEach(Array(viewModel.nodeModulesScanIssues.enumerated()), id: \.offset) { _, issue in
+                HStack(spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                    Text("\(Self.shortPath(issue.url)) — \(Self.label(for: issue.kind))")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    if issue.kind == .tccDenied {
+                        Link("Grant access…",
+                             destination: ScanError.fullDiskAccessSettingsURL)
+                            .font(.caption)
+                    }
+                    Spacer(minLength: 0)
+                }
+                .accessibilityElement(children: .combine)
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(Color.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+        .padding(.horizontal, 10)
+        .padding(.bottom, 4)
+    }
+
+    private static func shortPath(_ url: URL) -> String {
+        url.path.replacingOccurrences(
+            of: FileManager.default.homeDirectoryForCurrentUser.path, with: "~"
+        )
+    }
+
+    private static func label(for kind: NodeModulesScanIssue.Kind) -> String {
+        switch kind {
+        case .containerRefused: return "not a configured search root"
+        case .symlinkRoot: return "symlinked — not searched"
+        case .tccDenied: return "access denied by macOS privacy settings"
+        case .permissionDenied: return "permission denied"
+        case .unreadable: return "unreadable"
         }
     }
 }

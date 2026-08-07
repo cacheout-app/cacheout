@@ -40,6 +40,19 @@
 import Foundation
 import SwiftUI
 
+/// What set a scan in motion (fn-1.4, R9). TCC-protected search roots
+/// (Documents, Desktop, …) are enumerated ONLY for `.userInitiated` scans —
+/// a background refresh must never be the thing that fires a macOS privacy
+/// prompt.
+enum ScanTrigger: Equatable {
+    /// The user explicitly asked (Scan button, Quick Clean, confirmed
+    /// cleanup). Protected roots are included; macOS may prompt once.
+    case userInitiated
+    /// Popover/tab auto-rescan or any other background refresh. Protected
+    /// roots are skipped entirely.
+    case automatic
+}
+
 @MainActor
 class CacheoutViewModel: ObservableObject {
     @Published var scanResults: [ScanResult] = []
@@ -53,6 +66,12 @@ class CacheoutViewModel: ObservableObject {
 
     @Published var nodeModulesItems: [NodeModulesItem] = []
     @Published var isNodeModulesScanning = false
+
+    /// Classified problems from the last node_modules scan (fn-1.4, R14) —
+    /// a denied `~/Documents` search root must be VISIBLE here, never an
+    /// empty section. GUI-only surfacing: the CLI does not expose
+    /// node_modules at all until fn-2.
+    @Published var nodeModulesScanIssues: [NodeModulesScanIssue] = []
 
     /// Increments on every completed scan — views can use .task(id:) to react
     @Published var scanGeneration: Int = 0
@@ -80,18 +99,41 @@ class CacheoutViewModel: ObservableObject {
         didSet { UserDefaults.standard.set(launchAtLogin, forKey: "cacheout.launchAtLogin") }
     }
 
+    /// True while ANY phase of a scan is still running (R11). The cache
+    /// phase finishes first and clears `isScanning`; node_modules can run
+    /// 10–30s longer — scan/clean controls and model guards must cover the
+    /// WHOLE window, or a clean could act on a half-built result set.
+    var isAnyScanInProgress: Bool { isScanning || isNodeModulesScanning }
+
     /// Whether the menubar should trigger an auto-rescan (no results or stale data)
     var shouldAutoRescan: Bool {
-        if !hasResults && !isScanning { return true }
+        if isAnyScanInProgress || isCleaning { return false }
+        if !hasResults { return true }
         guard let last = lastScanDate else { return true }
         return Date().timeIntervalSince(last) > scanIntervalMinutes * 60
     }
 
-    private let scanner = CacheScanner()
-    private let nodeModulesScanner = NodeModulesScanner()
-    private let cleaner = CacheCleaner()
+    private let scanner: CacheScanner
+    private let nodeModulesScanner: NodeModulesScanner
+    private let cleaner: CacheCleaner
+    private let categories: [CacheCategory]
 
-    init() {
+    /// - Parameters:
+    ///   - scanner/nodeModulesScanner/cleaner: injectable for hermetic tests
+    ///     (fixture homes and search roots — zero real-`$HOME` reads);
+    ///     production uses the defaults.
+    ///   - categories: the category registry to scan; tests pass fixtures.
+    init(
+        scanner: CacheScanner = CacheScanner(),
+        nodeModulesScanner: NodeModulesScanner = NodeModulesScanner(),
+        cleaner: CacheCleaner = CacheCleaner(),
+        categories: [CacheCategory] = CacheCategory.allCategories
+    ) {
+        self.scanner = scanner
+        self.nodeModulesScanner = nodeModulesScanner
+        self.cleaner = cleaner
+        self.categories = categories
+
         let storedInterval = UserDefaults.standard.double(forKey: "cacheout.scanIntervalMinutes")
         self.scanIntervalMinutes = storedInterval > 0 ? storedInterval : 30
 
@@ -115,7 +157,32 @@ class CacheoutViewModel: ObservableObject {
     }
 
     var totalRecoverable: Int64 {
-        scanResults.lazy.filter { !$0.isEmpty }.reduce(0) { $0 + $1.sizeBytes }
+        // `.denied` contributes nothing by construction (nothing was
+        // measurable); the explicit filter keeps that true even if a future
+        // state carries bytes it cannot promise (R18).
+        scanResults.lazy
+            .filter { !$0.isEmpty && $0.state != .denied }
+            .reduce(0) { $0 + $1.sizeBytes }
+    }
+
+    /// D8 disclosure shown beside every recoverable/removable total (R8):
+    /// APFS clones and cross-category hardlinks make scan totals a ceiling,
+    /// not a promise.
+    nonisolated var overcountCaveat: String { DiskSpaceCaveat.overcount }
+
+    /// True when the current selection includes a `.partiallyDenied`
+    /// category — the confirmation sheet must warn that its size covers
+    /// measured bytes only (R18).
+    var hasPartiallyDeniedSelection: Bool {
+        scanResults.contains { $0.isSelected && $0.state == .partiallyDenied }
+    }
+
+    /// True when the current selection includes a command-backed category —
+    /// its clean commands execute regardless of the Move-to-Trash toggle and
+    /// erase permanently, so the confirmation sheet must say so whenever
+    /// Trash mode is on (P2).
+    var hasCommandBackedSelection: Bool {
+        scanResults.contains { $0.isSelected && $0.category.cleanCommands != nil }
     }
 
     var hasResults: Bool { !scanResults.isEmpty || !nodeModulesItems.isEmpty }
@@ -148,19 +215,36 @@ class CacheoutViewModel: ObservableObject {
         ByteCountFormatter.sharedFile.string(fromByteCount: totalSelectedSize)
     }
 
-    func scan() async {
+    /// No default trigger — every caller must classify itself (R9). A
+    /// defaulted `.userInitiated` let timer-driven refreshes inherit TCC
+    /// consent silently; making the argument mandatory turns a
+    /// misclassified new call site into a compile error.
+    func scan(trigger: ScanTrigger) async {
+        // Re-entrancy guard (R11): correctness must not depend on button
+        // state — an overlapping scan would race two writers over the same
+        // published arrays while the node_modules phase is still running,
+        // and scanning DURING a cleanup would publish results mid-deletion.
+        // (clean()'s own post-cleanup rescan runs after isCleaning clears.)
+        guard !isAnyScanInProgress && !isCleaning else { return }
         isScanning = true
         isNodeModulesScanning = true
         diskInfo = await Task.detached { DiskInfo.current() }.value
 
-        // Scan caches and node_modules in parallel
-        async let cacheResults = scanner.scanAll(CacheCategory.allCategories)
-        async let nmResults = nodeModulesScanner.scan()
+        // Scan caches and node_modules in parallel. TCC gating (R9):
+        // protected search roots are enumerated only when the user asked.
+        async let cacheResults = scanner.scanAll(categories)
+        async let nmResults = nodeModulesScanner.scan(
+            includeProtectedRoots: trigger == .userInitiated
+        )
 
         scanResults = await cacheResults
         isScanning = false
 
-        nodeModulesItems = await nmResults
+        let outcome = await nmResults
+        nodeModulesItems = outcome.items
+        // Classified scan problems are information, not noise (R14/D6) — a
+        // denied search root surfaces in the section, never as "found none".
+        nodeModulesScanIssues = outcome.errors
         isNodeModulesScanning = false
 
         // Track scan completion for reactive UI updates
@@ -171,13 +255,24 @@ class CacheoutViewModel: ObservableObject {
 
     func toggleSelection(for id: UUID) {
         if let index = scanResults.firstIndex(where: { $0.id == id }) {
+            // `.denied` is unselectable (R18): nothing was measurable and
+            // the cleaner refuses it regardless — the checkbox must not
+            // pretend otherwise. `.partiallyDenied` stays manually
+            // toggleable; the confirmation sheet carries the warning.
+            guard scanResults[index].state != .denied else { return }
             scanResults[index].isSelected.toggle()
         }
     }
 
     func selectAllSafe() {
         var results = scanResults
-        for i in results.indices where results[i].category.riskLevel == .safe && !results[i].isEmpty {
+        // R18: only cleanly `.measured` categories are auto-selected.
+        // `.partiallyDenied` is never auto-selected (smart-clean's auto
+        // path goes through here) and `.denied` is unselectable.
+        for i in results.indices
+        where results[i].category.riskLevel == .safe
+            && results[i].state == .measured
+            && !results[i].isEmpty {
             results[i].isSelected = true
         }
         scanResults = results
@@ -227,8 +322,13 @@ class CacheoutViewModel: ObservableObject {
         return String(format: "%.0fGB", freeGB)
     }
 
-    /// Quick clean: auto-select all safe categories, clean, deselect
+    /// Quick clean: a PURE auto path (R18). Any manual selections —
+    /// including a deliberately toggled `.partiallyDenied` category or
+    /// node_modules items — are cleared first, so Quick Clean acts on
+    /// exactly the auto-selected safe `.measured` set and nothing rides
+    /// along.
     func smartClean() async {
+        deselectAll()
         selectAllSafe()
         await clean()
         // Re-scan updates are handled inside clean()
@@ -249,6 +349,10 @@ class CacheoutViewModel: ObservableObject {
         process.arguments = ["docker", "system", "prune", "-f"]
         process.standardOutput = pipe
         process.standardError = pipe
+        // Real home is correct here: the view model has no injected-home
+        // seam — docker prune is a production-only action on the real
+        // account (unlike CacheCleaner/CacheCategory subprocesses, which
+        // pin HOME to their injected home).
         process.environment = [
             "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin",
             "HOME": FileManager.default.homeDirectoryForCurrentUser.path
@@ -291,6 +395,10 @@ class CacheoutViewModel: ObservableObject {
     }
 
     func clean() async {
+        // Guard at the model, not just the buttons (R11): cleaning while
+        // any scan phase is still running would act on a half-built result
+        // set (node_modules may still be populating).
+        guard !isCleaning && !isAnyScanInProgress else { return }
         isCleaning = true
         let selectedNM = nodeModulesItems.filter(\.isSelected)
         let report = await cleaner.clean(
@@ -302,7 +410,9 @@ class CacheoutViewModel: ObservableObject {
         isCleaning = false
         showCleanupReport = true
 
-        // Rescan to update sizes
-        await scan()
+        // Rescan to update sizes. `.userInitiated`: a confirmed cleanup is
+        // explicit user action (see ScanTrigger), and the refresh must see
+        // the same roots the results being updated came from.
+        await scan(trigger: .userInitiated)
     }
 }

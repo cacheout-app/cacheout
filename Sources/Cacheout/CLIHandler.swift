@@ -25,7 +25,8 @@
 /// ## Flags
 ///
 /// - `--dry-run`: Preview what would be cleaned/intervened without side effects
-/// - `--confirm`: Confirm execution for tier 2+ interventions
+/// - `--confirm`: Confirm execution of destructive commands — `clean`,
+///   `smart-clean` (schema v3, D5), and tier 2+ interventions
 /// - `--target-pid N`: Target process ID for signal interventions
 /// - `--target-name NAME`: Expected process name for PID validation (signal interventions)
 /// - `--top N`: Limit top-processes output to N entries (default: 10)
@@ -34,7 +35,11 @@
 /// ## Output Format
 ///
 /// All output is JSON (pretty-printed with sorted keys) written to stdout.
-/// Errors are written to stderr. Exit codes: 0 = success, 1 = usage error.
+/// Errors are written to stderr (structured `{"ok": false, "error": ...}`
+/// envelope). Exit codes: 0 = success — including a PARTIAL clean, which
+/// reports per-item `success` flags; 1 = usage error, refused confirmation
+/// (`CONFIRMATION_REQUIRED`, plan in the error `details`), refused root
+/// execution (`ROOT_REFUSED`), or total clean failure (`CLEAN_FAILED`).
 ///
 /// ## Spotlight Tagging
 ///
@@ -46,9 +51,10 @@
 ///
 /// ```bash
 /// Cacheout --cli scan
-/// Cacheout --cli clean xcode_derived_data npm_cache
+/// Cacheout --cli clean xcode_derived_data npm_cache --confirm
 /// Cacheout --cli clean xcode_derived_data --dry-run
-/// Cacheout --cli smart-clean 10.0
+/// Cacheout --cli smart-clean 10.0 --confirm
+/// Cacheout --cli smart-clean 10.0 --dry-run
 /// Cacheout --cli disk-info
 /// Cacheout --cli spotlight
 /// Cacheout --cli memory-stats
@@ -100,6 +106,9 @@ struct CLIHandler {
 
         let commandStr = args[cliIndex + 1]
         let isDryRun = args.contains("--dry-run")
+        // Parsed once for every command that gates on it (clean, smart-clean,
+        // intervene) — never re-read inside individual cases (fn-1.5, D5).
+        let isConfirmed = args.contains("--confirm")
 
         guard let command = Command(rawValue: commandStr) else {
             exitWithError(code: "UNKNOWN_COMMAND", message: "Unknown command: \(commandStr)")
@@ -117,11 +126,24 @@ struct CLIHandler {
 
         case .clean:
             let slugs = extractSlugs(from: args, after: cliIndex + 1)
-            await handleClean(slugs: slugs, dryRun: isDryRun)
+            await handleClean(slugs: slugs, dryRun: isDryRun, confirmed: isConfirmed)
 
         case .smartClean:
-            let targetGB = extractFloat(from: args, after: cliIndex + 1) ?? 5.0
-            await handleSmartClean(targetGB: targetGB, dryRun: isDryRun)
+            // An ABSENT target defaults to 5.0; a PRESENT but malformed one
+            // is a usage error — silently defaulting would let
+            // `smart-clean garbage --confirm` delete 5 GB the caller never
+            // asked for. (Range/finiteness is validated in the handler.)
+            let targetGB: Double
+            if let raw = extractPositionalArg(from: args, after: cliIndex + 1) {
+                guard let parsed = Double(raw) else {
+                    exitWithError(code: "INVALID_ARGUMENTS",
+                                  message: "smart-clean target must be a number of GB, got: \(raw)")
+                }
+                targetGB = parsed
+            } else {
+                targetGB = 5.0
+            }
+            await handleSmartClean(targetGB: targetGB, dryRun: isDryRun, confirmed: isConfirmed)
 
         case .spotlight:
             await handleSpotlight()
@@ -152,7 +174,6 @@ struct CLIHandler {
 
         case .intervene:
             let interventionName = extractPositionalArg(from: args, after: cliIndex + 1)
-            let isConfirmed = args.contains("--confirm")
             let targetPID: pid_t?
             if let flagIdx = args.firstIndex(of: "--target-pid") {
                 // Flag present — validate the value strictly.
@@ -181,6 +202,10 @@ struct CLIHandler {
             await handleIntervene(name: interventionName, dryRun: isDryRun, confirmed: isConfirmed, targetPID: targetPID, targetName: targetName)
         }
 
+        // Success paths only. Every failure path exits 1 through
+        // `exitWithError` (CONFIRMATION_REQUIRED, CLEAN_FAILED, ROOT_REFUSED,
+        // usage errors) and never reaches this line — a PARTIAL clean is a
+        // success at process level and reports per-item `success` flags (D5).
         Foundation.exit(0)
     }
 
@@ -189,7 +214,7 @@ struct CLIHandler {
     /// Fallback version for unbundled binaries (e.g. `.build/release/Cacheout`),
     /// where there is no Info.plist to read. Keep in sync with the VERSION file
     /// at the repo root when cutting a release.
-    private static let fallbackVersion = "2.1.9"
+    private static let fallbackVersion = "2.2.0"
 
     /// App version: read from the bundle's Info.plist (stamped from the VERSION
     /// file by scripts/bundle.sh), falling back to the compiled constant when
@@ -199,12 +224,19 @@ struct CLIHandler {
             ?? fallbackVersion
     }
 
+    /// Protocol schema version (PROTOCOL.md). 3 = `clean`/`smart-clean`
+    /// require `--confirm`, clean totals are exact-only with additive
+    /// estimated components, and total failure exits 1 `CLEAN_FAILED`
+    /// (fn-1.5, D5/R16). Non-private so the schema tests assert the bump
+    /// in-process.
+    static let cliSchemaVersion = 3
+
     private static func handleVersion() {
         let helperEnabled = HelperInstaller().status == .enabled
         let capabilities = Command.allCases.map(\.rawValue)
         outputJSON([
             "version": appVersion,
-            "schema_version": 2,
+            "schema_version": cliSchemaVersion,
             "mode": "cli",
             "app": "Cacheout",
             "helper_installed": helperEnabled, // backward-compat alias (schema v1)
@@ -235,24 +267,192 @@ struct CLIHandler {
         let scanner = CacheScanner()
         let results = await scanner.scanAll(CacheCategory.allCategories)
 
-        let items: [[String: Any]] = results.map { result in
-            [
-                "slug": result.category.slug,
-                "name": result.category.name,
-                "size_bytes": result.sizeBytes,
-                "size_human": result.formattedSize,
-                "item_count": result.itemCount,
-                "exists": result.exists,
-                "risk_level": result.category.riskLevel.rawValue.lowercased(),
-                "description": result.category.description,
-                "rebuild_note": result.category.rebuildNote,
-            ]
-        }
-
-        outputJSON(items)
+        outputJSON(results.map { scanItemJSON(for: $0) })
     }
 
-    private static func handleClean(slugs: [String], dryRun: Bool) async {
+    /// Actionable remedy emitted with TCC-denied scan errors (fn-1.4, R9):
+    /// a CLI process is denied SILENTLY by macOS — no prompt ever appears —
+    /// so the JSON must say what to do about it.
+    static let tccGrantHint = "macOS denied access without prompting (TCC). "
+        + "Grant Full Disk Access to this binary (or your terminal) in "
+        + "System Settings > Privacy & Security > Full Disk Access, then rescan."
+
+    /// One category's scan JSON (fn-1.4, R6/R16). Additive on schema v2:
+    /// `state`, `exact_bytes`, `estimated_up_to_bytes` always present
+    /// (`size_bytes` stays the compatibility sum); `scan_error` (plus
+    /// `grant_hint` for TCC denials) present only when the scan was
+    /// impeded — a clean category carries neither key.
+    static func scanItemJSON(for result: ScanResult) -> [String: Any] {
+        var item: [String: Any] = [
+            "slug": result.category.slug,
+            "name": result.category.name,
+            "size_bytes": result.sizeBytes,
+            "size_human": result.formattedSize,
+            "item_count": result.itemCount,
+            "exists": result.exists,
+            "risk_level": result.category.riskLevel.rawValue.lowercased(),
+            "description": result.category.description,
+            "rebuild_note": result.category.rebuildNote,
+            "state": result.state.rawValue,
+            "exact_bytes": result.exactBytes,
+            "estimated_up_to_bytes": result.estimatedUpToBytes,
+        ]
+        if let scanError = result.scanError {
+            item["scan_error"] = [
+                "kind": scanError.kind.wireString,
+                "message": scanError.message,
+            ] as [String: Any]
+            if scanError.kind == .tccDenied {
+                item["grant_hint"] = tccGrantHint
+            }
+        }
+        return item
+    }
+
+    // MARK: - Clean gate (D5, R5)
+
+    /// The pure gate decision for `clean`/`smart-clean`. Free of I/O so the
+    /// whole confirmed/dry-run/euid matrix is unit-testable in-process; the
+    /// handlers translate the decision into process behavior (exit code,
+    /// stderr envelope, stdout silence).
+    enum CleanGateDecision: Equatable {
+        /// Refused outright, before any scan: destructive cache deletion
+        /// must never run with root privileges (categories resolve against
+        /// a user home; euid 0 would bypass every permission backstop).
+        case refuseRootUser
+        /// Destructive run requested without `--confirm`: stdout stays
+        /// empty, the plan goes to the stderr error `details`, exit 1.
+        case refuseUnconfirmed
+        /// Non-destructive preview (`--dry-run` wins even beside
+        /// `--confirm` — matching the intervene gate, where dry-run is
+        /// always non-destructive).
+        case dryRun
+        /// Confirmed destructive run.
+        case proceed
+    }
+
+    static func cleanGateDecision(confirmed: Bool, dryRun: Bool, euid: uid_t) -> CleanGateDecision {
+        guard euid != 0 else { return .refuseRootUser }
+        if dryRun { return .dryRun }
+        return confirmed ? .proceed : .refuseUnconfirmed
+    }
+
+    /// The exit-code decision for a completed destructive run (R5), pure so
+    /// the whole matrix is unit-testable: TOTAL failure — exit 1
+    /// `CLEAN_FAILED` — iff at least one category was attempted, every
+    /// attempt failed, AND nothing was freed. Anything else (all-success,
+    /// nothing attempted, mixed flags, or bytes freed despite every flag
+    /// failing) is exit 0 with per-item `success` flags. Derived from the
+    /// per-category flags plus the freed components — never from
+    /// `entries.isEmpty`, which zero-byte successes also produce.
+    static func cleanRunIsTotalFailure(
+        successFlags: [Bool], freedExact: Int64, freedEstimated: Int64
+    ) -> Bool {
+        !successFlags.isEmpty
+            && successFlags.allSatisfy { !$0 }
+            && freedExact == 0
+            && freedEstimated == 0
+    }
+
+    private static let rootRefusalMessage = "clean and smart-clean refuse to run as root (euid 0): "
+        + "cache categories resolve against a user home, and deletion with root "
+        + "privileges would bypass every filesystem permission backstop. Re-run as the login user."
+
+    /// Warning attached to a `.partiallyDenied` category's clean output
+    /// (R18): the cleaner proceeds on explicit selection but its numbers are
+    /// a floor, not a promise — the CLI must say so.
+    static let partiallyDeniedCleanWarning = "Parts of this category were unreadable at scan "
+        + "time; only the measured bytes were cleaned and reported — the true size may be larger."
+
+    /// What the real run would do with one requested category — the same
+    /// decisions `CacheCleaner.clean` takes (missing/empty skipped, `.denied`
+    /// refused even force-selected, `.partiallyDenied` proceeds with a
+    /// warning). Drives both the `CONFIRMATION_REQUIRED` plan and the
+    /// dry-run payload so preview and reality cannot drift.
+    static func cleanPlanAction(for result: ScanResult) -> String {
+        if result.state == .missing { return "skip" }
+        if result.state == .denied { return "refuse" }
+        if result.isEmpty { return "skip" }
+        return result.state == .partiallyDenied ? "clean_with_warning" : "clean"
+    }
+
+    /// One plan entry (scan-time split components — never a re-walk, R16).
+    static func cleanPlanItemJSON(for result: ScanResult) -> [String: Any] {
+        var item: [String: Any] = [
+            "slug": result.category.slug,
+            "name": result.category.name,
+            "state": result.state.rawValue,
+            "action": cleanPlanAction(for: result),
+            "exact_bytes": result.exactBytes,
+            "estimated_up_to_bytes": result.estimatedUpToBytes,
+        ]
+        if result.state == .partiallyDenied {
+            item["warning"] = partiallyDeniedCleanWarning
+        }
+        if let scanError = result.scanError {
+            item["scan_error"] = [
+                "kind": scanError.kind.wireString,
+                "message": scanError.message,
+            ] as [String: Any]
+        }
+        return item
+    }
+
+    /// Exact-only totals over the entries the plan would actually clean.
+    private static func cleanPlanTotals(_ results: [ScanResult]) -> (exact: Int64, estimated: Int64) {
+        results.reduce(into: (exact: Int64(0), estimated: Int64(0))) { totals, result in
+            let action = cleanPlanAction(for: result)
+            guard action == "clean" || action == "clean_with_warning" else { return }
+            totals.exact += result.exactBytes
+            totals.estimated += result.estimatedUpToBytes
+        }
+    }
+
+    /// The `CONFIRMATION_REQUIRED` details payload for `clean` (R5): the
+    /// same per-category decisions the confirmed run would take.
+    static func cleanConfirmationDetails(for results: [ScanResult]) -> [String: Any] {
+        let totals = cleanPlanTotals(results)
+        return [
+            "command": "clean",
+            "plan": results.map { cleanPlanItemJSON(for: $0) },
+            "total_exact_bytes": totals.exact,
+            "total_estimated_up_to_bytes": totals.estimated,
+        ]
+    }
+
+    /// Dry-run clean payload (R16): built from the SCAN-TIME split
+    /// components — no re-walk, and `total_would_free` counts exact bytes
+    /// only (estimates are additive, never laundered into the total).
+    static func cleanDryRunPayload(for results: [ScanResult]) -> [String: Any] {
+        let entries: [[String: Any]] = results.map { result in
+            var item = cleanPlanItemJSON(for: result)
+            let action = cleanPlanAction(for: result)
+            let cleans = action == "clean" || action == "clean_with_warning"
+            let exact = cleans ? result.exactBytes : 0
+            let estimated = cleans ? result.estimatedUpToBytes : 0
+            item["bytes_would_free"] = exact
+            item["freed_human"] = CleanupReport.componentPhrase(
+                exact: exact, estimatedUpTo: estimated
+            )
+            return item
+        }
+        let totals = cleanPlanTotals(results)
+        return [
+            "dry_run": true,
+            "total_would_free": totals.exact,
+            "total_estimated_up_to_bytes": totals.estimated,
+            "results": entries,
+        ]
+    }
+
+    private static func handleClean(slugs: [String], dryRun: Bool, confirmed: Bool) async {
+        // The contract requires one or more slugs — an empty list must not
+        // masquerade as a successful no-op clean.
+        guard !slugs.isEmpty else {
+            exitWithError(code: "MISSING_ARGUMENT",
+                          message: "Usage: Cacheout --cli clean <slugs...> [--confirm|--dry-run]. Use 'scan' to list valid slugs.")
+        }
+
         let knownSlugs = Set(CacheCategory.allCategories.map(\.slug))
         let unknown = slugs.filter { !knownSlugs.contains($0) }
         guard unknown.isEmpty else {
@@ -260,72 +460,123 @@ struct CLIHandler {
                           message: "Unknown category slug(s): \(unknown.joined(separator: ", ")). Use 'scan' to list valid slugs.")
         }
 
+        // Gate decision BEFORE any scan (D5). The unconfirmed branch still
+        // scans below — read-only — because its refusal carries the plan.
+        let decision = cleanGateDecision(confirmed: confirmed, dryRun: dryRun, euid: geteuid())
+        if case .refuseRootUser = decision {
+            exitWithError(code: "ROOT_REFUSED", message: rootRefusalMessage)
+        }
+
+        // Scan only what was asked for, deduped in the user's argument order
+        // (scanAll returns size-descending).
+        var seen = Set<String>()
+        let requestedSlugs = slugs.filter { seen.insert($0).inserted }
+        let requested = CacheCategory.allCategories.filter { requestedSlugs.contains($0.slug) }
         let scanner = CacheScanner()
-        let allResults = await scanner.scanAll(CacheCategory.allCategories)
-
-        let toClean = allResults.filter { result in
-            slugs.contains(result.category.slug)
-        }.map { result in
-            var r = result
-            r.isSelected = true
-            return r
+        let scanned = await scanner.scanAll(requested)
+        let bySlug = Dictionary(scanned.map { ($0.category.slug, $0) },
+                                uniquingKeysWith: { first, _ in first })
+        let toClean: [ScanResult] = requestedSlugs.compactMap { slug in
+            guard var result = bySlug[slug] else { return nil }
+            // Force-select: the CLI user named the slug explicitly. The
+            // cleaner still refuses `.denied` regardless (R18) — that
+            // refusal surfaces below as the per-item error.
+            result.isSelected = true
+            return result
         }
 
-        if dryRun {
-            let dryResults: [[String: Any]] = toClean.map { r in
-                [
-                    "slug": r.category.slug,
-                    "name": r.category.name,
-                    "bytes_would_free": r.sizeBytes,
-                    "freed_human": r.formattedSize,
+        switch decision {
+        case .refuseRootUser:
+            preconditionFailure("unreachable — refused before scanning")
+
+        case .refuseUnconfirmed:
+            // Stdout stays EMPTY; the plan rides in the stderr details (R5).
+            exitWithError(
+                code: "CONFIRMATION_REQUIRED",
+                message: "clean deletes cache contents and requires --confirm (preview with --dry-run)",
+                details: cleanConfirmationDetails(for: toClean)
+            )
+
+        case .dryRun:
+            outputJSON(cleanDryRunPayload(for: toClean))
+
+        case .proceed:
+            let cleaner = CacheCleaner()
+            let report = await cleaner.clean(results: toClean, moveToTrash: false)
+
+            // Report entries/errors are keyed by category NAME; the wire
+            // reports per requested slug — including a `success: true` row
+            // for a slug that produced neither entry nor error (zero-byte
+            // success, missing/empty skip). `entries.isEmpty` is NOT a
+            // total-failure signal.
+            let entriesByName = Dictionary(report.entries.map { ($0.category, $0) },
+                                           uniquingKeysWith: { first, _ in first })
+            let errorsByName = Dictionary(grouping: report.errors, by: \.category)
+
+            let results: [[String: Any]] = toClean.map { result in
+                let name = result.category.name
+                let entry = entriesByName[name]
+                let errs = (errorsByName[name] ?? []).map(\.error)
+                let exact = entry?.exactBytes ?? 0
+                let estimated = entry?.estimatedUpToBytes ?? 0
+                var item: [String: Any] = [
+                    "category": result.category.slug,
+                    "name": name,
+                    "bytes_freed": exact,
+                    "exact_bytes": exact,
+                    "estimated_up_to_bytes": estimated,
+                    "freed_human": CleanupReport.componentPhrase(
+                        exact: exact, estimatedUpTo: estimated
+                    ),
+                    "success": errs.isEmpty,
                 ]
+                if !errs.isEmpty {
+                    item["error"] = errs.joined(separator: "; ")
+                }
+                if result.state == .partiallyDenied {
+                    item["warning"] = partiallyDeniedCleanWarning
+                }
+                return item
             }
+
+            // Exit contract (R5): TOTAL failure — every requested slug
+            // errored and nothing was freed — exits 1 CLEAN_FAILED with an
+            // empty stdout. Partial success stays exit 0 with per-item
+            // `success` flags.
+            if cleanRunIsTotalFailure(
+                successFlags: results.map { ($0["success"] as? Bool) ?? false },
+                freedExact: report.totalFreedExact,
+                freedEstimated: report.totalEstimatedUpTo
+            ) {
+                exitWithError(code: "CLEAN_FAILED",
+                              message: "No requested category could be cleaned",
+                              details: ["results": results])
+            }
+
             outputJSON([
-                "dry_run": true,
-                "total_would_free": toClean.reduce(Int64(0)) { $0 + $1.sizeBytes },
-                "results": dryResults,
+                "dry_run": false,
+                "total_freed_bytes": report.totalFreedExact,
+                "total_estimated_up_to_bytes": report.totalEstimatedUpTo,
+                "total_freed": CleanupReport.componentPhrase(
+                    exact: report.totalFreedExact,
+                    estimatedUpTo: report.totalEstimatedUpTo
+                ),
+                "results": results,
             ] as [String: Any])
-            return
         }
-
-        let cleaner = CacheCleaner()
-        let report = await cleaner.clean(results: toClean, moveToTrash: false)
-
-        let cleanResults: [[String: Any]] = report.cleaned.map { item in
-            [
-                "category": item.category,
-                "bytes_freed": item.bytesFreed,
-                "freed_human": ByteCountFormatter.sharedFile.string(fromByteCount: item.bytesFreed),
-                "success": true,
-            ]
-        }
-
-        let errorResults: [[String: Any]] = report.errors.map { item in
-            [
-                "category": item.category,
-                "error": item.error,
-                "success": false,
-            ]
-        }
-
-        outputJSON([
-            "dry_run": false,
-            "total_freed_bytes": report.totalFreed,
-            "total_freed": report.formattedTotal,
-            "results": cleanResults + errorResults,
-        ] as [String: Any])
     }
 
-    private static func handleSmartClean(targetGB: Double, dryRun: Bool) async {
-        let scanner = CacheScanner()
-        let allResults = await scanner.scanAll(CacheCategory.allCategories)
-
-        let targetBytes = Int64(targetGB * 1024 * 1024 * 1024)
-        var freedSoFar: Int64 = 0
-        var cleaned: [[String: Any]] = []
-
-        let sortedResults = allResults
-            .filter { $0.exists && $0.sizeBytes > 0 }
+    /// Smart-clean eligibility + order (R18): only cleanly-measured
+    /// categories with bytes qualify — `.denied` AND `.partiallyDenied` are
+    /// skipped (the auto path must never ride on a floor measurement), and
+    /// caution-risk categories are excluded entirely. Safe before review,
+    /// larger first within a tier.
+    static func smartCleanCandidates(_ results: [ScanResult]) -> [ScanResult] {
+        results
+            .filter {
+                $0.state == .measured && $0.sizeBytes > 0
+                    && $0.category.riskLevel != .caution
+            }
             .sorted { a, b in
                 let riskOrder: [RiskLevel: Int] = [.safe: 0, .review: 1, .caution: 2]
                 let aOrder = riskOrder[a.category.riskLevel] ?? 99
@@ -333,42 +584,181 @@ struct CLIHandler {
                 if aOrder != bOrder { return aOrder < bOrder }
                 return a.sizeBytes > b.sizeBytes
             }
+    }
 
-        let cleaner = CacheCleaner()
+    /// The smart-clean loop decision on SCAN-TIME components (R16): only
+    /// exact bytes advance the target — a hardlink-heavy category may be
+    /// cleaned, but its estimated bytes never mark `target_met`. Pure (no
+    /// I/O, no re-walk) so the loop decision is unit-testable; drives both
+    /// the dry-run payload and the `CONFIRMATION_REQUIRED` plan.
+    ///
+    /// The plan must describe EVERYTHING the confirmed run may touch: the
+    /// real loop advances on DELETE-TIME bytes, so when an early category
+    /// shrinks or partially fails, later candidates are cleaned too.
+    /// Candidates past the projected target-met point are therefore listed
+    /// with action `clean_if_needed` — deleted only if earlier categories
+    /// under-deliver — with projected `bytes_freed` 0 and their would-free
+    /// components intact. Projected totals and `target_met` count the
+    /// unconditional entries only.
+    static func smartCleanPlan(
+        results: [ScanResult], targetBytes: Int64
+    ) -> (entries: [[String: Any]], totalExact: Int64, totalEstimated: Int64, targetMet: Bool) {
+        var freedExact: Int64 = 0
+        var estimated: Int64 = 0
+        var entries: [[String: Any]] = []
+        for result in smartCleanCandidates(results) {
+            // Plan shape parity with `clean` (PROTOCOL.md details.plan):
+            // every candidate passed the `.measured` filter, so the derived
+            // action is "clean" — derived, not hardcoded, so the two
+            // commands cannot drift — until the projection meets the
+            // target, after which candidates become conditional fallbacks.
+            let isFallback = freedExact >= targetBytes
+            let projectedExact = isFallback ? 0 : result.exactBytes
+            let projectedEstimated = isFallback ? 0 : result.estimatedUpToBytes
+            freedExact += projectedExact
+            estimated += projectedEstimated
+            entries.append([
+                "slug": result.category.slug,
+                "name": result.category.name,
+                "state": result.state.rawValue,
+                "action": isFallback ? "clean_if_needed" : cleanPlanAction(for: result),
+                "bytes_freed": projectedExact,
+                "exact_bytes": result.exactBytes,
+                "estimated_up_to_bytes": result.estimatedUpToBytes,
+                "freed_human": CleanupReport.componentPhrase(
+                    exact: projectedExact,
+                    estimatedUpTo: projectedEstimated
+                ),
+            ])
+        }
+        return (entries, freedExact, estimated, freedExact >= targetBytes)
+    }
 
-        for result in sortedResults {
-            if freedSoFar >= targetBytes { break }
-            if result.category.riskLevel == .caution { continue }
+    private static func handleSmartClean(targetGB: Double, dryRun: Bool, confirmed: Bool) async {
+        // Usage validation first (parity with clean's slug guard): a
+        // non-finite or negative target would trap in the Int64 conversion
+        // below (nan/inf) or produce nonsense; a ZERO target is already met
+        // before anything runs (contradictory plan/target_met semantics);
+        // a target past ~8e9 GB would overflow Int64. Refuse with the
+        // documented usage error instead.
+        guard targetGB.isFinite, targetGB > 0, targetGB <= 1_000_000_000 else {
+            exitWithError(code: "INVALID_ARGUMENTS",
+                          message: "smart-clean target must be a finite number of GB greater than 0 and at most 1000000000, got: \(targetGB)")
+        }
+        // Validate the CONVERTED value too: a positive sub-byte target
+        // (e.g. 1e-20 GB) truncates to zero bytes and would recreate the
+        // zero-target contradiction — target_met true, nothing cleaned.
+        let targetBytes = Int64(targetGB * 1024 * 1024 * 1024)
+        guard targetBytes > 0 else {
+            exitWithError(code: "INVALID_ARGUMENTS",
+                          message: "smart-clean target must convert to at least one byte, got: \(targetGB) GB")
+        }
 
-            if dryRun {
-                freedSoFar += result.sizeBytes
-                cleaned.append([
-                    "name": result.category.name,
-                    "bytes_freed": result.sizeBytes,
-                    "freed_human": result.formattedSize,
-                ])
-            } else {
+        // Gate decision BEFORE any scan (D5); unconfirmed still scans
+        // read-only below to build the refusal plan.
+        let decision = cleanGateDecision(confirmed: confirmed, dryRun: dryRun, euid: geteuid())
+        if case .refuseRootUser = decision {
+            exitWithError(code: "ROOT_REFUSED", message: rootRefusalMessage)
+        }
+        let scanner = CacheScanner()
+        let allResults = await scanner.scanAll(CacheCategory.allCategories)
+
+        switch decision {
+        case .refuseRootUser:
+            preconditionFailure("unreachable — refused before scanning")
+
+        case .refuseUnconfirmed:
+            let plan = smartCleanPlan(results: allResults, targetBytes: targetBytes)
+            exitWithError(
+                code: "CONFIRMATION_REQUIRED",
+                message: "smart-clean deletes cache contents and requires --confirm (preview with --dry-run)",
+                details: [
+                    "command": "smart-clean",
+                    "target_gb": targetGB,
+                    "plan": plan.entries,
+                    "total_exact_bytes": plan.totalExact,
+                    "total_estimated_up_to_bytes": plan.totalEstimated,
+                    "target_met": plan.targetMet,
+                ]
+            )
+
+        case .dryRun:
+            let plan = smartCleanPlan(results: allResults, targetBytes: targetBytes)
+            outputJSON([
+                "target_gb": targetGB,
+                "target_met": plan.targetMet,
+                "total_freed_bytes": plan.totalExact,
+                "total_estimated_up_to_bytes": plan.totalEstimated,
+                "total_freed": CleanupReport.componentPhrase(
+                    exact: plan.totalExact, estimatedUpTo: plan.totalEstimated
+                ),
+                "dry_run": true,
+                "cleaned": plan.entries,
+            ] as [String: Any])
+
+        case .proceed:
+            let cleaner = CacheCleaner()
+            var freedExactSoFar: Int64 = 0
+            var estimatedSoFar: Int64 = 0
+            var cleaned: [[String: Any]] = []
+
+            for result in smartCleanCandidates(allResults) {
+                // Only exact (delete-time measured, unique-inode) bytes
+                // advance the target — estimated bytes never mark
+                // `target_met` (R16).
+                if freedExactSoFar >= targetBytes { break }
                 var selected = result
                 selected.isSelected = true
                 let report = await cleaner.clean(results: [selected], moveToTrash: false)
-                let freed = report.totalFreed
-                freedSoFar += freed
-                cleaned.append([
-                    "name": result.category.name,
-                    "bytes_freed": freed,
-                    "freed_human": ByteCountFormatter.sharedFile.string(fromByteCount: freed),
-                ])
-            }
-        }
+                let exact = report.totalFreedExact
+                let estimated = report.totalEstimatedUpTo
+                freedExactSoFar += exact
+                estimatedSoFar += estimated
 
-        outputJSON([
-            "target_gb": targetGB,
-            "target_met": freedSoFar >= targetBytes,
-            "total_freed_bytes": freedSoFar,
-            "total_freed": ByteCountFormatter.sharedFile.string(fromByteCount: freedSoFar),
-            "dry_run": dryRun,
-            "cleaned": cleaned,
-        ] as [String: Any])
+                let errs = report.errors.map(\.error)
+                var item: [String: Any] = [
+                    "slug": result.category.slug,
+                    "name": result.category.name,
+                    "bytes_freed": exact,
+                    "exact_bytes": exact,
+                    "estimated_up_to_bytes": estimated,
+                    "freed_human": CleanupReport.componentPhrase(
+                        exact: exact, estimatedUpTo: estimated
+                    ),
+                    "success": errs.isEmpty,
+                ]
+                if !errs.isEmpty {
+                    item["error"] = errs.joined(separator: "; ")
+                }
+                cleaned.append(item)
+            }
+
+            // Exit contract (R5): total failure — every attempted category
+            // errored and nothing was freed — exits 1 CLEAN_FAILED. An empty
+            // candidate list is a SUCCESS (nothing eligible), and partial
+            // failure stays exit 0 with per-item `success` flags.
+            if cleanRunIsTotalFailure(
+                successFlags: cleaned.map { ($0["success"] as? Bool) ?? false },
+                freedExact: freedExactSoFar,
+                freedEstimated: estimatedSoFar
+            ) {
+                exitWithError(code: "CLEAN_FAILED",
+                              message: "No eligible category could be cleaned",
+                              details: ["cleaned": cleaned, "target_gb": targetGB])
+            }
+
+            outputJSON([
+                "target_gb": targetGB,
+                "target_met": freedExactSoFar >= targetBytes,
+                "total_freed_bytes": freedExactSoFar,
+                "total_estimated_up_to_bytes": estimatedSoFar,
+                "total_freed": CleanupReport.componentPhrase(
+                    exact: freedExactSoFar, estimatedUpTo: estimatedSoFar
+                ),
+                "dry_run": false,
+                "cleaned": cleaned,
+            ] as [String: Any])
+        }
     }
 
     // MARK: - Spotlight Tagging
@@ -379,12 +769,62 @@ struct CLIHandler {
     private static func handleSpotlight() async {
         let scanner = CacheScanner()
         let results = await scanner.scanAll(CacheCategory.allCategories)
+        outputJSON(spotlightPayload(
+            for: results, home: FileManager.default.homeDirectoryForCurrentUser
+        ))
+    }
 
+    /// The spotlight tagging pass (fn-1.5). Writes are side effects against
+    /// category roots, so every root is admitted through `PathGuard` under
+    /// its own `CategoryAdmissionPolicy` BEFORE any xattr/marker write —
+    /// same admit-before-side-effect shape as `CacheCleaner.cleanViaCommands`
+    /// (R17 precedent). A `.denied` scan state is refused first: `exists` is
+    /// computed as `state != .missing`, so without this check an unreadable
+    /// root would still enter the tag loop. Refused roots are skipped and
+    /// reported in the additive `refused` array. Non-private so hermetic
+    /// tests can drive it with fixture results and an injected home.
+    static func spotlightPayload(for results: [ScanResult], home: URL) -> [String: Any] {
+        let pathGuard = PathGuard(home: home)
         var tagged: [[String: Any]] = []
+        var refused: [[String: Any]] = []
 
         for result in results where result.exists {
-            for url in result.category.resolvedPaths {
-                // 1. Write Finder comment via xattr
+            // Scan-state refusal first (R18 parity with the cleaner): the
+            // scanner established the root is unreadable/refused — never
+            // attempt writes against it.
+            if result.state == .denied {
+                let kind = result.scanError?.kind.wireString ?? "other"
+                let message = result.scanError?.message ?? "access denied at scan time"
+                for url in result.category.resolvedPaths(home: home) {
+                    refused.append([
+                        "slug": result.category.slug,
+                        "path": url.path,
+                        "reason": "scan denied (\(kind)): \(message)",
+                    ])
+                }
+                continue
+            }
+
+            let policy = CategoryAdmissionPolicy(category: result.category, home: home)
+            // Resolution anchors to the same injected home the policy does.
+            for url in result.category.resolvedPaths(home: home) {
+                // Admission BEFORE any write — a refusal skips the root and
+                // is reported, never silently swallowed.
+                do {
+                    _ = try pathGuard.admitDeletionRoot(url, policy: policy)
+                } catch {
+                    refused.append([
+                        "slug": result.category.slug,
+                        "path": url.path,
+                        "reason": error.localizedDescription,
+                    ])
+                    continue
+                }
+
+                // 1. Write Finder comment via xattr — outcome captured, not
+                // swallowed: a root is only reported "tagged" when at least
+                // one discovery mechanism actually landed.
+                var xattrWritten = false
                 let comment = "cacheout-managed: \(result.category.slug)"
                 let commentData = try? PropertyListSerialization.data(
                     fromPropertyList: comment, format: .binary, options: 0
@@ -393,8 +833,10 @@ struct CLIHandler {
                     data.withUnsafeBytes { bytes in
                         url.withUnsafeFileSystemRepresentation { path in
                             guard let path = path else { return }
-                            setxattr(path, "com.apple.metadata:kMDItemFinderComment",
-                                     bytes.baseAddress, data.count, 0, 0)
+                            xattrWritten = setxattr(
+                                path, "com.apple.metadata:kMDItemFinderComment",
+                                bytes.baseAddress, data.count, 0, 0
+                            ) == 0
                         }
                     }
                 }
@@ -408,22 +850,38 @@ struct CLIHandler {
                     size: \(result.formattedSize)
                     tagged: \(ISO8601DateFormatter.shared.string(from: Date()))
                     """
-                try? markerContent.write(to: marker, atomically: true, encoding: .utf8)
+                let markerWritten = (try? markerContent.write(
+                    to: marker, atomically: true, encoding: .utf8
+                )) != nil
+
+                guard xattrWritten || markerWritten else {
+                    refused.append([
+                        "slug": result.category.slug,
+                        "path": url.path,
+                        "reason": "metadata writes failed: neither the Finder-comment "
+                            + "xattr nor the .cacheout-managed marker could be written",
+                    ])
+                    continue
+                }
 
                 tagged.append([
                     "slug": result.category.slug,
                     "path": url.path,
                     "size": result.formattedSize,
+                    "xattr_written": xattrWritten,
+                    "marker_written": markerWritten,
                 ])
             }
         }
 
-        outputJSON([
+        return [
             "tagged_count": tagged.count,
             "directories": tagged,
+            "refused_count": refused.count,
+            "refused": refused,
             "query_hint": "mdfind 'kMDItemFinderComment == \"cacheout-managed*\"'",
             "marker_hint": "mdfind -name .cacheout-managed",
-        ] as [String: Any])
+        ]
     }
 
     // MARK: - Memory Stats
@@ -910,12 +1368,6 @@ struct CLIHandler {
             i += 1
         }
         return slugs
-    }
-
-    private static func extractFloat(from args: [String], after index: Int) -> Double? {
-        let nextIndex = index + 1
-        guard nextIndex < args.count else { return nil }
-        return Double(args[nextIndex])
     }
 
     /// Parse `--top N` flag from args after the command position.

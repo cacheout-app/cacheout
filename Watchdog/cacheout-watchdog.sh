@@ -205,18 +205,25 @@ run_emergency_cleanup() {
     local reason="$1"
     log "EMERGENCY CLEANUP: $reason"
 
-    # Prefer Cacheout CLI binary
+    # Prefer Cacheout CLI binary. smart-clean takes a positional GB target
+    # and requires --confirm (protocol schema 3) — the watchdog is the
+    # confirming principal for emergency cleanup. On any CLI failure
+    # (refusal, contract drift, crash) fall through to the direct cleanup
+    # below instead of silently freeing nothing.
     if [[ -n "$CACHEOUT_BIN" ]] && [[ -x "$CACHEOUT_BIN" ]]; then
-        log "Cleaning via: $CACHEOUT_BIN --cli smart-clean --target $SAFE_CLEAN_TARGET_GB"
-        local result
-        result=$("$CACHEOUT_BIN" --cli smart-clean --target "$SAFE_CLEAN_TARGET_GB" 2>&1) || true
-        log "Result: $result"
-        echo "$result"
-        return
+        log "Cleaning via: $CACHEOUT_BIN --cli smart-clean $SAFE_CLEAN_TARGET_GB --confirm"
+        local result status=0
+        result=$("$CACHEOUT_BIN" --cli smart-clean "$SAFE_CLEAN_TARGET_GB" --confirm 2>&1) || status=$?
+        if (( status == 0 )); then
+            log "Result: $result"
+            echo "$result"
+            return
+        fi
+        log "CLI smart-clean failed (exit $status): $result"
     fi
 
-    # Fallback: direct safe cleanup (no binary available)
-    log "No Cacheout binary found — manual safe cleanup"
+    # Fallback: direct safe cleanup (no binary available, or CLI failed)
+    log "Falling back to direct safe cleanup"
     local freed_kb=0
 
     # Xcode DerivedData (always safe, often huge)

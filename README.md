@@ -16,7 +16,7 @@ Built for developers on space-constrained Macs (especially the 256GB M4 Mac Mini
 - **node_modules finder** — Recursively scans your project directories to find every `node_modules` folder, shows project name, size, and staleness (30d+), with per-project selection
 - **Risk-level indicators** — Each category rated Safe / Review / Caution so you know what's risk-free
 - **Async parallel scanning** — Scans all categories concurrently for fast results
-- **Sparse file awareness** — Reports actual disk usage for Docker images (not inflated file sizes)
+- **Sparse file awareness** — Reports allocated (on-disk) usage everywhere, so sparse files — Docker's disk image, simulator disk images, and anything else logically larger than it really is — show what they actually consume, not inflated logical sizes
 - **Move to Trash option** — Recoverable deletion instead of permanent removal
 - **Cleanup logging** — All actions logged to `~/.cacheout/cleanup.log`
 - **No admin privileges** — Only touches user-space caches (`~/Library/`, `~/.`)

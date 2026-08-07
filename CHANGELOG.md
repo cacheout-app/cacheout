@@ -4,6 +4,97 @@ All notable changes to Cacheout will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.2.0] - 2026-08-06
+
+Disk-path safety hardening (D1–D8). Breaking CLI release: `schema_version` is
+now 3 and destructive commands require `--confirm`. Coordinate MCP updates with
+`cacheout-mcp` (see PROTOCOL.md and docs/v1/CLI-REFERENCE.md).
+
+### Changed
+
+- **BREAKING: `--cli clean` and `--cli smart-clean` require `--confirm`.** An
+  unconfirmed, non-dry-run invocation deletes nothing: stdout is empty, the exit
+  code is 1, and stderr carries a `CONFIRMATION_REQUIRED` error whose
+  `details.plan` lists the same per-category decisions the confirmed run would
+  take (`clean`, `clean_with_warning`, `refuse`, `skip`, and — smart-clean only —
+  `clean_if_needed` for eligible fallback candidates past the projected
+  target-met point). Preview with `--dry-run` (non-destructive,
+  schema-compatible stdout, no `--confirm` needed). `schema_version` bumps
+  2 → 3; there is no environment-variable bypass.
+- **BREAKING: clean totals are split by certainty.** `total_freed_bytes` now
+  sums exact bytes only (unique-inode bytes whose deletion verifiably freed
+  them); the additive `total_estimated_up_to_bytes` carries hardlinked and
+  command-freed bytes that MAY be freed. Per-entry `exact_bytes` /
+  `estimated_up_to_bytes` components replace the single mixed number, and
+  `results[].category` now carries the slug (v2 emitted the display name).
+- **Exit-code policy (schema 3).** A clean where every item failed exits 1 with
+  `CLEAN_FAILED`; a partial clean stays exit 0 and reports per-item `success`
+  flags. Running destructive commands as root is refused outright
+  (`ROOT_REFUSED`).
+- **`smart-clean` validates its target strictly.** An absent target still
+  defaults to 5 GB, but a *present* target that is non-numeric, non-finite,
+  non-positive, over 10^9, or too small to convert to a whole byte is an
+  `INVALID_ARGUMENTS` error — malformed input is never silently defaulted.
+- **Sizes are bigger — and truthful.** Sizing no longer skips package
+  descendants or hidden files, so `.app`/bundle contents and dot-directories
+  now count (D2/D3). Xcode DerivedData and Simulator categories in particular
+  report larger, accurate totals, and unreadable subtrees are recorded instead
+  of silently skipped.
+
+### Added
+
+- **PathGuard + FileSystemIdentityProvider (D4).** Every deletion root,
+  contained child, cleanCommand root, and node_modules item passes a single
+  admission chokepoint before anything is removed: category-scoped root
+  admission with a constrained version-drift rule (one-component sibling or
+  pure-version child of a declared root), a deny list
+  (`/`, volume roots, `$HOME`, protected first-level home children),
+  inode-identity checks, two-signal mount-boundary detection, and cross-device
+  refusal. Refusals are reported and logged, never silently skipped.
+- **Scan states + visible failures (D6).** Scan JSON entries carry `state`
+  (`missing` / `empty` / `measured` / `partiallyDenied` / `denied`) and
+  `scan_error` (`{kind, message}`); TCC denials additionally carry `grant_hint`
+  with the Full Disk Access remedy, because macOS denies a CLI process
+  silently. The cleaner refuses a `denied` category even when named explicitly;
+  `partiallyDenied` proceeds with a warning and measured bytes only.
+- **Split byte components end-to-end.** Scan entries expose `exact_bytes` /
+  `estimated_up_to_bytes` (`size_bytes` retained as their sum); clean entries
+  and dry-run plans reuse the same components; smart-clean target math consumes
+  scan-time exact components only, so estimates never advance `target_met`.
+- **Overcount disclosure.** Recoverable-bytes totals and the clean-confirmation
+  sheet disclose that APFS clones and files hardlinked across categories can
+  make actual freed space less than reported.
+- **TCC usage strings.** `NSDocumentsFolderUsageDescription`,
+  `NSDesktopFolderUsageDescription`, and `NSDownloadsFolderUsageDescription`
+  ship in all three build paths (bundle.sh heredoc, Info.plist, project.yml).
+  Protected roots (Documents / Desktop / Downloads) are enumerated only on
+  user-initiated scans, so a background rescan never fires a macOS privacy
+  prompt.
+- **`spotlight` pre-write admission gate.** The Spotlight rebuild command
+  admits its target before any write and reports a `refused` array instead of
+  touching unadmitted paths.
+
+### Fixed
+
+- **Freed-bytes over-report (D1).** Freed bytes were assumed from pre-scan
+  totals even when deletion partially failed. Every deletion target is now
+  measured immediately before deletion and settled through claim-based
+  two-phase inode accounting: only successfully deleted bytes are reported,
+  hardlinked bytes are always estimates, and command categories report exact 0
+  plus an estimated pre-scan size (nothing measures what a command frees).
+- **Silent scan failures (D6).** A TCC or permission denial used to read as
+  "0 bytes found" — indistinguishable from an empty cache. Denials now surface
+  as distinct states in the GUI ("Access denied — not scanned", with a System
+  Settings link) and in CLI JSON (`denied` state + `scan_error`).
+- **Hidden-directory discovery.** The node_modules scanner no longer skips
+  hidden directories (a 23 GB hidden-worktrees field case), still bounded by
+  the skip list and recursion depth limit.
+- **Hardlink double-count (within walk).** Hardlinked inodes are deduplicated
+  within each category walk and reported as estimated bytes instead of being
+  counted once per link. Cross-category hardlinks remain disclosed via the
+  overcount caveat (D8 is mitigated, not closed — cross-walk accounting is
+  deferred to the scanner-expansion epic).
+
 ## [2.1.9] - 2026-07-20
 
 ### Fixed

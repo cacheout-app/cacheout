@@ -25,8 +25,10 @@
 /// ### Custom Clean Commands
 ///
 /// Some categories (like Simulator Devices) require a specialized cleanup command
-/// instead of simple file deletion. The `cleanCommand` property holds an optional
-/// shell command that the `CacheCleaner` runs via `/bin/bash -c` with a 30-second timeout.
+/// instead of simple file deletion. The `cleanCommands` property holds optional
+/// argv arrays that `CacheCleaner` runs directly via `/usr/bin/env` (never a
+/// shell) with a 30-second timeout and a restricted `PATH` — after every
+/// resolved root passes `PathGuard` admission (R17).
 
 import Foundation
 
@@ -126,10 +128,14 @@ struct CacheCategory: Identifiable, Hashable {
 
     // MARK: - Path Resolution
 
-    /// Resolve all discovery entries to actual filesystem URLs.
+    /// Resolve all discovery entries to actual filesystem URLs, anchored to
+    /// `home`: `.staticPath` entries and non-`/`-prefixed probed fallbacks
+    /// are appended to it, and probe subprocesses run with `HOME` set to it.
+    /// Callers MUST pass the same home their `CategoryAdmissionPolicy` is
+    /// anchored to — resolving against one home and admitting against
+    /// another silently defeats the injectable-home seam.
     /// Probed commands are run synchronously with a short timeout.
-    var resolvedPaths: [URL] {
-        let home = FileManager.default.homeDirectoryForCurrentUser
+    func resolvedPaths(home: URL) -> [URL] {
         var results: [URL] = []
 
         for entry in discovery {
@@ -148,12 +154,12 @@ struct CacheCategory: Identifiable, Hashable {
 
             case .probed(let command, let requiresTool, let fallbacks):
                 // Check if required tool is installed
-                if let tool = requiresTool, !toolExists(tool) {
+                if let tool = requiresTool, !toolExists(tool, home: home) {
                     continue
                 }
 
                 // Try the probe command
-                if let probedPath = runProbe(command),
+                if let probedPath = runProbe(command, home: home),
                    directoryExists(at: URL(fileURLWithPath: probedPath)) {
                     results.append(URL(fileURLWithPath: probedPath))
                     continue
@@ -185,7 +191,7 @@ struct CacheCategory: Identifiable, Hashable {
         return FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir) && isDir.boolValue
     }
 
-    private func toolExists(_ tool: String) -> Bool {
+    private func toolExists(_ tool: String, home: URL) -> Bool {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/which")
         process.arguments = [tool]
@@ -193,7 +199,7 @@ struct CacheCategory: Identifiable, Hashable {
         process.standardError = FileHandle.nullDevice
         process.environment = [
             "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin",
-            "HOME": FileManager.default.homeDirectoryForCurrentUser.path
+            "HOME": home.path
         ]
 
         do {
@@ -205,14 +211,14 @@ struct CacheCategory: Identifiable, Hashable {
         }
     }
 
-    private func runProbe(_ command: String) -> String? {
-        guard let output = shell(command) else { return nil }
+    private func runProbe(_ command: String, home: URL) -> String? {
+        guard let output = shell(command, home: home) else { return nil }
         let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
     }
 
     /// Run a shell command with a 2-second timeout. Returns stdout or nil.
-    private func shell(_ command: String) -> String? {
+    private func shell(_ command: String, home: URL) -> String? {
         let process = Process()
         let pipe = Pipe()
 
@@ -222,7 +228,7 @@ struct CacheCategory: Identifiable, Hashable {
         process.standardError = FileHandle.nullDevice
         process.environment = [
             "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin",
-            "HOME": FileManager.default.homeDirectoryForCurrentUser.path
+            "HOME": home.path
         ]
 
         do {

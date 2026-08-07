@@ -82,7 +82,7 @@ struct CacheCategory: Identifiable, Hashable {
     let riskLevel: RiskLevel
     let rebuildNote: String
     let defaultSelected: Bool
-    let cleanCommand: String?
+    let cleanCommands: [[String]]?
 }
 ```
 
@@ -99,7 +99,7 @@ struct CacheCategory: Identifiable, Hashable {
 | `riskLevel` | `RiskLevel` | Safety classification |
 | `rebuildNote` | `String` | What happens after cleaning |
 | `defaultSelected` | `Bool` | Whether selected by default on scan |
-| `cleanCommand` | `String?` | Optional shell command for cleanup (instead of file deletion) |
+| `cleanCommands` | `[[String]]?` | Optional argv arrays for cleanup (instead of file deletion), run directly via `/usr/bin/env` — never a shell |
 
 **Computed Properties:**
 
@@ -113,8 +113,8 @@ struct CacheCategory: Identifiable, Hashable {
 // Legacy init (static paths only)
 init(name:slug:description:icon:paths:[String]:riskLevel:rebuildNote:defaultSelected:)
 
-// Full init (discovery + optional clean command)
-init(name:slug:description:icon:discovery:[PathDiscovery]:riskLevel:rebuildNote:defaultSelected:cleanCommand:)
+// Full init (discovery + optional clean commands)
+init(name:slug:description:icon:discovery:[PathDiscovery]:riskLevel:rebuildNote:defaultSelected:cleanCommands:)
 ```
 
 **Static Properties:**
@@ -159,19 +159,80 @@ struct DiskInfo {
 
 ---
 
+### `ScanState`
+
+**File:** `Sources/Cacheout/Models/ScanResult.swift`
+
+What a category scan actually established about its tree (D6: a TCC denial
+must never read as "0 bytes found").
+
+```swift
+enum ScanState: String, Equatable {
+    case missing          // No resolved path exists on this machine
+    case empty            // Resolved and walked cleanly; nothing there
+    case measured         // Fully walked and measured
+    case partiallyDenied  // Some bytes measured, parts of the tree denied
+    case denied           // Nothing measurable: admission refusal or root-level denial
+}
+```
+
+---
+
+### `ScanError`
+
+**File:** `Sources/Cacheout/Models/ScanResult.swift`
+
+The classified reason a scan is `denied`/`partiallyDenied`.
+
+```swift
+struct ScanError: Equatable {
+    enum Kind: Equatable {
+        case admissionRefused   // PathGuard refused the root — tree never walked
+        case tccDenied          // macOS TCC (privacy) denial — EPERM
+        case permissionDenied   // BSD permission denial — EACCES
+        case other
+    }
+    let kind: Kind
+    let message: String
+}
+```
+
+| Member | Type | Description |
+|--------|------|-------------|
+| `Kind.wireString` | `String` | Stable CLI wire mapping for `scan_error.kind`: `admission_refused`, `tcc_denied`, `permission_denied`, `other`. Hand-written — renaming a case must not silently change the wire format. |
+| `ScanError.fullDiskAccessSettingsURL` | `URL` (static) | Deep link to System Settings → Privacy & Security → Full Disk Access — the user-side remedy for TCC denials (also emitted as the CLI `grant_hint`). |
+
+---
+
+### `DiskSpaceCaveat`
+
+**File:** `Sources/Cacheout/Models/ScanResult.swift`
+
+D8 honesty disclosure shown beside every recoverable-bytes total and in the
+clean-confirmation sheet.
+
+| Member | Type | Description |
+|--------|------|-------------|
+| `overcount` | `String` (static) | Discloses both overcount mechanisms: APFS clones (invisible to any public API) and files hardlinked across categories — actual space freed may be less than reported. |
+
+---
+
 ### `ScanResult`
 
 **File:** `Sources/Cacheout/Models/ScanResult.swift`
 
-Result of scanning a single cache category.
+Result of scanning a single cache category, carrying the full scan-state model
+and split byte components.
 
 ```swift
 struct ScanResult: Identifiable {
     let id: UUID
     let category: CacheCategory
-    let sizeBytes: Int64
+    let state: ScanState
+    let exactBytes: Int64
+    let estimatedUpToBytes: Int64
     let itemCount: Int
-    let exists: Bool
+    let scanError: ScanError?
     var isSelected: Bool
 }
 ```
@@ -182,12 +243,27 @@ struct ScanResult: Identifiable {
 |----------|------|-------------|
 | `id` | `UUID` | Same as `category.id` for stable SwiftUI identity |
 | `category` | `CacheCategory` | The scanned category definition |
-| `sizeBytes` | `Int64` | Total size in bytes (using allocated size) |
+| `state` | `ScanState` | What the scan established (see above) |
+| `exactBytes` | `Int64` | Bytes on unique inodes — deletion verifiably frees these |
+| `estimatedUpToBytes` | `Int64` | Bytes on hardlinked inodes — freed only if every other link goes too |
 | `itemCount` | `Int` | Number of regular files found |
-| `exists` | `Bool` | Whether any resolved paths exist |
+| `scanError` | `ScanError?` | Why the scan is `denied`/`partiallyDenied`; `nil` for clean states |
 | `isSelected` | `Bool` | User selection state (mutable) |
-| `formattedSize` | `String` | Human-readable size |
+
+**Computed Properties:**
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `sizeBytes` | `Int64` | Compatibility sum: `exactBytes + estimatedUpToBytes` |
+| `exists` | `Bool` | Computed as `state != .missing` (no stored flag) |
+| `formattedSize` | `String` | Human-readable `sizeBytes` |
 | `isEmpty` | `Bool` | `!exists || sizeBytes == 0` |
+| `statusLabel` | `String?` | Presentation label for non-measured states; `nil` for `.measured` (the row shows the category description instead). The four labels are pairwise distinct — "Access denied — not scanned" must never read as "Not found". |
+
+**Selection defaults (init):** `.denied` is unselectable; `.partiallyDenied`
+is never auto-selected (its size is a floor, not a promise) but stays manually
+toggleable; the clean states auto-select per `category.defaultSelected` when
+non-missing and non-zero.
 
 ---
 
@@ -195,11 +271,24 @@ struct ScanResult: Identifiable {
 
 **File:** `Sources/Cacheout/Models/ScanResult.swift`
 
-Summary of a cleanup operation.
+Summary of a cleanup operation, with split byte components per entry. The
+pre-split surface (`cleaned` / `totalFreed` / `formattedTotal`) was retired in
+v2.2.0 — every consumer derives from the components.
 
 ```swift
 struct CleanupReport {
-    let cleaned: [(category: String, bytesFreed: Int64)]
+    enum Disposal: Equatable { case permanent, trash }
+
+    struct Entry {
+        let category: String
+        let exactBytes: Int64
+        let estimatedUpToBytes: Int64
+        var bytesFreed: Int64        // compatibility sum
+        var componentSummary: String // component-derived row text
+    }
+
+    let disposal: Disposal
+    let entries: [Entry]
     let errors: [(category: String, error: String)]
 }
 ```
@@ -208,10 +297,22 @@ struct CleanupReport {
 
 | Property | Type | Description |
 |----------|------|-------------|
-| `cleaned` | `[(String, Int64)]` | Successfully cleaned items with bytes freed |
+| `disposal` | `Disposal` | `.permanent` or `.trash` — rendering must never claim "Freed" for a Trash run |
+| `entries` | `[Entry]` | One entry per cleaned category/item; a partially-failed category yields ONE entry carrying only the bytes its successful children measured |
+| `entries[].exactBytes` | `Int64` | Measured unique-inode bytes — deletion verifiably freed them |
+| `entries[].estimatedUpToBytes` | `Int64` | Hardlinked bytes (freed only if every other link goes too) and command-category bytes (nothing measures what a command frees) |
+| `entries[].bytesFreed` | `Int64` | Compatibility sum of the entry components (computed) |
+| `entries[].componentSummary` | `String` | Component-derived row text via `componentPhrase` (computed) |
 | `errors` | `[(String, String)]` | Failed items with error messages |
-| `totalFreed` | `Int64` | Sum of all `bytesFreed` values |
-| `formattedTotal` | `String` | Human-readable total freed |
+| `totalFreedExact` | `Int64` | Pure sum of entry `exactBytes` — no other math |
+| `totalEstimatedUpTo` | `Int64` | Pure sum of entry `estimatedUpToBytes` — no other math |
+| `headline` | `String` | Mode-driven summary: permanent → "Freed …"; trash → "Moved … to Trash — empty Trash to reclaim"; never a success claim when nothing succeeded |
+
+**Static Methods:**
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `componentPhrase(exact:estimatedUpTo:)` | `String` | The amount phrase all rendering derives from: `"X"` (no estimates), `"X + up to Y more"` (both), `"up to Z"` (exact zero) — estimates are always hedged, never laundered into certainty |
 
 ---
 
@@ -263,13 +364,10 @@ Thread-safe scanner that discovers and measures cache categories in parallel.
 | Method | Signature | Description |
 |--------|-----------|-------------|
 | `scanAll` | `func scanAll(_ categories: [CacheCategory]) async -> [ScanResult]` | Scan all categories concurrently. Returns results sorted by size descending. |
-| `scanCategory` | `func scanCategory(_ category: CacheCategory) async -> ScanResult` | Scan a single category. Returns result with size, count, and existence. |
+| `scanCategory` | `func scanCategory(_ category: CacheCategory) async -> ScanResult` | Scan a single category. Admits each resolved root before sizing (refusal = scan error, never a walk); returns state, split components, and count. |
 
-**Private Methods:**
-
-| Method | Description |
-|--------|-------------|
-| `directorySize(at:)` | Enumerate files and sum `totalFileAllocatedSize`. Returns `(Int64, Int)` tuple of (size, count). |
+Sizing is delegated to `DirectorySizer` (`Sources/Cacheout/Scanner/DirectorySizer.swift`) —
+the single sizing routine shared with delete-time measurement.
 
 ---
 
@@ -283,7 +381,7 @@ Thread-safe scanner that recursively finds `node_modules` directories.
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| `scan` | `func scan(maxDepth: Int = 6) async -> [NodeModulesItem]` | Scan all search roots for node_modules. Returns deduplicated results sorted by size descending. |
+| `scan` | `func scan(maxDepth: Int = 6, includeProtectedRoots: Bool = true) async -> NodeModulesScanOutcome` | Scan all search roots for node_modules. Returns discovered items (each carrying `originContainer` provenance) plus classified `NodeModulesScanIssue` errors. With `includeProtectedRoots: false` (automatic/background scans), TCC-prompting roots (Documents / Desktop / Downloads) are skipped so a background rescan never fires a macOS privacy prompt. |
 
 **Search Roots:** Documents, Developer, Projects, Code, Sites, Desktop, Dropbox, repos, src, work
 
@@ -295,23 +393,28 @@ Thread-safe scanner that recursively finds `node_modules` directories.
 
 **File:** `Sources/Cacheout/Cleaner/CacheCleaner.swift`
 
-Thread-safe cleaner that handles file deletion, trashing, and cleanup logging.
+Thread-safe cleaner that handles guarded file deletion, trashing, freed-bytes
+accounting, and cleanup logging. Every deletion target passes `PathGuard`
+admission (a `.denied` scan state is refused even when force-selected), and
+freed bytes are measured at delete time and settled through the claim-based
+`InodeAccountingRegistry` — see [ARCHITECTURE.md](ARCHITECTURE.md) for the
+safety model and accounting design.
 
 **Methods:**
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| `clean` | `func clean(results: [ScanResult], nodeModules: [NodeModulesItem] = [], moveToTrash: Bool) async -> CleanupReport` | Clean selected items. Returns report with successes and errors. |
+| `clean` | `func clean(results: [ScanResult], nodeModules: [NodeModulesItem] = [], moveToTrash: Bool) async -> CleanupReport` | Clean selected items. Returns a report with split-component entries and errors. |
 
 **Private Methods:**
 
 | Method | Description |
 |--------|-------------|
-| `runCleanCommand(_:)` | Execute a custom shell command via `/bin/bash -c` with 30s timeout |
+| `runCleanCommand(_:)` | Execute a custom clean command argv directly via `/usr/bin/env` (never a shell) with 30s timeout and restricted `PATH`, after every resolved root passes admission |
 | `removeContents(of:)` | Remove all items inside a directory (preserving the directory) |
 | `trashItem(_:)` | Move a single item to Trash (`@MainActor`) |
 | `trashDirectory(_:)` | Move all contents of a directory to Trash (`@MainActor`) |
-| `logCleanup(category:bytesFreed:)` | Append entry to `~/.cacheout/cleanup.log` |
+| `logCleanup(category:bytesFreed:)` | Append entry to `<home>/.cacheout/cleanup.log` (successes AND refusals) |
 
 ---
 

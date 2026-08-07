@@ -645,6 +645,14 @@ struct CLIHandler {
             exitWithError(code: "INVALID_ARGUMENTS",
                           message: "smart-clean target must be a finite number of GB greater than 0 and at most 1000000000, got: \(targetGB)")
         }
+        // Validate the CONVERTED value too: a positive sub-byte target
+        // (e.g. 1e-20 GB) truncates to zero bytes and would recreate the
+        // zero-target contradiction — target_met true, nothing cleaned.
+        let targetBytes = Int64(targetGB * 1024 * 1024 * 1024)
+        guard targetBytes > 0 else {
+            exitWithError(code: "INVALID_ARGUMENTS",
+                          message: "smart-clean target must convert to at least one byte, got: \(targetGB) GB")
+        }
 
         // Gate decision BEFORE any scan (D5); unconfirmed still scans
         // read-only below to build the refusal plan.
@@ -652,8 +660,6 @@ struct CLIHandler {
         if case .refuseRootUser = decision {
             exitWithError(code: "ROOT_REFUSED", message: rootRefusalMessage)
         }
-
-        let targetBytes = Int64(targetGB * 1024 * 1024 * 1024)
         let scanner = CacheScanner()
         let allResults = await scanner.scanAll(CacheCategory.allCategories)
 

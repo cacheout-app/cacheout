@@ -353,9 +353,10 @@ as `clean` (the `CONFIRMATION_REQUIRED` details carry `"command":
 **Arguments:**
 - `<gb>` -- Target gigabytes to free (floating point). ABSENT defaults to
   5.0; a PRESENT but non-numeric value is refused with `INVALID_ARGUMENTS`
-  (never silently defaulted). Must be finite, greater than zero, and at
-  most 10^9 — anything else (including `0`, `nan`, and `inf`) is refused
-  with `INVALID_ARGUMENTS` before any scan or gate
+  (never silently defaulted). Must be finite, greater than zero, at most
+  10^9, and large enough to convert to at least one byte — anything else
+  (including `0`, sub-byte values like `1e-20`, `nan`, and `inf`) is
+  refused with `INVALID_ARGUMENTS` before any scan or gate
 - `--confirm` -- Actually delete
 - `--dry-run` -- Preview without deleting (needs no `--confirm`)
 

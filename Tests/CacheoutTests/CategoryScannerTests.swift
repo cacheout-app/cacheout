@@ -845,6 +845,49 @@ final class CategoryScannerTests: XCTestCase {
         XCTAssertEqual(outcome(of: verdict)?.items, [missing])
     }
 
+    func testCommandsArgvMustEqualTheCategoryDeclaration() throws {
+        // Action/argv coherence (fn-2.3, mirrored by the cleaner): command
+        // argv is registry code — the payload must BE the registered
+        // category's `cleanCommands`, and a command-backed category can
+        // never carry `.removeContents`.
+        let home = try makeTempDir("home")
+        let commandBacked = makeCategory(
+            at: [], slug: "cmd_cache", cleanCommands: [["true"]]
+        )
+        let runtime = try makeRuntime(
+            scanners: [], categories: [commandBacked], home: home
+        )
+        let adapterID = CategoryScanner.registeredID
+
+        // Forged argv payload on a genuine registered category: malformed.
+        let forgedArgv = makeAggregateItem(
+            category: commandBacked,
+            action: .commands([["rm", "-rf", "/tmp/evil"]])
+        )
+        XCTAssertNotNil(malformedIssue(of: runtime.validatedOutcome(
+            ScanOutcome(items: [forgedArgv], errors: []), from: adapterID
+        )))
+
+        // A command-backed category routed through file deletion: malformed.
+        let contentsRouted = makeAggregateItem(
+            category: commandBacked, action: .removeContents
+        )
+        XCTAssertNotNil(malformedIssue(of: runtime.validatedOutcome(
+            ScanOutcome(items: [contentsRouted], errors: []), from: adapterID
+        )))
+
+        // The genuine declaration passes.
+        let genuine = makeAggregateItem(
+            category: commandBacked, action: .commands([["true"]])
+        )
+        XCTAssertEqual(
+            outcome(of: runtime.validatedOutcome(
+                ScanOutcome(items: [genuine], errors: []), from: adapterID
+            ))?.items,
+            [genuine]
+        )
+    }
+
     func testCategoryProvenanceIsBoundToTheRegisteredRegistry() throws {
         let home = try makeTempDir("home")
         let registered = makeCategory(at: [], slug: "real_cache")

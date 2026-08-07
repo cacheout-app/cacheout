@@ -345,8 +345,13 @@ actor CacheCleaner {
                 if let entry = outcome.entry { entries.append(entry) }
                 errors.append(contentsOf: outcome.errors)
 
-            case .commands(let commands):
-                guard case .category(let category) = item.admission else { continue }
+            case .commands:
+                // Argv comes from the CATEGORY's declaration — check (1)
+                // refused any payload mismatch, and sourcing from the
+                // admission descriptor keeps command argv trusted registry
+                // code, never item input.
+                guard case .category(let category) = item.admission,
+                      let commands = category.cleanCommands else { continue }
                 let outcome = cleanViaCommands(commands, for: item, category: category)
                 if let entry = outcome.entry { entries.append(entry) }
                 errors.append(contentsOf: outcome.errors)
@@ -503,9 +508,32 @@ actor CacheCleaner {
             case .category:
                 return "refused: a remove_item item must carry the container-item admission descriptor"
             }
-        case .removeContents, .commands:
+        case .removeContents:
             switch item.admission {
-            case .category:
+            case .category(let category):
+                // A command-backed category can never route through file
+                // deletion: pre-unification, the category's OWN declaration
+                // decided the path (`cleanCommands` beat contents mode), so
+                // an action/category mismatch here can only be a forged or
+                // corrupted item.
+                if category.cleanCommands != nil {
+                    return "refused: a command-backed category cleans via its declared commands, never file deletion"
+                }
+                return nil
+            case .containerItem:
+                return "refused: a \(item.action.wireString) item must carry category admission provenance"
+            }
+        case .commands(let payload):
+            switch item.admission {
+            case .category(let category):
+                // Command argv is TRUSTED REGISTRY CODE (`Categories.swift`)
+                // — never item input. The payload riding the action must BE
+                // the category's declaration; dispatch then executes the
+                // CATEGORY's argv, so a crafted payload gains nothing even
+                // if this refusal were bypassed.
+                if category.cleanCommands != payload {
+                    return "refused: the item's argv payload does not match the category's declared cleanCommands"
+                }
                 return nil
             case .containerItem:
                 return "refused: a \(item.action.wireString) item must carry category admission provenance"

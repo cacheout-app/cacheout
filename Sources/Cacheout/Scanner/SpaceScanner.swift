@@ -508,7 +508,11 @@ struct SpaceScannerRuntime {
     ///     binding, any scanner could invent a `CacheCategory` whose
     ///     declared roots or clean commands sit outside every
     ///     registration-derived policy — exactly the admission-widening the
-    ///     runtime exists to prevent.
+    ///     runtime exists to prevent. Action/argv COHERENCE rides the same
+    ///     check (fn-2.3): a `.commands` payload must equal the category's
+    ///     declared `cleanCommands` (argv is registry code, never item
+    ///     input) and a command-backed category can never carry
+    ///     `.removeContents`.
     ///
     /// Any violation replaces the WHOLE outcome with a synthesized path-less
     /// `.malformedOutcome` issue — nothing from a malformed outcome is
@@ -600,6 +604,26 @@ struct SpaceScannerRuntime {
                     return "category '\(carried.slug)' is not the registered "
                         + "category for that slug — provenance is a claim, "
                         + "and only registered categories are trusted"
+                }
+                // Action/argv coherence (fn-2.3 defense-in-depth, mirrored
+                // by the cleaner): command argv is TRUSTED REGISTRY CODE —
+                // a `.commands` payload must BE the carried category's
+                // declaration, and a command-backed category can never
+                // route through `.removeContents` file deletion.
+                switch item.action {
+                case .commands(let payload):
+                    if carried.cleanCommands != payload {
+                        return "a commands item's argv must equal its "
+                            + "category's declared cleanCommands — argv is "
+                            + "registry code, never item input"
+                    }
+                case .removeContents:
+                    if carried.cleanCommands != nil {
+                        return "a command-backed category must carry the "
+                            + "commands action, never remove_contents"
+                    }
+                case .removeItem:
+                    break // unreachable — the outer switch splits it out
                 }
             case .containerItem:
                 return "a \(item.action.wireString) item must carry category "

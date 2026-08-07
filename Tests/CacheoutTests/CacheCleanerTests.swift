@@ -1931,6 +1931,73 @@ final class CacheCleanerTests: XCTestCase {
         )
     }
 
+    func testForgedArgvPayloadRefusedCommandArgvIsRegistryCode() async throws {
+        let cmdRoot = try makeTempDir("cmd-forged-argv")
+        defer { try? FileManager.default.removeItem(at: cmdRoot) }
+        let declaredMarker = cmdRoot.appendingPathComponent("declared.marker")
+        let forgedMarker = cmdRoot.appendingPathComponent("forged.marker")
+
+        // The category DECLARES one argv; the item's action payload carries
+        // a DIFFERENT one. Command argv is trusted registry code — a
+        // payload that is not the category's declaration is a structural
+        // refusal, and NOTHING executes.
+        let category = makeCategory(
+            at: [cmdRoot], name: "cmd-forged",
+            cleanCommands: [["/usr/bin/touch", declaredMarker.path]]
+        )
+        let item = makeItem(
+            id: "cmd-forged", scannerID: "categories",
+            displayName: "cmd-forged",
+            exact: 2048, records: [makeRecord(cmdRoot)],
+            action: .commands([["/usr/bin/touch", forgedMarker.path]]),
+            admission: .category(category)
+        )
+
+        let cleaner = CacheCleaner()
+        let report = await cleaner.clean(items: [item], moveToTrash: false)
+
+        XCTAssertTrue(report.entries.isEmpty)
+        XCTAssertEqual(report.errors.count, 1)
+        XCTAssertEqual(report.errors.first?.key, item.key)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: forgedMarker.path),
+                       "the forged argv must never execute")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: declaredMarker.path),
+                       "a malformed item is refused wholesale — not silently substituted")
+    }
+
+    func testCommandBackedCategoryCannotRouteThroughRemoveContents() async throws {
+        let cmdRoot = try makeTempDir("cmd-as-contents")
+        defer { try? FileManager.default.removeItem(at: cmdRoot) }
+        try writeFile(cmdRoot.appendingPathComponent("keep.bin"))
+
+        // A command-backed category carried under `.removeContents`: the
+        // category's own declaration decides the clean path, so this
+        // mismatch can only be a forged or corrupted item — refused, no
+        // file deletion.
+        let category = makeCategory(
+            at: [cmdRoot], name: "cmd-as-contents",
+            cleanCommands: [["/usr/bin/true"]]
+        )
+        let item = makeItem(
+            id: "cmd-as-contents", scannerID: "categories",
+            displayName: "cmd-as-contents",
+            records: [makeRecord(cmdRoot)],
+            action: .removeContents,
+            admission: .category(category)
+        )
+
+        let cleaner = CacheCleaner()
+        let report = await cleaner.clean(items: [item], moveToTrash: false)
+
+        XCTAssertTrue(report.entries.isEmpty)
+        XCTAssertEqual(report.errors.count, 1)
+        XCTAssertEqual(report.errors.first?.key, item.key)
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: cmdRoot.appendingPathComponent("keep.bin").path),
+            "a command category must never be routed through file deletion"
+        )
+    }
+
     func testMalformedMissingItemRefusedButWellFormedMissingSkips() async throws {
         let base = try makeTempDir()
         defer { try? FileManager.default.removeItem(at: base) }

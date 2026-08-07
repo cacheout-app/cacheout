@@ -435,6 +435,18 @@ actor CacheCleaner {
             at: child, mode: .deletionTarget,
             knownInodes: await registry.knownIdentities
         )
+
+        // A child that is ITSELF a mount boundary (mount point, or foreign
+        // device vs its parent) is refused outright — `validateContainedChild`
+        // is descendant-only by design, so this is where the mount rule lands
+        // for category children (R15). Item mode gets the same refusal from
+        // `validateRemovableItem`'s deny-list re-check.
+        if report.rootMountBoundary {
+            let detail = "\(child.path): mount boundary — refused, not deleted"
+            logRefusal(category: category, tag: "mount_boundary", detail: detail)
+            return .failed(detail)
+        }
+
         let token = await registry.registerObservations(report.claims)
 
         do {

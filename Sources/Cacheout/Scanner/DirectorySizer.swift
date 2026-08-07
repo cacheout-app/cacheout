@@ -105,6 +105,10 @@ struct SizeReport {
     var denials: [SizeDenial] = []
     /// Directories recorded as mount boundaries; their subtrees are uncounted.
     var mountBoundaries: [URL] = []
+    /// The measured root ITSELF is a mount boundary (mount point, or device
+    /// mismatch against its parent). The tree was never enumerated; a
+    /// `.deletionTarget` caller must refuse to delete it (R15).
+    var rootMountBoundary: Bool = false
     /// Non-regular, non-directory, non-symlink entries (fifos, sockets, …)
     /// recorded as skips.
     var skippedSpecialFiles: [URL] = []
@@ -183,7 +187,21 @@ struct DirectorySizer {
                 claimedInodes: &claimed, report: &report
             )
         case .kind(.directory):
-            report = enumerateTree(at: resolved, knownInodes: knownInodes)
+            // The root itself can be a mount boundary — the within-walk check
+            // only sees entries YIELDED by the enumerator, so a mount-point
+            // target handed directly to `measure` would otherwise be walked
+            // (and, in `.deletionTarget` mode, deleted through). Both signals,
+            // same as the within-walk rule (R15).
+            let parent = resolved.deletingLastPathComponent()
+            let device = provider.deviceID(of: resolved)
+            let parentDevice = provider.deviceID(of: parent)
+            if (device != nil && parentDevice != nil && device != parentDevice)
+                || provider.isMountPoint(resolved) {
+                report.rootMountBoundary = true
+                report.mountBoundaries.append(resolved)
+            } else {
+                report = enumerateTree(at: resolved, knownInodes: knownInodes)
+            }
         case .kind(.other):
             report.skippedSpecialFiles.append(resolved)
         }

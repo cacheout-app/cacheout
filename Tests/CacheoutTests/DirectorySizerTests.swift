@@ -444,6 +444,47 @@ final class DirectorySizerTests: XCTestCase {
         XCTAssertEqual(report.exactAllocatedBytes, allocated(local))
         XCTAssertEqual(report.itemCount, 1)
     }
+
+    func testDeletionTargetThatIsAMountPointIsABoundaryNotAWalk() throws {
+        // The within-walk check only sees entries the enumerator yields — a
+        // mount-point directory handed DIRECTLY to measure must be refused at
+        // the root, or the cleaner would delete through it (R15).
+        let target = base.appendingPathComponent("mounted-target")
+        try mkdir(target)
+        try writeFile(target.appendingPathComponent("payload.bin"), bytes: 8_192)
+
+        let provider = MountPointInjectingProvider()
+        let inode = try XCTUnwrap(provider.identity(of: target)?.inode)
+        provider.mountPointInodes.insert(inode)
+
+        let report = makeSizer(provider: provider)
+            .measure(at: target, mode: .deletionTarget)
+
+        XCTAssertTrue(report.rootMountBoundary)
+        XCTAssertEqual(report.mountBoundaries.count, 1)
+        XCTAssertEqual(report.measuredBytes, 0, "payload beneath never counted")
+        XCTAssertEqual(report.itemCount, 0, "tree never enumerated")
+        XCTAssertTrue(report.claims.isEmpty, "nothing claimable behind a boundary")
+    }
+
+    func testDeletionTargetOnForeignDeviceIsABoundaryNotAWalk() throws {
+        // Same rule via the OTHER signal: the target's device differs from
+        // its parent's (a real mounted volume, not a firmlink).
+        let target = base.appendingPathComponent("foreign-target")
+        try mkdir(target)
+        try writeFile(target.appendingPathComponent("payload.bin"), bytes: 8_192)
+
+        let provider = DeviceRemappingProvider()
+        let inode = try XCTUnwrap(provider.identity(of: target)?.inode)
+        provider.deviceOverridesByInode[inode] = 0xDEAD_BEEF
+
+        let report = makeSizer(provider: provider)
+            .measure(at: target, mode: .deletionTarget)
+
+        XCTAssertTrue(report.rootMountBoundary)
+        XCTAssertEqual(report.measuredBytes, 0)
+        XCTAssertEqual(report.itemCount, 0)
+    }
 }
 
 /// `CacheScanner` scan-time admission + `ScanResult` state derivation

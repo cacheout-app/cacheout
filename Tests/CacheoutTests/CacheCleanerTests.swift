@@ -635,6 +635,42 @@ final class CacheCleanerTests: XCTestCase {
                       "a cross-device item must not be deleted")
     }
 
+    func testCategoryChildThatIsAMountBoundaryIsRefusedNotDeleted() async throws {
+        // `validateContainedChild` is descendant-only by design, so the mount
+        // rule for category children lands via the sizer's root-boundary
+        // check: a direct child that IS a mount boundary must be refused, not
+        // enumerated-and-deleted (R15 completion-review gap).
+        let root = try makeTempDir("mount-child-root")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let mounted = root.appendingPathComponent("mounted-volume")
+        let normal = root.appendingPathComponent("normal-cache")
+        try FileManager.default.createDirectory(at: mounted, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: normal, withIntermediateDirectories: true)
+        try writeFile(mounted.appendingPathComponent("payload.bin"))
+        try writeFile(normal.appendingPathComponent("cache.bin"))
+
+        let provider = DeviceInjectingProvider()
+        provider.overrides = [(provider.canonicalize(mounted).path, 0xBEEF)]
+
+        let category = makeCategory(at: root, name: "mount-child")
+        let cleaner = CacheCleaner(provider: provider)
+        let report = await cleaner.clean(
+            results: [makeScanResult(category: category)], moveToTrash: false
+        )
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: mounted.path),
+                      "a mount-boundary child must not be deleted")
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: mounted.appendingPathComponent("payload.bin").path
+            ),
+            "nothing beneath the boundary may be touched"
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: normal.path),
+                       "siblings are still cleaned (per-child isolation)")
+        XCTAssertEqual(report.errors.count, 1)
+    }
+
     // MARK: - cleanCommands root admission (R17)
 
     func testInadmissibleCleanCommandsRootBlocksExecution() async throws {

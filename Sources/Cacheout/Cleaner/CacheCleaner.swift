@@ -24,9 +24,12 @@
 ///    `AdmittedRoot.resolvedURL`, and the chain is re-validated immediately
 ///    before each destructive call (TOCTOU narrowing).
 /// 4. **cleanCommands (R17)**: every resolved root is admitted BEFORE any
-///    argv runs; one refusal skips the whole command set. Paths that appear
-///    INSIDE a command's argv are trusted registry code (`Categories.swift`),
-///    not runtime input — admission covers the roots the category operates on.
+///    argv runs; one refusal skips the whole command set, and an EMPTY
+///    delete-time resolution (roots vanished since the scan) is itself a
+///    refusal — a vacuous admission pass never launches argv. Paths that
+///    appear INSIDE a command's argv are trusted registry code
+///    (`Categories.swift`), not runtime input — admission covers the roots
+///    the category operates on.
 ///
 /// ## Freed-bytes accounting (D1/R8)
 ///
@@ -58,8 +61,10 @@
 ///
 /// Categories with `cleanCommands` (e.g., Simulator Devices) bypass file
 /// deletion entirely. Each command runs directly via `/usr/bin/env` with an
-/// argv array (never a shell), a 30-second timeout, and a restricted `PATH`
-/// environment. If a command times out, the process is terminated and an
+/// argv array (never a shell), a 30-second timeout, and a restricted
+/// environment: an allowlisted `PATH` plus `HOME` pinned to the injected
+/// home, so commands stay anchored to the same seam as discovery and
+/// admission. If a command times out, the process is terminated and an
 /// error is reported.
 ///
 /// ## Cleanup Logging
@@ -290,7 +295,20 @@ actor CacheCleaner {
         // probed root that drifted outside the category's policy blocks the
         // whole command set (R17). Resolution anchors to the same injected
         // home the policy does.
-        for url in result.category.resolvedPaths(home: home) {
+        let roots = result.category.resolvedPaths(home: home)
+
+        // A category whose roots all vanished (or became undiscoverable)
+        // between scan and confirmation resolves to NOTHING here — and a
+        // vacuous admission pass must never launch destructive argv (e.g.
+        // `simctl erase all` with no admitted Simulator root). Refuse the
+        // whole command set instead of falling through.
+        guard !roots.isEmpty else {
+            let reason = "clean commands not run — no category root resolved at delete time"
+            logRefusal(category: name, tag: "no-resolved-root", detail: reason)
+            return (nil, [(name, reason)])
+        }
+
+        for url in roots {
             do {
                 let admitted = try pathGuard.admitDeletionRoot(url, policy: policy)
                 logDriftAdmission(admitted, category: name)
@@ -642,9 +660,13 @@ actor CacheCleaner {
         process.arguments = args
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
+        // HOME anchors to the same injected home as discovery, admission,
+        // and logging — a command that consults $HOME must see the fixture
+        // home in tests, never the real account (mirrors the probe
+        // environment in `CacheCategory`).
         process.environment = [
             "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin",
-            "HOME": FileManager.default.homeDirectoryForCurrentUser.path
+            "HOME": home.path
         ]
 
         try process.run()

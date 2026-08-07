@@ -833,6 +833,36 @@ final class CacheCleanerTests: XCTestCase {
                       "the refusal must be logged")
     }
 
+    func testVanishedCleanCommandsRootRefusesExecution() async throws {
+        let home = try makeTempDir("cmd-home-vanished")
+        defer { try? FileManager.default.removeItem(at: home) }
+        let marker = home.appendingPathComponent("command-ran.marker")
+
+        // The category's only root does not exist at clean time — modeling a
+        // directory that vanished between scan and confirmation. Delete-time
+        // resolution is therefore empty, so the admission loop would pass
+        // vacuously; the cleaner must refuse instead of running the argv.
+        let vanished = home.appendingPathComponent("vanished-root")
+        let category = makeCategory(
+            at: [vanished], name: "cmd-vanished",
+            cleanCommands: [["/usr/bin/touch", marker.path]]
+        )
+        // The scan result still claims measurable content (captured before
+        // the root disappeared) and is selected.
+        let cleaner = CacheCleaner(home: home)
+        let report = await cleaner.clean(
+            results: [makeScanResult(category: category, size: 4096)],
+            moveToTrash: false
+        )
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path),
+                       "commands must NOT execute when no root resolves at delete time")
+        XCTAssertTrue(report.entries.isEmpty)
+        XCTAssertEqual(report.errors.count, 1)
+        XCTAssertTrue(logContents(home: home).contains("REFUSED [no-resolved-root]"),
+                      "the empty-resolution refusal must be logged")
+    }
+
     func testAdmissibleCleanCommandsRootRunsAndReportsEstimatedBytes() async throws {
         let home = try makeTempDir("cmd-home-ok")
         let cmdRoot = try makeTempDir("cmd-root")
@@ -859,6 +889,40 @@ final class CacheCleanerTests: XCTestCase {
                        "nothing measures what a command frees — exact is 0")
         XCTAssertEqual(report.entries.first?.estimatedUpToBytes, 2048,
                        "command categories report the pre-scan size as estimated")
+    }
+
+    func testCleanCommandObservesInjectedHome() async throws {
+        let home = try makeTempDir("cmd-home-env")
+        let cmdRoot = try makeTempDir("cmd-root-env")
+        defer {
+            try? FileManager.default.removeItem(at: home)
+            try? FileManager.default.removeItem(at: cmdRoot)
+        }
+        let capture = cmdRoot.appendingPathComponent("observed-home.txt")
+
+        // The command itself consults $HOME — it must see the injected
+        // fixture home, never the real account, or a hermetic run could
+        // operate on the real user's data.
+        let category = makeCategory(
+            at: [cmdRoot], name: "cmd-env",
+            cleanCommands: [
+                ["/bin/sh", "-c", "printf %s \"$HOME\" > '\(capture.path)'"]
+            ]
+        )
+        let cleaner = CacheCleaner(home: home)
+        let report = await cleaner.clean(
+            results: [makeScanResult(category: category, size: 1024)],
+            moveToTrash: false
+        )
+
+        XCTAssertTrue(report.errors.isEmpty, "unexpected errors: \(report.errors)")
+        let observed = try String(contentsOf: capture, encoding: .utf8)
+        XCTAssertEqual(observed, home.path,
+                       "clean commands must observe the injected home")
+        XCTAssertNotEqual(
+            observed, FileManager.default.homeDirectoryForCurrentUser.path,
+            "clean commands must not leak the real account home"
+        )
     }
 
     // MARK: - Per-child isolation (R10)

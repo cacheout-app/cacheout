@@ -349,6 +349,10 @@ class CacheoutViewModel: ObservableObject {
         process.arguments = ["docker", "system", "prune", "-f"]
         process.standardOutput = pipe
         process.standardError = pipe
+        // Real home is correct here: the view model has no injected-home
+        // seam — docker prune is a production-only action on the real
+        // account (unlike CacheCleaner/CacheCategory subprocesses, which
+        // pin HOME to their injected home).
         process.environment = [
             "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin",
             "HOME": FileManager.default.homeDirectoryForCurrentUser.path

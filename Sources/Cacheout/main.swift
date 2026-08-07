@@ -28,7 +28,7 @@
 /// # CLI mode
 /// Cacheout --cli scan
 /// Cacheout --cli clean xcode_derived_data npm_cache --dry-run
-/// Cacheout --cli smart-clean 5.0
+/// Cacheout --cli smart-clean 5.0 --confirm
 /// Cacheout --cli disk-info
 ///
 /// # Daemon mode

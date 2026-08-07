@@ -177,7 +177,7 @@ final class CacheCleanerTests: XCTestCase {
         )
 
         XCTAssertTrue(report.errors.isEmpty, "unexpected errors: \(report.errors)")
-        XCTAssertEqual(report.cleaned.count, 1)
+        XCTAssertEqual(report.entries.count, 1)
         XCTAssertTrue(FileManager.default.fileExists(atPath: tmp.path),
                       "parent directory must survive — recreated by tools/apps that depend on it")
         let remaining = try FileManager.default.contentsOfDirectory(atPath: tmp.path)
@@ -247,7 +247,7 @@ final class CacheCleanerTests: XCTestCase {
         let report = await cleaner.clean(results: [], nodeModules: items, moveToTrash: false)
 
         XCTAssertTrue(report.errors.isEmpty, "unexpected errors: \(report.errors)")
-        XCTAssertEqual(report.cleaned.count, items.count)
+        XCTAssertEqual(report.entries.count, items.count)
         for item in items {
             XCTAssertFalse(FileManager.default.fileExists(atPath: item.nodeModulesPath.path),
                            "expected \(item.nodeModulesPath.path) removed")
@@ -286,7 +286,7 @@ final class CacheCleanerTests: XCTestCase {
 
         XCTAssertEqual(report.errors.count, 1, "exactly one missing item should surface as error")
         XCTAssertEqual(report.errors.first?.category, "node_modules: ghost")
-        XCTAssertEqual(report.cleaned.count, 2, "the two real items should still be cleaned")
+        XCTAssertEqual(report.entries.count, 2, "the two real items should still be cleaned")
         XCTAssertFalse(FileManager.default.fileExists(atPath: goodA.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: goodB.path))
     }
@@ -312,7 +312,7 @@ final class CacheCleanerTests: XCTestCase {
         let cleaner = CacheCleaner(containerRoots: [root])
         let report = await cleaner.clean(results: [], nodeModules: [item], moveToTrash: false)
 
-        XCTAssertTrue(report.cleaned.isEmpty)
+        XCTAssertTrue(report.entries.isEmpty)
         XCTAssertTrue(report.errors.isEmpty)
         XCTAssertTrue(FileManager.default.fileExists(atPath: kept.path),
                       "unselected items must not be touched")
@@ -1001,10 +1001,10 @@ final class CacheCleanerTests: XCTestCase {
         // Aggregates are pure sums of entry components.
         XCTAssertEqual(report.totalFreedExact, expectedExact)
         XCTAssertEqual(report.totalEstimatedUpTo, expectedEstimated + 2048)
-        // Compatibility surface stays coherent with the split model.
-        XCTAssertEqual(report.totalFreed, report.totalFreedExact + report.totalEstimatedUpTo)
+        // Entry compatibility sums stay coherent with the split aggregates.
         XCTAssertEqual(
-            report.cleaned.map(\.bytesFreed).reduce(0, +), report.totalFreed
+            report.entries.map(\.bytesFreed).reduce(0, +),
+            report.totalFreedExact + report.totalEstimatedUpTo
         )
     }
 

@@ -36,9 +36,9 @@
 /// never claims "Freed" (the bytes return only when the Trash is emptied),
 /// and a run where nothing succeeded never claims success.
 ///
-/// `cleaned`/`totalFreed`/`formattedTotal` remain as a compatibility surface
-/// for pre-split callers (CLI JSON until fn-1.5 — the GUI sheet migrated to
-/// `entries`/`headline` in fn-1.4).
+/// The pre-split compatibility surface (`cleaned`/`totalFreed`/
+/// `formattedTotal`) was retired in fn-1.5 once the CLI JSON moved onto the
+/// split entries — every consumer now derives from the components.
 
 import Foundation
 
@@ -284,15 +284,5 @@ struct CleanupReport {
         }
         return "\(format.string(fromByteCount: exact))"
             + " + up to \(format.string(fromByteCount: estimatedUpTo)) more"
-    }
-
-    // MARK: Compatibility surface (pre-split callers)
-
-    var cleaned: [(category: String, bytesFreed: Int64)] {
-        entries.map { ($0.category, $0.bytesFreed) }
-    }
-    var totalFreed: Int64 { totalFreedExact + totalEstimatedUpTo }
-    var formattedTotal: String {
-        ByteCountFormatter.sharedFile.string(fromByteCount: totalFreed)
     }
 }

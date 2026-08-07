@@ -1,8 +1,8 @@
 # CacheOut CLI Protocol
 
-**Version:** 1.0.0
-**Schema Version:** 2
-**Last Updated:** 2026-03-10
+**Version:** 1.1.0
+**Schema Version:** 3
+**Last Updated:** 2026-08-06
 
 This document defines the interface contract between the CacheOut macOS application (`cacheout`) and the MCP server (`cacheout-mcp`). Both repositories reference this protocol. Changes must be coordinated across both repos.
 
@@ -29,8 +29,8 @@ The MCP server discovers CacheOut capabilities before invoking commands. This en
 
 ```json
 {
-  "version": "2.0.0",
-  "schema_version": 2,
+  "version": "2.2.0",
+  "schema_version": 3,
   "mode": "cli",
   "app": "Cacheout",
   "helper_installed": true,
@@ -63,6 +63,8 @@ The MCP server discovers CacheOut capabilities before invoking commands. This en
 
 **MCP server behavior:** Before calling any CLI command, check that the command name appears in `capabilities`. If absent, skip the call and return a user-friendly message indicating the feature requires a newer CacheOut version.
 
+**Schema 3 gate:** When `schema_version >= 3`, `clean` and `smart-clean` are gated behind `--confirm` — an invocation without it exits 1 with a `CONFIRMATION_REQUIRED` error carrying the cleaning plan in `details`. Callers that intend to delete MUST pass `--confirm`; callers that only want a preview MUST pass `--dry-run`. There is no environment-variable bypass.
+
 ---
 
 ## CLI Commands
@@ -80,8 +82,8 @@ Cacheout --cli <command> [arguments] [flags]
 | `version` | Application version and capabilities | Existing | No |
 | `disk-info` | Boot volume disk space | Existing | No |
 | `scan` | Scan all cache categories | Existing | No |
-| `clean <slugs...>` | Delete specific cache categories | Existing | No |
-| `smart-clean <gb>` | Auto-clean safe categories to free target GB | Existing | No |
+| `clean <slugs...> [--confirm\|--dry-run]` | Delete specific cache categories (destructive — requires `--confirm` since schema 3) | Existing | No |
+| `smart-clean <gb> [--confirm\|--dry-run]` | Auto-clean safe categories to free target GB (destructive — requires `--confirm` since schema 3) | Existing | No |
 | `spotlight` | Tag cache directories with Spotlight metadata | Existing | No |
 | `memory-stats` | System memory statistics | Existing | No |
 | `purge` | Run `/usr/sbin/purge` and report delta | Existing | No |
@@ -125,7 +127,11 @@ Returns boot volume disk space information.
 
 ### `--cli scan`
 
-Scans all cache categories and returns results.
+Scans all cache categories and returns results. Since schema 3 every entry
+carries the scan STATE and the SPLIT byte components (additive on the v2
+shape): `exact_bytes` are bytes on unique inodes whose deletion verifiably
+frees them; `estimated_up_to_bytes` are hardlinked bytes that MAY be freed.
+`size_bytes` remains their compatibility sum.
 
 **Output schema (array):**
 
@@ -140,48 +146,133 @@ Scans all cache categories and returns results.
     "exists": true,
     "risk_level": "safe",
     "description": "Build artifacts regenerated on next build",
-    "rebuild_note": "Xcode rebuilds automatically"
+    "rebuild_note": "Xcode rebuilds automatically",
+    "state": "measured",
+    "exact_bytes": 15000000000,
+    "estimated_up_to_bytes": 32000000
   }
 ]
+```
+
+A category whose scan was impeded additionally carries `scan_error` (and,
+for TCC denials only, `grant_hint`):
+
+```json
+{
+  "slug": "browser_caches",
+  "state": "denied",
+  "exact_bytes": 0,
+  "estimated_up_to_bytes": 0,
+  "size_bytes": 0,
+  "scan_error": {
+    "kind": "tcc_denied",
+    "message": "Operation not permitted"
+  },
+  "grant_hint": "macOS denied access without prompting (TCC). Grant Full Disk Access to this binary (or your terminal) in System Settings > Privacy & Security > Full Disk Access, then rescan."
+}
 ```
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `slug` | string | yes | Machine-readable category identifier |
 | `name` | string | yes | Human-readable category name |
-| `size_bytes` | integer | yes | Size in bytes |
+| `size_bytes` | integer | yes | Compatibility sum: `exact_bytes + estimated_up_to_bytes` |
 | `size_human` | string | yes | Human-readable size |
 | `item_count` | integer | yes | Number of items found |
-| `exists` | boolean | yes | Whether the cache directory exists |
+| `exists` | boolean | yes | Compatibility: `state != "missing"` — a `"denied"` category still "exists" |
 | `risk_level` | string | yes | One of: `"safe"`, `"review"`, `"caution"` |
 | `description` | string | yes | What this cache category contains |
 | `rebuild_note` | string | yes | How this cache is regenerated |
+| `state` | string | yes | One of: `"missing"`, `"empty"`, `"measured"`, `"partiallyDenied"`, `"denied"`. A `"denied"` category was NOT measured — its zero size must never be read as "nothing there" |
+| `exact_bytes` | integer | yes | Bytes on unique inodes — deletion verifiably frees them |
+| `estimated_up_to_bytes` | integer | yes | Bytes on hardlinked inodes — freed only if every other link goes too |
+| `scan_error` | object | no | Present only for `"denied"`/`"partiallyDenied"`. `kind` is one of `"admission_refused"`, `"tcc_denied"`, `"permission_denied"`, `"other"`; `message` is human-readable |
+| `grant_hint` | string | no | Present only when `scan_error.kind == "tcc_denied"` — the user-side remedy (Full Disk Access), since macOS denies CLI processes silently |
 
 ---
 
-### `--cli clean <slugs...> [--dry-run]`
+### `--cli clean <slugs...> [--confirm|--dry-run]`
 
-Cleans the specified cache categories by slug.
+Cleans the specified cache categories by slug. **Destructive — since schema 3
+it requires `--confirm`.**
 
 **Arguments:**
 - `<slugs...>` -- One or more category slugs (from `scan` output)
-- `--dry-run` -- Preview what would be cleaned without deleting
+- `--confirm` -- Actually delete. Without it the command refuses (below)
+- `--dry-run` -- Preview without deleting (needs no `--confirm`; wins even beside it)
 
 Slugs that do not match any known category cause an `INVALID_ARGUMENTS` error
-naming the unknown slug(s); no cleaning is performed in that case.
+naming the unknown slug(s); no cleaning is performed in that case. Running as
+root (euid 0) is refused outright with a `ROOT_REFUSED` error, `--confirm` or
+not.
 
-**Output schema:**
+#### Confirmation gate (schema 3)
+
+An unconfirmed, non-dry-run invocation deletes NOTHING: **stdout is empty**,
+the exit code is 1, and stderr carries the standard error envelope with the
+cleaning plan — the same per-category decisions the confirmed run would take —
+under `details`:
+
+```json
+{
+  "ok": false,
+  "error": {
+    "code": "CONFIRMATION_REQUIRED",
+    "message": "clean deletes cache contents and requires --confirm (preview with --dry-run)"
+  },
+  "details": {
+    "command": "clean",
+    "plan": [
+      {
+        "slug": "npm_cache",
+        "name": "npm Cache",
+        "state": "measured",
+        "action": "clean",
+        "exact_bytes": 2035888128,
+        "estimated_up_to_bytes": 0
+      }
+    ],
+    "total_exact_bytes": 2035888128,
+    "total_estimated_up_to_bytes": 0
+  }
+}
+```
+
+| Details field | Type | Description |
+|---------------|------|-------------|
+| `command` | string | `"clean"` or `"smart-clean"` |
+| `plan` | object[] | One entry per requested slug (scan-time components — no re-walk) |
+| `plan[].state` | string | The scan state (see `scan`) |
+| `plan[].action` | string | What the confirmed run would do: `"clean"`, `"clean_with_warning"` (`partiallyDenied` — measured bytes only), `"refuse"` (`denied`), or `"skip"` (missing/empty) |
+| `plan[].exact_bytes` | integer | Scan-time exact component |
+| `plan[].estimated_up_to_bytes` | integer | Scan-time estimated component |
+| `plan[].warning` | string | Present for `partiallyDenied` entries |
+| `plan[].scan_error` | object | Present when the scan was impeded (same shape as `scan`) |
+| `total_exact_bytes` | integer | Sum of exact bytes over entries that would clean |
+| `total_estimated_up_to_bytes` | integer | Sum of estimated bytes over entries that would clean |
+
+#### Confirmed output (schema 3)
+
+Byte totals are **exact-only**: `total_freed_bytes` counts delete-time
+measured unique-inode bytes; hardlinked/command-freed bytes appear in the
+additive `total_estimated_up_to_bytes` and are never folded into the total.
+`results` carries one entry per requested slug — including slugs that had
+nothing to do (`success: true`, zero bytes).
 
 ```json
 {
   "dry_run": false,
   "total_freed_bytes": 13204889600,
-  "total_freed": "13.2 GB",
+  "total_estimated_up_to_bytes": 32000000,
+  "total_freed": "13.2 GB + up to 32 MB more",
   "results": [
     {
       "category": "xcode_derived_data",
+      "name": "Xcode Derived Data",
       "bytes_freed": 13204889600,
-      "freed_human": "13.2 GB",
+      "exact_bytes": 13204889600,
+      "estimated_up_to_bytes": 32000000,
+      "freed_human": "13.2 GB + up to 32 MB more",
       "success": true
     }
   ]
@@ -191,27 +282,58 @@ naming the unknown slug(s); no cleaning is performed in that case.
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `dry_run` | boolean | yes | Whether this was a dry run |
-| `total_freed_bytes` | integer | yes | Total bytes freed (0 if dry run) |
-| `total_freed` | string | yes | Human-readable total freed |
-| `results` | object[] | yes | Per-category results |
-| `results[].category` | string | yes | Category slug |
-| `results[].bytes_freed` | integer | yes | Bytes freed for this category |
-| `results[].freed_human` | string | yes | Human-readable bytes freed |
-| `results[].success` | boolean | yes | Whether the clean succeeded |
-| `results[].error` | string | no | Error message if `success` is false |
+| `total_freed_bytes` | integer | yes | **Exact bytes only** (schema 3 — was the mixed sum in v2) |
+| `total_estimated_up_to_bytes` | integer | yes | Hardlinked/command bytes that MAY have been freed |
+| `total_freed` | string | yes | Human-readable component phrase (e.g. `"13.2 GB + up to 32 MB more"`) |
+| `results` | object[] | yes | One entry per requested slug |
+| `results[].category` | string | yes | Category **slug** (schema 3 — v2 emitted the display name here despite this document) |
+| `results[].name` | string | yes | Human-readable category name |
+| `results[].bytes_freed` | integer | yes | Exact bytes freed for this category (== `exact_bytes`) |
+| `results[].exact_bytes` | integer | yes | Delete-time measured unique-inode bytes |
+| `results[].estimated_up_to_bytes` | integer | yes | Delete-time hardlinked / command-category bytes |
+| `results[].freed_human` | string | yes | Human-readable component phrase |
+| `results[].success` | boolean | yes | `false` iff the category reported at least one error |
+| `results[].error` | string | no | Error message(s), `"; "`-joined, when `success` is false |
+| `results[].warning` | string | no | Present when the category scanned `partiallyDenied` — only measured bytes were cleaned/reported |
 
-**Dry run output** uses `bytes_would_free` instead of `bytes_freed`:
+**Denied-state slugs:** naming a `denied` category is a per-item error
+(`success: false`, `error` explains the scan-time refusal — TCC, permissions,
+or admission), never a silent skip. Naming a `partiallyDenied` category
+proceeds but carries `warning`. The `smart-clean` auto path skips both.
+
+#### Exit-code policy (schema 3)
+
+| Outcome | Exit | stdout | stderr |
+|---------|------|--------|--------|
+| Everything succeeded (or nothing to do) | 0 | result JSON | empty |
+| PARTIAL failure — some slugs errored, or some bytes freed despite errors | 0 | result JSON with per-item `success` flags | empty |
+| TOTAL failure — every requested slug errored and nothing was freed | 1 | empty | `CLEAN_FAILED` envelope; `details.results` carries the per-item errors |
+| Unconfirmed (no `--confirm`, no `--dry-run`) | 1 | empty | `CONFIRMATION_REQUIRED` envelope with `details.plan` |
+| Running as root (euid 0) | 1 | empty | `ROOT_REFUSED` envelope |
+| Unknown slug | 1 | empty | `INVALID_ARGUMENTS` envelope |
+
+#### Dry run (schema 3)
+
+Non-destructive; built from the SCAN-TIME split components (no re-walk).
+`bytes_would_free`/`total_would_free` count **exact bytes only**; estimated
+bytes ride in the additive fields. Entries reuse the plan shape (`state`,
+`action`, components):
 
 ```json
 {
   "dry_run": true,
   "total_would_free": 13204889600,
+  "total_estimated_up_to_bytes": 32000000,
   "results": [
     {
       "slug": "xcode_derived_data",
       "name": "Xcode Derived Data",
+      "state": "measured",
+      "action": "clean",
       "bytes_would_free": 13204889600,
-      "freed_human": "13.2 GB"
+      "exact_bytes": 13204889600,
+      "estimated_up_to_bytes": 32000000,
+      "freed_human": "13.2 GB + up to 32 MB more"
     }
   ]
 }
@@ -219,13 +341,29 @@ naming the unknown slug(s); no cleaning is performed in that case.
 
 ---
 
-### `--cli smart-clean <gb> [--dry-run]`
+### `--cli smart-clean <gb> [--confirm|--dry-run]`
 
-Automatically cleans safe categories until the target GB of free space is reclaimed.
+Automatically cleans safe categories until the target GB of free space is
+reclaimed. **Destructive — since schema 3 it requires `--confirm`**, with the
+same confirmation gate, `ROOT_REFUSED` euid-0 refusal, and exit-code policy
+as `clean` (the `CONFIRMATION_REQUIRED` details carry `"command":
+"smart-clean"`, `target_gb`, the `plan`, and the projected `target_met`).
 
 **Arguments:**
-- `<gb>` -- Target gigabytes to free (floating point)
-- `--dry-run` -- Preview what would be cleaned without deleting
+- `<gb>` -- Target gigabytes to free (floating point; default 5.0)
+- `--confirm` -- Actually delete
+- `--dry-run` -- Preview without deleting (needs no `--confirm`)
+
+**Candidate policy (schema 3):** only cleanly-`measured` categories with
+bytes qualify. Categories that scanned `denied` or `partiallyDenied` are
+skipped (the auto path never rides on a floor measurement), as are
+caution-risk categories. Safe risk sorts before review; larger first within a
+tier.
+
+**Target semantics (schema 3):** only EXACT bytes advance `target_met` —
+delete-time measured unique-inode bytes on a real run, scan-time exact
+components on a dry run (no re-walk). A hardlink-heavy category may be
+cleaned, but its `estimated_up_to_bytes` never mark the target met.
 
 **Output schema:**
 
@@ -234,13 +372,18 @@ Automatically cleans safe categories until the target GB of free space is reclai
   "target_gb": 10.0,
   "target_met": true,
   "total_freed_bytes": 13204889600,
+  "total_estimated_up_to_bytes": 0,
   "total_freed": "13.2 GB",
   "dry_run": false,
   "cleaned": [
     {
+      "slug": "xcode_derived_data",
       "name": "Xcode Derived Data",
       "bytes_freed": 13204889600,
-      "freed_human": "13.2 GB"
+      "exact_bytes": 13204889600,
+      "estimated_up_to_bytes": 0,
+      "freed_human": "13.2 GB",
+      "success": true
     }
   ]
 }
@@ -249,20 +392,34 @@ Automatically cleans safe categories until the target GB of free space is reclai
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `target_gb` | number | yes | Requested target in GB |
-| `target_met` | boolean | yes | Whether the target was met |
-| `total_freed_bytes` | integer | yes | Total bytes freed |
-| `total_freed` | string | yes | Human-readable total freed |
+| `target_met` | boolean | yes | Whether EXACT freed bytes met the target |
+| `total_freed_bytes` | integer | yes | **Exact bytes only** (schema 3) |
+| `total_estimated_up_to_bytes` | integer | yes | Hardlinked/command bytes that MAY have been freed |
+| `total_freed` | string | yes | Human-readable component phrase |
 | `dry_run` | boolean | yes | Whether this was a dry run |
-| `cleaned` | object[] | yes | Per-category cleaning details |
+| `cleaned` | object[] | yes | Per-category details, in cleaning order |
+| `cleaned[].slug` | string | yes | Category slug |
 | `cleaned[].name` | string | yes | Category name |
-| `cleaned[].bytes_freed` | integer | yes | Bytes freed |
-| `cleaned[].freed_human` | string | yes | Human-readable bytes freed |
+| `cleaned[].bytes_freed` | integer | yes | Exact bytes freed (== `exact_bytes`) |
+| `cleaned[].exact_bytes` | integer | yes | Exact component |
+| `cleaned[].estimated_up_to_bytes` | integer | yes | Estimated component |
+| `cleaned[].freed_human` | string | yes | Human-readable component phrase |
+| `cleaned[].success` | boolean | real run only | `false` iff the category reported errors (absent on dry run) |
+| `cleaned[].error` | string | no | Error message(s) when `success` is false |
+
+Total failure — at least one category attempted, every attempt errored,
+nothing freed — exits 1 `CLEAN_FAILED` with empty stdout (details carry the
+per-category attempts). An empty candidate list is a success with
+`target_met: false`.
 
 ---
 
 ### `--cli spotlight`
 
-Tags discovered cache directories with Spotlight metadata for `mdfind` discovery.
+Tags discovered cache directories with Spotlight metadata for `mdfind`
+discovery. Since schema 3 every root is admitted through the deletion-path
+guard BEFORE any xattr/marker write, and roots whose scan was denied are
+never written to; refusals are reported in the additive `refused` array.
 
 **Output schema:**
 
@@ -274,6 +431,14 @@ Tags discovered cache directories with Spotlight metadata for `mdfind` discovery
       "slug": "xcode_derived_data",
       "path": "/Users/user/Library/Developer/Xcode/DerivedData",
       "size": "15 GB"
+    }
+  ],
+  "refused_count": 1,
+  "refused": [
+    {
+      "slug": "browser_caches",
+      "path": "/Users/user/Library/Caches/Google/Chrome",
+      "reason": "scan denied (tcc_denied): Operation not permitted"
     }
   ],
   "query_hint": "mdfind 'kMDItemFinderComment == \"cacheout-managed*\"'",
@@ -288,6 +453,11 @@ Tags discovered cache directories with Spotlight metadata for `mdfind` discovery
 | `directories[].slug` | string | yes | Category slug |
 | `directories[].path` | string | yes | Absolute filesystem path |
 | `directories[].size` | string | yes | Human-readable size |
+| `refused_count` | integer | yes | Number of roots refused (schema 3) |
+| `refused` | object[] | yes | Roots skipped without any write: guard refusals and scan-denied roots (schema 3) |
+| `refused[].slug` | string | yes | Category slug |
+| `refused[].path` | string | yes | Refused root path |
+| `refused[].reason` | string | yes | Why — a guard refusal message or `scan denied (<kind>): <message>` |
 | `query_hint` | string | yes | Example mdfind query for xattr-based discovery |
 | `marker_hint` | string | yes | Example mdfind query for marker-file discovery |
 
@@ -603,7 +773,8 @@ All CLI commands follow a consistent error reporting contract.
 | `PURGE_NOT_FOUND` | _(Legacy, schema v1 only)_ `/usr/sbin/purge` binary not found |
 | `PURGE_NOT_EXECUTABLE` | _(Legacy, schema v1 only)_ `/usr/sbin/purge` binary not executable |
 | `UNKNOWN_INTERVENTION` | Unrecognized intervention name |
-| `CONFIRMATION_REQUIRED` | Tier 2/3 intervention invoked without `--confirm` or `--dry-run` |
+| `CONFIRMATION_REQUIRED` | Destructive command invoked without `--confirm` or `--dry-run`: `clean`/`smart-clean` (schema 3 — `details` carries the cleaning plan) and tier 2/3 interventions |
+| `ROOT_REFUSED` | `clean`/`smart-clean` invoked with root privileges (euid 0) — refused regardless of flags (schema 3) |
 | `INTERVENTION_FAILED` | A named intervention failed during execution |
 | `PERMISSION_DENIED` | Insufficient privileges for the requested operation |
 | `DISK_INFO_FAILED` | Failed to read disk information |
@@ -614,7 +785,7 @@ All CLI commands follow a consistent error reporting contract.
 | `PAGE_SIZE_QUERY_FAILED` | Failed to query VM page size |
 | `VM_STATS_QUERY_FAILED` | Failed to query host_statistics64 |
 | `SCAN_FAILED` | Cache scan failed |
-| `CLEAN_FAILED` | Cache cleaning failed |
+| `CLEAN_FAILED` | TOTAL clean failure: every requested/attempted category errored and nothing was freed (partial failures exit 0 with per-item `success` flags — schema 3) |
 
 ### Subprocess Timeout
 
@@ -806,7 +977,9 @@ Dry-run validation of an autopilot config file.
 
 ### Versioning Rules
 
-1. **`schema_version`** is an integer that starts at 1 and increments monotonically. Current version: **2** (added `intervene` with all tiers, `purge` deprecated).
+1. **`schema_version`** is an integer that starts at 1 and increments monotonically. Current version: **3** (`clean`/`smart-clean` require `--confirm`; clean byte totals became exact-only with additive `*_estimated_up_to_bytes`; `results[].category` emits the slug; total clean failure exits 1 `CLEAN_FAILED`). Version 2 added `intervene` with all tiers and deprecated `purge`.
+
+   **`schema_version >= 3` ⇒ `clean` and `smart-clean` require `--confirm`.** MCP servers upgrading past this version MUST add `--confirm` to destructive invocations and treat a `CONFIRMATION_REQUIRED` stderr envelope as "re-invoke with --confirm after user consent", not as a failure.
 
 2. **Additive changes** (new optional fields, new commands) do NOT bump `schema_version`. The MCP server discovers new commands via the `capabilities` array.
 

@@ -416,6 +416,13 @@ struct CLIHandler {
     }
 
     private static func handleClean(slugs: [String], dryRun: Bool, confirmed: Bool) async {
+        // The contract requires one or more slugs — an empty list must not
+        // masquerade as a successful no-op clean.
+        guard !slugs.isEmpty else {
+            exitWithError(code: "MISSING_ARGUMENT",
+                          message: "Usage: Cacheout --cli clean <slugs...> [--confirm|--dry-run]. Use 'scan' to list valid slugs.")
+        }
+
         let knownSlugs = Set(CacheCategory.allCategories.map(\.slug))
         let unknown = slugs.filter { !knownSlugs.contains($0) }
         guard unknown.isEmpty else {
@@ -566,6 +573,12 @@ struct CLIHandler {
             entries.append([
                 "slug": result.category.slug,
                 "name": result.category.name,
+                // Plan shape parity with `clean` (PROTOCOL.md details.plan):
+                // every candidate passed the `.measured` filter, so the
+                // derived action is always "clean" — derived, not hardcoded,
+                // so the two commands cannot drift.
+                "state": result.state.rawValue,
+                "action": cleanPlanAction(for: result),
                 "bytes_freed": result.exactBytes,
                 "exact_bytes": result.exactBytes,
                 "estimated_up_to_bytes": result.estimatedUpToBytes,
@@ -579,6 +592,15 @@ struct CLIHandler {
     }
 
     private static func handleSmartClean(targetGB: Double, dryRun: Bool, confirmed: Bool) async {
+        // Usage validation first (parity with clean's slug guard): a
+        // non-finite or negative target would trap in the Int64 conversion
+        // below (nan/inf) or produce nonsense; a target past ~8e9 GB would
+        // overflow Int64. Refuse with the documented usage error instead.
+        guard targetGB.isFinite, targetGB >= 0, targetGB <= 1_000_000_000 else {
+            exitWithError(code: "INVALID_ARGUMENTS",
+                          message: "smart-clean target must be a finite number of GB between 0 and 1000000000, got: \(targetGB)")
+        }
+
         // Gate decision BEFORE any scan (D5); unconfirmed still scans
         // read-only below to build the refusal plan.
         let decision = cleanGateDecision(confirmed: confirmed, dryRun: dryRun, euid: geteuid())

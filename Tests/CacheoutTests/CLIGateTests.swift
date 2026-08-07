@@ -280,6 +280,9 @@ final class CLIGateTests: XCTestCase {
                        "the category is still cleaned — it just cannot satisfy the target")
         XCTAssertEqual(plan.entries[0]["bytes_freed"] as? Int64, 0,
                        "per-entry freed bytes are exact-only")
+        // Plan shape parity with `clean` (PROTOCOL.md details.plan).
+        XCTAssertEqual(plan.entries[0]["state"] as? String, "measured")
+        XCTAssertEqual(plan.entries[0]["action"] as? String, "clean")
     }
 
     func testSmartCleanPlanStopsOnceExactTargetMet() {
@@ -489,7 +492,38 @@ final class CLIGateFramingTests: XCTestCase {
         XCTAssertEqual(error["code"] as? String, "CONFIRMATION_REQUIRED")
         let details = try XCTUnwrap(envelope["details"] as? [String: Any])
         XCTAssertEqual(details["command"] as? String, "smart-clean")
-        XCTAssertNotNil(details["plan"], "the smart-clean refusal carries its plan")
+        let plan = try XCTUnwrap(details["plan"] as? [[String: Any]],
+                                 "the smart-clean refusal carries its plan")
+        for entry in plan {
+            XCTAssertNotNil(entry["state"],
+                            "smart-clean plan entries share the clean plan shape (PROTOCOL.md)")
+            XCTAssertEqual(entry["action"] as? String, "clean",
+                           "every smart-clean candidate is a cleanly-measured category")
+        }
         XCTAssertNotNil(details["target_gb"])
+    }
+
+    func testCleanWithoutSlugsIsAUsageError() throws {
+        let run = try runCLI(["--cli", "clean", "--confirm"])
+
+        XCTAssertEqual(run.exitCode, 1)
+        XCTAssertEqual(run.stdout, "",
+                       "an empty slug list must not masquerade as a successful no-op clean")
+        let envelope = try parseErrorEnvelope(run.stderr)
+        let error = try XCTUnwrap(envelope["error"] as? [String: Any])
+        XCTAssertEqual(error["code"] as? String, "MISSING_ARGUMENT")
+    }
+
+    func testSmartCleanRejectsNonFiniteTarget() throws {
+        // No --confirm: target validation precedes the gate, so the usage
+        // error must win — and the invocation stays read-only by contract.
+        let run = try runCLI(["--cli", "smart-clean", "nan"])
+
+        XCTAssertEqual(run.exitCode, 1,
+                       "a nan target must be refused, not trapped in the Int64 conversion")
+        XCTAssertEqual(run.stdout, "")
+        let envelope = try parseErrorEnvelope(run.stderr)
+        let error = try XCTUnwrap(envelope["error"] as? [String: Any])
+        XCTAssertEqual(error["code"] as? String, "INVALID_ARGUMENTS")
     }
 }

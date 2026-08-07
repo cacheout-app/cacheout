@@ -125,6 +125,8 @@ Cacheout --cli clean xcode_derived_data --dry-run
 | `--dry-run` | Preview what would be cleaned without deleting (wins even beside `--confirm`) |
 
 Running as root (euid 0) is refused with `ROOT_REFUSED`, flags or not.
+Calling `clean` with no slugs is a `MISSING_ARGUMENT` usage error; unknown
+slugs are `INVALID_ARGUMENTS`.
 
 **Output (unconfirmed — stderr, exit 1; stdout stays empty):**
 ```json
@@ -239,7 +241,7 @@ Cacheout --cli smart-clean 10.0 --dry-run
 
 | Argument | Description | Default |
 |----------|-------------|---------|
-| `<targetGB>` | Amount of space to free in GB | `5.0` |
+| `<targetGB>` | Amount of space to free in GB — must be finite, non-negative, and at most 10^9 (`nan`/`inf` refused with `INVALID_ARGUMENTS`) | `5.0` |
 | `--confirm` | Actually delete | Off (refuses) |
 | `--dry-run` | Preview without deleting (uses scan-time exact components, no re-walk) | Off |
 

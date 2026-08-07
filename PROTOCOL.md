@@ -311,6 +311,7 @@ proceeds but carries `warning`. The `smart-clean` auto path skips both.
 | Unconfirmed (no `--confirm`, no `--dry-run`) | 1 | empty | `CONFIRMATION_REQUIRED` envelope with `details.plan` |
 | Running as root (euid 0) | 1 | empty | `ROOT_REFUSED` envelope |
 | Unknown slug | 1 | empty | `INVALID_ARGUMENTS` envelope |
+| No slugs given | 1 | empty | `MISSING_ARGUMENT` envelope (an empty list is never a successful no-op) |
 
 #### Dry run (schema 3)
 
@@ -350,7 +351,9 @@ as `clean` (the `CONFIRMATION_REQUIRED` details carry `"command":
 "smart-clean"`, `target_gb`, the `plan`, and the projected `target_met`).
 
 **Arguments:**
-- `<gb>` -- Target gigabytes to free (floating point; default 5.0)
+- `<gb>` -- Target gigabytes to free (floating point; default 5.0). Must be
+  finite, non-negative, and at most 10^9 — anything else (including `nan`
+  and `inf`) is refused with `INVALID_ARGUMENTS` before any scan or gate
 - `--confirm` -- Actually delete
 - `--dry-run` -- Preview without deleting (needs no `--confirm`)
 
@@ -400,6 +403,8 @@ cleaned, but its `estimated_up_to_bytes` never mark the target met.
 | `cleaned` | object[] | yes | Per-category details, in cleaning order |
 | `cleaned[].slug` | string | yes | Category slug |
 | `cleaned[].name` | string | yes | Category name |
+| `cleaned[].state` | string | dry run only | Scan state (plan shape — always `"measured"`, candidates are filtered to it) |
+| `cleaned[].action` | string | dry run only | Plan action (always `"clean"` for eligible candidates) |
 | `cleaned[].bytes_freed` | integer | yes | Exact bytes freed (== `exact_bytes`) |
 | `cleaned[].exact_bytes` | integer | yes | Exact component |
 | `cleaned[].estimated_up_to_bytes` | integer | yes | Estimated component |

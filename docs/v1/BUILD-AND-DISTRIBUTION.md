@@ -103,6 +103,57 @@ path that supports helper registration out of the box.
 The helper is automatically unregistered on `brew uninstall --cask cacheout`
 via the cask's `uninstall_preflight` hook.
 
+## Release Checklist
+
+Release execution is manual and local (no CI). In order:
+
+1. **Version metadata agrees.** `VERSION`, `CLIHandler.fallbackVersion`
+   (`Sources/Cacheout/CLIHandler.swift`), and the `CHANGELOG.md` entry all
+   carry the same version.
+2. **Build + tests green.** `swift build` and `swift test` pass locally.
+3. **Bundle + notarize.** `bash scripts/bundle.sh --release`
+   (build → sign → DMG → notarize → staple).
+4. **TCC usage strings present in the bundled app.** All three build paths
+   (bundle.sh heredoc, `Sources/Cacheout/Info.plist`, `project.yml`
+   `INFOPLIST_KEY_*`) carry the same key set, and the built bundle shows it:
+
+   ```bash
+   plutil -p build/Cacheout.app/Contents/Info.plist | grep UsageDescription
+   # Expect: NSDocumentsFolderUsageDescription, NSDesktopFolderUsageDescription,
+   #         NSDownloadsFolderUsageDescription
+   ```
+5. **Manual TCC prompt verification — ☐ PENDING (human-owned release gate, R9).**
+   This step cannot be automated or delegated to an agent; a human must run it
+   against the bundled app before shipping:
+
+   1. Use the **bundled `Cacheout.app`** launched via Finder/`open` — never
+      the bare `.build` binary and never from a Terminal session. A
+      Terminal-spawned process attributes folder access to *Terminal's* TCC
+      grants, so Terminal testing is invalid and proves nothing.
+   2. Reset consent state so the prompts actually fire:
+
+      ```bash
+      tccutil reset SystemPolicyDocumentsFolder com.cacheout.app
+      tccutil reset SystemPolicyDesktopFolder com.cacheout.app
+      tccutil reset SystemPolicyDownloadsFolder com.cacheout.app
+      ```
+   3. Launch the app and start a **user-initiated scan**. macOS must prompt
+      for Documents (and Desktop) access, and each dialog must show the
+      explanatory usage string from the Info.plist — a bare prompt with no
+      explanation means a build path dropped the keys.
+   4. **Deny** one folder: the affected scan row must render
+      "Access denied — not scanned" (`ScanResult.statusLabel`) and offer the
+      System Settings → Privacy & Security → Full Disk Access link
+      (`ScanError.fullDiskAccessSettingsURL`) — never "Not found" or a
+      silent 0 bytes.
+   5. Let an **automatic/background rescan** run: it must NOT trigger any
+      TCC prompt (protected roots are skipped on non-user-initiated scans).
+   6. No prompt is expected for Downloads today — no scan walks
+      `~/Downloads`; its key ships defensively for future scanners.
+6. **Distribution.** Update the `sha256` + `version` in
+   `homebrew/cacheout.rb`, tag `vX.Y.Z`, push, `gh release create` with the
+   DMG.
+
 ## Project Configuration
 
 ### Package.swift
@@ -139,7 +190,10 @@ let package = Package(
 
 ### VERSION File
 
-The `VERSION` file at the project root contains the current version string (`1.0.0`).
+The `VERSION` file at the project root contains the current version string.
+`scripts/bundle.sh` stamps it into the bundle's `CFBundleShortVersionString`,
+and `CLIHandler.fallbackVersion` must be kept in sync with it for unbundled
+binaries (see the Release Checklist).
 
 ## Watchdog (Background Monitoring)
 

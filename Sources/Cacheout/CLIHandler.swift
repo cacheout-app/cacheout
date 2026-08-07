@@ -214,7 +214,7 @@ struct CLIHandler {
     /// Fallback version for unbundled binaries (e.g. `.build/release/Cacheout`),
     /// where there is no Info.plist to read. Keep in sync with the VERSION file
     /// at the repo root when cutting a release.
-    private static let fallbackVersion = "2.1.9"
+    private static let fallbackVersion = "2.2.0"
 
     /// App version: read from the bundle's Info.plist (stamped from the VERSION
     /// file by scripts/bundle.sh), falling back to the compiled constant when

@@ -40,8 +40,9 @@ CacheCategory(
 
 1. Fork the repository
 2. Create a feature branch: `git checkout -b feature/your-feature`
-3. Make changes, ensure `swift build` succeeds
-4. Test both GUI mode and CLI mode (`--cli scan`)
+3. Make changes, ensure `swift build` and `swift test` succeed
+4. Test both GUI mode and CLI mode (`--cli scan`; destructive commands require
+   `--confirm` — preview safely with `--cli clean <slug> --dry-run`)
 5. Submit a PR with a clear description
 
 ## Documentation

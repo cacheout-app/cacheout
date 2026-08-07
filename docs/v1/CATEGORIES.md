@@ -33,6 +33,40 @@ category's paths, discovery method, risk level, and behavior.
 
 ---
 
+## Size Reporting
+
+Since v2.2.0, category sizes are measured by a single sizing routine
+(`DirectorySizer`) and split by certainty:
+
+- **Exact bytes** — allocated bytes on unique inodes; deleting the category
+  verifiably frees them.
+- **Estimated "up to" bytes** — bytes on hardlinked inodes (freed only if
+  every other link goes too) and bytes a custom clean command may free
+  (nothing measures what a command frees).
+
+Consequences worth knowing:
+
+- **Sizes are bigger than in v2.1.x — and truthful.** Bundles (`.app`,
+  `.framework`) and hidden files/directories are now walked and counted, so
+  Xcode DerivedData and Simulator totals in particular grow. Unreadable
+  subtrees are recorded as scan errors instead of being silently skipped.
+- **Sparse files report allocated size.** `totalFileAllocatedSize` is used
+  throughout, so sparse files (Docker's disk image, simulator disk images)
+  report actual disk usage, not their inflated logical size.
+- **Totals can still overcount.** APFS clones share storage invisibly to any
+  public API, and files hardlinked *across* categories are counted in each —
+  actual space freed may be less. The UI discloses this next to every
+  recoverable-bytes total.
+- **Command-cleaned categories report "up to \<pre-scan size\>".** A category
+  cleaned by a command (e.g., Simulator Devices) frees bytes no file walk can
+  attribute, so its report entry carries exact 0 and an estimated component
+  equal to the pre-scan size.
+
+The CLI wire fields (`exact_bytes`, `estimated_up_to_bytes`, `state`,
+`scan_error`) are documented in [CLI-REFERENCE.md](CLI-REFERENCE.md).
+
+---
+
 ## Xcode & Apple Development
 
 ### Xcode DerivedData
@@ -58,10 +92,10 @@ category's paths, discovery method, risk level, and behavior.
 - **Risk:** Review
 - **Path:** `~/Library/Developer/CoreSimulator/Devices`
 - **Discovery:** Static
-- **Clean command:** `xcrun simctl shutdown all; xcrun simctl delete unavailable; xcrun simctl erase all`
+- **Clean commands:** `xcrun simctl shutdown all`, `xcrun simctl delete unavailable`, `xcrun simctl erase all` (run as separate argv commands via `/usr/bin/env`, never a shell)
 - **After cleaning:** Recreated when you use Simulator
 - **Typical size:** 5–30 GB
-- **Notes:** Uses a custom clean command instead of file deletion. Shuts down running simulators, deletes unavailable ones, and erases all data.
+- **Notes:** Uses custom clean commands instead of file deletion. Shuts down running simulators, deletes unavailable ones, and erases all data. Because a command frees the bytes (no file walk can attribute them), the cleanup report shows this category as freeing **"up to \<pre-scan size\>"** — exact 0 plus an estimated component equal to the size the scan measured.
 
 ### Swift PM Cache
 - **Slug:** `swift_pm_cache`

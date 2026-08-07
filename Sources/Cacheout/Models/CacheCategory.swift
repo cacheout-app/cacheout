@@ -25,8 +25,10 @@
 /// ### Custom Clean Commands
 ///
 /// Some categories (like Simulator Devices) require a specialized cleanup command
-/// instead of simple file deletion. The `cleanCommand` property holds an optional
-/// shell command that the `CacheCleaner` runs via `/bin/bash -c` with a 30-second timeout.
+/// instead of simple file deletion. The `cleanCommands` property holds optional
+/// argv arrays that `CacheCleaner` runs directly via `/usr/bin/env` (never a
+/// shell) with a 30-second timeout and a restricted `PATH` — after every
+/// resolved root passes `PathGuard` admission (R17).
 
 import Foundation
 

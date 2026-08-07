@@ -67,8 +67,11 @@ cask "cacheout" do
     CLI interface (headless, JSON output):
       cacheout --cli version          # Show version + capabilities
       cacheout --cli scan             # List all cache categories
-      cacheout --cli clean <slugs>    # Clean specific categories
-      cacheout --cli smart-clean 5.0  # Auto-clean safe categories
+      cacheout --cli clean <slugs> --confirm    # Clean categories (destructive
+                                                #   — requires --confirm)
+      cacheout --cli clean <slugs> --dry-run    # Preview without deleting
+      cacheout --cli smart-clean 5.0 --confirm  # Auto-clean safe categories
+                                                #   (requires --confirm)
       cacheout --cli disk-info        # Show disk space info
       cacheout --cli memory-stats     # System memory statistics
       cacheout --cli top-processes    # Top memory consumers

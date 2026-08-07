@@ -303,11 +303,20 @@ actor NodeModulesScanner {
             }
         }
 
-        // Deduplicate by path and sort by measured size — both surfaces
-        // inherit this order.
+        // Deduplicate by CANONICAL path and sort by measured size — both
+        // surfaces inherit this order. The key must be canonical (review
+        // r2): two admitted spellings of the same root (/var/… and
+        // /private/var/…) discover the same direct candidate under two
+        // unresolved spellings, and the canonical-path-derived stable ids
+        // would collide — a duplicate id renders the WHOLE outcome
+        // malformed at the runtime validator. First discovery wins,
+        // keeping its own unresolved spelling and origin provenance.
         var seen = Set<String>()
         let candidates = allCandidates
-            .filter { seen.insert($0.nodeModulesPath.path).inserted }
+            .filter {
+                seen.insert(provider.canonicalize($0.nodeModulesPath).path)
+                    .inserted
+            }
             .sorted { $0.report.measuredBytes > $1.report.measuredBytes }
         return NodeModulesTraversal(candidates: candidates, issues: allIssues)
     }

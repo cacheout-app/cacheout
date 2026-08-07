@@ -647,6 +647,52 @@ final class NodeModulesScannerTests: XCTestCase {
                        "display url is the RESOLVED spelling")
     }
 
+    func testAliasedSearchRootsYieldOneItemAndSurviveValidation() async throws {
+        // The /var/… and /private/var/… spellings of the SAME root both
+        // admit and both discover the direct candidate — under two
+        // unresolved spellings. Dedupe must key on the CANONICAL path
+        // (review r2): duplicate canonical-derived stable ids would render
+        // the WHOLE outcome malformed at the runtime validator, hiding
+        // every discovered item.
+        try mkdir(container.appendingPathComponent("node_modules/dep"))
+        try writeFile(container.appendingPathComponent("node_modules/dep/index.js"))
+        let provider = FileSystemIdentityProvider()
+        let canonical = provider.canonicalize(container)
+        try XCTSkipIf(canonical.path == container.path,
+                      "temp dir not symlink-aliased in this environment")
+        let scanner = NodeModulesScanner(
+            home: fixtureHome,
+            searchRoots: [container, canonical],
+            provider: provider
+        )
+
+        let outcome = await protocolScan(scanner)
+
+        XCTAssertEqual(outcome.items.count, 1,
+                       "aliased spellings collapse to ONE item")
+        XCTAssertEqual(Set(outcome.items.map(\.id)).count, outcome.items.count,
+                       "ids unique within the outcome (R7 invariant)")
+
+        // And through the validated stream: never a malformed outcome.
+        let runtime = try SpaceScannerRuntime(
+            scanners: [scanner], categories: [],
+            home: fixtureHome, provider: provider
+        )
+        var events: [ValidatedScannerEvent] = []
+        for await event in runtime.scanValidated(
+            context: ScanContext(trigger: .userInitiated)
+        ) {
+            events.append(event)
+        }
+        guard events.count == 1,
+              case .outcome(let scannerID, let validated) = events[0] else {
+            return XCTFail("aliased roots must not render the outcome "
+                            + "malformed: \(events)")
+        }
+        XCTAssertEqual(scannerID, NodeModulesScanner.registeredID)
+        XCTAssertEqual(validated.items.count, 1)
+    }
+
     func testDisplayPathShorteningRequiresComponentBoundary() async throws {
         // A sibling that merely string-prefixes the home path must NOT
         // shorten (/Users/d-other beside /Users/d — review r1): the full

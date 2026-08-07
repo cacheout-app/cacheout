@@ -441,8 +441,10 @@ struct SpaceScannerRuntime {
     }
 
     /// The production registry — the single place scanners are registered.
-    /// fn-2.2 adds NodeModulesScanner here; the ViewModel (fn-2.4) and CLI
-    /// (fn-2.6) both consume this factory.
+    /// The ViewModel (fn-2.4) and CLI (fn-2.6) both consume this factory.
+    /// NodeModulesScanner's registration (fn-2.2) is what puts its search
+    /// roots in the runtime's container-root union — delete-time admission
+    /// for node_modules items derives from HERE, never from items.
     ///
     /// `try!` is deliberate: the registry is static configuration, so a
     /// registration-validation failure is a programmer error (a malformed or
@@ -457,8 +459,11 @@ struct SpaceScannerRuntime {
             categories: categories,
             scanner: CacheScanner(home: home, provider: provider)
         )
+        let nodeModulesScanner = NodeModulesScanner(
+            home: home, provider: provider
+        )
         return try! SpaceScannerRuntime(
-            scanners: [categoryScanner],
+            scanners: [categoryScanner, nodeModulesScanner],
             categories: categories,
             home: home,
             provider: provider

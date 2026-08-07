@@ -714,10 +714,15 @@ final class CategoryScannerTests: XCTestCase {
     func testProductionFactoryRegistersCategoryScannerCollisionFree() throws {
         let home = try makeTempDir("home")
         let runtime = SpaceScannerRuntime.production(home: home)
-        XCTAssertEqual(runtime.scanners.map(\.id), ["categories"])
-        XCTAssertTrue(
-            runtime.trustedContainerRoots.isEmpty,
-            "CategoryScanner contributes no container roots"
+        XCTAssertEqual(
+            runtime.scanners.map(\.id),
+            [CategoryScanner.registeredID, NodeModulesScanner.registeredID]
+        )
+        XCTAssertEqual(
+            runtime.trustedContainerRoots.map(\.path),
+            NodeModulesScanner.defaultSearchRoots(home: home).map(\.path),
+            "the union is exactly NodeModulesScanner's declared search set "
+                + "(fn-2.2) — CategoryScanner contributes no container roots"
         )
         // The factory reaching here at all asserts the production
         // category-slug/scanner-slug namespace is collision-free (a

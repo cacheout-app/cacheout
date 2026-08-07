@@ -52,21 +52,42 @@ struct NodeModulesItem: Identifiable, Hashable {
         ByteCountFormatter.sharedFile.string(fromByteCount: sizeBytes)
     }
 
-    var daysSinceModified: Int? {
-        guard let date = lastModified else { return nil }
+    var daysSinceModified: Int? { Self.daysSince(modified: lastModified) }
+
+    /// Stale if node_modules hasn't been touched in 30+ days
+    var isStale: Bool { Self.isStale(daysSinceModified: daysSinceModified) }
+
+    var staleBadge: String? {
+        Self.staleAge(daysSinceModified: daysSinceModified).map { "\($0) old" }
+    }
+
+    // MARK: Staleness helpers (fn-2.2)
+    //
+    // The SAME math the instance properties always used, extracted as
+    // statics so the `SpaceScanner` mapping in `NodeModulesScanner` derives
+    // `ReclaimableItem.isStale` and the evidence age phrase from ONE source
+    // of truth — a threshold drift between GUI badge and protocol policy
+    // would silently break "Select Stale" (fn-2.4).
+
+    static func daysSince(modified date: Date?) -> Int? {
+        guard let date else { return nil }
         return Calendar.current.dateComponents([.day], from: date, to: Date()).day
     }
 
-    /// Stale if node_modules hasn't been touched in 30+ days
-    var isStale: Bool {
-        guard let days = daysSinceModified else { return false }
+    /// The 30-day staleness threshold — `staleBadge`'s "mo old" boundary and
+    /// the selection policy's `isStale` are the same predicate.
+    static func isStale(daysSinceModified days: Int?) -> Bool {
+        guard let days else { return false }
         return days > 30
     }
 
-    var staleBadge: String? {
-        guard let days = daysSinceModified else { return nil }
-        if days > 365 { return "\(days / 365)y old" }
-        if days > 30 { return "\(days / 30)mo old" }
+    /// Human age token ("3mo", "1y") for items past the staleness threshold;
+    /// nil when fresh or unknown. `staleBadge` renders it as "3mo old"; the
+    /// protocol mapping's evidence renders it as "last touched 3mo ago".
+    static func staleAge(daysSinceModified days: Int?) -> String? {
+        guard let days else { return nil }
+        if days > 365 { return "\(days / 365)y" }
+        if days > 30 { return "\(days / 30)mo" }
         return nil
     }
 

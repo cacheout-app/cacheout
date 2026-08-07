@@ -12,8 +12,9 @@
 /// enforced at this chokepoint via each item's admission descriptor and
 /// per-root records. The pre-unification category-vs-node_modules fork is
 /// gone; `clean(results:nodeModules:moveToTrash:)` survives only as a THIN
-/// adapter building items for the not-yet-migrated ViewModel/CLI call sites
-/// (deleted by fn-2.4/fn-2.6).
+/// adapter for its own compatibility tests — the ViewModel (fn-2.4) and the
+/// CLI (fn-2.6) both consume `clean(items:)` directly now (deletable once
+/// those tests migrate onto item fixtures).
 ///
 /// ## Safety model (fn-1.3, reshaped by fn-2.3)
 ///
@@ -386,11 +387,11 @@ actor CacheCleaner {
 
     // MARK: Clean — compatibility adapter (pre-unification callers)
 
-    /// THIN adapter for the not-yet-migrated call sites (the ViewModel
-    /// migrated in fn-2.4; the CLI remains until fn-2.6): builds
-    /// `ReclaimableItem`s and forwards to `clean(items:moveToTrash:)` — ONE
-    /// dispatch, no second code path. Scheduled for deletion once the CLI
-    /// consumes items directly.
+    /// THIN adapter with NO production caller left (the ViewModel migrated
+    /// in fn-2.4, the CLI in fn-2.6): builds `ReclaimableItem`s and
+    /// forwards to `clean(items:moveToTrash:)` — ONE dispatch, no second
+    /// code path. Survives for its own compatibility tests; deletable once
+    /// they migrate onto item fixtures.
     func clean(
         results: [ScanResult],
         nodeModules: [NodeModulesItem] = [],

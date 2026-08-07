@@ -43,9 +43,10 @@
 /// - **Legacy** `scan(maxDepth:includeProtectedRoots:)` — the pre-unification
 ///   surface (`NodeModulesScanOutcome`): candidate denials surface as
 ///   outcome errors and only measurable candidates become items, exactly as
-///   before. The GUI migrated off it in fn-2.4 (the ViewModel consumes the
-///   runtime's validated stream); it survives only for its own tests and
-///   the cleaner's compatibility adapter until fn-2.6 retires both.
+///   before. The GUI migrated off it in fn-2.4 and the CLI in fn-2.6 (both
+///   consume the runtime's validated stream); it survives only for its own
+///   tests and the cleaner's compatibility adapter, deletable once those
+///   migrate onto the protocol surface.
 /// - **Protocol** `scan(context:)` (`SpaceScanner`) — emits one
 ///   `ReclaimableItem` per recognized candidate under the epic's COMPLETE
 ///   truth table (`.measured`/`.empty`/`.partiallyDenied`/`.denied`):

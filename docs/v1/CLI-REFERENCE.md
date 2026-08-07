@@ -25,13 +25,15 @@ Cacheout --cli version
 {
   "app": "Cacheout",
   "mode": "cli",
-  "schema_version": 3,
+  "schema_version": 4,
   "version": "2.2.0"
 }
 ```
 
-`schema_version >= 3` means `clean` and `smart-clean` require `--confirm`
-(see below and PROTOCOL.md).
+`schema_version >= 3` means `clean` and `smart-clean` require `--confirm`;
+`schema_version >= 4` means `scan` emits the envelope (not an array), clean
+targets follow the address grammar, and clean/smart-clean rows carry
+`scanner_id`/`item_id` (see below and PROTOCOL.md).
 
 ---
 
@@ -61,33 +63,60 @@ Cacheout --cli disk-info
 
 ### `scan`
 
-Scan all cache categories and report sizes.
+Run every registered scanner (the 20+ cache categories plus per-item
+scanners such as `node_modules`) and report the schema-4 envelope.
 
 ```bash
 Cacheout --cli scan
 ```
 
-**Output:**
+**Output (schema 4 envelope):**
 ```json
-[
-  {
-    "description": "Build artifacts and indexes. Xcode rebuilds automatically.",
-    "estimated_up_to_bytes": 0,
-    "exact_bytes": 5368709120,
-    "exists": true,
-    "item_count": 15234,
-    "name": "Xcode DerivedData",
-    "rebuild_note": "Xcode rebuilds on next build",
-    "risk_level": "safe",
-    "size_bytes": 5368709120,
-    "size_human": "5 GB",
-    "slug": "xcode_derived_data",
-    "state": "measured"
-  }
-]
+{
+  "categories": [
+    {
+      "description": "Build artifacts and indexes. Xcode rebuilds automatically.",
+      "estimated_up_to_bytes": 0,
+      "exact_bytes": 5368709120,
+      "exists": true,
+      "item_count": 15234,
+      "name": "Xcode DerivedData",
+      "rebuild_note": "Xcode rebuilds on next build",
+      "risk_level": "safe",
+      "size_bytes": 5368709120,
+      "size_human": "5 GB",
+      "slug": "xcode_derived_data",
+      "state": "measured"
+    }
+  ],
+  "scanner_errors": [],
+  "scanner_items": [
+    {
+      "action": "remove_item",
+      "estimated_up_to_bytes": 0,
+      "evidence": "node_modules of myapp — ~/Projects/myapp; last touched 3 months ago",
+      "exact_bytes": 1200000000,
+      "item_count": 40231,
+      "item_id": "0d3a9ab9a662fb335a6803cccf0e8a73dd5f1f2a36965334d7f3f5742caeec0e",
+      "name": "myapp",
+      "path": "/Users/you/Projects/myapp/node_modules",
+      "risk_level": "review",
+      "scanner_id": "node_modules",
+      "size_bytes": 1200000000,
+      "state": "measured"
+    }
+  ],
+  "schema_version": 4
+}
 ```
 
-Results are sorted by `size_bytes` descending.
+`categories` rows are field-for-field the schema-3 rows, sorted by
+`size_bytes` descending. `scanner_items` lists per-item scanner findings —
+`item_id` is an OPAQUE 64-char stable id you echo back as a clean target
+(`node_modules:<item_id>`), never parse or derive. `scanner_errors` carries
+root/scanner-level problems (`scanner_id`, `kind`, `detail`, and `path` for
+filesystem kinds; a `malformed_outcome` row has no path and means that
+scanner's items were excluded fail-closed).
 
 **Split components + scan state (schema 3):**
 
@@ -106,12 +135,28 @@ Results are sorted by `size_bytes` descending.
 
 ### `clean`
 
-Clean specific categories by slug. **Destructive — requires `--confirm`
-(schema 3).**
+Clean addressed targets. **Destructive — requires `--confirm` (schema 3).**
+
+A target (schema 4 address grammar) is one of:
+
+| Form | Meaning |
+|------|---------|
+| `<category-slug>` | One category aggregate (unchanged from schema 3), e.g. `npm_cache` |
+| `<scanner-slug>` | ALL items of a per-item scanner, e.g. `node_modules` |
+| `<scanner-slug>:<item-id>` | One item — the opaque 64-char id echoed from `scan`'s `scanner_items` |
+
+The frozen aggregate scanner id `categories` is NOT a valid target; address
+category aggregates by their category slug.
 
 ```bash
 # Clean specific categories
 Cacheout --cli clean xcode_derived_data npm_cache yarn_cache --confirm
+
+# Clean every discovered node_modules directory
+Cacheout --cli clean node_modules --confirm
+
+# Clean ONE node_modules item (id from scan output)
+Cacheout --cli clean node_modules:0d3a9ab9a662fb335a6803cccf0e8a73dd5f1f2a36965334d7f3f5742caeec0e --confirm
 
 # Preview without deleting (no --confirm needed)
 Cacheout --cli clean xcode_derived_data --dry-run
@@ -125,8 +170,9 @@ Cacheout --cli clean xcode_derived_data --dry-run
 | `--dry-run` | Preview what would be cleaned without deleting (wins even beside `--confirm`) |
 
 Running as root (euid 0) is refused with `ROOT_REFUSED`, flags or not.
-Calling `clean` with no slugs is a `MISSING_ARGUMENT` usage error; unknown
-slugs are `INVALID_ARGUMENTS`.
+Calling `clean` with no targets is a `MISSING_ARGUMENT` usage error; unknown
+or invalid targets (unknown slugs, unknown item ids, the excluded
+`categories` token) are `INVALID_ARGUMENTS`.
 
 **Output (unconfirmed — stderr, exit 1; stdout stays empty):**
 ```json
@@ -138,7 +184,9 @@ slugs are `INVALID_ARGUMENTS`.
         "action": "clean",
         "estimated_up_to_bytes": 0,
         "exact_bytes": 5368709120,
+        "item_id": "xcode_derived_data",
         "name": "Xcode DerivedData",
+        "scanner_id": "categories",
         "slug": "xcode_derived_data",
         "state": "measured"
       }
@@ -158,7 +206,7 @@ slugs are `INVALID_ARGUMENTS`.
 `clean_with_warning` (a `partiallyDenied` scan — measured bytes only),
 `refuse` (a `denied` scan), or `skip` (missing/empty).
 
-**Output (confirmed clean):**
+**Output (confirmed clean, schema 4):**
 ```json
 {
   "dry_run": false,
@@ -169,10 +217,22 @@ slugs are `INVALID_ARGUMENTS`.
       "estimated_up_to_bytes": 0,
       "exact_bytes": 5368709120,
       "freed_human": "5 GB",
+      "item_id": "xcode_derived_data",
       "name": "Xcode DerivedData",
+      "scanner_id": "categories",
       "success": true
     }
   ],
+  "scanner_rollups": [
+    {
+      "bytes_freed": 5368709120,
+      "entry_count": 1,
+      "estimated_up_to_bytes": 0,
+      "exact_bytes": 5368709120,
+      "scanner_id": "categories"
+    }
+  ],
+  "schema_version": 4,
   "total_estimated_up_to_bytes": 0,
   "total_freed": "5 GB",
   "total_freed_bytes": 5368709120
@@ -183,8 +243,13 @@ Byte totals are exact-only (verifiably freed unique-inode bytes);
 hardlinked/command-freed bytes ride in `estimated_up_to_bytes` /
 `total_estimated_up_to_bytes` and are never folded into the totals. Every
 requested slug gets a result row with a `success` flag; naming a `denied`
-category yields a per-item error, naming a `partiallyDenied` category
-proceeds with a `warning` field.
+category or item yields a per-item error, naming a `partiallyDenied`
+category proceeds with a `warning` field. Every row carries
+`scanner_id`/`item_id` (schema 4); an aggregate row's `category` value is
+the category slug, a per-item row's is the composite address
+`<scanner_id>:<item_id>` — reusable directly as a clean target. A per-item
+target whose scan state was `empty` is skipped silently: nothing deleted,
+no result row.
 
 **Output (dry run):** same shape as the plan, plus exact-only
 `bytes_would_free`/`total_would_free`:
@@ -198,11 +263,14 @@ proceeds with a `warning` field.
       "estimated_up_to_bytes": 0,
       "exact_bytes": 5368709120,
       "freed_human": "5 GB",
+      "item_id": "xcode_derived_data",
       "name": "Xcode DerivedData",
+      "scanner_id": "categories",
       "slug": "xcode_derived_data",
       "state": "measured"
     }
   ],
+  "schema_version": 4,
   "total_estimated_up_to_bytes": 0,
   "total_would_free": 5368709120
 }
@@ -228,10 +296,13 @@ Cacheout --cli smart-clean 10.0 --dry-run
 ```
 
 **Behavior:**
-1. Scans all categories
+1. Scans all categories (the aggregate category scanner ONLY — per-item
+   scanners like `node_modules` are never part of smart-clean; explicit
+   `clean` addressing is the only way to delete their items)
 2. Keeps only cleanly-measured categories with bytes — `denied` and
    `partiallyDenied` scans are skipped (the auto path never rides on a
-   floor measurement), as are Caution-level categories
+   floor measurement), as are Caution-level categories and items not
+   eligible for automatic cleaning
 3. Sorts by risk level (Safe first), then by size descending
 4. Cleans categories until target bytes are freed or all eligible categories
    are exhausted — only EXACT bytes advance the target; estimated
@@ -258,12 +329,15 @@ Cacheout --cli smart-clean 10.0 --dry-run
       "estimated_up_to_bytes": 0,
       "exact_bytes": 5368709120,
       "freed_human": "5 GB",
+      "item_id": "xcode_derived_data",
       "name": "Xcode DerivedData",
+      "scanner_id": "categories",
       "slug": "xcode_derived_data",
       "success": true
     }
   ],
   "dry_run": false,
+  "schema_version": 4,
   "target_gb": 10.0,
   "target_met": false,
   "total_estimated_up_to_bytes": 0,
@@ -439,6 +513,12 @@ Use these slugs with the `clean` command:
 | `chatgpt_desktop_cache` | ChatGPT Desktop Cache |
 | `prisma_engines` | Prisma Engines |
 | `typescript_cache` | TypeScript Build Cache |
+
+Per-item scanner slugs (usable bare or as `<slug>:<item-id>`):
+
+| Slug | Scanner |
+|------|---------|
+| `node_modules` | Project node_modules directories (item ids from `scan`'s `scanner_items`) |
 
 ---
 

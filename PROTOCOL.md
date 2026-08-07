@@ -1,8 +1,8 @@
 # CacheOut CLI Protocol
 
-**Version:** 1.1.0
-**Schema Version:** 3
-**Last Updated:** 2026-08-06
+**Version:** 1.2.0
+**Schema Version:** 4
+**Last Updated:** 2026-08-07
 
 This document defines the interface contract between the CacheOut macOS application (`cacheout`) and the MCP server (`cacheout-mcp`). Both repositories reference this protocol. Changes must be coordinated across both repos.
 
@@ -30,7 +30,7 @@ The MCP server discovers CacheOut capabilities before invoking commands. This en
 ```json
 {
   "version": "2.2.0",
-  "schema_version": 3,
+  "schema_version": 4,
   "mode": "cli",
   "app": "Cacheout",
   "helper_installed": true,
@@ -65,6 +65,25 @@ The MCP server discovers CacheOut capabilities before invoking commands. This en
 
 **Schema 3 gate:** When `schema_version >= 3`, `clean` and `smart-clean` are gated behind `--confirm` — an invocation without it exits 1 with a `CONFIRMATION_REQUIRED` error carrying the cleaning plan in `details`. Callers that intend to delete MUST pass `--confirm`; callers that only want a preview MUST pass `--dry-run`. There is no environment-variable bypass.
 
+**Schema 4 changes:** When `schema_version >= 4`:
+
+- `scan` output changes from a top-level array to the **scan envelope**
+  (`{schema_version, categories, scanner_items, scanner_errors}`). The
+  `categories` rows are field-for-field the schema-3 rows; the other keys
+  are additive (per-item scanners such as `node_modules` become visible for
+  the first time).
+- `clean` accepts the **target address grammar** (`<category-slug>` |
+  `<scanner-slug>` | `<scanner-slug>:<item-id>`) — bare category slugs work
+  exactly as in schema 3.
+- Every `clean`/`smart-clean` row gains `scanner_id`/`item_id` identity
+  fields, and EVERY payload (scan envelope, clean result, smart-clean
+  result, both dry-run payloads) self-describes with a top-level
+  `schema_version` — consumers can branch on one field regardless of which
+  command produced the payload.
+- The `--confirm` gate is unchanged and covers the new per-item targets:
+  deleting a `node_modules` item requires `--confirm` exactly like a
+  category clean.
+
 ---
 
 ## CLI Commands
@@ -81,8 +100,8 @@ Cacheout --cli <command> [arguments] [flags]
 |---------|-------------|-------|-----------------|
 | `version` | Application version and capabilities | Existing | No |
 | `disk-info` | Boot volume disk space | Existing | No |
-| `scan` | Scan all cache categories | Existing | No |
-| `clean <slugs...> [--confirm\|--dry-run]` | Delete specific cache categories (destructive — requires `--confirm` since schema 3) | Existing | No |
+| `scan` | Run every registered scanner; emit the schema-4 envelope (categories + per-item scanner items + scanner errors) | Existing | No |
+| `clean <targets...> [--confirm\|--dry-run]` | Delete addressed targets — category slugs, per-item scanner slugs, or `<scanner-slug>:<item-id>` addresses (destructive — requires `--confirm` since schema 3) | Existing | No |
 | `smart-clean <gb> [--confirm\|--dry-run]` | Auto-clean safe categories to free target GB (destructive — requires `--confirm` since schema 3) | Existing | No |
 | `spotlight` | Tag cache directories with Spotlight metadata | Existing | No |
 | `memory-stats` | System memory statistics | Existing | No |
@@ -127,32 +146,103 @@ Returns boot volume disk space information.
 
 ### `--cli scan`
 
-Scans all cache categories and returns results. Since schema 3 every entry
-carries the scan STATE and the SPLIT byte components (additive on the v2
-shape): `exact_bytes` are bytes on unique inodes whose deletion verifiably
-frees them; `estimated_up_to_bytes` are hardlinked bytes that MAY be freed.
-`size_bytes` remains their compatibility sum.
+Runs every registered scanner and returns the **schema-4 envelope**. The
+`categories` key preserves schema 3's category rows EXACTLY field-for-field
+(same keys, same values, size-descending order); `scanner_items` and
+`scanner_errors` are additive. Since schema 3 every category entry carries
+the scan STATE and the SPLIT byte components: `exact_bytes` are bytes on
+unique inodes whose deletion verifiably frees them; `estimated_up_to_bytes`
+are hardlinked bytes that MAY be freed. `size_bytes` remains their
+compatibility sum.
 
-**Output schema (array):**
+**Output schema (envelope):**
 
 ```json
-[
-  {
-    "slug": "xcode_derived_data",
-    "name": "Xcode Derived Data",
-    "size_bytes": 15032000000,
-    "size_human": "15.03 GB",
-    "item_count": 42,
-    "exists": true,
-    "risk_level": "safe",
-    "description": "Build artifacts regenerated on next build",
-    "rebuild_note": "Xcode rebuilds automatically",
-    "state": "measured",
-    "exact_bytes": 15000000000,
-    "estimated_up_to_bytes": 32000000
-  }
-]
+{
+  "schema_version": 4,
+  "categories": [
+    {
+      "slug": "xcode_derived_data",
+      "name": "Xcode Derived Data",
+      "size_bytes": 15032000000,
+      "size_human": "15.03 GB",
+      "item_count": 42,
+      "exists": true,
+      "risk_level": "safe",
+      "description": "Build artifacts regenerated on next build",
+      "rebuild_note": "Xcode rebuilds automatically",
+      "state": "measured",
+      "exact_bytes": 15000000000,
+      "estimated_up_to_bytes": 32000000
+    }
+  ],
+  "scanner_items": [
+    {
+      "scanner_id": "node_modules",
+      "item_id": "0d3a9ab9a662fb335a6803cccf0e8a73dd5f1f2a36965334d7f3f5742caeec0e",
+      "path": "/Users/dev/project/node_modules",
+      "name": "project",
+      "state": "measured",
+      "exact_bytes": 1200000000,
+      "estimated_up_to_bytes": 0,
+      "size_bytes": 1200000000,
+      "item_count": 40231,
+      "risk_level": "review",
+      "evidence": "node_modules of project — ~/project; last touched 3 months ago",
+      "action": "remove_item"
+    }
+  ],
+  "scanner_errors": [
+    {
+      "scanner_id": "node_modules",
+      "kind": "container_refused",
+      "detail": "search root is not a configured container",
+      "path": "/Users/dev/Elsewhere"
+    }
+  ]
+}
 ```
+
+**Envelope keys:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `schema_version` | integer | yes | Always present — every schema-4 payload self-describes |
+| `categories` | object[] | yes | Schema 3's category rows, field-for-field (table below). NO `scanner_id`/`item_id` here — identity fields live on `scanner_items` and the clean/smart-clean rows only |
+| `scanner_items` | object[] | yes | One row per PER-ITEM scanner item (node_modules today; build artifacts, git worktrees, temp dirs to follow). Empty array when no per-item scanner found anything |
+| `scanner_errors` | object[] | yes | Root/scanner-level problems that produced NO item (refused search roots, traversal failures, malformed outcomes). Empty array when clean |
+
+**`scanner_items` rows:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `scanner_id` | string | yes | Owning scanner's registered slug (`[a-z0-9_]+`) |
+| `item_id` | string | yes | OPAQUE stable item id — the full 64-char lowercase-hex SHA-256 over the UTF-8 bytes of `scannerID + "\0" + canonicalPath` (NUL separator; no truncation, ever). Consumers NEVER parse or derive ids — echo back exactly what scan printed. Always adjacent to its `scanner_id` sibling: a bare item id row without `scanner_id` is malformed by definition |
+| `path` | string | yes | The item's resolved location (the declared spelling when unresolved — never a fake resolution) |
+| `name` | string | yes | Display name (node_modules: the project name) |
+| `state` | string | yes | Same state machine as category rows |
+| `exact_bytes` / `estimated_up_to_bytes` / `size_bytes` | integer | yes | Split components + compatibility sum (same semantics as category rows) |
+| `item_count` | integer | yes | Files/items inside |
+| `risk_level` | string | yes | `node_modules` rows are always `"review"` (frozen mapping — never auto-cleaned) |
+| `evidence` | string | yes | Human-readable provenance rendered in confirmation UIs |
+| `action` | string | yes | Reclaim action wire string: `"remove_contents"`, `"remove_item"`, or `"commands"`. For `"commands"` ONLY the kind is serialized — **the argv arrays are NEVER exposed anywhere in CLI output** (the JSON is a reporting surface, not an execution contract) |
+| `scan_error` | object | no | Same conditional shape as category rows |
+| `grant_hint` | string | no | Same conditional TCC remedy as category rows |
+
+**`scanner_errors` rows:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `scanner_id` | string | yes | Which scanner reported (or failed validation) |
+| `kind` | string | yes | One of: `"container_refused"`, `"symlink_root"`, `"tcc_denied"`, `"permission_denied"`, `"unreadable"`, `"malformed_outcome"`. The list is EXTENSIBLE — consumers must tolerate unknown kinds |
+| `detail` | string | yes | Human-readable description |
+| `path` | string | conditional | Present for the filesystem kinds; ABSENT for `"malformed_outcome"` (no filesystem location exists — a fake path is never invented) |
+
+A `malformed_outcome` row means that scanner's ENTIRE outcome failed
+fail-closed validation: its items are excluded from `scanner_items` AND from
+clean addressability, and the remaining valid scanners' rows are unaffected.
+
+**Category row fields (unchanged from schema 3):**
 
 A category whose scan was impeded additionally carries `scan_error` (and,
 for TCC denials only, `grant_hint`):
@@ -191,26 +281,58 @@ for TCC denials only, `grant_hint`):
 
 ---
 
-### `--cli clean <slugs...> [--confirm|--dry-run]`
+### `--cli clean <targets...> [--confirm|--dry-run]`
 
-Cleans the specified cache categories by slug. **Destructive — since schema 3
-it requires `--confirm`.**
+Cleans the addressed targets. **Destructive — since schema 3 it requires
+`--confirm`.**
+
+#### Target address grammar (schema 4 — permanent contract)
+
+A positional target token is ONE of:
+
+| Form | Meaning |
+|------|---------|
+| `<category-slug>` | One category aggregate — unchanged from schema 3 (e.g. `npm_cache`) |
+| `<scanner-slug>` | ALL items of that per-item scanner (e.g. `node_modules`) |
+| `<scanner-slug>:<item-id>` | One item of that scanner, by the opaque id echoed from `scan`'s `scanner_items` |
+
+- Category slugs and scanner slugs match `[a-z0-9_]+` — no colon — so the
+  FIRST `:` splits scanner slug from item id unambiguously. The combined
+  category-slug/scanner-slug namespace is collision-free (enforced at
+  registration), so a bare token resolves to whichever exists.
+- **Aggregate-scanner exclusion:** the frozen aggregate scanner id
+  `categories` is NOT a valid target token in any form (`categories` and
+  `categories:<x>` are both refused with `INVALID_ARGUMENTS`) — category
+  aggregates are addressed by category slug only. A scanner-wide token over
+  every category would be a mass-clean footgun.
+- **Item-id opacity:** item ids are opaque, CLI-safe strings with a frozen
+  derivation — the FULL lowercase-hex SHA-256 (64 chars) over the UTF-8
+  bytes of `scannerID + "\0" + canonicalPath` (the NUL separator prevents
+  ambiguous concatenations; no truncation, ever, so stability is
+  unconditional). Consumers NEVER parse or derive ids — they echo back
+  exactly what `scan` printed. Ids are stable across rescans of the same
+  logical item.
 
 **Arguments:**
-- `<slugs...>` -- One or more category slugs (from `scan` output)
-- `--confirm` -- Actually delete. Without it the command refuses (below)
+- `<targets...>` -- One or more targets per the grammar above
+- `--confirm` -- Actually delete. Without it the command refuses (below).
+  Required for per-item targets too: node_modules deletion honors the same
+  gate as category cleans
 - `--dry-run` -- Preview without deleting (needs no `--confirm`; wins even beside it)
 
-Slugs that do not match any known category cause an `INVALID_ARGUMENTS` error
-naming the unknown slug(s); no cleaning is performed in that case. Running as
-root (euid 0) is refused outright with a `ROOT_REFUSED` error, `--confirm` or
-not.
+Tokens that match no known category slug, scanner slug, or scanned item id
+cause an `INVALID_ARGUMENTS` error naming the invalid token(s); no cleaning
+is performed in that case. A target addressing a scanner whose outcome
+failed validation (`malformed_outcome` in `scan`'s `scanner_errors`) is
+likewise refused — a malformed scanner's items can never be listed,
+selected, addressed, or deleted. Running as root (euid 0) is refused
+outright with a `ROOT_REFUSED` error, `--confirm` or not.
 
-#### Confirmation gate (schema 3)
+#### Confirmation gate (schema 3; plan rows extended in schema 4)
 
 An unconfirmed, non-dry-run invocation deletes NOTHING: **stdout is empty**,
 the exit code is 1, and stderr carries the standard error envelope with the
-cleaning plan — the same per-category decisions the confirmed run would take —
+cleaning plan — the same per-target decisions the confirmed run would take —
 under `details`:
 
 ```json
@@ -229,7 +351,9 @@ under `details`:
         "state": "measured",
         "action": "clean",
         "exact_bytes": 2035888128,
-        "estimated_up_to_bytes": 0
+        "estimated_up_to_bytes": 0,
+        "scanner_id": "categories",
+        "item_id": "npm_cache"
       }
     ],
     "total_exact_bytes": 2035888128,
@@ -241,26 +365,33 @@ under `details`:
 | Details field | Type | Description |
 |---------------|------|-------------|
 | `command` | string | `"clean"` or `"smart-clean"` |
-| `plan` | object[] | One entry per requested slug (scan-time components — no re-walk) |
+| `plan` | object[] | One entry per resolved target (scan-time components — no re-walk) |
+| `plan[].slug` | string | The retained address key, frozen BY ITEM TYPE (schema 4): the category SLUG for aggregate rows; the composite ADDRESS `<scanner_id>:<item_id>` for per-item rows — directly reusable as a clean target token |
 | `plan[].state` | string | The scan state (see `scan`) |
 | `plan[].action` | string | What the confirmed run would do: `"clean"`, `"clean_with_warning"` (`partiallyDenied` — measured bytes only), `"refuse"` (`denied`), or `"skip"` (missing/empty). Smart-clean plans additionally use `"clean_if_needed"` for eligible fallback candidates past the projected target-met point — deleted only if earlier categories free fewer delete-time bytes than their scan-time exact components |
 | `plan[].exact_bytes` | integer | Scan-time exact component |
 | `plan[].estimated_up_to_bytes` | integer | Scan-time estimated component |
+| `plan[].scanner_id` / `plan[].item_id` | string | Identity siblings on EVERY row (schema 4) — consumers never parse the composite `slug` value |
 | `plan[].warning` | string | Present for `partiallyDenied` entries |
 | `plan[].scan_error` | object | Present when the scan was impeded (same shape as `scan`) |
 | `total_exact_bytes` | integer | Sum of exact bytes over entries that would clean |
 | `total_estimated_up_to_bytes` | integer | Sum of estimated bytes over entries that would clean |
 
-#### Confirmed output (schema 3)
+#### Confirmed output (schema 4)
 
 Byte totals are **exact-only**: `total_freed_bytes` counts delete-time
 measured unique-inode bytes; hardlinked/command-freed bytes appear in the
 additive `total_estimated_up_to_bytes` and are never folded into the total.
-`results` carries one entry per requested slug — including slugs that had
-nothing to do (`success: true`, zero bytes).
+`results` carries one entry per resolved aggregate target — including slugs
+that had nothing to do (`success: true`, zero bytes) — and one entry per
+resolved per-item target that reached the cleaner. A per-item target whose
+scan state was `empty` (or `missing`) is the cleaner's silent pre-admission
+skip: nothing is deleted, NO result row appears for it, and the run stays a
+process-level success.
 
 ```json
 {
+  "schema_version": 4,
   "dry_run": false,
   "total_freed_bytes": 13204889600,
   "total_estimated_up_to_bytes": 32000000,
@@ -273,7 +404,36 @@ nothing to do (`success: true`, zero bytes).
       "exact_bytes": 13204889600,
       "estimated_up_to_bytes": 32000000,
       "freed_human": "13.2 GB + up to 32 MB more",
-      "success": true
+      "success": true,
+      "scanner_id": "categories",
+      "item_id": "xcode_derived_data"
+    },
+    {
+      "category": "node_modules:0d3a9ab9a662fb335a6803cccf0e8a73dd5f1f2a36965334d7f3f5742caeec0e",
+      "name": "project",
+      "bytes_freed": 1200000000,
+      "exact_bytes": 1200000000,
+      "estimated_up_to_bytes": 0,
+      "freed_human": "1.2 GB",
+      "success": true,
+      "scanner_id": "node_modules",
+      "item_id": "0d3a9ab9a662fb335a6803cccf0e8a73dd5f1f2a36965334d7f3f5742caeec0e"
+    }
+  ],
+  "scanner_rollups": [
+    {
+      "scanner_id": "categories",
+      "exact_bytes": 13204889600,
+      "estimated_up_to_bytes": 32000000,
+      "bytes_freed": 13236889600,
+      "entry_count": 1
+    },
+    {
+      "scanner_id": "node_modules",
+      "exact_bytes": 1200000000,
+      "estimated_up_to_bytes": 0,
+      "bytes_freed": 1200000000,
+      "entry_count": 1
     }
   ]
 }
@@ -281,47 +441,53 @@ nothing to do (`success: true`, zero bytes).
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
+| `schema_version` | integer | yes | Always `4` — every payload self-describes (schema 4) |
 | `dry_run` | boolean | yes | Whether this was a dry run |
 | `total_freed_bytes` | integer | yes | **Exact bytes only** (schema 3 — was the mixed sum in v2) |
 | `total_estimated_up_to_bytes` | integer | yes | Hardlinked/command bytes that MAY have been freed |
 | `total_freed` | string | yes | Human-readable component phrase (e.g. `"13.2 GB + up to 32 MB more"`) |
-| `results` | object[] | yes | One entry per requested slug |
-| `results[].category` | string | yes | Category **slug** (schema 3 — v2 emitted the display name here despite this document) |
-| `results[].name` | string | yes | Human-readable category name |
-| `results[].bytes_freed` | integer | yes | Exact bytes freed for this category (== `exact_bytes`) |
+| `results` | object[] | yes | One entry per resolved target (per-item `empty`/`missing` skips excluded, above) |
+| `results[].category` | string | yes | The retained key, frozen BY ITEM TYPE (schema 4): the category **slug** for aggregate rows (unchanged from schema 3); the composite ADDRESS `<scanner_id>:<item_id>` for per-item rows — directly reusable as a clean target token |
+| `results[].name` | string | yes | Human-readable display name (category name; per-item: the item's display name) |
+| `results[].bytes_freed` | integer | yes | Exact bytes freed for this entry (== `exact_bytes`) |
 | `results[].exact_bytes` | integer | yes | Delete-time measured unique-inode bytes |
 | `results[].estimated_up_to_bytes` | integer | yes | Delete-time hardlinked / command-category bytes |
 | `results[].freed_human` | string | yes | Human-readable component phrase |
-| `results[].success` | boolean | yes | `false` iff the category reported at least one error |
+| `results[].success` | boolean | yes | `false` iff the entry reported at least one error |
+| `results[].scanner_id` | string | yes | Owning scanner id — `"categories"` on aggregate rows (schema 4) |
+| `results[].item_id` | string | yes | Scanner-scoped item id — the category slug on aggregate rows, the full-hash id on per-item rows (schema 4) |
 | `results[].error` | string | no | Error message(s), `"; "`-joined, when `success` is false |
 | `results[].warning` | string | no | Present when the category scanned `partiallyDenied` — only measured bytes were cleaned/reported |
+| `scanner_rollups` | object[] | yes | Additive per-scanner sums over the report entries (`scanner_id`, `exact_bytes`, `estimated_up_to_bytes`, `bytes_freed`, `entry_count`), first-appearance order |
 
-**Denied-state slugs:** naming a `denied` category is a per-item error
-(`success: false`, `error` explains the scan-time refusal — TCC, permissions,
-or admission), never a silent skip. Naming a `partiallyDenied` category
-proceeds but carries `warning`. The `smart-clean` auto path skips both.
+**Denied-state targets:** naming a `denied` category or item is a per-entry
+error (`success: false`, `error` explains the scan-time refusal — TCC,
+permissions, or admission), never a silent skip. Naming a `partiallyDenied`
+category proceeds but carries `warning`. The `smart-clean` auto path skips
+both.
 
 #### Exit-code policy (schema 3)
 
 | Outcome | Exit | stdout | stderr |
 |---------|------|--------|--------|
 | Everything succeeded (or nothing to do) | 0 | result JSON | empty |
-| PARTIAL failure — some slugs errored, or some bytes freed despite errors | 0 | result JSON with per-item `success` flags | empty |
-| TOTAL failure — every requested slug errored and nothing was freed | 1 | empty | `CLEAN_FAILED` envelope; `details.results` carries the per-item errors |
+| PARTIAL failure — some targets errored, or some bytes freed despite errors | 0 | result JSON with per-item `success` flags | empty |
+| TOTAL failure — every resolved target errored and nothing was freed | 1 | empty | `CLEAN_FAILED` envelope; `details.results` carries the per-item errors |
 | Unconfirmed (no `--confirm`, no `--dry-run`) | 1 | empty | `CONFIRMATION_REQUIRED` envelope with `details.plan` |
 | Running as root (euid 0) | 1 | empty | `ROOT_REFUSED` envelope |
-| Unknown slug | 1 | empty | `INVALID_ARGUMENTS` envelope |
-| No slugs given | 1 | empty | `MISSING_ARGUMENT` envelope (an empty list is never a successful no-op) |
+| Unknown/invalid target (unknown slug, unknown item id, `categories`, or a malformed scanner's address) | 1 | empty | `INVALID_ARGUMENTS` envelope |
+| No targets given | 1 | empty | `MISSING_ARGUMENT` envelope (an empty list is never a successful no-op) |
 
-#### Dry run (schema 3)
+#### Dry run (schema 4)
 
 Non-destructive; built from the SCAN-TIME split components (no re-walk).
 `bytes_would_free`/`total_would_free` count **exact bytes only**; estimated
 bytes ride in the additive fields. Entries reuse the plan shape (`state`,
-`action`, components):
+`action`, components, identity fields):
 
 ```json
 {
+  "schema_version": 4,
   "dry_run": true,
   "total_would_free": 13204889600,
   "total_estimated_up_to_bytes": 32000000,
@@ -334,7 +500,9 @@ bytes ride in the additive fields. Entries reuse the plan shape (`state`,
       "bytes_would_free": 13204889600,
       "exact_bytes": 13204889600,
       "estimated_up_to_bytes": 32000000,
-      "freed_human": "13.2 GB + up to 32 MB more"
+      "freed_human": "13.2 GB + up to 32 MB more",
+      "scanner_id": "categories",
+      "item_id": "xcode_derived_data"
     }
   ]
 }
@@ -360,11 +528,17 @@ as `clean` (the `CONFIRMATION_REQUIRED` details carry `"command":
 - `--confirm` -- Actually delete
 - `--dry-run` -- Preview without deleting (needs no `--confirm`)
 
-**Candidate policy (schema 3):** only cleanly-`measured` categories with
-bytes qualify. Categories that scanned `denied` or `partiallyDenied` are
-skipped (the auto path never rides on a floor measurement), as are
-caution-risk categories. Safe risk sorts before review; larger first within a
-tier.
+**Candidate policy (schema 3; scope pinned in schema 4):** only
+cleanly-`measured` categories with bytes qualify. Categories that scanned
+`denied` or `partiallyDenied` are skipped (the auto path never rides on a
+floor measurement), as are caution-risk categories. Safe risk sorts before
+review; larger first within a tier. Since schema 4 the candidate set is
+EXPLICITLY category-aggregates-only: smart-clean scans the aggregate
+category scanner exclusively and items that are not eligible for automatic
+cleaning (node_modules — every per-item scanner item today) are excluded by
+model policy. Per-item scanners becoming CLI-visible does NOT widen
+automatic destruction — that is a deliberate non-goal; per-item deletions
+happen only through explicitly addressed `clean` targets.
 
 **Target semantics (schema 3):** only EXACT bytes advance `target_met` —
 delete-time measured unique-inode bytes on a real run, scan-time exact
@@ -383,6 +557,7 @@ unconditional (`"clean"`) entries only.
 
 ```json
 {
+  "schema_version": 4,
   "target_gb": 10.0,
   "target_met": true,
   "total_freed_bytes": 13204889600,
@@ -397,14 +572,22 @@ unconditional (`"clean"`) entries only.
       "exact_bytes": 13204889600,
       "estimated_up_to_bytes": 0,
       "freed_human": "13.2 GB",
-      "success": true
+      "success": true,
+      "scanner_id": "categories",
+      "item_id": "xcode_derived_data"
     }
   ]
 }
 ```
 
+Note the deliberate as-built key asymmetry, preserved (not "fixed") across
+schema versions: `clean` result rows say `category`, smart-clean rows say
+`slug` — consumers read both spellings, and both follow the same by-item-type
+value rule.
+
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
+| `schema_version` | integer | yes | Always `4` — result AND dry-run payloads (schema 4) |
 | `target_gb` | number | yes | Requested target in GB |
 | `target_met` | boolean | yes | Whether EXACT freed bytes met the target |
 | `total_freed_bytes` | integer | yes | **Exact bytes only** (schema 3) |
@@ -412,8 +595,10 @@ unconditional (`"clean"`) entries only.
 | `total_freed` | string | yes | Human-readable component phrase |
 | `dry_run` | boolean | yes | Whether this was a dry run |
 | `cleaned` | object[] | yes | Per-category details, in cleaning order |
-| `cleaned[].slug` | string | yes | Category slug |
+| `cleaned[].slug` | string | yes | Category slug (aggregate rows; a per-item row — none today — would carry the composite address per the by-item-type rule) |
 | `cleaned[].name` | string | yes | Category name |
+| `cleaned[].scanner_id` | string | yes | Owning scanner id — `"categories"` on every row today (schema 4) |
+| `cleaned[].item_id` | string | yes | Scanner-scoped item id — the category slug on aggregate rows (schema 4) |
 | `cleaned[].state` | string | dry run only | Scan state (plan shape — always `"measured"`, candidates are filtered to it) |
 | `cleaned[].action` | string | dry run only | Plan action: `"clean"`, or `"clean_if_needed"` for fallback candidates past the projected target-met point |
 | `cleaned[].bytes_freed` | integer | yes | Exact bytes freed (== `exact_bytes`) |
@@ -997,9 +1182,11 @@ Dry-run validation of an autopilot config file.
 
 ### Versioning Rules
 
-1. **`schema_version`** is an integer that starts at 1 and increments monotonically. Current version: **3** (`clean`/`smart-clean` require `--confirm`; clean byte totals became exact-only with additive `*_estimated_up_to_bytes`; `results[].category` emits the slug; total clean failure exits 1 `CLEAN_FAILED`). Version 2 added `intervene` with all tiers and deprecated `purge`.
+1. **`schema_version`** is an integer that starts at 1 and increments monotonically. Current version: **4** (scan output becomes the envelope `{schema_version, categories, scanner_items, scanner_errors}` — a breaking change from schema 3's top-level array; clean targets follow the address grammar; clean/smart-clean rows carry `scanner_id`/`item_id`; every payload self-describes with a top-level `schema_version`). Version 3 gated `clean`/`smart-clean` behind `--confirm` with exact-only totals and `CLEAN_FAILED`; version 2 added `intervene` with all tiers and deprecated `purge`.
 
    **`schema_version >= 3` ⇒ `clean` and `smart-clean` require `--confirm`.** MCP servers upgrading past this version MUST add `--confirm` to destructive invocations and treat a `CONFIRMATION_REQUIRED` stderr envelope as "re-invoke with --confirm after user consent", not as a failure.
+
+   **`schema_version >= 4` ⇒ `scan` output is the envelope, not an array.** Consumers MUST branch on the payload shape or the cached `schema_version`: a JSON array is schema ≤ 3, an object with a `categories` key is schema 4. Category rows inside the envelope are field-for-field the schema-3 rows.
 
 2. **Additive changes** (new optional fields, new commands) do NOT bump `schema_version`. The MCP server discovers new commands via the `capabilities` array.
 

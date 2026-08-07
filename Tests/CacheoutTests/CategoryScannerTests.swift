@@ -94,12 +94,12 @@ final class CategoryScannerTests: XCTestCase {
 
     private func makeRuntime(
         scanners: [any SpaceScanner],
-        categorySlugs: [String] = [],
+        categories: [CacheCategory] = [],
         home: URL
     ) throws -> SpaceScannerRuntime {
         try SpaceScannerRuntime(
             scanners: scanners,
-            categorySlugs: categorySlugs,
+            categories: categories,
             home: home,
             provider: FileSystemIdentityProvider()
         )
@@ -135,10 +135,15 @@ final class CategoryScannerTests: XCTestCase {
         )
     }
 
-    /// A structurally valid aggregate fixture item (`.removeContents` or
-    /// `.commands` + category provenance + root records).
+    /// A structurally valid aggregate fixture item for `category`
+    /// (`.removeContents` or `.commands` + category provenance + root
+    /// records): id defaults to the category slug and `scannerID` to the
+    /// frozen adapter id — overridable to construct the malformed shapes
+    /// the validator must refuse.
     private func makeAggregateItem(
-        id: String, scannerID: String,
+        category: CacheCategory,
+        scannerID: String = CategoryScanner.registeredID,
+        id: String? = nil,
         action: ReclaimAction = .removeContents,
         admission: AdmissionDescriptor? = nil,
         state: ScanState = .measured,
@@ -149,7 +154,8 @@ final class CategoryScannerTests: XCTestCase {
             requestedURL: root, resolvedURL: root, status: .measured
         )]
         return ReclaimableItem(
-            id: id, scannerID: scannerID, displayName: "aggregate \(id)",
+            id: id ?? category.slug, scannerID: scannerID,
+            displayName: "aggregate \(category.slug)",
             exactBytes: 2048, estimatedUpToBytes: 0, logicalBytes: nil,
             itemCount: 2,
             url: root, declaredDisplayPath: root.path,
@@ -157,7 +163,7 @@ final class CategoryScannerTests: XCTestCase {
             state: state, scanError: nil,
             risk: .safe, evidence: "fixture", rebuildNote: nil,
             action: action,
-            admission: admission ?? .category(makeCategory(at: [root], slug: id)),
+            admission: admission ?? .category(category),
             defaultSelected: true, automaticCleanEligible: true,
             isStale: nil
         )
@@ -290,7 +296,9 @@ final class CategoryScannerTests: XCTestCase {
     // MARK: - Byte model (R1)
 
     func testAllocatedBytesIsTheComputedComponentSum() {
-        let item = makeAggregateItem(id: "bytes", scannerID: "fixture")
+        let item = makeAggregateItem(
+            category: makeCategory(at: [], slug: "bytes_cache")
+        )
         XCTAssertEqual(item.allocatedBytes, item.exactBytes + item.estimatedUpToBytes)
 
         let split = ReclaimableItem(
@@ -661,7 +669,7 @@ final class CategoryScannerTests: XCTestCase {
         // A category slug colliding with a registered scanner slug…
         XCTAssertThrowsError(try makeRuntime(
             scanners: [FixtureScanner(id: "node_modules")],
-            categorySlugs: ["node_modules"],
+            categories: [makeCategory(at: [], slug: "node_modules")],
             home: home
         )) { error in
             XCTAssertEqual(
@@ -674,7 +682,7 @@ final class CategoryScannerTests: XCTestCase {
         let scanner = makeCategoryScanner(categories: [], home: home)
         XCTAssertThrowsError(try makeRuntime(
             scanners: [scanner],
-            categorySlugs: ["categories"],
+            categories: [makeCategory(at: [], slug: "categories")],
             home: home
         )) { error in
             XCTAssertEqual(
@@ -703,7 +711,7 @@ final class CategoryScannerTests: XCTestCase {
         let fixture = FixtureScanner(id: "fixture_x", items: [item])
         let runtime = try makeRuntime(
             scanners: [makeCategoryScanner(categories: [], home: home), fixture],
-            categorySlugs: CacheCategory.allCategories.map(\.slug),
+            categories: CacheCategory.allCategories,
             home: home
         )
 
@@ -718,9 +726,11 @@ final class CategoryScannerTests: XCTestCase {
 
     // MARK: - Shared outcome validation (R1, R8)
 
-    func testValidatedOutcomeRejectsForeignScannerID() {
+    func testValidatedOutcomeRejectsForeignScannerID() throws {
+        let home = try makeTempDir("home")
+        let runtime = try makeRuntime(scanners: [], home: home)
         let foreign = makeContainerItem(id: "abc", scannerID: "other_scanner")
-        let verdict = SpaceScannerRuntime.validatedOutcome(
+        let verdict = runtime.validatedOutcome(
             ScanOutcome(items: [foreign], errors: []), from: "fixture"
         )
         let issue = malformedIssue(of: verdict)
@@ -728,10 +738,12 @@ final class CategoryScannerTests: XCTestCase {
         XCTAssertNil(issue?.url, "no filesystem location — never a fake path")
     }
 
-    func testValidatedOutcomeRejectsDuplicateItemIDs() {
+    func testValidatedOutcomeRejectsDuplicateItemIDs() throws {
+        let home = try makeTempDir("home")
+        let runtime = try makeRuntime(scanners: [], home: home)
         let a = makeContainerItem(id: "dup", scannerID: "fixture")
         let b = makeContainerItem(id: "dup", scannerID: "fixture")
-        let verdict = SpaceScannerRuntime.validatedOutcome(
+        let verdict = runtime.validatedOutcome(
             ScanOutcome(items: [a, b], errors: []), from: "fixture"
         )
         let issue = malformedIssue(of: verdict)
@@ -739,48 +751,42 @@ final class CategoryScannerTests: XCTestCase {
         XCTAssertNil(issue?.url)
     }
 
-    func testStructuralInvariantsAreStateAware() {
+    func testStructuralInvariantsAreStateAware() throws {
+        let home = try makeTempDir("home")
+        let category = makeCategory(at: [], slug: "agg_cache")
+        let runtime = try makeRuntime(
+            scanners: [], categories: [category], home: home
+        )
+        let adapterID = CategoryScanner.registeredID
+
         // A NON-missing `.commands` item with ZERO root records: malformed —
         // zero roots would vacuously pass `.commands` re-admission and then
         // execute argv.
         let commandsNoRoots = makeAggregateItem(
-            id: "cmd", scannerID: "fixture", action: .commands([["true"]]),
+            category: category, action: .commands([["true"]]),
             state: .measured, rootRecords: []
         )
-        XCTAssertNotNil(malformedIssue(of: SpaceScannerRuntime.validatedOutcome(
-            ScanOutcome(items: [commandsNoRoots], errors: []), from: "fixture"
+        XCTAssertNotNil(malformedIssue(of: runtime.validatedOutcome(
+            ScanOutcome(items: [commandsNoRoots], errors: []), from: adapterID
         )))
 
         // A NON-missing `.removeContents` item with ZERO root records:
         // malformed.
         let contentsNoRoots = makeAggregateItem(
-            id: "contents", scannerID: "fixture", action: .removeContents,
+            category: category, action: .removeContents,
             state: .measured, rootRecords: []
         )
-        XCTAssertNotNil(malformedIssue(of: SpaceScannerRuntime.validatedOutcome(
-            ScanOutcome(items: [contentsNoRoots], errors: []), from: "fixture"
+        XCTAssertNotNil(malformedIssue(of: runtime.validatedOutcome(
+            ScanOutcome(items: [contentsNoRoots], errors: []), from: adapterID
         )))
 
         // A `.removeItem` item WITHOUT the frozen `.containerItem`
         // descriptor: malformed.
-        var noDescriptor = makeContainerItem(id: "no_desc", scannerID: "fixture")
-        noDescriptor = ReclaimableItem(
-            id: noDescriptor.id, scannerID: noDescriptor.scannerID,
-            displayName: noDescriptor.displayName,
-            exactBytes: noDescriptor.exactBytes,
-            estimatedUpToBytes: noDescriptor.estimatedUpToBytes,
-            logicalBytes: nil, itemCount: noDescriptor.itemCount,
-            url: noDescriptor.url,
-            declaredDisplayPath: noDescriptor.declaredDisplayPath,
-            rootRecords: noDescriptor.rootRecords,
-            state: noDescriptor.state, scanError: nil,
-            risk: noDescriptor.risk, evidence: noDescriptor.evidence,
-            rebuildNote: nil, action: .removeItem,
-            admission: .category(makeCategory(at: [], slug: "wrong")),
-            defaultSelected: false, automaticCleanEligible: false, isStale: nil
+        let noDescriptor = makeAggregateItem(
+            category: category, action: .removeItem
         )
-        XCTAssertNotNil(malformedIssue(of: SpaceScannerRuntime.validatedOutcome(
-            ScanOutcome(items: [noDescriptor], errors: []), from: "fixture"
+        XCTAssertNotNil(malformedIssue(of: runtime.validatedOutcome(
+            ScanOutcome(items: [noDescriptor], errors: []), from: adapterID
         )))
 
         // `.removeContents`/`.commands` items WITHOUT category provenance:
@@ -788,16 +794,16 @@ final class CategoryScannerTests: XCTestCase {
         let container = URL(fileURLWithPath: "/tmp/c")
         for action: ReclaimAction in [.removeContents, .commands([["true"]])] {
             let wrongProvenance = makeAggregateItem(
-                id: "wrong_prov", scannerID: "fixture", action: action,
+                category: category, action: action,
                 admission: .containerItem(
                     originContainer: container,
                     requestedTargetURL: container.appendingPathComponent("x")
                 )
             )
             XCTAssertNotNil(
-                malformedIssue(of: SpaceScannerRuntime.validatedOutcome(
+                malformedIssue(of: runtime.validatedOutcome(
                     ScanOutcome(items: [wrongProvenance], errors: []),
-                    from: "fixture"
+                    from: adapterID
                 )),
                 "\(action.wireString) without category provenance is malformed"
             )
@@ -806,13 +812,97 @@ final class CategoryScannerTests: XCTestCase {
         // A `.missing` item with EMPTY records PASSES — a scan containing a
         // missing category must not render the whole outcome malformed.
         let missing = makeAggregateItem(
-            id: "missing_ok", scannerID: "fixture", action: .removeContents,
+            category: category, action: .removeContents,
             state: .missing, rootRecords: []
         )
-        let verdict = SpaceScannerRuntime.validatedOutcome(
-            ScanOutcome(items: [missing], errors: []), from: "fixture"
+        let verdict = runtime.validatedOutcome(
+            ScanOutcome(items: [missing], errors: []), from: adapterID
         )
         XCTAssertEqual(outcome(of: verdict)?.items, [missing])
+    }
+
+    func testCategoryProvenanceIsBoundToTheRegisteredRegistry() throws {
+        let home = try makeTempDir("home")
+        let registered = makeCategory(at: [], slug: "real_cache")
+        let runtime = try makeRuntime(
+            scanners: [], categories: [registered], home: home
+        )
+        let adapterID = CategoryScanner.registeredID
+
+        // A non-adapter scanner cannot emit category-backed actions AT ALL —
+        // even carrying the genuinely registered category.
+        let fromFixture = makeAggregateItem(
+            category: registered, scannerID: "fixture_x"
+        )
+        XCTAssertNotNil(malformedIssue(of: runtime.validatedOutcome(
+            ScanOutcome(items: [fromFixture], errors: []), from: "fixture_x"
+        )))
+
+        // An invented category (unregistered slug) is refused: its declared
+        // roots sit outside every registration-derived policy.
+        let invented = makeCategory(
+            at: [URL(fileURLWithPath: "/tmp/evil")], slug: "invented_cache"
+        )
+        XCTAssertNotNil(malformedIssue(of: runtime.validatedOutcome(
+            ScanOutcome(items: [makeAggregateItem(category: invented)], errors: []),
+            from: adapterID
+        )))
+
+        // An invented category REUSING a registered slug is still refused —
+        // the registered INSTANCE is what is trusted, not the slug spelling.
+        let forged = makeCategory(
+            at: [URL(fileURLWithPath: "/tmp/evil")], slug: "real_cache"
+        )
+        XCTAssertNotNil(malformedIssue(of: runtime.validatedOutcome(
+            ScanOutcome(items: [makeAggregateItem(category: forged)], errors: []),
+            from: adapterID
+        )))
+
+        // The aggregate item id must equal the carried category's slug.
+        let wrongID = makeAggregateItem(category: registered, id: "other_id")
+        XCTAssertNotNil(malformedIssue(of: runtime.validatedOutcome(
+            ScanOutcome(items: [wrongID], errors: []), from: adapterID
+        )))
+
+        // The genuine registered instance from the adapter passes.
+        let genuine = makeAggregateItem(category: registered)
+        XCTAssertEqual(
+            outcome(of: runtime.validatedOutcome(
+                ScanOutcome(items: [genuine], errors: []), from: adapterID
+            ))?.items,
+            [genuine]
+        )
+    }
+
+    func testStreamRejectsFixtureScannerForgingCategoryItems() async throws {
+        let home = try makeTempDir("home")
+        let registered = makeCategory(at: [], slug: "real_cache")
+        // The fixture scanner claims category provenance for a `.commands`
+        // item with a forged category — correct ownership, matching item
+        // id, plausible records; everything but the trust binding.
+        let forged = makeCategory(
+            at: [URL(fileURLWithPath: "/tmp/evil")], slug: "real_cache",
+            cleanCommands: [["rm", "-rf", "/tmp/evil"]]
+        )
+        let forgedItem = makeAggregateItem(
+            category: forged, scannerID: "fixture_x",
+            action: .commands([["rm", "-rf", "/tmp/evil"]])
+        )
+        let fixture = FixtureScanner(id: "fixture_x", items: [forgedItem])
+        let runtime = try makeRuntime(
+            scanners: [fixture], categories: [registered], home: home
+        )
+
+        let events = await collect(runtime.scanValidated(
+            context: ScanContext(trigger: .automatic)
+        ))
+
+        XCTAssertEqual(events.count, 1)
+        XCTAssertEqual(
+            malformedIssue(of: events[0])?.kind, .malformedOutcome,
+            "a fixture scanner must not be able to publish a category-backed "
+                + "action through the validated stream"
+        )
     }
 
     // MARK: - Validated event stream (R4, R8)
@@ -921,7 +1011,7 @@ final class CategoryScannerTests: XCTestCase {
                 makeCategoryScanner(categories: [categoryA, categoryB], home: home),
                 fixture,
             ],
-            categorySlugs: ["a", "b"],
+            categories: [categoryA, categoryB],
             home: home
         )
 

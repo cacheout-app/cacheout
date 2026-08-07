@@ -370,6 +370,13 @@ struct SpaceScannerRuntime {
     /// registration order, deduplicated by path.
     let trustedContainerRoots: [URL]
 
+    /// The AUTHORITATIVE category registry, keyed by slug — registered at
+    /// composition time alongside the scanners. Category-backed items are
+    /// validated against THIS map (identity included), so an item carrying
+    /// an invented `CacheCategory` can never widen admission past the
+    /// registration-derived policy.
+    private let registeredCategories: [String: CacheCategory]
+
     private let home: URL
     private let provider: FileSystemIdentityProvider
 
@@ -378,9 +385,13 @@ struct SpaceScannerRuntime {
     /// category-slug/scanner-slug namespace collision check. Injectable for
     /// tests — registering a fixture scanner requires zero production edits
     /// (R4).
+    ///
+    /// - Parameter categories: the category registry the `CategoryScanner`
+    ///   adapter scans — registered HERE so scan-time validation has an
+    ///   authoritative source to check category provenance against.
     init(
         scanners: [any SpaceScanner],
-        categorySlugs: [String],
+        categories: [CacheCategory],
         home: URL,
         provider: FileSystemIdentityProvider
     ) throws {
@@ -394,10 +405,12 @@ struct SpaceScannerRuntime {
                 throw SpaceScannerRegistrationError.duplicateScannerID(id)
             }
         }
-        for slug in categorySlugs {
-            guard namespace.insert(slug).inserted else {
-                throw SpaceScannerRegistrationError.namespaceCollision(slug)
+        var registered: [String: CacheCategory] = [:]
+        for category in categories {
+            guard namespace.insert(category.slug).inserted else {
+                throw SpaceScannerRegistrationError.namespaceCollision(category.slug)
             }
+            registered[category.slug] = category
         }
 
         var union: [URL] = []
@@ -410,6 +423,7 @@ struct SpaceScannerRuntime {
         }
 
         self.scanners = scanners
+        self.registeredCategories = registered
         self.trustedContainerRoots = union
         self.home = home
         self.provider = provider
@@ -434,7 +448,7 @@ struct SpaceScannerRuntime {
         )
         return try! SpaceScannerRuntime(
             scanners: [categoryScanner],
-            categorySlugs: categories.map(\.slug),
+            categories: categories,
             home: home,
             provider: provider
         )
@@ -469,14 +483,36 @@ struct SpaceScannerRuntime {
     ///     are valid exactly for `.missing` items (pre-dispatch-skipped) —
     ///     every NON-`.missing` `.removeContents`/`.commands` item requires
     ///     AT LEAST ONE root record (zero records on a non-missing item is
-    ///     malformed, never vacuously admissible).
+    ///     malformed, never vacuously admissible);
+    /// (d) CATEGORY-PROVENANCE TRUST — category-backed actions are accepted
+    ///     ONLY from the registered category adapter (the frozen
+    ///     `categories` id), the item id must equal the carried category's
+    ///     slug, and the carried category must BE the registered instance
+    ///     for that slug. A category descriptor is a CLAIM: without this
+    ///     binding, any scanner could invent a `CacheCategory` whose
+    ///     declared roots or clean commands sit outside every
+    ///     registration-derived policy — exactly the admission-widening the
+    ///     runtime exists to prevent.
     ///
     /// Any violation replaces the WHOLE outcome with a synthesized path-less
     /// `.malformedOutcome` issue — nothing from a malformed outcome is
     /// published or reachable downstream. (`CacheCleaner` independently
     /// refuses the same shapes at dispatch, fn-2.3 — defense in depth.)
-    static func validatedOutcome(
+    func validatedOutcome(
         _ outcome: ScanOutcome, from scannerID: String
+    ) -> ValidatedScannerEvent {
+        Self.validatedOutcome(
+            outcome, from: scannerID,
+            registeredCategories: registeredCategories
+        )
+    }
+
+    /// Static core so the stream's task-group children capture only the
+    /// Sendable category map, never the runtime.
+    private static func validatedOutcome(
+        _ outcome: ScanOutcome,
+        from scannerID: String,
+        registeredCategories: [String: CacheCategory]
     ) -> ValidatedScannerEvent {
         var seenIDs = Set<String>()
         for item in outcome.items {
@@ -494,7 +530,10 @@ struct SpaceScannerRuntime {
                         + "'\(item.id)'"
                 ))
             }
-            if let violation = structuralViolation(of: item) {
+            if let violation = structuralViolation(
+                of: item, from: scannerID,
+                registeredCategories: registeredCategories
+            ) {
                 return .malformed(scannerID: scannerID, ScanIssue(
                     url: nil, kind: .malformedOutcome,
                     detail: "scanner '\(scannerID)' item '\(item.id)': "
@@ -505,11 +544,13 @@ struct SpaceScannerRuntime {
         return .outcome(scannerID: scannerID, outcome)
     }
 
-    /// The state-aware structural invariants ((c) above). Exhaustive over
-    /// `ReclaimAction` — a future action case must make this a compile-time
-    /// decision, never a silent pass through `default:`.
+    /// The state-aware structural invariants ((c)/(d) above). Exhaustive
+    /// over `ReclaimAction` — a future action case must make this a
+    /// compile-time decision, never a silent pass through `default:`.
     private static func structuralViolation(
-        of item: ReclaimableItem
+        of item: ReclaimableItem,
+        from scannerID: String,
+        registeredCategories: [String: CacheCategory]
     ) -> String? {
         switch item.action {
         case .removeItem:
@@ -522,8 +563,28 @@ struct SpaceScannerRuntime {
             }
         case .removeContents, .commands:
             switch item.admission {
-            case .category:
-                break
+            case .category(let carried):
+                // (d) Category provenance is trusted only from the
+                // registered adapter, and only for the registered category
+                // INSTANCE. `CacheCategory` ids are per-launch UUIDs on
+                // fully-immutable values, so identity equality pins the
+                // exact registered declaration — a freshly-invented
+                // category (even one reusing a registered slug) can never
+                // match.
+                if scannerID != CategoryScanner.registeredID {
+                    return "category-backed \(item.action.wireString) items "
+                        + "are accepted only from the registered category "
+                        + "adapter ('\(CategoryScanner.registeredID)')"
+                }
+                if item.id != carried.slug {
+                    return "aggregate item id '\(item.id)' must equal its "
+                        + "category slug '\(carried.slug)'"
+                }
+                guard registeredCategories[carried.slug] == carried else {
+                    return "category '\(carried.slug)' is not the registered "
+                        + "category for that slug — provenance is a claim, "
+                        + "and only registered categories are trusted"
+                }
             case .containerItem:
                 return "a \(item.action.wireString) item must carry category "
                     + "admission provenance"
@@ -564,6 +625,7 @@ struct SpaceScannerRuntime {
         let selected = scanners.filter { scanner in
             scannerIDs?.contains(scanner.id) ?? true
         }
+        let registeredCategories = self.registeredCategories
         return AsyncStream { continuation in
             let task = Task {
                 // Parallelism must not regress: scanners run concurrently
@@ -575,7 +637,8 @@ struct SpaceScannerRuntime {
                         group.addTask {
                             let outcome = await scanner.scan(context: context)
                             return Self.validatedOutcome(
-                                outcome, from: scanner.id
+                                outcome, from: scanner.id,
+                                registeredCategories: registeredCategories
                             )
                         }
                     }

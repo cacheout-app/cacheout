@@ -251,7 +251,7 @@ final class ScanPresentationTests: XCTestCase {
         let permanent = CleanupReport(
             disposal: .permanent,
             entries: [CleanupReport.Entry(
-                category: "c", exactBytes: 4096, estimatedUpToBytes: 2048,
+                itemID: "c", scannerID: "categories", displayName: "c", exactBytes: 4096, estimatedUpToBytes: 2048,
                 disposal: .permanent
             )],
             errors: []
@@ -261,7 +261,7 @@ final class ScanPresentationTests: XCTestCase {
         let trashed = CleanupReport(
             disposal: .trash,
             entries: [CleanupReport.Entry(
-                category: "c", exactBytes: 4096, estimatedUpToBytes: 2048,
+                itemID: "c", scannerID: "categories", displayName: "c", exactBytes: 4096, estimatedUpToBytes: 2048,
                 disposal: .trash
             )],
             errors: []
@@ -272,7 +272,7 @@ final class ScanPresentationTests: XCTestCase {
         let estimateOnly = CleanupReport(
             disposal: .permanent,
             entries: [CleanupReport.Entry(
-                category: "c", exactBytes: 0, estimatedUpToBytes: 2048,
+                itemID: "c", scannerID: "categories", displayName: "c", exactBytes: 0, estimatedUpToBytes: 2048,
                 disposal: .permanent
             )],
             errors: []
@@ -287,11 +287,11 @@ final class ScanPresentationTests: XCTestCase {
             disposal: .trash,
             entries: [
                 CleanupReport.Entry(
-                    category: "cache", exactBytes: 4096, estimatedUpToBytes: 0,
+                    itemID: "cache", scannerID: "categories", displayName: "cache", exactBytes: 4096, estimatedUpToBytes: 0,
                     disposal: .trash
                 ),
                 CleanupReport.Entry(
-                    category: "sim", exactBytes: 0, estimatedUpToBytes: 2048,
+                    itemID: "sim", scannerID: "categories", displayName: "sim", exactBytes: 0, estimatedUpToBytes: 2048,
                     disposal: .permanent
                 ),
             ],
@@ -304,7 +304,11 @@ final class ScanPresentationTests: XCTestCase {
         )
 
         let allFailed = CleanupReport(
-            disposal: .permanent, entries: [], errors: [("c", "boom")]
+            disposal: .permanent, entries: [],
+            errors: [CleanupReport.ItemError(
+                key: ItemKey(scannerID: "categories", itemID: "c"),
+                displayName: "c", message: "boom"
+            )]
         )
         XCTAssertEqual(allFailed.headline, "Nothing cleaned — every item failed",
                        "no success claim when everything failed (R11)")
@@ -312,7 +316,7 @@ final class ScanPresentationTests: XCTestCase {
 
     func testEntryComponentSummaryMatchesPhrase() {
         let entry = CleanupReport.Entry(
-            category: "c", exactBytes: 8192, estimatedUpToBytes: 1024,
+            itemID: "c", scannerID: "categories", displayName: "c", exactBytes: 8192, estimatedUpToBytes: 1024,
             disposal: .permanent
         )
         XCTAssertEqual(
@@ -480,7 +484,7 @@ final class ScanPresentationTests: XCTestCase {
         await viewModel.smartClean()
 
         let report = try XCTUnwrap(viewModel.lastReport)
-        XCTAssertEqual(report.entries.map(\.category), ["safe-measured"],
+        XCTAssertEqual(report.entries.map(\.displayName), ["safe-measured"],
                        "Quick Clean acts on the auto-selected safe set only")
         XCTAssertTrue(fm.fileExists(atPath: partialPayload.path),
                       "a manually selected .partiallyDenied category must NOT ride into the auto path (R18)")

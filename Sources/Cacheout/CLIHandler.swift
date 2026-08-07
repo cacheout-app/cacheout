@@ -504,19 +504,20 @@ struct CLIHandler {
             let cleaner = CacheCleaner()
             let report = await cleaner.clean(results: toClean, moveToTrash: false)
 
-            // Report entries/errors are keyed by category NAME; the wire
-            // reports per requested slug — including a `success: true` row
-            // for a slug that produced neither entry nor error (zero-byte
-            // success, missing/empty skip). `entries.isEmpty` is NOT a
-            // total-failure signal.
-            let entriesByName = Dictionary(report.entries.map { ($0.category, $0) },
+            // Report entries/errors carry the item's display name (the
+            // category NAME for aggregates); the wire reports per requested
+            // slug — including a `success: true` row for a slug that
+            // produced neither entry nor error (zero-byte success,
+            // missing/empty skip). `entries.isEmpty` is NOT a total-failure
+            // signal.
+            let entriesByName = Dictionary(report.entries.map { ($0.displayName, $0) },
                                            uniquingKeysWith: { first, _ in first })
-            let errorsByName = Dictionary(grouping: report.errors, by: \.category)
+            let errorsByName = Dictionary(grouping: report.errors, by: \.displayName)
 
             let results: [[String: Any]] = toClean.map { result in
                 let name = result.category.name
                 let entry = entriesByName[name]
-                let errs = (errorsByName[name] ?? []).map(\.error)
+                let errs = (errorsByName[name] ?? []).map(\.message)
                 let exact = entry?.exactBytes ?? 0
                 let estimated = entry?.estimatedUpToBytes ?? 0
                 var item: [String: Any] = [
@@ -715,7 +716,7 @@ struct CLIHandler {
                 freedExactSoFar += exact
                 estimatedSoFar += estimated
 
-                let errs = report.errors.map(\.error)
+                let errs = report.errors.map(\.message)
                 var item: [String: Any] = [
                     "slug": result.category.slug,
                     "name": result.category.name,

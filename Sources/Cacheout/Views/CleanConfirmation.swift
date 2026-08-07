@@ -160,10 +160,10 @@ struct CleanupReportSheet: View {
 
             if !report.entries.isEmpty {
                 VStack(alignment: .leading, spacing: 4) {
-                    ForEach(report.entries, id: \.category) { entry in
+                    ForEach(report.entries, id: \.key) { entry in
                         VStack(alignment: .leading, spacing: 1) {
                             HStack {
-                                Text(entry.category)
+                                Text(entry.displayName)
                                 Spacer()
                                 Text(entry.componentSummary)
                                     .foregroundStyle(.secondary)
@@ -189,8 +189,11 @@ struct CleanupReportSheet: View {
                     Text("Errors:")
                         .font(.caption.bold())
                         .foregroundStyle(.red)
-                    ForEach(report.errors, id: \.category) { item in
-                        Text("\(item.category): \(item.error)")
+                    // Self-contained `ItemError` records (fn-2.3) render
+                    // without any item lookup; positional identity because
+                    // one item may carry several error lines.
+                    ForEach(Array(report.errors.enumerated()), id: \.offset) { _, item in
+                        Text("\(item.displayName): \(item.message)")
                             .font(.caption)
                             .foregroundStyle(.red)
                     }

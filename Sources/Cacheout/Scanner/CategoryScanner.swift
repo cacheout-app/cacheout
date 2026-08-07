@@ -78,7 +78,17 @@ struct CategoryScanner: SpaceScanner {
     /// re-measurement and, critically, no re-evaluation of
     /// `CacheCategory.resolvedPaths` (a second evaluation could resolve
     /// differently and break the root-capture invariant).
-    private static func item(from result: ScanResult) -> ReclaimableItem {
+    ///
+    /// Internal (not private) because `CacheCleaner`'s compatibility
+    /// adapter reuses this mapping — aggregate item construction lives in
+    /// ONE place. `rootRecords` overrides the result's capture ONLY for
+    /// pre-capture compatibility callers (the adapter synthesizes records
+    /// for fixture `ScanResult`s built without them); scan paths always
+    /// pass nil and consume the scan-time capture verbatim.
+    static func item(
+        from result: ScanResult, rootRecords: [RootScanRecord]? = nil
+    ) -> ReclaimableItem {
+        let records = rootRecords ?? result.rootRecords
         let category = result.category
         let action: ReclaimAction
         if let commands = category.cleanCommands {
@@ -105,9 +115,9 @@ struct CategoryScanner: SpaceScanner {
             // Display only: the first RESOLVED root regardless of status —
             // a denied root's resolved location is still honest display
             // data. Nil for `.missing` (no fake resolution).
-            url: result.rootRecords.first { $0.resolvedURL != nil }?.resolvedURL,
+            url: records.first { $0.resolvedURL != nil }?.resolvedURL,
             declaredDisplayPath: declaredDisplayPath(of: category),
-            rootRecords: result.rootRecords,
+            rootRecords: records,
             state: result.state,
             scanError: result.scanError,
             risk: category.riskLevel,

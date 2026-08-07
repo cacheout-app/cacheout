@@ -237,7 +237,7 @@ initial results to the user.
 ### Why a single admission chokepoint (PathGuard)?
 
 Every destructive path — category roots, contained children, node_modules
-items, cleanCommand roots — asks `PathGuard` "may I delete this URL?" before
+items, cleanCommands roots — asks `PathGuard` "may I delete this URL?" before
 anything runs. Guarding each call site separately is how deletion bugs ship:
 one forgotten site is enough. The chokepoint also enforces a deny list that no
 policy can override (`/`, volume roots, `$HOME`, protected first-level home
@@ -319,7 +319,7 @@ to defer update checks until a signed appcast URL is configured in Info.plist.
 - **No admin privileges**: Only accesses user-space directories (`~/Library/`, `~/.`)
 - **No network access**: No analytics, telemetry, or phoning home
 - **PathGuard admission on every destructive path**: category roots, contained
-  children, node_modules items, and cleanCommand roots are admitted against
+  children, node_modules items, and cleanCommands roots are admitted against
   category-scoped policies plus an inode-identity deny list (`/`, volume
   roots, `$HOME`, protected first-level home children) before anything is
   deleted; the parent chain is re-validated immediately before each

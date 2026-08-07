@@ -31,9 +31,10 @@ now 3 and destructive commands require `--confirm`. Coordinate MCP updates with
   `CLEAN_FAILED`; a partial clean stays exit 0 and reports per-item `success`
   flags. Running destructive commands as root is refused outright
   (`ROOT_REFUSED`).
-- **`smart-clean` validates its target strictly.** A missing, non-numeric,
-  non-positive, or zero-truncating target GB argument is an `INVALID_ARGUMENTS`
-  error — never a silent 5 GB default.
+- **`smart-clean` validates its target strictly.** An absent target still
+  defaults to 5 GB, but a *present* target that is non-numeric, non-finite,
+  non-positive, over 10^9, or too small to convert to a whole byte is an
+  `INVALID_ARGUMENTS` error — malformed input is never silently defaulted.
 - **Sizes are bigger — and truthful.** Sizing no longer skips package
   descendants or hidden files, so `.app`/bundle contents and dot-directories
   now count (D2/D3). Xcode DerivedData and Simulator categories in particular

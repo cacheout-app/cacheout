@@ -82,7 +82,7 @@ struct CacheCategory: Identifiable, Hashable {
     let riskLevel: RiskLevel
     let rebuildNote: String
     let defaultSelected: Bool
-    let cleanCommand: String?
+    let cleanCommands: [[String]]?
 }
 ```
 
@@ -99,7 +99,7 @@ struct CacheCategory: Identifiable, Hashable {
 | `riskLevel` | `RiskLevel` | Safety classification |
 | `rebuildNote` | `String` | What happens after cleaning |
 | `defaultSelected` | `Bool` | Whether selected by default on scan |
-| `cleanCommand` | `String?` | Optional shell command for cleanup (instead of file deletion) |
+| `cleanCommands` | `[[String]]?` | Optional argv arrays for cleanup (instead of file deletion), run directly via `/usr/bin/env` — never a shell |
 
 **Computed Properties:**
 
@@ -113,8 +113,8 @@ struct CacheCategory: Identifiable, Hashable {
 // Legacy init (static paths only)
 init(name:slug:description:icon:paths:[String]:riskLevel:rebuildNote:defaultSelected:)
 
-// Full init (discovery + optional clean command)
-init(name:slug:description:icon:discovery:[PathDiscovery]:riskLevel:rebuildNote:defaultSelected:cleanCommand:)
+// Full init (discovery + optional clean commands)
+init(name:slug:description:icon:discovery:[PathDiscovery]:riskLevel:rebuildNote:defaultSelected:cleanCommands:)
 ```
 
 **Static Properties:**

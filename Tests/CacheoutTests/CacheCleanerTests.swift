@@ -143,6 +143,9 @@ final class CacheCleanerTests: XCTestCase {
     /// (same pattern as PathGuardTests).
     private final class DeviceInjectingProvider: FileSystemIdentityProvider {
         var overrides: [(canonicalPrefix: String, device: UInt64)] = []
+        /// Canonical paths reported as mount points while keeping their real
+        /// device — the same-st_dev firmlink-mount stand-in.
+        var mountPointPaths: Set<String> = []
 
         override func identity(of url: URL) -> Identity? {
             let path = url.path
@@ -154,6 +157,14 @@ final class CacheCleanerTests: XCTestCase {
                 }
             }
             return super.identity(of: url)
+        }
+
+        override func isMountPoint(_ url: URL) -> Bool {
+            if mountPointPaths.contains(url.path)
+                || mountPointPaths.contains(canonicalize(url).path) {
+                return true
+            }
+            return super.isMountPoint(url)
         }
     }
 
@@ -668,6 +679,93 @@ final class CacheCleanerTests: XCTestCase {
         )
         XCTAssertFalse(FileManager.default.fileExists(atPath: normal.path),
                        "siblings are still cleaned (per-child isolation)")
+        XCTAssertEqual(report.errors.count, 1)
+    }
+
+    func testNestedMountBoundaryInsideChildRefusesThatChildOnly() async throws {
+        // Round-2 completion-review gap: the sizer records-and-skips an INNER
+        // mount for sizing, but removeItem would recurse straight through it.
+        // A boundary anywhere in the measured tree must refuse that child;
+        // both nested-mount signals covered, sibling isolation preserved.
+        let root = try makeTempDir("nested-mount-root")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let host = root.appendingPathComponent("host-cache")
+        let sibling = root.appendingPathComponent("plain-cache")
+        let innerForeign = host.appendingPathComponent("foreign-mount")
+        let innerFirmlink = host.appendingPathComponent("firmlink-mount")
+        for dir in [host, sibling, innerForeign, innerFirmlink] {
+            try FileManager.default.createDirectory(
+                at: dir, withIntermediateDirectories: true
+            )
+        }
+        try writeFile(host.appendingPathComponent("loose.bin"))
+        try writeFile(innerForeign.appendingPathComponent("payload-a.bin"))
+        try writeFile(innerFirmlink.appendingPathComponent("payload-b.bin"))
+        try writeFile(sibling.appendingPathComponent("cache.bin"))
+
+        let provider = DeviceInjectingProvider()
+        provider.overrides = [(provider.canonicalize(innerForeign).path, 0xF00D)]
+        provider.mountPointPaths = [provider.canonicalize(innerFirmlink).path]
+
+        let category = makeCategory(at: root, name: "nested-mount")
+        let cleaner = CacheCleaner(provider: provider)
+        let report = await cleaner.clean(
+            results: [makeScanResult(category: category)], moveToTrash: false
+        )
+
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: innerForeign.appendingPathComponent("payload-a.bin").path
+            ),
+            "foreign-device mounted payload must survive"
+        )
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: innerFirmlink.appendingPathComponent("payload-b.bin").path
+            ),
+            "same-device mount-point payload must survive"
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: host.path),
+                      "the hosting child is refused wholesale, not partially deleted")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: sibling.path),
+                       "the unrelated sibling is still cleaned")
+        XCTAssertEqual(report.errors.count, 1)
+    }
+
+    func testNestedMountBoundaryInsideNodeModulesItemRefused() async throws {
+        // Item mode has the same shape: validateRemovableItem catches the
+        // item ITSELF being a mount target, but not a mount nested beneath.
+        let root = try makeTempDir("nested-mount-nm")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let nm = root.appendingPathComponent("proj/node_modules")
+        let inner = nm.appendingPathComponent("inner-mount")
+        try FileManager.default.createDirectory(
+            at: inner, withIntermediateDirectories: true
+        )
+        try writeFile(nm.appendingPathComponent("x.js"))
+        try writeFile(inner.appendingPathComponent("payload.bin"))
+
+        let provider = DeviceInjectingProvider()
+        provider.mountPointPaths = [provider.canonicalize(inner).path]
+
+        let item = NodeModulesItem(
+            projectName: "proj", projectPath: nm.deletingLastPathComponent(),
+            nodeModulesPath: nm, sizeBytes: 16, lastModified: nil,
+            originContainer: root, isSelected: true
+        )
+        let cleaner = CacheCleaner(containerRoots: [root], provider: provider)
+        let report = await cleaner.clean(
+            results: [], nodeModules: [item], moveToTrash: false
+        )
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: nm.path),
+                      "an item with a nested mount must not be deleted")
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: inner.appendingPathComponent("payload.bin").path
+            )
+        )
+        XCTAssertTrue(report.entries.isEmpty)
         XCTAssertEqual(report.errors.count, 1)
     }
 

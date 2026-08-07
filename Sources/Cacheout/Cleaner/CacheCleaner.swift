@@ -436,13 +436,15 @@ actor CacheCleaner {
             knownInodes: await registry.knownIdentities
         )
 
-        // A child that is ITSELF a mount boundary (mount point, or foreign
-        // device vs its parent) is refused outright — `validateContainedChild`
-        // is descendant-only by design, so this is where the mount rule lands
-        // for category children (R15). Item mode gets the same refusal from
-        // `validateRemovableItem`'s deny-list re-check.
-        if report.rootMountBoundary {
-            let detail = "\(child.path): mount boundary — refused, not deleted"
+        // ANY mount boundary in the measured tree — the child itself, or a
+        // mounted subtree nested anywhere beneath it — refuses the deletion.
+        // The sizer records-and-skips boundaries for SIZING, but `removeItem`
+        // would recurse straight through an inner mount; refusal is the
+        // epic's mount doctrine (R15). `validateContainedChild` is
+        // descendant-only by design, so this is where the rule lands for
+        // category children.
+        if let boundary = report.mountBoundaries.first {
+            let detail = "\(child.path): mount boundary at \(boundary.path) — refused, not deleted"
             logRefusal(category: category, tag: "mount_boundary", detail: detail)
             return .failed(detail)
         }
@@ -528,6 +530,18 @@ actor CacheCleaner {
                 at: item.nodeModulesPath, mode: .deletionTarget,
                 knownInodes: await registry.knownIdentities
             )
+
+            // Same mount doctrine as category children (R15): a boundary
+            // anywhere in the measured tree refuses the deletion —
+            // `validateRemovableItem` catches the item ITSELF being a mount
+            // target, but not a mount nested beneath it.
+            if let boundary = report.mountBoundaries.first {
+                let detail = "\(item.nodeModulesPath.path): mount boundary at \(boundary.path) — refused, not deleted"
+                logRefusal(category: label, tag: "mount_boundary", detail: detail)
+                errors.append((label, detail))
+                continue
+            }
+
             let token = await registry.registerObservations(report.claims)
 
             do {

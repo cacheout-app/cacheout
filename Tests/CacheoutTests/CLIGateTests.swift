@@ -101,6 +101,7 @@ final class CLIGateTests: XCTestCase {
         exact: Int64 = 4096,
         estimated: Int64 = 0,
         state: ScanState = .measured,
+        action: ReclaimAction = .removeItem,
         automaticCleanEligible: Bool = false,
         defaultSelected: Bool = false
     ) -> ReclaimableItem {
@@ -117,7 +118,7 @@ final class CLIGateTests: XCTestCase {
             )],
             state: state, scanError: nil,
             risk: risk, evidence: "fixture evidence", rebuildNote: nil,
-            action: .removeItem,
+            action: action,
             admission: .containerItem(
                 originContainer: container, requestedTargetURL: target
             ),
@@ -808,6 +809,71 @@ final class CLIGateTests: XCTestCase {
         XCTAssertFalse(try jsonString(confirmed).contains(token))
         let rows = try XCTUnwrap(confirmed["results"] as? [[String: Any]])
         XCTAssertEqual(rows[0]["success"] as? Bool, true)
+    }
+
+    // MARK: - Frozen wire values, complete matrix (R8)
+
+    func testFrozenWireValuesAssertedExactlyOnCLIRows() throws {
+        // ALL THREE ReclaimAction wire strings, asserted through the CLI's
+        // scanner_items row builder (permanent external contract — fn-3..6
+        // and cacheout-mcp inherit these values verbatim). The `.commands`
+        // case doubles as the argv non-exposure proof at the row level:
+        // ONLY the kind is serialized.
+        let actionMatrix: [(ReclaimAction, String)] = [
+            (.removeContents, "remove_contents"),
+            (.removeItem, "remove_item"),
+            (.commands([["rm", "-rf", "NEVER_ON_THE_WIRE"]]), "commands"),
+        ]
+        for (action, wire) in actionMatrix {
+            let row = CLIHandler.scannerItemRowJSON(
+                for: makeStandaloneItem(id: "wire_\(wire)", action: action)
+            )
+            XCTAssertEqual(row["action"] as? String, wire,
+                           "frozen wire string for \(wire)")
+            XCTAssertFalse(try jsonString(row).contains("NEVER_ON_THE_WIRE"),
+                           "argv arrays never appear in any row")
+        }
+
+        // ALL SIX ScanIssue.Kind wire strings through the scanner_errors row
+        // builder — exact rows: the five filesystem kinds carry their real
+        // `path`; `malformed_outcome` has NO path key at all.
+        let url = URL(fileURLWithPath: "/tmp/wire-fixture-root")
+        let filesystemKinds: [(ScanIssue.Kind, String)] = [
+            (.containerRefused, "container_refused"),
+            (.symlinkRoot, "symlink_root"),
+            (.tccDenied, "tcc_denied"),
+            (.permissionDenied, "permission_denied"),
+            (.unreadable, "unreadable"),
+        ]
+        for (kind, wire) in filesystemKinds {
+            let row = CLIHandler.scannerErrorRowJSON(
+                scannerID: "wire_scanner",
+                issue: ScanIssue(url: url, kind: kind, detail: "fixture detail")
+            )
+            XCTAssertEqual(row as NSDictionary, [
+                "scanner_id": "wire_scanner",
+                "kind": wire,
+                "detail": "fixture detail",
+                "path": url.path,
+            ] as NSDictionary, "exact row for filesystem kind \(wire)")
+        }
+        let malformedRow = CLIHandler.scannerErrorRowJSON(
+            scannerID: "wire_scanner",
+            issue: ScanIssue(url: nil, kind: .malformedOutcome, detail: "fixture detail")
+        )
+        XCTAssertEqual(malformedRow as NSDictionary, [
+            "scanner_id": "wire_scanner",
+            "kind": "malformed_outcome",
+            "detail": "fixture detail",
+        ] as NSDictionary, "malformed_outcome is path-less by contract")
+
+        // The frozen aggregate scanner id on clean-side identity fields —
+        // the literal string, not just the constant (a renamed constant
+        // must not silently change the wire).
+        let aggregateRow = CLIHandler.cleanPlanItemJSON(
+            for: makeItem(state: .measured, exact: 4096, items: 1)
+        )
+        XCTAssertEqual(aggregateRow["scanner_id"] as? String, "categories")
     }
 
     // MARK: - Address grammar (R7)

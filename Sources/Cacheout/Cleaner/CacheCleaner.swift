@@ -386,10 +386,11 @@ actor CacheCleaner {
 
     // MARK: Clean — compatibility adapter (pre-unification callers)
 
-    /// THIN adapter for the not-yet-migrated call sites (ViewModel until
-    /// fn-2.4, CLI until fn-2.6): builds `ReclaimableItem`s and forwards to
-    /// `clean(items:moveToTrash:)` — ONE dispatch, no second code path.
-    /// Scheduled for deletion once both callers consume items directly.
+    /// THIN adapter for the not-yet-migrated call sites (the ViewModel
+    /// migrated in fn-2.4; the CLI remains until fn-2.6): builds
+    /// `ReclaimableItem`s and forwards to `clean(items:moveToTrash:)` — ONE
+    /// dispatch, no second code path. Scheduled for deletion once the CLI
+    /// consumes items directly.
     func clean(
         results: [ScanResult],
         nodeModules: [NodeModulesItem] = [],

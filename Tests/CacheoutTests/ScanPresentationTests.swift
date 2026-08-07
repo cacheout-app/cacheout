@@ -69,19 +69,51 @@ final class ScanPresentationTests: XCTestCase {
         )
     }
 
-    /// Hermetic view model: fixture-home scanners, empty category registry.
+    /// Hermetic view model (fn-2.4): a fixture-home RUNTIME — empty category
+    /// registry, injected search roots, zero reads of the real `$HOME`. The
+    /// cleaner is runtime-constructed, exactly as production composes it.
     @MainActor
     private func makeViewModel(
         searchRoots: [URL] = []
-    ) -> CacheoutViewModel {
-        CacheoutViewModel(
-            scanner: CacheScanner(home: fixtureHome),
-            nodeModulesScanner: NodeModulesScanner(
-                home: fixtureHome, searchRoots: searchRoots
-            ),
-            cleaner: CacheCleaner(home: fixtureHome),
-            categories: []
+    ) throws -> CacheoutViewModel {
+        let provider = FileSystemIdentityProvider()
+        let runtime = try SpaceScannerRuntime(
+            scanners: [
+                CategoryScanner(
+                    categories: [],
+                    scanner: CacheScanner(home: fixtureHome, provider: provider)
+                ),
+                NodeModulesScanner(
+                    home: fixtureHome, searchRoots: searchRoots,
+                    provider: provider
+                ),
+            ],
+            categories: [],
+            home: fixtureHome,
+            provider: provider
         )
+        return CacheoutViewModel(runtime: runtime)
+    }
+
+    /// Seeds category-aggregate state through the SAME reconciliation path
+    /// production uses (`handle` is `scan()`'s per-event entry point) —
+    /// aggregate items built by the one real mapping, never a parallel
+    /// construction.
+    @MainActor
+    private func seedCategories(
+        _ viewModel: CacheoutViewModel, results: [ScanResult]
+    ) {
+        viewModel.handle(.outcome(
+            scannerID: CategoryScanner.registeredID,
+            ScanOutcome(
+                items: results.map { CategoryScanner.item(from: $0) },
+                errors: []
+            )
+        ))
+    }
+
+    private func categoryKey(_ slug: String) -> ItemKey {
+        ItemKey(scannerID: CategoryScanner.registeredID, itemID: slug)
     }
 
     // MARK: - statusLabel (R6 presentation)
@@ -128,8 +160,8 @@ final class ScanPresentationTests: XCTestCase {
     }
 
     @MainActor
-    func testToggleSelectionRefusesDeniedAllowsPartiallyDenied() {
-        let viewModel = makeViewModel()
+    func testToggleSelectionRefusesDeniedAllowsPartiallyDenied() throws {
+        let viewModel = try makeViewModel()
         let denied = makeResult(
             state: .denied, category: makeCategory(name: "denied-cat"),
             scanError: ScanError(kind: .tccDenied, message: "denied")
@@ -139,25 +171,27 @@ final class ScanPresentationTests: XCTestCase {
             exact: 4096, items: 1,
             scanError: ScanError(kind: .permissionDenied, message: "partial")
         )
-        viewModel.scanResults = [denied, partial]
+        seedCategories(viewModel, results: [denied, partial])
 
-        viewModel.toggleSelection(for: denied.id)
-        XCTAssertFalse(viewModel.scanResults[0].isSelected,
+        viewModel.toggleSelection(for: categoryKey("denied-cat"))
+        XCTAssertFalse(viewModel.selectedItemKeys.contains(categoryKey("denied-cat")),
                        ".denied must not be selectable from the UI (R18)")
+        XCTAssertFalse(viewModel.categoryRows[0].result.isSelected,
+                       "the row projection must agree")
 
-        viewModel.toggleSelection(for: partial.id)
-        XCTAssertTrue(viewModel.scanResults[1].isSelected,
+        viewModel.toggleSelection(for: categoryKey("partial-cat"))
+        XCTAssertTrue(viewModel.selectedItemKeys.contains(categoryKey("partial-cat")),
                       "explicit manual toggle of .partiallyDenied is allowed")
         XCTAssertTrue(viewModel.hasPartiallyDeniedSelection,
                       "the confirmation sheet warning must arm")
 
-        viewModel.toggleSelection(for: partial.id)
+        viewModel.toggleSelection(for: categoryKey("partial-cat"))
         XCTAssertFalse(viewModel.hasPartiallyDeniedSelection)
     }
 
     @MainActor
-    func testSelectAllSafeSkipsDeniedAndPartiallyDenied() {
-        let viewModel = makeViewModel()
+    func testSelectAllSafeSkipsDeniedAndPartiallyDenied() throws {
+        let viewModel = try makeViewModel()
         // defaultSelected: false so any true below came from selectAllSafe.
         let safeMeasured = makeResult(
             state: .measured,
@@ -180,21 +214,20 @@ final class ScanPresentationTests: XCTestCase {
             category: makeCategory(name: "review-measured", risk: .review, defaultSelected: false),
             exact: 4096, items: 1
         )
-        viewModel.scanResults = [safeMeasured, safePartial, safeDenied, reviewMeasured]
+        seedCategories(viewModel, results: [safeMeasured, safePartial, safeDenied, reviewMeasured])
 
         viewModel.selectAllSafe()
 
-        XCTAssertTrue(viewModel.scanResults[0].isSelected, "safe .measured is auto-selected")
-        XCTAssertFalse(viewModel.scanResults[1].isSelected,
-                       ".partiallyDenied is excluded from the auto path (smart-clean)")
-        XCTAssertFalse(viewModel.scanResults[2].isSelected, ".denied stays unselected")
-        XCTAssertFalse(viewModel.scanResults[3].isSelected, "non-safe risk untouched")
+        XCTAssertEqual(viewModel.selectedItemKeys, [categoryKey("safe-measured")],
+                       "safe .measured is auto-selected; .partiallyDenied is excluded from "
+                       + "the auto path (smart-clean), .denied stays unselected, non-safe "
+                       + "risk untouched")
     }
 
     @MainActor
-    func testTotalRecoverableExcludesDenied() {
-        let viewModel = makeViewModel()
-        viewModel.scanResults = [
+    func testTotalRecoverableExcludesDenied() throws {
+        let viewModel = try makeViewModel()
+        seedCategories(viewModel, results: [
             makeResult(state: .measured, category: makeCategory(name: "m"),
                        exact: 4096, items: 1),
             makeResult(state: .partiallyDenied, category: makeCategory(name: "p"),
@@ -202,7 +235,7 @@ final class ScanPresentationTests: XCTestCase {
                        scanError: ScanError(kind: .permissionDenied, message: "x")),
             makeResult(state: .denied, category: makeCategory(name: "d"),
                        scanError: ScanError(kind: .tccDenied, message: "x")),
-        ]
+        ])
 
         XCTAssertEqual(viewModel.totalRecoverable, 4096 + 2048,
                        "denied contributes nothing; partiallyDenied contributes its measured floor")
@@ -219,8 +252,8 @@ final class ScanPresentationTests: XCTestCase {
     }
 
     @MainActor
-    func testViewModelExposesCaveatBesideRecoverableTotal() {
-        XCTAssertEqual(makeViewModel().overcountCaveat, DiskSpaceCaveat.overcount)
+    func testViewModelExposesCaveatBesideRecoverableTotal() throws {
+        XCTAssertEqual(try makeViewModel().overcountCaveat, DiskSpaceCaveat.overcount)
     }
 
     // MARK: - Component-derived rendering (R11/R16)
@@ -389,26 +422,26 @@ final class ScanPresentationTests: XCTestCase {
     // MARK: - Whole-window scan guards (R11)
 
     @MainActor
-    func testIsAnyScanInProgressCoversBothPhases() {
-        let viewModel = makeViewModel()
+    func testIsAnyScanInProgressCoversEveryPendingScanner() throws {
+        let viewModel = try makeViewModel()
         XCTAssertFalse(viewModel.isAnyScanInProgress)
 
-        // The cache phase clears `isScanning` while node_modules keeps
-        // running 10–30s longer — the whole window must read as scanning.
-        viewModel.isNodeModulesScanning = true
+        // The category scanner reports in seconds while node_modules keeps
+        // running 10–30s longer — ANY pending scanner must read as scanning.
+        viewModel.scanningScannerIDs = [NodeModulesScanner.registeredID]
         XCTAssertTrue(viewModel.isAnyScanInProgress)
         XCTAssertFalse(viewModel.shouldAutoRescan,
                        "an in-flight scan must never trigger an auto-rescan")
 
-        viewModel.isNodeModulesScanning = false
-        viewModel.isScanning = true
+        viewModel.scanningScannerIDs = [CategoryScanner.registeredID]
         XCTAssertTrue(viewModel.isAnyScanInProgress)
     }
 
     @MainActor
-    func testCleanRefusedWhileNodeModulesPhaseStillRunning() async {
-        let viewModel = makeViewModel()
-        viewModel.isNodeModulesScanning = true  // cache phase already done
+    func testCleanRefusedWhileAnyScannerStillPending() async throws {
+        let viewModel = try makeViewModel()
+        // categories already reported; node_modules still pending
+        viewModel.scanningScannerIDs = [NodeModulesScanner.registeredID]
 
         await viewModel.clean()
 
@@ -419,9 +452,9 @@ final class ScanPresentationTests: XCTestCase {
     }
 
     @MainActor
-    func testScanReentrancyRefusedWhileAnyPhaseRunning() async {
-        let viewModel = makeViewModel()
-        viewModel.isNodeModulesScanning = true
+    func testScanReentrancyRefusedWhileAnyScannerPending() async throws {
+        let viewModel = try makeViewModel()
+        viewModel.scanningScannerIDs = [NodeModulesScanner.registeredID]
 
         await viewModel.scan(trigger: .userInitiated)
 
@@ -431,8 +464,8 @@ final class ScanPresentationTests: XCTestCase {
     }
 
     @MainActor
-    func testScanRefusedWhileCleaning() async {
-        let viewModel = makeViewModel()
+    func testScanRefusedWhileCleaning() async throws {
+        let viewModel = try makeViewModel()
         viewModel.isCleaning = true
 
         await viewModel.scan(trigger: .userInitiated)
@@ -465,21 +498,35 @@ final class ScanPresentationTests: XCTestCase {
             )
         }
 
-        let viewModel = makeViewModel()
+        let viewModel = try makeViewModel()
         viewModel.moveToTrash = false  // permanent delete, fixture-contained
+        // Real scan-time-shaped root records — the unified cleaner deletes
+        // only what the scan captured (root-snapshot rule).
+        let provider = FileSystemIdentityProvider()
+        func record(at url: URL) -> RootScanRecord {
+            RootScanRecord(
+                requestedURL: url,
+                resolvedURL: provider.canonicalize(url),
+                status: .measured
+            )
+        }
         let safe = ScanResult(
             category: fixtureCategory("safe-measured", at: safeRoot),
             state: .measured, exactBytes: 4096, estimatedUpToBytes: 0,
-            itemCount: 1, scanError: nil
+            itemCount: 1, scanError: nil,
+            rootRecords: [record(at: safeRoot)]
         )
-        var partial = ScanResult(
+        let partial = ScanResult(
             category: fixtureCategory("partial-denied", at: partialRoot),
             state: .partiallyDenied, exactBytes: 4096, estimatedUpToBytes: 0,
             itemCount: 1,
-            scanError: ScanError(kind: .permissionDenied, message: "partial")
+            scanError: ScanError(kind: .permissionDenied, message: "partial"),
+            rootRecords: [record(at: partialRoot)]
         )
-        partial.isSelected = true  // manual selection made BEFORE Quick Clean
-        viewModel.scanResults = [safe, partial]
+        seedCategories(viewModel, results: [safe, partial])
+        // Manual selection made BEFORE Quick Clean.
+        viewModel.toggleSelection(for: categoryKey("partial-denied"))
+        XCTAssertTrue(viewModel.selectedItemKeys.contains(categoryKey("partial-denied")))
 
         await viewModel.smartClean()
 
@@ -507,19 +554,20 @@ final class ScanPresentationTests: XCTestCase {
             try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: docs.path)
         }
 
-        let viewModel = makeViewModel(searchRoots: [docs])
+        let viewModel = try makeViewModel(searchRoots: [docs])
+        let nm = NodeModulesScanner.registeredID
 
         await viewModel.scan(trigger: .userInitiated)
-        XCTAssertFalse(viewModel.nodeModulesScanIssues.isEmpty,
+        XCTAssertFalse(viewModel.issues(forScanner: nm).isEmpty,
                        "the denied root must be visible in the view model (R14)")
         XCTAssertTrue(
-            viewModel.nodeModulesScanIssues.allSatisfy { $0.kind == .permissionDenied },
-            "unexpected classification: \(viewModel.nodeModulesScanIssues)"
+            viewModel.issues(forScanner: nm).allSatisfy { $0.kind == .permissionDenied },
+            "unexpected classification: \(viewModel.issues(forScanner: nm))"
         )
-        XCTAssertTrue(viewModel.nodeModulesItems.isEmpty)
+        XCTAssertTrue(viewModel.items(forScanner: nm).isEmpty)
 
         await viewModel.scan(trigger: .automatic)
-        XCTAssertTrue(viewModel.nodeModulesScanIssues.isEmpty,
+        XCTAssertTrue(viewModel.issues(forScanner: nm).isEmpty,
                       "automatic scans skip protected roots — nothing walked, nothing to report (R9)")
     }
 
@@ -533,16 +581,17 @@ final class ScanPresentationTests: XCTestCase {
         try Data(repeating: 0xCD, count: 4096)
             .write(to: dep.appendingPathComponent("index.js"))
 
-        let viewModel = makeViewModel(searchRoots: [docs])
+        let viewModel = try makeViewModel(searchRoots: [docs])
+        let nm = NodeModulesScanner.registeredID
 
         await viewModel.scan(trigger: .automatic)
-        XCTAssertTrue(viewModel.nodeModulesItems.isEmpty,
+        XCTAssertTrue(viewModel.items(forScanner: nm).isEmpty,
                       "automatic scans never enumerate protected roots (R9)")
-        XCTAssertTrue(viewModel.nodeModulesScanIssues.isEmpty,
+        XCTAssertTrue(viewModel.issues(forScanner: nm).isEmpty,
                       "a policy skip is not a scan problem")
 
         await viewModel.scan(trigger: .userInitiated)
-        XCTAssertEqual(viewModel.nodeModulesItems.map(\.projectName), ["proj"],
+        XCTAssertEqual(viewModel.items(forScanner: nm).map(\.displayName), ["proj"],
                        "user-initiated scans include protected roots (R9)")
     }
 }

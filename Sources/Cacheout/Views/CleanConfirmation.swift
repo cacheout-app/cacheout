@@ -42,8 +42,7 @@ struct CleanConfirmationSheet: View {
             Text("Clean Selected Caches?")
                 .font(.title2.bold())
 
-            // ⚡ Bolt: Use .lazy.filter for .count to avoid allocating an intermediate array
-            Text("This will remove \(viewModel.formattedTotalSelectedSize) from \(viewModel.selectedResults.count + viewModel.nodeModulesItems.lazy.filter(\.isSelected).count) items.")
+            Text("This will remove \(viewModel.formattedTotalSelectedSize) from \(viewModel.selectedCount) items.")
                 .font(.body)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
@@ -55,27 +54,30 @@ struct CleanConfirmationSheet: View {
                 .multilineTextAlignment(.center)
 
             VStack(alignment: .leading, spacing: 4) {
-                ForEach(viewModel.selectedResults) { result in
+                // Category aggregates keep their category icon; identity by
+                // composite ItemKey (fn-2.4).
+                ForEach(viewModel.selectedCategoryRows) { row in
                     HStack {
-                        Image(systemName: result.category.icon)
+                        Image(systemName: row.result.category.icon)
                             .frame(width: 20)
-                        Text(result.category.name)
+                        Text(row.result.category.name)
                         Spacer()
-                        Text(result.formattedSize)
+                        Text(row.result.formattedSize)
                             .foregroundStyle(.secondary)
                     }
                     .font(.caption)
                     .accessibilityElement(children: .combine)
                 }
 
-                // Node modules
-                ForEach(viewModel.nodeModulesItems.filter(\.isSelected)) { item in
+                // Per-item scanner rows, "scanner: item" labelled (renders
+                // "node_modules: <project>" exactly as before).
+                ForEach(viewModel.selectedItems.filter { $0.scannerID != CategoryScanner.registeredID }, id: \.key) { item in
                     HStack {
                         Image(systemName: "shippingbox.fill")
                             .frame(width: 20)
-                        Text("node_modules: \(item.projectName)")
+                        Text("\(item.scannerID): \(item.displayName)")
                         Spacer()
-                        Text(item.formattedSize)
+                        Text(ByteCountFormatter.sharedFile.string(fromByteCount: item.allocatedBytes))
                             .foregroundStyle(.secondary)
                     }
                     .font(.caption)
@@ -89,8 +91,7 @@ struct CleanConfirmationSheet: View {
             Toggle("Move to Trash (instead of permanent delete)", isOn: $viewModel.moveToTrash)
                 .font(.caption)
 
-            let hasCaution = viewModel.selectedResults.contains { $0.category.riskLevel == .caution }
-            if hasCaution {
+            if viewModel.hasCautionSelection {
                 Label("Caution items selected — these may require manual recovery", systemImage: "exclamationmark.triangle.fill")
                     .font(.caption)
                     .foregroundStyle(.orange)

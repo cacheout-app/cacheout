@@ -158,8 +158,7 @@ struct MenuBarView: View {
             Spacer()
             statPill(
                 label: "Categories",
-                // ⚡ Bolt: Use .lazy.filter to prevent intermediate array allocation for .count
-                value: "\(viewModel.scanResults.lazy.filter { !$0.isEmpty }.count)",
+                value: "\(viewModel.categoryRows.lazy.filter { !$0.result.isEmpty }.count)",
                 color: .blue
             )
         }
@@ -184,17 +183,18 @@ struct MenuBarView: View {
 
     private var topCategories: some View {
         // ⚡ Bolt: Filter eagerly before sorting, as sorting forces full array materialization
-        let top = viewModel.scanResults
-            .filter { !$0.isEmpty && $0.state != .denied }
-            .sorted { $0.sizeBytes > $1.sizeBytes }
+        let top = viewModel.categoryRows
+            .filter { !$0.result.isEmpty && $0.result.state != .denied }
+            .sorted { $0.result.sizeBytes > $1.result.sizeBytes }
             .prefix(5)
         // Denied categories are appended VISIBLY after the size ranking —
         // denial is information and must never be hidden by a size sort
         // where "nothing measurable" reads as 0 bytes (fn-1.4, R18/D6).
-        let denied = viewModel.scanResults.filter { $0.state == .denied }
+        let denied = viewModel.categoryRows.filter { $0.result.state == .denied }
 
         return VStack(spacing: 0) {
-            ForEach(Array(top)) { result in
+            ForEach(Array(top)) { row in
+                let result = row.result
                 HStack(spacing: 8) {
                     Image(systemName: result.category.icon)
                         .font(.caption)
@@ -215,7 +215,8 @@ struct MenuBarView: View {
                 .padding(.vertical, 5)
             }
 
-            ForEach(denied) { result in
+            ForEach(denied) { row in
+                let result = row.result
                 HStack(spacing: 8) {
                     Image(systemName: "lock.fill")
                         .font(.caption)

@@ -41,9 +41,11 @@
 /// consume them:
 ///
 /// - **Legacy** `scan(maxDepth:includeProtectedRoots:)` — the pre-unification
-///   GUI surface (`NodeModulesScanOutcome`): candidate denials surface as
+///   surface (`NodeModulesScanOutcome`): candidate denials surface as
 ///   outcome errors and only measurable candidates become items, exactly as
-///   before. fn-2.4 retires this surface.
+///   before. The GUI migrated off it in fn-2.4 (the ViewModel consumes the
+///   runtime's validated stream); it survives only for its own tests and
+///   the cleaner's compatibility adapter until fn-2.6 retires both.
 /// - **Protocol** `scan(context:)` (`SpaceScanner`) — emits one
 ///   `ReclaimableItem` per recognized candidate under the epic's COMPLETE
 ///   truth table (`.measured`/`.empty`/`.partiallyDenied`/`.denied`):
@@ -84,7 +86,7 @@ struct NodeModulesScanIssue: Equatable {
 }
 
 /// What a node_modules scan produced: items plus classified errors (the
-/// legacy pre-unification surface; fn-2.4 retires it).
+/// legacy pre-unification surface; the GUI no longer consumes it — fn-2.4).
 struct NodeModulesScanOutcome {
     var items: [NodeModulesItem]
     var errors: [NodeModulesScanIssue]
@@ -191,9 +193,10 @@ actor NodeModulesScanner {
         )
     }
 
-    /// Legacy surface (pre-unification GUI; fn-2.4 retires it) — behavior
-    /// preserved byte-for-byte: candidate sizing denials surface as OUTCOME
-    /// errors, and only candidates with measurable bytes become items.
+    /// Legacy surface (pre-unification; no GUI caller since fn-2.4) —
+    /// behavior preserved byte-for-byte: candidate sizing denials surface as
+    /// OUTCOME errors, and only candidates with measurable bytes become
+    /// items.
     ///
     /// - Parameters:
     ///   - maxDepth: recursion bound below each search root.

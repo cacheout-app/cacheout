@@ -97,7 +97,7 @@ struct CacheoutApp: App {
                 .environmentObject(viewModel)
                 .onReceive(tickTimer) { _ in
                     Task { @MainActor in
-                        if viewModel.shouldAutoRescan && !viewModel.isScanning {
+                        if viewModel.shouldAutoRescan && !viewModel.isAnyScanInProgress {
                             // `.automatic`: a timer tick is not user consent —
                             // protected roots wait for an explicit Scan (R9).
                             await viewModel.scan(trigger: .automatic)

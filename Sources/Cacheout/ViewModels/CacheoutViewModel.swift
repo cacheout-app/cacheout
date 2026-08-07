@@ -40,18 +40,9 @@
 import Foundation
 import SwiftUI
 
-/// What set a scan in motion (fn-1.4, R9). TCC-protected search roots
-/// (Documents, Desktop, …) are enumerated ONLY for `.userInitiated` scans —
-/// a background refresh must never be the thing that fires a macOS privacy
-/// prompt.
-enum ScanTrigger: Equatable {
-    /// The user explicitly asked (Scan button, Quick Clean, confirmed
-    /// cleanup). Protected roots are included; macOS may prompt once.
-    case userInitiated
-    /// Popover/tab auto-rescan or any other background refresh. Protected
-    /// roots are skipped entirely.
-    case automatic
-}
+// `ScanTrigger` lives in Scanner/SpaceScanner.swift (fn-2.1): the scanner
+// layer consumes it via `ScanContext`, so the declaration must not live in
+// this SwiftUI-importing file.
 
 @MainActor
 class CacheoutViewModel: ObservableObject {

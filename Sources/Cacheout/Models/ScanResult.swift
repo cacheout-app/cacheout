@@ -128,6 +128,15 @@ struct ScanResult: Identifiable {
     let itemCount: Int
     /// Why the scan is `denied`/`partiallyDenied`; nil for clean states.
     let scanError: ScanError?
+    /// Per-root capture (fn-2.1, root-capture invariant): one record for
+    /// EVERY root the scan resolved, populated by `CacheScanner` AT SCAN
+    /// TIME — it already resolves and admits each root before measuring.
+    /// `CategoryScanner` carries these records onto the aggregate item
+    /// verbatim and never re-evaluates `resolvedPaths`; clean-time dispatch
+    /// (fn-2.3) deletes only `.measured` records and re-admits
+    /// `requestedURL`s. Empty for `.missing` (and for pre-capture
+    /// compatibility callers).
+    let rootRecords: [RootScanRecord]
     var isSelected: Bool
 
     /// Compatibility sum of the split components — what pre-split callers
@@ -143,7 +152,8 @@ struct ScanResult: Identifiable {
         exactBytes: Int64,
         estimatedUpToBytes: Int64,
         itemCount: Int,
-        scanError: ScanError?
+        scanError: ScanError?,
+        rootRecords: [RootScanRecord] = []
     ) {
         self.id = category.id
         self.category = category
@@ -152,6 +162,7 @@ struct ScanResult: Identifiable {
         self.estimatedUpToBytes = estimatedUpToBytes
         self.itemCount = itemCount
         self.scanError = scanError
+        self.rootRecords = rootRecords
         // Selection defaults (fn-1.4, R18): `.denied` is unselectable —
         // nothing was measurable and the cleaner refuses it regardless.
         // `.partiallyDenied` is NEVER auto-selected (its size is a floor,

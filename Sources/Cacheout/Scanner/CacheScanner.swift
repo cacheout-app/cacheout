@@ -71,6 +71,8 @@ actor CacheScanner {
         // one would refuse every home-relative root and defeat the seam.
         let resolvedPaths = category.resolvedPaths(home: home)
         guard !resolvedPaths.isEmpty else {
+            // `.missing` carries an EMPTY root capture by contract (fn-2.1):
+            // there is nothing deletable and nothing to re-admit.
             return ScanResult(
                 category: category, state: .missing,
                 exactBytes: 0, estimatedUpToBytes: 0,
@@ -79,6 +81,7 @@ actor CacheScanner {
         }
 
         let policy = CategoryAdmissionPolicy(category: category, home: home)
+        let provider = self.provider
         let pathGuard = PathGuard(home: home, provider: provider)
         let sizer = DirectorySizer(provider: provider)
 
@@ -87,6 +90,7 @@ actor CacheScanner {
         var items = 0
         var denials: [SizeDenial] = []
         var refusals: [Error] = []
+        var rootRecords: [RootScanRecord] = []
 
         for url in resolvedPaths {
             let admitted: AdmittedRoot
@@ -94,8 +98,15 @@ actor CacheScanner {
                 admitted = try pathGuard.admitDeletionRoot(url, policy: policy)
             } catch {
                 // Refused roots are NEVER walked (R19) — the refusal is the
-                // scan outcome for this root.
+                // scan outcome for this root. The record still carries the
+                // canonical spelling: a refused root's resolved location is
+                // honest display data (fn-2.1), just never a deletion input.
                 refusals.append(error)
+                rootRecords.append(RootScanRecord(
+                    requestedURL: url,
+                    resolvedURL: provider.canonicalize(url),
+                    status: .refusedAdmission
+                ))
                 continue
             }
 
@@ -104,6 +115,23 @@ actor CacheScanner {
             estimated += report.estimatedUpToBytes
             items += report.itemCount
             denials.append(contentsOf: report.denials)
+
+            // Per-root record capture (fn-2.1, FROZEN truth table): a walk
+            // that measured ANYTHING — or walked cleanly, even to emptiness
+            // — is `.measured` (deletable); an admitted root whose sizing
+            // was denied before any measurement is `.deniedUnmeasured` (not
+            // deletable). `requestedURL` keeps the UNRESOLVED spelling
+            // deletion uses; `resolvedURL` the canonical spelling
+            // containment compares against.
+            let measuredAnythingAtRoot =
+                report.itemCount > 0 || report.measuredBytes > 0
+            rootRecords.append(RootScanRecord(
+                requestedURL: admitted.requestedURL,
+                resolvedURL: admitted.resolvedURL,
+                status: (!measuredAnythingAtRoot && !report.denials.isEmpty)
+                    ? .deniedUnmeasured
+                    : .measured
+            ))
         }
 
         let measuredAnything = items > 0 || (exact + estimated) > 0
@@ -123,7 +151,8 @@ actor CacheScanner {
         return ScanResult(
             category: category, state: state,
             exactBytes: exact, estimatedUpToBytes: estimated,
-            itemCount: items, scanError: scanError
+            itemCount: items, scanError: scanError,
+            rootRecords: rootRecords
         )
     }
 

@@ -637,11 +637,13 @@ struct CLIHandler {
     private static func handleSmartClean(targetGB: Double, dryRun: Bool, confirmed: Bool) async {
         // Usage validation first (parity with clean's slug guard): a
         // non-finite or negative target would trap in the Int64 conversion
-        // below (nan/inf) or produce nonsense; a target past ~8e9 GB would
-        // overflow Int64. Refuse with the documented usage error instead.
-        guard targetGB.isFinite, targetGB >= 0, targetGB <= 1_000_000_000 else {
+        // below (nan/inf) or produce nonsense; a ZERO target is already met
+        // before anything runs (contradictory plan/target_met semantics);
+        // a target past ~8e9 GB would overflow Int64. Refuse with the
+        // documented usage error instead.
+        guard targetGB.isFinite, targetGB > 0, targetGB <= 1_000_000_000 else {
             exitWithError(code: "INVALID_ARGUMENTS",
-                          message: "smart-clean target must be a finite number of GB between 0 and 1000000000, got: \(targetGB)")
+                          message: "smart-clean target must be a finite number of GB greater than 0 and at most 1000000000, got: \(targetGB)")
         }
 
         // Gate decision BEFORE any scan (D5); unconfirmed still scans

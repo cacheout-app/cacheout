@@ -605,6 +605,19 @@ final class CLIGateFramingTests: XCTestCase {
         XCTAssertEqual(error["code"] as? String, "INVALID_ARGUMENTS")
     }
 
+    func testSmartCleanRejectsZeroTarget() throws {
+        // A zero target is already met before anything runs — the plan
+        // would mark every candidate clean_if_needed and target_met true
+        // while the confirmed run touches nothing. Refused as usage error.
+        let run = try runCLI(["--cli", "smart-clean", "0"])
+
+        XCTAssertEqual(run.exitCode, 1)
+        XCTAssertEqual(run.stdout, "")
+        let envelope = try parseErrorEnvelope(run.stderr)
+        let error = try XCTUnwrap(envelope["error"] as? [String: Any])
+        XCTAssertEqual(error["code"] as? String, "INVALID_ARGUMENTS")
+    }
+
     func testSmartCleanRejectsMalformedTarget() throws {
         // A PRESENT but non-numeric target must never silently default to
         // 5.0 — that would let `smart-clean garbage --confirm` delete 5 GB

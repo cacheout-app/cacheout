@@ -245,7 +245,7 @@ Cacheout --cli smart-clean 10.0 --dry-run
 
 | Argument | Description | Default |
 |----------|-------------|---------|
-| `<targetGB>` | Amount of space to free in GB — must be numeric, finite, non-negative, and at most 10^9; a present but malformed value is refused with `INVALID_ARGUMENTS`, never silently defaulted | `5.0` (when absent) |
+| `<targetGB>` | Amount of space to free in GB — must be numeric, finite, greater than zero, and at most 10^9; a present but malformed or zero value is refused with `INVALID_ARGUMENTS`, never silently defaulted | `5.0` (when absent) |
 | `--confirm` | Actually delete | Off (refuses) |
 | `--dry-run` | Preview without deleting (uses scan-time exact components, no re-walk) | Off |
 

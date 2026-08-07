@@ -664,6 +664,25 @@ final class CategoryScannerTests: XCTestCase {
         }
     }
 
+    func testRegistrationRejectsMalformedCategorySlugs() throws {
+        let home = try makeTempDir("home")
+        // Category slugs share the address grammar with scanner slugs —
+        // colon, whitespace, uppercase, and empty spellings must all be
+        // refused at registration, not discovered as broken CLI addresses.
+        for bad in ["bad:slug", "with space", "Uppercase", ""] {
+            XCTAssertThrowsError(try makeRuntime(
+                scanners: [],
+                categories: [makeCategory(at: [], slug: bad)],
+                home: home
+            ), "category slug '\(bad)' must be rejected") { error in
+                XCTAssertEqual(
+                    error as? SpaceScannerRegistrationError,
+                    .malformedCategorySlug(bad)
+                )
+            }
+        }
+    }
+
     func testRegistrationRejectsCategorySlugCollisions() throws {
         let home = try makeTempDir("home")
         // A category slug colliding with a registered scanner slug…

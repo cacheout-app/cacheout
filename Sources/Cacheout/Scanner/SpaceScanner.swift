@@ -352,6 +352,10 @@ enum SpaceScannerRegistrationError: Error, Equatable {
     /// Scanner id does not match `[a-z0-9_]+`.
     case malformedScannerID(String)
     case duplicateScannerID(String)
+    /// Category slug does not match `[a-z0-9_]+` — the address grammar
+    /// covers category slugs exactly as it covers scanner slugs (a colon
+    /// or whitespace in an aggregate item id would break CLI addressing).
+    case malformedCategorySlug(String)
     /// The combined category-slug/scanner-slug namespace has a collision
     /// (covers the frozen `categories` id: no category slug may spell it).
     case namespaceCollision(String)
@@ -407,6 +411,13 @@ struct SpaceScannerRuntime {
         }
         var registered: [String: CacheCategory] = [:]
         for category in categories {
+            // Category slugs live in the SAME address grammar as scanner
+            // slugs (aggregate item ids ARE the slugs) — validate them with
+            // the same rule, or a `bad:slug` category would ship an
+            // unaddressable aggregate through the `try!` factory.
+            guard Self.isValidSlug(category.slug) else {
+                throw SpaceScannerRegistrationError.malformedCategorySlug(category.slug)
+            }
             guard namespace.insert(category.slug).inserted else {
                 throw SpaceScannerRegistrationError.namespaceCollision(category.slug)
             }

@@ -18,14 +18,21 @@ business logic (scanning/cleaning), state management, and presentation.
 │              CacheoutViewModel (@MainActor)                 │
 ├─────────────────────────────────────────────────────────────┤
 │                    Business Logic                           │
-│    CacheScanner (actor) │ NodeModulesScanner (actor)        │
-│    CacheCleaner (actor)                                     │
+│  SpaceScannerRuntime (registry + validated scan stream)     │
+│    CategoryScanner ──► CacheScanner (actor)                 │
+│    NodeModulesScanner (actor) │ CacheCleaner (actor)        │
 ├─────────────────────────────────────────────────────────────┤
 │                     Data Models                             │
-│  CacheCategory │ ScanResult │ DiskInfo │ NodeModulesItem    │
-│  RiskLevel │ PathDiscovery │ CleanupReport                  │
+│  ReclaimableItem │ ItemKey │ ScanOutcome │ ScanIssue        │
+│  CacheCategory │ ScanResult │ DiskInfo │ CleanupReport      │
+│  RiskLevel │ PathDiscovery │ ReclaimAction │ NodeModulesItem│
 └─────────────────────────────────────────────────────────────┘
 ```
+
+Every space scanner — the category registry (via the `CategoryScanner`
+adapter) and every per-item scanner — implements one `SpaceScanner` protocol
+and registers with the `SpaceScannerRuntime`. Scanners emit `ReclaimableItem`s,
+the one currency the GUI, CLI, and cleaner all consume.
 
 ## File Organization
 
@@ -41,9 +48,11 @@ Sources/Cacheout/
 │   └── NodeModulesItem.swift           # node_modules directory info
 ├── Scanner/
 │   ├── CacheScanner.swift              # Parallel category scanner (actor)
-│   ├── Categories.swift                # 25+ category definitions
+│   ├── Categories.swift                # Category definitions (data-driven registry)
+│   ├── CategoryScanner.swift           # SpaceScanner adapter over the category registry
 │   ├── DirectorySizer.swift            # Single sizing routine (split components + inode claims)
-│   └── NodeModulesScanner.swift        # Recursive node_modules finder (actor)
+│   ├── NodeModulesScanner.swift        # Recursive node_modules finder (actor, SpaceScanner)
+│   └── SpaceScanner.swift              # SpaceScanner protocol, ReclaimableItem model, SpaceScannerRuntime
 ├── Cleaner/
 │   ├── CacheCleaner.swift              # Guarded deletion/trash + InodeAccountingRegistry (actors)
 │   ├── FileSystemIdentityProvider.swift # realpath/lstat identity: (st_dev, st_ino), st_nlink, mounts
@@ -70,14 +79,17 @@ Cacheout uses Swift's structured concurrency throughout:
 
 ### Actor Isolation
 
-Three actors provide thread-safe business logic:
+These actors provide thread-safe business logic:
 
 | Actor | Purpose | Key Methods |
 |-------|---------|-------------|
 | `CacheScanner` | Parallel category scanning (sizing delegated to `DirectorySizer`) | `scanAll()`, `scanCategory()` |
-| `NodeModulesScanner` | Recursive node_modules discovery | `scan(maxDepth:includeProtectedRoots:)` |
-| `CacheCleaner` | Guarded deletion, freed-bytes accounting, logging | `clean()`, `runCleanCommand()` |
+| `NodeModulesScanner` | Recursive node_modules discovery (a `SpaceScanner`) | `scan(context:)`, `scan(maxDepth:includeProtectedRoots:)` |
+| `CacheCleaner` | Guarded deletion, freed-bytes accounting, logging | `clean(items:moveToTrash:)`, `runCleanCommand()` |
 | `InodeAccountingRegistry` | Per-operation claim-based freed-bytes settlement | `registerObservations(_:)`, `acceptSuccessful(_:)` |
+
+(`CategoryScanner` and `SpaceScannerRuntime` are value types — the runtime
+owns orchestration, not state.)
 
 ### MainActor
 
@@ -98,18 +110,30 @@ await withTaskGroup(of: ScanResult.self) { group in
 }
 ```
 
-### async let Parallelism
+### Runtime-Owned Scan Orchestration
 
-The view model runs both scanners simultaneously:
+The top-level scan `TaskGroup` lives inside
+`SpaceScannerRuntime.scanValidated(scannerIDs:context:)`, which returns a
+progressive `AsyncStream<ValidatedScannerEvent>`:
 
 ```swift
-// CacheoutViewModel.scan()
-async let cacheResults = scanner.scanAll(CacheCategory.allCategories)
-async let nmResults = nodeModulesScanner.scan()
-
-scanResults = await cacheResults       // Typically 2-5s
-nodeModulesItems = await nmResults     // Typically 10-30s
+// CacheoutViewModel.scan(trigger:)
+let stream = runtime.scanValidated(
+    context: ScanContext(trigger: trigger)
+)
+for await event in stream {
+    handle(event)   // reconcile one scanner's validated outcome
+}
 ```
+
+Registered scanners run in parallel across the group (and stay internally
+parallel as above); each outcome is ownership- and structure-validated before
+it is yielded, and events arrive in completion order. That is the
+progressive-publishing contract: category results appear in seconds
+(typically 2-5s) while the node_modules scan keeps running (10-30s). The
+ViewModel consumes events as they arrive; the CLI collects the same stream to
+completion. Consumers pick scope (a scanner subset and/or a category filter),
+never validation.
 
 ## Data Flow
 
@@ -119,25 +143,32 @@ nodeModulesItems = await nmResults     // Typically 10-30s
 User taps "Scan"
     │
     ▼
-CacheoutViewModel.scan()
+CacheoutViewModel.scan(trigger:)
     │
-    ├── async let ──► CacheScanner.scanAll()
-    │                     │
-    │                     ├── TaskGroup ──► scanCategory(Xcode DerivedData)
-    │                     ├── TaskGroup ──► scanCategory(npm Cache)
-    │                     ├── TaskGroup ──► scanCategory(...)
-    │                     │
-    │                     ▼
-    │                 [ScanResult] sorted by size desc
+    ▼
+SpaceScannerRuntime.scanValidated(context:)
     │
-    ├── async let ──► NodeModulesScanner.scan()
-    │                     │
-    │                     ├── TaskGroup ──► findNodeModules(~/Documents)
-    │                     ├── TaskGroup ──► findNodeModules(~/Developer)
-    │                     ├── TaskGroup ──► findNodeModules(...)
-    │                     │
+    ├── TaskGroup ──► CategoryScanner.scan(context:)
+    │                     │ delegates to CacheScanner.scanAll()
+    │                     │ (internally parallel per category)
     │                     ▼
-    │                 [NodeModulesItem] deduplicated, sorted by size desc
+    │                 ScanOutcome — one aggregate ReclaimableItem per category
+    │
+    ├── TaskGroup ──► NodeModulesScanner.scan(context:)
+    │                     │ (internally parallel per search root)
+    │                     ▼
+    │                 ScanOutcome — one ReclaimableItem per node_modules dir
+    │
+    ▼
+validatedOutcome() per event: ownership, id uniqueness, structural invariants
+(a malformed outcome is replaced by a path-less `malformed_outcome` issue)
+    │
+    ▼
+AsyncStream<ValidatedScannerEvent> — events yield in completion order
+    │
+    ▼
+ViewModel reconciles each event: defaultSelected applies only to first-ever
+emissions; prior selections AND deselections survive by ItemKey
     │
     ▼
 @Published updates trigger SwiftUI view refresh
@@ -149,36 +180,46 @@ CacheoutViewModel.scan()
 User taps "Clean Selected"
     │
     ▼
-CleanConfirmationSheet (modal)
+CleanConfirmationSheet (modal — unified per-item rows, each with evidence)
     │ User confirms
     ▼
 CacheoutViewModel.clean()
     │
     ▼
-CacheCleaner.clean(results:nodeModules:moveToTrash:)
+CacheCleaner.clean(items:moveToTrash:)        ◄── selected [ReclaimableItem]
     │
-    ├── Scan-state refusal: `.denied` refused even if force-selected
+    ├── (1) Structural refusal FIRST, every item, every state:
+    │       action/descriptor/provenance compatibility — the chokepoint never
+    │       assumes runtime validation ran
+    ├── (2) Well-formed `.missing` skip (no entry, no error)
+    ├── (3) Non-`.missing` zero-root-record refusal
+    ├── (4) State eligibility: `.denied` refused even when selected;
+    │       `.empty` no-op; `.commands` zero-measured skip
     │
-    ├── For each selected category:
-    │   ├── PathGuard.admitDeletionRoot() — refusal ► errors + log, root skipped
-    │   ├── Has cleanCommands? ──► admit every resolved root, then
-    │   │                          runCleanCommand() argv via /usr/bin/env
-    │   └── No cleanCommands? For each child (validateContainedChild):
-    │       ├── measure (.deletionTarget) ──► registerObservations(claims)
-    │       ├── moveToTrash? ──► FileManager.trashItem()   (unresolved URL)
-    │       │   permanent?   ──► FileManager.removeItem()  (unresolved URL)
-    │       └── success ──► acceptSuccessful(token) ──► exact/estimated bytes
-    │   └── logCleanup() ──► ~/.cacheout/cleanup.log (successes AND refusals)
+    ├── (5) Dispatch on ReclaimAction:
+    │   ├── .removeContents (category aggregates):
+    │   │   ├── admit each `.measured` RootScanRecord.requestedURL
+    │   │   │   (PathGuard.admitDeletionRoot, category policy)
+    │   │   └── per child (validateContainedChild):
+    │   │       measure (.deletionTarget) ► registerObservations(claims)
+    │   │       ► trash/remove (unresolved URL) ► acceptSuccessful(token)
+    │   ├── .commands (Simulator Devices):
+    │   │   ├── re-admit EVERY record's requestedURL — ANY refusal blocks
+    │   │   │   the ENTIRE command set
+    │   │   └── runCleanCommand() argv via /usr/bin/env
+    │   └── .removeItem (per-item scanners, e.g. node_modules):
+    │       ├── PathGuard.admitContainer() against the RUNTIME's declared
+    │       │   roots (never the item's claim) + validateRemovableItem()
+    │       └── measure ► register ► delete ► accept (same settlement)
     │
-    ├── For each selected node_modules:
-    │   ├── PathGuard.admitContainer() + validateRemovableItem()
-    │   └── measure ► register ► delete ► accept (same two-phase settlement)
+    └── logCleanup() ──► ~/.cacheout/cleanup.log (successes AND refusals)
     │
     ▼
-CleanupReport { disposal, entries: [Entry(exact + estimatedUpTo)], errors }
+CleanupReport { disposal, entries (itemID/scannerID/displayName + split
+                components), errors: [ItemError], scannerRollups derived }
     │
     ▼
-CleanupReportSheet (modal)
+CleanupReportSheet (modal, per-scanner sections)
     │
     ▼
 Auto-rescan to update sizes
@@ -224,15 +265,43 @@ can change the scan interval in Settings, we use 60-second ticks and check
 elapsed time against the preference. This avoids recreating the timer on every
 settings change.
 
+### Why a registry of protocol conformers instead of a third bespoke stack?
+
+Cacheout used to have two parallel scanning stacks: the data-driven
+`CacheCategory` aggregate registry and the bespoke `NodeModulesScanner` (own
+item model, own views, own cleaner branch — and absent from the CLI
+entirely). The planned scanners (build artifacts, git worktrees, temp dirs,
+orphaned caches) are all per-item by nature; replicating the node_modules
+pattern for each would mean ~6 touch-points per scanner and guaranteed drift
+— the pre-unification CLI gap (node_modules was never wired into the CLI at
+all) is the proof.
+
+Instead, every scanner implements the `SpaceScanner` protocol and registers
+with `SpaceScannerRuntime`; selection, totals, cleaning, and rendering are
+written ONCE against `ReclaimableItem`. Adding a scanner = implement the
+protocol + register — zero edits to the ViewModel, cleaner, CLI, or views.
+Aggregate categories stay data-driven behind the `CategoryScanner` adapter,
+so the cheap one-line-category path is preserved.
+
+Registration is also the trust boundary: the runtime derives the cleaner's
+container-root admission from the union of what registered scanners DECLARE
+(`trustedContainerRoots`), and scan outcomes are ownership- and
+structure-validated fail-closed before any surface can address them — an
+item's claimed provenance can never widen admission, and a malformed
+scanner's items cannot be listed, selected, addressed, or deleted through
+any path.
+
 ### Why separate CacheScanner and NodeModulesScanner?
 
 They have fundamentally different search strategies:
 - `CacheScanner`: Knows exactly where to look (predefined paths per category)
 - `NodeModulesScanner`: Must recursively search unknown project directories
 
-Separating them allows the cache scan to complete quickly (2-5s) while the
-node_modules scan continues in the background (10-30s), providing faster
-initial results to the user.
+Both now sit behind the `SpaceScanner` protocol (`CacheScanner` via the
+`CategoryScanner` adapter), but the split survives: the runtime's event
+stream yields each scanner's outcome as it completes, so the cache scan
+lands quickly (2-5s) while the node_modules scan continues (10-30s),
+providing faster initial results to the user.
 
 ### Why a single admission chokepoint (PathGuard)?
 
@@ -328,6 +397,13 @@ to defer update checks until a signed appcast URL is configured in Info.plist.
   roots, `$HOME`, protected first-level home children) before anything is
   deleted; the parent chain is re-validated immediately before each
   destructive call, and refusals are reported and logged
+- **Registration-derived container admission**: delete-time container roots
+  for per-item scanners come from the union the registered scanners DECLARE
+  (`SpaceScannerRuntime.trustedContainerRoots`), never from scanned items — a
+  buggy or hostile item claiming a novel container gains nothing; scan
+  outcomes are additionally ownership- and structure-validated fail-closed
+  before any surface can address their items, and the cleaner independently
+  refuses the same malformed shapes at dispatch (defense in depth)
 - **TCC-respecting scans**: privacy-protected roots (Documents / Desktop /
   Downloads) are enumerated only on user-initiated scans, with usage strings
   in the Info.plist; the CLI surfaces denials as `scan_error` + `grant_hint`

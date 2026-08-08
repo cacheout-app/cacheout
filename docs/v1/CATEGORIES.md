@@ -1,7 +1,27 @@
 # Cache Categories
 
-Cacheout scans 25+ cache categories organized into groups. This document details each
-category's paths, discovery method, risk level, and behavior.
+Cacheout scans its built-in cache categories, organized into groups. This document
+details each category's paths, discovery method, risk level, and behavior. The
+registry in `Sources/Cacheout/Scanner/Categories.swift` is the source of truth —
+this document deliberately states no category count, because prose counts rot the
+moment an entry is added.
+
+## Scanner Registry
+
+Since the scanner unification, every space scanner — the category registry AND
+per-item scanners — implements one `SpaceScanner` protocol and registers with the
+`SpaceScannerRuntime` (see [ARCHITECTURE.md](ARCHITECTURE.md)):
+
+- **Categories are one aggregate scanner.** The `CategoryScanner` adapter (scanner
+  id `categories`) wraps the data-driven registry and emits one aggregate item per
+  category. Category behavior is unchanged, and adding a category is still a
+  one-line `CacheCategory` entry — no scanner code involved.
+- **node_modules is the first per-item scanner** (scanner id `node_modules`),
+  emitting one item per discovered directory. Follow-on scanners (build
+  artifacts, git worktrees, temp dirs) drop into the same registry.
+- The CLI addresses categories by slug and per-item scanners by
+  `<scanner-slug>` or `<scanner-slug>:<item-id>` — see
+  [CLI-REFERENCE.md](CLI-REFERENCE.md) and the address grammar in PROTOCOL.md.
 
 ## Category Overview
 
@@ -285,8 +305,21 @@ The CLI wire fields (`exact_bytes`, `estimated_up_to_bytes`, `state`,
 
 ## node_modules Discovery
 
-In addition to cache categories, Cacheout includes a dedicated `node_modules` scanner
-that recursively searches common project directories.
+In addition to cache categories, Cacheout includes a `node_modules` scanner that
+recursively searches common project directories. It is a per-item `SpaceScanner`
+(scanner id `node_modules`) in the same registry as the categories — no longer a
+GUI-only special case:
+
+- **CLI-visible.** `--cli scan` lists each discovered directory as a
+  `scanner_items` row; `--cli clean node_modules --confirm` cleans all of them,
+  `--cli clean node_modules:<item-id> --confirm` cleans one. Item ids are opaque,
+  stable across rescans, and echoed back exactly as scan printed them (see
+  [CLI-REFERENCE.md](CLI-REFERENCE.md)).
+- **Risk level: Review, never auto-cleaned.** node_modules items are excluded
+  from smart-clean and Quick Clean; every deletion is an explicit selection
+  (GUI) or an explicit target with `--confirm` (CLI).
+- **Selection survives rescans.** Items carry stable ids, so a rescan preserves
+  both selections and explicit deselections.
 
 ### Search Roots
 
@@ -318,3 +351,8 @@ than 30 days. Stale directories show an age badge (e.g., "3mo old", "1y old") in
 4. Set `riskLevel` conservatively
 5. Write a clear `rebuildNote`
 6. Set `defaultSelected: true` only for `.safe` categories
+
+Adding a new **per-item scanner** (as opposed to a category) is a different path:
+implement the `SpaceScanner` protocol and register it in
+`SpaceScannerRuntime.production()` — the ViewModel, cleaner, CLI, and views need
+zero edits. See [ARCHITECTURE.md](ARCHITECTURE.md).

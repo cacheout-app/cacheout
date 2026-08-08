@@ -12,7 +12,7 @@ Built for developers on space-constrained Macs (especially the 256GB M4 Mac Mini
 
 ## Features
 
-- **15 built-in cache categories** — Xcode, Docker, npm, Yarn, pnpm, Homebrew, Playwright, CocoaPods, Swift PM, Gradle, browser caches, VS Code, Electron, pip
+- **Built-in cache categories** — Xcode, Docker, npm, Yarn, pnpm, Homebrew, Playwright, CocoaPods, Swift PM, Gradle, browser caches, VS Code, Electron, pip, and more (the full list lives in [docs/v1/CATEGORIES.md](docs/v1/CATEGORIES.md))
 - **node_modules finder** — Recursively scans your project directories to find every `node_modules` folder, shows project name, size, and staleness (30d+), with per-project selection
 - **Risk-level indicators** — Each category rated Safe / Review / Caution so you know what's risk-free
 - **Async parallel scanning** — Scans all categories concurrently for fast results
@@ -75,6 +75,8 @@ open Package.swift
 | Electron Cache | ✅ Safe | Re-downloads when Electron apps need it |
 | pip Cache | ✅ Safe | pip re-downloads on install |
 
+This table is a sample — see [docs/v1/CATEGORIES.md](docs/v1/CATEGORIES.md) for every category with paths, discovery method, and risk level.
+
 ## node_modules Finder
 
 Cacheout includes a dedicated project scanner that recursively searches common developer directories (`~/Documents`, `~/Developer`, `~/Projects`, `~/Code`, `~/Desktop`, `~/Dropbox`, etc.) for `node_modules` folders.
@@ -82,6 +84,8 @@ Cacheout includes a dedicated project scanner that recursively searches common d
 Each discovered `node_modules` shows the project name, full path, size, and how old it is. Projects with stale node_modules (30+ days untouched) are flagged with an age badge. You can quickly select all stale projects, or pick individually.
 
 This is especially impactful on space-constrained Macs — a single project's `node_modules` can be 500MB-1GB, and most developers have 5-20 projects sitting around.
+
+The finder is also available headlessly: `--cli scan` lists discovered `node_modules` directories, and `--cli clean node_modules --confirm` (or `node_modules:<item-id>` for one project) deletes them. See [docs/v1/CLI-REFERENCE.md](docs/v1/CLI-REFERENCE.md).
 
 ## How it works
 

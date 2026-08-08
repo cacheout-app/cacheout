@@ -4,6 +4,56 @@ All notable changes to Cacheout will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+Scanner unification (`SpaceScanner` protocol). Breaking CLI release for JSON
+consumers: `schema_version` is now 4 and `--cli scan` emits an envelope
+instead of a top-level array. Coordinate MCP updates with `cacheout-mcp`
+(see PROTOCOL.md and docs/v1/CLI-REFERENCE.md).
+
+### Added
+
+- **node_modules in the CLI.** `--cli scan` now reports discovered
+  `node_modules` directories as `scanner_items` rows, and `--cli clean`
+  accepts `node_modules` (every discovered directory) or
+  `node_modules:<item-id>` (one directory) as targets — destructive runs
+  still require `--confirm`. Item ids are opaque, stable across rescans,
+  and echoed back exactly as scan printed them. node_modules is
+  `review`-risk and never part of smart-clean or any automatic clean path.
+- **Per-item evidence in the confirmation sheet.** Every row of the clean
+  confirmation states what the item is and where it lives, and
+  command-cleaned categories are named in a disclosure: their bytes are
+  erased permanently by the command and never land in the Trash, even in a
+  Move-to-Trash run.
+- **Per-scanner report rollups.** The cleanup report groups entries into
+  per-scanner sections with component-derived sums; per-item failures are
+  reported from self-contained error records, so a failed item that no
+  longer exists still renders an honest error line.
+- **Stable selection across rescans.** Selection is keyed by scanner-scoped
+  stable item ids: a rescan preserves both selections and explicit
+  deselections. node_modules selection previously reset on every rescan.
+
+### Changed
+
+- **BREAKING: CLI JSON `schema_version` bumps 3 → 4.** `--cli scan` output
+  is now an envelope `{schema_version, categories, scanner_items,
+  scanner_errors}`; the `categories` rows are field-for-field identical to
+  schema 3. Clean and smart-clean rows gain `scanner_id`/`item_id` identity
+  fields, and for per-item rows the retained `category`/`slug` key carries
+  the composite address `<scanner_id>:<item_id>` (directly reusable as a
+  clean target). Every payload — scan, clean, smart-clean, and both
+  dry-runs — self-describes with a top-level `schema_version`.
+- **Unified scanner architecture (internal).** The category registry and
+  the node_modules scanner now sit behind one `SpaceScanner` protocol with
+  a validated registry runtime: scan outcomes are ownership- and
+  structure-validated fail-closed before any surface can address them, and
+  delete-time container admission derives from scanner registration, never
+  from scanned items. Category content and behavior are unchanged.
+- **Category-count claims removed from docs.** README and docs/v1 no longer
+  state a hardcoded number of cache categories — prose counts rot; the
+  registry in `Sources/Cacheout/Scanner/Categories.swift` is the source of
+  truth.
+
 ## [2.2.0] - 2026-08-06
 
 Disk-path safety hardening (D1–D8). Breaking CLI release: `schema_version` is

@@ -28,9 +28,9 @@ Cacheout is a native macOS utility that helps developers reclaim disk space by s
 and cleaning common cache directories. It targets macOS 14+ (Sonoma) and is built with
 Swift 5.9+ and SwiftUI.
 
-**Key numbers:**
-- 18 Swift source files
-- 25+ cache categories
+**At a glance:**
+- Built-in cache categories, defined in `Scanner/Categories.swift` and detailed in [CATEGORIES.md](CATEGORIES.md)
+- Per-item scanners (node_modules today) unified with the categories under the `SpaceScanner` registry ([ARCHITECTURE.md](ARCHITECTURE.md))
 - 2 execution modes (GUI + CLI)
 - 3 app scenes (Main Window, Menubar, Settings)
 - 1 external dependency (Sparkle for updates)

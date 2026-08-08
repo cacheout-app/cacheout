@@ -233,6 +233,7 @@ struct ScanResult: Identifiable {
     let estimatedUpToBytes: Int64
     let itemCount: Int
     let scanError: ScanError?
+    let rootRecords: [RootScanRecord]
     var isSelected: Bool
 }
 ```
@@ -248,6 +249,7 @@ struct ScanResult: Identifiable {
 | `estimatedUpToBytes` | `Int64` | Bytes on hardlinked inodes — freed only if every other link goes too |
 | `itemCount` | `Int` | Number of regular files found |
 | `scanError` | `ScanError?` | Why the scan is `denied`/`partiallyDenied`; `nil` for clean states |
+| `rootRecords` | `[RootScanRecord]` | Per-root capture, populated by `CacheScanner` AT SCAN TIME (root-capture invariant): one record for every root the scan resolved. `CategoryScanner` carries these onto the aggregate item verbatim; clean-time dispatch deletes only `.measured` records. Empty for `.missing` |
 | `isSelected` | `Bool` | User selection state (mutable) |
 
 **Computed Properties:**
@@ -271,25 +273,50 @@ non-missing and non-zero.
 
 **File:** `Sources/Cacheout/Models/ScanResult.swift`
 
-Summary of a cleanup operation, with split byte components per entry. The
-pre-split surface (`cleaned` / `totalFreed` / `formattedTotal`) was retired in
-v2.2.0 — every consumer derives from the components.
+Summary of a cleanup operation over `ReclaimableItem`s, with split byte
+components per entry. Since the scanner unification every entry carries its
+item's ownership identity (`itemID`/`scannerID`/`displayName`), errors are
+self-contained `ItemError` records keyed by `ItemKey`, and per-scanner
+rollups are pure derivations over the entries. The pre-split surface
+(`cleaned` / `totalFreed` / `formattedTotal`) was retired in v2.2.0.
 
 ```swift
 struct CleanupReport {
     enum Disposal: Equatable { case permanent, trash }
 
     struct Entry {
-        let category: String
+        let itemID: String
+        let scannerID: String
+        let displayName: String
         let exactBytes: Int64
         let estimatedUpToBytes: Int64
-        var bytesFreed: Int64        // compatibility sum
-        var componentSummary: String // component-derived row text
+        let disposal: Disposal       // what ACTUALLY happened to this entry
+        var bytesFreed: Int64        // compatibility sum (computed)
+        var key: ItemKey             // composite identity (computed)
+        var componentSummary: String // component-derived row text (computed)
+    }
+
+    struct ItemError: Equatable {
+        let key: ItemKey
+        let displayName: String
+        let message: String
+    }
+
+    struct ScannerRollup: Equatable {
+        let scannerID: String
+        let exactBytes: Int64
+        let estimatedUpToBytes: Int64
+        let entryCount: Int
+    }
+
+    struct ScannerSection {
+        let rollup: ScannerRollup
+        let entries: [Entry]
     }
 
     let disposal: Disposal
     let entries: [Entry]
-    let errors: [(category: String, error: String)]
+    let errors: [ItemError]
 }
 ```
 
@@ -297,22 +324,31 @@ struct CleanupReport {
 
 | Property | Type | Description |
 |----------|------|-------------|
-| `disposal` | `Disposal` | `.permanent` or `.trash` — rendering must never claim "Freed" for a Trash run |
-| `entries` | `[Entry]` | One entry per cleaned category/item; a partially-failed category yields ONE entry carrying only the bytes its successful children measured |
+| `disposal` | `Disposal` | The REQUESTED mode for the run — entries carry what actually happened |
+| `entries` | `[Entry]` | One entry per cleaned item; a partially-failed item yields ONE entry carrying only the bytes its successful children measured |
+| `entries[].itemID` | `String` | The cleaned item's scanner-scoped id: category slug for aggregates, full-hash stable id for per-item scanners |
+| `entries[].scannerID` | `String` | The owning scanner's registered id |
+| `entries[].displayName` | `String` | Presentation identity, sourced from the cleaned item's REQUIRED ownership fields — never looked up against state that may have been rescanned since |
 | `entries[].exactBytes` | `Int64` | Measured unique-inode bytes — deletion verifiably freed them |
 | `entries[].estimatedUpToBytes` | `Int64` | Hardlinked bytes (freed only if every other link goes too) and command-category bytes (nothing measures what a command frees) |
+| `entries[].disposal` | `Disposal` | What ACTUALLY happened to this entry's bytes — command-backed categories run their argv regardless of the Move-to-Trash toggle, so their entries stay `.permanent` even in a Trash run |
 | `entries[].bytesFreed` | `Int64` | Compatibility sum of the entry components (computed) |
+| `entries[].key` | `ItemKey` | The composite cross-scanner identity (computed) |
 | `entries[].componentSummary` | `String` | Component-derived row text via `componentPhrase` (computed) |
-| `errors` | `[(String, String)]` | Failed items with error messages |
+| `errors` | `[ItemError]` | SELF-CONTAINED failure records: a failed item may not exist in any post-clean rescan, so rendering never looks the item up — `key` correlates, `displayName` + `message` carry everything a report line needs |
 | `totalFreedExact` | `Int64` | Pure sum of entry `exactBytes` — no other math |
 | `totalEstimatedUpTo` | `Int64` | Pure sum of entry `estimatedUpToBytes` — no other math |
-| `headline` | `String` | Mode-driven summary: permanent → "Freed …"; trash → "Moved … to Trash — empty Trash to reclaim"; never a success claim when nothing succeeded |
+| `scannerRollups` | `[ScannerRollup]` | Per-scanner sums over `entries`, grouped by `scannerID` in first-appearance order — pure derivation, nothing stored twice |
+| `scannerSections` | `[ScannerSection]` | Each scanner's rollup paired with its entries in report order — the report sheet's sectioned rendering |
+| `errorLines` | `[String]` | Report error lines rendered from the `ItemError` records ALONE |
+| `headline` | `String` | Entry-disposal-driven summary: permanent entries → "Freed …"; trashed entries → "Moved … to Trash — empty Trash to reclaim"; a mixed run renders both parts; never a success claim when nothing succeeded |
 
-**Static Methods:**
+**Methods:**
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `componentPhrase(exact:estimatedUpTo:)` | `String` | The amount phrase all rendering derives from: `"X"` (no estimates), `"X + up to Y more"` (both), `"up to Z"` (exact zero) — estimates are always hedged, never laundered into certainty |
+| `rowAnnotation(for:)` | `String?` | Trash-run honesty marker: for an entry whose bytes were erased permanently in a Trash-mode run, returns "erased permanently — not in Trash"; `nil` when the entry's actual disposal matches the requested mode |
+| `componentPhrase(exact:estimatedUpTo:)` (static) | `String` | The amount phrase all rendering derives from: `"X"` (no estimates), `"X + up to Y more"` (both), `"up to Z"` (exact zero) — estimates are always hedged, never laundered into certainty |
 
 ---
 
@@ -320,7 +356,10 @@ struct CleanupReport {
 
 **File:** `Sources/Cacheout/Models/NodeModulesItem.swift`
 
-A discovered `node_modules` directory.
+A discovered `node_modules` directory — the scanner's INTERNAL discovery
+model. The `SpaceScanner` conformance (below) maps each to a
+`ReclaimableItem` with a stable full-hash id; consumers outside the scanner
+work with `ReclaimableItem`, not this type.
 
 ```swift
 struct NodeModulesItem: Identifiable, Hashable {
@@ -351,6 +390,299 @@ struct NodeModulesItem: Identifiable, Hashable {
 
 ---
 
+## Scanner Registry (SpaceScanner)
+
+**File:** `Sources/Cacheout/Scanner/SpaceScanner.swift`
+
+The unified scanner abstraction: every space scanner — the category registry
+(via `CategoryScanner`) and every per-item scanner — implements `SpaceScanner`
+and emits `ReclaimableItem`s, the one currency the GUI, CLI, and cleaner all
+consume. The registry stays `[any SpaceScanner]` with NO downcasting:
+scanner-specific knobs cross the protocol boundary via `ScanContext` or not
+at all.
+
+### `ScanTrigger`
+
+What set a scan in motion. TCC-protected search roots (Documents, Desktop, …)
+are enumerated ONLY for `.userInitiated` scans — a background refresh must
+never be the thing that fires a macOS privacy prompt.
+
+```swift
+enum ScanTrigger: Equatable, Sendable {
+    case userInitiated  // protected roots included; macOS may prompt once
+    case automatic      // protected roots skipped entirely
+}
+```
+
+### `ScanContext`
+
+The generic per-scan parameter every `SpaceScanner` receives.
+
+```swift
+struct ScanContext: Equatable, Sendable {
+    let trigger: ScanTrigger
+    let categoryFilter: Set<String>?   // nil = all
+
+    var includeProtectedRoots: Bool { trigger == .userInitiated }
+}
+```
+
+| Member | Description |
+|--------|-------------|
+| `trigger` | `CategoryScanner` ignores it; per-item scanners consume the derived flag |
+| `categoryFilter` | Category slugs to scan. `CategoryScanner` is the ONLY scanner that honors it — with a filter, unrequested categories' resolvers/probes are never invoked. Every other scanner ignores it |
+| `includeProtectedRoots` | DERIVED TCC gate — protected search roots are walked only when the user explicitly asked |
+
+### `RootScanStatus` / `RootScanRecord`
+
+The per-root capture (FROZEN truth table — this IS the deletability boundary).
+
+```swift
+enum RootScanStatus: Equatable, Sendable {
+    case refusedAdmission  // PathGuard refused at scan time. NEVER deletable
+    case deniedUnmeasured  // admitted, sizing denied before ANY measurement. NOT deletable
+    case measured          // admitted and walked (incl. clean-empty walks). Deletable
+}
+
+struct RootScanRecord: Equatable, Sendable {
+    let requestedURL: URL   // the UNRESOLVED spelling — the one deletion uses
+    let resolvedURL: URL?   // canonical spelling containment compares against
+    let status: RootScanStatus
+}
+```
+
+Clean-time contracts: `.removeContents` deletes only `.measured` records;
+`.commands` re-admits every record's `requestedURL` at delete time and any
+refusal blocks the entire command set.
+
+### `ItemKey`
+
+The composite cross-scanner identity: selection sets, progressive-publish
+reconciliation, `CleanupReport` error keying, and SwiftUI list identity all
+use it. A bare item id is meaningful only in scanner scope.
+
+```swift
+struct ItemKey: Hashable, Sendable {
+    let scannerID: String
+    let itemID: String
+}
+```
+
+### `ReclaimAction`
+
+How an item's bytes are reclaimed. Dispatch with EXHAUSTIVE switches (no
+`default:`) — a future case must be a compile-time-visible change.
+
+```swift
+enum ReclaimAction: Equatable, Sendable {
+    case removeContents        // delete children of every .measured root record
+    case removeItem            // delete the item's own tree
+    case commands([[String]])  // run argv arrays via /usr/bin/env
+}
+```
+
+| Member | Description |
+|--------|-------------|
+| `wireString` | FROZEN wire strings: `remove_contents` \| `remove_item` \| `commands`. `.commands` serializes ONLY its kind — argv arrays are NEVER exposed on any wire surface |
+
+### `AdmissionDescriptor`
+
+Which PathGuard admission mode applies at the cleaner's chokepoint.
+Provenance is a CLAIM the runtime validates and the cleaner independently
+re-checks — items can never widen admission.
+
+```swift
+enum AdmissionDescriptor: Equatable, Sendable {
+    case category(CacheCategory)
+    case containerItem(originContainer: URL, requestedTargetURL: URL)
+}
+```
+
+`requestedTargetURL` is the UNRESOLVED deletion target — leaf never resolved
+(dual-canonicalization doctrine). `ReclaimableItem.url` is display state and
+NEVER an admission or deletion input.
+
+### `ReclaimableItem`
+
+The ONE unified item model.
+
+```swift
+struct ReclaimableItem: Equatable, Sendable {
+    let id: String
+    let scannerID: String
+    let displayName: String
+    let exactBytes: Int64
+    let estimatedUpToBytes: Int64
+    let logicalBytes: Int64?
+    let itemCount: Int
+    let url: URL?
+    let declaredDisplayPath: String
+    let rootRecords: [RootScanRecord]
+    let state: ScanState
+    let scanError: ScanError?
+    let risk: RiskLevel
+    let evidence: String
+    let rebuildNote: String?
+    let action: ReclaimAction
+    let admission: AdmissionDescriptor
+    let defaultSelected: Bool
+    let automaticCleanEligible: Bool
+    let isStale: Bool?
+
+    var key: ItemKey { get }
+    var allocatedBytes: Int64 { get }  // computed: exactBytes + estimatedUpToBytes
+}
+```
+
+**Properties:**
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `id` | `String` | Scanner-DEFINED under three invariants: stable across rescans for the same logical item, unique within its scanner, CLI-safe opaque string. Category aggregates use the category SLUG; per-item scanners derive ids via `stableID` |
+| `scannerID` / `displayName` | `String` | Ownership and presentation ride ON the item — `clean(items:)` receives bare items, so nothing may need to be looked up (and race a rescan) at clean time |
+| `exactBytes` | `Int64` | Bytes on unique inodes — deletion verifiably frees these |
+| `estimatedUpToBytes` | `Int64` | Hardlinked/command bytes that MAY be freed |
+| `logicalBytes` | `Int64?` | Logical (apparent) bytes; nil unless materially diverging from allocated (sparse files) |
+| `url` | `URL?` | DISPLAY ONLY — first root record with a non-nil `resolvedURL` regardless of status; nil only for `.missing` items or when no root resolved. NEVER an admission or deletion input |
+| `declaredDisplayPath` | `String` | The declared spelling, for presenting unresolved/missing items honestly without a fake resolution |
+| `rootRecords` | `[RootScanRecord]` | The scan's per-root capture, carried verbatim. Empty for `.missing`; single-element for per-item scanners |
+| `state` / `scanError` | `ScanState` / `ScanError?` | Item-level error surface — never flatten `denied` into `empty` (D6) |
+| `risk` | `RiskLevel` | node_modules items are frozen at `.review` |
+| `evidence` | `String` | Renders in the confirmation sheet per item (aggregates: the category description) |
+| `action` | `ReclaimAction` | How the cleaner reclaims this item's bytes |
+| `admission` | `AdmissionDescriptor` | Which PathGuard mode applies at the chokepoint |
+| `defaultSelected` | `Bool` | GUI initial selection — applied ONLY when a key is emitted for the first time |
+| `automaticCleanEligible` | `Bool` | `false` excludes the item from Quick Clean AND CLI smart-clean (node_modules ships `false` — CLI-visible is not auto-cleanable) |
+| `isStale` | `Bool?` | nil = staleness not applicable ("Select Stale" operates on `isStale == true`) |
+| `key` | `ItemKey` | Computed composite identity |
+| `allocatedBytes` | `Int64` | COMPUTED component sum — display convenience only, never stored |
+
+**Static Methods:**
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `stableID(scannerID:canonicalPath:)` | `String` | The shared per-item id derivation with the EXACT frozen preimage: full lowercase-hex SHA-256 (64 chars) over the UTF-8 bytes of `scannerID + "\0" + canonicalPath`. No truncation, ever. Every per-item scanner calls this instead of re-implementing; the derivation is documented in PROTOCOL.md |
+
+### `ScanIssue` / `ScanOutcome`
+
+```swift
+struct ScanIssue: Equatable, Sendable {
+    enum Kind: Equatable, Sendable {
+        case containerRefused, symlinkRoot, tccDenied,
+             permissionDenied, unreadable, malformedOutcome
+    }
+    let url: URL?      // required by convention for filesystem kinds;
+                       // nil for .malformedOutcome (no fake paths)
+    let kind: Kind
+    let detail: String
+}
+
+struct ScanOutcome: Sendable {
+    var items: [ReclaimableItem]
+    var errors: [ScanIssue]
+}
+```
+
+Two-surface rule: impediments attributable to an emitted item ride the item's
+`state`/`scanError`; only root/scanner-level problems with no recognized
+candidate land in `ScanOutcome.errors`. `Kind` is EXTENSIBLE — never write
+consumers that assume the case list is closed. Wire strings (frozen):
+`container_refused`, `symlink_root`, `tcc_denied`, `permission_denied`,
+`unreadable`, `malformed_outcome`. `.malformedOutcome` is synthesized ONLY by
+the runtime's validation, never by scanners.
+
+### `SpaceScanner` (protocol)
+
+```swift
+protocol SpaceScanner: Sendable {
+    var id: String { get }                       // stable slug, [a-z0-9_]+
+    var displayName: String { get }
+    var trustedContainerRoots: [URL] { get }     // declared at REGISTRATION
+    func scan(context: ScanContext) async -> ScanOutcome
+}
+```
+
+Adding a scanner = implement this + register with the runtime — nothing else:
+the runtime derives delete-time admission from registration. Conformers:
+`CategoryScanner` (id `categories`), `NodeModulesScanner` (id `node_modules`).
+
+### `ValidatedScannerEvent` / `SpaceScannerRegistrationError`
+
+```swift
+enum ValidatedScannerEvent: Sendable {
+    case outcome(scannerID: String, ScanOutcome)
+    case malformed(scannerID: String, ScanIssue)
+}
+
+enum SpaceScannerRegistrationError: Error, Equatable {
+    case malformedScannerID(String)
+    case duplicateScannerID(String)
+    case malformedCategorySlug(String)
+    case namespaceCollision(String)
+}
+```
+
+### `SpaceScannerRuntime`
+
+The ONE trusted composition source: scanner instances + the cleaner
+configuration DERIVED from them. The production `CacheCleaner` is constructed
+FROM the runtime, so "implement protocol + register" automatically extends
+delete-time admission — and NOTHING else does.
+
+```swift
+struct SpaceScannerRuntime {
+    let scanners: [any SpaceScanner]
+    let trustedContainerRoots: [URL]  // union of scanner declarations
+
+    init(scanners:categories:home:provider:) throws
+    static func production(home:provider:) -> SpaceScannerRuntime
+    func makeCleaner(trashHandler:) -> CacheCleaner
+    func scanValidated(scannerIDs: Set<String>? = nil,
+                       context: ScanContext) -> AsyncStream<ValidatedScannerEvent>
+    static func isValidSlug(_ slug: String) -> Bool
+}
+```
+
+| Member | Description |
+|--------|-------------|
+| `init` | Registration + FOLDED validation as one check: scanner-id slug syntax, scanner-id uniqueness, category-slug syntax, and the combined category-slug/scanner-slug namespace collision check (covers the frozen `categories` id). Injectable for tests — registering a fixture scanner requires zero production edits |
+| `production()` | The production registry — the single place scanners are registered (`CategoryScanner` + `NodeModulesScanner` today) |
+| `makeCleaner(trashHandler:)` | Builds the `CacheCleaner` whose PathGuard container roots are the runtime union — delete-time container admission covers exactly what registration declared, never anything an item claims |
+| `scanValidated(scannerIDs:context:)` | The ONE scan-and-validate entry point: a progressive validated event stream. The scan `TaskGroup` and ALL validation live inside; each event is one scanner's validated outcome or its synthesized `malformedOutcome` issue, yielded in completion order. `scannerIDs` scopes to a scanner subset (nil = all); the context's `categoryFilter` gives category-granular scoping inside `CategoryScanner`. Consumers pick scope and consumption style, never validation |
+| `isValidSlug(_:)` | `[a-z0-9_]+` — the address grammar's slug alphabet (no colon) |
+
+Validation (applied per event, fail-closed): (a) every item's `scannerID`
+equals the producing scanner's id; (b) item ids unique within the outcome;
+(c) state-aware structural invariants — `.removeItem` requires the
+`.containerItem` descriptor, `.removeContents`/`.commands` require category
+provenance, and every non-`.missing` `.removeContents`/`.commands` item
+requires at least one root record; (d) category provenance is trusted only
+from the registered category adapter, the item id must equal the carried
+category's slug, the carried category must BE the registered instance, and a
+`.commands` payload must equal the category's declared `cleanCommands` (argv
+is registry code, never item input). Any violation replaces the WHOLE outcome
+with a synthesized path-less `malformedOutcome` issue. `CacheCleaner`
+independently refuses the same shapes at dispatch — defense in depth.
+
+### `CategoryScanner`
+
+**File:** `Sources/Cacheout/Scanner/CategoryScanner.swift`
+
+The `SpaceScanner` adapter over the data-driven `CacheCategory` registry —
+one aggregate `ReclaimableItem` per category, current behavior preserved with
+zero churn to the category entries (scanning delegates to the existing
+`CacheScanner` actor).
+
+| Member | Description |
+|--------|-------------|
+| `registeredID` (static) | The FROZEN aggregate scanner id `categories`. NOT a valid bare CLI address token — category aggregates are addressed by category slug only |
+| `trustedContainerRoots` | Empty — aggregate admission is category-policy, not container-based |
+| `scan(context:)` | Honors `categoryFilter` BEFORE any resolver/probe runs; ignores the trigger (category scans never touch TCC-prompting roots) |
+| `item(from:rootRecords:)` (static) | The one place aggregate items are built: id = category slug, byte components/state/error/root records straight from the `ScanResult` — no re-measurement, no re-evaluation of `resolvedPaths` |
+| `declaredDisplayPath(of:)` (static) | The category's declared spelling for honest missing/unresolved presentation |
+
+---
+
 ## Actors
 
 ### `CacheScanner`
@@ -375,7 +707,17 @@ the single sizing routine shared with delete-time measurement.
 
 **File:** `Sources/Cacheout/Scanner/NodeModulesScanner.swift`
 
-Thread-safe scanner that recursively finds `node_modules` directories.
+Thread-safe scanner that recursively finds `node_modules` directories. The
+first per-item `SpaceScanner` (registered id: `node_modules`).
+
+**SpaceScanner conformance:**
+
+| Member | Description |
+|--------|-------------|
+| `id` | `node_modules` (`registeredID`) |
+| `displayName` | "Project node_modules" |
+| `trustedContainerRoots` | The scanner's search roots — declaring them at registration is what puts node_modules deletion admission into the runtime's container-root union |
+| `scan(context:)` | Maps the context's derived `includeProtectedRoots` onto the legacy gate below and emits one `ReclaimableItem` per discovered directory: stable full-hash id (`ReclaimableItem.stableID`), frozen `.review` risk, `automaticCleanEligible: false`, `isStale` populated, `.removeItem` action with the `.containerItem` admission descriptor. Classified `NodeModulesScanIssue`s generalize to `ScanIssue`s |
 
 **Methods:**
 
@@ -394,7 +736,9 @@ Thread-safe scanner that recursively finds `node_modules` directories.
 **File:** `Sources/Cacheout/Cleaner/CacheCleaner.swift`
 
 Thread-safe cleaner that handles guarded file deletion, trashing, freed-bytes
-accounting, and cleanup logging. Every deletion target passes `PathGuard`
+accounting, and cleanup logging. Constructed FROM the runtime
+(`SpaceScannerRuntime.makeCleaner()`) so its PathGuard container roots are
+the registration-derived union. Every deletion target passes `PathGuard`
 admission (a `.denied` scan state is refused even when force-selected), and
 freed bytes are measured at delete time and settled through the claim-based
 `InodeAccountingRegistry` — see [ARCHITECTURE.md](ARCHITECTURE.md) for the
@@ -404,7 +748,8 @@ safety model and accounting design.
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| `clean` | `func clean(results: [ScanResult], nodeModules: [NodeModulesItem] = [], moveToTrash: Bool) async -> CleanupReport` | Clean selected items. Returns a report with split-component entries and errors. |
+| `clean` | `func clean(items: [ReclaimableItem], moveToTrash: Bool) async -> CleanupReport` | THE one clean path. Dispatches on `ReclaimAction` at the chokepoint with a FROZEN check order: (1) structural action/descriptor/provenance compatibility on every item regardless of state, (2) well-formed `.missing` skip, (3) non-`.missing` zero-root-record refusal, (4) state eligibility (`.denied` refused even when selected; `.empty` no-op; `.commands` zero-measured skip), (5) dispatch. Independently refuses the same malformed shapes the runtime validator rejects — the chokepoint never assumes validation ran. |
+| `clean` (compatibility) | `func clean(results: [ScanResult], nodeModules: [NodeModulesItem] = [], moveToTrash: Bool) async -> CleanupReport` | Thin adapter with no production caller left: builds `ReclaimableItem`s and forwards to `clean(items:moveToTrash:)` — one dispatch, no second code path. |
 
 **Private Methods:**
 
@@ -424,23 +769,28 @@ safety model and accounting design.
 
 **File:** `Sources/Cacheout/ViewModels/CacheoutViewModel.swift`
 
-Central `@MainActor` `ObservableObject` managing all application state.
+Central `@MainActor` `ObservableObject` managing all application state — one
+selection/totals/clean model over `ReclaimableItem`, written once for every
+scanner. Constructed from a `SpaceScannerRuntime` (injectable for hermetic
+tests; production uses `.production()`); the runtime owns scan orchestration
+and validation, the view model owns reconciliation and presentation.
 
 **Published Properties:**
 
 | Property | Type | Description |
 |----------|------|-------------|
-| `scanResults` | `[ScanResult]` | Current scan results |
-| `isScanning` | `Bool` | Whether a scan is in progress |
+| `outcomesByScannerID` | `[String: ScanOutcome]` | Each scanner's latest VALIDATED outcome. A malformed event never lands here — the previous outcome is retained (fail-closed) |
+| `selectedItemKeys` | `Set<ItemKey>` | THE selection surface — composite keys only. Selections AND explicit deselections survive rescans; `defaultSelected` applies only to first-ever emissions; vanished keys are pruned when the stream completes, never mid-scan |
+| `scanningScannerIDs` | `Set<String>` | Scanners whose event has not arrived in the current scan (replaces the split `isScanning`/`isNodeModulesScanning` flags) |
+| `malformedIssuesByScannerID` | `[String: ScanIssue]` | The synthesized path-less issue for a scanner whose last event was malformed, surfaced beside the retained previous items |
 | `isCleaning` | `Bool` | Whether cleanup is in progress |
 | `diskInfo` | `DiskInfo?` | Current disk space info |
 | `showCleanConfirmation` | `Bool` | Controls confirmation sheet |
 | `showCleanupReport` | `Bool` | Controls report sheet |
 | `lastReport` | `CleanupReport?` | Most recent cleanup report |
 | `moveToTrash` | `Bool` | Deletion mode preference |
-| `nodeModulesItems` | `[NodeModulesItem]` | Discovered node_modules |
-| `isNodeModulesScanning` | `Bool` | Whether NM scan is in progress |
 | `scanGeneration` | `Int` | Monotonic counter for reactive updates |
+| `hasScanned` | `Bool` | Whether at least one scan completed (stays true on zero items) |
 | `lastScanDate` | `Date?` | When the last scan completed |
 | `scanIntervalMinutes` | `Double` | Auto-scan interval (persisted) |
 | `lowDiskThresholdGB` | `Double` | Notification threshold (persisted) |
@@ -448,19 +798,21 @@ Central `@MainActor` `ObservableObject` managing all application state.
 | `isDockerPruning` | `Bool` | Whether Docker prune is in progress |
 | `lastDockerPruneResult` | `String?` | Docker prune output message |
 
-**Computed Properties:**
+**Item access & computed properties:**
 
-| Property | Type | Description |
-|----------|------|-------------|
-| `selectedResults` | `[ScanResult]` | Currently selected scan results |
-| `selectedSize` | `Int64` | Total bytes of selected categories |
-| `formattedSelectedSize` | `String` | Human-readable selected size |
-| `totalRecoverable` | `Int64` | Total bytes across all non-empty categories |
-| `hasResults` | `Bool` | Whether any results exist |
-| `hasSelection` | `Bool` | Whether anything is selected |
-| `nodeModulesTotal` | `Int64` | Total node_modules bytes |
-| `selectedNodeModulesSize` | `Int64` | Selected node_modules bytes |
-| `totalSelectedSize` | `Int64` | Combined selected size |
+| Member | Type | Description |
+|--------|------|-------------|
+| `items(forScanner:)` / `issues(forScanner:)` / `item(for:)` | — | Validated-outcome accessors |
+| `selectedItems` | `[ReclaimableItem]` | Selected items in presentation order — exactly what `clean()` hands the cleaner |
+| `hasResults` / `hasSelection` / `selectedCount` | — | Selection/result predicates |
+| `isAnyScanInProgress` | `Bool` | True while ANY scanner's event is pending — clean must never act on a half-built result set |
+| `categoryRows` | `[CategoryRowModel]` | Category aggregates presented through the unchanged `CategoryRow` inputs; list identity is the composite key |
+| `perItemSections` | `[ScannerSectionModel]` | One generic section per non-category scanner, in registry order (the node_modules section, generalized) |
+| `categoryScanIssues` | `[ScanIssue]` | Category-scanner issues incl. a synthesized `malformedOutcome` |
+| `confirmationRows` | `[ConfirmationRowModel]` | Unified confirmation-sheet rows — every row carries its item's `evidence` |
+| `totalRecoverable` / `totalSelectedSize` / `selectedSize(forScanner:)` / `totalSize(forScanner:)` | `Int64` | Byte totals through one shared aggregation helper with explicit scope/inclusion predicates |
+| `automaticCleanableSize` / `hasAutomaticCleanableItems` | — | Bytes Quick Clean would actually act on (policy (b), registry-wide) |
+| `hasPartiallyDeniedSelection` / `hasCommandBackedSelection` / `hasCautionSelection` | `Bool` | Confirmation-sheet disclosure predicates |
 | `shouldAutoRescan` | `Bool` | Whether data is stale |
 | `menuBarTitle` | `String` | Free GB for menubar display |
 
@@ -468,17 +820,14 @@ Central `@MainActor` `ObservableObject` managing all application state.
 
 | Method | Description |
 |--------|-------------|
-| `scan()` | Run full scan (categories + node_modules in parallel) |
-| `clean()` | Clean selected items, show report, then rescan |
-| `smartClean()` | Select all safe categories and clean |
+| `scan(trigger:)` | Consume the runtime's progressive validated event stream (all scanners, nil filter). The trigger is MANDATORY — every caller must classify itself, so a misclassified new call site is a compile error, and TCC-protected roots are walked only for `.userInitiated` |
+| `clean()` | Clean `selectedItems` via the runtime-constructed cleaner, show report, then rescan |
+| `smartClean()` | GUI Quick Clean — a PURE auto path, strictly policy (b): deselect all, `selectAllSafe()`, clean. CLI smart-clean's safe-then-review policy (c) is exclusively the CLI's |
 | `dockerPrune()` | Run `docker system prune -f` |
-| `toggleSelection(for:)` | Toggle a category's selection state |
-| `selectAllSafe()` | Select all safe, non-empty categories |
-| `deselectAll()` | Deselect all categories and node_modules |
-| `toggleNodeModulesSelection(for:)` | Toggle a node_modules item's selection |
-| `selectStaleNodeModules()` | Select all node_modules >30 days old |
-| `selectAllNodeModules()` | Select all node_modules |
-| `deselectAllNodeModules()` | Deselect all node_modules |
+| `toggleSelection(for:)` | Toggle one `ItemKey`'s selection (unselectable states refused) |
+| `selectAllSafe()` | Policy (b): `automaticCleanEligible && risk == .safe`, across every scanner |
+| `deselectAll()` | Clear the whole selection |
+| `selectStale(inScanner:)` / `selectAll(inScanner:)` / `deselectAll(inScanner:)` | Scanner-scoped batch selection (the node_modules buttons, generalized) |
 
 ---
 
@@ -524,31 +873,40 @@ Capsule-shaped risk level indicator.
 
 **Properties:** `level: RiskLevel`
 
-### `NodeModulesSection`
+### `ScannerItemSection`
 
 **File:** `Sources/Cacheout/Views/NodeModulesSection.swift`
 
-Collapsible section with node_modules list and batch selection buttons.
+Collapsible per-item scanner section (the node_modules section, generalized):
+item list, batch selection buttons ("Select Stale" renders only where
+staleness applies), and scan-issue disclosure via `ScanIssuesBlock`.
 
-### `NodeModulesRow`
+**Properties:** `section: ScannerSectionModel`
+
+### `ScannerItemRow`
 
 **File:** `Sources/Cacheout/Views/NodeModulesSection.swift`
 
-Single node_modules row with checkbox, project name, path, stale badge, and size.
+Single per-item row with checkbox, display name, path, stale badge, and size.
 
-**Properties:** `item: NodeModulesItem`, `onToggle: () -> Void`
+**Properties:** `item: ReclaimableItem`
 
 ### `CleanConfirmationSheet`
 
 **File:** `Sources/Cacheout/Views/CleanConfirmation.swift`
 
-Modal sheet confirming cleanup with itemized list and trash toggle.
+Modal sheet confirming cleanup with the unified itemization
+(`ConfirmationRowModel` — every row carries its item's evidence string), the
+trash toggle, and the command-backed trash disclosure (command-cleaned
+categories are named: their bytes are erased permanently, never in the
+Trash).
 
 ### `CleanupReportSheet`
 
 **File:** `Sources/Cacheout/Views/CleanConfirmation.swift`
 
-Modal sheet showing cleanup results with per-category breakdown.
+Modal sheet showing cleanup results in per-scanner sections
+(`CleanupReport.scannerSections`) with component-derived rollup headers.
 
 **Properties:** `report: CleanupReport`
 

@@ -1551,6 +1551,39 @@ final class CacheCleanerTests: XCTestCase {
                        "command items report the pre-scan size as estimated")
     }
 
+    func testZeroAllocatedMeasuredAggregateIsSkippedChildrenSurvive() async throws {
+        let root = try makeTempDir("zero-alloc-aggregate")
+        defer { try? FileManager.default.removeItem(at: root) }
+        // Zero-allocation regular files: the scan measures itemCount > 0
+        // with allocatedBytes == 0, so the aggregate is `.measured` — NOT
+        // `.empty` — yet the CLI confirmation/dry-run plan reports "skip"
+        // for it (the as-built `result.isEmpty` parity). The confirmed run
+        // must not delete what its plan said it would skip.
+        let emptyA = root.appendingPathComponent("zero-a.bin")
+        let emptyB = root.appendingPathComponent("zero-b.bin")
+        try Data().write(to: emptyA)
+        try Data().write(to: emptyB)
+
+        let item = makeCategoryItem(
+            category: makeCategory(at: root, name: "zero-alloc-cat"),
+            records: [makeRecord(root)],
+            exact: 0, estimated: 0
+        )
+        XCTAssertEqual(item.state, .measured)
+        XCTAssertEqual(item.allocatedBytes, 0)
+
+        let report = await CacheCleaner().clean(items: [item], moveToTrash: false)
+
+        XCTAssertTrue(report.entries.isEmpty,
+                      "a zero-allocated aggregate yields no entry")
+        XCTAssertTrue(report.errors.isEmpty,
+                      "the skip is a no-op, never an error: \(report.errors)")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: emptyA.path),
+                      "children survive a confirmed clean of a zero-allocated aggregate")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: emptyB.path),
+                      "children survive a confirmed clean of a zero-allocated aggregate")
+    }
+
     func testCommandsIgnoreMoveToTrashAndNeverUseAShell() async throws {
         let cmdRoot = try makeTempDir("cmd-argv")
         let trashDir = try makeTempDir("fake-trash")

@@ -376,6 +376,7 @@ under `details`:
 | `plan[].scan_error` | object | Present when the scan was impeded (same shape as `scan`) |
 | `total_exact_bytes` | integer | Sum of exact bytes over entries that would clean |
 | `total_estimated_up_to_bytes` | integer | Sum of estimated bytes over entries that would clean |
+| `scanner_errors` | object[] | Additive, optional: present only when a bare `<scanner-slug>` target's scan reported root/scanner-level issues (same row shape as `scan`'s `scanner_errors`) — the scanner-wide selection was impeded and may be incomplete |
 
 #### Confirmed output (schema 4)
 
@@ -459,12 +460,28 @@ process-level success.
 | `results[].error` | string | no | Error message(s), `"; "`-joined, when `success` is false |
 | `results[].warning` | string | no | Present when the category scanned `partiallyDenied` — only measured bytes were cleaned/reported |
 | `scanner_rollups` | object[] | yes | Additive per-scanner sums over the report entries (`scanner_id`, `exact_bytes`, `estimated_up_to_bytes`, `bytes_freed`, `entry_count`), first-appearance order |
+| `scanner_errors` | object[] | no | Additive: present only when a bare `<scanner-slug>` target's scan reported root/scanner-level issues — same row shape as `scan`'s `scanner_errors`. Also present on the `CLEAN_FAILED` details when applicable |
 
 **Denied-state targets:** naming a `denied` category or item is a per-entry
 error (`success: false`, `error` explains the scan-time refusal — TCC,
 permissions, or admission), never a silent skip. Naming a `partiallyDenied`
 category proceeds but carries `warning`. The `smart-clean` auto path skips
 both.
+
+**Impeded scanner-wide targets:** a bare `<scanner-slug>` target selects
+whatever the backing scan discovered, so that scan's root/scanner-level
+issues (TCC denials, permission denials, refused roots) travel with the
+selection: every clean surface — the `CONFIRMATION_REQUIRED` details, the
+dry-run payload, and the confirmed payload — carries them as an additive
+`scanner_errors` array (same row shape as `scan`'s; the key is present only
+when non-empty). With EVERY root denied, the confirmed run exits 0 with
+empty `results` and the denial rows: an impeded no-op, never a silent
+success. Scan-time impediments never flip the exit code (the `scan`
+envelope precedent — a fully-denied `scan` also exits 0 with
+`scanner_errors` rows); `CLEAN_FAILED` remains a delete-time verdict.
+Explicitly addressed `<scanner-slug>:<item-id>` targets carry no
+`scanner_errors`: the addressed item WAS discovered, so root-level issues
+did not impede that specific operation.
 
 #### Exit-code policy (schema 3)
 
@@ -483,7 +500,10 @@ both.
 Non-destructive; built from the SCAN-TIME split components (no re-walk).
 `bytes_would_free`/`total_would_free` count **exact bytes only**; estimated
 bytes ride in the additive fields. Entries reuse the plan shape (`state`,
-`action`, components, identity fields):
+`action`, components, identity fields). A bare `<scanner-slug>` target
+whose scan reported root/scanner-level issues additionally carries the
+additive `scanner_errors` array (same row shape as `scan`'s; present only
+when non-empty — see "Impeded scanner-wide targets" above):
 
 ```json
 {

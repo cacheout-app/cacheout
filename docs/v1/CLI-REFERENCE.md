@@ -63,8 +63,11 @@ Cacheout --cli disk-info
 
 ### `scan`
 
-Run every registered scanner (the 20+ cache categories plus per-item
-scanners such as `node_modules`) and report the schema-4 envelope.
+Run every registered scanner (the built-in cache categories plus per-item
+scanners such as `node_modules`) and report the schema-4 envelope. The
+registry in `Sources/Cacheout/Scanner/Categories.swift` is the source of
+truth for which categories exist — see [CATEGORIES.md](CATEGORIES.md) for
+the full list.
 
 ```bash
 Cacheout --cli scan

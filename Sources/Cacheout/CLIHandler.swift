@@ -684,6 +684,20 @@ struct CLIHandler {
         return .success(targets)
     }
 
+    /// What target resolution selected: the deduped items PLUS the
+    /// root/scanner-level scan issues carried by every BARE
+    /// `<scanner-slug>` target's outcome. A scanner-wide selection is only
+    /// as complete as the scan that backed it, so its impediments travel
+    /// WITH the selection instead of being discarded — a fully-denied
+    /// scanner must be visible as an impeded no-op, never a clean success.
+    /// Explicitly addressed `<scanner>:<item>` targets carry no
+    /// scanner-level issues: the addressed item WAS discovered, so root
+    /// problems did not impede that specific operation.
+    struct ResolvedCleanSelection {
+        var items: [ReclaimableItem] = []
+        var scannerErrors: [(scannerID: String, issue: ScanIssue)] = []
+    }
+
     /// Resolve parsed targets AGAINST THE VALIDATED SCAN RESULTS ONLY
     /// (round 8): a malformed scanner's items are unaddressable by
     /// construction — any target referencing one fails with the same
@@ -694,13 +708,14 @@ struct CLIHandler {
         _ targets: [CleanTarget],
         outcomes: [String: ScanOutcome],
         malformed: [String: ScanIssue]
-    ) -> Result<[ReclaimableItem], CLIAddressError> {
-        var items: [ReclaimableItem] = []
+    ) -> Result<ResolvedCleanSelection, CLIAddressError> {
+        var selection = ResolvedCleanSelection()
         var seenKeys = Set<ItemKey>()
+        var seenErrorScanners = Set<String>()
 
         func append(_ item: ReclaimableItem) {
             guard seenKeys.insert(item.key).inserted else { return }
-            items.append(item)
+            selection.items.append(item)
         }
 
         for target in targets {
@@ -731,9 +746,20 @@ struct CLIHandler {
                     )))
                 }
                 // Zero items is a legitimate no-op (like cleaning an empty
-                // category), not an error.
-                for item in outcomes[scannerID]?.items ?? [] {
+                // category), not an error — but ONLY when the scan actually
+                // looked everywhere: root/scanner-level issues (TCC or
+                // permission denials, refused roots) ride along with the
+                // selection so an impeded scanner-wide clean is reported as
+                // impeded, never as a clean empty success.
+                let outcome = outcomes[scannerID]
+                for item in outcome?.items ?? [] {
                     append(item)
+                }
+                if let outcome, !outcome.errors.isEmpty,
+                   seenErrorScanners.insert(scannerID).inserted {
+                    for issue in outcome.errors {
+                        selection.scannerErrors.append((scannerID, issue))
+                    }
                 }
 
             case .scannerItem(let scannerID, let itemID):
@@ -752,7 +778,7 @@ struct CLIHandler {
                 append(item)
             }
         }
-        return .success(items)
+        return .success(selection)
     }
 
     /// The unknown/invalid-target refusal for addresses that reach a
@@ -841,21 +867,37 @@ struct CLIHandler {
 
     /// The `CONFIRMATION_REQUIRED` details payload for `clean` (R5): the
     /// same per-item decisions the confirmed run would take.
-    static func cleanConfirmationDetails(for items: [ReclaimableItem]) -> [String: Any] {
+    /// `scannerErrors` carries the bare-scanner-target scan impediments
+    /// (additive `scanner_errors`, same frozen row shape as `scan`'s) —
+    /// present only when non-empty, so pre-existing payloads are unchanged.
+    static func cleanConfirmationDetails(
+        for items: [ReclaimableItem],
+        scannerErrors: [[String: Any]] = []
+    ) -> [String: Any] {
         let totals = cleanPlanTotals(items)
-        return [
+        var details: [String: Any] = [
             "command": "clean",
             "plan": items.map { cleanPlanItemJSON(for: $0) },
             "total_exact_bytes": totals.exact,
             "total_estimated_up_to_bytes": totals.estimated,
         ]
+        if !scannerErrors.isEmpty {
+            details["scanner_errors"] = scannerErrors
+        }
+        return details
     }
 
     /// Dry-run clean payload (R16): built from the SCAN-TIME split
     /// components — no re-walk, and `total_would_free` counts exact bytes
     /// only (estimates are additive, never laundered into the total).
     /// Self-describes with `schema_version` (round 8 — every payload).
-    static func cleanDryRunPayload(for items: [ReclaimableItem]) -> [String: Any] {
+    /// `scannerErrors` (additive `scanner_errors`, `scan`'s frozen row
+    /// shape) surfaces bare-scanner-target scan impediments; the key is
+    /// present only when non-empty.
+    static func cleanDryRunPayload(
+        for items: [ReclaimableItem],
+        scannerErrors: [[String: Any]] = []
+    ) -> [String: Any] {
         let entries: [[String: Any]] = items.map { item in
             var row = cleanPlanItemJSON(for: item)
             let action = cleanPlanAction(for: item)
@@ -869,13 +911,17 @@ struct CLIHandler {
             return row
         }
         let totals = cleanPlanTotals(items)
-        return [
+        var payload: [String: Any] = [
             "schema_version": cliSchemaVersion,
             "dry_run": true,
             "total_would_free": totals.exact,
             "total_estimated_up_to_bytes": totals.estimated,
             "results": entries,
         ]
+        if !scannerErrors.isEmpty {
+            payload["scanner_errors"] = scannerErrors
+        }
+        return payload
     }
 
     /// Additive per-scanner rollup rows (fn-2.3's report derivation on the
@@ -970,14 +1016,24 @@ struct CLIHandler {
         )
 
         // Address resolution NEVER sees unvalidated data (round 8).
-        let items: [ReclaimableItem]
+        let selection: ResolvedCleanSelection
         switch resolveCleanTargets(
             parsed, outcomes: collected.outcomes, malformed: collected.malformed
         ) {
         case .failure(let error):
             return .failure(code: "INVALID_ARGUMENTS", message: error.message, details: nil)
         case .success(let resolved):
-            items = resolved
+            selection = resolved
+        }
+        let items = selection.items
+        // Bare-scanner-target scan impediments as `scan`'s frozen
+        // `scanner_errors` rows — surfaced on EVERY branch below (plan,
+        // dry-run, confirmed) so a denied or partially-denied scanner-wide
+        // clean is never reported as an unimpeded success (P2). Scan-time
+        // impediments are payload DATA (the `scan` envelope precedent);
+        // exit codes stay reserved for clean-time failures.
+        let scannerErrorRows = selection.scannerErrors.map {
+            scannerErrorRowJSON(scannerID: $0.scannerID, issue: $0.issue)
         }
 
         switch decision {
@@ -989,16 +1045,22 @@ struct CLIHandler {
             return .failure(
                 code: "CONFIRMATION_REQUIRED",
                 message: "clean deletes cache contents and requires --confirm (preview with --dry-run)",
-                details: cleanConfirmationDetails(for: items)
+                details: cleanConfirmationDetails(
+                    for: items, scannerErrors: scannerErrorRows
+                )
             )
 
         case .dryRun:
-            return .success(cleanDryRunPayload(for: items))
+            return .success(cleanDryRunPayload(
+                for: items, scannerErrors: scannerErrorRows
+            ))
 
         case .proceed:
             let cleaner = deps.makeCleaner()
             let report = await cleaner.clean(items: items, moveToTrash: false)
-            return confirmedCleanPayload(items: items, report: report)
+            return confirmedCleanPayload(
+                items: items, report: report, scannerErrors: scannerErrorRows
+            )
         }
     }
 
@@ -1010,8 +1072,17 @@ struct CLIHandler {
     /// signal). Per-item `.empty`/`.missing` items are the cleaner's
     /// silent pre-admission skip (round 9) and get NO row — nothing was
     /// deleted and no error occurred, even when explicitly addressed.
+    /// `scannerErrors` (additive `scanner_errors`, `scan`'s frozen row
+    /// shape) reports bare-scanner-target scan impediments on BOTH result
+    /// arms — the success payload and the `CLEAN_FAILED` details — present
+    /// only when non-empty. A fully-denied scanner-wide target therefore
+    /// yields empty `results` WITH the denial rows: an impeded no-op, not
+    /// a silent success. The exit contract is unchanged — scan-time
+    /// impediments never flip the exit code (the `scan` envelope
+    /// precedent); `CLEAN_FAILED` stays a delete-time verdict.
     private static func confirmedCleanPayload(
-        items: [ReclaimableItem], report: CleanupReport
+        items: [ReclaimableItem], report: CleanupReport,
+        scannerErrors: [[String: Any]] = []
     ) -> CLIOutcome {
         let entriesByKey = Dictionary(
             report.entries.map { ($0.key, $0) },
@@ -1060,14 +1131,18 @@ struct CLIHandler {
             freedExact: report.totalFreedExact,
             freedEstimated: report.totalEstimatedUpTo
         ) {
+            var details: [String: Any] = ["results": rows]
+            if !scannerErrors.isEmpty {
+                details["scanner_errors"] = scannerErrors
+            }
             return .failure(
                 code: "CLEAN_FAILED",
                 message: "No requested target could be cleaned",
-                details: ["results": rows]
+                details: details
             )
         }
 
-        return .success([
+        var payload: [String: Any] = [
             "schema_version": cliSchemaVersion,
             "dry_run": false,
             "total_freed_bytes": report.totalFreedExact,
@@ -1078,7 +1153,11 @@ struct CLIHandler {
             ),
             "results": rows,
             "scanner_rollups": scannerRollupRows(report),
-        ])
+        ]
+        if !scannerErrors.isEmpty {
+            payload["scanner_errors"] = scannerErrors
+        }
+        return .success(payload)
     }
 
     /// Smart-clean eligibility + order — policy (c), EXCLUSIVELY this

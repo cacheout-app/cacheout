@@ -262,8 +262,9 @@ actor CacheCleaner {
     /// malformed shape): (1) structural action/descriptor compatibility on
     /// EVERY item regardless of state; (2) well-formed `.missing` skip;
     /// (3) non-`.missing` category-backed zero-record refusal; (4) state
-    /// eligibility (`.denied` refusal, `.empty` no-op, `.commands`
-    /// zero-measured skip); (5) action dispatch.
+    /// eligibility (`.denied` refusal, `.empty` no-op, aggregate
+    /// `.commands`/`.removeContents` zero-measured skip); (5) action
+    /// dispatch.
     func clean(items: [ReclaimableItem], moveToTrash: Bool) async -> CleanupReport {
         var entries: [CleanupReport.Entry] = []
         var errors: [CleanupReport.ItemError] = []
@@ -325,10 +326,21 @@ actor CacheCleaner {
             // for EVERY action — no entry, never an error, even when
             // explicitly selected/addressed (round 9).
             if item.state == .empty { continue }
-            // `.commands` zero-measured parity (the as-built
-            // `result.isEmpty` guard): no argv ever runs for an empty
-            // command category.
-            if case .commands = item.action, item.allocatedBytes == 0 { continue }
+            // Aggregate zero-measured parity (the as-built `result.isEmpty`
+            // guard): no argv ever runs for an empty command category, and
+            // no children are deleted for a zero-allocated `.removeContents`
+            // aggregate — a `.measured` category holding only zero-allocation
+            // files plans as "skip" in the CLI confirmation/dry-run, and a
+            // confirmed run must never delete what its plan said it would
+            // skip. `.removeItem` deliberately has NO zero-byte skip (frozen
+            // plan parity: a measured zero-byte per-item target IS deleted).
+            // Exhaustive so a future action decides at compile time.
+            switch item.action {
+            case .commands, .removeContents:
+                if item.allocatedBytes == 0 { continue }
+            case .removeItem:
+                break
+            }
             // `.partiallyDenied` reaches here only through explicit
             // selection (fn-1.4/fn-2.4 own never auto-selecting it) and
             // reports measured deletions only — which is all this pipeline

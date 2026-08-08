@@ -1166,6 +1166,160 @@ final class CLIGateTests: XCTestCase {
         XCTAssertEqual(payload["total_freed_bytes"] as? Int64, 0)
     }
 
+    // MARK: - Scanner-wide targets surface scan impediments (P2)
+
+    /// A REAL removable per-item fixture (`<container>/projX` with content)
+    /// emitted by a FixtureScanner that ALSO reports root-level issues —
+    /// the shapes a TCC/permission-impeded per-item scanner produces.
+    private func makeImpededScannerFixture(
+        id: String, errors: [ScanIssue]
+    ) throws -> (scanner: FixtureScanner, itemDir: URL, address: String) {
+        let container = base.appendingPathComponent("\(id)-container")
+        let itemDir = container.appendingPathComponent("projX")
+        try fm.createDirectory(at: itemDir, withIntermediateDirectories: true)
+        try Data(repeating: 0xCD, count: 8192).write(
+            to: itemDir.appendingPathComponent("payload.bin")
+        )
+        let resolved = FileSystemIdentityProvider().canonicalize(itemDir)
+        let itemID = ReclaimableItem.stableID(
+            scannerID: id, canonicalPath: resolved.path
+        )
+        let item = ReclaimableItem(
+            id: itemID, scannerID: id, displayName: "projX",
+            exactBytes: 8192, estimatedUpToBytes: 0,
+            logicalBytes: nil, itemCount: 1,
+            url: resolved, declaredDisplayPath: itemDir.path,
+            rootRecords: [RootScanRecord(
+                requestedURL: itemDir, resolvedURL: resolved, status: .measured
+            )],
+            state: .measured, scanError: nil,
+            risk: .review, evidence: "fixture item", rebuildNote: nil,
+            action: .removeItem,
+            admission: .containerItem(
+                originContainer: container, requestedTargetURL: itemDir
+            ),
+            defaultSelected: false, automaticCleanEligible: false,
+            isStale: nil
+        )
+        let scanner = FixtureScanner(
+            id: id, trustedContainerRoots: [container],
+            items: [item], errors: errors
+        )
+        return (scanner, itemDir, "\(id):\(itemID)")
+    }
+
+    func testScannerWideCleanFullDenialIsAVisiblyImpededNoOp() async throws {
+        // Every search root TCC-denied: the scan produced NO items, only
+        // root-level issues. The bare `<scanner-slug>` clean must carry
+        // those issues on EVERY branch — full denial is an impeded no-op,
+        // never a silent success (P2).
+        let deniedRoot = base.appendingPathComponent("denied-root")
+        let fixture = FixtureScanner(
+            id: "denied_scanner",
+            errors: [ScanIssue(
+                url: deniedRoot, kind: .tccDenied, detail: "fixture TCC denial"
+            )]
+        )
+        let deps = try makeDeps(categories: [], extraScanners: [fixture])
+        // The frozen `scan` scanner_errors row shape, verbatim.
+        let expectedRow: NSDictionary = [
+            "scanner_id": "denied_scanner",
+            "kind": "tcc_denied",
+            "detail": "fixture TCC denial",
+            "path": deniedRoot.path,
+        ]
+
+        // Unconfirmed: the plan is empty but the impediment rides the details.
+        let unconfirmed = try failureOutcome(await CLIHandler.cleanCLIOutcome(
+            targets: ["denied_scanner"], dryRun: false, confirmed: false,
+            euid: 501, deps: deps
+        ))
+        XCTAssertEqual(unconfirmed.code, "CONFIRMATION_REQUIRED")
+        let details = try XCTUnwrap(unconfirmed.details)
+        XCTAssertEqual((details["plan"] as? [[String: Any]])?.count, 0)
+        let planErrors = try XCTUnwrap(details["scanner_errors"] as? [[String: Any]])
+        XCTAssertEqual(planErrors.count, 1)
+        XCTAssertEqual(planErrors[0] as NSDictionary, expectedRow)
+
+        // Dry run: empty results, zero bytes — WITH the denial rows.
+        let dryRun = try successPayload(await CLIHandler.cleanCLIOutcome(
+            targets: ["denied_scanner"], dryRun: true, confirmed: false,
+            euid: 501, deps: deps
+        ))
+        XCTAssertEqual((dryRun["results"] as? [[String: Any]])?.count, 0)
+        XCTAssertEqual(dryRun["total_would_free"] as? Int64, 0)
+        let dryErrors = try XCTUnwrap(dryRun["scanner_errors"] as? [[String: Any]])
+        XCTAssertEqual(dryErrors[0] as NSDictionary, expectedRow)
+
+        // Confirmed: STILL a process-level success — scan-time impediments
+        // are payload data (the `scan` envelope precedent; CLEAN_FAILED
+        // stays a delete-time verdict) — but never a SILENT no-op.
+        let confirmed = try successPayload(await CLIHandler.cleanCLIOutcome(
+            targets: ["denied_scanner"], dryRun: false, confirmed: true,
+            euid: 501, deps: deps
+        ))
+        XCTAssertEqual((confirmed["results"] as? [[String: Any]])?.count, 0)
+        XCTAssertEqual(confirmed["total_freed_bytes"] as? Int64, 0)
+        let confirmedErrors = try XCTUnwrap(confirmed["scanner_errors"] as? [[String: Any]])
+        XCTAssertEqual(confirmedErrors[0] as NSDictionary, expectedRow)
+    }
+
+    func testScannerWideCleanPartialDenialReportsRowsPlusScannerErrors() async throws {
+        // One root scanned (its item is real and deletable), one root
+        // denied: the confirmed scanner-wide clean reports the accessible
+        // subset's success rows AND says the target was incomplete.
+        let otherRoot = base.appendingPathComponent("unreadable-root")
+        let fixture = try makeImpededScannerFixture(
+            id: "px_scanner",
+            errors: [ScanIssue(
+                url: otherRoot, kind: .permissionDenied, detail: "fixture EACCES"
+            )]
+        )
+        let deps = try makeDeps(categories: [], extraScanners: [fixture.scanner])
+
+        let payload = try successPayload(await CLIHandler.cleanCLIOutcome(
+            targets: ["px_scanner"], dryRun: false, confirmed: true,
+            euid: 501, deps: deps
+        ))
+
+        XCTAssertFalse(fm.fileExists(atPath: fixture.itemDir.path),
+                       "the accessible item is cleaned for real")
+        let rows = try XCTUnwrap(payload["results"] as? [[String: Any]])
+        XCTAssertEqual(rows.count, 1)
+        XCTAssertEqual(rows[0]["success"] as? Bool, true)
+        XCTAssertGreaterThan(try XCTUnwrap(rows[0]["bytes_freed"] as? Int64), 0)
+        let errors = try XCTUnwrap(payload["scanner_errors"] as? [[String: Any]])
+        XCTAssertEqual(errors.count, 1)
+        XCTAssertEqual(errors[0] as NSDictionary, [
+            "scanner_id": "px_scanner",
+            "kind": "permission_denied",
+            "detail": "fixture EACCES",
+            "path": otherRoot.path,
+        ] as NSDictionary)
+    }
+
+    func testExplicitItemAddressCarriesNoScannerErrors() async throws {
+        // Root-level issues do NOT impede an explicitly addressed item that
+        // WAS discovered — `<scanner>:<item>` payloads stay byte-identical
+        // to their pre-P2 shape (the additive key is scanner-wide only).
+        let fixture = try makeImpededScannerFixture(
+            id: "px_scanner",
+            errors: [ScanIssue(
+                url: base.appendingPathComponent("unreadable-root"),
+                kind: .permissionDenied, detail: "fixture EACCES"
+            )]
+        )
+        let deps = try makeDeps(categories: [], extraScanners: [fixture.scanner])
+
+        let dryRun = try successPayload(await CLIHandler.cleanCLIOutcome(
+            targets: [fixture.address], dryRun: true, confirmed: false,
+            euid: 501, deps: deps
+        ))
+        XCTAssertEqual((dryRun["results"] as? [[String: Any]])?.count, 1)
+        XCTAssertNil(dryRun["scanner_errors"],
+                     "scanner-level issues ride only scanner-WIDE targets")
+    }
+
     // MARK: - Malformed outcomes are unaddressable through clean (R2, R8)
 
     func testMalformedScannerItemsAreUnreachableThroughClean() async throws {

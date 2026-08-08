@@ -622,6 +622,13 @@ discovery. Since schema 3 every root is admitted through the deletion-path
 guard BEFORE any xattr/marker write, and roots whose scan was denied are
 never written to; refusals are reported in the additive `refused` array.
 
+Since schema 4 the discovery pass runs through the same validated scanner
+runtime as `scan`/`clean`/`smart-clean`, scoped to the `categories` adapter
+(tagging is a category-root side effect). If the `categories` outcome fails
+validation (`malformed_outcome`), the command fails closed with error code
+`MALFORMED_SCANNER_OUTPUT` — tag targets are never derived from unvalidated
+results.
+
 **Output schema:**
 
 ```json

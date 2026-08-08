@@ -1330,11 +1330,51 @@ struct CLIHandler {
     /// `mdfind "kMDItemFinderComment == 'cacheout-managed'"` finds them.
     /// Also writes a `.cacheout-managed` marker file for `mdfind -name` queries.
     private static func handleSpotlight() async {
-        let scanner = CacheScanner()
-        let results = await scanner.scanAll(CacheCategory.allCategories)
-        outputJSON(spotlightPayload(
-            for: results, home: FileManager.default.homeDirectoryForCurrentUser
+        render(await spotlightOutcome(
+            deps: .production(),
+            home: FileManager.default.homeDirectoryForCurrentUser
         ))
+    }
+
+    /// The spotlight scan pass runs through the SAME validated runtime entry
+    /// point as scan/clean/smart-clean (R8 — no CLI consumer scans outside
+    /// the chokepoint), scoped to the `categories` adapter: tagging is a
+    /// category-root side effect. A malformed `categories` outcome fails
+    /// closed — tag targets are never derived from unvalidated results.
+    static func spotlightOutcome(
+        deps: CLIRuntimeDependencies, home: URL
+    ) async -> CLIOutcome {
+        let adapterID = CategoryScanner.registeredID
+        let collected = await collectValidatedScan(
+            deps.runtime, scannerIDs: [adapterID],
+            context: ScanContext(trigger: .userInitiated)
+        )
+        if let issue = collected.malformed[adapterID] {
+            return .failure(
+                code: "MALFORMED_SCANNER_OUTPUT",
+                message: "Scanner '\(adapterID)' failed outcome validation; "
+                    + "refusing to tag from unvalidated results: \(issue.detail)",
+                details: nil
+            )
+        }
+        // Validated aggregate items map back to the category results the
+        // payload consumes; the runtime guarantees `.category` admission on
+        // every adapter item, so a non-category descriptor is unreachable
+        // (kept fail-closed via compactMap rather than assumed).
+        let results = (collected.outcomes[adapterID]?.items ?? []).compactMap {
+            item -> ScanResult? in
+            guard case .category(let category) = item.admission else { return nil }
+            return ScanResult(
+                category: category,
+                state: item.state,
+                exactBytes: item.exactBytes,
+                estimatedUpToBytes: item.estimatedUpToBytes,
+                itemCount: item.itemCount,
+                scanError: item.scanError,
+                rootRecords: item.rootRecords
+            )
+        }
+        return .success(spotlightPayload(for: results, home: home))
     }
 
     /// The spotlight tagging pass (fn-1.5). Writes are side effects against

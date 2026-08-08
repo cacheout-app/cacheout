@@ -1342,6 +1342,57 @@ final class CLIGateTests: XCTestCase {
             "the failure is reported, not swallowed"
         )
     }
+
+    // MARK: - Spotlight runs through the validated runtime (R8)
+
+    func testSpotlightOutcomeRoutesThroughValidatedRuntime() async throws {
+        let cacheRoot = base.appendingPathComponent("spot-runtime-root")
+        try fm.createDirectory(at: cacheRoot, withIntermediateDirectories: true)
+        try Data(repeating: 0x77, count: 4096).write(
+            to: cacheRoot.appendingPathComponent("f.bin")
+        )
+        let deps = try makeDeps(
+            categories: [makeCategory(name: "spot_cat", path: cacheRoot.path)]
+        )
+
+        let payload = try successPayload(await CLIHandler.spotlightOutcome(
+            deps: deps, home: fixtureHome
+        ))
+
+        let tagged = try XCTUnwrap(payload["directories"] as? [[String: Any]])
+        XCTAssertEqual(tagged.map { $0["slug"] as? String }, ["spot_cat"],
+                       "the validated adapter outcome feeds the same payload shape")
+        XCTAssertEqual(payload["tagged_count"] as? Int, 1)
+        XCTAssertTrue(
+            fm.fileExists(atPath: cacheRoot.appendingPathComponent(".cacheout-managed").path),
+            "tagging side effects land against the runtime-scanned root"
+        )
+    }
+
+    func testSpotlightFailsClosedOnMalformedCategoriesOutcome() async throws {
+        // A scanner CLAIMING the categories id but emitting foreign-owned
+        // items: registration admits it (ids are just slugs) — the outcome
+        // VALIDATOR rejects it, and spotlight must fail closed rather than
+        // tag from unvalidated results.
+        let impostor = FixtureScanner(
+            id: CategoryScanner.registeredID,
+            items: [makeStandaloneItem(id: "forged", scannerID: "someone_else")]
+        )
+        let runtime = try SpaceScannerRuntime(
+            scanners: [impostor], categories: [],
+            home: fixtureHome, provider: FileSystemIdentityProvider()
+        )
+        let deps = CLIHandler.CLIRuntimeDependencies(
+            runtime: runtime, categorySlugs: []
+        )
+
+        let failure = try failureOutcome(await CLIHandler.spotlightOutcome(
+            deps: deps, home: fixtureHome
+        ))
+        XCTAssertEqual(failure.code, "MALFORMED_SCANNER_OUTPUT")
+        XCTAssertTrue(failure.message.contains(CategoryScanner.registeredID),
+                      "the refusal names the scanner: \(failure.message)")
+    }
 }
 
 /// fn-1.5 subprocess INTEGRATION tests (R5) — read-only, framing ONLY.

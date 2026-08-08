@@ -116,6 +116,48 @@ final class ScanPresentationTests: XCTestCase {
         ItemKey(scannerID: CategoryScanner.registeredID, itemID: slug)
     }
 
+    /// A per-item scanner fixture row (`.removeItem` + `.containerItem`, the
+    /// shape the runtime validator admits) for `ScannerItemRowPresentation`
+    /// assertions — state and scanError are the variables under test.
+    private func perItem(
+        state: ScanState,
+        scanError: ScanError? = nil,
+        bytes: Int64 = 0
+    ) -> ReclaimableItem {
+        let target = base
+            .appendingPathComponent("node_modules-fixture")
+            .appendingPathComponent("projectA")
+        let rootStatus: RootScanStatus =
+            state == .denied ? .deniedUnmeasured : .measured
+        return ReclaimableItem(
+            id: "item-a",
+            scannerID: "node_modules",
+            displayName: "projectA",
+            exactBytes: bytes,
+            estimatedUpToBytes: 0,
+            logicalBytes: nil,
+            itemCount: bytes > 0 ? 1 : 0,
+            url: target,
+            declaredDisplayPath: target.path,
+            rootRecords: [RootScanRecord(
+                requestedURL: target, resolvedURL: target, status: rootStatus
+            )],
+            state: state,
+            scanError: scanError,
+            risk: .review,
+            evidence: "node_modules of projectA",
+            rebuildNote: nil,
+            action: .removeItem,
+            admission: .containerItem(
+                originContainer: target.deletingLastPathComponent(),
+                requestedTargetURL: target
+            ),
+            defaultSelected: false,
+            automaticCleanEligible: false,
+            isStale: nil
+        )
+    }
+
     // MARK: - statusLabel (R6 presentation)
 
     func testStatusLabelsAreDistinctForAllNonMeasuredStates() {
@@ -138,6 +180,123 @@ final class ScanPresentationTests: XCTestCase {
         XCTAssertFalse(denied.localizedCaseInsensitiveContains("not found"))
         XCTAssertFalse(denied.localizedCaseInsensitiveContains("empty"))
         XCTAssertTrue(denied.localizedCaseInsensitiveContains("denied"))
+    }
+
+    // MARK: - Per-item row presentation (fn-2.4, CategoryRow parity/D6)
+
+    func testScannerItemRowRendersDeniedTccExplicitly() throws {
+        let presentation = ScannerItemRowPresentation(
+            item: perItem(
+                state: .denied,
+                scanError: ScanError(kind: .tccDenied, message: "EPERM")
+            ),
+            isSelected: false
+        )
+
+        XCTAssertEqual(presentation.statusLabel, "Access denied — not scanned",
+                       "a denied item must never look like an ordinary empty row (D6)")
+        XCTAssertEqual(presentation.checkboxSymbol, "circle.slash",
+                       "denied rows are unselectable — the checkbox must not pretend otherwise (R18)")
+        XCTAssertTrue(presentation.showsLockInsteadOfSize,
+                      "a lock, never a misleading 'Zero KB'")
+        XCTAssertTrue(presentation.showsSettingsLink,
+                      "TCC denials carry the Full Disk Access remedy (R9)")
+        XCTAssertFalse(presentation.isInert,
+                       "denied rows stay interactive — the settings link must be tappable")
+    }
+
+    func testScannerItemRowDeniedNonTccOffersNoSettingsLink() {
+        let presentation = ScannerItemRowPresentation(
+            item: perItem(
+                state: .denied,
+                scanError: ScanError(kind: .permissionDenied, message: "EACCES")
+            ),
+            isSelected: false
+        )
+
+        XCTAssertEqual(presentation.checkboxSymbol, "circle.slash")
+        XCTAssertTrue(presentation.showsLockInsteadOfSize)
+        XCTAssertFalse(presentation.showsSettingsLink,
+                       "BSD-permission denials have no user-side Settings remedy — no link that cannot help")
+    }
+
+    func testScannerItemRowRendersPartialDenialExplicitly() throws {
+        let partial = ScannerItemRowPresentation(
+            item: perItem(
+                state: .partiallyDenied,
+                scanError: ScanError(kind: .permissionDenied, message: "EACCES"),
+                bytes: 4096
+            ),
+            isSelected: false
+        )
+
+        XCTAssertEqual(partial.statusLabel,
+                       "Partially unreadable — measured bytes only",
+                       "the size is a floor, not a promise — the subtitle must say so")
+        XCTAssertEqual(partial.checkboxSymbol, "circle",
+                       ".partiallyDenied stays manually toggleable (R18)")
+        XCTAssertFalse(partial.showsLockInsteadOfSize,
+                       "the measured floor is honest data — show it")
+        XCTAssertFalse(partial.showsSettingsLink)
+        XCTAssertFalse(partial.isInert)
+
+        let partialTcc = ScannerItemRowPresentation(
+            item: perItem(
+                state: .partiallyDenied,
+                scanError: ScanError(kind: .tccDenied, message: "EPERM"),
+                bytes: 4096
+            ),
+            isSelected: true
+        )
+        XCTAssertTrue(partialTcc.showsSettingsLink,
+                      "a TCC-caused partial denial carries the remedy too")
+        XCTAssertEqual(partialTcc.checkboxSymbol, "checkmark.circle.fill",
+                       "manual selection of .partiallyDenied renders as selected")
+    }
+
+    func testScannerItemRowMeasuredHasNoStatusLine() {
+        let unselected = ScannerItemRowPresentation(
+            item: perItem(state: .measured, bytes: 8192), isSelected: false
+        )
+        XCTAssertNil(unselected.statusLabel)
+        XCTAssertEqual(unselected.checkboxSymbol, "circle")
+        XCTAssertFalse(unselected.showsLockInsteadOfSize)
+        XCTAssertFalse(unselected.showsSettingsLink)
+        XCTAssertFalse(unselected.isInert)
+
+        let selected = ScannerItemRowPresentation(
+            item: perItem(state: .measured, bytes: 8192), isSelected: true
+        )
+        XCTAssertEqual(selected.checkboxSymbol, "checkmark.circle.fill")
+    }
+
+    func testScannerItemRowInertStatesAreDimmedNotSlashed() {
+        for state in [ScanState.missing, .empty] {
+            let presentation = ScannerItemRowPresentation(
+                item: perItem(state: state), isSelected: false
+            )
+            XCTAssertTrue(presentation.isInert,
+                          "\(state): nothing to act on — dimmed, disabled")
+            XCTAssertEqual(presentation.checkboxSymbol, "circle",
+                           "\(state) mirrors CategoryRow: inert, not slashed")
+            XCTAssertFalse(presentation.showsLockInsteadOfSize)
+        }
+    }
+
+    /// Drift guard: the per-item row wording must stay identical to the
+    /// category rows' `ScanResult.statusLabel`, case for case — the same
+    /// state must never read differently across the two surfaces.
+    func testScannerItemRowStatusWordingMatchesCategoryRows() {
+        let states: [ScanState] = [.missing, .empty, .measured, .partiallyDenied, .denied]
+        for state in states {
+            let rowLabel = ScannerItemRowPresentation(
+                item: perItem(state: state), isSelected: false
+            ).statusLabel
+            XCTAssertEqual(
+                rowLabel, makeResult(state: state).statusLabel,
+                "\(state): per-item row wording must match CategoryRow's statusLabel"
+            )
+        }
     }
 
     // MARK: - Selection defaults (R18)

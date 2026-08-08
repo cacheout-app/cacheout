@@ -54,9 +54,13 @@
 ///    runs; ANY refusal blocks the ENTIRE command set. `.missing` items
 ///    skip pre-dispatch and zero-record non-missing items are refused
 ///    outright, so a vacuous admission pass (a loop over zero roots) can
-///    never launch argv. Paths INSIDE a command's argv are trusted registry
-///    code (`Categories.swift`), not runtime input — admission covers the
-///    roots the category operates on.
+///    never launch argv — and because admission's canonical-components
+///    fallback passes a declared spelling that no longer exists, a
+///    delete-time SURVIVAL GATE additionally refuses the whole set when no
+///    captured root still exists as a real directory (pre-unification
+///    `resolvedPaths` parity; partial survival proceeds). Paths INSIDE a
+///    command's argv are trusted registry code (`Categories.swift`), not
+///    runtime input — admission covers the roots the category operates on.
 ///
 /// ## Freed-bytes accounting (D1/R8)
 ///
@@ -590,6 +594,35 @@ actor CacheCleaner {
                 )
                 return (nil, [Self.itemError(item, reason)])
             }
+        }
+
+        // DELETE-TIME SURVIVAL GATE (pre-unification parity): the old
+        // cleaner re-ran `resolvedPaths` at delete time, which filtered
+        // every root through an exists-as-directory check — a category
+        // whose roots ALL vanished (or were renamed) between scan and
+        // confirmation resolved to NOTHING and was refused rather than
+        // running destructive argv (the PR #454 "no-resolved-root"
+        // refusal; think `simctl erase all` after the Simulator root was
+        // removed). The captured-record snapshot re-admits the SPELLING,
+        // and admission's canonical-components fallback deliberately
+        // passes a nonexistent declared path — so existence is its own
+        // check, composed AFTER admission, never replacing it. At least
+        // one captured root must still exist as a real directory
+        // (canonicalized first, so a symlink root pointing at a real
+        // directory still counts — `directoryExists` parity). Partial
+        // survival proceeds, matching the old semantics where surviving
+        // roots resolved and the command set ran.
+        let anyCapturedRootSurvives = item.rootRecords.contains { record in
+            provider.probeKind(
+                of: provider.canonicalize(record.requestedURL)
+            ) == .kind(.directory)
+        }
+        guard anyCapturedRootSurvives else {
+            let reason = "clean commands not run — no captured root still exists as a directory at delete time"
+            logRefusal(
+                label: item.displayName, tag: "no-resolved-root", detail: reason
+            )
+            return (nil, [Self.itemError(item, reason)])
         }
 
         do {

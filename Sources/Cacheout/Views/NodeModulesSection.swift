@@ -20,6 +20,14 @@
 /// evidence in full, fn-2.5). List identity is the composite `ItemKey`,
 /// never a bare item id (unique only within one scanner).
 ///
+/// Non-measured item states render EXPLICITLY (`CategoryRow` parity, D6): a
+/// `.denied` item shows a slashed checkbox, "Access denied — not scanned", a
+/// lock instead of a misleading zero size, and the Full Disk Access remedy
+/// for TCC denials; `.partiallyDenied` shows its warning subtitle over the
+/// measured floor. `ScannerItemRowPresentation` is the testable derivation —
+/// the view model already refuses selection of `.denied` items everywhere
+/// (round 9), so this is purely the honest-rendering half.
+///
 /// ## Issues (fn-1.4 R14/D6, generalized)
 /// Classified scan problems render as a warning block — a TCC-denied
 /// `~/Documents` search root is VISIBLE information ("access denied", with a
@@ -198,6 +206,55 @@ struct ScanIssuesBlock: View {
     }
 }
 
+// MARK: - Row presentation (testable)
+
+/// The testable presentation derivation for `ScannerItemRow` — SwiftUI views
+/// are not unit-testable, so this struct is the assertion surface (the
+/// `ScanResult.statusLabel` precedent). `CategoryRow` parity (fn-1.4
+/// R6/R18, D6): a denied item is INFORMATION — slashed checkbox, explicit
+/// status, a lock instead of a misleading "Zero KB", and the Full Disk
+/// Access remedy for TCC denials — never an ordinary empty-looking row.
+struct ScannerItemRowPresentation: Equatable {
+    /// State-aware subtitle under the display path; nil for `.measured`
+    /// (no status line needed). Wording matches `ScanResult.statusLabel`
+    /// case-for-case — the parity test guards drift.
+    let statusLabel: String?
+    /// `.denied` rows show `circle.slash` — the view model refuses the
+    /// toggle (round 9) and the checkbox must not pretend otherwise (R18).
+    let checkboxSymbol: String
+    /// Denied rows show a lock instead of a misleading zero size;
+    /// `.partiallyDenied` keeps its size — the subtitle marks it a floor.
+    let showsLockInsteadOfSize: Bool
+    /// TCC denials have a user-side remedy (System Settings deep link);
+    /// BSD-permission and admission refusals do not — no link that cannot
+    /// help. `scanError` is nil for clean states by contract.
+    let showsSettingsLink: Bool
+    /// `.missing`/`.empty`: nothing to act on — dimmed, disabled. `.denied`
+    /// is deliberately NOT inert: the settings link must stay tappable.
+    let isInert: Bool
+
+    init(item: ReclaimableItem, isSelected: Bool) {
+        switch item.state {
+        case .measured:
+            statusLabel = nil
+        case .missing:
+            statusLabel = "Not found"
+        case .empty:
+            statusLabel = "Nothing to clean"
+        case .partiallyDenied:
+            statusLabel = "Partially unreadable — measured bytes only"
+        case .denied:
+            statusLabel = "Access denied — not scanned"
+        }
+        checkboxSymbol = item.state == .denied
+            ? "circle.slash"
+            : (isSelected ? "checkmark.circle.fill" : "circle")
+        showsLockInsteadOfSize = item.state == .denied
+        showsSettingsLink = item.scanError?.kind == .tccDenied
+        isInert = item.state == .missing || item.state == .empty
+    }
+}
+
 // MARK: - Row
 
 struct ScannerItemRow: View {
@@ -205,10 +262,17 @@ struct ScannerItemRow: View {
     let isSelected: Bool
     let onToggle: () -> Void
 
+    private var presentation: ScannerItemRowPresentation {
+        ScannerItemRowPresentation(item: item, isSelected: isSelected)
+    }
+
     var body: some View {
+        let presentation = self.presentation
         Button(action: onToggle) {
             HStack(spacing: 10) {
-                Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+                // Checkbox — slashed for unselectable denied rows (R18);
+                // the view model already refuses the toggle (round 9).
+                Image(systemName: presentation.checkboxSymbol)
                     .font(.title3)
                     .foregroundStyle(isSelected ? .purple : .secondary)
 
@@ -224,6 +288,20 @@ struct ScannerItemRow: View {
                         .foregroundStyle(.tertiary)
                         .lineLimit(1)
                         .truncationMode(.middle)
+                    // State-aware status (CategoryRow parity, D6): a TCC
+                    // denial must never read as an ordinary empty item.
+                    if let status = presentation.statusLabel {
+                        HStack(spacing: 6) {
+                            Text(status)
+                                .font(.caption)
+                                .foregroundStyle(statusColor)
+                            if presentation.showsSettingsLink {
+                                Link("Grant access…",
+                                     destination: ScanError.fullDiskAccessSettingsURL)
+                                    .font(.caption)
+                            }
+                        }
+                    }
                 }
 
                 Spacer()
@@ -238,18 +316,36 @@ struct ScannerItemRow: View {
                         .foregroundStyle(.orange)
                 }
 
-                Text(ByteCountFormatter.sharedFile.string(fromByteCount: item.allocatedBytes))
-                    .font(.body.monospacedDigit())
+                // Size — denied rows show a lock instead of a misleading
+                // "Zero KB" (CategoryRow parity).
+                if presentation.showsLockInsteadOfSize {
+                    Image(systemName: "lock.fill")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                } else {
+                    Text(ByteCountFormatter.sharedFile.string(fromByteCount: item.allocatedBytes))
+                        .font(.body.monospacedDigit())
+                }
             }
             .padding(.vertical, 4)
             .padding(.horizontal, 10)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .disabled(presentation.isInert)
+        .opacity(presentation.isInert ? 0.5 : 1)
         // The evidence string in brief — the confirmation sheet renders it
         // in full (fn-2.5).
         .help(item.evidence)
         .accessibilityElement(children: .combine)
         .accessibilityAddTraits(isSelected ? .isSelected : [])
+    }
+
+    private var statusColor: Color {
+        switch item.state {
+        case .denied: return .red
+        case .partiallyDenied: return .orange
+        default: return Color(.tertiaryLabelColor)
+        }
     }
 }

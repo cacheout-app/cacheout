@@ -1626,6 +1626,119 @@ final class CacheCleanerTests: XCTestCase {
                        "command bytes are erased permanently even in a Trash run")
     }
 
+    // MARK: - Unified entry: delete-time command survival gate (R17)
+
+    func testCommandsRefusedWhenAllCapturedRootsDeletedAfterScan() async throws {
+        let home = try makeTempDir("cmd-survival-home")
+        let cmdRoot = try makeTempDir("cmd-survival-root")
+        defer {
+            try? FileManager.default.removeItem(at: home)
+            try? FileManager.default.removeItem(at: cmdRoot)
+        }
+        // The marker lives OUTSIDE the vanished root: the touch would
+        // succeed if the argv ever launched, so its absence proves the
+        // command never ran.
+        let marker = home.appendingPathComponent("never-run.marker")
+
+        // Record captured while the root existed (fn-2.1 snapshot) — then
+        // the root is deleted before confirmation. Re-admission alone would
+        // pass the stale spelling via the canonical-components fallback.
+        let item = makeCategoryItem(
+            category: makeCategory(
+                at: [cmdRoot], name: "cmd-root-deleted",
+                cleanCommands: [["/usr/bin/touch", marker.path]]
+            ),
+            records: [makeRecord(cmdRoot)],
+            exact: 4096
+        )
+        try FileManager.default.removeItem(at: cmdRoot)
+
+        let report = await CacheCleaner(home: home).clean(
+            items: [item], moveToTrash: false
+        )
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path),
+                       "commands must NOT execute after every captured root vanished")
+        XCTAssertTrue(report.entries.isEmpty)
+        XCTAssertEqual(report.errors.count, 1)
+        XCTAssertTrue(logContents(home: home).contains("REFUSED [no-resolved-root]"),
+                      "the survival-gate refusal must be logged")
+    }
+
+    func testCommandsRefusedWhenCapturedRootRenamedAfterScan() async throws {
+        let home = try makeTempDir("cmd-renamed-home")
+        let base = try makeTempDir("cmd-renamed-base")
+        defer {
+            try? FileManager.default.removeItem(at: home)
+            try? FileManager.default.removeItem(at: base)
+        }
+        let cmdRoot = base.appendingPathComponent("cmd-root")
+        try FileManager.default.createDirectory(
+            at: cmdRoot, withIntermediateDirectories: true
+        )
+        let marker = home.appendingPathComponent("never-run.marker")
+
+        let item = makeCategoryItem(
+            category: makeCategory(
+                at: [cmdRoot], name: "cmd-root-renamed",
+                cleanCommands: [["/usr/bin/touch", marker.path]]
+            ),
+            records: [makeRecord(cmdRoot)],
+            exact: 4096
+        )
+        // Renamed (not deleted) after capture: the captured spelling no
+        // longer exists, and nothing may silently retarget the moved tree.
+        try FileManager.default.moveItem(
+            at: cmdRoot, to: base.appendingPathComponent("cmd-root-moved")
+        )
+
+        let report = await CacheCleaner(home: home).clean(
+            items: [item], moveToTrash: false
+        )
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path),
+                       "commands must NOT execute after the captured root was renamed")
+        XCTAssertTrue(report.entries.isEmpty)
+        XCTAssertEqual(report.errors.count, 1)
+        XCTAssertTrue(logContents(home: home).contains("REFUSED [no-resolved-root]"),
+                      "the survival-gate refusal must be logged")
+    }
+
+    func testCommandsProceedWhenSomeCapturedRootsSurvive() async throws {
+        let base = try makeTempDir("cmd-partial-base")
+        defer { try? FileManager.default.removeItem(at: base) }
+        let survivor = base.appendingPathComponent("survivor-root")
+        let vanished = base.appendingPathComponent("vanished-root")
+        for dir in [survivor, vanished] {
+            try FileManager.default.createDirectory(
+                at: dir, withIntermediateDirectories: true
+            )
+        }
+        let marker = survivor.appendingPathComponent("ran.marker")
+
+        // Both roots captured at scan time; one vanishes before
+        // confirmation. Pre-unification semantics: surviving roots still
+        // resolved at delete time, so the command set ran — partial
+        // survival proceeds.
+        let item = makeCategoryItem(
+            category: makeCategory(
+                at: [survivor, vanished], name: "cmd-partial",
+                cleanCommands: [["/usr/bin/touch", marker.path]]
+            ),
+            records: [makeRecord(survivor), makeRecord(vanished)],
+            exact: 2048
+        )
+        try FileManager.default.removeItem(at: vanished)
+
+        let report = await CacheCleaner().clean(items: [item], moveToTrash: false)
+
+        XCTAssertTrue(report.errors.isEmpty, "unexpected errors: \(report.errors)")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path),
+                      "the command set runs while at least one captured root survives")
+        XCTAssertEqual(report.entries.count, 1)
+        XCTAssertEqual(report.entries.first?.estimatedUpToBytes, 2048)
+    }
+
     // MARK: - Unified entry: root-record statuses (frozen truth table)
 
     func testRootRecordStatusesHonoredOnlyMeasuredRootsClean() async throws {

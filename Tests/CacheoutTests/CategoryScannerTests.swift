@@ -106,10 +106,13 @@ final class CategoryScannerTests: XCTestCase {
     }
 
     /// A structurally valid per-item fixture item (`.removeItem` +
-    /// the frozen `.containerItem` descriptor).
+    /// the frozen `.containerItem` descriptor + the measured record
+    /// binding the deletion target). `rootRecords` is overridable to
+    /// construct the unbound shapes the validator must refuse.
     private func makeContainerItem(
         id: String, scannerID: String,
-        state: ScanState = .measured
+        state: ScanState = .measured,
+        rootRecords: [RootScanRecord]? = nil
     ) -> ReclaimableItem {
         let container = URL(fileURLWithPath: "/tmp/fixture-container")
         return ReclaimableItem(
@@ -118,7 +121,7 @@ final class CategoryScannerTests: XCTestCase {
             itemCount: 1,
             url: container.appendingPathComponent(id),
             declaredDisplayPath: "/tmp/fixture-container/\(id)",
-            rootRecords: [RootScanRecord(
+            rootRecords: rootRecords ?? [RootScanRecord(
                 requestedURL: container.appendingPathComponent(id),
                 resolvedURL: container.appendingPathComponent(id),
                 status: .measured
@@ -773,6 +776,137 @@ final class CategoryScannerTests: XCTestCase {
         let issue = malformedIssue(of: verdict)
         XCTAssertEqual(issue?.kind, .malformedOutcome)
         XCTAssertNil(issue?.url)
+    }
+
+    func testValidatedOutcomeRejectsNonCLISafeItemIDs() throws {
+        // The documented `ReclaimableItem.id` invariant (nonempty, no
+        // whitespace, no colon) is enforced at validation: an empty id
+        // publishes a `<scanner>:` address `parseCleanTargets` rejects —
+        // an item `scan` prints but `clean` can never target.
+        let home = try makeTempDir("home")
+        let runtime = try makeRuntime(scanners: [], home: home)
+        for bad in ["", " ", "with space", "with:colon", "tab\tid", "line\nid"] {
+            let item = makeContainerItem(id: bad, scannerID: "fixture")
+            let issue = malformedIssue(of: runtime.validatedOutcome(
+                ScanOutcome(items: [item], errors: []), from: "fixture"
+            ))
+            XCTAssertEqual(
+                issue?.kind, .malformedOutcome,
+                "item id '\(bad)' must render the outcome malformed"
+            )
+            XCTAssertNil(issue?.url, "no filesystem location — never a fake path")
+        }
+
+        // The production id forms pass: the full 64-hex `stableID` (per-item
+        // scanners) — NOT the slug grammar, which the item-id invariant is
+        // deliberately looser than.
+        let hex = ReclaimableItem.stableID(
+            scannerID: "fixture", canonicalPath: "/tmp/fixture-container/x"
+        )
+        XCTAssertTrue(SpaceScannerRuntime.isCLISafeItemID(hex))
+        let good = makeContainerItem(id: hex, scannerID: "fixture")
+        XCTAssertEqual(
+            outcome(of: runtime.validatedOutcome(
+                ScanOutcome(items: [good], errors: []), from: "fixture"
+            ))?.items,
+            [good]
+        )
+    }
+
+    func testDeletableRemoveItemMustBindItsMeasuredCapture() throws {
+        // Thread the deletion-target binding: in the states the cleaner
+        // actually deletes (`.measured`/`.partiallyDenied`), a
+        // `.removeItem` item's `requestedTargetURL` must be one of the
+        // scan's own `.measured` captures — otherwise the GUI/CLI would
+        // confirm the records' path while `removeGuardedItem` deletes a
+        // DIFFERENT descendant of the admitted container.
+        let home = try makeTempDir("home")
+        let runtime = try makeRuntime(scanners: [], home: home)
+        let container = URL(fileURLWithPath: "/tmp/fixture-container")
+        let target = container.appendingPathComponent("bound1")
+        let elsewhere = container.appendingPathComponent("elsewhere")
+
+        // ZERO records on a measured `.removeItem` item: malformed.
+        let noRecords = makeContainerItem(
+            id: "bound1", scannerID: "fixture", rootRecords: []
+        )
+        XCTAssertNotNil(malformedIssue(of: runtime.validatedOutcome(
+            ScanOutcome(items: [noRecords], errors: []), from: "fixture"
+        )), "a deletable remove_item item with no records is unbound")
+
+        // A measured record capturing a DIFFERENT path: malformed — the
+        // mapping-error shape (confirm one path, delete another).
+        let mismatched = makeContainerItem(
+            id: "bound1", scannerID: "fixture",
+            rootRecords: [RootScanRecord(
+                requestedURL: elsewhere, resolvedURL: elsewhere,
+                status: .measured
+            )]
+        )
+        XCTAssertNotNil(malformedIssue(of: runtime.validatedOutcome(
+            ScanOutcome(items: [mismatched], errors: []), from: "fixture"
+        )), "a measured record for another path does not bind the target")
+
+        // The right path but NOT `.measured`: malformed for a deletable
+        // state — only measured captures are deletable (frozen truth table).
+        let unmeasured = makeContainerItem(
+            id: "bound1", scannerID: "fixture",
+            rootRecords: [RootScanRecord(
+                requestedURL: target, resolvedURL: target,
+                status: .deniedUnmeasured
+            )]
+        )
+        XCTAssertNotNil(malformedIssue(of: runtime.validatedOutcome(
+            ScanOutcome(items: [unmeasured], errors: []), from: "fixture"
+        )), "an unmeasured record does not bind a deletable target")
+
+        // `.partiallyDenied` is deletable and demands the same binding.
+        let partialUnbound = makeContainerItem(
+            id: "bound1", scannerID: "fixture", state: .partiallyDenied,
+            rootRecords: []
+        )
+        XCTAssertNotNil(malformedIssue(of: runtime.validatedOutcome(
+            ScanOutcome(items: [partialUnbound], errors: []), from: "fixture"
+        )))
+
+        // The genuine shape passes — the fn-2.2 single-element-record
+        // correspondence (requested spelling == descriptor target).
+        let genuine = makeContainerItem(id: "bound1", scannerID: "fixture")
+        XCTAssertEqual(
+            outcome(of: runtime.validatedOutcome(
+                ScanOutcome(items: [genuine], errors: []), from: "fixture"
+            ))?.items,
+            [genuine]
+        )
+
+        // The production truth table's NON-deletable emissions still pass:
+        // `.denied` carries its honest `.deniedUnmeasured` record (the
+        // cleaner refuses it; demanding a measured record would break
+        // NodeModulesScanner's denied emission), and `.missing` carries
+        // zero records.
+        let denied = makeContainerItem(
+            id: "bound1", scannerID: "fixture", state: .denied,
+            rootRecords: [RootScanRecord(
+                requestedURL: target, resolvedURL: target,
+                status: .deniedUnmeasured
+            )]
+        )
+        XCTAssertNotNil(outcome(of: runtime.validatedOutcome(
+            ScanOutcome(items: [denied], errors: []), from: "fixture"
+        )), "an honest denied emission must not be rejected")
+        let missing = makeContainerItem(
+            id: "bound1", scannerID: "fixture", state: .missing,
+            rootRecords: []
+        )
+        XCTAssertNotNil(outcome(of: runtime.validatedOutcome(
+            ScanOutcome(items: [missing], errors: []), from: "fixture"
+        )), "a missing item carries no records and must pass")
+        let empty = makeContainerItem(
+            id: "bound1", scannerID: "fixture", state: .empty
+        )
+        XCTAssertNotNil(outcome(of: runtime.validatedOutcome(
+            ScanOutcome(items: [empty], errors: []), from: "fixture"
+        )), "a clean-empty walk (measured record, empty state) must pass")
     }
 
     func testStructuralInvariantsAreStateAware() throws {

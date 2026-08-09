@@ -492,15 +492,27 @@ struct SpaceScannerRuntime {
     ///
     /// (a) OWNERSHIP — every item's `scannerID` equals the producing
     ///     scanner's id;
-    /// (b) UNIQUENESS — item ids are unique within the outcome;
-    /// (c) STRUCTURE, STATE-AWARE — a `.removeItem` item MUST carry the
-    ///     frozen `.containerItem` descriptor; `.removeContents`/`.commands`
-    ///     items MUST ALWAYS carry category provenance; EMPTY root records
-    ///     are valid exactly for `.missing` items (pre-dispatch-skipped) —
-    ///     every NON-`.missing` `.removeContents`/`.commands` item requires
-    ///     AT LEAST ONE root record (zero records on a non-missing item is
-    ///     malformed, never vacuously admissible);
-    /// (d) CATEGORY-PROVENANCE TRUST — category-backed actions are accepted
+    /// (b) ID FORM — every item id is a NONEMPTY, CLI-safe opaque string
+    ///     (no whitespace, no colon — the documented `ReclaimableItem.id`
+    ///     invariant): an empty or unaddressable id would publish an item
+    ///     `scan` prints but whose `<scanner>:<item-id>` address
+    ///     `parseCleanTargets` can never accept;
+    /// (c) UNIQUENESS — item ids are unique within the outcome;
+    /// (d) STRUCTURE, STATE-AWARE — a `.removeItem` item MUST carry the
+    ///     frozen `.containerItem` descriptor, and in the states the
+    ///     cleaner actually deletes (`.measured`/`.partiallyDenied` —
+    ///     `.missing`/`.empty` skip pre-dispatch, `.denied` is refused) its
+    ///     `requestedTargetURL` must be BOUND to the scan's own capture:
+    ///     at least one `.measured` root record whose `requestedURL` is
+    ///     that exact spelling, so the path the scan measured and the
+    ///     GUI/CLI confirm IS the path the cleaner deletes;
+    ///     `.removeContents`/`.commands` items MUST ALWAYS carry category
+    ///     provenance; EMPTY root records are valid exactly for `.missing`
+    ///     items (pre-dispatch-skipped) — every NON-`.missing`
+    ///     `.removeContents`/`.commands` item requires AT LEAST ONE root
+    ///     record (zero records on a non-missing item is malformed, never
+    ///     vacuously admissible);
+    /// (e) CATEGORY-PROVENANCE TRUST — category-backed actions are accepted
     ///     ONLY from the registered category adapter (the frozen
     ///     `categories` id), the item id must equal the carried category's
     ///     slug, and the carried category must BE the registered instance
@@ -543,6 +555,15 @@ struct SpaceScannerRuntime {
                         + "'\(item.scannerID)' (id '\(item.id)')"
                 ))
             }
+            guard isCLISafeItemID(item.id) else {
+                return .malformed(scannerID: scannerID, ScanIssue(
+                    url: nil, kind: .malformedOutcome,
+                    detail: "scanner '\(scannerID)' emitted item id "
+                        + "'\(item.id)' that cannot round-trip the "
+                        + "<scanner>:<item-id> address grammar (ids must be "
+                        + "nonempty with no whitespace and no colon)"
+                ))
+            }
             guard seenIDs.insert(item.id).inserted else {
                 return .malformed(scannerID: scannerID, ScanIssue(
                     url: nil, kind: .malformedOutcome,
@@ -564,7 +585,7 @@ struct SpaceScannerRuntime {
         return .outcome(scannerID: scannerID, outcome)
     }
 
-    /// The state-aware structural invariants ((c)/(d) above). Exhaustive
+    /// The state-aware structural invariants ((d)/(e) above). Exhaustive
     /// over `ReclaimAction` — a future action case must make this a
     /// compile-time decision, never a silent pass through `default:`.
     private static func structuralViolation(
@@ -575,7 +596,36 @@ struct SpaceScannerRuntime {
         switch item.action {
         case .removeItem:
             switch item.admission {
-            case .containerItem:
+            case .containerItem(_, let requestedTargetURL):
+                // Deletion-target binding: in the states the cleaner
+                // dispatches (`removeGuardedItem` deletes the descriptor's
+                // `requestedTargetURL`, never anything read off records),
+                // the target must be one of the scan's own `.measured`
+                // captures — same requested (unresolved) spelling, the
+                // fn-2.2 single-element-record correspondence. Without it,
+                // a scanner mapping bug could measure and display one path
+                // while deleting a DIFFERENT descendant of the admitted
+                // container. Exhaustive over `ScanState` so a future state
+                // decides its deletability at compile time; `.denied`
+                // (honest `.deniedUnmeasured` record) and `.empty`/
+                // `.missing` never reach deletion, so no binding is
+                // demanded of them.
+                switch item.state {
+                case .measured, .partiallyDenied:
+                    let bound = item.rootRecords.contains { record in
+                        record.status == .measured
+                            && record.requestedURL.path
+                                == requestedTargetURL.path
+                    }
+                    if !bound {
+                        return "a deletable remove_item item must carry a "
+                            + "measured root record capturing its "
+                            + "requestedTargetURL — the measured path and "
+                            + "the deletion target must be the same capture"
+                    }
+                case .missing, .empty, .denied:
+                    break
+                }
                 return nil
             case .category:
                 return "a .removeItem item must carry the .containerItem "
@@ -692,7 +742,7 @@ struct SpaceScannerRuntime {
         }
     }
 
-    // MARK: Slug syntax
+    // MARK: Slug & item-id syntax
 
     /// `[a-z0-9_]+` — the address grammar's slug alphabet (no colon, so the
     /// first `:` in a target token splits scanner slug from item id
@@ -703,5 +753,18 @@ struct SpaceScannerRuntime {
                 || (byte >= UInt8(ascii: "0") && byte <= UInt8(ascii: "9"))
                 || byte == UInt8(ascii: "_")
         }
+    }
+
+    /// The documented `ReclaimableItem.id` invariant, enforced at scan-time
+    /// validation: a NONEMPTY opaque string with no whitespace and no colon
+    /// — anything else cannot round-trip the `<scanner-slug>:<item-id>`
+    /// address (an empty id publishes a `<scanner>:` address
+    /// `parseCleanTargets` rejects, so the item could never be cleaned
+    /// individually even by echoing `scan` output verbatim). Deliberately
+    /// LOOSER than the slug grammar: item ids are opaque (64-hex
+    /// `stableID`s and category slugs today), not slugs — the validator
+    /// must never reject an id the documented contract allows.
+    static func isCLISafeItemID(_ id: String) -> Bool {
+        !id.isEmpty && !id.contains { $0 == ":" || $0.isWhitespace }
     }
 }

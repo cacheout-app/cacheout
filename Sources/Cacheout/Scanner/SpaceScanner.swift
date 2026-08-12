@@ -498,20 +498,30 @@ struct SpaceScannerRuntime {
     ///     `scan` prints but whose `<scanner>:<item-id>` address
     ///     `parseCleanTargets` can never accept;
     /// (c) UNIQUENESS — item ids are unique within the outcome;
-    /// (d) STRUCTURE, STATE-AWARE — a `.removeItem` item MUST carry the
-    ///     frozen `.containerItem` descriptor, and in the states the
+    /// (d) STRUCTURE, STATE-AWARE — EMPTY root records are valid exactly
+    ///     for `.missing` items (pre-dispatch-skipped): every non-`.missing`
+    ///     item of EVERY action requires AT LEAST ONE root record (zero
+    ///     records on a non-missing item is malformed, never vacuously
+    ///     admissible — the records are the only capture supporting the
+    ///     item's state, bytes, and display identity). A `.removeItem` item
+    ///     is accepted ONLY from per-item scanners — NEVER the aggregate
+    ///     adapter (converse ownership: downstream treats every
+    ///     `categories` item as an aggregate, e.g. the CLI plan's zero-byte
+    ///     "skip", while the cleaner deliberately deletes zero-byte
+    ///     `.removeItem` targets — an adapter-owned `.removeItem` would let
+    ///     a confirmed run delete what its preview skipped). It MUST carry
+    ///     the frozen `.containerItem` descriptor, and in the states the
     ///     cleaner actually deletes (`.measured`/`.partiallyDenied` —
     ///     `.missing`/`.empty` skip pre-dispatch, `.denied` is refused) its
     ///     `requestedTargetURL` must be BOUND to the scan's own capture:
     ///     at least one `.measured` root record whose `requestedURL` is
-    ///     that exact spelling, so the path the scan measured and the
-    ///     GUI/CLI confirm IS the path the cleaner deletes;
+    ///     that exact spelling AND whose `resolvedURL` is the identity the
+    ///     item DISPLAYS (`url`, nil matching nil — internal consistency
+    ///     among already-captured fields, never a second resolution), so
+    ///     the path the scan measured, the path the GUI/CLI show, and the
+    ///     path the cleaner deletes are all the SAME capture;
     ///     `.removeContents`/`.commands` items MUST ALWAYS carry category
-    ///     provenance; EMPTY root records are valid exactly for `.missing`
-    ///     items (pre-dispatch-skipped) — every NON-`.missing`
-    ///     `.removeContents`/`.commands` item requires AT LEAST ONE root
-    ///     record (zero records on a non-missing item is malformed, never
-    ///     vacuously admissible);
+    ///     provenance;
     /// (e) CATEGORY-PROVENANCE TRUST — category-backed actions are accepted
     ///     ONLY from the registered category adapter (the frozen
     ///     `categories` id), the item id must equal the carried category's
@@ -593,8 +603,32 @@ struct SpaceScannerRuntime {
         from scannerID: String,
         registeredCategories: [String: CacheCategory]
     ) -> String? {
+        // Empty root records are valid exactly for `.missing` items
+        // (pre-dispatch-skipped); zero records on a non-missing item of ANY
+        // action can only be a construction bug — the records are the sole
+        // capture supporting the item's state, bytes, and display identity,
+        // and for `.commands` an empty set would even vacuously pass
+        // re-admission before executing argv.
+        if item.state != .missing && item.rootRecords.isEmpty {
+            return "a non-missing \(item.action.wireString) item requires "
+                + "at least one root record"
+        }
         switch item.action {
         case .removeItem:
+            // CONVERSE ownership: the aggregate adapter may emit ONLY
+            // category-backed actions. Downstream treats every `categories`
+            // item as an aggregate (the CLI plan skips zero-byte aggregates
+            // while the cleaner deliberately deletes zero-byte `.removeItem`
+            // targets), so an adapter-owned `.removeItem` — a mapping
+            // regression, since the adapter constructs only category-backed
+            // items — could delete on a confirmed run what its preview said
+            // it would skip. The forward direction (category-backed actions
+            // only FROM the adapter) is check (e) below.
+            if scannerID == CategoryScanner.registeredID {
+                return "the aggregate category adapter may emit only "
+                    + "category-backed actions — remove_item is reserved "
+                    + "for per-item scanners"
+            }
             switch item.admission {
             case .containerItem(_, let requestedTargetURL):
                 // Deletion-target binding: in the states the cleaner
@@ -612,16 +646,37 @@ struct SpaceScannerRuntime {
                 // demanded of them.
                 switch item.state {
                 case .measured, .partiallyDenied:
-                    let bound = item.rootRecords.contains { record in
+                    let bound = item.rootRecords.filter { record in
                         record.status == .measured
                             && record.requestedURL.path
                                 == requestedTargetURL.path
                     }
-                    if !bound {
+                    if bound.isEmpty {
                         return "a deletable remove_item item must carry a "
                             + "measured root record capturing its "
                             + "requestedTargetURL — the measured path and "
                             + "the deletion target must be the same capture"
+                    }
+                    // Display-identity binding: the record that binds the
+                    // deletion target must ALSO be the identity the item
+                    // displays — `url` (documented: the first root record
+                    // with a non-nil `resolvedURL`) must be that record's
+                    // own `resolvedURL`, nil matching nil (a target whose
+                    // resolution honestly failed displays the declared
+                    // spelling, never another record's resolution). This is
+                    // internal consistency among already-captured fields —
+                    // NEVER a second resolution (root-capture doctrine: a
+                    // re-canonicalization here could race the filesystem).
+                    // Without it, a mapping bug could publish path B as
+                    // `url` while the descriptor deletes path A.
+                    let displayBound = bound.contains { record in
+                        record.resolvedURL?.path == item.url?.path
+                    }
+                    if !displayBound {
+                        return "a deletable remove_item item's display url "
+                            + "must be the resolved identity of the record "
+                            + "binding its deletion target — the path shown "
+                            + "and the path deleted must be the same capture"
                     }
                 case .missing, .empty, .denied:
                     break
@@ -678,14 +733,6 @@ struct SpaceScannerRuntime {
             case .containerItem:
                 return "a \(item.action.wireString) item must carry category "
                     + "admission provenance"
-            }
-            // Empty root records are valid exactly for `.missing` items
-            // (pre-dispatch-skipped); zero records on a non-missing item can
-            // only be a construction bug — and would vacuously pass
-            // `.commands` re-admission before executing argv.
-            if item.state != .missing && item.rootRecords.isEmpty {
-                return "a non-missing \(item.action.wireString) item requires "
-                    + "at least one root record"
             }
             return nil
         }

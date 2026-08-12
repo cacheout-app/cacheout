@@ -233,14 +233,38 @@ class CacheoutViewModel: ObservableObject {
         outcomesByScannerID[key.scannerID]?.items.first { $0.id == key.itemID }
     }
 
+    /// True while `scannerID`'s LATEST rescan was rejected as malformed.
+    /// The fail-closed disposition retains the previous items and selections
+    /// for DISPLAY (epic contract — nothing user-set is lost), but validation
+    /// rejected the scanner's current view of the world, so those retained
+    /// records must not reach any DESTRUCTIVE path until a valid outcome
+    /// replaces them (`reconcile` clears the entry, lifting the block).
+    private func isBlockedFromDestructivePaths(_ scannerID: String) -> Bool {
+        malformedIssuesByScannerID[scannerID] != nil
+    }
+
     /// The selected items in presentation order (registry order, then each
     /// outcome's own order) — exactly what `clean()` hands the unified entry
-    /// and what the confirmation sheet lists.
+    /// and what the confirmation sheet lists. Scanners whose latest rescan
+    /// was rejected as malformed are EXCLUDED: their retained selections
+    /// stay visible in the results list but never reach a destructive path.
     var selectedItems: [ReclaimableItem] {
-        orderedScannerIDs.flatMap { id in
-            items(forScanner: id).filter { selectedItemKeys.contains($0.key) }
-        }
+        orderedScannerIDs
+            .filter { !isBlockedFromDestructivePaths($0) }
+            .flatMap { id in
+                items(forScanner: id).filter { selectedItemKeys.contains($0.key) }
+            }
     }
+
+    /// The destructive-selection gate for the Clean button and the
+    /// confirmation sheet's item count — derived from the gated
+    /// `selectedItems`, NOT from `selectedItemKeys`, so retained
+    /// selections under a malformed rescan cannot enable or inflate the
+    /// clean controls. (`hasSelection`/`selectedCount` stay key-based for
+    /// display surfaces that mirror the visible checkmarks.)
+    var hasCleanableSelection: Bool { !selectedItems.isEmpty }
+
+    var cleanableSelectedCount: Int { selectedItems.count }
 
     var selectedCount: Int { selectedItemKeys.count }
 
@@ -414,6 +438,23 @@ class CacheoutViewModel: ObservableObject {
         ByteCountFormatter.sharedFile.string(fromByteCount: totalSelectedSize)
     }
 
+    /// NOT a fourth display scope — the DESTRUCTIVE variant of scope 3 the
+    /// confirmation sheet quotes: selected bytes excluding scanners blocked
+    /// by a malformed rescan, i.e. exactly the bytes `clean()` will act on.
+    /// The three frozen scopes above stay key-based (display parity — they
+    /// mirror the visible checkmarks, retained rows included).
+    var totalCleanableSelectedSize: Int64 {
+        aggregateBytes(
+            scannerScope: { !isBlockedFromDestructivePaths($0) },
+            include: { selectedItemKeys.contains($0.key) }
+        )
+    }
+
+    var formattedTotalCleanableSelectedSize: String {
+        ByteCountFormatter.sharedFile
+            .string(fromByteCount: totalCleanableSelectedSize)
+    }
+
     /// Section-header display total (all of one scanner's items — the old
     /// `nodeModulesTotal`); same helper, unfiltered inclusion.
     func totalSize(forScanner id: String) -> Int64 {
@@ -487,8 +528,11 @@ class CacheoutViewModel: ObservableObject {
     /// bytes are zero (and bytes that policy (b) will not touch must not
     /// light the button).
     var automaticCleanableSize: Int64 {
+        // Malformed-blocked scanners are excluded from the SCOPE, keeping
+        // this gate equal to what `selectAllSafe` (and therefore Quick
+        // Clean) will actually act on.
         aggregateBytes(
-            scannerScope: { _ in true },
+            scannerScope: { !isBlockedFromDestructivePaths($0) },
             include: Self.safeAutoSelectable
         )
     }
@@ -552,7 +596,11 @@ class CacheoutViewModel: ObservableObject {
             // this scanner — previous items and selections RETAINED, the
             // path-less issue surfaced. The failure is visible, nothing is
             // corrupted, nothing user-set is lost. Validation itself
-            // happened in the runtime; this is only the disposition.
+            // happened in the runtime; this is only the disposition. While
+            // this entry is set the retained records are DISPLAY-ONLY:
+            // every destructive derivation excludes the scanner (see
+            // `isBlockedFromDestructivePaths`) until a valid outcome
+            // replaces it.
             malformedIssuesByScannerID[scannerID] = issue
             scanningScannerIDs.remove(scannerID)
         }
@@ -646,7 +694,10 @@ class CacheoutViewModel: ObservableObject {
     /// is unchanged — and a future eligible safe scanner enrolls by
     /// declaration, not by an edit here.
     func selectAllSafe() {
-        for outcome in outcomesByScannerID.values {
+        for (scannerID, outcome) in outcomesByScannerID
+        where !isBlockedFromDestructivePaths(scannerID) {
+            // A malformed-blocked scanner's retained items are display-only:
+            // the auto path must not (re)stage them for cleaning.
             for item in outcome.items where Self.safeAutoSelectable(item) {
                 selectedItemKeys.insert(item.key)
             }
@@ -661,8 +712,13 @@ class CacheoutViewModel: ObservableObject {
     // generalized per scanner id)
 
     /// "Select Stale" operates on `isStale == true` ONLY — `isStale == nil`
-    /// means staleness is inapplicable and contributes nothing.
+    /// means staleness is inapplicable and contributes nothing. No-op while
+    /// the scanner is malformed-blocked: bulk actions stage items for
+    /// cleaning, and a blocked scanner's retained items are display-only.
+    /// (The individual checkbox stays live — retained selection state is
+    /// the user's to curate, it just cannot reach a destructive path.)
     func selectStale(inScanner id: String) {
+        guard !isBlockedFromDestructivePaths(id) else { return }
         for item in items(forScanner: id)
         where item.isStale == true && Self.isSelectableState(item.state) {
             selectedItemKeys.insert(item.key)
@@ -670,6 +726,7 @@ class CacheoutViewModel: ObservableObject {
     }
 
     func selectAll(inScanner id: String) {
+        guard !isBlockedFromDestructivePaths(id) else { return }
         for item in items(forScanner: id)
         where Self.isSelectableState(item.state) {
             selectedItemKeys.insert(item.key)

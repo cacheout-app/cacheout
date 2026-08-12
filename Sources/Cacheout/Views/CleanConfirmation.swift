@@ -54,7 +54,10 @@ struct CleanConfirmationSheet: View {
             Text("Clean Selected Caches?")
                 .font(.title2.bold())
 
-            Text("This will remove \(viewModel.formattedTotalSelectedSize) from \(viewModel.selectedCount) items.")
+            // CLEANABLE totals, not bare selection totals: the headline must
+            // quote exactly what clean() will act on — retained selections
+            // under a malformed rescan are excluded from destructive paths.
+            Text("This will remove \(viewModel.formattedTotalCleanableSelectedSize) from \(viewModel.cleanableSelectedCount) items.")
                 .font(.body)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
@@ -132,7 +135,7 @@ struct CleanConfirmationSheet: View {
                 Button("Cancel") { dismiss() }
                     .keyboardShortcut(.cancelAction)
 
-                Button("Clean \(viewModel.formattedTotalSelectedSize)") {
+                Button("Clean \(viewModel.formattedTotalCleanableSelectedSize)") {
                     dismiss()
                     Task { await viewModel.clean() }
                 }

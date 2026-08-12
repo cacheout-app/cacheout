@@ -462,7 +462,11 @@ final class SpaceScannerIntegrationTests: XCTestCase {
     private static func removeItemFixture(
         scanner: String, key: ItemKey, name: String, origin: URL, target: URL
     ) -> ReclaimableItem {
-        ReclaimableItem(
+        // `url` is the record's OWN captured resolution (the documented
+        // display contract) — the validator's display-identity binding
+        // refuses an item whose display is not its deletion-target capture.
+        let resolved = FileSystemIdentityProvider().canonicalize(target)
+        return ReclaimableItem(
             id: key.itemID,
             scannerID: scanner,
             displayName: name,
@@ -470,11 +474,11 @@ final class SpaceScannerIntegrationTests: XCTestCase {
             estimatedUpToBytes: 0,
             logicalBytes: nil,
             itemCount: 1,
-            url: target,
+            url: resolved,
             declaredDisplayPath: target.path,
             rootRecords: [RootScanRecord(
                 requestedURL: target,
-                resolvedURL: FileSystemIdentityProvider().canonicalize(target),
+                resolvedURL: resolved,
                 status: .measured
             )],
             state: .measured,

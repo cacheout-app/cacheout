@@ -20,6 +20,10 @@ import XCTest
 /// - the three FROZEN totals scopes through the one shared helper
 /// - fail-closed malformed-outcome disposition (validation lives in the
 ///   runtime — the view model applies only the disposition)
+/// - malformed-BLOCKED scanners are display-only: retained items/selections
+///   stay visible but every destructive path (clean()'s input, the sheet,
+///   Quick Clean/selectAllSafe, Select Stale/All, the Clean gate) excludes
+///   them until a valid outcome lifts the block
 /// - `clean()` driving fn-2.3's unified entry with exactly the selection
 ///
 /// Everything runs hermetically against fixture homes and fixture scanners —
@@ -747,6 +751,157 @@ final class CacheoutViewModelTests: XCTestCase {
         let issue = try XCTUnwrap(viewModel.malformedIssuesByScannerID["mal"])
         XCTAssertEqual(issue.kind, .malformedOutcome)
         XCTAssertNil(issue.url)
+    }
+
+    // MARK: - Malformed-BLOCKED scanners: retained records are display-only
+    // (every destructive path excludes them until a valid outcome arrives)
+
+    @MainActor
+    func testMalformedRescanBlocksRetainedItemsFromDestructivePaths() async throws {
+        let validMal = ScanOutcome(
+            items: [perItem(scanner: "mal", id: "m1", bytes: 7000, risk: .safe,
+                            automaticCleanEligible: true, isStale: true)],
+            errors: []
+        )
+        let foreign = ScanOutcome(
+            items: [perItem(scanner: "other", id: "f1")], errors: []
+        )
+        let malSequence = OutcomeSequence([validMal, foreign, validMal])
+        let okOutcome = ScanOutcome(
+            items: [perItem(scanner: "ok", id: "o1", bytes: 5000)], errors: []
+        )
+        let runtime = try makeRuntime([
+            FixtureScanner(id: "mal") { await malSequence.next() },
+            FixtureScanner(id: "ok") { okOutcome },
+        ])
+        let viewModel = CacheoutViewModel(runtime: runtime)
+
+        await viewModel.scan(trigger: .automatic)
+        viewModel.toggleSelection(for: key("mal", "m1"))
+        viewModel.toggleSelection(for: key("ok", "o1"))
+        XCTAssertEqual(viewModel.selectedItems.map(\.key),
+                       [key("mal", "m1"), key("ok", "o1")],
+                       "both selections cleanable while both scanners are valid")
+        XCTAssertEqual(viewModel.automaticCleanableSize, 7000,
+                       "policy (b) sees mal's safe eligible item pre-block")
+
+        // Rescan: mal's outcome is rejected as malformed; ok stays valid.
+        await viewModel.scan(trigger: .automatic)
+        XCTAssertNotNil(viewModel.malformedIssuesByScannerID["mal"])
+
+        // Display retention is UNCHANGED (epic contract): items, selections,
+        // section rows, and the frozen display totals still show the
+        // retained records — the block is destructive-path-only.
+        XCTAssertEqual(viewModel.items(forScanner: "mal").map(\.id), ["m1"])
+        XCTAssertTrue(viewModel.selectedItemKeys.contains(key("mal", "m1")))
+        XCTAssertTrue(
+            viewModel.perItemSections.first { $0.scannerID == "mal" }?
+                .items.isEmpty == false,
+            "retained rows stay displayable"
+        )
+        XCTAssertEqual(viewModel.selectedSize(forScanner: "mal"), 7000,
+                       "frozen scope 2 stays display-scoped (mirrors checkmarks)")
+        XCTAssertEqual(viewModel.totalSelectedSize, 7000 + 5000,
+                       "frozen scope 3 stays display-scoped (mirrors checkmarks)")
+
+        // Destructive derivations exclude the blocked scanner.
+        XCTAssertEqual(viewModel.selectedItems.map(\.key), [key("ok", "o1")],
+                       "clean()'s input excludes the malformed-blocked scanner")
+        XCTAssertEqual(viewModel.confirmationRows.map(\.key), [key("ok", "o1")],
+                       "the sheet itemizes exactly what clean() acts on")
+        XCTAssertEqual(viewModel.cleanableSelectedCount, 1)
+        XCTAssertEqual(viewModel.totalCleanableSelectedSize, 5000)
+        XCTAssertEqual(viewModel.automaticCleanableSize, 0,
+                       "Quick Clean's gate must not count blocked bytes")
+        XCTAssertFalse(viewModel.hasAutomaticCleanableItems)
+
+        // The bulk selection paths refuse to (re)stage blocked items.
+        viewModel.deselectAll()
+        viewModel.selectAllSafe()
+        XCTAssertTrue(viewModel.selectedItemKeys.isEmpty,
+                      "policy (b) skips the blocked scanner's retained safe item")
+        viewModel.selectStale(inScanner: "mal")
+        XCTAssertTrue(viewModel.selectedItemKeys.isEmpty,
+                      "Select Stale is a no-op on a blocked scanner")
+        viewModel.selectAll(inScanner: "mal")
+        XCTAssertTrue(viewModel.selectedItemKeys.isEmpty,
+                      "Select All is a no-op on a blocked scanner")
+
+        // The Clean gate reads the CLEANABLE selection, not bare keys.
+        viewModel.toggleSelection(for: key("mal", "m1"))
+        XCTAssertTrue(viewModel.hasSelection,
+                      "the individual checkbox stays live — retained state is "
+                      + "the user's to curate")
+        XCTAssertFalse(viewModel.hasCleanableSelection,
+                       "a blocked-only selection must not enable Clean")
+
+        // A subsequent VALID outcome lifts the block: the retained selection
+        // (user-set state, kept verbatim) is cleanable again.
+        await viewModel.scan(trigger: .automatic)
+        XCTAssertNil(viewModel.malformedIssuesByScannerID["mal"])
+        XCTAssertEqual(viewModel.selectedItems.map(\.key), [key("mal", "m1")])
+        XCTAssertTrue(viewModel.hasCleanableSelection)
+        XCTAssertEqual(viewModel.totalCleanableSelectedSize, 7000)
+        XCTAssertEqual(viewModel.automaticCleanableSize, 7000)
+    }
+
+    @MainActor
+    func testCleanNeverTouchesMalformedBlockedScanner() async throws {
+        // Real filesystem for the healthy scanner; a fixture scanner that
+        // goes malformed AFTER publishing a valid outcome. The blocked
+        // scanner's retained selection must leave NO trace in the clean
+        // report — no entry AND no error: excluded before dispatch, not
+        // refused at dispatch.
+        let container = base.appendingPathComponent("projects")
+        let junkA = container.appendingPathComponent("junk_a")
+        try fm.createDirectory(at: junkA, withIntermediateDirectories: true)
+        try Data(repeating: 0xAB, count: 4096)
+            .write(to: junkA.appendingPathComponent("payload.bin"))
+
+        // The retained item's deletion target (perItem targets base/mal/m1).
+        let malTarget = base
+            .appendingPathComponent("mal").appendingPathComponent("m1")
+        try fm.createDirectory(at: malTarget, withIntermediateDirectories: true)
+
+        let validMal = ScanOutcome(
+            items: [perItem(scanner: "mal", id: "m1")], errors: []
+        )
+        let foreign = ScanOutcome(
+            items: [perItem(scanner: "other", id: "f1")], errors: []
+        )
+        let malSequence = OutcomeSequence([validMal, foreign, validMal])
+        let runtime = try makeRuntime([
+            FixtureScanner(id: "mal") { await malSequence.next() },
+            DirectoryFixtureScanner(id: "fixture_items", container: container),
+        ])
+        let viewModel = CacheoutViewModel(runtime: runtime)
+        viewModel.moveToTrash = false  // permanent delete, fixture-contained
+
+        await viewModel.scan(trigger: .userInitiated)
+        viewModel.toggleSelection(for: key("mal", "m1"))
+        viewModel.toggleSelection(for: key("fixture_items", "junk_a"))
+
+        // Rescan rejects mal's outcome; its selection is retained, blocked.
+        await viewModel.scan(trigger: .userInitiated)
+        XCTAssertNotNil(viewModel.malformedIssuesByScannerID["mal"])
+
+        await viewModel.clean()
+
+        let report = try XCTUnwrap(viewModel.lastReport)
+        XCTAssertEqual(report.entries.map(\.itemID), ["junk_a"],
+                       "clean receives ONLY the unblocked selection")
+        XCTAssertTrue(report.errors.isEmpty,
+                      "the blocked item never reaches dispatch — not even as "
+                      + "a refusal: \(report.errors)")
+        XCTAssertTrue(fm.fileExists(atPath: malTarget.path),
+                      "the blocked scanner's retained target is untouched")
+        XCTAssertFalse(fm.fileExists(atPath: junkA.path))
+
+        // clean()'s trailing rescan delivered mal's next VALID outcome: the
+        // block lifts and the retained selection is cleanable again.
+        XCTAssertNil(viewModel.malformedIssuesByScannerID["mal"])
+        XCTAssertEqual(viewModel.selectedItems.map(\.key), [key("mal", "m1")])
+        XCTAssertTrue(viewModel.hasCleanableSelection)
     }
 
     // MARK: - clean(): the unified entry, exactly the selection

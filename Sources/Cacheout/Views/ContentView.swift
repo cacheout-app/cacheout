@@ -258,8 +258,11 @@ struct ContentView: View {
                 // Disabled while ANY scan phase runs (R11): confirming
                 // against a half-built result set would clean stale
                 // selections (the model guard in clean() backs this up).
-                .disabled(!viewModel.hasSelection || viewModel.isCleaning || viewModel.isAnyScanInProgress)
-                .help(viewModel.isCleaning ? "Cleanup in progress" : (viewModel.isAnyScanInProgress ? "Scan in progress" : (!viewModel.hasSelection ? "Select at least one item to clean" : "Clean selected items")))
+                // Gates on the CLEANABLE selection, not bare keys: retained
+                // selections under a malformed rescan are display-only and
+                // must not enable a destructive control.
+                .disabled(!viewModel.hasCleanableSelection || viewModel.isCleaning || viewModel.isAnyScanInProgress)
+                .help(viewModel.isCleaning ? "Cleanup in progress" : (viewModel.isAnyScanInProgress ? "Scan in progress" : (!viewModel.hasCleanableSelection ? "Select at least one cleanable item" : "Clean selected items")))
             }
             .padding(.horizontal)
             .padding(.vertical, 10)

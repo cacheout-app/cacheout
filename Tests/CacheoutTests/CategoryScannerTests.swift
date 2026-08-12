@@ -108,18 +108,21 @@ final class CategoryScannerTests: XCTestCase {
     /// A structurally valid per-item fixture item (`.removeItem` +
     /// the frozen `.containerItem` descriptor + the measured record
     /// binding the deletion target). `rootRecords` is overridable to
-    /// construct the unbound shapes the validator must refuse.
+    /// construct the unbound shapes the validator must refuse;
+    /// `displayURL` (double-optional: `.some(nil)` forces a nil `url`)
+    /// constructs the display/deletion divergences it must also refuse.
     private func makeContainerItem(
         id: String, scannerID: String,
         state: ScanState = .measured,
-        rootRecords: [RootScanRecord]? = nil
+        rootRecords: [RootScanRecord]? = nil,
+        displayURL: URL?? = nil
     ) -> ReclaimableItem {
         let container = URL(fileURLWithPath: "/tmp/fixture-container")
         return ReclaimableItem(
             id: id, scannerID: scannerID, displayName: "item \(id)",
             exactBytes: 1024, estimatedUpToBytes: 0, logicalBytes: nil,
             itemCount: 1,
-            url: container.appendingPathComponent(id),
+            url: displayURL ?? container.appendingPathComponent(id),
             declaredDisplayPath: "/tmp/fixture-container/\(id)",
             rootRecords: rootRecords ?? [RootScanRecord(
                 requestedURL: container.appendingPathComponent(id),
@@ -869,8 +872,50 @@ final class CategoryScannerTests: XCTestCase {
             ScanOutcome(items: [partialUnbound], errors: []), from: "fixture"
         )))
 
+        // DISPLAY-IDENTITY binding (review round 4): the record binding
+        // the deletion target must also be the identity the item displays.
+        // A record that captures the target's requested spelling but whose
+        // `resolvedURL` names ANOTHER path than `url`: malformed — `scan`
+        // would show one path while `removeGuardedItem` deletes another.
+        let displayElsewhere = makeContainerItem(
+            id: "bound1", scannerID: "fixture",
+            rootRecords: [RootScanRecord(
+                requestedURL: target, resolvedURL: target, status: .measured
+            )],
+            displayURL: .some(elsewhere)
+        )
+        XCTAssertNotNil(malformedIssue(of: runtime.validatedOutcome(
+            ScanOutcome(items: [displayElsewhere], errors: []), from: "fixture"
+        )), "a display url that is not the bound record's resolution is malformed")
+
+        // A bound record whose resolution honestly FAILED (nil
+        // `resolvedURL`) demands a nil display url (the declared spelling
+        // is what renders) — a non-nil url alongside it is display forged
+        // from somewhere other than the deletion capture: malformed.
+        let unresolvedHonest = makeContainerItem(
+            id: "bound1", scannerID: "fixture",
+            rootRecords: [RootScanRecord(
+                requestedURL: target, resolvedURL: nil, status: .measured
+            )],
+            displayURL: .some(nil)
+        )
+        XCTAssertNotNil(outcome(of: runtime.validatedOutcome(
+            ScanOutcome(items: [unresolvedHonest], errors: []), from: "fixture"
+        )), "nil resolution + nil display url is honest and must pass")
+        let unresolvedForged = makeContainerItem(
+            id: "bound1", scannerID: "fixture",
+            rootRecords: [RootScanRecord(
+                requestedURL: target, resolvedURL: nil, status: .measured
+            )],
+            displayURL: .some(elsewhere)
+        )
+        XCTAssertNotNil(malformedIssue(of: runtime.validatedOutcome(
+            ScanOutcome(items: [unresolvedForged], errors: []), from: "fixture"
+        )), "a display url with no resolved capture behind it is malformed")
+
         // The genuine shape passes — the fn-2.2 single-element-record
-        // correspondence (requested spelling == descriptor target).
+        // correspondence (requested spelling == descriptor target;
+        // display url == that record's own resolution).
         let genuine = makeContainerItem(id: "bound1", scannerID: "fixture")
         XCTAssertEqual(
             outcome(of: runtime.validatedOutcome(
@@ -939,13 +984,33 @@ final class CategoryScannerTests: XCTestCase {
         )))
 
         // A `.removeItem` item WITHOUT the frozen `.containerItem`
-        // descriptor: malformed.
+        // descriptor: malformed — from a PER-ITEM scanner, so the
+        // descriptor check itself is exercised (an adapter-owned
+        // `.removeItem` is refused EARLIER, for converse ownership).
         let noDescriptor = makeAggregateItem(
-            category: category, action: .removeItem
+            category: category, scannerID: "fixture_x", action: .removeItem
         )
         XCTAssertNotNil(malformedIssue(of: runtime.validatedOutcome(
-            ScanOutcome(items: [noDescriptor], errors: []), from: adapterID
+            ScanOutcome(items: [noDescriptor], errors: []), from: "fixture_x"
         )))
+
+        // The zero-record rule covers `.removeItem` in EVERY non-missing
+        // state (round 4): `.empty`/`.denied` never reach deletion, but a
+        // recordless item has NO capture supporting its state, bytes, or
+        // display identity — construction bug, never vacuously admissible.
+        for state: ScanState in [.empty, .denied] {
+            let recordless = makeContainerItem(
+                id: "recordless", scannerID: "fixture_x",
+                state: state, rootRecords: []
+            )
+            XCTAssertNotNil(
+                malformedIssue(of: runtime.validatedOutcome(
+                    ScanOutcome(items: [recordless], errors: []),
+                    from: "fixture_x"
+                )),
+                "a non-missing \(state) remove_item item with zero records is malformed"
+            )
+        }
 
         // `.removeContents`/`.commands` items WITHOUT category provenance:
         // malformed.
@@ -977,6 +1042,87 @@ final class CategoryScannerTests: XCTestCase {
             ScanOutcome(items: [missing], errors: []), from: adapterID
         )
         XCTAssertEqual(outcome(of: verdict)?.items, [missing])
+    }
+
+    func testAggregateAdapterMayEmitOnlyCategoryBackedActions() throws {
+        // CONVERSE ownership (review round 4): downstream treats every
+        // `categories` item as an aggregate — the CLI plan skips zero-byte
+        // aggregates while the cleaner deliberately deletes zero-byte
+        // `.removeItem` targets — so an adapter-owned `.removeItem` could
+        // delete on a confirmed run what its preview said it would skip.
+        // The validator refuses it even in the OTHERWISE-VALID shape
+        // (container descriptor + bound measured record + matching display)
+        // that a per-item scanner passes with.
+        let home = try makeTempDir("home")
+        let runtime = try makeRuntime(scanners: [], home: home)
+        let adapterOwned = makeContainerItem(
+            id: "sneaky", scannerID: CategoryScanner.registeredID
+        )
+        XCTAssertNotNil(malformedIssue(of: runtime.validatedOutcome(
+            ScanOutcome(items: [adapterOwned], errors: []),
+            from: CategoryScanner.registeredID
+        )), "the adapter may emit only category-backed actions")
+
+        // The IDENTICAL shape from a per-item scanner still passes — the
+        // refusal is ownership-directional, not shape-based.
+        let perItem = makeContainerItem(id: "sneaky", scannerID: "fixture")
+        XCTAssertEqual(
+            outcome(of: runtime.validatedOutcome(
+                ScanOutcome(items: [perItem], errors: []), from: "fixture"
+            ))?.items,
+            [perItem]
+        )
+    }
+
+    func testOwnershipDirectionMatrixOverActionAndScannerKind() throws {
+        // The COMPLETE ownership-direction matrix, one table (review
+        // round 4): category-backed actions (`.removeContents`/`.commands`
+        // with `.category` provenance) are valid ONLY from the aggregate
+        // adapter; container-backed `.removeItem` is valid ONLY from
+        // per-item scanners. Every action x scanner-kind cell, each item
+        // otherwise fully valid, so ownership direction alone decides.
+        let home = try makeTempDir("home")
+        let category = makeCategory(at: [], slug: "agg_cache")
+        let commandBacked = makeCategory(
+            at: [], slug: "cmd_cache", cleanCommands: [["true"]]
+        )
+        let runtime = try makeRuntime(
+            scanners: [], categories: [category, commandBacked], home: home
+        )
+        let adapterID = CategoryScanner.registeredID
+
+        let cells: [(label: String, item: ReclaimableItem, producer: String, valid: Bool)] = [
+            ("remove_contents from the adapter",
+             makeAggregateItem(category: category), adapterID, true),
+            ("commands from the adapter",
+             makeAggregateItem(category: commandBacked,
+                               action: .commands([["true"]])), adapterID, true),
+            ("remove_item from the adapter",
+             makeContainerItem(id: "x1", scannerID: adapterID), adapterID, false),
+            ("remove_contents from a per-item scanner",
+             makeAggregateItem(category: category, scannerID: "fixture"),
+             "fixture", false),
+            ("commands from a per-item scanner",
+             makeAggregateItem(category: commandBacked, scannerID: "fixture",
+                               action: .commands([["true"]])), "fixture", false),
+            ("remove_item from a per-item scanner",
+             makeContainerItem(id: "x1", scannerID: "fixture"), "fixture", true),
+        ]
+        for cell in cells {
+            let verdict = runtime.validatedOutcome(
+                ScanOutcome(items: [cell.item], errors: []), from: cell.producer
+            )
+            if cell.valid {
+                XCTAssertNotNil(
+                    outcome(of: verdict), "\(cell.label) must validate"
+                )
+                XCTAssertNil(malformedIssue(of: verdict), cell.label)
+            } else {
+                XCTAssertNotNil(
+                    malformedIssue(of: verdict), "\(cell.label) must be refused"
+                )
+            }
+        }
     }
 
     func testCommandsArgvMustEqualTheCategoryDeclaration() throws {

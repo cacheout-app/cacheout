@@ -82,7 +82,11 @@ struct ScanContext: Equatable, Sendable {
 enum RootScanStatus: Equatable, Sendable {
     /// PathGuard refused the root at scan-time admission. NEVER deletable.
     case refusedAdmission
-    /// Admitted, but sizing was denied before ANY measurement. NOT deletable.
+    /// Admitted, but nothing DELETABLE was established: sizing was denied
+    /// before any measurement, or a mount boundary anywhere in the tree
+    /// voids the whole target (R15 — `removeGuardedItem` refuses it
+    /// entirely, so partial sibling measurements are deliberately not
+    /// published as deletable). NOT deletable.
     case deniedUnmeasured
     /// Admitted and walked — INCLUDING clean-empty walks and partial walks
     /// that yielded any measurable content. Deletable.
@@ -770,10 +774,15 @@ struct SpaceScannerRuntime {
     /// - `.partiallyDenied` — measured bytes exist beside denials: >=1
     ///   `.measured` record (the measured content came from a walked
     ///   root), measured something, non-nil `scanError`.
-    /// - `.denied` — nothing measurable: >=1 record, >=1
+    /// - `.denied` — nothing deletable was established: >=1 record, >=1
     ///   refused-or-denied record (something must actually have been
     ///   refused or denied), zero components, non-nil `scanError`, nil
-    ///   `logicalBytes`.
+    ///   `logicalBytes`. Boundary-voided candidates (a mount boundary
+    ///   anywhere in a `.removeItem` tree — R15 refuses the WHOLE target)
+    ///   land here too: their mapping publishes zero components even when
+    ///   the walk measured readable siblings, because the components mean
+    ///   "deletion frees these" and deletion is categorically refused —
+    ///   the measured floor rides the scanError message instead.
     ///
     /// Deliberately NOT enforced — production emits these shapes:
     /// - `.partiallyDenied` does NOT require a refused/denied RECORD: a

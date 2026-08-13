@@ -486,7 +486,9 @@ struct CLIHandler {
 
     /// One `scanner_errors` row. `path` is CONDITIONAL (round 7): present
     /// for the filesystem kinds, ABSENT for `malformed_outcome` — a fake
-    /// path must never be invented.
+    /// path must never be invented. `grant_hint` is CONDITIONAL: present
+    /// only for `tcc_denied` — the same remedy category and per-item rows
+    /// carry, since macOS denies CLI processes silently (no consent prompt).
     static func scannerErrorRowJSON(
         scannerID: String, issue: ScanIssue
     ) -> [String: Any] {
@@ -497,6 +499,9 @@ struct CLIHandler {
         ]
         if let url = issue.url {
             row["path"] = url.path
+        }
+        if issue.kind == .tccDenied {
+            row["grant_hint"] = tccGrantHint
         }
         return row
     }

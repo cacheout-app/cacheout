@@ -841,12 +841,13 @@ final class CLIGateTests: XCTestCase {
 
         // ALL SIX ScanIssue.Kind wire strings through the scanner_errors row
         // builder — exact rows: the five filesystem kinds carry their real
-        // `path`; `malformed_outcome` has NO path key at all.
+        // `path`; `malformed_outcome` has NO path key at all; `tcc_denied`
+        // ALONE additionally carries `grant_hint` (macOS denies CLI
+        // processes silently — the row must say what to do about it).
         let url = URL(fileURLWithPath: "/tmp/wire-fixture-root")
         let filesystemKinds: [(ScanIssue.Kind, String)] = [
             (.containerRefused, "container_refused"),
             (.symlinkRoot, "symlink_root"),
-            (.tccDenied, "tcc_denied"),
             (.permissionDenied, "permission_denied"),
             (.unreadable, "unreadable"),
         ]
@@ -860,8 +861,19 @@ final class CLIGateTests: XCTestCase {
                 "kind": wire,
                 "detail": "fixture detail",
                 "path": url.path,
-            ] as NSDictionary, "exact row for filesystem kind \(wire)")
+            ] as NSDictionary, "exact row for filesystem kind \(wire) — no grant_hint")
         }
+        let tccRow = CLIHandler.scannerErrorRowJSON(
+            scannerID: "wire_scanner",
+            issue: ScanIssue(url: url, kind: .tccDenied, detail: "fixture detail")
+        )
+        XCTAssertEqual(tccRow as NSDictionary, [
+            "scanner_id": "wire_scanner",
+            "kind": "tcc_denied",
+            "detail": "fixture detail",
+            "path": url.path,
+            "grant_hint": CLIHandler.tccGrantHint,
+        ] as NSDictionary, "tcc_denied alone carries the FDA remedy")
         let malformedRow = CLIHandler.scannerErrorRowJSON(
             scannerID: "wire_scanner",
             issue: ScanIssue(url: nil, kind: .malformedOutcome, detail: "fixture detail")
@@ -1226,12 +1238,15 @@ final class CLIGateTests: XCTestCase {
             )]
         )
         let deps = try makeDeps(categories: [], extraScanners: [fixture])
-        // The frozen `scan` scanner_errors row shape, verbatim.
+        // The frozen `scan` scanner_errors row shape, verbatim — a TCC
+        // denial carries `grant_hint` (the clean surface reuses `scan`'s
+        // row builder, so the remedy rides along here too).
         let expectedRow: NSDictionary = [
             "scanner_id": "denied_scanner",
             "kind": "tcc_denied",
             "detail": "fixture TCC denial",
             "path": deniedRoot.path,
+            "grant_hint": CLIHandler.tccGrantHint,
         ]
 
         // Unconfirmed: the plan is empty but the impediment rides the details.

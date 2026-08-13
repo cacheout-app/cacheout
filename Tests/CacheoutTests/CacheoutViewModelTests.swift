@@ -624,6 +624,58 @@ final class CacheoutViewModelTests: XCTestCase {
         XCTAssertTrue(viewModel.selectedItemKeys.isEmpty)
     }
 
+    @MainActor
+    func testBoundaryDeniedShapeIsUnselectableWhileDenialPartialStaysToggleable() throws {
+        // PR #455 P2: a boundary-bearing node_modules candidate publishes
+        // the `.denied` shape (zero components, `.other` error naming the
+        // boundary) because the cleaner refuses the WHOLE target while the
+        // boundary remains — the GUI must never stage it, and its bytes
+        // must never light a total. A DENIAL-partial item, whose deletion
+        // genuinely proceeds and partially succeeds, keeps its
+        // manual-selection-with-warning behavior verbatim (R18).
+        // The scanner must be REGISTERED (not only seeded): `selectedItems`
+        // — and therefore the confirmation-sheet derivations asserted below
+        // — iterates the runtime's registration order.
+        let runtime = try makeRuntime([
+            fixtureScanner("nm") { ScanOutcome(items: [], errors: []) }
+        ])
+        let viewModel = CacheoutViewModel(runtime: runtime)
+        let boundaryKey = key("nm", "boundary_item")
+        let partialKey = key("nm", "partial_item")
+        seed(viewModel, scanner: "nm", items: [
+            perItem(scanner: "nm", id: "boundary_item", bytes: 0,
+                    state: .denied,
+                    scanError: ScanError(
+                        kind: .other,
+                        message: "mount boundary at /x — subtree not "
+                            + "measured; deletion would be refused"
+                    )),
+            perItem(scanner: "nm", id: "partial_item", bytes: 2_048,
+                    state: .partiallyDenied,
+                    scanError: ScanError(kind: .permissionDenied, message: "x")),
+        ])
+
+        viewModel.toggleSelection(for: boundaryKey)
+        XCTAssertFalse(viewModel.selectedItemKeys.contains(boundaryKey),
+                       "a boundary-refused item can never be staged for "
+                        + "cleaning — the toggle is a no-op")
+
+        viewModel.toggleSelection(for: partialKey)
+        XCTAssertTrue(viewModel.selectedItemKeys.contains(partialKey),
+                      "denial-partial stays manually toggleable (R18)")
+        XCTAssertTrue(viewModel.hasPartiallyDeniedSelection,
+                      "…and the confirmation sheet still gets its warning")
+        viewModel.toggleSelection(for: partialKey)
+
+        viewModel.selectAll(inScanner: "nm")
+        XCTAssertEqual(viewModel.selectedItemKeys, [partialKey],
+                       "Select All stages the denial-partial item only — "
+                        + "the boundary shape is skipped")
+        XCTAssertEqual(viewModel.totalSize(forScanner: "nm"), 2_048,
+                       "the boundary item's zero components contribute "
+                        + "nothing to the section total")
+    }
+
     // MARK: - Displayable output: issue-only scans must render (R14/D6)
 
     @MainActor

@@ -814,11 +814,15 @@ final class NodeModulesScannerTests: XCTestCase {
         }
     }
 
-    func testCandidateWithMountedSubtreeIsPartiallyDeniedNotClean() async throws {
-        // The cleaner refuses ANY boundary in the tree at delete time
-        // (`removeGuardedItem`, R15) — so the scan must never publish this
-        // candidate as a clean `.measured` a dry run would promise to clean.
-        let payload = try makeProject("mounted-sub", payloadBytes: 4_096)
+    func testCandidateWithMountedSubtreeIsDeniedNotCleanable() async throws {
+        // The cleaner refuses the WHOLE target at delete time whenever ANY
+        // boundary sits in the tree (`removeGuardedItem`, R15) — so the
+        // scan must publish the item as `.denied` (visible, never
+        // cleanable), NOT `.partiallyDenied`: that state's manual
+        // selection and `clean_with_warning` plan verb would promise a
+        // partial clean the confirmed run categorically refuses (PR #455
+        // P2).
+        try makeProject("mounted-sub", payloadBytes: 4_096)
         let nm = container.appendingPathComponent("mounted-sub/node_modules")
         let mounted = nm.appendingPathComponent("mounted-volume")
         try mkdir(mounted)
@@ -832,9 +836,10 @@ final class NodeModulesScannerTests: XCTestCase {
 
         XCTAssertEqual(outcome.items.count, 1)
         let item = try XCTUnwrap(outcome.items.first)
-        XCTAssertEqual(item.state, .partiallyDenied,
-                       "a known delete-time refusal must be visible before "
-                        + "confirmation — never a clean state")
+        XCTAssertEqual(item.state, .denied,
+                       "boundary-bearing items are non-cleanable regardless "
+                        + "of measured sibling bytes — never a state any "
+                        + "surface presents as cleanable")
         XCTAssertEqual(item.scanError?.kind, .other,
                        "no new wire kind: boundary is neither TCC nor BSD "
                         + "permissions")
@@ -843,11 +848,24 @@ final class NodeModulesScannerTests: XCTestCase {
                 && item.scanError?.message.contains("mount boundary") == true,
             "the error names the boundary: \(String(describing: item.scanError))"
         )
-        XCTAssertEqual(item.exactBytes, allocated(payload),
-                       "measured bytes stay honest — the readable portion "
-                        + "only, never the uncounted mounted subtree")
-        XCTAssertEqual(item.rootRecords.map(\.status), [.measured],
-                       "the walk measured something — the record is honest")
+        XCTAssertTrue(
+            item.scanError?.message.contains("not reclaimable") == true,
+            "the readable siblings' measured floor is preserved in the "
+                + "message — real information relocated, not discarded: "
+                + "\(String(describing: item.scanError))"
+        )
+        XCTAssertEqual(item.exactBytes, 0,
+                       "components mean 'deletion frees these' — the whole "
+                        + "target is refused, so zero is the honest figure")
+        XCTAssertEqual(item.estimatedUpToBytes, 0)
+        XCTAssertEqual(item.itemCount, 0)
+        XCTAssertNil(item.logicalBytes)
+        XCTAssertEqual(item.rootRecords.map(\.status), [.deniedUnmeasured],
+                       "the deletability boundary: nothing deletable was "
+                        + "established")
+        XCTAssertEqual(CLIHandler.cleanPlanAction(for: item), "refuse",
+                       "dry-run and confirmation say what the confirmed run "
+                        + "does — refuse, never clean_with_warning")
         XCTAssertTrue(outcome.errors.isEmpty,
                       "candidate-attributable boundaries ride the ITEM, "
                         + "never the outcome: \(outcome.errors)")
@@ -919,8 +937,58 @@ final class NodeModulesScannerTests: XCTestCase {
             return XCTFail("boundary states must not render the outcome "
                             + "malformed: \(events)")
         }
-        XCTAssertEqual(Set(validated.items.map(\.state)),
-                       [.partiallyDenied, .denied])
+        XCTAssertEqual(validated.items.count, 2)
+        XCTAssertEqual(Set(validated.items.map(\.state)), [.denied],
+                       "BOTH boundary shapes — root mount point and nested "
+                        + "boundary beside measured content — publish the "
+                        + "non-cleanable .denied shape and pass checks "
+                        + "(d)/(e)/(f) verbatim")
+    }
+
+    func testBoundaryDeniedItemIsRefusedWholeByCleanerAndLeftOnDisk() async throws {
+        // End-to-end honesty (PR #455 P2): the plan verb (`refuse`), the
+        // cleaner's pre-dispatch R18 state refusal, and the on-disk outcome
+        // all agree — no deletion entry, one SURFACED item error, and the
+        // readable siblings stay untouched (a boundary refusal is total,
+        // never a partial clean).
+        let payload = try makeProject("mounted-sub", payloadBytes: 4_096)
+        let nm = container.appendingPathComponent("mounted-sub/node_modules")
+        let mounted = nm.appendingPathComponent("mounted-volume")
+        try mkdir(mounted)
+
+        let provider = MountPointInjectingProvider()
+        let inode = try XCTUnwrap(provider.identity(of: mounted)?.inode)
+        provider.mountPointInodes.insert(inode)
+
+        let runtime = try SpaceScannerRuntime(
+            scanners: [makeScanner(provider: provider)], categories: [],
+            home: fixtureHome, provider: provider
+        )
+        var items: [ReclaimableItem] = []
+        for await event in runtime.scanValidated(
+            context: ScanContext(trigger: .userInitiated)
+        ) {
+            if case .outcome(_, let outcome) = event { items = outcome.items }
+        }
+        let item = try XCTUnwrap(items.first, "the validated item publishes")
+        XCTAssertEqual(item.state, .denied)
+
+        let cleaner = runtime.makeCleaner()
+        let report = await cleaner.clean(items: [item], moveToTrash: false)
+
+        XCTAssertTrue(report.entries.isEmpty,
+                      "no deletion entry — nothing was freed")
+        XCTAssertEqual(report.errors.count, 1,
+                       "the refusal SURFACES as an item error (R18), never "
+                        + "a silent skip")
+        XCTAssertEqual(report.errors.first?.key, item.key)
+        XCTAssertTrue(
+            report.errors.first?.message.contains("refused") == true,
+            "the error says refusal: \(String(describing: report.errors.first))"
+        )
+        XCTAssertTrue(fm.fileExists(atPath: payload.path),
+                      "the readable payload is untouched — whole-target "
+                        + "refusal, not partial deletion")
     }
 
     // MARK: - Cooperative cancellation (PR #455 P2)

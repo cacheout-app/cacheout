@@ -493,26 +493,36 @@ extension NodeModulesScanner: SpaceScanner {
     }
 
     /// The COMPLETE recognized-candidate truth table (epic contract): every
-    /// recognized candidate emits an item, no exceptions. An IMPEDIMENT is
-    /// a classified walk denial OR a recorded mount boundary — the
-    /// candidate itself (`rootMountBoundary`: the tree was never
-    /// enumerated) or a mounted subtree skipped mid-walk. Boundaries fold
-    /// into the denied family exactly like denials because the cleaner's
-    /// R15 doctrine refuses ANY boundary at delete time
-    /// (`removeGuardedItem` remeasures and refuses): a clean-looking
-    /// `.measured`/`.empty` would let a dry run promise a clean the
-    /// confirmed run refuses — the known refusal must be visible BEFORE
-    /// confirmation.
+    /// recognized candidate emits an item, no exceptions. Impediments split
+    /// by what the CLEANER would do, not only by what the walk saw
+    /// (PR #455 P2): a walk denial leaves a tree `removeItem` genuinely
+    /// attempts and partially clears, while ANY mount boundary makes
+    /// `removeGuardedItem` refuse the WHOLE target for as long as the
+    /// boundary exists (R15) — so the two impediments must not share the
+    /// cleanable-with-warning presentation.
     ///
     /// - clean walk + measurable content → `.measured` (nil `scanError`)
     /// - clean walk + NO measurable content → `.empty` (nil `scanError`,
     ///   zero components) — an honest terminal state, not a suppression
-    /// - impediment + SOME measurable content → `.partiallyDenied` +
-    ///   classified `scanError`, carrying the readable portion's components
-    ///   (a nested boundary's subtree is uncounted — the bytes stay honest)
-    /// - impediment + NO measurable content → `.denied` + classified
-    ///   `scanError`, zero components (a boundary-at-root candidate always
-    ///   lands here — nothing was enumerated, nothing is deletable)
+    /// - ANY recorded mount boundary — the candidate itself
+    ///   (`rootMountBoundary`: the tree was never enumerated; the sizer
+    ///   records the root in `mountBoundaries` for that case) or a mounted
+    ///   subtree skipped mid-walk — → `.denied` REGARDLESS of measured
+    ///   sibling bytes: `.denied` is the model's existing
+    ///   visible-but-never-cleanable state (GUI renders it unselectably,
+    ///   the CLI plan maps it to `refuse`, the cleaner surfaces the same
+    ///   refusal as an item error), which is exactly the delete-time truth.
+    ///   `.partiallyDenied` would promise a partial clean the confirmed run
+    ///   categorically refuses. Zero components (the coherence table's
+    ///   `.denied` shape — the byte components mean "deletion frees these",
+    ///   and deletion frees nothing here); the readable siblings' measured
+    ///   floor rides the synthesized `scanError` naming the boundary.
+    /// - walk denial(s), NO boundary + SOME measurable content →
+    ///   `.partiallyDenied` + classified `scanError`, carrying the readable
+    ///   portion's components (deletion proceeds and partially succeeds —
+    ///   the manual-selection warning is honest, R18)
+    /// - walk denial(s), NO boundary + NO measurable content → `.denied` +
+    ///   classified `scanError`, zero components
     ///
     /// All candidate-attributable outcomes are ITEM-level, never outcome
     /// errors. "Measurable content" is fn-1.2's rule verbatim
@@ -522,24 +532,37 @@ extension NodeModulesScanner: SpaceScanner {
     ) -> ReclaimableItem {
         let report = candidate.report
         let measuredAnything = report.itemCount > 0 || report.measuredBytes > 0
-        // `rootMountBoundary` needs no separate check: the sizer records the
-        // root itself in `mountBoundaries` for that case.
-        let impeded = !report.denials.isEmpty || !report.mountBoundaries.isEmpty
         let state: ScanState
         let scanError: ScanError?
-        if !impeded {
-            state = measuredAnything ? .measured : .empty
-            scanError = nil
-        } else {
+        if !report.mountBoundaries.isEmpty {
+            // Boundary doctrine (R15, PR #455 P2): the whole target is
+            // refused at delete time, so no measured sibling byte makes it
+            // partially cleanable. The synthesized error ALWAYS names the
+            // boundary — a coexisting walk denial's classification must not
+            // mask the impediment that actually voids deletion (and no TCC
+            // or permission grant would lift it).
+            state = .denied
+            scanError = Self.mountBoundaryScanError(from: report)
+        } else if !report.denials.isEmpty {
             state = measuredAnything ? .partiallyDenied : .denied
             // Same classification path as category scans: kind from the
-            // denial's classification (tcc/permission/other). A boundary
-            // with no denial to classify synthesizes its own error naming
-            // the boundary the cleaner will refuse.
+            // denial's classification (tcc/permission/other).
             scanError = CacheScanner.deriveScanError(
                 refusals: [], denials: report.denials
-            ) ?? Self.mountBoundaryScanError(from: report)
+            )
+        } else {
+            state = measuredAnything ? .measured : .empty
+            scanError = nil
         }
+
+        // A `.denied` item publishes ZERO components and no logical figure
+        // (the frozen coherence shape). For the boundary-bearing case the
+        // walk may honestly have measured readable siblings, but every
+        // consumer reads the components as "deletion frees these" (GUI
+        // totals, CLI rows, plan sums) — and deletion of a boundary-bearing
+        // target frees NOTHING. The measured floor is preserved in the
+        // scanError message, never summed into any reclaimable figure.
+        let deletable = state != .denied
 
         // Dual canonicalization (fn-1 doctrine): `requestedURL` keeps the
         // unresolved discovered spelling (the deletion input), `resolvedURL`
@@ -553,8 +576,9 @@ extension NodeModulesScanner: SpaceScanner {
             // Frozen truth table: `.empty`/`.measured`/`.partiallyDenied`
             // candidates were admitted and walked (clean-empty and partial
             // walks count as measured); only `.denied` — admitted but
-            // nothing measurable, whether denied at its own top level or
-            // never enumerated behind a root mount boundary — is
+            // nothing DELETABLE established, whether denied at its own top
+            // level, never enumerated behind a root mount boundary, or
+            // voided whole by a nested boundary (R15) — is
             // `.deniedUnmeasured`. A refused search root never yields a
             // recognized candidate, so no candidate ever maps to
             // `.refusedAdmission`.
@@ -578,17 +602,19 @@ extension NodeModulesScanner: SpaceScanner {
             // The item's display identity today: the PROJECT name.
             displayName: candidate.projectName,
             // Split components preserved from SizeReport — never a
-            // collapsed sum (epic byte-model contract).
-            exactBytes: report.exactAllocatedBytes,
-            estimatedUpToBytes: report.estimatedUpToBytes,
+            // collapsed sum (epic byte-model contract) — except on
+            // `.denied`, where nothing is deletable and the honest
+            // reclaimable figure is zero (see `deletable` above).
+            exactBytes: deletable ? report.exactAllocatedBytes : 0,
+            estimatedUpToBytes: deletable ? report.estimatedUpToBytes : 0,
             // Carried only in the sparse-divergence direction that matters
             // for honest display: logical exceeding allocated means deletion
             // frees LESS than the apparent size (57.1G-logical vs
             // 31G-allocated field case). Block-rounding makes logical <
             // allocated for ordinary trees — that divergence is noise.
-            logicalBytes: report.logicalBytes > report.measuredBytes
+            logicalBytes: deletable && report.logicalBytes > report.measuredBytes
                 ? report.logicalBytes : nil,
-            itemCount: report.itemCount,
+            itemCount: deletable ? report.itemCount : 0,
             // DISPLAY ONLY (destructive-target rule): the resolved location.
             url: resolved,
             declaredDisplayPath: shortPath,
@@ -625,22 +651,34 @@ extension NodeModulesScanner: SpaceScanner {
         )
     }
 
-    /// The classified impediment for a boundary-affected candidate with no
-    /// walk denial to classify. `.other` is the honest EXISTING kind: a
-    /// boundary is neither a TCC nor a BSD permission problem and no
-    /// admission was refused, and the frozen `ScanError.Kind` wire table
-    /// (`wireString`) must not silently grow a new case — the message
-    /// carries the specifics, mirroring the cleaner's delete-time refusal
-    /// wording (R15).
+    /// The classified impediment for a boundary-bearing candidate. `.other`
+    /// is the honest EXISTING kind: a boundary is neither a TCC nor a BSD
+    /// permission problem and no admission was refused, and the frozen
+    /// `ScanError.Kind` wire table (`wireString`) must not silently grow a
+    /// new case — the message carries the specifics, mirroring the
+    /// cleaner's delete-time refusal wording (R15). When the walk measured
+    /// readable siblings beside a nested boundary, their floor is REAL
+    /// information and it rides here — visible in the GUI's denied row and
+    /// the CLI's `scan_error.message` — because the item's byte components
+    /// must stay zero (they mean "deletion frees these", and the whole
+    /// target is refused).
     private static func mountBoundaryScanError(
         from report: SizeReport
     ) -> ScanError? {
         guard let boundary = report.mountBoundaries.first else { return nil }
-        let message = report.rootMountBoundary
+        var message = report.rootMountBoundary
             ? "\(boundary.path): item is a mount point — not measured; "
                 + "deletion would be refused"
             : "mount boundary at \(boundary.path) — subtree not measured; "
                 + "deletion would be refused"
+        if report.itemCount > 0 || report.measuredBytes > 0 {
+            let floor = CleanupReport.componentPhrase(
+                exact: report.exactAllocatedBytes,
+                estimatedUpTo: report.estimatedUpToBytes
+            )
+            message += " (\(floor) measured beside the boundary is not "
+                + "reclaimable while the boundary remains)"
+        }
         return ScanError(kind: .other, message: message)
     }
 

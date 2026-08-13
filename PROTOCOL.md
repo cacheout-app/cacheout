@@ -237,6 +237,7 @@ compatibility sum.
 | `kind` | string | yes | One of: `"container_refused"`, `"symlink_root"`, `"tcc_denied"`, `"permission_denied"`, `"unreadable"`, `"malformed_outcome"`. The list is EXTENSIBLE — consumers must tolerate unknown kinds |
 | `detail` | string | yes | Human-readable description |
 | `path` | string | conditional | Present for the filesystem kinds; ABSENT for `"malformed_outcome"` (no filesystem location exists — a fake path is never invented) |
+| `grant_hint` | string | no | Present only when `kind == "tcc_denied"` — the same user-side remedy (Full Disk Access) as category and `scanner_items` rows, since macOS denies CLI processes silently |
 
 A `malformed_outcome` row means that scanner's ENTIRE outcome failed
 fail-closed validation: its items are excluded from `scanner_items` AND from

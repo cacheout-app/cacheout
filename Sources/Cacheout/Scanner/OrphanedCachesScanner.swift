@@ -44,10 +44,17 @@
 ///
 /// Entries already owned by an existing `CacheCategory` are filtered out
 /// BEFORE the facts list is returned (no double listing or double counting).
-/// The exclusion set is built from DECLARED discovery roots — all three
-/// `PathDiscovery` kinds, probed FALLBACKS included, probe stdout
-/// contributing nothing (deterministic + hermetic; the exact stance of
-/// `CategoryAdmissionPolicy(category:home:)`, which this reuses).
+/// The exclusion set is built from DECLARED discovery roots — never probe
+/// stdout — with ONE gate (PR #456 review): a `.probed` entry's fallbacks
+/// are excluded only while its `requiresTool` is PRESENT, because a missing
+/// tool makes `CacheCategory.resolvedPaths(home:)` skip the whole discovery
+/// entry (fallbacks included), so the category scan provably does not own
+/// the fallback this session — and the stale cache an uninstalled tool left
+/// behind (the exact case this epic exists for) must surface HERE instead
+/// of being invisible to both surfaces. Tool presence is the same bounded
+/// `which` check the category scan gates on, memoized per enumeration and
+/// consulted only for fallbacks inside the sweep root; probe COMMANDS still
+/// never run during exclusion-set construction.
 
 import Foundation
 import Darwin
@@ -132,7 +139,13 @@ enum SweepEnumeration: Equatable {
 /// One user-data-shape pattern (R4). The table is extensible DATA, not
 /// conditionals: `name` is the stable identifier recorded in the facts;
 /// `glob` is an `fnmatch(3)` pattern applied to basenames at every visited
-/// probe depth.
+/// probe depth — CASE-INSENSITIVELY (`FNM_CASEFOLD`, PR #456 review): the
+/// guard protects user content in whatever casing it was stored, and a
+/// spurious extra match only forces review / refuses deletion (fail-safe).
+/// The classifier's known-leak glob deliberately stays case-EXACT: leak
+/// patterns name system-generated, case-stable spellings, and a case-folded
+/// leak match would WIDEN the auto-clean-eligible safe tier — a case
+/// variant falls to the review tiers instead.
 struct UserDataShapePattern: Equatable {
     let name: String
     let glob: String
@@ -143,7 +156,7 @@ struct UserDataShapePattern: Equatable {
 /// `@unchecked Sendable` under the same discipline as the other scanners
 /// (`SpaceScanner: Sendable`): every stored property is an immutable `let`;
 /// `FileSystemIdentityProvider` and `DirectorySizer` hold no mutable state;
-/// `FileManager.default` is documented thread-safe; both stored closures
+/// `FileManager.default` is documented thread-safe; all stored closures
 /// are `@Sendable` by type.
 struct OrphanedCachesScanner: @unchecked Sendable {
 
@@ -205,6 +218,12 @@ struct OrphanedCachesScanner: @unchecked Sendable {
     /// because the scanner is long-lived and each scan must classify
     /// against its own "now".
     private let now: @Sendable () -> Date
+    /// Tool-presence gate for probed-fallback exclusion (R3, PR #456
+    /// review) — injectable so tests stay hermetic; the production default
+    /// mirrors `CacheCategory.toolExists` (same `which`, same PATH/HOME
+    /// environment, same bounded wait), because the two MUST agree on
+    /// whether the category scan attempts a probed discovery entry.
+    private let toolIsAvailable: @Sendable (String) -> Bool
 
     init(
         home: URL,
@@ -217,7 +236,8 @@ struct OrphanedCachesScanner: @unchecked Sendable {
             OrphanedCachesSweepConfig.defaultThresholds,
         installedAppStatus: @escaping @Sendable (String) -> InstalledAppStatus =
             { _ in .unknown },
-        now: @escaping @Sendable () -> Date = { Date() }
+        now: @escaping @Sendable () -> Date = { Date() },
+        toolAvailability: (@Sendable (String) -> Bool)? = nil
     ) {
         self.home = home
         self.cachesRoot = cachesRoot
@@ -230,6 +250,8 @@ struct OrphanedCachesScanner: @unchecked Sendable {
         self.thresholds = thresholds
         self.installedAppStatus = installedAppStatus
         self.now = now
+        self.toolIsAvailable = toolAvailability
+            ?? { Self.productionToolAvailability($0, home: home) }
     }
 
     // MARK: - Enumeration
@@ -329,28 +351,108 @@ struct OrphanedCachesScanner: @unchecked Sendable {
     // MARK: - Category-owned exclusion (R3)
 
     /// Declared category roots kept for exclusion, as standardized path
-    /// components. Reuses `CategoryAdmissionPolicy(category:home:)` for the
-    /// declared-root resolution — all three `PathDiscovery` kinds, probed
-    /// FALLBACKS included, probe stdout contributing nothing.
+    /// components. Path construction mirrors BOTH
+    /// `CategoryAdmissionPolicy(category:home:)` and
+    /// `CacheCategory.resolvedPaths(home:)` — all three `PathDiscovery`
+    /// kinds, `.staticPath` and non-`/`-prefixed probed fallbacks anchored
+    /// to the injected home, probe stdout contributing nothing.
     ///
     /// Step 1 — scope filter: keep ONLY roots STRICTLY below the sweep
     /// root. A root outside the sweep root, or EQUAL to it, contributes
     /// NOTHING — otherwise a category declaring e.g. `~/Library` (an
     /// ancestor of every entry) would silently suppress the entire sweep.
+    ///
+    /// Step 1b — tool gate on probed fallbacks (PR #456 review): a
+    /// `.probed` entry with an ABSENT `requiresTool` is skipped ENTIRELY by
+    /// the category scan (`CacheCategory.resolvedPaths`), fallbacks
+    /// included, so excluding them here would hide the stale cache an
+    /// uninstalled tool left behind from BOTH surfaces. Gate order is
+    /// deliberate — scope filter FIRST, so the bounded `which` runs only
+    /// for fallbacks that could actually contribute (production: 4 distinct
+    /// tools), memoized per enumeration. While the tool IS present the
+    /// exclusion deliberately stays a SUPERSET of what the category scan
+    /// captured (all declared fallbacks, even when the probe resolved
+    /// elsewhere or a later fallback lost the first-match cut) —
+    /// conservative against double listing, and a declared-but-uncaptured
+    /// root remains attributable to its category by declaration. A probed
+    /// entry with NO `requiresTool` is always attempted by the category
+    /// scan, so its fallbacks stay unconditionally excluded, exactly as
+    /// before.
     private func categoryExclusionRoots() -> [[String]] {
         let rootComponents = cachesRoot.standardizedFileURL.pathComponents
+        var toolPresence: [String: Bool] = [:]
         var kept: [[String]] = []
         for category in categories {
-            let policy = CategoryAdmissionPolicy(category: category, home: home)
-            for declared in policy.declaredRoots {
-                let components = declared.url.standardizedFileURL.pathComponents
-                guard components.count > rootComponents.count,
-                      components.starts(with: rootComponents)
-                else { continue }
-                kept.append(components)
+            for entry in category.discovery {
+                let declared: [URL]
+                let gatingTool: String?
+                switch entry {
+                case .staticPath(let relative):
+                    declared = [home.appendingPathComponent(relative)]
+                    gatingTool = nil
+                case .absolutePath(let absolute):
+                    declared = [URL(fileURLWithPath: absolute)]
+                    gatingTool = nil
+                case .probed(_, let requiresTool, let fallbacks):
+                    declared = fallbacks.map {
+                        $0.hasPrefix("/")
+                            ? URL(fileURLWithPath: $0)
+                            : home.appendingPathComponent($0)
+                    }
+                    gatingTool = requiresTool
+                }
+                for url in declared {
+                    let components = url.standardizedFileURL.pathComponents
+                    guard components.count > rootComponents.count,
+                          components.starts(with: rootComponents)
+                    else { continue }
+                    if let tool = gatingTool {
+                        let present: Bool
+                        if let cached = toolPresence[tool] {
+                            present = cached
+                        } else {
+                            present = toolIsAvailable(tool)
+                            toolPresence[tool] = present
+                        }
+                        guard present else { continue }
+                    }
+                    kept.append(components)
+                }
             }
         }
         return kept
+    }
+
+    /// The production tool-presence check — mirrors
+    /// `CacheCategory.toolExists` exactly (same `/usr/bin/which`, same
+    /// restricted PATH, same injected HOME, same bounded 2s wait), because
+    /// exclusion must agree with the category scan's own gate on whether a
+    /// probed discovery entry is attempted. `false` on any failure — the
+    /// fallback then SURFACES in the sweep, where classification and
+    /// container admission still govern it (visibility, never a deletion
+    /// grant).
+    private static func productionToolAvailability(
+        _ tool: String, home: URL
+    ) -> Bool {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/which")
+        process.arguments = [tool]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        process.environment = [
+            "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin",
+            "HOME": home.path
+        ]
+        do {
+            try process.run()
+        } catch {
+            return false
+        }
+        guard process.waitForExit(within: 2) else {
+            process.terminate()
+            return false
+        }
+        return process.terminationStatus == 0
     }
 
     /// Step 2 — containment, BIDIRECTIONAL, by `pathComponents` prefix,
@@ -485,8 +587,17 @@ struct OrphanedCachesScanner: @unchecked Sendable {
                 visited += 1
 
                 let name = child.lastPathComponent
+                // FNM_CASEFOLD (PR #456 review): the guard protects user
+                // content in ANY casing (`Photos Library.PHOTOSLIBRARY`,
+                // `pictures`, `DOCUMENTS`) — the stored spelling is
+                // arbitrary, and flags 0 compared it case-sensitively even
+                // on the case-insensitive default filesystem. Fail-safe by
+                // direction: casefolding here can only ADD matches, which
+                // only forces review / refuses deletion. Deliberately NOT
+                // mirrored by the classifier's known-leak glob (see the
+                // pattern-table doc above).
                 for pattern in userDataShapePatterns
-                where fnmatch(pattern.glob, name, 0) == 0 {
+                where fnmatch(pattern.glob, name, FNM_CASEFOLD) == 0 {
                     matched.insert(pattern.name)
                 }
 

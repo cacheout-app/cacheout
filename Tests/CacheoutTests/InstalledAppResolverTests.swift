@@ -414,6 +414,65 @@ final class InstalledAppResolverTests: XCTestCase {
                        "one failure latches the probe — a broken mds costs bounded time once")
     }
 
+    func testProbeConcurrentFailureLatchPoisonsInFlightZero() {
+        // PR #456 review r2 interleaving: query A fails and latches while
+        // query B's zero-count is still in flight. B's zero must NOT become
+        // .absent — after ANY query failure no absence is trustworthy.
+        // Driven deterministically through the scripted runQuery seam: B's
+        // query simulates the concurrent A-failure with a re-entrant
+        // presence() call (queries run OUTSIDE the probe's lock, so this
+        // cannot deadlock) BEFORE returning its zero — B has already passed
+        // ensureHealthy() at that point, exactly the racing schedule.
+        weak var probeRef: SpotlightBundleIDProbe?
+        var aVerdict: SpotlightPresence?
+        let probe = SpotlightBundleIDProbe(runQuery: { id in
+            switch id {
+            case "com.apple.finder":
+                return 1 // healthy canary — both queries pass the gate
+            case "com.example.a-fails":
+                return nil // A's spawn/timeout failure → latch
+            case "com.example.b-zero":
+                // A fails and latches while B's subprocess is "running".
+                aVerdict = probeRef?.presence(ofBundleID: "com.example.a-fails")
+                return 0
+            default:
+                return 0
+            }
+        })
+        probeRef = probe
+        XCTAssertEqual(
+            probe.presence(ofBundleID: "com.example.b-zero"), .unavailable,
+            "a zero landing after a concurrent failure latched must not mint an absence"
+        )
+        XCTAssertEqual(aVerdict, .unavailable, "the failing query itself latched")
+        XCTAssertEqual(probe.presence(ofBundleID: "com.example.later"), .unavailable,
+                       "the latch sticks for all later queries")
+    }
+
+    func testResolverInterleavedLatchYieldsUnknownNotNotInstalled() {
+        // The same interleaving observed at the resolver level: the
+        // poisoned zero degrades a complete-census no-match to .unknown —
+        // it must never mint the .notInstalled the orphan tier treats as a
+        // positive global-absence claim.
+        weak var probeRef: SpotlightBundleIDProbe?
+        let probe = SpotlightBundleIDProbe(runQuery: { id in
+            switch id {
+            case "com.apple.finder": return 1
+            case "com.example.a-fails": return nil
+            case "com.example.absent":
+                _ = probeRef?.presence(ofBundleID: "com.example.a-fails")
+                return 0
+            default: return 0
+            }
+        })
+        probeRef = probe
+        let resolver = makeResolver(spotlight: { probe.presence(ofBundleID: $0) })
+        XCTAssertEqual(
+            resolver.status(ofBundleID: "com.example.absent"), .unknown,
+            "a complete census + a poisoned Spotlight zero fails closed"
+        )
+    }
+
     func testProbeQueryStringEscapesQuoteAndBackslash() {
         // A hostile cache-directory NAME must not inject query syntax: the
         // value rides inside argv (no shell) with \ and " escaped.

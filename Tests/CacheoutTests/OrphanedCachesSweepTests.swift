@@ -78,14 +78,16 @@ final class OrphanedCachesSweepTests: XCTestCase {
         categories: [CacheCategory] = [],
         provider: FileSystemIdentityProvider = FileSystemIdentityProvider(),
         probeDepthLimit: Int = 3,
-        probeEntryLimit: Int = 512
+        probeEntryLimit: Int = 512,
+        toolAvailability: (@Sendable (String) -> Bool)? = nil
     ) -> OrphanedCachesScanner {
         OrphanedCachesScanner(
             home: home,
             categories: categories,
             provider: provider,
             probeDepthLimit: probeDepthLimit,
-            probeEntryLimit: probeEntryLimit
+            probeEntryLimit: probeEntryLimit,
+            toolAvailability: toolAvailability
         )
     }
 
@@ -156,16 +158,20 @@ final class OrphanedCachesSweepTests: XCTestCase {
 
     func testCategoryOwnedEntriesExcludedViaProductionCategoryList() throws {
         // Homebrew's declared root is a probed FALLBACK
-        // (`Library/Caches/Homebrew`) — declared roots include fallbacks,
-        // and the production `allCategories` default is pure data (no probe
-        // ever runs during exclusion-set construction).
+        // (`Library/Caches/Homebrew`) — declared roots include fallbacks
+        // WHILE the gating tool is present (injected here so the test never
+        // depends on the machine's brew installation); probe commands never
+        // run during exclusion-set construction.
         try mkdir(cachesRoot.appendingPathComponent("Homebrew"))
         try writeFile(
             cachesRoot.appendingPathComponent("Homebrew/bottle.tar.gz"), bytes: 4_096
         )
         try mkdir(cachesRoot.appendingPathComponent("UnownedSweepEntry"))
 
-        let facts = factsByName(makeScanner(categories: CacheCategory.allCategories))
+        let facts = factsByName(makeScanner(
+            categories: CacheCategory.allCategories,
+            toolAvailability: { _ in true }
+        ))
 
         XCTAssertNil(facts["Homebrew"], "category-owned entry absent from facts")
         XCTAssertNotNil(facts["UnownedSweepEntry"], "non-owned sibling present")
@@ -189,6 +195,113 @@ final class OrphanedCachesSweepTests: XCTestCase {
         XCTAssertNotNil(facts["Sibling"])
         XCTAssertFalse(fm.fileExists(atPath: sentinel.path),
                        "probe stdout contributes NOTHING — the command never runs")
+    }
+
+    func testProbedFallbackWithAbsentToolIsSwept() throws {
+        // The uninstalled-Homebrew case (PR #456 review P2): a missing
+        // `requiresTool` makes the category scan skip the WHOLE probed
+        // discovery entry (`CacheCategory.resolvedPaths`), fallbacks
+        // included — so the sweep must NOT exclude them, or the stale cache
+        // the removed tool left behind is invisible to both surfaces.
+        let sentinel = base.appendingPathComponent("probe-ran")
+        let category = syntheticCategory(discovery: [
+            .probed(
+                command: "touch '\(sentinel.path)'",
+                requiresTool: "cacheout-test-tool",
+                fallbacks: ["Library/Caches/UninstalledTool"]
+            ),
+        ])
+        try mkdir(cachesRoot.appendingPathComponent("UninstalledTool"))
+        try writeFile(
+            cachesRoot.appendingPathComponent("UninstalledTool/stale.bin")
+        )
+
+        let facts = factsByName(makeScanner(
+            categories: [category], toolAvailability: { _ in false }
+        ))
+
+        XCTAssertNotNil(facts["UninstalledTool"],
+                        "a fallback the category scan provably skipped is swept")
+        XCTAssertFalse(fm.fileExists(atPath: sentinel.path),
+                       "probe commands still never run during exclusion")
+    }
+
+    func testProbedFallbackWithPresentToolStaysExcluded() throws {
+        let sentinel = base.appendingPathComponent("probe-ran")
+        let category = syntheticCategory(discovery: [
+            .probed(
+                command: "touch '\(sentinel.path)'",
+                requiresTool: "cacheout-test-tool",
+                fallbacks: ["Library/Caches/InstalledTool"]
+            ),
+        ])
+        try mkdir(cachesRoot.appendingPathComponent("InstalledTool"))
+        try mkdir(cachesRoot.appendingPathComponent("Sibling"))
+
+        let facts = factsByName(makeScanner(
+            categories: [category], toolAvailability: { _ in true }
+        ))
+
+        XCTAssertNil(facts["InstalledTool"],
+                     "tool present — the category scan owns the entry; "
+                     + "excluded exactly as before")
+        XCTAssertNotNil(facts["Sibling"])
+        XCTAssertFalse(fm.fileExists(atPath: sentinel.path),
+                       "the gate is tool PRESENCE only — probe stdout still "
+                       + "contributes nothing")
+    }
+
+    func testToolGateScopeFilteredAndMemoized() throws {
+        // The `which` gate is bounded: consulted only for fallbacks inside
+        // the sweep root (scope filter runs FIRST), and once per distinct
+        // tool per enumeration — never per fallback.
+        let recorder = ToolCheckRecorder()
+        let categories = [
+            syntheticCategory(name: "in-scope-a", discovery: [
+                .probed(command: "true", requiresTool: "shared-tool",
+                        fallbacks: ["Library/Caches/InScopeA"]),
+            ]),
+            syntheticCategory(name: "in-scope-b", discovery: [
+                .probed(command: "true", requiresTool: "shared-tool",
+                        fallbacks: ["Library/Caches/InScopeB"]),
+            ]),
+            syntheticCategory(name: "out-of-scope", discovery: [
+                .probed(command: "true", requiresTool: "out-of-scope-tool",
+                        fallbacks: [".npm"]),
+            ]),
+        ]
+        try mkdir(cachesRoot.appendingPathComponent("InScopeA"))
+
+        _ = factsByName(makeScanner(
+            categories: categories,
+            toolAvailability: { recorder.record($0); return false }
+        ))
+
+        XCTAssertEqual(recorder.names, ["shared-tool"],
+                       "one check per in-scope tool; out-of-scope fallbacks "
+                       + "never consult the gate")
+    }
+
+    func testProductionToolGateAbsentToolViaRealWhich() throws {
+        // The DEFAULT (uninjected) gate: a tool name that cannot exist
+        // resolves absent through the real bounded `which`, and the
+        // fallback is swept — mirroring exactly the discovery entry the
+        // category scan skips.
+        let category = syntheticCategory(discovery: [
+            .probed(
+                command: "true",
+                requiresTool: "cacheout-absent-\(UUID().uuidString.prefix(8))",
+                fallbacks: ["Library/Caches/GhostTool"]
+            ),
+        ])
+        try mkdir(cachesRoot.appendingPathComponent("GhostTool"))
+
+        XCTAssertTrue(category.resolvedPaths(home: home).isEmpty,
+                      "the category scan provably does not own the fallback")
+
+        let facts = factsByName(makeScanner(categories: [category]))
+        XCTAssertNotNil(facts["GhostTool"],
+                        "swept via the production which-based gate")
     }
 
     func testDeeperCategoryRootExcludesFirstLevelAncestor() throws {
@@ -471,6 +584,31 @@ final class OrphanedCachesSweepTests: XCTestCase {
         XCTAssertTrue(leak.userDataProbeComplete)
     }
 
+    func testUserDataProbeMatchesCaseVariants() throws {
+        // The guard protects user content in ANY casing (PR #456 review):
+        // the stored spelling is arbitrary, and `fnmatch` with flags 0
+        // compared it case-sensitively — missing these even on the usual
+        // case-insensitive macOS filesystem.
+        let upperLibrary = cachesRoot.appendingPathComponent("upper-library")
+        try mkdir(upperLibrary.appendingPathComponent(
+            "Photos Library.PHOTOSLIBRARY"
+        ))
+        let lowerPictures = cachesRoot.appendingPathComponent("lower-pictures")
+        try mkdir(lowerPictures.appendingPathComponent("pictures"))
+        let upperDocuments = cachesRoot.appendingPathComponent("upper-documents")
+        try mkdir(upperDocuments.appendingPathComponent("DOCUMENTS"))
+
+        let facts = factsByName(makeScanner())
+
+        XCTAssertEqual(facts["upper-library"]?.userDataShapeMatches,
+                       ["photos-library"])
+        XCTAssertEqual(facts["lower-pictures"]?.userDataShapeMatches,
+                       ["pictures-directory"])
+        XCTAssertEqual(facts["upper-documents"]?.userDataShapeMatches,
+                       ["documents-directory"])
+        XCTAssertEqual(facts["upper-library"]?.userDataProbeComplete, true)
+    }
+
     func testCleanEntryHasNoMatchesAndCompleteProbe() throws {
         let entry = cachesRoot.appendingPathComponent("plain-cache")
         try mkdir(entry.appendingPathComponent("sub"))
@@ -568,5 +706,21 @@ final class OrphanedCachesSweepTests: XCTestCase {
         XCTAssertEqual(namedFacts.userDataShapeMatches, ["pictures-directory"],
                        "matched by NAME only — the target's photoslibrary "
                        + "never surfaces")
+    }
+}
+
+/// Thread-safe tool-name recorder for the exclusion tool gate (the gate
+/// closure is `@Sendable` by type; the test reads after the synchronous
+/// enumeration returns).
+private final class ToolCheckRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var recorded: [String] = []
+    var names: [String] {
+        lock.lock(); defer { lock.unlock() }
+        return recorded
+    }
+    func record(_ name: String) {
+        lock.lock(); defer { lock.unlock() }
+        recorded.append(name)
     }
 }

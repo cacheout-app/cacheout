@@ -69,7 +69,8 @@ final class OrphanedCachesScannerTests: XCTestCase {
             OrphanedCachesSweepConfig.defaultThresholds,
         installedAppStatus: @escaping @Sendable (String) -> InstalledAppStatus =
             { _ in .unknown },
-        now: @escaping @Sendable () -> Date = { Date() }
+        now: @escaping @Sendable () -> Date = { Date() },
+        toolAvailability: (@Sendable (String) -> Bool)? = nil
     ) -> OrphanedCachesScanner {
         OrphanedCachesScanner(
             home: home,
@@ -77,7 +78,8 @@ final class OrphanedCachesScannerTests: XCTestCase {
             provider: provider,
             thresholds: thresholds,
             installedAppStatus: installedAppStatus,
-            now: now
+            now: now,
+            toolAvailability: toolAvailability
         )
     }
 
@@ -1254,6 +1256,21 @@ final class OrphanedCachesScannerTests: XCTestCase {
                        "a boundary directory left unexpanded is fail-closed")
     }
 
+    func testPreDeleteProbeMatchesCaseVariants() throws {
+        // Delete-time face of the FNM_CASEFOLD fix (PR #456 review): both
+        // probe faces share one static core, so a differently cased
+        // user-data name is caught here too.
+        let entry = cachesRoot.appendingPathComponent("cased-entry")
+        try mkdir(entry.appendingPathComponent("PICTURES"))
+
+        let result = OrphanedCachesScanner.preDeleteUserDataProbe(
+            at: entry, provider: FileSystemIdentityProvider()
+        )
+
+        XCTAssertEqual(result.matches, ["pictures-directory"])
+        XCTAssertTrue(result.complete)
+    }
+
     func testEntryRecreatedAfterScanWithUserDataIsRefusedAtDeleteTime() async throws {
         let entry = cachesRoot.appendingPathComponent("com.apple.SwiftUI.Drag-REBORN")
         try mkdir(entry)
@@ -1298,6 +1315,105 @@ final class OrphanedCachesScannerTests: XCTestCase {
         XCTAssertTrue(fresh.evidence.contains(
             "verify the original still exists before deleting"
         ), fresh.evidence)
+    }
+
+    func testCaseVariantUserDataForcesReviewAtScanTime() async throws {
+        // Scan-time face of the FNM_CASEFOLD fix (PR #456 review): a
+        // leak-named entry holding `DOCUMENTS` — a differently cased
+        // user-data name — must classify exactly like the exact-case
+        // fixture: review risk, never default-selected, never
+        // auto-clean-eligible.
+        let entry = cachesRoot.appendingPathComponent("com.apple.SwiftUI.Drag-CASE")
+        try mkdir(entry.appendingPathComponent("DOCUMENTS"))
+        try writeFile(entry.appendingPathComponent("payload.bin"))
+
+        let scanner = makeScanner()
+        let (byName, outcome) = await scanItems(scanner)
+        try assertValidates(outcome, scanner: scanner)
+
+        let item = try XCTUnwrap(byName["com.apple.SwiftUI.Drag-CASE"])
+        XCTAssertEqual(item.risk, .review, "forced off safe by the guard")
+        XCTAssertFalse(item.defaultSelected)
+        XCTAssertFalse(item.automaticCleanEligible)
+        XCTAssertTrue(item.evidence.contains("user-data-shaped content"),
+                      item.evidence)
+    }
+
+    func testEntryRecreatedWithCaseVariantUserDataIsRefusedAtDeleteTime() async throws {
+        // The recreation TOCTOU with a CASE-VARIANT payload: without
+        // FNM_CASEFOLD the delete-time revalidation reported clean and the
+        // recreated user data was deleted.
+        let entry = cachesRoot.appendingPathComponent("com.apple.SwiftUI.Drag-CASED")
+        try mkdir(entry)
+        try writeFile(entry.appendingPathComponent("payload.bin"))
+
+        let runtime = try makeRuntime([makeScanner()])
+        let (items, snapshot) = await scanSession(runtime)
+        let leak = try XCTUnwrap(items.first)
+        XCTAssertTrue(leak.automaticCleanEligible,
+                      "the fixture entry scans as a clean known leak")
+
+        try fm.removeItem(at: entry)
+        let library = entry.appendingPathComponent(
+            "PICTURES/Photos Library.PHOTOSLIBRARY"
+        )
+        try mkdir(library)
+        let victim = try writeFile(library.appendingPathComponent("database.db"))
+
+        let cleaner = runtime.makeCleaner(snapshot: snapshot)
+        let report = await cleaner.clean(items: [leak], moveToTrash: false)
+
+        XCTAssertTrue(report.entries.isEmpty, "nothing deleted")
+        XCTAssertEqual(report.errors.count, 1)
+        let message = try XCTUnwrap(report.errors.first?.message)
+        XCTAssertTrue(message.contains("contents changed since scan"), message)
+        XCTAssertTrue(fm.fileExists(atPath: victim.path),
+                      "the case-variant recreated content is byte-untouched")
+    }
+
+    func testUninstalledToolStaleFallbackSurfacesThroughProtocolScan() async throws {
+        // The fn-3 epic case end-to-end (PR #456 review P2): tool
+        // uninstalled, its stale cache dir still on disk — the category
+        // scan skips the probed discovery entry entirely, so the sweep
+        // must list it, classified (review-tier visibility, never a
+        // deletion widening: auto-eligibility still requires a clean known
+        // leak).
+        let category = CacheCategory(
+            name: "Homebrew Cache", slug: "homebrew_cache",
+            description: "test", icon: "mug.fill",
+            discovery: [.probed(
+                command: "brew --cache",
+                requiresTool: "brew",
+                fallbacks: ["Library/Caches/Homebrew"]
+            )],
+            riskLevel: .safe, rebuildNote: "", defaultSelected: true
+        )
+        let stale = cachesRoot.appendingPathComponent("Homebrew")
+        try mkdir(stale)
+        try writeFile(stale.appendingPathComponent("bottle.tar.gz"))
+
+        let swept = makeScanner(
+            categories: [category], toolAvailability: { _ in false }
+        )
+        let (byName, outcome) = await scanItems(swept)
+        try assertValidates(outcome, scanner: swept)
+
+        let item = try XCTUnwrap(
+            byName["Homebrew"],
+            "the stale cache of an uninstalled tool is visible in the sweep"
+        )
+        XCTAssertEqual(item.risk, .review,
+                       "surfaced through classification — never auto-safe")
+        XCTAssertFalse(item.defaultSelected)
+        XCTAssertFalse(item.automaticCleanEligible)
+
+        // Tool present: excluded from the sweep exactly as before (the
+        // category scan owns it).
+        let excluded = makeScanner(
+            categories: [category], toolAvailability: { _ in true }
+        )
+        let (byNamePresent, _) = await scanItems(excluded)
+        XCTAssertNil(byNamePresent["Homebrew"])
     }
 
     // MARK: - R5/R9: GUI selection policy + session gates

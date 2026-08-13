@@ -328,7 +328,8 @@ final class InstalledAppResolver: @unchecked Sendable {
 enum SpotlightPresence {
     /// The index has at least one item carrying this bundle identifier.
     case present
-    /// A HEALTHY index (canary-verified) answered and has none.
+    /// A HEALTHY index (canary-verified) answered and has none — and no
+    /// query failure had latched the probe when the zero was accepted.
     case absent
     /// No trustworthy answer: Spotlight disabled or its index missing the
     /// canary apps, a query failure, or a timeout. Callers must fail
@@ -377,7 +378,11 @@ enum SpotlightPresence {
 ///
 /// Thread-safe (`lock` guards the latch state; queries themselves run
 /// outside the lock — a racing duplicate canary is idempotent and
-/// harmless). `@unchecked Sendable` under that discipline.
+/// harmless). Because queries run unlocked, a zero-count RECHECKS the
+/// latch before it may become `.absent`: a concurrent query's failure
+/// poisons every in-flight absence (the canary path already has this
+/// property — its verdict is recomputed under the lock, first writer
+/// wins). `@unchecked Sendable` under that discipline.
 final class SpotlightBundleIDProbe: @unchecked Sendable {
 
     /// Bundle ids present on every macOS installation; ANY one hit proves
@@ -418,7 +423,21 @@ final class SpotlightBundleIDProbe: @unchecked Sendable {
             latchUnavailable()
             return .unavailable
         }
-        return count > 0 ? .present : .absent
+        if count > 0 { return .present }
+        // A zero is only trustworthy while the latch is still clean:
+        // queries run OUTSIDE the lock by design, so a CONCURRENT query's
+        // failure may have latched the probe while this one was in flight —
+        // and after ANY failure no absence is trustworthy (the same mds
+        // that failed one query may be answering others with spurious
+        // zeros). Recheck under the lock before converting the zero into
+        // `.absent` (PR #456 review r2). A positive needs no recheck:
+        // presence is a positive signal and `.installed` wins over
+        // everything. Full serialization — holding the lock ACROSS the
+        // subprocess — would stall every concurrent `status()` call behind
+        // the 2s worst-case wait; the recheck closes the observable window
+        // instead (a failure latching after this point is
+        // indistinguishable from one latching after return).
+        return latchedUnavailable() ? .unavailable : .absent
     }
 
     /// The exact query handed to mdfind — exposed for the escaping tests.
@@ -461,6 +480,13 @@ final class SpotlightBundleIDProbe: @unchecked Sendable {
         lock.lock()
         state = .unavailable
         lock.unlock()
+    }
+
+    /// Post-query latch recheck — see `presence(ofBundleID:)`.
+    private func latchedUnavailable() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return state == .unavailable
     }
 
     // MARK: - Live mdfind runner

@@ -4,8 +4,7 @@
 /// tier, risk, user-facing evidence strings, selection policy, and the
 /// output-set selection. Every rule in the epic's Edge Cases section lives
 /// here as a testable function — no filesystem access, no fixtures, no
-/// async, no ambient clock (`now` is injected; the grep gate forbids
-/// constructing a date in this file).
+/// async, no ambient clock construction (`now` is injected).
 ///
 /// ## Tier precedence (category-excluded entries never reach this — fn-3.1
 /// filters them out before the facts list is returned)

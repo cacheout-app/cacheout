@@ -223,21 +223,33 @@ actor CacheCleaner {
     private let provider: FileSystemIdentityProvider
     private let sizer: DirectorySizer
     private let pathGuard: PathGuard
+    /// The scan-session container snapshot delete-time `.removeItem`
+    /// admission is identity-bound to (fn-3.4, R9). `nil` is FAIL-CLOSED:
+    /// a cleaner built without a session snapshot refuses every
+    /// `.removeItem` item (`container-unavailable`) — there is no
+    /// fail-open path; the cleaner for a set of items must hold the
+    /// snapshot of the session that produced them.
+    private let containerSnapshot: ContainerSnapshot?
     private nonisolated let trashHandler: TrashHandler
 
     /// - Parameters:
     ///   - home: home directory admission policies and the deny list anchor
     ///     to, and where `.cacheout/cleanup.log` lives (injectable — tests
     ///     pass a fixture home; production the real one).
-    ///   - containerRoots: configured node_modules search roots for
-    ///     `admitContainer`. `nil` uses the scanner's default list for
-    ///     `home`, keeping delete-time admission in lockstep with discovery.
+    ///   - containerRoots: configured container roots for delete-time
+    ///     `.removeItem` admission. `nil` uses the node_modules scanner's
+    ///     default list for `home`, keeping delete-time admission in
+    ///     lockstep with discovery.
+    ///   - containerSnapshot: the producing scan session's container
+    ///     identity snapshot; `nil` refuses every `.removeItem` deletion
+    ///     (fail-closed — category admission is unaffected).
     ///   - provider: identity provider shared with `PathGuard` and the sizer
     ///     (tests may subclass to inject devices/kinds).
     ///   - trashHandler: Trash seam; `nil` uses `FileManager.trashItem`.
     init(
         home: URL = FileManager.default.homeDirectoryForCurrentUser,
         containerRoots: [URL]? = nil,
+        containerSnapshot: ContainerSnapshot? = nil,
         provider: FileSystemIdentityProvider = FileSystemIdentityProvider(),
         trashHandler: TrashHandler? = nil
     ) {
@@ -250,6 +262,7 @@ actor CacheCleaner {
                 ?? NodeModulesScanner.defaultSearchRoots(home: home),
             provider: provider
         )
+        self.containerSnapshot = containerSnapshot
         self.trashHandler = trashHandler ?? { url in
             try FileManager.default.trashItem(at: url, resultingItemURL: nil)
         }
@@ -846,9 +859,26 @@ actor CacheCleaner {
         _ item: ReclaimableItem, origin: URL, target: URL,
         registry: InodeAccountingRegistry, moveToTrash: Bool
     ) async -> (entry: CleanupReport.Entry?, errors: [CleanupReport.ItemError]) {
+        // The scan-session snapshot is the delete-time identity anchor
+        // (fn-3.4, R9). A cleaner built WITHOUT one refuses fail-closed:
+        // the deletion-capable token is structurally unmintable without a
+        // snapshot-bound admission, and this refusal is the runtime face
+        // of that type-level rule.
+        guard let snapshot = containerSnapshot else {
+            let error = PathGuardError.containerUnavailable(path: origin.path)
+            let detail = "\(target.path): \(error.localizedDescription) "
+                + "(no scan-session container snapshot — items must be "
+                + "cleaned with the session that produced them)"
+            logRefusal(
+                label: item.displayName, tag: Self.refusalTag(error),
+                detail: detail
+            )
+            return (nil, [Self.itemError(item, detail)])
+        }
+
         let container: AdmittedContainer
         do {
-            container = try pathGuard.admitContainer(origin)
+            container = try pathGuard.admitContainer(origin, snapshot: snapshot)
             try pathGuard.validateRemovableItem(target, inside: container)
         } catch {
             logRefusal(
@@ -881,8 +911,12 @@ actor CacheCleaner {
         let token = await registry.registerObservations(report.claims)
 
         do {
-            // TOCTOU narrowing, immediately pre-delete.
-            try pathGuard.validateRemovableItem(target, inside: container)
+            // TOCTOU narrowing, immediately pre-delete: the SAME no-follow
+            // + snapshot-identity admission re-runs (a container swapped
+            // between the checks above and here is refused), then the
+            // containment chain re-validates.
+            let recheck = try pathGuard.admitContainer(origin, snapshot: snapshot)
+            try pathGuard.validateRemovableItem(target, inside: recheck)
             if moveToTrash {
                 // A trash failure is an item error — it never falls through
                 // to a permanent delete (R11).
@@ -938,6 +972,7 @@ actor CacheCleaner {
         case .isRootItself: return "root-itself"
         case .notADescendant: return "not-a-descendant"
         case .crossDevice: return "cross-device"
+        case .containerUnavailable: return "container-unavailable"
         }
     }
 

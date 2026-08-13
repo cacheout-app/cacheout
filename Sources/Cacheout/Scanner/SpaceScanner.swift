@@ -362,6 +362,14 @@ enum ValidatedScannerEvent: Sendable {
 /// The producer is private — a consumer can WAIT for it, never steer it
 /// (stream termination remains the one cancellation path).
 struct ValidatedScanSession {
+    /// The session's container-identity snapshot (fn-3.4, R9): every
+    /// REGISTERED container root's no-follow (device, inode), captured
+    /// BEFORE any scanner task launched — so anything swapped DURING the
+    /// scan already mismatches at delete time. Cleaning this session's
+    /// items must go through `makeCleaner(snapshot:)` with THIS snapshot;
+    /// capture is part of the session on purpose (a consumer cannot
+    /// misorder it), and absent roots are omitted (fail-closed downstream).
+    let snapshot: ContainerSnapshot
     /// Progressive validated events — the identical frozen contract
     /// `scanValidated` returns (that API is now a thin wrapper over this).
     let events: AsyncStream<ValidatedScannerEvent>
@@ -495,9 +503,16 @@ struct SpaceScannerRuntime {
     /// registration-validation failure is a programmer error (a malformed or
     /// colliding slug in source) that unit tests catch before it can ship —
     /// there is no runtime input to recover from.
+    /// - Parameter orphanedCachesThresholds: the sweep scanner's
+    ///   classification thresholds (R8). `nil` — the GUI's composition —
+    ///   resolves defaults → UserDefaults; the CLI passes an
+    ///   invocation-scoped layering that additionally folds in its flags
+    ///   (never persisted). Thresholds are scanner-construction state by
+    ///   frozen contract: they do not ride `ScanContext`.
     static func production(
         home: URL = FileManager.default.homeDirectoryForCurrentUser,
-        provider: FileSystemIdentityProvider = FileSystemIdentityProvider()
+        provider: FileSystemIdentityProvider = FileSystemIdentityProvider(),
+        orphanedCachesThresholds: OrphanedCacheClassifier.Thresholds? = nil
     ) -> SpaceScannerRuntime {
         let categories = CacheCategory.allCategories
         let categoryScanner = CategoryScanner(
@@ -507,8 +522,19 @@ struct SpaceScannerRuntime {
         let nodeModulesScanner = NodeModulesScanner(
             home: home, provider: provider
         )
+        // fn-3.3's production resolver, wired in as the classifier's
+        // tri-state predicate; one instance per runtime so its lazy census
+        // is built at most once per process.
+        let installedAppResolver = InstalledAppResolver(home: home)
+        let orphanedCachesScanner = OrphanedCachesScanner(
+            home: home,
+            provider: provider,
+            thresholds: orphanedCachesThresholds
+                ?? OrphanedCachesSweepConfig.resolvedThresholds(),
+            installedAppStatus: { installedAppResolver.status(ofBundleID: $0) }
+        )
         return try! SpaceScannerRuntime(
-            scanners: [categoryScanner, nodeModulesScanner],
+            scanners: [categoryScanner, nodeModulesScanner, orphanedCachesScanner],
             categories: categories,
             home: home,
             provider: provider
@@ -518,12 +544,20 @@ struct SpaceScannerRuntime {
     /// The cleaner configuration derived from registration (R4 groundwork):
     /// delete-time container admission covers exactly the runtime union —
     /// never anything an item claims.
+    ///
+    /// - Parameter snapshot: the container-identity snapshot of the scan
+    ///   session that produced the items this cleaner will consume
+    ///   (`ValidatedScanSession.snapshot`). `nil` is FAIL-CLOSED: every
+    ///   `.removeItem` deletion is refused (`container-unavailable`) —
+    ///   there is deliberately no fail-open path.
     func makeCleaner(
+        snapshot: ContainerSnapshot? = nil,
         trashHandler: CacheCleaner.TrashHandler? = nil
     ) -> CacheCleaner {
         CacheCleaner(
             home: home,
             containerRoots: trustedContainerRoots,
+            containerSnapshot: snapshot,
             provider: provider,
             trashHandler: trashHandler
         )
@@ -1164,6 +1198,16 @@ struct SpaceScannerRuntime {
         scannerIDs: Set<String>? = nil,
         context: ScanContext
     ) -> ValidatedScanSession {
+        // Container-identity capture is PART OF the session (fn-3.4, R9 —
+        // a consumer cannot misorder it): every REGISTERED root, before
+        // any scanner task launches, so a container swapped mid-scan
+        // mismatches at delete time. ALL registered roots on purpose, even
+        // under a scanner subset — capture is cheap (one lstat per root)
+        // and a subset-blind snapshot can never pair a root with the wrong
+        // session.
+        let snapshot = ContainerSnapshot.capture(
+            roots: trustedContainerRoots, provider: provider
+        )
         let selected = scanners.filter { scanner in
             scannerIDs?.contains(scanner.id) ?? true
         }
@@ -1198,7 +1242,9 @@ struct SpaceScannerRuntime {
             continuation.finish()
         }
         continuation.onTermination = { _ in task.cancel() }
-        return ValidatedScanSession(events: events, producer: task)
+        return ValidatedScanSession(
+            snapshot: snapshot, events: events, producer: task
+        )
     }
 
     // MARK: Slug & item-id syntax

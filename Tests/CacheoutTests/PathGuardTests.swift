@@ -40,6 +40,16 @@ final class PathGuardTests: XCTestCase {
         PathGuard(home: fixtureHome, containerRoots: containers, provider: provider)
     }
 
+    /// A scan-session snapshot over the given roots — what the runtime's
+    /// validated-scan entry point captures before launching scanners
+    /// (fn-3.4, R9). Delete-time container admission requires one.
+    private func snapshot(
+        of roots: [URL],
+        provider: FileSystemIdentityProvider = FileSystemIdentityProvider()
+    ) -> ContainerSnapshot {
+        ContainerSnapshot.capture(roots: roots, provider: provider)
+    }
+
     /// Policy with home-relative declared roots (drift allowed), mirroring
     /// `.staticPath` / `.probed`-fallback declarations.
     private func driftPolicy(_ relatives: [String]) -> CategoryAdmissionPolicy {
@@ -283,12 +293,23 @@ final class PathGuardTests: XCTestCase {
         try mkdir(downloads)
         let pathGuard = makeGuard(containers: [documents])
 
-        // Admitted as a container (a place to look)…
-        XCTAssertNoThrow(try pathGuard.admitContainer(documents))
+        // Admitted as a search root (a place to look, scan-time mode)…
+        XCTAssertNoThrow(try pathGuard.admitSearchRoot(documents))
+        // …and as a delete-time container under a session snapshot…
+        XCTAssertNoThrow(try pathGuard.admitContainer(
+            documents, snapshot: snapshot(of: [documents])
+        ))
         // …while deletion-root admission refuses the same URL.
         assertRefused(documents, policy: emptyPolicy, guard: pathGuard)
-        // Unconfigured roots are not containers.
-        XCTAssertThrowsError(try pathGuard.admitContainer(downloads)) { error in
+        // Unconfigured roots are not containers, in EITHER mode.
+        XCTAssertThrowsError(try pathGuard.admitSearchRoot(downloads)) { error in
+            guard case .notAConfiguredContainer? = error as? PathGuardError else {
+                return XCTFail("expected notAConfiguredContainer, got \(error)")
+            }
+        }
+        XCTAssertThrowsError(try pathGuard.admitContainer(
+            downloads, snapshot: snapshot(of: [downloads])
+        )) { error in
             guard case .notAConfiguredContainer? = error as? PathGuardError else {
                 return XCTFail("expected notAConfiguredContainer, got \(error)")
             }
@@ -412,7 +433,10 @@ final class PathGuardTests: XCTestCase {
         try mkdir(documents)
         try mkdir(library)
         let pathGuard = makeGuard(containers: [documents, fixtureHome])
-        let docsContainer = try pathGuard.admitContainer(documents)
+        let sessionSnapshot = snapshot(of: [documents, fixtureHome])
+        let docsContainer = try pathGuard.admitContainer(
+            documents, snapshot: sessionSnapshot
+        )
 
         // Item inside the container: accepted.
         let item = documents.appendingPathComponent("proj/node_modules")
@@ -443,7 +467,9 @@ final class PathGuardTests: XCTestCase {
 
         // Deny-list re-check: a protected first-level child is refused even
         // as a strict descendant of an admitted (home) container.
-        let homeContainer = try pathGuard.admitContainer(fixtureHome)
+        let homeContainer = try pathGuard.admitContainer(
+            fixtureHome, snapshot: sessionSnapshot
+        )
         XCTAssertThrowsError(
             try pathGuard.validateRemovableItem(library, inside: homeContainer)
         ) {
@@ -486,7 +512,9 @@ final class PathGuardTests: XCTestCase {
             (provider.canonicalize(mounted).path, 0xBEEF)
         ]
         let pathGuard = makeGuard(containers: [documents], provider: provider)
-        let container = try pathGuard.admitContainer(documents)
+        let container = try pathGuard.admitContainer(
+            documents, snapshot: snapshot(of: [documents], provider: provider)
+        )
 
         XCTAssertThrowsError(
             try pathGuard.validateRemovableItem(item, inside: container)

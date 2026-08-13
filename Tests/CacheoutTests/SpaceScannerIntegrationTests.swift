@@ -409,8 +409,13 @@ final class SpaceScannerIntegrationTests: XCTestCase {
         // DEFENSE IN DEPTH (frozen R4 design, unchanged): even if such an
         // item reached the cleaner, delete-time admission — derived from
         // the registration union — refuses the undeclared container
-        // independently, and nothing is deleted.
-        let cleaner = runtime.makeCleaner()
+        // independently, and nothing is deleted. The snapshot is present
+        // so the refusal is the CONTAINER-membership verdict, not the
+        // snapshot-less fail-close.
+        let cleaner = runtime.makeCleaner(snapshot: ContainerSnapshot.capture(
+            roots: runtime.trustedContainerRoots,
+            provider: FileSystemIdentityProvider()
+        ))
         let deepReport = await cleaner.clean(
             items: [Self.removeItemFixture(
                 scanner: "fixture_e2e_refusals", key: undeclaredKey,

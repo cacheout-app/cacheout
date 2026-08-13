@@ -196,7 +196,31 @@ class CacheoutViewModel: ObservableObject {
     /// `trustedContainerRoots` reach delete-time admission with ZERO view
     /// model edits (R4).
     private let runtime: SpaceScannerRuntime
-    private let cleaner: CacheCleaner
+
+    // MARK: Session provenance & snapshot pairing (fn-3.4, R9)
+
+    /// The container-identity snapshot of the last COMPLETED scan session —
+    /// adopted atomically WITH that session's freshness set (below), so a
+    /// mid-scan snapshot can never pair old retained items with a new
+    /// container identity. `clean()` builds its cleaner from THIS; nil (no
+    /// completed session yet) fail-closes every `.removeItem` deletion.
+    private var adoptedSnapshot: ContainerSnapshot?
+
+    /// Monotonic scan-session counter: bumped when `scan()` starts.
+    private var sessionGeneration = 0
+    /// The generation whose snapshot `adoptedSnapshot` is — set at scan
+    /// COMPLETION, never mid-scan.
+    private var adoptedGeneration = 0
+    /// Per-scanner session provenance: the generation in which each scanner
+    /// last delivered a VALID outcome (a malformed event deliberately
+    /// clears it). An item is CLEANABLE only when its scanner's provenance
+    /// equals the adopted generation — fn-2's retention rules keep items
+    /// the latest session did NOT produce (malformed retention, an
+    /// undelivered scanner after early termination), and those retained
+    /// rows stay VISIBLE but must never pair with a snapshot their session
+    /// did not capture (fail-closed; cleanability returns when the scanner
+    /// succeeds in a completed session).
+    private var outcomeGenerationByScannerID: [String: Int] = [:]
 
     /// - Parameter runtime: injectable for hermetic tests (fixture scanners
     ///   and homes — zero real-`$HOME` reads); production uses the one
@@ -204,7 +228,6 @@ class CacheoutViewModel: ObservableObject {
     ///   extensibility proof exercises.
     init(runtime: SpaceScannerRuntime = .production()) {
         self.runtime = runtime
-        self.cleaner = runtime.makeCleaner()
 
         let storedInterval = UserDefaults.standard.double(forKey: "cacheout.scanIntervalMinutes")
         self.scanIntervalMinutes = storedInterval > 0 ? storedInterval : 30
@@ -233,14 +256,17 @@ class CacheoutViewModel: ObservableObject {
         outcomesByScannerID[key.scannerID]?.items.first { $0.id == key.itemID }
     }
 
-    /// True while `scannerID`'s LATEST rescan was rejected as malformed.
+    /// True while `scannerID`'s LATEST rescan was rejected as malformed OR
+    /// while its displayed outcome was not produced by the session whose
+    /// snapshot the cleaner would hold (the fn-3.4 freshness gate, R9).
     /// The fail-closed disposition retains the previous items and selections
-    /// for DISPLAY (epic contract — nothing user-set is lost), but validation
-    /// rejected the scanner's current view of the world, so those retained
-    /// records must not reach any DESTRUCTIVE path until a valid outcome
-    /// replaces them (`reconcile` clears the entry, lifting the block).
+    /// for DISPLAY (epic contract — nothing user-set is lost), but those
+    /// retained records must not reach any DESTRUCTIVE path until the
+    /// scanner delivers a valid outcome in a COMPLETED session again
+    /// (`reconcile` + session adoption lift the block together).
     private func isBlockedFromDestructivePaths(_ scannerID: String) -> Bool {
         malformedIssuesByScannerID[scannerID] != nil
+            || outcomeGenerationByScannerID[scannerID] != adoptedGeneration
     }
 
     /// The selected items in presentation order (registry order, then each
@@ -563,6 +589,10 @@ class CacheoutViewModel: ObservableObject {
         // (clean()'s own post-cleanup rescan runs after isCleaning clears.)
         guard !isAnyScanInProgress && !isCleaning else { return }
         scanningScannerIDs = Set(runtime.scanners.map(\.id))
+        // New session: outcomes reconciled from here on carry THIS
+        // generation's provenance — they pair only with THIS session's
+        // snapshot, adopted below at completion (fn-3.4, R9).
+        sessionGeneration += 1
         diskInfo = await Task.detached { DiskInfo.current() }.value
 
         let session = runtime.scanValidatedSession(
@@ -589,6 +619,15 @@ class CacheoutViewModel: ObservableObject {
         scanningScannerIDs = []
         guard completed else { return }
 
+        // Atomic (items, snapshot) adoption (R9): the snapshot and the
+        // generation it vouches for land in ONE MainActor step, only at
+        // COMPLETION. A cancelled scan adopts nothing — outcomes it
+        // reconciled carry the new generation while the adopted one stays
+        // old, so their items are non-cleanable (fail-closed) until a
+        // completed session pairs them with its own capture.
+        adoptedSnapshot = session.snapshot
+        adoptedGeneration = sessionGeneration
+
         pruneVanishedSelections()
 
         // Track scan completion for reactive UI updates
@@ -604,6 +643,13 @@ class CacheoutViewModel: ObservableObject {
         switch event {
         case .outcome(let scannerID, let outcome):
             reconcile(outcome, from: scannerID)
+            // Session provenance (R9): this scanner's displayed outcome now
+            // belongs to the CURRENT generation. Mid-scan that generation
+            // is not yet adopted, so the items are non-cleanable until the
+            // session completes and its snapshot is adopted (cleaning is
+            // blocked mid-scan anyway — this keeps the pairing honest even
+            // if the scan is cancelled before adoption).
+            outcomeGenerationByScannerID[scannerID] = sessionGeneration
             scanningScannerIDs.remove(scannerID)
         case .malformed(let scannerID, let issue):
             // Fail-closed disposition (epic contract): NOTHING published for
@@ -616,6 +662,11 @@ class CacheoutViewModel: ObservableObject {
             // `isBlockedFromDestructivePaths`) until a valid outcome
             // replaces it.
             malformedIssuesByScannerID[scannerID] = issue
+            // The retained items' provenance is REVOKED (R9): whatever
+            // session they came from, they no longer represent a validated
+            // view — non-cleanable until a valid outcome in a completed
+            // session replaces them.
+            outcomeGenerationByScannerID[scannerID] = nil
             scanningScannerIDs.remove(scannerID)
         }
     }
@@ -841,11 +892,18 @@ class CacheoutViewModel: ObservableObject {
     /// composition source, so delete-time admission covers exactly the
     /// registered scanners' declared container roots.
     func clean() async {
-        // Guard at the model, not just the buttons (R11): cleaning while
-        // any scanner is still reporting would act on a half-built result
-        // set.
+        // Guard at the model, not just the buttons (R11 + fn-3.4 session
+        // integrity): cleaning while any scanner is still reporting would
+        // act on a half-built result set — and on items not yet paired
+        // with an adopted session snapshot.
         guard !isCleaning && !isAnyScanInProgress else { return }
         isCleaning = true
+        // The cleaner is built PER CLEAN from the adopted session's
+        // snapshot (R9): `selectedItems` already excludes every scanner
+        // whose outcome that session did not produce, so items and
+        // snapshot are the atomic pair the session adoption established.
+        // No completed session (nil snapshot) fail-closes `.removeItem`.
+        let cleaner = runtime.makeCleaner(snapshot: adoptedSnapshot)
         let report = await cleaner.clean(
             items: selectedItems, moveToTrash: moveToTrash
         )

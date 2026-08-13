@@ -85,6 +85,17 @@ final class CacheCleanerTests: XCTestCase {
             .reduce(0) { $0 + measured($1).exactAllocatedBytes }
     }
 
+    /// A scan-session container snapshot over the given roots — what the
+    /// runtime's validated-scan entry point captures before launching
+    /// scanners (fn-3.4, R9). Delete-time `.removeItem` admission requires
+    /// the producing session's snapshot; a snapshot-less cleaner refuses.
+    private func sessionSnapshot(
+        of roots: [URL],
+        provider: FileSystemIdentityProvider = FileSystemIdentityProvider()
+    ) -> ContainerSnapshot {
+        ContainerSnapshot.capture(roots: roots, provider: provider)
+    }
+
     /// Two directory entries, one inode (8192 bytes allocated).
     private func makeHardlinkPair(
         in dir: URL, name: String = "hl"
@@ -398,7 +409,9 @@ final class CacheCleanerTests: XCTestCase {
             ))
         }
 
-        let cleaner = CacheCleaner(containerRoots: [root])
+        let cleaner = CacheCleaner(
+            containerRoots: [root], containerSnapshot: sessionSnapshot(of: [root])
+        )
         let report = await cleaner.clean(results: [], nodeModules: items, moveToTrash: false)
 
         XCTAssertTrue(report.errors.isEmpty, "unexpected errors: \(report.errors)")
@@ -436,7 +449,9 @@ final class CacheCleanerTests: XCTestCase {
                             originContainer: root, isSelected: true),
         ]
 
-        let cleaner = CacheCleaner(containerRoots: [root])
+        let cleaner = CacheCleaner(
+            containerRoots: [root], containerSnapshot: sessionSnapshot(of: [root])
+        )
         let report = await cleaner.clean(results: [], nodeModules: items, moveToTrash: false)
 
         XCTAssertEqual(report.errors.count, 1, "exactly one missing item should surface as error")
@@ -464,7 +479,9 @@ final class CacheCleanerTests: XCTestCase {
             isSelected: false
         )
 
-        let cleaner = CacheCleaner(containerRoots: [root])
+        let cleaner = CacheCleaner(
+            containerRoots: [root], containerSnapshot: sessionSnapshot(of: [root])
+        )
         let report = await cleaner.clean(results: [], nodeModules: [item], moveToTrash: false)
 
         XCTAssertTrue(report.entries.isEmpty)
@@ -654,7 +671,9 @@ final class CacheCleanerTests: XCTestCase {
             projectName: "app", projectPath: projectDir, nodeModulesPath: nm,
             sizeBytes: 999, lastModified: nil, originContainer: root, isSelected: true
         )
-        let cleaner = CacheCleaner(containerRoots: [root])
+        let cleaner = CacheCleaner(
+            containerRoots: [root], containerSnapshot: sessionSnapshot(of: [root])
+        )
         let report = await cleaner.clean(results: [], nodeModules: [item], moveToTrash: false)
 
         XCTAssertTrue(report.errors.isEmpty, "unexpected errors: \(report.errors)")
@@ -678,7 +697,9 @@ final class CacheCleanerTests: XCTestCase {
             nodeModulesPath: nm, sizeBytes: 16, lastModified: nil,
             originContainer: nil, isSelected: true
         )
-        let cleaner = CacheCleaner(containerRoots: [root])
+        let cleaner = CacheCleaner(
+            containerRoots: [root], containerSnapshot: sessionSnapshot(of: [root])
+        )
         let report = await cleaner.clean(results: [], nodeModules: [item], moveToTrash: false)
 
         XCTAssertTrue(report.entries.isEmpty)
@@ -752,7 +773,10 @@ final class CacheCleanerTests: XCTestCase {
             nodeModulesPath: nm, sizeBytes: 16, lastModified: nil,
             originContainer: elsewhere, isSelected: true
         )
-        let cleaner = CacheCleaner(containerRoots: [configured])
+        let cleaner = CacheCleaner(
+            containerRoots: [configured],
+            containerSnapshot: sessionSnapshot(of: [configured])
+        )
         let report = await cleaner.clean(results: [], nodeModules: [item], moveToTrash: false)
 
         XCTAssertTrue(report.entries.isEmpty)
@@ -781,7 +805,11 @@ final class CacheCleanerTests: XCTestCase {
             nodeModulesPath: nm, sizeBytes: 16, lastModified: nil,
             originContainer: root, isSelected: true
         )
-        let cleaner = CacheCleaner(containerRoots: [root], provider: provider)
+        let cleaner = CacheCleaner(
+            containerRoots: [root],
+            containerSnapshot: sessionSnapshot(of: [root], provider: provider),
+            provider: provider
+        )
         let report = await cleaner.clean(results: [], nodeModules: [item], moveToTrash: false)
 
         XCTAssertTrue(report.entries.isEmpty)
@@ -897,7 +925,11 @@ final class CacheCleanerTests: XCTestCase {
             nodeModulesPath: nm, sizeBytes: 16, lastModified: nil,
             originContainer: root, isSelected: true
         )
-        let cleaner = CacheCleaner(containerRoots: [root], provider: provider)
+        let cleaner = CacheCleaner(
+            containerRoots: [root],
+            containerSnapshot: sessionSnapshot(of: [root], provider: provider),
+            provider: provider
+        )
         let report = await cleaner.clean(
             results: [], nodeModules: [item], moveToTrash: false
         )
@@ -1468,6 +1500,7 @@ final class CacheCleanerTests: XCTestCase {
         )
         let cleaner = CacheCleaner(
             containerRoots: [root],
+            containerSnapshot: sessionSnapshot(of: [root]),
             trashHandler: makeTrashSeam(into: trashDir, recorder: recorder)
         )
         let report = await cleaner.clean(results: [], nodeModules: [item], moveToTrash: true)
@@ -1517,7 +1550,10 @@ final class CacheCleanerTests: XCTestCase {
             exact: 2048
         )
 
-        let cleaner = CacheCleaner(containerRoots: [container])
+        let cleaner = CacheCleaner(
+            containerRoots: [container],
+            containerSnapshot: sessionSnapshot(of: [container])
+        )
         let report = await cleaner.clean(
             items: [contentsItem, removeItem, commandsItem], moveToTrash: false
         )
@@ -1859,7 +1895,10 @@ final class CacheCleanerTests: XCTestCase {
         let target = container.appendingPathComponent("ghost/node_modules")
         let item = makeRemoveItem(origin: container, target: target)
 
-        let cleaner = CacheCleaner(containerRoots: [container])
+        let cleaner = CacheCleaner(
+            containerRoots: [container],
+            containerSnapshot: sessionSnapshot(of: [container])
+        )
         let report = await cleaner.clean(items: [item], moveToTrash: false)
 
         XCTAssertTrue(report.entries.isEmpty)
@@ -1917,7 +1956,10 @@ final class CacheCleanerTests: XCTestCase {
         try FileManager.default.createSymbolicLink(at: link, withDestinationURL: external)
 
         let item = makeRemoveItem(origin: container, target: link)
-        let cleaner = CacheCleaner(containerRoots: [container])
+        let cleaner = CacheCleaner(
+            containerRoots: [container],
+            containerSnapshot: sessionSnapshot(of: [container])
+        )
         let report = await cleaner.clean(items: [item], moveToTrash: false)
 
         XCTAssertTrue(report.errors.isEmpty, "unexpected errors: \(report.errors)")
@@ -1954,7 +1996,10 @@ final class CacheCleanerTests: XCTestCase {
             id: "item-b", displayName: "proj-b", origin: container, target: dirB
         )
 
-        let cleaner = CacheCleaner(containerRoots: [container])
+        let cleaner = CacheCleaner(
+            containerRoots: [container],
+            containerSnapshot: sessionSnapshot(of: [container])
+        )
         let report = await cleaner.clean(items: [itemA, itemB], moveToTrash: false)
 
         XCTAssertTrue(report.errors.isEmpty, "unexpected errors: \(report.errors)")
@@ -2270,7 +2315,10 @@ final class CacheCleanerTests: XCTestCase {
             ),
         ]
 
-        let cleaner = CacheCleaner(containerRoots: [container])
+        let cleaner = CacheCleaner(
+            containerRoots: [container],
+            containerSnapshot: sessionSnapshot(of: [container])
+        )
         let report = await cleaner.clean(items: items, moveToTrash: false)
 
         XCTAssertEqual(report.entries.count, 3)
@@ -2329,7 +2377,9 @@ final class CacheCleanerTests: XCTestCase {
             home: home,
             provider: FileSystemIdentityProvider()
         )
-        let cleaner = runtime.makeCleaner()
+        let cleaner = runtime.makeCleaner(
+            snapshot: sessionSnapshot(of: runtime.trustedContainerRoots)
+        )
 
         let goodItem = makeRemoveItem(
             id: "good", displayName: "good",

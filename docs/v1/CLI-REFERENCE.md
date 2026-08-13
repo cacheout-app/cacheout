@@ -71,7 +71,18 @@ the full list.
 
 ```bash
 Cacheout --cli scan
+Cacheout --cli scan --orphan-size-floor-mb 100 --orphan-stale-days 30
 ```
+
+**Options:**
+
+| Flag | Description |
+|------|-------------|
+| `--orphan-size-floor-mb N` | Orphaned-caches sweep: stale-large size floor in DECIMAL megabytes (positive integer) for this invocation only — overrides the persisted `cacheout.orphanedCaches.sizeFloorMB`, never persisted. Default 50 |
+| `--orphan-stale-days N` | Orphaned-caches sweep: stale-large age in days (positive integer) for this invocation only — overrides the persisted `cacheout.orphanedCaches.staleAgeDays`, never persisted. Default 60 |
+
+Zero, negative, non-numeric, or overflowing flag values are refused with
+`INVALID_ARGUMENTS`.
 
 **Output (schema 4 envelope):**
 ```json
@@ -171,6 +182,7 @@ Cacheout --cli clean xcode_derived_data --dry-run
 |------|-------------|
 | `--confirm` | Actually delete. Without it (and without `--dry-run`) the command refuses: exit 1, empty stdout, `CONFIRMATION_REQUIRED` on stderr with the cleaning plan in `details` |
 | `--dry-run` | Preview what would be cleaned without deleting (wins even beside `--confirm`) |
+| `--orphan-size-floor-mb N` / `--orphan-stale-days N` | Invocation-scoped orphaned-caches sweep thresholds (same semantics as on `scan`; never persisted). NOT accepted by `smart-clean` — it is category-only and refuses them with `INVALID_ARGUMENTS` |
 
 Running as root (euid 0) is refused with `ROOT_REFUSED`, flags or not.
 Calling `clean` with no targets is a `MISSING_ARGUMENT` usage error; unknown
@@ -522,6 +534,7 @@ Per-item scanner slugs (usable bare or as `<slug>:<item-id>`):
 | Slug | Scanner |
 |------|---------|
 | `node_modules` | Project node_modules directories (item ids from `scan`'s `scanner_items`) |
+| `orphaned_caches` | First-level `~/Library/Caches` sweep — leaked, orphaned, and stale cache entries (item ids from `scan`'s `scanner_items`; see [CATEGORIES.md](CATEGORIES.md)) |
 
 ---
 

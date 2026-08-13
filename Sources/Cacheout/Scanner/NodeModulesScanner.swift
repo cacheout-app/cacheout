@@ -10,9 +10,10 @@
 /// and gets none of the enumerator's symlink guarantees. Three lstat gates
 /// close the escape vectors:
 ///
-/// 1. **Search roots** are admitted through `PathGuard.admitContainer(_:)`
-///    (configured containers only) AND must themselves be real directories —
-///    a symlink search root is never traversed.
+/// 1. **Search roots** are admitted through `PathGuard.admitSearchRoot(_:)`
+///    (configured containers only, read-only traversal mode) AND must
+///    themselves be real directories — a symlink search root is never
+///    traversed.
 /// 2. **Every manual descent** re-checks `provider.kind(of:) == .directory`
 ///    (lstat, no-follow) — a nested symlink to an external tree is never
 ///    followed.
@@ -263,9 +264,11 @@ actor NodeModulesScanner {
                 }
                 guard currentFileManager.fileExists(atPath: root.path) else { continue }
 
-                // Container admission BEFORE any traversal (R19).
+                // Container admission BEFORE any traversal (R19) — the
+                // SCAN-TIME read-only mode (fn-3.4 round 9): scanners never
+                // hold session snapshots, and this token cannot delete.
                 do {
-                    _ = try pathGuard.admitContainer(root)
+                    _ = try pathGuard.admitSearchRoot(root)
                 } catch {
                     allIssues.append(NodeModulesScanIssue(
                         url: root, kind: .containerRefused,

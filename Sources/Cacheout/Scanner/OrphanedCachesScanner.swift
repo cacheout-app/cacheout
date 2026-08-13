@@ -6,10 +6,12 @@
 /// only reclaims what its authors have already seen leak — this scanner
 /// enumerates the caches directory and explains what it finds.
 ///
-/// This file currently holds the PROTOCOL-INDEPENDENT enumeration half: it
-/// produces per-entry FACTS, no judgments. Classification (tiers, risk,
-/// evidence) is fn-3.2; installed-app resolution is fn-3.3; `SpaceScanner`
-/// conformance, config, and registration land in fn-3.4 (in this same file).
+/// The file holds two layers: the PROTOCOL-INDEPENDENT enumeration half
+/// (fn-3.1 — per-entry FACTS, no judgments) and the fn-3.4 assembly — the
+/// `SpaceScanner` conformance that pipes facts → classifier (fn-3.2, with
+/// fn-3.3's resolver as its predicate) → `ReclaimableItem`s, plus the
+/// config surface (`OrphanedCachesSweepConfig`). Registration lives in
+/// `SpaceScannerRuntime.production`.
 ///
 /// ## Rules the enumeration enforces
 ///
@@ -138,7 +140,17 @@ struct UserDataShapePattern: Equatable {
 
 // MARK: - OrphanedCachesScanner (enumeration core)
 
-struct OrphanedCachesScanner {
+/// `@unchecked Sendable` under the same discipline as the other scanners
+/// (`SpaceScanner: Sendable`): every stored property is an immutable `let`;
+/// `FileSystemIdentityProvider` and `DirectorySizer` hold no mutable state;
+/// `FileManager.default` is documented thread-safe; both stored closures
+/// are `@Sendable` by type.
+struct OrphanedCachesScanner: @unchecked Sendable {
+
+    /// Stable scanner slug (fn-3.4) — the CLI address prefix
+    /// (`orphaned_caches:<item-id>`) and the GUI section key. PERMANENT
+    /// external contract; matches the address grammar `[a-z0-9_]+`.
+    static let registeredID = "orphaned_caches"
 
     /// The production sweep root, relative to home. First-level entries of
     /// this directory only — no `/Library/Caches` (system domain), no
@@ -173,13 +185,32 @@ struct OrphanedCachesScanner {
     private let probeDepthLimit: Int
     private let probeEntryLimit: Int
 
+    /// Classification thresholds (R8) — scanner-CONSTRUCTION state by
+    /// frozen contract (they never ride `ScanContext`). The composition
+    /// site layers defaults → UserDefaults → CLI flags
+    /// (`OrphanedCachesSweepConfig`).
+    let thresholds: OrphanedCacheClassifier.Thresholds
+    /// fn-3.3's tri-state resolver, injected as a plain predicate (fn-3.2's
+    /// classifier contract). The default never orphan-classifies —
+    /// production wires `InstalledAppResolver.status(ofBundleID:)`.
+    private let installedAppStatus: @Sendable (String) -> InstalledAppStatus
+    /// Injected clock for stale-age math — a PROVIDER (not a `Date`)
+    /// because the scanner is long-lived and each scan must classify
+    /// against its own "now".
+    private let now: @Sendable () -> Date
+
     init(
         home: URL,
         cachesRoot: URL? = nil,
         categories: [CacheCategory] = CacheCategory.allCategories,
         provider: FileSystemIdentityProvider = FileSystemIdentityProvider(),
         probeDepthLimit: Int = 3,
-        probeEntryLimit: Int = 512
+        probeEntryLimit: Int = 512,
+        thresholds: OrphanedCacheClassifier.Thresholds =
+            OrphanedCachesSweepConfig.defaultThresholds,
+        installedAppStatus: @escaping @Sendable (String) -> InstalledAppStatus =
+            { _ in .unknown },
+        now: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.home = home
         self.cachesRoot = cachesRoot
@@ -189,6 +220,9 @@ struct OrphanedCachesScanner {
         self.sizer = DirectorySizer(provider: provider)
         self.probeDepthLimit = probeDepthLimit
         self.probeEntryLimit = probeEntryLimit
+        self.thresholds = thresholds
+        self.installedAppStatus = installedAppStatus
+        self.now = now
     }
 
     // MARK: - Enumeration
@@ -421,5 +455,351 @@ struct OrphanedCachesScanner {
         // Table order, deduplicated — deterministic output for fn-3.2.
         let names = Self.userDataShapePatterns.map(\.name).filter(matched.contains)
         return (names, complete)
+    }
+}
+
+// MARK: - Config surface (fn-3.4, R8)
+
+/// The sweep's two knobs — size floor (decimal MB) and stale age (days) —
+/// layered defaults → UserDefaults → CLI flags at the COMPOSITION site
+/// (`SpaceScannerRuntime.production` / the CLI handlers). Fail-safe by
+/// contract: conversions are overflow-checked and never trap; an invalid
+/// PERSISTED value (≤ 0, non-numeric, non-integral, overflow) falls back to
+/// the default for that scan and is NEVER rewritten — a value this build
+/// cannot read may be meaningful to another build.
+enum OrphanedCachesSweepConfig {
+
+    /// UserDefaults keys, per the `cacheout.*` precedent
+    /// (`CacheoutViewModel`).
+    static let sizeFloorMBKey = "cacheout.orphanedCaches.sizeFloorMB"
+    static let staleAgeDaysKey = "cacheout.orphanedCaches.staleAgeDays"
+
+    static let defaultSizeFloorMB: Int64 = 50
+    static let defaultStaleAgeDays: Int64 = 60
+
+    /// 50 MB / 60 days, through the same checked conversions as every other
+    /// value (the force-unwraps are compile-time constants proven finite).
+    static let defaultThresholds = OrphanedCacheClassifier.Thresholds(
+        sizeFloorBytes: sizeFloorBytes(fromMB: defaultSizeFloorMB)!,
+        staleAge: staleAge(fromDays: defaultStaleAgeDays)!
+    )
+
+    /// MB → bytes at ×1,000,000 — DECIMAL, matching the app's base-10
+    /// `ByteCountFormatter` display convention. `nil` on non-positive or
+    /// overflowing input (never traps).
+    static func sizeFloorBytes(fromMB megabytes: Int64) -> Int64? {
+        guard megabytes > 0 else { return nil }
+        let (bytes, overflow) = megabytes
+            .multipliedReportingOverflow(by: 1_000_000)
+        return overflow ? nil : bytes
+    }
+
+    /// Days → seconds at ×86,400, overflow-checked in integer space before
+    /// the `TimeInterval` conversion. `nil` on non-positive or overflowing
+    /// input (never traps).
+    static func staleAge(fromDays days: Int64) -> TimeInterval? {
+        guard days > 0 else { return nil }
+        let (seconds, overflow) = days.multipliedReportingOverflow(by: 86_400)
+        return overflow ? nil : TimeInterval(seconds)
+    }
+
+    /// The layered resolution: an invocation-scoped OVERRIDE (CLI flag —
+    /// already validated by the CLI's invalid-arguments gate) wins; else a
+    /// VALID persisted value; else the default. Each half resolves
+    /// independently, and nothing is ever written back to UserDefaults.
+    static func resolvedThresholds(
+        defaults: UserDefaults = .standard,
+        sizeFloorMBOverride: Int64? = nil,
+        staleAgeDaysOverride: Int64? = nil
+    ) -> OrphanedCacheClassifier.Thresholds {
+        let floorMB = sizeFloorMBOverride
+            ?? persistedPositiveInteger(defaults.object(forKey: sizeFloorMBKey))
+        let ageDays = staleAgeDaysOverride
+            ?? persistedPositiveInteger(defaults.object(forKey: staleAgeDaysKey))
+        // A value that parses but overflows its conversion is INVALID too —
+        // same fallback, still no rewrite.
+        return OrphanedCacheClassifier.Thresholds(
+            sizeFloorBytes: floorMB.flatMap(sizeFloorBytes(fromMB:))
+                ?? defaultThresholds.sizeFloorBytes,
+            staleAge: ageDays.flatMap(staleAge(fromDays:))
+                ?? defaultThresholds.staleAge
+        )
+    }
+
+    /// A persisted value read as a positive INTEGER, or nil when it is
+    /// absent or invalid (non-numeric, non-integral, zero, negative, or
+    /// past Int64). Both NSNumber (the normal `set(_:forKey:)` shapes) and
+    /// numeric strings are accepted — nothing else.
+    static func persistedPositiveInteger(_ stored: Any?) -> Int64? {
+        if let number = stored as? NSNumber {
+            let value = number.doubleValue
+            guard value.isFinite, value > 0,
+                  value == value.rounded(),
+                  let integer = Int64(exactly: value.rounded())
+            else { return nil }
+            return integer
+        }
+        if let string = stored as? String {
+            guard let integer = Int64(string), integer > 0 else { return nil }
+            return integer
+        }
+        return nil
+    }
+}
+
+// MARK: - SpaceScanner conformance (fn-3.4)
+
+extension OrphanedCachesScanner: SpaceScanner {
+
+    var id: String { Self.registeredID }
+    var displayName: String { "Orphaned Caches" }
+
+    /// The sweep root, declared at registration — this is HOW the container
+    /// reaches the cleaner: the runtime unions scanner-declared roots into
+    /// PathGuard's delete-time admission (nothing item-side can widen it).
+    var trustedContainerRoots: [URL] { [cachesRoot] }
+
+    /// Protocol scan. The sweep ignores `categoryFilter` (category-scanner
+    /// only) and runs on BOTH triggers — `~/Library/Caches` is not a
+    /// TCC-gated search root; per-entry TCC denials are still classified by
+    /// the sizer and propagated per R7.
+    func scan(context: ScanContext) async -> ScanOutcome {
+        switch enumerateFacts() {
+        case .rootNotADirectory(let kind):
+            // A symlinked/non-directory sweep root is NEVER traversed —
+            // the scanner-level issue fn-2 defined for exactly this.
+            return ScanOutcome(items: [], errors: [ScanIssue(
+                url: cachesRoot,
+                kind: .symlinkRoot,
+                detail: "sweep root is not a real directory "
+                    + "(\(Self.describe(kind))) — never traversed"
+            )])
+        case .rootUnreadable(let denial):
+            // Root-level denial → classified ScanOutcome error (R7): the
+            // GUI/CLI show "couldn't scan ~/Library/Caches", never an
+            // empty-looking success (D6).
+            return ScanOutcome(items: [], errors: [ScanIssue(
+                url: denial.url,
+                kind: Self.rootIssueKind(for: denial.kind),
+                detail: denial.detail
+            )])
+        case .entries(let facts):
+            let classifier = OrphanedCacheClassifier(
+                thresholds: thresholds,
+                installedAppStatus: installedAppStatus,
+                now: now()
+            )
+            // classifyForOutput applies the frozen output-set rule AND the
+            // frozen deterministic order — the mapping preserves it 1:1.
+            let items = classifier.classifyForOutput(facts)
+                .map(reclaimableItem(from:))
+            return ScanOutcome(items: items, errors: [])
+        }
+    }
+
+    // MARK: Item mapping (field by field — the fn-2 validator's invariants
+    // are load-bearing here; see each field's note)
+
+    /// One sweep entry's classification → one `ReclaimableItem`.
+    ///
+    /// State mapping (mount-boundary doctrine per the as-merged
+    /// `NodeModulesScanner.reclaimableItem` — delete refuses a
+    /// boundary-bearing target ENTIRELY, so `.partiallyDenied` is reserved
+    /// for walk-denial impediments, where deletion partially succeeds):
+    ///
+    /// - ANY mount boundary (root or nested, measured content or not) →
+    ///   `.denied`, ZERO components (components mean "deletion frees
+    ///   these"; deletion frees nothing), the measured floor riding the
+    ///   boundary-naming scanError message.
+    /// - walk denial(s), no boundary + measured something →
+    ///   `.partiallyDenied` with real components.
+    /// - walk denial(s), no boundary + measured nothing → `.denied`, zero
+    ///   components.
+    /// - clean walk → `.measured` / `.empty`.
+    private func reclaimableItem(
+        from classification: SweepClassification
+    ) -> ReclaimableItem {
+        let entry = classification.entry
+        let hasBoundary = entry.rootMountBoundary
+            || !entry.mountBoundaries.isEmpty
+        let measuredAnything = entry.itemCount > 0 || entry.allocatedBytes > 0
+
+        let state: ScanState
+        if hasBoundary {
+            state = .denied
+        } else if !entry.denials.isEmpty {
+            state = measuredAnything ? .partiallyDenied : .denied
+        } else {
+            state = measuredAnything ? .measured : .empty
+        }
+        let deletable = state == .measured || state == .partiallyDenied
+
+        // Identity path, FROZEN (epic rule): canonical PARENT chain +
+        // UNRESOLVED leaf. Fully canonicalizing the leaf would point
+        // identity and display OUTSIDE the container for symlink entries,
+        // and two symlink entries sharing one target would collide on one
+        // id — which fn-2's outcome validation rejects as duplicate ids,
+        // poisoning the ENTIRE outcome. The ORIGINAL unresolved spelling
+        // stays the deletion input (`requestedTargetURL` / `requestedURL`).
+        let identity = provider.resolveTargetKeepingLeaf(entry.url)
+
+        // Exactly ONE root record (a missing entry never becomes an item).
+        // `.deniedUnmeasured` iff nothing deletable was established —
+        // matching the frozen truth table and check (e)'s `.denied` shape.
+        let record = RootScanRecord(
+            requestedURL: entry.url,
+            resolvedURL: identity,
+            status: state == .denied ? .deniedUnmeasured : .measured
+        )
+
+        // Selection triple: the classifier's clean-knownLeak-only flags,
+        // additionally gated on a cleanly `.measured` state — an `.empty`
+        // leak row (e.g. a glob-matching symlink) is unselectable in every
+        // surface, and the item itself must not claim otherwise.
+        let selectable = classification.defaultSelected && state == .measured
+
+        let isStale: Bool?
+        switch classification.tier {
+        case .staleLarge:
+            isStale = true
+        case .knownLeak, .orphan, .unclassified:
+            // Staleness is knowable only when the walk dated content.
+            isStale = entry.newestContentDate == nil ? nil : false
+        }
+
+        return ReclaimableItem(
+            id: ReclaimableItem.stableID(
+                scannerID: Self.registeredID, canonicalPath: identity.path
+            ),
+            scannerID: Self.registeredID,
+            displayName: entry.name,
+            // A `.denied` item publishes ZERO components (frozen coherence
+            // shape): every consumer reads them as "deletion frees these",
+            // and deletion is refused. The boundary case's measured floor
+            // rides the scanError message instead.
+            exactBytes: deletable ? entry.exactBytes : 0,
+            estimatedUpToBytes: deletable ? entry.estimatedUpToBytes : 0,
+            // Only the sparse-divergence direction that matters for honest
+            // display (logical exceeding allocated — deletion frees LESS
+            // than the apparent size); block-rounding noise stays nil.
+            logicalBytes: deletable && entry.logicalBytes > entry.allocatedBytes
+                ? entry.logicalBytes : nil,
+            itemCount: deletable ? entry.itemCount : 0,
+            // DISPLAY ONLY (destructive-target rule) — the same identity
+            // the binding record resolves to, per check (f)'s
+            // display-identity rule.
+            url: identity,
+            declaredDisplayPath: Self.displayPath(of: entry.url, home: home),
+            rootRecords: [record],
+            state: state,
+            scanError: Self.sweepScanError(for: entry),
+            risk: classification.risk,
+            // The item model carries ONE evidence string; the classifier's
+            // deterministic lines join in order.
+            evidence: classification.evidence.joined(separator: "; "),
+            rebuildNote: classification.tier == .orphan
+                ? "reinstalling the app recreates its cache" : nil,
+            // `.removeItem` — the entry directory ITSELF is deleted, trash
+            // honored via fn-2's cleaner. NOT `.removeContents`: the frozen
+            // validator reserves that for category provenance.
+            action: .removeItem,
+            // Frozen arm: origin = the scanner's own declared container
+            // (check (f) binds it to the registration declaration), target
+            // = the UNRESOLVED entry spelling (leaf never resolved — fn-1
+            // dual-canonicalization doctrine).
+            admission: .containerItem(
+                originContainer: cachesRoot,
+                requestedTargetURL: entry.url
+            ),
+            defaultSelected: selectable,
+            automaticCleanEligible: selectable,
+            isStale: isStale
+        )
+    }
+
+    /// The single `scanError`, by FROZEN precedence when conditions coexist
+    /// (an entry can carry BOTH a denial and a mount boundary; either-order
+    /// overwrites would suppress the TCC grant hint): `tccDenied` →
+    /// `permissionDenied` → other denial (`.other`) → mount boundary
+    /// (`.other`, boundary detail). The most ACTIONABLE error wins the one
+    /// error slot; EVERY condition still appears in the item's evidence,
+    /// and the state is the more severe mapping regardless.
+    static func sweepScanError(for entry: SweptCacheEntry) -> ScanError? {
+        let denials = entry.denials
+        if let ranked = denials.first(where: { $0.kind == .tcc })
+            ?? denials.first(where: { $0.kind == .permission })
+            ?? denials.first {
+            return ScanError(
+                kind: ranked.kind.scanErrorKind,
+                message: "\(ranked.url.path): \(ranked.detail)"
+            )
+        }
+        guard entry.rootMountBoundary || !entry.mountBoundaries.isEmpty else {
+            return nil
+        }
+        return mountBoundaryScanError(for: entry)
+    }
+
+    /// The boundary-naming error, mirroring the as-merged
+    /// `NodeModulesScanner` doctrine: `.other` (a boundary is neither TCC
+    /// nor BSD permissions, and no grant would lift it), the message naming
+    /// the boundary — and carrying the measured floor when the walk
+    /// measured readable content beside it, because the item's byte
+    /// components must stay zero (they mean "deletion frees these", and a
+    /// boundary-bearing target is refused whole).
+    private static func mountBoundaryScanError(
+        for entry: SweptCacheEntry
+    ) -> ScanError {
+        let boundary = entry.mountBoundaries.first ?? entry.url
+        var message = entry.rootMountBoundary
+            ? "\(boundary.path): item is a mount point — not measured; "
+                + "deletion would be refused"
+            : "mount boundary at \(boundary.path) — subtree not measured; "
+                + "deletion would be refused"
+        if entry.itemCount > 0 || entry.allocatedBytes > 0 {
+            let floor = CleanupReport.componentPhrase(
+                exact: entry.exactBytes,
+                estimatedUpTo: entry.estimatedUpToBytes
+            )
+            message += " (\(floor) measured beside the boundary is not "
+                + "reclaimable while the boundary remains)"
+        }
+        return ScanError(kind: .other, message: message)
+    }
+
+    /// Root-level denial → `ScanIssue.Kind`, same taxonomy as the sizer's
+    /// classification (R7).
+    private static func rootIssueKind(
+        for kind: SizeDenial.Kind
+    ) -> ScanIssue.Kind {
+        switch kind {
+        case .tcc: return .tccDenied
+        case .permission: return .permissionDenied
+        case .metadata, .other: return .unreadable
+        }
+    }
+
+    private static func describe(
+        _ kind: FileSystemIdentityProvider.FileKind
+    ) -> String {
+        switch kind {
+        case .regularFile: return "regular file"
+        case .directory: return "directory"
+        case .symlink: return "symlink"
+        case .other: return "special file"
+        }
+    }
+
+    /// The declared display spelling: the entry's unresolved path,
+    /// home-shortened to `~` on a PATH-COMPONENT boundary (a sibling that
+    /// merely string-prefixes the home path must never render as `~…`,
+    /// least of all beside a destructive `.removeItem` action).
+    private static func displayPath(of url: URL, home: URL) -> String {
+        let path = url.path
+        let homePath = home.path
+        if path == homePath { return "~" }
+        let prefix = homePath.hasSuffix("/") ? homePath : homePath + "/"
+        guard path.hasPrefix(prefix) else { return path }
+        return "~/" + path.dropFirst(prefix.count)
     }
 }

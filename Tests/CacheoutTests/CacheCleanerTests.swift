@@ -2355,4 +2355,34 @@ final class CacheCleanerTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: foreignTarget.path),
                       "an item claiming an unregistered container is refused — items cannot widen admission")
     }
+
+    // MARK: - Bounded subprocess wait primitive (waitUntilExit flake fix)
+
+    func testWaitForExitObservesFastExitAndBoundsSlowChild() throws {
+        // Every command/probe wait goes through `waitForExit(within:)` —
+        // never `waitUntilExit()`, which misses its termination wakeup
+        // under concurrent process spawning/reaping and misreported
+        // millisecond commands as 30s timeouts. Fast path: a trivial child
+        // is observed exited within a generous bound.
+        let fast = Process()
+        fast.executableURL = URL(fileURLWithPath: "/usr/bin/true")
+        try fast.run()
+        XCTAssertTrue(fast.waitForExit(within: 10),
+                      "a trivially-fast child is observed exited within the bound")
+        XCTAssertEqual(fast.terminationStatus, 0,
+                       "terminationStatus is readable once the wait reports exit")
+
+        // Bound path: the deadline caps the wait (`false`, caller owns
+        // termination policy) instead of blocking. `sleep 30` cannot exit
+        // within 0.2s, so this is deterministic — not a race.
+        let slow = Process()
+        slow.executableURL = URL(fileURLWithPath: "/bin/sleep")
+        slow.arguments = ["30"]
+        try slow.run()
+        XCTAssertFalse(slow.waitForExit(within: 0.2),
+                       "a still-running child bounds out as false")
+        slow.terminate()
+        XCTAssertTrue(slow.waitForExit(within: 10),
+                      "termination after a bounded refusal is still observed")
+    }
 }

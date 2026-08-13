@@ -980,15 +980,15 @@ actor CacheCleaner {
 
         try process.run()
 
-        let deadline = DispatchTime.now() + .seconds(30)
-        let group = DispatchGroup()
-        group.enter()
-        DispatchQueue.global().async {
-            process.waitUntilExit()
-            group.leave()
-        }
-
-        if group.wait(timeout: deadline) == .timedOut {
+        // Bounded poll — NEVER `waitUntilExit()` observed from a helper
+        // thread (the previous DispatchGroup pattern): `waitUntilExit` can
+        // miss its termination wakeup under concurrent process
+        // spawning/reaping (see `Process.waitForExit(within:)`), so a
+        // trivially-successful command was misreported as timed out after
+        // the full 30s — and the helper thread stayed blocked forever.
+        // Timeout contract unchanged: 30 seconds, `terminate()` on expiry,
+        // same error text, then the exit-status check.
+        guard process.waitForExit(within: 30) else {
             process.terminate()
             throw NSError(domain: "CacheCleaner", code: -1,
                           userInfo: [NSLocalizedDescriptionKey: "Clean command timed out after 30s"])

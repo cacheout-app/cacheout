@@ -31,6 +31,7 @@
 /// resolved root passes `PathGuard` admission (R17).
 
 import Foundation
+import Darwin
 
 /// Risk level classification for cache categories, indicating how safe it is to delete.
 enum RiskLevel: String, CaseIterable {
@@ -204,11 +205,19 @@ struct CacheCategory: Identifiable, Hashable {
 
         do {
             try process.run()
-            process.waitUntilExit()
-            return process.terminationStatus == 0
         } catch {
             return false
         }
+
+        // Bounded wait (2s, the probe-timeout doctrine): `which` answers in
+        // milliseconds, and the unbounded `waitUntilExit()` this replaces
+        // could block a scan forever when the termination wakeup is missed
+        // (see `Process.waitForExit(within:)`).
+        guard process.waitForExit(within: 2) else {
+            process.terminate()
+            return false
+        }
+        return process.terminationStatus == 0
     }
 
     private func runProbe(_ command: String, home: URL) -> String? {
@@ -237,25 +246,90 @@ struct CacheCategory: Identifiable, Hashable {
             return nil
         }
 
+        // 2-second timeout to prevent hanging on interactive prompts.
+        //
+        // Single-threaded on purpose: the previous
+        // read-to-EOF-then-`waitUntilExit()`-on-a-global-queue pattern hung
+        // when `waitUntilExit` missed its termination wakeup (see
+        // `Process.waitForExit(within:)`), so a probe whose command
+        // finished in milliseconds timed out and resolved as nil. Instead,
+        // poll for exit while draining stdout NON-BLOCKINGLY — the drain
+        // preserves the buffer-fill defense (a probe emitting more than
+        // the 64 KiB pipe buffer would otherwise block on write and never
+        // exit).
+        let readFD = pipe.fileHandleForReading.fileDescriptor
+        _ = fcntl(readFD, F_SETFL, fcntl(readFD, F_GETFL) | O_NONBLOCK)
         var data = Data()
-        // 2-second timeout to prevent hanging on interactive prompts
-        let deadline = DispatchTime.now() + .seconds(2)
-        let group = DispatchGroup()
-        group.enter()
-        DispatchQueue.global().async {
-            // Defense in depth: Read before waiting to prevent deadlock if buffer fills
-            data = pipe.fileHandleForReading.readDataToEndOfFile()
-            process.waitUntilExit()
-            group.leave()
-        }
-
-        if group.wait(timeout: deadline) == .timedOut {
-            process.terminate()
-            return nil
+        var reachedEOF = false
+        var exited = false
+        let deadline = DispatchTime.now() + 2.0
+        var pollInterval: UInt32 = 1_000 // µs; backs off to 16ms
+        while true {
+            if !reachedEOF {
+                reachedEOF = Self.drainAvailableOutput(from: readFD, into: &data)
+            }
+            if !exited { exited = !process.isRunning }
+            // EOF alone is not exit (terminationStatus needs the exit);
+            // exit alone is not EOF (buffered output still needs draining
+            // — though once the child is gone EOF follows immediately,
+            // because Process closed the parent's write end at launch).
+            if exited && reachedEOF { break }
+            if DispatchTime.now() >= deadline {
+                // Includes the child that exited but handed its stdout to
+                // a still-running grandchild (no EOF): nil, as before.
+                process.terminate()
+                return nil
+            }
+            usleep(pollInterval)
+            pollInterval = min(pollInterval * 2, 16_000)
         }
 
         guard process.terminationStatus == 0 else { return nil }
 
         return String(data: data, encoding: .utf8)
+    }
+
+    /// Appends whatever is currently readable on `fd` (which must be
+    /// `O_NONBLOCK`) to `data`. Returns `true` once EOF is reached, `false`
+    /// when the pipe is merely empty right now (`EAGAIN`) or errored.
+    private static func drainAvailableOutput(from fd: Int32, into data: inout Data) -> Bool {
+        var buffer = [UInt8](repeating: 0, count: 65_536)
+        while true {
+            let count = read(fd, &buffer, buffer.count)
+            if count > 0 {
+                data.append(contentsOf: buffer[0..<count])
+                continue
+            }
+            if count == 0 { return true } // EOF: every write end closed
+            if errno == EINTR { continue }
+            return false // EAGAIN/EWOULDBLOCK or error: nothing more now
+        }
+    }
+}
+
+// MARK: - Deterministic bounded subprocess wait
+
+/// `Process.waitUntilExit()` can miss its termination wakeup when several
+/// processes are spawned and reaped concurrently (macOS Foundation
+/// contention — reproduced on macOS 26: the child exits and is reaped,
+/// `isRunning` is already `false`, yet `waitUntilExit` stays blocked
+/// indefinitely; ~12-25% of spawns under parallel-test/build load). Every
+/// bounded subprocess wait in this module therefore polls `isRunning`
+/// under a monotonic deadline instead: the poll observes the same
+/// Foundation state `waitUntilExit` gates on, needs no helper thread, and
+/// is deterministic under load.
+extension Process {
+    /// Returns `true` once the process has exited — `terminationStatus`
+    /// is then safe to read — or `false` if it is still running when
+    /// `timeout` elapses (the caller decides termination policy).
+    func waitForExit(within timeout: TimeInterval) -> Bool {
+        let deadline = DispatchTime.now() + timeout
+        var pollInterval: UInt32 = 1_000 // µs; backs off to 16ms
+        while isRunning {
+            if DispatchTime.now() >= deadline { return false }
+            usleep(pollInterval)
+            pollInterval = min(pollInterval * 2, 16_000)
+        }
+        return true
     }
 }

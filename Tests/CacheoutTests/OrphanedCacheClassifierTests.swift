@@ -553,7 +553,7 @@ final class OrphanedCacheClassifierTests: XCTestCase {
         let expected = ["huge-unclassified", "Alpha", "Zeta", "beta", "com.dead.app"]
         // Same output for ANY input order.
         XCTAssertEqual(classifier.classifyForOutput(entries).map(\.entry.name), expected)
-        XCTAssertEqual(classifier.classifyForOutput(entries.reversed()).map(\.entry.name), expected)
+        XCTAssertEqual(classifier.classifyForOutput(Array(entries.reversed())).map(\.entry.name), expected)
         XCTAssertEqual(classifier.classifyForOutput(entries.shuffled()).map(\.entry.name), expected)
     }
 
@@ -569,8 +569,8 @@ final class OrphanedCacheClassifierTests: XCTestCase {
         entries.append(makeEntry(name: "aaa", exactBytes: 500))
         entries.append(makeEntry(name: "bbb", exactBytes: 500))
 
-        for variant in [entries, entries.reversed(), entries.shuffled()] {
-            let names = classifier.classifyForOutput(Array(variant)).map(\.entry.name)
+        for variant in [entries, Array(entries.reversed()), entries.shuffled()] {
+            let names = classifier.classifyForOutput(variant).map(\.entry.name)
             XCTAssertEqual(names.count, 10)
             XCTAssertTrue(names.contains("aaa"), "byte-wise-first tie member survives the cut")
             XCTAssertFalse(names.contains("bbb"))

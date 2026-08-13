@@ -1289,16 +1289,26 @@ struct CLIHandler {
         }
 
         // The aggregate scanner only, all categories (nil filter), through
-        // the validated entry point. Fail-closed disposition on a malformed
-        // `categories` outcome: nothing is published, so the candidate list
-        // is empty and nothing is deletable — an empty candidate list is
-        // the documented "nothing eligible" success. (Unreachable with the
-        // production adapter, whose outcomes satisfy the validator's
-        // invariants by construction.)
+        // the validated entry point. A malformed `categories` outcome fails
+        // closed LOUDLY (spotlight precedent): nothing is published, so
+        // silently deriving an empty candidate list would make a rejected
+        // scanner indistinguishable from the documented "nothing eligible"
+        // success. The check precedes the gate switch, so all three surfaces
+        // — unconfirmed plan, --dry-run, confirmed run — fail identically.
+        // (Unreachable with the production adapter, whose outcomes satisfy
+        // the validator's invariants by construction.)
         let collected = await collectValidatedScan(
             deps.runtime, scannerIDs: [CategoryScanner.registeredID],
             context: ScanContext(trigger: .userInitiated)
         )
+        if let issue = collected.malformed[CategoryScanner.registeredID] {
+            return .failure(
+                code: "MALFORMED_SCANNER_OUTPUT",
+                message: "Scanner '\(CategoryScanner.registeredID)' failed outcome validation; "
+                    + "refusing to smart-clean from unvalidated results: \(issue.detail)",
+                details: nil
+            )
+        }
         let allItems = collected.outcomes[CategoryScanner.registeredID]?.items ?? []
 
         switch decision {

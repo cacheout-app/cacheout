@@ -486,9 +486,10 @@ struct SpaceScannerRuntime {
 
     // MARK: Scan-time validation
 
-    /// The SHARED fail-closed outcome validation (epic rounds 7-12) —
-    /// applied INSIDE `scanValidated`; consumers never call it directly and
-    /// never own validation. Checks, in order:
+    /// The SHARED fail-closed outcome validation (epic rounds 7-12; the
+    /// value-domain and state-coherence checks close round 13) — applied
+    /// INSIDE `scanValidated`; consumers never call it directly and never
+    /// own validation. Checks, in order:
     ///
     /// (a) OWNERSHIP — every item's `scannerID` equals the producing
     ///     scanner's id;
@@ -498,12 +499,29 @@ struct SpaceScannerRuntime {
     ///     `scan` prints but whose `<scanner>:<item-id>` address
     ///     `parseCleanTargets` can never accept;
     /// (c) UNIQUENESS — item ids are unique within the outcome;
-    /// (d) STRUCTURE, STATE-AWARE — EMPTY root records are valid exactly
-    ///     for `.missing` items (pre-dispatch-skipped): every non-`.missing`
-    ///     item of EVERY action requires AT LEAST ONE root record (zero
-    ///     records on a non-missing item is malformed, never vacuously
-    ///     admissible — the records are the only capture supporting the
-    ///     item's state, bytes, and display identity). A `.removeItem` item
+    /// (d) VALUE DOMAIN — every numeric field is a sane physical quantity:
+    ///     byte components and `itemCount` nonnegative, `logicalBytes`
+    ///     (when carried) nonnegative, and `exactBytes +
+    ///     estimatedUpToBytes` representable in Int64. `allocatedBytes` is
+    ///     a COMPUTED sum touched by `scanEnvelope` rows, GUI totals, size
+    ///     sorting, and clean plans — an overflowing pair would trap the
+    ///     first consumer instead of producing `malformed_outcome`
+    ///     (`valueDomainViolation`);
+    /// (e) STATE↔RECORD COHERENCE — the item's `state` must be SUPPORTED
+    ///     by its captured record statuses, byte components, and error
+    ///     surface, per the frozen truth table: e.g. a `.measured` item
+    ///     whose nonempty records are all refused/denied would let the CLI
+    ///     plan a clean that `cleanContents` (which deletes only
+    ///     `.measured` records) turns into a zero-byte "success"
+    ///     (`stateCoherenceViolation` documents the full per-state table
+    ///     and the deliberately unenforced boundaries). This subsumes the
+    ///     record-presence rule: EMPTY root records are valid exactly for
+    ///     `.missing` items (pre-dispatch-skipped) — every non-`.missing`
+    ///     item of EVERY action requires AT LEAST ONE root record (the
+    ///     records are the only capture supporting the item's state,
+    ///     bytes, and display identity, and for `.commands` an empty set
+    ///     would even vacuously pass re-admission before executing argv);
+    /// (f) STRUCTURE, STATE-AWARE — a `.removeItem` item
     ///     is accepted ONLY from per-item scanners — NEVER the aggregate
     ///     adapter (converse ownership: downstream treats every
     ///     `categories` item as an aggregate, e.g. the CLI plan's zero-byte
@@ -522,7 +540,7 @@ struct SpaceScannerRuntime {
     ///     path the cleaner deletes are all the SAME capture;
     ///     `.removeContents`/`.commands` items MUST ALWAYS carry category
     ///     provenance;
-    /// (e) CATEGORY-PROVENANCE TRUST — category-backed actions are accepted
+    /// (g) CATEGORY-PROVENANCE TRUST — category-backed actions are accepted
     ///     ONLY from the registered category adapter (the frozen
     ///     `categories` id), the item id must equal the carried category's
     ///     slug, and the carried category must BE the registered instance
@@ -581,10 +599,17 @@ struct SpaceScannerRuntime {
                         + "'\(item.id)'"
                 ))
             }
-            if let violation = structuralViolation(
-                of: item, from: scannerID,
-                registeredCategories: registeredCategories
-            ) {
+            // `??` is lazy left-to-right, so the ORDER is load-bearing:
+            // value-domain first (state coherence reads `allocatedBytes`,
+            // which is only safe once the components are proven
+            // nonnegative and non-overflowing), then coherence (structure
+            // may assume a non-missing item carries >=1 record).
+            if let violation = valueDomainViolation(of: item)
+                ?? stateCoherenceViolation(of: item)
+                ?? structuralViolation(
+                    of: item, from: scannerID,
+                    registeredCategories: registeredCategories
+                ) {
                 return .malformed(scannerID: scannerID, ScanIssue(
                     url: nil, kind: .malformedOutcome,
                     detail: "scanner '\(scannerID)' item '\(item.id)': "
@@ -595,24 +620,203 @@ struct SpaceScannerRuntime {
         return .outcome(scannerID: scannerID, outcome)
     }
 
-    /// The state-aware structural invariants ((d)/(e) above). Exhaustive
-    /// over `ReclaimAction` — a future action case must make this a
-    /// compile-time decision, never a silent pass through `default:`.
+    /// Check (d): the value-domain invariants over EVERY numeric field on
+    /// `ReclaimableItem` (`exactBytes`, `estimatedUpToBytes`,
+    /// `logicalBytes`, `itemCount` — `RootScanRecord` carries no numeric
+    /// fields, only URLs and a status). Producers measure real trees (the
+    /// shared sizer emits only nonnegative components), so a negative or
+    /// overflowing figure can only be a scanner mapping bug — and
+    /// `allocatedBytes` is computed on EVERY access (`scanEnvelope` rows,
+    /// GUI totals, size sorting, clean plans), so an overflowing pair
+    /// would trap the process at first touch instead of producing
+    /// `malformed_outcome`. Fail closed here.
+    ///
+    /// Deliberately NOT enforced: cross-ITEM aggregation bounds. Totals
+    /// are consumer-side arithmetic over per-item-validated fields, and
+    /// any per-item cap below `Int64.max` would be an invented constraint
+    /// the model does not document.
+    private static func valueDomainViolation(
+        of item: ReclaimableItem
+    ) -> String? {
+        if item.exactBytes < 0 {
+            return "exactBytes \(item.exactBytes) is negative — byte "
+                + "components are physical quantities"
+        }
+        if item.estimatedUpToBytes < 0 {
+            return "estimatedUpToBytes \(item.estimatedUpToBytes) is "
+                + "negative — byte components are physical quantities"
+        }
+        if item.exactBytes
+            .addingReportingOverflow(item.estimatedUpToBytes).overflow {
+            return "exactBytes (\(item.exactBytes)) + estimatedUpToBytes "
+                + "(\(item.estimatedUpToBytes)) overflows Int64 — "
+                + "allocatedBytes would trap its first consumer"
+        }
+        if let logical = item.logicalBytes, logical < 0 {
+            return "logicalBytes \(logical) is negative — byte components "
+                + "are physical quantities"
+        }
+        if item.itemCount < 0 {
+            return "itemCount \(item.itemCount) is negative"
+        }
+        return nil
+    }
+
+    /// Check (e): state ↔ record-status/component coherence, derived from
+    /// the FROZEN `RootScanStatus` truth table (fn-2.1) and verified
+    /// against BOTH production mappings (`CacheScanner.scanCategory`'s
+    /// state derivation and `NodeModulesScanner`'s complete candidate
+    /// truth table). The consumers make this load-bearing: `cleanContents`
+    /// deletes only `.measured` records while the CLI/GUI plan from
+    /// `state`, so a `.measured` item whose records are all
+    /// refused/denied plans a clean that deletes nothing and reports a
+    /// zero-byte "success" for a scan that never established a deletable
+    /// root. Enforced, per state (every rule holds on every production
+    /// emission path):
+    ///
+    /// - `.missing` — no resolved path exists: NO records, zero
+    ///   components, nil `url` (never a fake resolution), nil `scanError`,
+    ///   nil `logicalBytes`.
+    /// - `.empty` — clean walk to emptiness: >=1 record, ALL `.measured`
+    ///   (clean-empty = measured, frozen truth table), zero components,
+    ///   nil `scanError`, nil `logicalBytes`.
+    /// - `.measured` — fully walked: >=1 record, ALL `.measured` (any
+    ///   refusal or denial forces a denied-family state), measured
+    ///   SOMETHING (items or bytes — zero-byte trees with counted files
+    ///   are honestly measured), nil `scanError`.
+    /// - `.partiallyDenied` — measured bytes exist beside denials: >=1
+    ///   `.measured` record (the measured content came from a walked
+    ///   root), measured something, non-nil `scanError`.
+    /// - `.denied` — nothing measurable: >=1 record, >=1
+    ///   refused-or-denied record (something must actually have been
+    ///   refused or denied), zero components, non-nil `scanError`, nil
+    ///   `logicalBytes`.
+    ///
+    /// Deliberately NOT enforced — production emits these shapes:
+    /// - `.partiallyDenied` does NOT require a refused/denied RECORD: a
+    ///   single-root partial walk carries its denials INSIDE the tree, so
+    ///   the root record itself is honestly `.measured` (both mappings).
+    /// - `.denied` does NOT forbid `.measured` records: a clean-empty root
+    ///   beside a refused sibling walked honestly yet measured nothing —
+    ///   `CacheScanner` emits exactly that mix.
+    /// - `logicalBytes > allocated` when present is NodeModulesScanner's
+    ///   sparse-divergence display policy, not a model invariant — only
+    ///   sign (check (d)) and absence on unmeasured states are validated.
+    private static func stateCoherenceViolation(
+        of item: ReclaimableItem
+    ) -> String? {
+        // Safe only AFTER check (d): the components are nonnegative and
+        // their sum representable.
+        let measuredAnything = item.itemCount > 0 || item.allocatedBytes > 0
+        let statuses = item.rootRecords.map(\.status)
+        let recordless = "a non-missing \(item.action.wireString) item "
+            + "requires at least one root record"
+
+        switch item.state {
+        case .missing:
+            if !item.rootRecords.isEmpty {
+                return "a missing item carries root records — no resolved "
+                    + "path exists, so there is nothing to have captured"
+            }
+            if measuredAnything {
+                return "a missing item carries measured components — "
+                    + "nothing resolved, so nothing can have been measured"
+            }
+            if item.url != nil {
+                return "a missing item displays a resolved url — never a "
+                    + "fake resolution"
+            }
+            if item.scanError != nil {
+                return "a missing item carries a scan error — absence is "
+                    + "not an impediment (clean states carry nil)"
+            }
+            if item.logicalBytes != nil {
+                return "a missing item carries a logical-bytes figure with "
+                    + "no measurement behind it"
+            }
+        case .empty:
+            if item.rootRecords.isEmpty { return recordless }
+            if statuses.contains(where: { $0 != .measured }) {
+                return "an empty item may carry only measured root records "
+                    + "— a refusal or denial forces a denied-family state"
+            }
+            if measuredAnything {
+                return "an empty item carries measured components — "
+                    + "emptiness means a clean walk measured nothing"
+            }
+            if item.scanError != nil {
+                return "an empty item carries a scan error — clean states "
+                    + "carry nil"
+            }
+            if item.logicalBytes != nil {
+                return "an empty item carries a logical-bytes figure with "
+                    + "no measurement behind it"
+            }
+        case .measured:
+            if item.rootRecords.isEmpty { return recordless }
+            if statuses.contains(where: { $0 != .measured }) {
+                return "a measured item may carry only measured root "
+                    + "records — a refusal or denial forces a denied-family "
+                    + "state, and the cleaner deletes only measured records"
+            }
+            if !measuredAnything {
+                return "a measured item measured nothing — no items and no "
+                    + "bytes is the empty state"
+            }
+            if item.scanError != nil {
+                return "a measured item carries a scan error — clean "
+                    + "states carry nil"
+            }
+        case .partiallyDenied:
+            if item.rootRecords.isEmpty { return recordless }
+            if !statuses.contains(.measured) {
+                return "a partially-denied item requires at least one "
+                    + "measured root record — its measured content must "
+                    + "come from a walked root"
+            }
+            if !measuredAnything {
+                return "a partially-denied item measured nothing — that is "
+                    + "the denied state"
+            }
+            if item.scanError == nil {
+                return "a denied-family item requires its classified "
+                    + "scanError"
+            }
+        case .denied:
+            if item.rootRecords.isEmpty { return recordless }
+            if !statuses.contains(where: {
+                $0 == .refusedAdmission || $0 == .deniedUnmeasured
+            }) {
+                return "a denied item requires at least one refused or "
+                    + "denied root record — something must actually have "
+                    + "been refused or denied"
+            }
+            if measuredAnything {
+                return "a denied item carries measured components — denied "
+                    + "means nothing was measurable"
+            }
+            if item.scanError == nil {
+                return "a denied-family item requires its classified "
+                    + "scanError"
+            }
+            if item.logicalBytes != nil {
+                return "a denied item carries a logical-bytes figure with "
+                    + "no measurement behind it"
+            }
+        }
+        return nil
+    }
+
+    /// The state-aware structural invariants ((f)/(g) above). Runs AFTER
+    /// checks (d)/(e), so a non-missing item is guaranteed >=1 root record
+    /// here. Exhaustive over `ReclaimAction` — a future action case must
+    /// make this a compile-time decision, never a silent pass through
+    /// `default:`.
     private static func structuralViolation(
         of item: ReclaimableItem,
         from scannerID: String,
         registeredCategories: [String: CacheCategory]
     ) -> String? {
-        // Empty root records are valid exactly for `.missing` items
-        // (pre-dispatch-skipped); zero records on a non-missing item of ANY
-        // action can only be a construction bug — the records are the sole
-        // capture supporting the item's state, bytes, and display identity,
-        // and for `.commands` an empty set would even vacuously pass
-        // re-admission before executing argv.
-        if item.state != .missing && item.rootRecords.isEmpty {
-            return "a non-missing \(item.action.wireString) item requires "
-                + "at least one root record"
-        }
         switch item.action {
         case .removeItem:
             // CONVERSE ownership: the aggregate adapter may emit ONLY
@@ -623,7 +827,7 @@ struct SpaceScannerRuntime {
             // regression, since the adapter constructs only category-backed
             // items — could delete on a confirmed run what its preview said
             // it would skip. The forward direction (category-backed actions
-            // only FROM the adapter) is check (e) below.
+            // only FROM the adapter) is check (g) below.
             if scannerID == CategoryScanner.registeredID {
                 return "the aggregate category adapter may emit only "
                     + "category-backed actions — remove_item is reserved "
@@ -689,7 +893,7 @@ struct SpaceScannerRuntime {
         case .removeContents, .commands:
             switch item.admission {
             case .category(let carried):
-                // (d) Category provenance is trusted only from the
+                // (g) Category provenance is trusted only from the
                 // registered adapter, and only for the registered category
                 // INSTANCE. `CacheCategory` ids are per-launch UUIDs on
                 // fully-immutable values, so identity equality pins the

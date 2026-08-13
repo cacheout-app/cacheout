@@ -103,9 +103,9 @@ final class CLIGateTests: XCTestCase {
         state: ScanState = .measured,
         action: ReclaimAction = .removeItem,
         automaticCleanEligible: Bool = false,
-        defaultSelected: Bool = false
+        defaultSelected: Bool = false,
+        container: URL = URL(fileURLWithPath: "/tmp/fixture-container")
     ) -> ReclaimableItem {
-        let container = URL(fileURLWithPath: "/tmp/fixture-container")
         let target = container.appendingPathComponent(id)
         return ReclaimableItem(
             id: id, scannerID: scannerID,
@@ -1546,6 +1546,66 @@ final class CLIGateTests: XCTestCase {
         XCTAssertEqual(failure.code, "MALFORMED_SCANNER_OUTPUT")
         XCTAssertTrue(failure.message.contains(CategoryScanner.registeredID),
                       "the refusal names the scanner: \(failure.message)")
+    }
+
+    // MARK: - Smart-clean fails closed on a malformed categories outcome
+
+    func testSmartCleanFailsClosedOnMalformedCategoriesOutcome() async throws {
+        // Same impostor shape as the spotlight test: a scanner CLAIMING the
+        // categories id but emitting a foreign-owned item — here pointed at
+        // REAL content on disk so the survival assertion is meaningful. The
+        // validator rejects the outcome; every smart-clean surface must fail
+        // loudly with MALFORMED_SCANNER_OUTPUT rather than presenting the
+        // rejection as an empty plan or an empty "nothing eligible" success,
+        // and nothing may be deleted.
+        let victimID = "forged-smart-victim"
+        let victim = base.appendingPathComponent(victimID)
+        try fm.createDirectory(at: victim, withIntermediateDirectories: true)
+        let survivor = victim.appendingPathComponent("keep.bin")
+        try Data(repeating: 0x5A, count: 4096).write(to: survivor)
+
+        let impostor = FixtureScanner(
+            id: CategoryScanner.registeredID,
+            items: [makeStandaloneItem(
+                id: victimID, scannerID: "someone_else",
+                risk: .safe, automaticCleanEligible: true,
+                container: base
+            )]
+        )
+        let runtime = try SpaceScannerRuntime(
+            scanners: [impostor], categories: [],
+            home: fixtureHome, provider: FileSystemIdentityProvider()
+        )
+        let deps = CLIHandler.CLIRuntimeDependencies(
+            runtime: runtime, categorySlugs: []
+        )
+
+        // Unconfirmed plan surface: MALFORMED_SCANNER_OUTPUT, never an
+        // empty CONFIRMATION_REQUIRED plan.
+        let unconfirmed = try failureOutcome(await CLIHandler.smartCleanCLIOutcome(
+            targetGB: 1, dryRun: false, confirmed: false, euid: 501, deps: deps
+        ))
+        XCTAssertEqual(unconfirmed.code, "MALFORMED_SCANNER_OUTPUT",
+                       "an unconfirmed invocation never presents a rejected scanner as an empty plan")
+
+        // Dry-run surface: failure, never an empty success payload.
+        let dryRun = try failureOutcome(await CLIHandler.smartCleanCLIOutcome(
+            targetGB: 1, dryRun: true, confirmed: false, euid: 501, deps: deps
+        ))
+        XCTAssertEqual(dryRun.code, "MALFORMED_SCANNER_OUTPUT",
+                       "a dry run never presents a rejected scanner as 'nothing eligible'")
+
+        // Confirmed surface: failure before any cleaner runs.
+        let confirmed = try failureOutcome(await CLIHandler.smartCleanCLIOutcome(
+            targetGB: 1, dryRun: false, confirmed: true, euid: 501, deps: deps
+        ))
+        XCTAssertEqual(confirmed.code, "MALFORMED_SCANNER_OUTPUT",
+                       "a confirmed run never presents a rejected scanner as an empty success")
+        XCTAssertTrue(confirmed.message.contains(CategoryScanner.registeredID),
+                      "the refusal names the scanner: \(confirmed.message)")
+
+        XCTAssertTrue(fm.fileExists(atPath: survivor.path),
+                      "a confirmed run against a rejected scanner deletes nothing")
     }
 }
 

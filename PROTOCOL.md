@@ -560,6 +560,14 @@ model policy. Per-item scanners becoming CLI-visible does NOT widen
 automatic destruction — that is a deliberate non-goal; per-item deletions
 happen only through explicitly addressed `clean` targets.
 
+Since schema 4 the scan runs through the same validated scanner runtime as
+`scan`/`clean`/`spotlight`. If the `categories` outcome fails validation
+(`malformed_outcome`), the command fails closed with error code
+`MALFORMED_SCANNER_OUTPUT` on all three surfaces — the unconfirmed plan,
+`--dry-run`, and the confirmed run — candidates are never derived from
+unvalidated results, and a rejected scanner is never presented as an empty
+plan or a "nothing eligible" success.
+
 **Target semantics (schema 3):** only EXACT bytes advance `target_met` —
 delete-time measured unique-inode bytes on a real run, scan-time exact
 components on a dry run (no re-walk). A hardlink-heavy category may be
@@ -1018,6 +1026,7 @@ All CLI commands follow a consistent error reporting contract.
 | `VM_STATS_QUERY_FAILED` | Failed to query host_statistics64 |
 | `SCAN_FAILED` | Cache scan failed |
 | `CLEAN_FAILED` | TOTAL clean failure: every requested/attempted category errored and nothing was freed (partial failures exit 0 with per-item `success` flags — schema 3) |
+| `MALFORMED_SCANNER_OUTPUT` | A scanner's outcome failed runtime validation — `spotlight` and `smart-clean` (all three surfaces) refuse to act on unvalidated results (schema 4) |
 
 ### Subprocess Timeout
 

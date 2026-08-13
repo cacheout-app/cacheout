@@ -107,34 +107,63 @@ final class CategoryScannerTests: XCTestCase {
 
     /// A structurally valid per-item fixture item (`.removeItem` +
     /// the frozen `.containerItem` descriptor + the measured record
-    /// binding the deletion target). `rootRecords` is overridable to
-    /// construct the unbound shapes the validator must refuse;
-    /// `displayURL` (double-optional: `.some(nil)` forces a nil `url`)
-    /// constructs the display/deletion divergences it must also refuse.
+    /// binding the deletion target). Defaults are STATE-COHERENT (round
+    /// 5): zero-component states carry zeros, denied-family states carry a
+    /// classified error, and the record multiset matches the frozen truth
+    /// table — every default overridable to construct the exact malformed
+    /// shapes the validator must refuse. `displayURL` (double-optional:
+    /// `.some(nil)` forces a nil `url`) constructs display/deletion
+    /// divergences; `scanError` likewise (`.some(nil)` forces nil on a
+    /// denied-family state).
     private func makeContainerItem(
         id: String, scannerID: String,
         state: ScanState = .measured,
         rootRecords: [RootScanRecord]? = nil,
-        displayURL: URL?? = nil
+        displayURL: URL?? = nil,
+        exactBytes: Int64? = nil,
+        estimatedUpToBytes: Int64 = 0,
+        logicalBytes: Int64? = nil,
+        itemCount: Int? = nil,
+        scanError: ScanError?? = nil
     ) -> ReclaimableItem {
         let container = URL(fileURLWithPath: "/tmp/fixture-container")
+        let target = container.appendingPathComponent(id)
+        let zeroComponents =
+            state == .missing || state == .empty || state == .denied
+        let defaultRecords: [RootScanRecord]
+        switch state {
+        case .missing:
+            defaultRecords = []
+        case .denied:
+            defaultRecords = [RootScanRecord(
+                requestedURL: target, resolvedURL: target,
+                status: .deniedUnmeasured
+            )]
+        case .empty, .measured, .partiallyDenied:
+            defaultRecords = [RootScanRecord(
+                requestedURL: target, resolvedURL: target, status: .measured
+            )]
+        }
+        let defaultError: ScanError? =
+            (state == .denied || state == .partiallyDenied)
+            ? ScanError(kind: .permissionDenied, message: "fixture denial")
+            : nil
+        let defaultURL: URL? = state == .missing ? nil : target
         return ReclaimableItem(
             id: id, scannerID: scannerID, displayName: "item \(id)",
-            exactBytes: 1024, estimatedUpToBytes: 0, logicalBytes: nil,
-            itemCount: 1,
-            url: displayURL ?? container.appendingPathComponent(id),
+            exactBytes: exactBytes ?? (zeroComponents ? 0 : 1024),
+            estimatedUpToBytes: estimatedUpToBytes,
+            logicalBytes: logicalBytes,
+            itemCount: itemCount ?? (zeroComponents ? 0 : 1),
+            url: displayURL ?? defaultURL,
             declaredDisplayPath: "/tmp/fixture-container/\(id)",
-            rootRecords: rootRecords ?? [RootScanRecord(
-                requestedURL: container.appendingPathComponent(id),
-                resolvedURL: container.appendingPathComponent(id),
-                status: .measured
-            )],
-            state: state, scanError: nil,
+            rootRecords: rootRecords ?? defaultRecords,
+            state: state, scanError: scanError ?? defaultError,
             risk: .review, evidence: "fixture", rebuildNote: nil,
             action: .removeItem,
             admission: .containerItem(
                 originContainer: container,
-                requestedTargetURL: container.appendingPathComponent(id)
+                requestedTargetURL: target
             ),
             defaultSelected: false, automaticCleanEligible: false,
             isStale: nil
@@ -144,8 +173,9 @@ final class CategoryScannerTests: XCTestCase {
     /// A structurally valid aggregate fixture item for `category`
     /// (`.removeContents` or `.commands` + category provenance + root
     /// records): id defaults to the category slug and `scannerID` to the
-    /// frozen adapter id — overridable to construct the malformed shapes
-    /// the validator must refuse.
+    /// frozen adapter id. Defaults are STATE-COHERENT (round 5) exactly as
+    /// `makeContainerItem`'s — everything overridable to construct the
+    /// malformed shapes the validator must refuse.
     private func makeAggregateItem(
         category: CacheCategory,
         scannerID: String = CategoryScanner.registeredID,
@@ -153,20 +183,45 @@ final class CategoryScannerTests: XCTestCase {
         action: ReclaimAction = .removeContents,
         admission: AdmissionDescriptor? = nil,
         state: ScanState = .measured,
-        rootRecords: [RootScanRecord]? = nil
+        rootRecords: [RootScanRecord]? = nil,
+        exactBytes: Int64? = nil,
+        estimatedUpToBytes: Int64 = 0,
+        logicalBytes: Int64? = nil,
+        itemCount: Int? = nil,
+        scanError: ScanError?? = nil
     ) -> ReclaimableItem {
         let root = URL(fileURLWithPath: "/tmp/fixture-root")
-        let defaultRecords = [RootScanRecord(
-            requestedURL: root, resolvedURL: root, status: .measured
-        )]
+        let zeroComponents =
+            state == .missing || state == .empty || state == .denied
+        let defaultRecords: [RootScanRecord]
+        switch state {
+        case .missing:
+            defaultRecords = []
+        case .denied:
+            defaultRecords = [RootScanRecord(
+                requestedURL: root, resolvedURL: root,
+                status: .deniedUnmeasured
+            )]
+        case .empty, .measured, .partiallyDenied:
+            defaultRecords = [RootScanRecord(
+                requestedURL: root, resolvedURL: root, status: .measured
+            )]
+        }
+        let defaultError: ScanError? =
+            (state == .denied || state == .partiallyDenied)
+            ? ScanError(kind: .permissionDenied, message: "fixture denial")
+            : nil
+        let defaultURL: URL? = state == .missing ? nil : root
         return ReclaimableItem(
             id: id ?? category.slug, scannerID: scannerID,
             displayName: "aggregate \(category.slug)",
-            exactBytes: 2048, estimatedUpToBytes: 0, logicalBytes: nil,
-            itemCount: 2,
-            url: root, declaredDisplayPath: root.path,
+            exactBytes: exactBytes ?? (zeroComponents ? 0 : 2048),
+            estimatedUpToBytes: estimatedUpToBytes,
+            logicalBytes: logicalBytes,
+            itemCount: itemCount ?? (zeroComponents ? 0 : 2),
+            url: defaultURL, declaredDisplayPath: root.path,
             rootRecords: rootRecords ?? defaultRecords,
-            state: state, scanError: nil,
+            state: state, scanError: scanError ?? defaultError,
             risk: .safe, evidence: "fixture", rebuildNote: nil,
             action: action,
             admission: admission ?? .category(category),
@@ -1042,6 +1097,364 @@ final class CategoryScannerTests: XCTestCase {
             ScanOutcome(items: [missing], errors: []), from: adapterID
         )
         XCTAssertEqual(outcome(of: verdict)?.items, [missing])
+    }
+
+    // MARK: - Value-domain validation (round 5)
+
+    func testValueDomainMatrixOverEveryNumericField() throws {
+        // The COMPLETE numeric-field domain, one table (`ReclaimableItem`
+        // carries exactly four numeric fields; `RootScanRecord` carries
+        // none): components nonnegative, their sum representable,
+        // `logicalBytes`/`itemCount` nonnegative. The overflow cells are
+        // the review shape — `allocatedBytes` is computed on first access,
+        // so an accepted overflowing pair would trap `scanEnvelope`, GUI
+        // totals, sorting, and clean plans instead of producing
+        // `malformed_outcome`.
+        let home = try makeTempDir("home")
+        let category = makeCategory(at: [], slug: "value_cache")
+        let runtime = try makeRuntime(
+            scanners: [], categories: [category], home: home
+        )
+        let adapterID = CategoryScanner.registeredID
+
+        let cells: [(label: String, item: ReclaimableItem, producer: String, valid: Bool)] = [
+            ("Int64.max + 1 component sum (the review shape)",
+             makeContainerItem(id: "v1", scannerID: "fixture",
+                               exactBytes: .max, estimatedUpToBytes: 1),
+             "fixture", false),
+            ("both components Int64.max",
+             makeContainerItem(id: "v1", scannerID: "fixture",
+                               exactBytes: .max, estimatedUpToBytes: .max),
+             "fixture", false),
+            ("negative exactBytes",
+             makeContainerItem(id: "v1", scannerID: "fixture", exactBytes: -1),
+             "fixture", false),
+            ("negative estimatedUpToBytes",
+             makeContainerItem(id: "v1", scannerID: "fixture",
+                               estimatedUpToBytes: -1),
+             "fixture", false),
+            ("negative logicalBytes",
+             makeContainerItem(id: "v1", scannerID: "fixture",
+                               logicalBytes: -5),
+             "fixture", false),
+            ("negative itemCount",
+             makeContainerItem(id: "v1", scannerID: "fixture", itemCount: -1),
+             "fixture", false),
+            // Boundary: Int64.max ALONE is representable — the domain rule
+            // is about the SUM, never a cap on either component.
+            ("Int64.max exactBytes alone",
+             makeContainerItem(id: "v1", scannerID: "fixture",
+                               exactBytes: .max),
+             "fixture", true),
+            // A positive logical-divergence figure is a valid shape.
+            ("positive logicalBytes",
+             makeContainerItem(id: "v1", scannerID: "fixture",
+                               logicalBytes: 4096),
+             "fixture", true),
+            // The identical domain rules cover the aggregate kind.
+            ("negative exactBytes on an aggregate",
+             makeAggregateItem(category: category, exactBytes: -1),
+             adapterID, false),
+            ("overflowing component sum on an aggregate",
+             makeAggregateItem(category: category,
+                               exactBytes: .max, estimatedUpToBytes: 1),
+             adapterID, false),
+        ]
+        for cell in cells {
+            let verdict = runtime.validatedOutcome(
+                ScanOutcome(items: [cell.item], errors: []),
+                from: cell.producer
+            )
+            if cell.valid {
+                XCTAssertNotNil(
+                    outcome(of: verdict), "\(cell.label) must validate"
+                )
+                XCTAssertNil(malformedIssue(of: verdict), cell.label)
+            } else {
+                let issue = malformedIssue(of: verdict)
+                XCTAssertNotNil(issue, "\(cell.label) must be refused")
+                XCTAssertEqual(issue?.kind, .malformedOutcome, cell.label)
+                XCTAssertNil(
+                    issue?.url,
+                    "\(cell.label): no filesystem location — never a fake path"
+                )
+            }
+        }
+    }
+
+    // MARK: - State ↔ record-status coherence (round 5)
+
+    func testStateCoherenceMatrixOverRecordStatusesAndComponents() throws {
+        // The COMPLETE state x record-status/component table, one matrix
+        // (round-4 idiom), derived from the frozen truth table and the two
+        // production mappings. Valid cells pin every shape production
+        // actually emits (including the boundaries the validator must NOT
+        // over-enforce); invalid cells pin every incoherence it must
+        // refuse — headlined by the review shape: a `.measured` item whose
+        // nonempty records are all refused/denied, which would let the CLI
+        // plan a clean that `cleanContents` (measured-records-only) turns
+        // into a zero-byte "success".
+        let home = try makeTempDir("home")
+        let category = makeCategory(at: [], slug: "coherent_cache")
+        let runtime = try makeRuntime(
+            scanners: [], categories: [category], home: home
+        )
+        let adapterID = CategoryScanner.registeredID
+        let root = URL(fileURLWithPath: "/tmp/fixture-root")
+        let record = { (status: RootScanStatus) in
+            RootScanRecord(requestedURL: root, resolvedURL: root, status: status)
+        }
+        let target = URL(fileURLWithPath: "/tmp/fixture-container/c1")
+        let targetRecord = { (status: RootScanStatus) in
+            RootScanRecord(
+                requestedURL: target, resolvedURL: target, status: status
+            )
+        }
+        let fixtureError = ScanError(
+            kind: .permissionDenied, message: "fixture denial"
+        )
+
+        let cells: [(label: String, item: ReclaimableItem, producer: String, valid: Bool)] = [
+            // ---- Valid: every shape production emits.
+            ("measured aggregate over a measured record",
+             makeAggregateItem(category: category), adapterID, true),
+            ("measured zero-byte item with counted files",
+             makeContainerItem(id: "c1", scannerID: "fixture",
+                               exactBytes: 0, itemCount: 1),
+             "fixture", true),
+            ("clean-empty aggregate (measured record, zero components)",
+             makeAggregateItem(category: category, state: .empty),
+             adapterID, true),
+            // Single-root partial walk: denials live INSIDE the tree — the
+            // only record is honestly `.measured` (both mappings emit
+            // this; demanding a denied record here would reject them).
+            ("partially-denied aggregate with ONLY a measured record",
+             makeAggregateItem(category: category, state: .partiallyDenied),
+             adapterID, true),
+            ("partially-denied aggregate with measured + denied records",
+             makeAggregateItem(category: category, state: .partiallyDenied,
+                               rootRecords: [record(.measured),
+                                             record(.deniedUnmeasured)]),
+             adapterID, true),
+            ("denied aggregate with a denied-unmeasured record",
+             makeAggregateItem(category: category, state: .denied),
+             adapterID, true),
+            ("denied aggregate with a refused record",
+             makeAggregateItem(category: category, state: .denied,
+                               rootRecords: [record(.refusedAdmission)]),
+             adapterID, true),
+            // CacheScanner's boundary mix: a clean-empty root walks
+            // honestly (`.measured`) beside a refused sibling while the
+            // aggregate measured nothing — `.denied` must not forbid the
+            // measured record.
+            ("denied aggregate with clean-empty measured + refused records",
+             makeAggregateItem(category: category, state: .denied,
+                               rootRecords: [record(.measured),
+                                             record(.refusedAdmission)]),
+             adapterID, true),
+            ("missing aggregate (no records, zero components)",
+             makeAggregateItem(category: category, state: .missing),
+             adapterID, true),
+            ("denied per-item (NodeModulesScanner's denied emission)",
+             makeContainerItem(id: "c1", scannerID: "fixture",
+                               state: .denied),
+             "fixture", true),
+
+            // ---- Invalid: the review shape, both scanner kinds.
+            ("measured aggregate whose records are all refused/denied",
+             makeAggregateItem(category: category,
+                               rootRecords: [record(.refusedAdmission),
+                                             record(.deniedUnmeasured)]),
+             adapterID, false),
+            ("measured per-item whose record is denied-unmeasured",
+             makeContainerItem(id: "c1", scannerID: "fixture",
+                               rootRecords: [targetRecord(.deniedUnmeasured)]),
+             "fixture", false),
+
+            // ---- Invalid: the rest of the coherence table.
+            ("measured aggregate with a refused record mixed in",
+             makeAggregateItem(category: category,
+                               rootRecords: [record(.measured),
+                                             record(.refusedAdmission)]),
+             adapterID, false),
+            ("measured aggregate that measured nothing",
+             makeAggregateItem(category: category,
+                               exactBytes: 0, itemCount: 0),
+             adapterID, false),
+            ("measured aggregate carrying a scan error",
+             makeAggregateItem(category: category,
+                               scanError: .some(fixtureError)),
+             adapterID, false),
+            ("empty aggregate with nonzero bytes",
+             makeAggregateItem(category: category, state: .empty,
+                               exactBytes: 4096),
+             adapterID, false),
+            ("empty aggregate with a counted item",
+             makeAggregateItem(category: category, state: .empty,
+                               itemCount: 1),
+             adapterID, false),
+            ("empty aggregate over a denied record",
+             makeAggregateItem(category: category, state: .empty,
+                               rootRecords: [record(.deniedUnmeasured)]),
+             adapterID, false),
+            ("empty aggregate carrying a logical-bytes figure",
+             makeAggregateItem(category: category, state: .empty,
+                               logicalBytes: 4096),
+             adapterID, false),
+            ("partially-denied aggregate with no measured record",
+             makeAggregateItem(category: category, state: .partiallyDenied,
+                               rootRecords: [record(.deniedUnmeasured)]),
+             adapterID, false),
+            ("partially-denied aggregate with nil scanError",
+             makeAggregateItem(category: category, state: .partiallyDenied,
+                               scanError: .some(nil)),
+             adapterID, false),
+            ("partially-denied aggregate that measured nothing",
+             makeAggregateItem(category: category, state: .partiallyDenied,
+                               exactBytes: 0, itemCount: 0),
+             adapterID, false),
+            ("denied aggregate with only measured records",
+             makeAggregateItem(category: category, state: .denied,
+                               rootRecords: [record(.measured)]),
+             adapterID, false),
+            ("denied aggregate with nonzero bytes",
+             makeAggregateItem(category: category, state: .denied,
+                               exactBytes: 4096),
+             adapterID, false),
+            ("denied aggregate with nil scanError",
+             makeAggregateItem(category: category, state: .denied,
+                               scanError: .some(nil)),
+             adapterID, false),
+            ("denied aggregate carrying a logical-bytes figure",
+             makeAggregateItem(category: category, state: .denied,
+                               logicalBytes: 4096),
+             adapterID, false),
+            ("missing aggregate carrying a record",
+             makeAggregateItem(category: category, state: .missing,
+                               rootRecords: [record(.measured)]),
+             adapterID, false),
+            ("missing aggregate with nonzero bytes",
+             makeAggregateItem(category: category, state: .missing,
+                               exactBytes: 4096),
+             adapterID, false),
+            ("missing per-item displaying a url",
+             makeContainerItem(id: "c1", scannerID: "fixture",
+                               state: .missing, displayURL: .some(target)),
+             "fixture", false),
+        ]
+        for cell in cells {
+            let verdict = runtime.validatedOutcome(
+                ScanOutcome(items: [cell.item], errors: []),
+                from: cell.producer
+            )
+            if cell.valid {
+                XCTAssertNotNil(
+                    outcome(of: verdict), "\(cell.label) must validate"
+                )
+                XCTAssertNil(malformedIssue(of: verdict), cell.label)
+            } else {
+                let issue = malformedIssue(of: verdict)
+                XCTAssertNotNil(issue, "\(cell.label) must be refused")
+                XCTAssertEqual(issue?.kind, .malformedOutcome, cell.label)
+                XCTAssertNil(
+                    issue?.url,
+                    "\(cell.label): no filesystem location — never a fake path"
+                )
+            }
+        }
+    }
+
+    func testProductionStateEmissionsPassCoherenceValidation() async throws {
+        // Every state the REAL category pipeline can emit, through the
+        // validated stream: the coherence rules must be exactly as strong
+        // as the production mappings — no emission may render its outcome
+        // malformed. Covers the two boundary shapes the validator
+        // deliberately permits: a partially-denied aggregate carrying all
+        // three record statuses, and a denied aggregate carrying an honest
+        // clean-empty `.measured` record beside its refused root.
+        let home = try makeTempDir("home")
+        // Refused root: a protected first-level $HOME child (deny list).
+        let documents = home.appendingPathComponent("Documents")
+        try FileManager.default.createDirectory(
+            at: documents, withIntermediateDirectories: true
+        )
+        // Denied-unmeasured root: admitted, denied before any measurement.
+        let deniedDir = try makeTempDir("denied")
+        try writeFile(deniedDir.appendingPathComponent("f.bin"))
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o000], ofItemAtPath: deniedDir.path
+        )
+        addTeardownBlock {
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o755], ofItemAtPath: deniedDir.path
+            )
+        }
+        let measuredDir = try makeTempDir("measured")
+        try writeFile(measuredDir.appendingPathComponent("f.bin"))
+        let emptyDir = try makeTempDir("empty")
+        let emptyBesideRefused = try makeTempDir("empty-beside-refused")
+        let nowhere = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CategoryScannerTests-nowhere-\(UUID().uuidString)")
+
+        func category(_ slug: String, _ discovery: [PathDiscovery]) -> CacheCategory {
+            CacheCategory(
+                name: slug, slug: slug, description: "fixture", icon: "trash",
+                discovery: discovery, riskLevel: .safe, rebuildNote: "",
+                defaultSelected: true
+            )
+        }
+        let categories = [
+            // All three record statuses on one aggregate → .partiallyDenied.
+            category("partial_cache", [
+                .staticPath("Documents"),
+                .absolutePath(deniedDir.path),
+                .absolutePath(measuredDir.path),
+                .absolutePath(emptyDir.path),
+            ]),
+            // Clean-empty measured record beside a refused root → .denied
+            // with a `.measured` record present.
+            category("denied_mixed", [
+                .staticPath("Documents"),
+                .absolutePath(emptyBesideRefused.path),
+            ]),
+            category("measured_cache", [.absolutePath(measuredDir.path)]),
+            category("empty_cache", [.absolutePath(emptyDir.path)]),
+            category("denied_cache", [.absolutePath(deniedDir.path)]),
+            category("missing_cache", [.absolutePath(nowhere.path)]),
+        ]
+        let runtime = try makeRuntime(
+            scanners: [makeCategoryScanner(categories: categories, home: home)],
+            categories: categories,
+            home: home
+        )
+
+        let events = await collect(runtime.scanValidated(
+            context: ScanContext(trigger: .userInitiated)
+        ))
+
+        XCTAssertEqual(events.count, 1)
+        XCTAssertNil(
+            malformedIssue(of: events[0]),
+            "no production emission may fail the coherence validator"
+        )
+        let items = try XCTUnwrap(outcome(of: events[0])?.items)
+        let bySlug = Dictionary(uniqueKeysWithValues: items.map { ($0.id, $0) })
+        XCTAssertEqual(bySlug["partial_cache"]?.state, .partiallyDenied)
+        XCTAssertEqual(
+            Set(bySlug["partial_cache"]?.rootRecords.map(\.status) ?? []),
+            [.refusedAdmission, .deniedUnmeasured, .measured],
+            "all three statuses ride one validated partially-denied aggregate"
+        )
+        XCTAssertEqual(bySlug["denied_mixed"]?.state, .denied)
+        XCTAssertEqual(
+            Set(bySlug["denied_mixed"]?.rootRecords.map(\.status) ?? []),
+            [.refusedAdmission, .measured],
+            "the honest clean-empty measured record validates beside the refusal"
+        )
+        XCTAssertEqual(bySlug["measured_cache"]?.state, .measured)
+        XCTAssertEqual(bySlug["empty_cache"]?.state, .empty)
+        XCTAssertEqual(bySlug["denied_cache"]?.state, .denied)
+        XCTAssertEqual(bySlug["missing_cache"]?.state, .missing)
     }
 
     func testAggregateAdapterMayEmitOnlyCategoryBackedActions() throws {

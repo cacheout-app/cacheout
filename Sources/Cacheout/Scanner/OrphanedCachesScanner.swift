@@ -165,6 +165,13 @@ struct OrphanedCachesScanner: @unchecked Sendable {
         UserDataShapePattern(name: "pictures-directory", glob: "Pictures"),
     ]
 
+    /// PRODUCTION probe caps — one definition shared by the init defaults
+    /// and the delete-time revalidation entry point
+    /// (`preDeleteUserDataProbe`), so scan-time and delete-time inspection
+    /// bounds can never drift apart.
+    static let defaultProbeDepthLimit = 3
+    static let defaultProbeEntryLimit = 512
+
     /// The sweep root this instance enumerates (injectable for tests; no
     /// test touches the real `$HOME` or the real `~/Library/Caches`).
     let cachesRoot: URL
@@ -204,8 +211,8 @@ struct OrphanedCachesScanner: @unchecked Sendable {
         cachesRoot: URL? = nil,
         categories: [CacheCategory] = CacheCategory.allCategories,
         provider: FileSystemIdentityProvider = FileSystemIdentityProvider(),
-        probeDepthLimit: Int = 3,
-        probeEntryLimit: Int = 512,
+        probeDepthLimit: Int = OrphanedCachesScanner.defaultProbeDepthLimit,
+        probeEntryLimit: Int = OrphanedCachesScanner.defaultProbeEntryLimit,
         thresholds: OrphanedCacheClassifier.Thresholds =
             OrphanedCachesSweepConfig.defaultThresholds,
         installedAppStatus: @escaping @Sendable (String) -> InstalledAppStatus =
@@ -382,9 +389,58 @@ struct OrphanedCachesScanner: @unchecked Sendable {
 
     // MARK: - User-data-shape probe (R4 input)
 
-    /// Bounded shallow walk of one REAL-DIRECTORY entry, matching basenames
-    /// against `userDataShapePatterns`. Returns the matched pattern NAMES
-    /// (in table order, deduplicated) and the fail-closed completeness flag.
+    /// Bounded shallow walk of one REAL-DIRECTORY entry — the instance
+    /// (scan-time) face of the shared static core below, using the
+    /// injectable per-instance caps.
+    private func probeUserDataShapes(at entryURL: URL) -> (matches: [String], complete: Bool) {
+        Self.boundedUserDataShapeWalk(
+            at: entryURL, provider: provider,
+            depthLimit: probeDepthLimit, entryLimit: probeEntryLimit
+        )
+    }
+
+    /// DELETE-TIME REVALIDATION entry point (cleaner seam, PR #456 review):
+    /// a sweep entry removed and RECREATED at the same name between scan
+    /// and confirmation passes the cleaner's container-snapshot check (the
+    /// snapshot binds the `~/Library/Caches` root's identity, not the
+    /// entry's), so the scan-time user-data probe describes content that no
+    /// longer exists. The cleaner re-runs THIS probe immediately before
+    /// deleting an auto-clean-eligible sweep item and refuses unless it
+    /// re-establishes the clean promise (no matches AND complete) — the
+    /// same fail-closed doctrine as scan time.
+    ///
+    /// Kind gating mirrors the scan path exactly:
+    /// - real directory → the bounded no-follow walk (PRODUCTION caps);
+    /// - symlink / regular file / special → no contents of their own —
+    ///   clean and complete by construction (deletion removes the leaf
+    ///   as-is, never a target's tree);
+    /// - absent → clean and complete: the deletion path surfaces its own
+    ///   ENOENT (frozen ghost asymmetry) — the probe must not preempt it;
+    /// - unprobeable → fail closed (incomplete).
+    static func preDeleteUserDataProbe(
+        at target: URL, provider: FileSystemIdentityProvider
+    ) -> (matches: [String], complete: Bool) {
+        switch provider.probeKind(of: target) {
+        case .kind(.directory):
+            return boundedUserDataShapeWalk(
+                at: target, provider: provider,
+                depthLimit: defaultProbeDepthLimit,
+                entryLimit: defaultProbeEntryLimit
+            )
+        case .kind:
+            return ([], true)
+        case .absent:
+            return ([], true)
+        case .failed:
+            return ([], false)
+        }
+    }
+
+    /// The ONE bounded user-data-shape walk, shared by the scan-time probe
+    /// and the delete-time revalidation so the two can never drift. Matches
+    /// basenames against `userDataShapePatterns`, returning the matched
+    /// pattern NAMES (in table order, deduplicated) and the fail-closed
+    /// completeness flag.
     ///
     /// NO-FOLLOW rule (safety — mirrors `.deletionTarget` sizing): the
     /// caller lstat-gates the probe root, and every descent below is
@@ -394,7 +450,13 @@ struct OrphanedCachesScanner: @unchecked Sendable {
     /// mode bought. An unexpanded symlink does NOT mark the probe
     /// incomplete: deleting the entry removes the link, never its target,
     /// so no deletable content went uninspected.
-    private func probeUserDataShapes(at entryURL: URL) -> (matches: [String], complete: Bool) {
+    private static func boundedUserDataShapeWalk(
+        at entryURL: URL,
+        provider: FileSystemIdentityProvider,
+        depthLimit: Int,
+        entryLimit: Int
+    ) -> (matches: [String], complete: Bool) {
+        let fileManager = FileManager.default
         var matched = Set<String>()
         var complete = true
         var visited = 0
@@ -415,7 +477,7 @@ struct OrphanedCachesScanner: @unchecked Sendable {
                 continue
             }
             for child in children {
-                guard visited < probeEntryLimit else {
+                guard visited < entryLimit else {
                     // Entry cap hit before exhausting the tree.
                     complete = false
                     break walk
@@ -423,7 +485,7 @@ struct OrphanedCachesScanner: @unchecked Sendable {
                 visited += 1
 
                 let name = child.lastPathComponent
-                for pattern in Self.userDataShapePatterns
+                for pattern in userDataShapePatterns
                 where fnmatch(pattern.glob, name, 0) == 0 {
                     matched.insert(pattern.name)
                 }
@@ -431,7 +493,7 @@ struct OrphanedCachesScanner: @unchecked Sendable {
                 switch provider.probeKind(of: child) {
                 case .kind(.directory):
                     let childDepth = depth + 1
-                    if childDepth < probeDepthLimit {
+                    if childDepth < depthLimit {
                         stack.append((child, childDepth))
                     } else {
                         // A directory at the depth boundary left unexpanded:
@@ -453,7 +515,7 @@ struct OrphanedCachesScanner: @unchecked Sendable {
         }
 
         // Table order, deduplicated — deterministic output for fn-3.2.
-        let names = Self.userDataShapePatterns.map(\.name).filter(matched.contains)
+        let names = userDataShapePatterns.map(\.name).filter(matched.contains)
         return (names, complete)
     }
 }

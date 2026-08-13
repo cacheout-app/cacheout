@@ -12,7 +12,7 @@ import AppKit
 import Darwin
 import Foundation
 
-/// Resolves bundle-id presence from two signals, either of which
+/// Resolves bundle-id presence from three signals, any of which
 /// establishes presence:
 ///
 /// 1. **LaunchServices** — `NSWorkspace.shared.urlForApplication(
@@ -24,26 +24,49 @@ import Foundation
 ///    /Applications, ~/Applications against the injected home, and both
 ///    Homebrew caskroom prefixes). Covers a stale/incomplete LS database
 ///    and caskroom-only copies.
+/// 3. **Spotlight** — a bounded `mdfind` count query for
+///    `kMDItemCFBundleIdentifier` (see `SpotlightBundleIDProbe`). The only
+///    signal that covers ARBITRARY install locations (`/Volumes/Work/Apps`,
+///    `~/Developer`, …) for apps never LS-registered — the census roots
+///    alone must not be mistaken for the whole disk (PR #456 review P2).
+///    Injectable closure so hermetic tests never spawn a subprocess.
 ///
 /// ## Tri-state contract (epic API contract)
 ///
 /// Orphan classification asserts a NEGATIVE ("no installed app"), so
-/// `.notInstalled` must mean the census was complete enough to establish
-/// absence:
+/// `.notInstalled` must mean the machine was searched completely enough to
+/// establish absence — GLOBALLY, not merely under the census roots:
 ///
-/// - `.installed` wins over everything the moment EITHER signal matches —
-///   even an incomplete census can establish presence.
-/// - `.notInstalled` requires a no-match against a COMPLETE census (and no
-///   LaunchServices match when that signal is enabled).
-/// - `.unknown` when the census was INCOMPLETE and LaunchServices produced
-///   no match either: an EXISTING root that could not be enumerated, an
-///   enumeration failure partway, or a bundle whose metadata was present
-///   (or possibly present) but unreadable — see below.
+/// - `.installed` wins over everything the moment ANY signal matches —
+///   even an incomplete census can establish presence, and a Spotlight hit
+///   establishes presence the other two signals cannot see.
+/// - `.notInstalled` requires a no-match against a COMPLETE census, no
+///   LaunchServices match (when that signal is enabled), AND a clean
+///   Spotlight miss from a HEALTHY index (canary-verified — see the probe).
+///   Census + LS alone cover only four roots plus whatever LS happens to
+///   have registered; only Spotlight extends the search to arbitrary
+///   indexed locations, so without its clean miss global absence is not
+///   established.
+/// - `.unknown` when absence cannot be asserted: the census was INCOMPLETE
+///   (an EXISTING root that could not be enumerated, an enumeration failure
+///   partway, or a bundle whose metadata was present (or possibly present)
+///   but unreadable — see below), or Spotlight was UNAVAILABLE (disabled,
+///   unhealthy index, query failure or timeout) while the other signals
+///   produced no match. Fail closed: a partial search never asserts a
+///   global negative.
 ///
 /// MISSING roots (no Caskroom on a non-Homebrew machine) are normal
 /// absence — they never make the census incomplete. Likewise a root that
 /// exists but is not a directory: it contains no app bundles, with
 /// certainty.
+///
+/// Residual gap, accepted: an app on a volume EXCLUDED from Spotlight
+/// indexing that was also never LS-registered is invisible to all three
+/// signals and would still resolve `.notInstalled`. The classifier's orphan
+/// evidence therefore names the basis of the claim ("checked
+/// LaunchServices, Spotlight, and standard app folders") instead of
+/// asserting bare global absence — and the orphan tier is review-only,
+/// never bulk-eligible, by frozen epic policy.
 ///
 /// Metadata failures fail CLOSED, but only genuine failures: an `.app`
 /// directory with POSITIVELY no `Contents/Info.plist` (lstat fails with
@@ -79,10 +102,15 @@ import Foundation
 ///
 /// The public API is SYNCHRONOUS by contract: fn-3.2's classifier takes a
 /// non-async `(String) -> InstalledAppStatus` predicate, so an actor is
-/// not an option. Final class, `@unchecked Sendable` under this lock
-/// discipline: `cachedCensus` is read/written ONLY while `lock` is held;
-/// every other stored property is an immutable `let`. Compatible with
-/// fn-2's `SpaceScanner: Sendable`.
+/// not an option. The Spotlight signal stays inside that contract as a
+/// BOUNDED synchronous subprocess wait (house 2s probe-timeout doctrine —
+/// see `SpotlightBundleIDProbe`), and its unavailability latch caps the
+/// worst case at one canary round plus one query, never per-candidate
+/// stalls. Final class, `@unchecked Sendable` under this lock discipline:
+/// `cachedCensus` is read/written ONLY while `lock` is held; every other
+/// stored property is an immutable `let` (the probe closure's own state is
+/// lock-guarded inside the probe). Compatible with fn-2's
+/// `SpaceScanner: Sendable`.
 ///
 /// Deliberately NOT MainActor-isolated, on the type or any query path:
 /// the resolver runs inside `scan(context:) async` and in `--cli` mode
@@ -110,6 +138,11 @@ final class InstalledAppResolver: @unchecked Sendable {
     private let censusRoots: [URL]
     private let useLaunchServices: Bool
     private let fileManager: FileManager
+    /// Signal 3 — Spotlight presence, consulted ONLY after both other
+    /// signals miss (a subprocess spawn is never paid for an id the census
+    /// or LS already resolves). Injectable so hermetic tests script all
+    /// three outcomes without touching the real index.
+    private let spotlightPresence: (String) -> SpotlightPresence
 
     /// Guards `cachedCensus` (the only mutable state; see the header's
     /// lock discipline).
@@ -119,15 +152,20 @@ final class InstalledAppResolver: @unchecked Sendable {
     // MARK: - Init
 
     /// Injectable-roots initializer — hermetic tests use this with
-    /// `useLaunchServices: false` so they never touch the real machine.
+    /// `useLaunchServices: false` and an injected `spotlightPresence`
+    /// closure so they never touch the real machine. `nil` (the default,
+    /// and the production path) means the live `SpotlightBundleIDProbe`.
     init(
         censusRoots: [URL],
         useLaunchServices: Bool = true,
-        fileManager: FileManager = .default
+        fileManager: FileManager = .default,
+        spotlightPresence: ((String) -> SpotlightPresence)? = nil
     ) {
         self.censusRoots = censusRoots
         self.useLaunchServices = useLaunchServices
         self.fileManager = fileManager
+        self.spotlightPresence = spotlightPresence
+            ?? { [probe = SpotlightBundleIDProbe()] in probe.presence(ofBundleID: $0) }
     }
 
     /// Production initializer: default census roots resolved against the
@@ -168,7 +206,20 @@ final class InstalledAppResolver: @unchecked Sendable {
         if census.identifiers.contains(bundleID.lowercased()) {
             return .installed
         }
-        return census.complete ? .notInstalled : .unknown
+
+        // Signal 3 — Spotlight, the only signal covering arbitrary install
+        // locations for never-LS-registered apps. Consulted only now that
+        // both cheaper signals have missed. A clean miss from a HEALTHY
+        // index is REQUIRED before the census verdict may claim global
+        // absence; an unavailable index fails closed (header contract).
+        switch spotlightPresence(bundleID) {
+        case .present:
+            return .installed
+        case .absent:
+            return census.complete ? .notInstalled : .unknown
+        case .unavailable:
+            return .unknown
+        }
     }
 
     // MARK: - Census (lazy, one-shot)
@@ -268,5 +319,177 @@ final class InstalledAppResolver: @unchecked Sendable {
             return false
         }
         return errno == ENOENT || errno == ENOTDIR
+    }
+}
+
+// MARK: - Spotlight signal
+
+/// Outcome of one Spotlight bundle-id presence probe.
+enum SpotlightPresence {
+    /// The index has at least one item carrying this bundle identifier.
+    case present
+    /// A HEALTHY index (canary-verified) answered and has none.
+    case absent
+    /// No trustworthy answer: Spotlight disabled or its index missing the
+    /// canary apps, a query failure, or a timeout. Callers must fail
+    /// closed — this can never support an absence claim.
+    case unavailable
+}
+
+/// Spotlight bundle-id presence via a bounded `/usr/bin/mdfind -count`
+/// subprocess.
+///
+/// ## Why a subprocess and not the query APIs
+///
+/// Measured on macOS 26 (Darwin 25): `MDQueryExecute` (synchronous, with
+/// an explicit computer scope) SUCCEEDS yet returns 0 results for ids
+/// `mdfind` resolves instantly — Finder and Safari included — from an
+/// unentitled third-party process; metadata results are filtered for such
+/// clients, and `NSMetadataQuery` rides the same mds connection. The
+/// Apple-signed `mdfind` sees the real index, so it is the only avenue
+/// that actually works — and this codebase already runs bounded
+/// subprocess probes (`CacheCategory.toolExists`, house 2s probe-timeout
+/// doctrine, `Process.waitForExit(within:)`).
+///
+/// ## Query shape
+///
+/// `kMDItemCFBundleIdentifier = "<escaped id>"c` — the trailing `c` flag
+/// is the case-insensitivity form that WORKS with mdfind (bundle ids
+/// compare case-insensitively, and plain `==` is case-sensitive: a query
+/// for `com.apple.SAFARI` misses `com.apple.Safari`). The `==[c]`
+/// modifier syntax empirically returns 0 for known-present ids on macOS
+/// 26 and must not be used. The id is passed inside argv (never a shell),
+/// with `\` and `"` escaped so a hostile cache-directory NAME cannot
+/// inject query syntax.
+///
+/// ## Canary, health, and the fail-closed latch
+///
+/// `mdfind` reports a malformed query and a disabled/rebuilding index the
+/// SAME way as genuine absence: exit 0, count 0. A zero is therefore only
+/// trustworthy after a canary proves the index can see apps that exist on
+/// every macOS installation (Finder, Dock, System Settings — any ONE hit
+/// passes). The canary runs ONCE per probe instance and uses the same
+/// query shape as real queries, so a shape regression fails the canary
+/// rather than minting false absences. Any failure — canary miss, spawn
+/// error, non-zero exit, unparseable output, timeout — LATCHES the probe
+/// unavailable so a broken mds costs bounded time once, not 2s per
+/// candidate.
+///
+/// Thread-safe (`lock` guards the latch state; queries themselves run
+/// outside the lock — a racing duplicate canary is idempotent and
+/// harmless). `@unchecked Sendable` under that discipline.
+final class SpotlightBundleIDProbe: @unchecked Sendable {
+
+    /// Bundle ids present on every macOS installation; ANY one hit proves
+    /// the index healthy.
+    static let canaryBundleIDs = [
+        "com.apple.finder",
+        "com.apple.dock",
+        "com.apple.systempreferences",
+    ]
+
+    /// House probe-timeout doctrine (`CacheCategory.toolExists`): mdfind
+    /// count queries answer in tens of milliseconds; anything slower than
+    /// this is a hung mds and latches the probe unavailable.
+    static let queryTimeout: TimeInterval = 2
+
+    private enum HealthState {
+        case unprobed
+        case healthy
+        case unavailable
+    }
+
+    /// Bundle id → match count; `nil` on any query failure. Injectable so
+    /// hermetic tests script canary/latch behavior without subprocesses.
+    private let runQuery: (String) -> Int?
+
+    private let lock = NSLock()
+    private var state: HealthState = .unprobed
+
+    init(runQuery: ((String) -> Int?)? = nil) {
+        self.runQuery = runQuery ?? Self.liveMDFindCount
+    }
+
+    /// Tri-state presence for one bundle id. Synchronous and bounded; see
+    /// the type header for the canary/latch semantics.
+    func presence(ofBundleID bundleID: String) -> SpotlightPresence {
+        guard ensureHealthy() else { return .unavailable }
+        guard let count = runQuery(bundleID) else {
+            latchUnavailable()
+            return .unavailable
+        }
+        return count > 0 ? .present : .absent
+    }
+
+    /// The exact query handed to mdfind — exposed for the escaping tests.
+    static func queryString(forBundleID bundleID: String) -> String {
+        let escaped = bundleID
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        return "kMDItemCFBundleIdentifier = \"\(escaped)\"c"
+    }
+
+    // MARK: - Health
+
+    /// One-shot canary, double-checked around the lock (canary queries run
+    /// OUTSIDE it — they spawn subprocesses; a racing duplicate computes
+    /// the same verdict).
+    private func ensureHealthy() -> Bool {
+        lock.lock()
+        let current = state
+        lock.unlock()
+        switch current {
+        case .healthy: return true
+        case .unavailable: return false
+        case .unprobed: break
+        }
+
+        let healthy = Self.canaryBundleIDs.contains { id in
+            (runQuery(id) ?? 0) > 0
+        }
+        lock.lock()
+        // First writer wins; an unavailable latch set meanwhile sticks.
+        if state == .unprobed {
+            state = healthy ? .healthy : .unavailable
+        }
+        let verdict = state == .healthy
+        lock.unlock()
+        return verdict
+    }
+
+    private func latchUnavailable() {
+        lock.lock()
+        state = .unavailable
+        lock.unlock()
+    }
+
+    // MARK: - Live mdfind runner
+
+    private static func liveMDFindCount(forBundleID bundleID: String) -> Int? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/mdfind")
+        process.arguments = ["-count", queryString(forBundleID: bundleID)]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+
+        do {
+            try process.run()
+        } catch {
+            return nil
+        }
+        guard process.waitForExit(within: queryTimeout) else {
+            process.terminate()
+            return nil
+        }
+        guard process.terminationStatus == 0 else { return nil }
+
+        // The output is one tiny count line — far below the 64 KiB pipe
+        // buffer, so the child can never block on write before exit, and
+        // reading to EOF after exit terminates promptly (the parent's copy
+        // of the write end was closed at spawn).
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        guard let text = String(data: data, encoding: .utf8) else { return nil }
+        return Int(text.trimmingCharacters(in: .whitespacesAndNewlines))
     }
 }

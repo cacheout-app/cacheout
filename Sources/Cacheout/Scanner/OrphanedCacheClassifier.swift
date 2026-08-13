@@ -113,8 +113,10 @@ struct SweepClassification: Equatable {
     let tier: SweepTier
     let risk: RiskLevel
     /// User-facing evidence lines (fn-2 renders them in the confirmation
-    /// sheet). Frozen shapes per the epic's examples; deterministic order:
-    /// tier line, incomplete-resolution note, user-data caution,
+    /// sheet). Frozen shapes per the epic's examples (the orphan line
+    /// additionally appends its basis parenthetical — PR #456 review P2 —
+    /// keeping the epic's prefix intact as a substring); deterministic
+    /// order: tier line, incomplete-resolution note, user-data caution,
     /// incomplete-probe caution, denial lines, boundary line.
     let evidence: [String]
     /// Selection policy (epic mapping): BOTH flags are true exactly for a
@@ -216,7 +218,19 @@ struct OrphanedCacheClassifier {
             }
             if isOrphan {
                 tier = .orphan
-                evidence.append("no installed app for bundle id \(entry.name)")
+                // The frozen epic prefix ("no installed app for bundle id
+                // X" — e2e asserts it as a substring) plus the BASIS of
+                // the claim (PR #456 review P2): the production resolver
+                // (fn-3.3, wired by fn-3.4) establishes absence from
+                // LaunchServices + the app-folder census + a
+                // canary-verified Spotlight miss, so the evidence names
+                // that search instead of overclaiming bare global absence
+                // (an app on a Spotlight-excluded volume, never
+                // LS-registered, remains invisible to all three signals).
+                evidence.append(
+                    "no installed app for bundle id \(entry.name)"
+                        + " (checked LaunchServices, Spotlight, and standard app folders)"
+                )
             } else if let untouchedDays = staleLargeUntouchedDays(entry) {
                 tier = .staleLarge
                 evidence.append(

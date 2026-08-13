@@ -225,7 +225,8 @@ final class CacheCleanerTests: XCTestCase {
         state: ScanState = .measured,
         scanError: ScanError? = nil,
         action: ReclaimAction,
-        admission: AdmissionDescriptor
+        admission: AdmissionDescriptor,
+        autoEligible: Bool = true
     ) -> ReclaimableItem {
         ReclaimableItem(
             id: id, scannerID: scannerID, displayName: displayName,
@@ -235,7 +236,8 @@ final class CacheCleanerTests: XCTestCase {
             rootRecords: records, state: state, scanError: scanError,
             risk: .safe, evidence: "", rebuildNote: nil,
             action: action, admission: admission,
-            defaultSelected: true, automaticCleanEligible: true, isStale: nil
+            defaultSelected: true, automaticCleanEligible: autoEligible,
+            isStale: nil
         )
     }
 
@@ -273,7 +275,8 @@ final class CacheCleanerTests: XCTestCase {
         displayName: String = "fixture-item",
         origin: URL, target: URL,
         state: ScanState = .measured,
-        exact: Int64 = 1024
+        exact: Int64 = 1024,
+        autoEligible: Bool = true
     ) -> ReclaimableItem {
         makeItem(
             id: id, scannerID: scannerID, displayName: displayName,
@@ -281,7 +284,8 @@ final class CacheCleanerTests: XCTestCase {
             action: .removeItem,
             admission: .containerItem(
                 originContainer: origin, requestedTargetURL: target
-            )
+            ),
+            autoEligible: autoEligible
         )
     }
 
@@ -1970,6 +1974,167 @@ final class CacheCleanerTests: XCTestCase {
         XCTAssertEqual(report.entries.count, 1)
         XCTAssertEqual(report.entries.first?.bytesFreed, 0,
                        "a symlink leaf measures nothing")
+    }
+
+    // MARK: - Delete-time auto-clean revalidation (sweep items, PR #456)
+
+    /// A fixture "~/Library/Caches" container plus one sweep entry holding
+    /// plain cache content, with the session snapshot captured while that
+    /// content exists — the pre-mutation state every revalidation test
+    /// starts from.
+    private func makeSweepFixture(
+        _ label: String = #function
+    ) throws -> (home: URL, caches: URL, entry: URL, snapshot: ContainerSnapshot) {
+        let home = try makeTempDir(label)
+        let caches = home.appendingPathComponent("Library/Caches")
+        let entry = caches.appendingPathComponent("com.apple.SwiftUI.Drag-REVAL")
+        try FileManager.default.createDirectory(at: entry, withIntermediateDirectories: true)
+        try writeFile(entry.appendingPathComponent("payload.bin"), bytes: 4096)
+        return (home, caches, entry, sessionSnapshot(of: [caches]))
+    }
+
+    func testAutoEligibleSweepItemRecreatedWithUserDataIsRefusedUntouched() async throws {
+        let (home, caches, entry, snapshot) = try makeSweepFixture()
+        defer { try? FileManager.default.removeItem(at: home) }
+
+        // Between scan and confirmation: the ENTRY (not the container) is
+        // removed and recreated at the same name holding user-data-shaped
+        // content the scan never inspected. The container's identity — all
+        // the session snapshot binds — is untouched, so every pre-existing
+        // check still passes.
+        try FileManager.default.removeItem(at: entry)
+        let library = entry.appendingPathComponent("Photos Library.photoslibrary")
+        try FileManager.default.createDirectory(at: library, withIntermediateDirectories: true)
+        let victim = library.appendingPathComponent("database.db")
+        try writeFile(victim, bytes: 4096)
+
+        let item = makeRemoveItem(
+            scannerID: OrphanedCachesScanner.registeredID,
+            displayName: entry.lastPathComponent,
+            origin: caches, target: entry
+        )
+        let cleaner = CacheCleaner(
+            home: home, containerRoots: [caches], containerSnapshot: snapshot
+        )
+        let report = await cleaner.clean(items: [item], moveToTrash: false)
+
+        XCTAssertTrue(report.entries.isEmpty, "nothing may be deleted")
+        XCTAssertEqual(report.errors.count, 1)
+        let message = try XCTUnwrap(report.errors.first?.message)
+        XCTAssertTrue(message.contains("contents changed since scan"), message)
+        XCTAssertTrue(message.contains("photos-library"),
+                      "the refusal names the matched shape: \(message)")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: victim.path),
+                      "the recreated, uninspected content is untouched")
+        XCTAssertTrue(logContents(home: home).contains("REFUSED [content-drift]"),
+                      "the refusal is logged with its own tag")
+    }
+
+    func testAutoEligibleSweepItemProbeIncompleteAtDeleteTimeIsRefused() async throws {
+        let (home, caches, entry, snapshot) = try makeSweepFixture()
+        defer { try? FileManager.default.removeItem(at: home) }
+
+        // Recreate the entry with a directory sitting AT the probe's depth
+        // boundary (entry/a/b/c — c is a directory at depth 3, left
+        // unexpanded): the pre-delete probe cannot prove the absence of
+        // user data, and an inspection that could not finish is treated
+        // like a change (fail closed).
+        try FileManager.default.removeItem(at: entry)
+        let deep = entry.appendingPathComponent("a/b/c")
+        try FileManager.default.createDirectory(at: deep, withIntermediateDirectories: true)
+        let survivor = deep.appendingPathComponent("hidden.bin")
+        try writeFile(survivor, bytes: 1024)
+
+        let item = makeRemoveItem(
+            scannerID: OrphanedCachesScanner.registeredID,
+            displayName: entry.lastPathComponent,
+            origin: caches, target: entry
+        )
+        let cleaner = CacheCleaner(
+            home: home, containerRoots: [caches], containerSnapshot: snapshot
+        )
+        let report = await cleaner.clean(items: [item], moveToTrash: false)
+
+        XCTAssertTrue(report.entries.isEmpty)
+        XCTAssertEqual(report.errors.count, 1)
+        let message = try XCTUnwrap(report.errors.first?.message)
+        XCTAssertTrue(message.contains("couldn't fully re-inspect"), message)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: survivor.path),
+                      "content behind the uninspectable boundary survives")
+        XCTAssertTrue(logContents(home: home).contains("REFUSED [content-drift]"))
+    }
+
+    func testAutoEligibleSweepItemUnchangedStillDeletes() async throws {
+        let (home, caches, entry, snapshot) = try makeSweepFixture()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let expected = measured(entry).exactAllocatedBytes
+
+        let item = makeRemoveItem(
+            scannerID: OrphanedCachesScanner.registeredID,
+            displayName: entry.lastPathComponent,
+            origin: caches, target: entry
+        )
+        let cleaner = CacheCleaner(
+            home: home, containerRoots: [caches], containerSnapshot: snapshot
+        )
+        let report = await cleaner.clean(items: [item], moveToTrash: false)
+
+        XCTAssertTrue(report.errors.isEmpty, "unexpected errors: \(report.errors)")
+        XCTAssertEqual(report.entries.count, 1)
+        XCTAssertEqual(report.entries.first?.exactBytes, expected)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: entry.path),
+                       "an unchanged clean entry deletes normally")
+    }
+
+    func testRevalidationScopedToAutoEligibleSweepItemsOnly() async throws {
+        // (a) A review-tier sweep item (`automaticCleanEligible == false`)
+        // whose user-data shape was DISCLOSED in its displayed evidence at
+        // scan time: conscious per-item confirmation still deletes it — the
+        // epic's verified-Photos-library field case must never become
+        // permanently undeletable. (b) Another scanner's `.removeItem`
+        // target containing user-data-shaped content: the revalidation is
+        // keyed to the sweep scanner and must not fire.
+        let home = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let caches = home.appendingPathComponent("Library/Caches")
+        let reviewed = caches.appendingPathComponent("com.apple.SwiftUI.Drag-REVIEWED")
+        try FileManager.default.createDirectory(
+            at: reviewed.appendingPathComponent("Pictures"),
+            withIntermediateDirectories: true
+        )
+        try writeFile(reviewed.appendingPathComponent("Pictures/photo.jpg"), bytes: 2048)
+        let other = caches.appendingPathComponent("other-scanner-target")
+        try FileManager.default.createDirectory(
+            at: other.appendingPathComponent("Documents"),
+            withIntermediateDirectories: true
+        )
+        try writeFile(other.appendingPathComponent("Documents/doc.txt"), bytes: 1024)
+
+        let reviewedItem = makeRemoveItem(
+            id: "reviewed", scannerID: OrphanedCachesScanner.registeredID,
+            displayName: reviewed.lastPathComponent,
+            origin: caches, target: reviewed,
+            autoEligible: false
+        )
+        let otherItem = makeRemoveItem(
+            id: "other", scannerID: "fixture_scanner",
+            displayName: other.lastPathComponent,
+            origin: caches, target: other
+        )
+        let cleaner = CacheCleaner(
+            home: home, containerRoots: [caches],
+            containerSnapshot: sessionSnapshot(of: [caches])
+        )
+        let report = await cleaner.clean(
+            items: [reviewedItem, otherItem], moveToTrash: false
+        )
+
+        XCTAssertTrue(report.errors.isEmpty, "unexpected errors: \(report.errors)")
+        XCTAssertEqual(report.entries.count, 2)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: reviewed.path),
+                       "a consciously-confirmed review item still deletes")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: other.path),
+                       "the sweep-keyed revalidation never fires for other scanners")
     }
 
     // MARK: - Unified entry: accounting-registry scope

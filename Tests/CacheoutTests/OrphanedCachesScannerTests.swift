@@ -1195,6 +1195,111 @@ final class OrphanedCachesScannerTests: XCTestCase {
         ))
     }
 
+    // MARK: - Delete-time revalidation probe (PR #456 review)
+
+    func testPreDeleteUserDataProbeKindGatingAndFailClosed() throws {
+        let provider = FileSystemIdentityProvider()
+
+        // (a) Real directory holding a user-data shape → matched, complete.
+        let shaped = cachesRoot.appendingPathComponent("shaped-entry")
+        try mkdir(shaped.appendingPathComponent("Pictures"))
+        var result = OrphanedCachesScanner.preDeleteUserDataProbe(
+            at: shaped, provider: provider
+        )
+        XCTAssertEqual(result.matches, ["pictures-directory"])
+        XCTAssertTrue(result.complete)
+
+        // (b) Clean directory → no matches, complete.
+        let clean = cachesRoot.appendingPathComponent("clean-entry")
+        try mkdir(clean)
+        try writeFile(clean.appendingPathComponent("cache.bin"))
+        result = OrphanedCachesScanner.preDeleteUserDataProbe(
+            at: clean, provider: provider
+        )
+        XCTAssertTrue(result.matches.isEmpty)
+        XCTAssertTrue(result.complete)
+
+        // (c) Absent target → clean and complete: the deletion path owns
+        // the ENOENT surfacing (frozen ghost asymmetry) — the probe must
+        // not preempt it with a refusal.
+        result = OrphanedCachesScanner.preDeleteUserDataProbe(
+            at: cachesRoot.appendingPathComponent("never-existed"),
+            provider: provider
+        )
+        XCTAssertTrue(result.matches.isEmpty)
+        XCTAssertTrue(result.complete)
+
+        // (d) Symlink at the target — even one pointing at a tree full of
+        // user data — is NEVER followed: deletion removes the link, not
+        // the target, so nothing deletable goes uninspected.
+        let external = base.appendingPathComponent("external-userdata")
+        try mkdir(external.appendingPathComponent("Pictures"))
+        let link = cachesRoot.appendingPathComponent("link-entry")
+        try fm.createSymbolicLink(at: link, withDestinationURL: external)
+        result = OrphanedCachesScanner.preDeleteUserDataProbe(
+            at: link, provider: provider
+        )
+        XCTAssertTrue(result.matches.isEmpty)
+        XCTAssertTrue(result.complete)
+
+        // (e) A directory at the depth boundary is left unexpanded → the
+        // probe is INCOMPLETE (fail closed): entry/a/b/c, c at depth 3.
+        let deep = cachesRoot.appendingPathComponent("deep-entry")
+        try mkdir(deep.appendingPathComponent("a/b/c"))
+        result = OrphanedCachesScanner.preDeleteUserDataProbe(
+            at: deep, provider: provider
+        )
+        XCTAssertTrue(result.matches.isEmpty)
+        XCTAssertFalse(result.complete,
+                       "a boundary directory left unexpanded is fail-closed")
+    }
+
+    func testEntryRecreatedAfterScanWithUserDataIsRefusedAtDeleteTime() async throws {
+        let entry = cachesRoot.appendingPathComponent("com.apple.SwiftUI.Drag-REBORN")
+        try mkdir(entry)
+        try writeFile(entry.appendingPathComponent("payload.bin"))
+
+        let runtime = try makeRuntime([makeScanner()])
+        let (items, snapshot) = await scanSession(runtime)
+        let leak = try XCTUnwrap(items.first)
+        XCTAssertTrue(leak.automaticCleanEligible,
+                      "the fixture entry scans as a clean known leak")
+
+        // The ENTRY — not the container — is removed and recreated at the
+        // same name with user-data-shaped content the scan never saw. The
+        // session snapshot binds the CONTAINER's identity and still
+        // matches, so only the pre-delete revalidation stands between
+        // Quick Clean and the uninspected content.
+        try fm.removeItem(at: entry)
+        let library = entry.appendingPathComponent(
+            "Pictures/Photos Library.photoslibrary"
+        )
+        try mkdir(library)
+        let victim = try writeFile(library.appendingPathComponent("database.db"))
+
+        let cleaner = runtime.makeCleaner(snapshot: snapshot)
+        let report = await cleaner.clean(items: [leak], moveToTrash: false)
+
+        XCTAssertTrue(report.entries.isEmpty, "nothing deleted")
+        XCTAssertEqual(report.errors.count, 1)
+        let message = try XCTUnwrap(report.errors.first?.message)
+        XCTAssertTrue(message.contains("contents changed since scan"), message)
+        XCTAssertTrue(fm.fileExists(atPath: victim.path),
+                      "the recreated content is byte-untouched")
+        try assertCleanupLogContains(tag: "content-drift")
+
+        // Self-healing: a fresh session inspects the recreated content and
+        // classifies it honestly — review risk with the caution evidence,
+        // never auto-eligible.
+        let (rescanned, _) = await scanSession(runtime)
+        let fresh = try XCTUnwrap(rescanned.first)
+        XCTAssertFalse(fresh.automaticCleanEligible)
+        XCTAssertEqual(fresh.risk, .review)
+        XCTAssertTrue(fresh.evidence.contains(
+            "verify the original still exists before deleting"
+        ), fresh.evidence)
+    }
+
     // MARK: - R5/R9: GUI selection policy + session gates
 
     /// A runtime whose sweep fixture carries every tier: only the clean

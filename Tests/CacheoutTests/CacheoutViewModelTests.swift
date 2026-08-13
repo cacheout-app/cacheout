@@ -315,6 +315,167 @@ final class CacheoutViewModelTests: XCTestCase {
                        "a cancelled scan never counts as a completed one")
     }
 
+    // MARK: - Session-scoped guard & generation pairing (PR #456 P2)
+
+    /// A scan attempt while a session is in flight must NO-OP per the
+    /// re-entrancy convention (guard + return) — never queue, never
+    /// interleave — and each completed session's adoption pairs ITS OWN
+    /// events with ITS OWN snapshot.
+    @MainActor
+    func testScanAttemptMidSessionNoOpsAndEachSessionPairsItsOwnAdoption() async throws {
+        let entered = ScanGate()
+        let release = ScanGate()
+        let calls = CallCounter()
+        let firstGated = ScanOutcome(
+            items: [perItem(scanner: "ggg", id: "g1")], errors: []
+        )
+        let secondGated = ScanOutcome(
+            items: [perItem(scanner: "ggg", id: "g2")], errors: []
+        )
+        let gatedSequence = OutcomeSequence([firstGated, secondGated])
+        let fastOutcome = ScanOutcome(
+            items: [perItem(scanner: "fff", id: "f1")], errors: []
+        )
+        let runtime = try makeRuntime([
+            fixtureScanner("fff") {
+                await calls.increment(); return fastOutcome
+            },
+            fixtureScanner("ggg") {
+                await entered.open()
+                await release.wait()
+                return await gatedSequence.next()
+            },
+        ])
+        let viewModel = CacheoutViewModel(runtime: runtime)
+
+        let scanA = Task { await viewModel.scan(trigger: .automatic) }
+        await entered.wait()
+        try await waitUntil("fast scanner delivered mid-session A") {
+            !viewModel.items(forScanner: "fff").isEmpty
+        }
+
+        // Session A mid-stream: the attempt returns without effect.
+        await viewModel.scan(trigger: .userInitiated)
+        let callsAfterBlockedAttempt = await calls.count
+        XCTAssertEqual(callsAfterBlockedAttempt, 1,
+                       "a blocked scan attempt must not re-invoke any scanner")
+        XCTAssertEqual(viewModel.scanGeneration, 0, "no completed scan yet")
+        XCTAssertTrue(viewModel.isAnyScanInProgress,
+                      "the blocked attempt must not perturb session A's guard")
+
+        await release.open()
+        await scanA.value
+
+        // A's adoption pairs A's events with A's snapshot: everything the
+        // session reconciled is cleanable (stamped generation == adopted
+        // generation) — the blocked attempt changed no provenance.
+        XCTAssertEqual(viewModel.scanGeneration, 1)
+        viewModel.toggleSelection(for: key("fff", "f1"))
+        viewModel.toggleSelection(for: key("ggg", "g1"))
+        XCTAssertEqual(viewModel.selectedItems.map(\.key),
+                       [key("fff", "f1"), key("ggg", "g1")],
+                       "session A's items pair with session A's adoption")
+        XCTAssertTrue(viewModel.hasCleanableSelection)
+
+        // A subsequent session B pairs its own adoption: g1 vanished (its
+        // selection pruned at B's completion), g2 arrives cleanable.
+        await viewModel.scan(trigger: .automatic)
+        let callsAfterB = await calls.count
+        XCTAssertEqual(callsAfterB, 2, "session B invoked each scanner once")
+        XCTAssertEqual(viewModel.scanGeneration, 2)
+        XCTAssertEqual(viewModel.items(forScanner: "ggg").map(\.id), ["g2"])
+        XCTAssertFalse(viewModel.selectedItemKeys.contains(key("ggg", "g1")),
+                       "g1 vanished in session B — pruned at B's completion")
+        viewModel.toggleSelection(for: key("ggg", "g2"))
+        XCTAssertTrue(viewModel.selectedItems.map(\.key).contains(key("ggg", "g2")),
+                      "session B's outcome pairs with session B's adoption")
+    }
+
+    /// The guard is SESSION-KEYED: a cancelled session's wind-down blocks
+    /// new scans, its own epilogue (and only that) releases the guard, and
+    /// a fresh session afterwards runs to adoption — the release path can
+    /// neither strand the guard nor clear a session it does not own.
+    @MainActor
+    func testCancelledWindDownBlocksNewScanThenReleasesGuardForFreshSession() async throws {
+        let entered = ScanGate()
+        let release = ScanGate()
+        let calls = CallCounter()
+        let runtime = try makeRuntime([
+            fixtureScanner("slow_walk") {
+                await calls.increment()
+                await entered.open()
+                await release.wait()
+                return ScanOutcome(items: [], errors: [])
+            },
+        ])
+        let viewModel = CacheoutViewModel(runtime: runtime)
+
+        let scanA = Task { await viewModel.scan(trigger: .automatic) }
+        await entered.wait()
+        scanA.cancel()
+        try await Task.sleep(nanoseconds: 100_000_000)
+
+        // Mid-wind-down: a new scan must no-op against the held guard.
+        await viewModel.scan(trigger: .userInitiated)
+        let callsDuringWindDown = await calls.count
+        XCTAssertEqual(callsDuringWindDown, 1,
+                       "no scanner re-invoked while the walk winds down")
+        XCTAssertTrue(viewModel.isAnyScanInProgress)
+
+        await release.open()
+        await scanA.value
+        XCTAssertFalse(viewModel.isAnyScanInProgress,
+                       "the owning session's epilogue releases the guard — "
+                       + "cancelled path included")
+        XCTAssertFalse(viewModel.hasScanned)
+
+        // Guard released: a FRESH session completes and adopts.
+        await viewModel.scan(trigger: .userInitiated)
+        let callsAfterFresh = await calls.count
+        XCTAssertEqual(callsAfterFresh, 2)
+        XCTAssertTrue(viewModel.hasScanned)
+        XCTAssertEqual(viewModel.scanGeneration, 1)
+    }
+
+    /// PR #456 P2 regression probe: whenever the in-flight guard reads
+    /// FALSE on the MainActor, the finished session's adoption has ALREADY
+    /// landed (`scanGeneration` advanced in the same synchronous step that
+    /// released the guard). Before the fix the guard derived from
+    /// `scanningScannerIDs`, which empties on the LAST event — several
+    /// MainActor suspensions before adoption — so a poll (or a second
+    /// scan, or a clean) could observe guard-down with adoption pending
+    /// and interleave into the session's epilogue, cross-pairing its
+    /// generation with the other session's snapshot. Each iteration polls
+    /// at Task.yield granularity to land inside that window if it exists.
+    @MainActor
+    func testGuardNeverReadsClearBeforeSnapshotAdoption() async throws {
+        let outcome = ScanOutcome(
+            items: [perItem(scanner: "sss", id: "s1")], errors: []
+        )
+        let runtime = try makeRuntime([fixtureScanner("sss") { outcome }])
+        let viewModel = CacheoutViewModel(runtime: runtime)
+
+        for iteration in 0..<25 {
+            let scanTask = Task { await viewModel.scan(trigger: .automatic) }
+            // Wait for the session to rise — or to complete outright
+            // between our slices, in which case both loops fall through
+            // and the assertion holds trivially.
+            while !viewModel.isAnyScanInProgress
+                && viewModel.scanGeneration == iteration {
+                await Task.yield()
+            }
+            while viewModel.isAnyScanInProgress {
+                await Task.yield()
+            }
+            XCTAssertEqual(
+                viewModel.scanGeneration, iteration + 1,
+                "iteration \(iteration): the guard dropped before adoption "
+                + "— a second scan could interleave into the epilogue"
+            )
+            await scanTask.value
+        }
+    }
+
     // MARK: - Mid-scan selection survival + completion-time pruning
 
     @MainActor
@@ -1175,6 +1336,13 @@ private struct DirectoryFixtureScanner: SpaceScanner {
         }
         return ScanOutcome(items: items, errors: [])
     }
+}
+
+/// Counts fixture-scanner invocations — proof that a guarded-out scan
+/// attempt never re-invoked the scanners.
+private actor CallCounter {
+    private(set) var count = 0
+    func increment() { count += 1 }
 }
 
 /// An openable/closable gate the staggered fixtures block on.

@@ -4,11 +4,13 @@ import Darwin
 @testable import Cacheout
 
 /// Hermetic tests for the fn-3.3 `InstalledAppResolver` census — every
-/// resolver here runs with `useLaunchServices: false` over UUID-derived
-/// fixture roots under the system temp directory, so nothing reads the
-/// real /Applications or the LaunchServices database. The single
-/// LaunchServices case is a CONDITIONAL integration test that skips when
-/// LS itself has no registration to confirm against.
+/// resolver here runs with `useLaunchServices: false` AND an injected
+/// `spotlightPresence` closure (default: a healthy index that finds
+/// nothing) over UUID-derived fixture roots under the system temp
+/// directory, so nothing reads the real /Applications, the LaunchServices
+/// database, or the Spotlight index. The LaunchServices and live-Spotlight
+/// cases are CONDITIONAL integration tests that skip when the real machine
+/// has nothing to confirm against.
 ///
 /// Fixture `.app` bundles are plain directories carrying
 /// `Contents/Info.plist` with `CFBundleIdentifier` — no codesigning needed
@@ -56,9 +58,18 @@ final class InstalledAppResolverTests: XCTestCase {
     }
 
     /// Hermetic resolver: LaunchServices OFF, census over the fixture root
-    /// (or explicit `roots`).
-    private func makeResolver(roots: [URL]? = nil) -> InstalledAppResolver {
-        InstalledAppResolver(censusRoots: roots ?? [appsRoot], useLaunchServices: false)
+    /// (or explicit `roots`), Spotlight scripted (default: a HEALTHY index
+    /// that finds nothing — `.absent` — so census-mechanics tests exercise
+    /// the census verdict exactly as before the third signal existed).
+    private func makeResolver(
+        roots: [URL]? = nil,
+        spotlight: @escaping (String) -> SpotlightPresence = { _ in .absent }
+    ) -> InstalledAppResolver {
+        InstalledAppResolver(
+            censusRoots: roots ?? [appsRoot],
+            useLaunchServices: false,
+            spotlightPresence: spotlight
+        )
     }
 
     private func chmod000(_ url: URL) throws {
@@ -276,9 +287,164 @@ final class InstalledAppResolverTests: XCTestCase {
         guard NSWorkspace.shared.urlForApplication(withBundleIdentifier: finderID) != nil else {
             throw XCTSkip("LaunchServices has no Finder registration in this environment")
         }
-        // Empty census roots: only the LS signal can answer .installed.
-        let resolver = InstalledAppResolver(censusRoots: [], useLaunchServices: true)
+        // Empty census roots and Spotlight scripted absent: only the LS
+        // signal can answer .installed (and it wins before Spotlight is
+        // ever consulted).
+        let resolver = InstalledAppResolver(
+            censusRoots: [],
+            useLaunchServices: true,
+            spotlightPresence: { _ in .absent }
+        )
         XCTAssertEqual(resolver.status(ofBundleID: finderID), .installed)
+    }
+
+    // MARK: - Spotlight signal (resolver-level, scripted)
+
+    func testSpotlightPresenceRescuesAppOutsideCensusRoots() throws {
+        // The PR #456 P2 scenario: an app at an arbitrary location
+        // (/Volumes/Work/Apps, ~/Developer) is invisible to the census and
+        // (here) to LS — only Spotlight can establish presence.
+        let resolver = makeResolver(spotlight: { _ in .present })
+        XCTAssertEqual(
+            resolver.status(ofBundleID: "com.example.elsewhere"), .installed,
+            "a Spotlight hit establishes presence the census cannot see"
+        )
+    }
+
+    func testSpotlightUnavailableMakesCompleteCensusNoMatchUnknown() throws {
+        // The P2 fix proper: a COMPLETE four-root census alone must not
+        // assert GLOBAL absence — without a healthy Spotlight index the
+        // no-match degrades to .unknown, fail closed.
+        let resolver = makeResolver(spotlight: { _ in .unavailable })
+        XCTAssertEqual(
+            resolver.status(ofBundleID: "com.example.absent"), .unknown,
+            "census roots alone cannot establish absence from arbitrary install locations"
+        )
+    }
+
+    func testSpotlightCleanMissKeepsCompleteCensusNotInstalled() throws {
+        var queried: [String] = []
+        let resolver = makeResolver(spotlight: { id in
+            queried.append(id)
+            return .absent
+        })
+        XCTAssertEqual(
+            resolver.status(ofBundleID: "com.example.absent"), .notInstalled,
+            "complete census + healthy-Spotlight clean miss is the positive notInstalled the orphan tier requires"
+        )
+        XCTAssertEqual(queried, ["com.example.absent"],
+                       "the Spotlight signal is consulted with the exact queried id")
+    }
+
+    func testSpotlightPresenceWinsEvenOverIncompleteCensus() throws {
+        try XCTSkipIf(geteuid() == 0, "root ignores permission bits")
+        let locked = base.appendingPathComponent("LockedRoot")
+        try fm.createDirectory(at: locked, withIntermediateDirectories: true)
+        try chmod000(locked)
+        defer { restorePerms(locked) }
+
+        let resolver = makeResolver(roots: [appsRoot, locked],
+                                    spotlight: { _ in .present })
+        XCTAssertEqual(
+            resolver.status(ofBundleID: "com.example.elsewhere"), .installed,
+            "installed wins from any signal — an incomplete census cannot suppress a Spotlight hit"
+        )
+    }
+
+    func testSpotlightNotConsultedWhenCensusMatches() throws {
+        try makeApp(at: appsRoot.appendingPathComponent("Bar.app"),
+                    bundleID: "com.example.bar")
+        var queried: [String] = []
+        let resolver = makeResolver(spotlight: { id in
+            queried.append(id)
+            return .unavailable
+        })
+        XCTAssertEqual(resolver.status(ofBundleID: "com.example.bar"), .installed)
+        XCTAssertEqual(queried, [],
+                       "a subprocess-backed signal is never consulted for an id a cheaper signal resolves")
+    }
+
+    // MARK: - SpotlightBundleIDProbe (hermetic, scripted runner)
+
+    func testProbeCanaryHealthyThenCleanMiss() {
+        var queries: [String] = []
+        let probe = SpotlightBundleIDProbe(runQuery: { id in
+            queries.append(id)
+            return id == "com.apple.finder" ? 1 : 0
+        })
+        XCTAssertEqual(probe.presence(ofBundleID: "com.example.gone"), .absent)
+        XCTAssertEqual(
+            queries, ["com.apple.finder", "com.example.gone"],
+            "the canary runs FIRST (short-circuiting on its first hit) and shares the real query path"
+        )
+        XCTAssertEqual(probe.presence(ofBundleID: "com.example.here.too"), .absent,
+                       "the canary verdict is one-shot — not re-probed per query")
+        XCTAssertEqual(queries.filter { $0 == "com.apple.finder" }.count, 1)
+    }
+
+    func testProbeCanaryMissLatchesUnavailable() {
+        // A zero count for EVERY guaranteed-present system app means the
+        // index cannot be trusted for absence (Spotlight disabled,
+        // rebuilding, or a query-shape regression — mdfind reports all of
+        // them as exit 0, count 0).
+        var queryCount = 0
+        let probe = SpotlightBundleIDProbe(runQuery: { _ in
+            queryCount += 1
+            return 0
+        })
+        XCTAssertEqual(probe.presence(ofBundleID: "com.example.gone"), .unavailable)
+        XCTAssertEqual(queryCount, SpotlightBundleIDProbe.canaryBundleIDs.count,
+                       "an unhealthy canary never runs the real query")
+        XCTAssertEqual(probe.presence(ofBundleID: "com.example.other"), .unavailable)
+        XCTAssertEqual(queryCount, SpotlightBundleIDProbe.canaryBundleIDs.count,
+                       "the unavailable verdict is LATCHED — no further subprocess cost")
+    }
+
+    func testProbeQueryFailureLatchesUnavailable() {
+        var queries: [String] = []
+        let probe = SpotlightBundleIDProbe(runQuery: { id in
+            queries.append(id)
+            return id == "com.apple.finder" ? 1 : nil // healthy canary, then failure
+        })
+        XCTAssertEqual(probe.presence(ofBundleID: "com.example.gone"), .unavailable,
+                       "a spawn/timeout/parse failure can never support an absence claim")
+        let callsAfterFirst = queries.count
+        XCTAssertEqual(probe.presence(ofBundleID: "com.example.other"), .unavailable)
+        XCTAssertEqual(queries.count, callsAfterFirst,
+                       "one failure latches the probe — a broken mds costs bounded time once")
+    }
+
+    func testProbeQueryStringEscapesQuoteAndBackslash() {
+        // A hostile cache-directory NAME must not inject query syntax: the
+        // value rides inside argv (no shell) with \ and " escaped.
+        XCTAssertEqual(
+            SpotlightBundleIDProbe.queryString(forBundleID: "com.foo\"||true\\x"),
+            "kMDItemCFBundleIdentifier = \"com.foo\\\"||true\\\\x\"c"
+        )
+        XCTAssertEqual(
+            SpotlightBundleIDProbe.queryString(forBundleID: "com.example.plain"),
+            "kMDItemCFBundleIdentifier = \"com.example.plain\"c",
+            "the trailing c flag is the case-insensitivity form that works with mdfind (==[c] does not)"
+        )
+    }
+
+    // MARK: - Conditional live Spotlight integration
+
+    func testLiveSpotlightProbeResolvesFinderOrSkips() throws {
+        let probe = SpotlightBundleIDProbe()
+        switch probe.presence(ofBundleID: "com.apple.finder") {
+        case .unavailable:
+            throw XCTSkip("Spotlight unavailable in this environment")
+        case .absent:
+            XCTFail("a canary-healthy index must see Finder")
+        case .present:
+            break
+        }
+        XCTAssertEqual(
+            probe.presence(ofBundleID: "com.cacheout.tests.definitely-not-installed"),
+            .absent,
+            "a healthy live index answers a genuine no-match as absent"
+        )
     }
 
     // MARK: - Production defaults
@@ -301,7 +467,11 @@ final class InstalledAppResolverTests: XCTestCase {
         // async test method is nonisolated, and the call below is
         // SYNCHRONOUS — no await, no MainActor hop — mirroring consumption
         // inside `scan(context:) async` and the headless CLI.
-        let resolver = InstalledAppResolver(censusRoots: [], useLaunchServices: false)
+        let resolver = InstalledAppResolver(
+            censusRoots: [],
+            useLaunchServices: false,
+            spotlightPresence: { _ in .absent }
+        )
         let status = resolver.status(ofBundleID: "com.example.absent")
         XCTAssertEqual(status, .notInstalled)
         requireSendable(resolver)

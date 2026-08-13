@@ -32,9 +32,11 @@
 /// - `--top N`: Limit top-processes output to N entries (default: 10)
 /// - `--orphan-size-floor-mb N` / `--orphan-stale-days N`: invocation-scoped
 ///   orphaned-caches sweep thresholds (positive integers; decimal MB /
-///   days). Accepted by `scan` and `clean` ONLY — smart-clean is frozen
-///   category-only and REJECTS them. Overrides the persisted
-///   `cacheout.orphanedCaches.*` value for this invocation; never persisted
+///   days). Accepted by `scan` and `clean` ONLY — EVERY other command
+///   (smart-clean is frozen category-only; the rest never run the sweep)
+///   REJECTS them with `INVALID_ARGUMENTS` before dispatch. Overrides the
+///   persisted `cacheout.orphanedCaches.*` value for this invocation;
+///   never persisted
 /// - Clean targets are positional arguments after the command. A target is
 ///   one of `<category-slug>` (a category aggregate), `<scanner-slug>` (ALL
 ///   items of a per-item scanner, e.g. `node_modules`), or
@@ -127,6 +129,18 @@ struct CLIHandler {
             exitWithError(code: "UNKNOWN_COMMAND", message: "Unknown command: \(commandStr)")
         }
 
+        // Pre-dispatch gate: the sweep's config flags (R8) are accepted by
+        // the commands that actually run the sweep scanner — scan and clean
+        // ONLY. Every other command rejects them up front; silently
+        // ignoring a threshold the caller passed would hide the flag
+        // landing on the wrong command.
+        if let flag = rejectedSweepFlag(for: command, in: args) {
+            exitWithError(
+                code: "INVALID_ARGUMENTS",
+                message: sweepFlagRejectionMessage(flag: flag, command: command)
+            )
+        }
+
         switch command {
         case .version:
             handleVersion()
@@ -152,16 +166,10 @@ struct CLIHandler {
 
         case .smartClean:
             // smart-clean is frozen category-only (fn-2 round 10): the
-            // sweep never runs there, so its flags are a usage error, not
-            // a silent no-op.
-            if let flag = smartCleanRejectedSweepFlag(in: args) {
-                exitWithError(
-                    code: "INVALID_ARGUMENTS",
-                    message: "\(flag) is not accepted by smart-clean — "
-                        + "smart-clean is category-only and never runs the "
-                        + "orphaned-caches sweep; use the flag with scan or clean"
-                )
-            }
+            // sweep never runs there. Its sweep flags are a usage error,
+            // not a silent no-op — rejected by the pre-dispatch gate above
+            // along with every other non-scan/clean command.
+            //
             // An ABSENT target defaults to 5.0; a PRESENT but malformed one
             // is a usage error — silently defaulting would let
             // `smart-clean garbage --confirm` delete 5 GB the caller never
@@ -474,12 +482,34 @@ struct CLIHandler {
         }
     }
 
-    /// The first sweep flag present in a smart-clean invocation, or nil.
-    /// smart-clean is frozen category-only (fn-2 round 10) — the sweep
-    /// never runs there, so accepting its flags would be a silent no-op
-    /// lie; `run()` turns a non-nil result into INVALID_ARGUMENTS.
+    /// The first sweep flag present in an invocation of a command that
+    /// never runs the orphaned-caches sweep, or nil. Only `scan` and
+    /// `clean` run the sweep scanner — for every other command
+    /// (smart-clean is frozen category-only, fn-2 round 10; the rest have
+    /// no sweep at all) accepting the flags would be a silent no-op lie.
+    /// `run()` turns a non-nil result into INVALID_ARGUMENTS before
+    /// dispatch.
+    static func rejectedSweepFlag(for command: Command, in args: [String]) -> String? {
+        guard command != .scan, command != .clean else { return nil }
+        return [orphanSizeFloorFlag, orphanStaleDaysFlag].first(where: args.contains)
+    }
+
+    /// smart-clean's view of the pre-dispatch gate — the original fn-3.4
+    /// entry point, retained so existing callers (the OrphanedCachesScanner
+    /// test surface) keep working; the gate itself is
+    /// `rejectedSweepFlag(for:in:)`.
     static func smartCleanRejectedSweepFlag(in args: [String]) -> String? {
-        [orphanSizeFloorFlag, orphanStaleDaysFlag].first(where: args.contains)
+        rejectedSweepFlag(for: .smartClean, in: args)
+    }
+
+    /// The INVALID_ARGUMENTS message for a rejected sweep flag: names the
+    /// offending flag, the command that refused it, and the commands that
+    /// accept it (kept actionable — the caller's next invocation should be
+    /// obvious from the refusal alone).
+    static func sweepFlagRejectionMessage(flag: String, command: Command) -> String {
+        "\(flag) is not accepted by \(command.rawValue) — only scan and "
+            + "clean run the orphaned-caches sweep; use the flag with "
+            + "scan or clean"
     }
 
     /// The process-facing resolution: parse both flags (exiting via the

@@ -129,7 +129,14 @@ final class OrphanedCacheClassifierTests: XCTestCase {
         let result = classifier.classify(makeEntry(name: "com.foo.bar", exactBytes: 1_000))
         XCTAssertEqual(result.tier, .orphan)
         XCTAssertEqual(result.risk, .review)
-        XCTAssertEqual(result.evidence, ["no installed app for bundle id com.foo.bar"])
+        // The epic's frozen prefix, plus the basis parenthetical (PR #456
+        // review P2): the evidence names WHAT was searched instead of
+        // asserting bare global absence. fn-3.4's e2e asserts the frozen
+        // prefix as a substring, so the addition must stay append-only.
+        XCTAssertEqual(result.evidence, [
+            "no installed app for bundle id com.foo.bar"
+                + " (checked LaunchServices, Spotlight, and standard app folders)"
+        ])
         XCTAssertFalse(result.defaultSelected)
         XCTAssertFalse(result.automaticCleanEligible)
     }

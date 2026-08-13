@@ -49,6 +49,11 @@
 ///    state, never a destructive input). Containment always compares
 ///    against the canonical resolved form, and the chain is re-validated
 ///    immediately before each destructive call (TOCTOU narrowing).
+///    Additionally, an auto-clean-eligible orphaned-caches item re-runs the
+///    sweep's bounded user-data probe immediately pre-delete and is refused
+///    unless the scan-time clean promise re-establishes (no matches AND a
+///    complete probe) — an entry recreated at the same name since the scan
+///    must never be deleted on the strength of a probe of its predecessor.
 /// 4. **`.commands` (R17)**: EVERY root record's `requestedURL` — all
 ///    statuses, the full scan-time capture — is re-admitted BEFORE any argv
 ///    runs; ANY refusal blocks the ENTIRE command set. `.missing` items
@@ -906,6 +911,54 @@ actor CacheCleaner {
             let detail = "\(target.path): mount boundary at \(boundary.path) — refused, not deleted"
             logRefusal(label: item.displayName, tag: "mount_boundary", detail: detail)
             return (nil, [Self.itemError(item, detail)])
+        }
+
+        // DELETE-TIME SAFETY REVALIDATION (PR #456 review): the snapshot
+        // admission above binds the CONTAINER's identity, not the entry's —
+        // a sweep entry removed and recreated at the same name since the
+        // scan passes every check so far while holding content the scan
+        // never inspected. An orphaned-caches item still carrying the CLEAN
+        // PROMISE (`automaticCleanEligible` is set by the classifier ONLY
+        // when the scan-time user-data probe found nothing AND completed)
+        // therefore re-runs the same bounded no-follow probe here,
+        // immediately pre-delete, and is refused unless the promise
+        // re-establishes — fail-closed, the scan-time doctrine ("an
+        // inspection that could not finish is treated like a caution")
+        // applied at delete time. Non-eligible sweep items reach this point
+        // only through conscious per-item confirmation against DISPLAYED
+        // caution evidence (the verified-Photos-library field case);
+        // re-refusing them on the same disclosed state would make them
+        // permanently undeletable, so they keep the epic's accepted
+        // conscious-confirmation TOCTOU residual. Direction-safe either
+        // way: a revalidation can only REFUSE, never widen admission — a
+        // forged `automaticCleanEligible == false` merely opts back into
+        // today's behavior. The scanner-keyed coupling is deliberate and
+        // minimal (the scanner owns its probe; the cleaner owns the
+        // chokepoint) — generalize into a per-scanner revalidator seam when
+        // fn-4/fn-5 scanners need one.
+        if item.scannerID == OrphanedCachesScanner.registeredID,
+           item.automaticCleanEligible {
+            let probe = OrphanedCachesScanner.preDeleteUserDataProbe(
+                at: target, provider: provider
+            )
+            if !probe.matches.isEmpty {
+                let names = probe.matches.joined(separator: ", ")
+                let detail = "\(target.path): contents changed since scan — "
+                    + "user-data-shaped content (\(names)) present at delete "
+                    + "time; refused, re-scan required"
+                logRefusal(label: item.displayName, tag: "content-drift",
+                           detail: detail)
+                return (nil, [Self.itemError(item, detail)])
+            }
+            if !probe.complete {
+                let detail = "\(target.path): couldn't fully re-inspect "
+                    + "contents at delete time — refused (an inspection that "
+                    + "could not finish is treated like a change since scan); "
+                    + "re-scan required"
+                logRefusal(label: item.displayName, tag: "content-drift",
+                           detail: detail)
+                return (nil, [Self.itemError(item, detail)])
+            }
         }
 
         let token = await registry.registerObservations(report.claims)

@@ -754,7 +754,9 @@ final class OrphanedCachesScannerTests: XCTestCase {
         // overflow) fall back to the DEFAULT for that scan — and are NOT
         // rewritten (a value this build cannot read may be meaningful to
         // another build).
-        let invalids: [Any] = [0, -5, "garbage", 50.5, Int64.max]
+        // `true` bridges to NSNumber(1) — a boolean is NOT a
+        // positive-integer threshold (review r2).
+        let invalids: [Any] = [0, -5, "garbage", 50.5, Int64.max, true]
         for invalid in invalids {
             defaults.set(invalid, forKey: OrphanedCachesSweepConfig.sizeFloorMBKey)
             resolved = OrphanedCachesSweepConfig.resolvedThresholds(defaults: defaults)
@@ -767,8 +769,8 @@ final class OrphanedCachesScannerTests: XCTestCase {
                 forKey: OrphanedCachesSweepConfig.sizeFloorMBKey
             )
             XCTAssertNotNil(stillStored, "never rewritten")
-            XCTAssertEqual("\(stillStored!)", "\(invalid)",
-                           "the stored value survives byte-for-byte")
+            XCTAssertEqual(stillStored as? NSObject, invalid as? NSObject,
+                           "the stored value survives unchanged")
         }
 
         // A numeric-string persisted value parses (positive integer).

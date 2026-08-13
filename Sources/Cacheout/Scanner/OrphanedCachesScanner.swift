@@ -527,11 +527,20 @@ enum OrphanedCachesSweepConfig {
     }
 
     /// A persisted value read as a positive INTEGER, or nil when it is
-    /// absent or invalid (non-numeric, non-integral, zero, negative, or
-    /// past Int64). Both NSNumber (the normal `set(_:forKey:)` shapes) and
-    /// numeric strings are accepted — nothing else.
+    /// absent or invalid (non-numeric, non-integral, boolean, zero,
+    /// negative, or past Int64). Both NSNumber (the normal
+    /// `set(_:forKey:)` shapes) and numeric strings are accepted —
+    /// nothing else.
     static func persistedPositiveInteger(_ stored: Any?) -> Int64? {
         if let number = stored as? NSNumber {
+            // A persisted Bool bridges to NSNumber (`true` → 1) — a
+            // boolean is not a positive-integer threshold, so it is
+            // invalid like any other non-numeric value (falls back to the
+            // default, never rewritten). CFBoolean is the toll-free type
+            // a bridged Bool actually carries.
+            guard CFGetTypeID(number) != CFBooleanGetTypeID() else {
+                return nil
+            }
             let value = number.doubleValue
             guard value.isFinite, value > 0,
                   value == value.rounded(),

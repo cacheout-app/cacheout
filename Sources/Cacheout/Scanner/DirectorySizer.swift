@@ -114,6 +114,12 @@ struct SizeReport {
     var skippedSpecialFiles: [URL] = []
     /// One claim per measured regular-file inode — see the type doc.
     var claims: [InodeClaim] = []
+    /// Newest `contentModificationDate` among measured REGULAR FILES (fn-3
+    /// R8 input, produced by the SAME walk — never a second sizing
+    /// enumeration). Regular files only: directory mtimes change on any
+    /// child churn and lie about content age. `nil` when no regular file's
+    /// date could be read.
+    var newestContentDate: Date?
 
     /// The two byte components summed — what a scan row displays today.
     var measuredBytes: Int64 { exactAllocatedBytes + estimatedUpToBytes }
@@ -211,9 +217,13 @@ struct DirectorySizer {
     // MARK: - Enumeration
 
     /// Prefetched during enumeration to avoid a second stat per entry.
+    /// `.contentModificationDateKey` is prefetch-only here — the read that
+    /// actually consumes it lives in `recordRegularFile`, which is also the
+    /// only path a regular-file ROOT takes (it never passes through the
+    /// enumerator at all).
     private static let prefetchKeys: [URLResourceKey] = [
         .totalFileAllocatedSizeKey, .fileAllocatedSizeKey,
-        .totalFileSizeKey, .isRegularFileKey,
+        .totalFileSizeKey, .isRegularFileKey, .contentModificationDateKey,
     ]
 
     private func enumerateTree(
@@ -308,7 +318,7 @@ struct DirectorySizer {
         do {
             values = try url.resourceValues(forKeys: [
                 .totalFileAllocatedSizeKey, .fileAllocatedSizeKey,
-                .totalFileSizeKey,
+                .totalFileSizeKey, .contentModificationDateKey,
             ])
         } catch {
             report.denials.append(Self.classifyDenial(error, at: url))
@@ -331,6 +341,18 @@ struct DirectorySizer {
         let logical = Int64(values.totalFileSize ?? 0)
 
         report.itemCount += 1
+
+        // Newest-content date: max-merged BEFORE the dedupe/known-inode
+        // guards — a second hardlink or a known inode contributes zero bytes
+        // but its content age is still real evidence for this tree (and an
+        // inode's links share one mtime anyway).
+        if let modified = values.contentModificationDate {
+            if let newest = report.newestContentDate {
+                report.newestContentDate = max(newest, modified)
+            } else {
+                report.newestContentDate = modified
+            }
+        }
 
         // Within-walk hardlink dedupe: a second link to an already-claimed
         // inode is a directory entry (itemCount above) but contributes no

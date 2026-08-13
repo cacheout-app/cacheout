@@ -576,19 +576,36 @@ class CacheoutViewModel: ObservableObject {
     /// consent silently; making the argument mandatory turns a
     /// misclassified new call site into a compile error.
     ///
-    /// Consumes fn-2.1's progressive validated event stream — ALL scanners,
-    /// nil `categoryFilter`. The trigger rides `ScanContext` (its derived
+    /// Consumes fn-2.1's progressive validated event stream — nil
+    /// `categoryFilter`. The trigger rides `ScanContext` (its derived
     /// `includeProtectedRoots` is the exact TCC mapping this view model used
     /// to special-case at the node_modules call site); orchestration,
     /// parallelism, and validation all live inside the runtime.
-    func scan(trigger: ScanTrigger) async {
+    ///
+    /// - Parameter scannerIDs: SCANNER SUBSET to run (nil — every existing
+    ///   caller — scans all registered scanners, byte-identical behavior).
+    ///   A subset session adopts its snapshot atomically exactly like a
+    ///   full one, so scanners OUTSIDE the subset keep their PRIOR session
+    ///   provenance: fn-2's retention rules leave their items displayed,
+    ///   but the R9 freshness gate makes those retained rows
+    ///   visible-but-NON-cleanable — they never pair with a snapshot their
+    ///   session did not capture — until their scanner succeeds in a later
+    ///   completed session (fail-closed; a full rescan restores them). The
+    ///   frozen display scopes (totals, sections, checkmarks) are
+    ///   deliberately untouched by the gate.
+    func scan(trigger: ScanTrigger, scannerIDs: Set<String>? = nil) async {
         // Re-entrancy guard (R11): correctness must not depend on button
         // state — an overlapping scan would race two writers over the same
         // published state while slower scanners are still running, and
         // scanning DURING a cleanup would publish results mid-deletion.
         // (clean()'s own post-cleanup rescan runs after isCleaning clears.)
         guard !isAnyScanInProgress && !isCleaning else { return }
-        scanningScannerIDs = Set(runtime.scanners.map(\.id))
+        // Pending state covers exactly the scanners this session RUNS —
+        // a subset must not hold the guard hostage to scanners that will
+        // never report (the runtime invokes only the named subset).
+        scanningScannerIDs = Set(runtime.scanners.map(\.id).filter {
+            scannerIDs?.contains($0) ?? true
+        })
         // New session: outcomes reconciled from here on carry THIS
         // generation's provenance — they pair only with THIS session's
         // snapshot, adopted below at completion (fn-3.4, R9).
@@ -596,6 +613,7 @@ class CacheoutViewModel: ObservableObject {
         diskInfo = await Task.detached { DiskInfo.current() }.value
 
         let session = runtime.scanValidatedSession(
+            scannerIDs: scannerIDs,
             context: ScanContext(trigger: trigger)
         )
         for await event in session.events {
@@ -624,7 +642,11 @@ class CacheoutViewModel: ObservableObject {
         // COMPLETION. A cancelled scan adopts nothing — outcomes it
         // reconciled carry the new generation while the adopted one stays
         // old, so their items are non-cleanable (fail-closed) until a
-        // completed session pairs them with its own capture.
+        // completed session pairs them with its own capture. A SUBSET
+        // session adopts exactly the same way: scanners outside the subset
+        // never delivered in this generation, so their retained rows are
+        // REVOKED from every destructive path by the same comparison —
+        // visible-but-stale beats deletable-under-a-swapped-container.
         adoptedSnapshot = session.snapshot
         adoptedGeneration = sessionGeneration
 

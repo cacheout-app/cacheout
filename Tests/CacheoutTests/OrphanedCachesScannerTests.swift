@@ -1370,6 +1370,114 @@ final class OrphanedCachesScannerTests: XCTestCase {
     }
 
     @MainActor
+    func testSubsetScanRevokesProvenanceOfUnscannedScannersUntilTheySucceed() async throws {
+        // The R9 subset arm: a subset session adopts its snapshot, and a
+        // scanner OUTSIDE the subset keeps its prior provenance — its
+        // retained rows stay visible but are excluded from selectedItems,
+        // Quick Clean staging, and clean() dispatch until the scanner
+        // succeeds in a later session.
+        let entry = cachesRoot.appendingPathComponent("com.apple.SwiftUI.Drag-SUBSET")
+        try mkdir(entry)
+        try writeFile(entry.appendingPathComponent("payload.bin"), bytes: 8192)
+
+        // A second per-item fixture scanner over its own real container.
+        let otherContainer = base.appendingPathComponent("other")
+        let otherTarget = otherContainer.appendingPathComponent("junk")
+        try mkdir(otherTarget)
+        try writeFile(otherTarget.appendingPathComponent("f.bin"))
+        let provider = FileSystemIdentityProvider()
+        let otherResolved = provider.canonicalize(otherTarget)
+        let otherItem = ReclaimableItem(
+            id: ReclaimableItem.stableID(
+                scannerID: "other_fixture", canonicalPath: otherResolved.path
+            ),
+            scannerID: "other_fixture", displayName: "junk",
+            exactBytes: 4096, estimatedUpToBytes: 0, logicalBytes: nil,
+            itemCount: 1, url: otherResolved,
+            declaredDisplayPath: otherTarget.path,
+            rootRecords: [RootScanRecord(
+                requestedURL: otherTarget, resolvedURL: otherResolved,
+                status: .measured
+            )],
+            state: .measured, scanError: nil, risk: .review,
+            evidence: "fixture", rebuildNote: nil, action: .removeItem,
+            admission: .containerItem(
+                originContainer: otherContainer, requestedTargetURL: otherTarget
+            ),
+            defaultSelected: false, automaticCleanEligible: false, isStale: nil
+        )
+        let runtime = try makeRuntime([
+            makeScanner(),
+            GatedFixtureScanner(
+                id: "other_fixture", trustedContainerRoots: [otherContainer],
+                gate: nil,
+                provide: { ScanOutcome(items: [otherItem], errors: []) }
+            ),
+        ])
+        let viewModel = CacheoutViewModel(runtime: runtime)
+        viewModel.moveToTrash = false
+
+        // Full scan: both scanners fresh; the clean leak auto-selects
+        // (policy (a)); the fixture item is selected explicitly.
+        await viewModel.scan(trigger: .userInitiated)
+        let leakKey = try XCTUnwrap(
+            viewModel.items(forScanner: "orphaned_caches").first
+        ).key
+        XCTAssertTrue(viewModel.selectedItemKeys.contains(leakKey))
+        viewModel.toggleSelection(for: otherItem.key)
+        XCTAssertEqual(Set(viewModel.selectedItems.map(\.key)),
+                       [leakKey, otherItem.key],
+                       "both scanners cleanable after the full scan")
+
+        // SUBSET scan excluding the sweep: its retained rows stay VISIBLE
+        // (items + checkmark) but its provenance is revoked — the newer
+        // session's snapshot never vouched for them.
+        await viewModel.scan(
+            trigger: .userInitiated, scannerIDs: ["other_fixture"]
+        )
+        XCTAssertFalse(
+            viewModel.items(forScanner: "orphaned_caches").isEmpty,
+            "retained rows stay displayed after the subset scan"
+        )
+        XCTAssertTrue(viewModel.selectedItemKeys.contains(leakKey),
+                      "the retained selection survives (display state)")
+        XCTAssertEqual(viewModel.selectedItems.map(\.key), [otherItem.key],
+                       "the unscanned scanner is excluded from clean()'s input")
+        XCTAssertEqual(viewModel.automaticCleanableSize, 0,
+                       "Quick Clean's gate must not count the revoked safe leak")
+        viewModel.deselectAll()
+        viewModel.selectAllSafe()
+        XCTAssertTrue(viewModel.selectedItemKeys.isEmpty,
+                      "the bulk path refuses to stage the revoked leak")
+
+        // clean() dispatches ONLY the subset-fresh scanner's item; the
+        // revoked leak's tree is untouched.
+        viewModel.toggleSelection(for: leakKey)
+        viewModel.toggleSelection(for: otherItem.key)
+        await viewModel.clean()
+        let report = try XCTUnwrap(viewModel.lastReport)
+        XCTAssertEqual(report.entries.map(\.itemID), [otherItem.id],
+                       "only the subset-fresh item reaches the cleaner")
+        XCTAssertTrue(
+            report.errors.allSatisfy { $0.key != leakKey },
+            "the revoked item never reaches dispatch — not even as a refusal"
+        )
+        XCTAssertFalse(fm.fileExists(atPath: otherTarget.path))
+        XCTAssertTrue(fm.fileExists(atPath: entry.path),
+                      "the unscanned scanner's target is untouched")
+
+        // clean()'s trailing FULL rescan restores the sweep's provenance:
+        // cleanability returns once the scanner succeeds in a completed
+        // session, and the retained selection cleans normally.
+        XCTAssertTrue(viewModel.selectedItems.map(\.key).contains(leakKey),
+                      "cleanability returns after the scanner succeeds")
+        viewModel.toggleSelection(for: otherItem.key)  // deselect the ghost
+        await viewModel.clean()
+        XCTAssertFalse(fm.fileExists(atPath: entry.path),
+                       "the restored item cleans end-to-end")
+    }
+
+    @MainActor
     func testFreshnessGateMalformedRetentionIsVisibleButNonCleanable() async throws {
         // A scanner that emits a VALID outcome, then a malformed one
         // (foreign-owned item), then valid again.

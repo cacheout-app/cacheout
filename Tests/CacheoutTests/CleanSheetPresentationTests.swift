@@ -344,6 +344,33 @@ final class CleanSheetPresentationTests: XCTestCase {
         )
     }
 
+    func testReportTotalsAndRollupsSaturateInsteadOfTrapping() {
+        // Round 8: report entries cross scanners, and the runtime
+        // validator bounds each scanner's outcome only individually —
+        // every derived report sum must clamp at Int64.max, never trap
+        // mid-render.
+        let report = CleanupReport(
+            disposal: .permanent,
+            entries: [
+                entry(scanner: "scanner_a", id: "a", name: "a", exact: .max),
+                entry(scanner: "scanner_b", id: "b", name: "b",
+                      exact: .max, estimated: .max),
+            ],
+            errors: []
+        )
+
+        XCTAssertEqual(report.totalFreedExact, Int64.max,
+                       "the report-wide exact total clamps")
+        XCTAssertEqual(report.totalEstimatedUpTo, Int64.max)
+        XCTAssertEqual(report.entries[1].bytesFreed, Int64.max,
+                       "the per-entry compatibility sum clamps too")
+        XCTAssertEqual(report.scannerRollups.map(\.bytesFreed),
+                       [Int64.max, Int64.max],
+                       "rollup sums and their compatibility sums clamp")
+        XCTAssertFalse(report.headline.isEmpty,
+                       "the amount phrase renders from clamped sums")
+    }
+
     // MARK: - Vanished failed item renders from the ItemError record alone (R1)
 
     func testVanishedFailedItemRendersFromItemErrorRecordAlone() {

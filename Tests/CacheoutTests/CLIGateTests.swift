@@ -419,6 +419,43 @@ final class CLIGateTests: XCTestCase {
         XCTAssertEqual(plan[1]["action"] as? String, "refuse")
     }
 
+    func testCleanPlanTotalsSaturateAcrossScanners() throws {
+        // Round 8: the runtime validator bounds each scanner's outcome
+        // individually, but a multi-target plan can span scanners — the
+        // plan totals must clamp at Int64.max, never trap. Each item here
+        // is individually valid (and would ride an individually valid
+        // outcome); only their cross-scanner sum is impossible.
+        let items = [
+            makeStandaloneItem(id: "huge_a", scannerID: "scanner_a",
+                               exact: .max),
+            makeStandaloneItem(id: "huge_b", scannerID: "scanner_b",
+                               exact: .max),
+        ]
+
+        let details = CLIHandler.cleanConfirmationDetails(for: items)
+        XCTAssertEqual(details["total_exact_bytes"] as? Int64, Int64.max,
+                       "cross-scanner exact totals clamp instead of trapping")
+        XCTAssertEqual(details["total_estimated_up_to_bytes"] as? Int64, 0)
+
+        let payload = CLIHandler.cleanDryRunPayload(for: items)
+        XCTAssertEqual(payload["total_would_free"] as? Int64, Int64.max,
+                       "the dry-run total rides the same saturating sums")
+
+        // The estimated column clamps independently through the same
+        // helper.
+        let estimated = [
+            makeStandaloneItem(id: "est_a", scannerID: "scanner_a",
+                               exact: 0, estimated: .max),
+            makeStandaloneItem(id: "est_b", scannerID: "scanner_b",
+                               exact: 0, estimated: .max),
+        ]
+        let estDetails = CLIHandler.cleanConfirmationDetails(for: estimated)
+        XCTAssertEqual(
+            estDetails["total_estimated_up_to_bytes"] as? Int64, Int64.max
+        )
+        XCTAssertEqual(estDetails["total_exact_bytes"] as? Int64, 0)
+    }
+
     // MARK: - Smart-clean candidates (R18 CLI half, policy (c))
 
     func testSmartCleanCandidatesExcludeDeniedPartialAndCaution() {

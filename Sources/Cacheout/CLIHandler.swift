@@ -861,12 +861,17 @@ struct CLIHandler {
     }
 
     /// Exact-only totals over the entries the plan would actually clean.
+    /// SATURATING (round 8): a multi-target plan can span scanners, and
+    /// the validator bounds each scanner's outcome only individually —
+    /// clamp at Int64.max instead of trapping (byte-identical for every
+    /// physically possible total).
     private static func cleanPlanTotals(_ items: [ReclaimableItem]) -> (exact: Int64, estimated: Int64) {
         items.reduce(into: (exact: Int64(0), estimated: Int64(0))) { totals, item in
             let action = cleanPlanAction(for: item)
             guard action == "clean" || action == "clean_with_warning" else { return }
-            totals.exact += item.exactBytes
-            totals.estimated += item.estimatedUpToBytes
+            totals.exact = totals.exact.saturatingAdding(item.exactBytes)
+            totals.estimated = totals.estimated
+                .saturatingAdding(item.estimatedUpToBytes)
         }
     }
 

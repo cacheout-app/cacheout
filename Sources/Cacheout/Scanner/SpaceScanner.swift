@@ -553,7 +553,14 @@ struct SpaceScannerRuntime {
     ///     a COMPUTED sum touched by `scanEnvelope` rows, GUI totals, size
     ///     sorting, and clean plans — an overflowing pair would trap the
     ///     first consumer instead of producing `malformed_outcome`
-    ///     (`valueDomainViolation`);
+    ///     (`valueDomainViolation`). The OUTCOME-WIDE half (round 8): the
+    ///     sum of `allocatedBytes` ACROSS the outcome's items must also be
+    ///     representable — two individually valid items can still claim
+    ///     more than Int64.max bytes together, which no real scan can
+    ///     (> 9.2 EB), and the cross-item sum is exactly what every
+    ///     single-scanner consumer total computes. Cross-SCANNER totals
+    ///     remain consumer arithmetic, saturating by construction
+    ///     (`Int64.saturatingAdding`);
     /// (e) STATE↔RECORD COHERENCE — the item's `state` must be SUPPORTED
     ///     by its captured record statuses, byte components, and error
     ///     surface, per the frozen truth table: e.g. a `.measured` item
@@ -647,6 +654,8 @@ struct SpaceScannerRuntime {
         registeredCategories: [String: CacheCategory]
     ) -> ValidatedScannerEvent {
         var seenIDs = Set<String>()
+        // Check (d), outcome-wide half: running `allocatedBytes` sum.
+        var outcomeAllocatedTotal: Int64 = 0
         for item in outcome.items {
             guard item.scannerID == scannerID else {
                 return .malformed(scannerID: scannerID, ScanIssue(
@@ -689,6 +698,26 @@ struct SpaceScannerRuntime {
                         + violation
                 ))
             }
+            // Check (d), outcome-wide half (round 8): `allocatedBytes` is
+            // safe to touch only AFTER the per-item value-domain check
+            // above proved this item's pair representable. Two
+            // individually valid items can still sum past Int64.max —
+            // an outcome claiming more than 9.2 EB from one scan is
+            // physically impossible, and the cross-item sum is exactly
+            // what every single-scanner consumer total computes.
+            let (runningTotal, overflow) = outcomeAllocatedTotal
+                .addingReportingOverflow(item.allocatedBytes)
+            if overflow {
+                return .malformed(scannerID: scannerID, ScanIssue(
+                    url: nil, kind: .malformedOutcome,
+                    detail: "scanner '\(scannerID)' outcome-wide "
+                        + "allocatedBytes sum overflows Int64 at item "
+                        + "'\(item.id)' — a single scan claiming more than "
+                        + "Int64.max bytes is physically impossible, and "
+                        + "the sum would trap the first consumer total"
+                ))
+            }
+            outcomeAllocatedTotal = runningTotal
         }
         // Check (h): the reserved issue kind. Runs over the ISSUE list —
         // a scanner-authored `.malformedOutcome` would let the CLI print
@@ -718,10 +747,18 @@ struct SpaceScannerRuntime {
     /// would trap the process at first touch instead of producing
     /// `malformed_outcome`. Fail closed here.
     ///
-    /// Deliberately NOT enforced: cross-ITEM aggregation bounds. Totals
-    /// are consumer-side arithmetic over per-item-validated fields, and
-    /// any per-item cap below `Int64.max` would be an invented constraint
-    /// the model does not document.
+    /// PER-ITEM half only — the outcome-wide `allocatedBytes` sum (the
+    /// same honesty rule one level up, round 8) accumulates in
+    /// `validatedOutcome`'s item loop, where the running total lives.
+    /// Round 5 declined cross-item bounds as "consumer-side arithmetic";
+    /// that held for any per-item CAP below `Int64.max` (an invented
+    /// constraint the model does not document) but NOT for outcome-wide
+    /// overflow: an outcome whose items sum past Int64.max claims more
+    /// than 9.2 EB from one scan — physically impossible, so rejecting it
+    /// invents nothing. Cross-SCANNER totals stay deliberately unenforced
+    /// here (each outcome is bounded individually; their sum is unbounded
+    /// in principle) — every consumer aggregation saturates instead
+    /// (`Int64.saturatingAdding`).
     private static func valueDomainViolation(
         of item: ReclaimableItem
     ) -> String? {

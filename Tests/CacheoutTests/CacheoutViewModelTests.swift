@@ -794,6 +794,41 @@ final class CacheoutViewModelTests: XCTestCase {
         XCTAssertEqual(viewModel.overcountCaveat, DiskSpaceCaveat.overcount)
     }
 
+    @MainActor
+    func testMultiScannerTotalsSaturateInsteadOfTrapping() async throws {
+        // Round 8: the runtime validator bounds every SINGLE outcome's
+        // component sum, but the frozen totals add ACROSS scanners — two
+        // individually valid outcomes can still exceed Int64.max together,
+        // so the shared helper saturates (a clamped ceiling is honest at
+        // physically impossible magnitudes; a trap is not). Both outcomes
+        // ride the REAL scan path, so each also proves the validator's
+        // exactly-Int64.max boundary passes end-to-end.
+        let bigA = perItem(scanner: "sat_a", id: "a1", bytes: .max)
+        let bigB = perItem(scanner: "sat_b", id: "b1", bytes: .max)
+        let runtime = try makeRuntime([
+            fixtureScanner("sat_a") { ScanOutcome(items: [bigA], errors: []) },
+            fixtureScanner("sat_b") { ScanOutcome(items: [bigB], errors: []) },
+        ])
+        let viewModel = CacheoutViewModel(runtime: runtime)
+
+        await viewModel.scan(trigger: .userInitiated)
+        XCTAssertNil(viewModel.malformedIssuesByScannerID["sat_a"],
+                     "a single outcome AT the Int64.max boundary validates")
+        XCTAssertNil(viewModel.malformedIssuesByScannerID["sat_b"])
+        XCTAssertEqual(viewModel.totalSize(forScanner: "sat_a"), .max,
+                       "a single scanner at the ceiling is exact, not clamped")
+
+        viewModel.toggleSelection(for: key("sat_a", "a1"))
+        viewModel.toggleSelection(for: key("sat_b", "b1"))
+
+        XCTAssertEqual(viewModel.totalSelectedSize, .max,
+                       "cross-scanner totals clamp at Int64.max instead of trapping")
+        XCTAssertEqual(viewModel.totalCleanableSelectedSize, .max,
+                       "the destructive-scoped variant rides the same helper")
+        XCTAssertFalse(viewModel.formattedTotalSelectedSize.isEmpty,
+                       "the clamped total still formats for display")
+    }
+
     // MARK: - Malformed outcomes: fail-closed disposition (validation lives
     // in the runtime; the view model applies only the disposition)
 

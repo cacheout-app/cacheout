@@ -261,8 +261,9 @@ struct CleanupReport {
         /// Move-to-Trash toggle and place nothing in the Trash, so their
         /// entries stay `.permanent` even in a Trash run.
         let disposal: Disposal
-        /// Compatibility sum for pre-split callers.
-        var bytesFreed: Int64 { exactBytes + estimatedUpToBytes }
+        /// Compatibility sum for pre-split callers — saturating (round 8):
+        /// report arithmetic must never trap, whatever the components.
+        var bytesFreed: Int64 { exactBytes.saturatingAdding(estimatedUpToBytes) }
 
         /// The composite cross-scanner identity — report correlation and
         /// list identity both key on it.
@@ -297,7 +298,8 @@ struct CleanupReport {
         let estimatedUpToBytes: Int64
         /// How many entries contributed to this rollup.
         let entryCount: Int
-        var bytesFreed: Int64 { exactBytes + estimatedUpToBytes }
+        /// Saturating (round 8): report arithmetic must never trap.
+        var bytesFreed: Int64 { exactBytes.saturatingAdding(estimatedUpToBytes) }
 
         /// Component-derived rollup text for the report sheet's section
         /// header (fn-2.5) — the same R16 phrase entry rows use, never a
@@ -326,10 +328,17 @@ struct CleanupReport {
     let entries: [Entry]
     let errors: [ItemError]
 
-    /// Pure sum of entry `exactBytes` — no other math (R16).
-    var totalFreedExact: Int64 { entries.reduce(0) { $0 + $1.exactBytes } }
+    /// Pure sum of entry `exactBytes` — no other math (R16). Saturating
+    /// (round 8): entries cross scanners, and the validator bounds each
+    /// scanner's outcome only individually — clamp instead of trap.
+    var totalFreedExact: Int64 {
+        entries.reduce(0) { $0.saturatingAdding($1.exactBytes) }
+    }
     /// Pure sum of entry `estimatedUpToBytes` — no other math (R16).
-    var totalEstimatedUpTo: Int64 { entries.reduce(0) { $0 + $1.estimatedUpToBytes } }
+    /// Saturating for the same cross-scanner reason as `totalFreedExact`.
+    var totalEstimatedUpTo: Int64 {
+        entries.reduce(0) { $0.saturatingAdding($1.estimatedUpToBytes) }
+    }
 
     /// Per-scanner sums over `entries`, grouped by `scannerID` in order of
     /// first appearance — pure derivation, nothing stored (fn-2.3).
@@ -339,8 +348,10 @@ struct CleanupReport {
         for entry in entries {
             if sums[entry.scannerID] == nil { order.append(entry.scannerID) }
             var sum = sums[entry.scannerID] ?? (0, 0, 0)
-            sum.exact += entry.exactBytes
-            sum.estimated += entry.estimatedUpToBytes
+            // Saturating (round 8): report arithmetic must never trap.
+            sum.exact = sum.exact.saturatingAdding(entry.exactBytes)
+            sum.estimated = sum.estimated
+                .saturatingAdding(entry.estimatedUpToBytes)
             sum.count += 1
             sums[entry.scannerID] = sum
         }
@@ -412,11 +423,14 @@ struct CleanupReport {
         return "erased permanently — not in Trash"
     }
 
-    /// R16 amount phrase over a subset of entries (one disposal's worth).
+    /// R16 amount phrase over a subset of entries (one disposal's worth) —
+    /// saturating sums (round 8): the headline must render, never trap.
     private static func amountPhrase(for subset: [Entry]) -> String {
         componentPhrase(
-            exact: subset.reduce(0) { $0 + $1.exactBytes },
-            estimatedUpTo: subset.reduce(0) { $0 + $1.estimatedUpToBytes }
+            exact: subset.reduce(0) { $0.saturatingAdding($1.exactBytes) },
+            estimatedUpTo: subset.reduce(0) {
+                $0.saturatingAdding($1.estimatedUpToBytes)
+            }
         )
     }
 

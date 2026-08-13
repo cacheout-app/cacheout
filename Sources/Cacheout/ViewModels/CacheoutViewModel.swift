@@ -385,7 +385,11 @@ class CacheoutViewModel: ObservableObject {
 
     /// THE aggregation helper: every byte total flows through here with
     /// EXPLICIT predicates — scope (which scanners) and inclusion (which
-    /// items) as arguments, never copy-pasted loops.
+    /// items) as arguments, never copy-pasted loops. SATURATING (round 8):
+    /// the validator bounds each outcome's sum individually, but this
+    /// helper adds ACROSS scanners, where no per-outcome bound applies —
+    /// clamp at Int64.max instead of trapping (byte-identical for every
+    /// physically possible total).
     private func aggregateBytes(
         scannerScope: (String) -> Bool,
         include: (ReclaimableItem) -> Bool
@@ -393,7 +397,7 @@ class CacheoutViewModel: ObservableObject {
         var total: Int64 = 0
         for (scannerID, outcome) in outcomesByScannerID where scannerScope(scannerID) {
             for item in outcome.items where include(item) {
-                total += item.allocatedBytes
+                total = total.saturatingAdding(item.allocatedBytes)
             }
         }
         return total

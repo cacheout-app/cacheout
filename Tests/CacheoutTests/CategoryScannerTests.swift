@@ -1323,6 +1323,60 @@ final class CategoryScannerTests: XCTestCase {
         }
     }
 
+    // MARK: - Value domain, outcome-wide half (round 8)
+
+    func testOutcomeWideComponentSumOverflowIsMalformedAndBoundaryPasses() throws {
+        // Per-item validation bounds each PAIR, but the cross-item
+        // `allocatedBytes` sum is what every single-scanner consumer total
+        // computes — two individually valid items claiming Int64.max + 1
+        // bytes together describe a physically impossible scan (> 9.2 EB)
+        // and would trap the first consumer instead of producing
+        // `malformed_outcome`.
+        let home = try makeTempDir("home")
+        let runtime = try makeValidationRuntime(home: home)
+
+        let overflowCells: [(label: String, items: [ReclaimableItem])] = [
+            ("Int64.max + 1 across two exact components (the review shape)",
+             [makeContainerItem(id: "big", scannerID: "fixture",
+                                exactBytes: .max),
+              makeContainerItem(id: "one", scannerID: "fixture",
+                                exactBytes: 1)]),
+            ("overflow reached through an estimated component",
+             [makeContainerItem(id: "big", scannerID: "fixture",
+                                exactBytes: .max),
+              makeContainerItem(id: "est", scannerID: "fixture",
+                                exactBytes: 0, estimatedUpToBytes: 1)]),
+        ]
+        for cell in overflowCells {
+            let issue = malformedIssue(of: runtime.validatedOutcome(
+                ScanOutcome(items: cell.items, errors: []), from: "fixture"
+            ))
+            XCTAssertNotNil(issue, "\(cell.label) must be refused")
+            XCTAssertEqual(issue?.kind, .malformedOutcome, cell.label)
+            XCTAssertNil(
+                issue?.url,
+                "\(cell.label): no filesystem location — never a fake path"
+            )
+        }
+
+        // Boundary: an outcome summing EXACTLY to Int64.max is
+        // representable — the rule is overflow, never an invented cap
+        // below it (round 5's objection, preserved).
+        let boundary = ScanOutcome(
+            items: [
+                makeContainerItem(id: "almost", scannerID: "fixture",
+                                  exactBytes: .max - 1),
+                makeContainerItem(id: "last", scannerID: "fixture",
+                                  exactBytes: 0, estimatedUpToBytes: 1),
+            ],
+            errors: []
+        )
+        let verdict = runtime.validatedOutcome(boundary, from: "fixture")
+        XCTAssertNil(malformedIssue(of: verdict),
+                     "an outcome summing exactly to Int64.max must publish")
+        XCTAssertEqual(outcome(of: verdict)?.items.count, 2)
+    }
+
     // MARK: - State ↔ record-status coherence (round 5)
 
     func testStateCoherenceMatrixOverRecordStatusesAndComponents() throws {

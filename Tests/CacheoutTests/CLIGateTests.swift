@@ -724,9 +724,14 @@ final class CLIGateTests: XCTestCase {
         // validator replaces the WHOLE outcome with a path-less issue.
         let foreign = makeStandaloneItem(id: "abc", scannerID: "someone_else")
         let badScanner = FixtureScanner(id: "bad_scanner", items: [foreign])
-        // A valid scanner in the same run keeps publishing.
+        // A valid scanner in the same run keeps publishing — declaring the
+        // origin container its item claims (round 6 origin binding).
         let good = makeStandaloneItem(id: "ok1", scannerID: "good_scanner")
-        let goodScanner = FixtureScanner(id: "good_scanner", items: [good])
+        let goodScanner = FixtureScanner(
+            id: "good_scanner",
+            trustedContainerRoots: [URL(fileURLWithPath: "/tmp/fixture-container")],
+            items: [good]
+        )
 
         let deps = try makeDeps(
             categories: [],

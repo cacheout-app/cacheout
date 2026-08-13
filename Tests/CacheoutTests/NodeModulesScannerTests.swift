@@ -797,4 +797,163 @@ final class NodeModulesScannerTests: XCTestCase {
                             + "the deletion descriptor")
         }
     }
+
+    // MARK: - Mount boundaries fold into item state (R15, PR #455 P2)
+
+    /// Marks chosen inodes as mount points while keeping real devices —
+    /// hermetic stand-in for a volume mounted inside a candidate (the same
+    /// injection seam `DirectorySizerTests` uses).
+    private final class MountPointInjectingProvider: FileSystemIdentityProvider {
+        var mountPointInodes: Set<UInt64> = []
+
+        override func isMountPoint(_ url: URL) -> Bool {
+            if let id = identity(of: url), mountPointInodes.contains(id.inode) {
+                return true
+            }
+            return super.isMountPoint(url)
+        }
+    }
+
+    func testCandidateWithMountedSubtreeIsPartiallyDeniedNotClean() async throws {
+        // The cleaner refuses ANY boundary in the tree at delete time
+        // (`removeGuardedItem`, R15) — so the scan must never publish this
+        // candidate as a clean `.measured` a dry run would promise to clean.
+        let payload = try makeProject("mounted-sub", payloadBytes: 4_096)
+        let nm = container.appendingPathComponent("mounted-sub/node_modules")
+        let mounted = nm.appendingPathComponent("mounted-volume")
+        try mkdir(mounted)
+        try writeFile(mounted.appendingPathComponent("beyond.bin"), bytes: 8_192)
+
+        let provider = MountPointInjectingProvider()
+        let inode = try XCTUnwrap(provider.identity(of: mounted)?.inode)
+        provider.mountPointInodes.insert(inode)
+
+        let outcome = await protocolScan(makeScanner(provider: provider))
+
+        XCTAssertEqual(outcome.items.count, 1)
+        let item = try XCTUnwrap(outcome.items.first)
+        XCTAssertEqual(item.state, .partiallyDenied,
+                       "a known delete-time refusal must be visible before "
+                        + "confirmation — never a clean state")
+        XCTAssertEqual(item.scanError?.kind, .other,
+                       "no new wire kind: boundary is neither TCC nor BSD "
+                        + "permissions")
+        XCTAssertTrue(
+            item.scanError?.message.contains("mounted-volume") == true
+                && item.scanError?.message.contains("mount boundary") == true,
+            "the error names the boundary: \(String(describing: item.scanError))"
+        )
+        XCTAssertEqual(item.exactBytes, allocated(payload),
+                       "measured bytes stay honest — the readable portion "
+                        + "only, never the uncounted mounted subtree")
+        XCTAssertEqual(item.rootRecords.map(\.status), [.measured],
+                       "the walk measured something — the record is honest")
+        XCTAssertTrue(outcome.errors.isEmpty,
+                      "candidate-attributable boundaries ride the ITEM, "
+                        + "never the outcome: \(outcome.errors)")
+    }
+
+    func testCandidateThatIsAMountPointIsDeniedNotEmpty() async throws {
+        // A candidate that IS a mount point is never enumerated
+        // (`rootMountBoundary`) and never deletable — `.denied`, not a
+        // clean-looking `.empty`.
+        let nm = container.appendingPathComponent("mount-root/node_modules")
+        try mkdir(nm)
+        try writeFile(nm.appendingPathComponent("payload.bin"), bytes: 8_192)
+
+        let provider = MountPointInjectingProvider()
+        let inode = try XCTUnwrap(provider.identity(of: nm)?.inode)
+        provider.mountPointInodes.insert(inode)
+
+        let outcome = await protocolScan(makeScanner(provider: provider))
+
+        XCTAssertEqual(outcome.items.count, 1)
+        let item = try XCTUnwrap(outcome.items.first)
+        XCTAssertEqual(item.state, .denied,
+                       "nothing measurable, nothing deletable — never .empty")
+        XCTAssertEqual(item.scanError?.kind, .other)
+        XCTAssertTrue(
+            item.scanError?.message.contains("mount point") == true,
+            "the error names the refusal: \(String(describing: item.scanError))"
+        )
+        XCTAssertEqual(item.exactBytes, 0)
+        XCTAssertEqual(item.estimatedUpToBytes, 0)
+        XCTAssertEqual(item.itemCount, 0,
+                       "the tree behind the boundary was never enumerated")
+        XCTAssertNil(item.logicalBytes)
+        XCTAssertEqual(item.rootRecords.map(\.status), [.deniedUnmeasured])
+        XCTAssertTrue(outcome.errors.isEmpty)
+    }
+
+    func testBoundaryStatesSurviveRuntimeValidation() async throws {
+        // Both boundary shapes must pass the runtime's state-coherence
+        // validator (checks (d)/(e)) end-to-end through scanValidated —
+        // a malformed outcome would hide EVERY discovered item.
+        try makeProject("mounted-sub", payloadBytes: 4_096)
+        let nm = container.appendingPathComponent("mounted-sub/node_modules")
+        let mounted = nm.appendingPathComponent("mounted-volume")
+        try mkdir(mounted)
+        let rootBoundaryNM = container
+            .appendingPathComponent("mount-root/node_modules")
+        try mkdir(rootBoundaryNM)
+
+        let provider = MountPointInjectingProvider()
+        let mountedInode = try XCTUnwrap(provider.identity(of: mounted)?.inode)
+        let rootInode = try XCTUnwrap(
+            provider.identity(of: rootBoundaryNM)?.inode
+        )
+        provider.mountPointInodes = [mountedInode, rootInode]
+
+        let runtime = try SpaceScannerRuntime(
+            scanners: [makeScanner(provider: provider)], categories: [],
+            home: fixtureHome, provider: provider
+        )
+        var events: [ValidatedScannerEvent] = []
+        for await event in runtime.scanValidated(
+            context: ScanContext(trigger: .userInitiated)
+        ) {
+            events.append(event)
+        }
+        guard events.count == 1,
+              case .outcome(_, let validated) = events[0] else {
+            return XCTFail("boundary states must not render the outcome "
+                            + "malformed: \(events)")
+        }
+        XCTAssertEqual(Set(validated.items.map(\.state)),
+                       [.partiallyDenied, .denied])
+    }
+
+    // MARK: - Cooperative cancellation (PR #455 P2)
+
+    func testCancelledWalkStopsBeforeRecognizingCandidates() async throws {
+        // The traversal checks `Task.isCancelled` at every node: a walk
+        // whose task is cancelled must STOP instead of running its full
+        // 10-30s course orphaned. (The runtime cancels the producer at
+        // stream termination, and the ViewModel now holds its scan guard
+        // until the walk actually returns — this pins the "returns
+        // promptly" half of that contract.)
+        try makeProject("proj")
+
+        // Sanity: the same fixture IS discoverable by a live walk.
+        let live = await protocolScan()
+        XCTAssertEqual(live.items.count, 1)
+
+        let scanner = makeScanner()
+        let cancelled = await Task { () -> ScanOutcome in
+            // Deterministic ordering: cancel SELF before the walk begins,
+            // so the very first traversal node observes the cancellation.
+            withUnsafeCurrentTask { $0?.cancel() }
+            return await scanner.scan(
+                context: ScanContext(trigger: .userInitiated)
+            )
+        }.value
+
+        XCTAssertTrue(cancelled.items.isEmpty,
+                      "a cancelled walk recognizes no candidates")
+        XCTAssertTrue(
+            cancelled.errors.isEmpty,
+            "cancellation truncation is silent — results after termination "
+                + "are discarded, so it is never a classified scan problem"
+        )
+    }
 }

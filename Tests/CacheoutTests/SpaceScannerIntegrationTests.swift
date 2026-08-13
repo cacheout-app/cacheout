@@ -339,19 +339,15 @@ final class SpaceScannerIntegrationTests: XCTestCase {
         let undeclaredKey = treeItemKey(
             scanner: "fixture_e2e_refusals", target: undeclaredItem
         )
-        // Both items are structurally VALID (`.removeItem` + container
-        // provenance), so the runtime validator publishes them — admission
-        // is the CLEANER's delete-time verdict, and these pin it.
+        // The escape item is structurally valid AND origin-bound (its
+        // origin IS the scanner's declared root), so the runtime validator
+        // publishes it — containment is the CLEANER's delete-time verdict,
+        // and this pins it end-to-end through the view model.
         let outcome = ScanOutcome(
             items: [
                 Self.removeItemFixture(
                     scanner: "fixture_e2e_refusals", key: escapeKey,
                     name: "escape", origin: declared, target: escapeVictim
-                ),
-                Self.removeItemFixture(
-                    scanner: "fixture_e2e_refusals", key: undeclaredKey,
-                    name: "undeclared", origin: undeclared,
-                    target: undeclaredItem
                 ),
             ],
             errors: []
@@ -371,8 +367,7 @@ final class SpaceScannerIntegrationTests: XCTestCase {
 
         await viewModel.scan(trigger: .userInitiated)
         viewModel.toggleSelection(for: escapeKey)
-        viewModel.toggleSelection(for: undeclaredKey)
-        XCTAssertEqual(viewModel.selectedCount, 2)
+        XCTAssertEqual(viewModel.selectedCount, 1)
 
         await viewModel.clean()
 
@@ -380,20 +375,57 @@ final class SpaceScannerIntegrationTests: XCTestCase {
         let report = try XCTUnwrap(viewModel.lastReport)
         XCTAssertEqual(report.entries.map(\.key), [],
                        "a refused item never yields a report entry")
-        XCTAssertEqual(report.errors.map(\.key), [escapeKey, undeclaredKey])
-        XCTAssertEqual(report.errors.map(\.displayName),
-                       ["escape", "undeclared"])
+        XCTAssertEqual(report.errors.map(\.key), [escapeKey])
+        XCTAssertEqual(report.errors.map(\.displayName), ["escape"])
         let escapeError = try XCTUnwrap(report.errors.first)
         XCTAssertTrue(escapeError.message.contains("not strictly inside"),
                       "refused for the RIGHT reason (containment): \(escapeError.message)")
-        let undeclaredError = try XCTUnwrap(report.errors.last)
+        XCTAssertTrue(fm.fileExists(
+            atPath: escapeVictim.appendingPathComponent("payload_a.bin").path
+        ), "the escape target's payload is intact")
+
+        // The undeclared-container shape can no longer even PUBLISH: the
+        // validator's origin binding (round 6) refuses an origin outside
+        // the producing scanner's declared roots at scan time, so the item
+        // never becomes selectable — fail-closed one layer earlier.
+        let undeclaredOutcome = ScanOutcome(
+            items: [
+                Self.removeItemFixture(
+                    scanner: "fixture_e2e_refusals", key: undeclaredKey,
+                    name: "undeclared", origin: undeclared,
+                    target: undeclaredItem
+                ),
+            ],
+            errors: []
+        )
+        let event = runtime.validatedOutcome(
+            undeclaredOutcome, from: "fixture_e2e_refusals"
+        )
+        guard case .malformed(_, let issue) = event else {
+            return XCTFail("an undeclared origin must malform the outcome")
+        }
+        XCTAssertEqual(issue.kind, .malformedOutcome)
+
+        // DEFENSE IN DEPTH (frozen R4 design, unchanged): even if such an
+        // item reached the cleaner, delete-time admission — derived from
+        // the registration union — refuses the undeclared container
+        // independently, and nothing is deleted.
+        let cleaner = runtime.makeCleaner()
+        let deepReport = await cleaner.clean(
+            items: [Self.removeItemFixture(
+                scanner: "fixture_e2e_refusals", key: undeclaredKey,
+                name: "undeclared", origin: undeclared,
+                target: undeclaredItem
+            )],
+            moveToTrash: false
+        )
+        XCTAssertEqual(deepReport.entries.map(\.key), [])
+        XCTAssertEqual(deepReport.errors.map(\.key), [undeclaredKey])
+        let undeclaredError = try XCTUnwrap(deepReport.errors.first)
         XCTAssertTrue(
             undeclaredError.message.contains("not a configured search root"),
             "refused for the RIGHT reason (undeclared container): \(undeclaredError.message)"
         )
-        XCTAssertTrue(fm.fileExists(
-            atPath: escapeVictim.appendingPathComponent("payload_a.bin").path
-        ), "the escape target's payload is intact")
         XCTAssertTrue(fm.fileExists(
             atPath: undeclaredItem.appendingPathComponent("payload_a.bin").path
         ), "the undeclared-container target's payload is intact")

@@ -105,6 +105,31 @@ final class CategoryScannerTests: XCTestCase {
         )
     }
 
+    /// The container root every `makeContainerItem` admission claims.
+    private let fixtureContainer = URL(fileURLWithPath: "/tmp/fixture-container")
+
+    /// A runtime with the two per-item fixture producer ids REGISTERED,
+    /// each declaring `fixtureContainer` — origin-binding validation
+    /// (round 6) checks a container-item origin against the PRODUCING
+    /// scanner's registration-declared roots, so direct `validatedOutcome`
+    /// exercises need the producer registered exactly as the stream has it.
+    private func makeValidationRuntime(
+        categories: [CacheCategory] = [], home: URL
+    ) throws -> SpaceScannerRuntime {
+        try makeRuntime(
+            scanners: [
+                FixtureScanner(
+                    id: "fixture", trustedContainerRoots: [fixtureContainer]
+                ),
+                FixtureScanner(
+                    id: "fixture_x", trustedContainerRoots: [fixtureContainer]
+                ),
+            ],
+            categories: categories,
+            home: home
+        )
+    }
+
     /// A structurally valid per-item fixture item (`.removeItem` +
     /// the frozen `.containerItem` descriptor + the measured record
     /// binding the deletion target). Defaults are STATE-COHERENT (round
@@ -124,9 +149,10 @@ final class CategoryScannerTests: XCTestCase {
         estimatedUpToBytes: Int64 = 0,
         logicalBytes: Int64? = nil,
         itemCount: Int? = nil,
-        scanError: ScanError?? = nil
+        scanError: ScanError?? = nil,
+        admission: AdmissionDescriptor? = nil
     ) -> ReclaimableItem {
-        let container = URL(fileURLWithPath: "/tmp/fixture-container")
+        let container = fixtureContainer
         let target = container.appendingPathComponent(id)
         let zeroComponents =
             state == .missing || state == .empty || state == .denied
@@ -161,7 +187,7 @@ final class CategoryScannerTests: XCTestCase {
             state: state, scanError: scanError ?? defaultError,
             risk: .review, evidence: "fixture", rebuildNote: nil,
             action: .removeItem,
-            admission: .containerItem(
+            admission: admission ?? .containerItem(
                 originContainer: container,
                 requestedTargetURL: target
             ),
@@ -174,7 +200,9 @@ final class CategoryScannerTests: XCTestCase {
     /// (`.removeContents` or `.commands` + category provenance + root
     /// records): id defaults to the category slug and `scannerID` to the
     /// frozen adapter id. Defaults are STATE-COHERENT (round 5) exactly as
-    /// `makeContainerItem`'s — everything overridable to construct the
+    /// `makeContainerItem`'s, and POLICY-COHERENT (round 6): `risk` and
+    /// `defaultSelected` default to the adapter mapping's derivations from
+    /// the category itself — everything overridable to construct the
     /// malformed shapes the validator must refuse.
     private func makeAggregateItem(
         category: CacheCategory,
@@ -188,7 +216,11 @@ final class CategoryScannerTests: XCTestCase {
         estimatedUpToBytes: Int64 = 0,
         logicalBytes: Int64? = nil,
         itemCount: Int? = nil,
-        scanError: ScanError?? = nil
+        scanError: ScanError?? = nil,
+        risk: RiskLevel? = nil,
+        defaultSelected: Bool? = nil,
+        automaticCleanEligible: Bool = true,
+        isStale: Bool? = nil
     ) -> ReclaimableItem {
         let root = URL(fileURLWithPath: "/tmp/fixture-root")
         let zeroComponents =
@@ -222,11 +254,13 @@ final class CategoryScannerTests: XCTestCase {
             url: defaultURL, declaredDisplayPath: root.path,
             rootRecords: rootRecords ?? defaultRecords,
             state: state, scanError: scanError ?? defaultError,
-            risk: .safe, evidence: "fixture", rebuildNote: nil,
+            risk: risk ?? category.riskLevel,
+            evidence: "fixture", rebuildNote: nil,
             action: action,
             admission: admission ?? .category(category),
-            defaultSelected: true, automaticCleanEligible: true,
-            isStale: nil
+            defaultSelected: defaultSelected ?? category.defaultSelected,
+            automaticCleanEligible: automaticCleanEligible,
+            isStale: isStale
         )
     }
 
@@ -793,7 +827,10 @@ final class CategoryScannerTests: XCTestCase {
     func testFixtureScannerRegistersAlongsideProductionWithZeroEdits() async throws {
         let home = try makeTempDir("home")
         let item = makeContainerItem(id: "abc123", scannerID: "fixture_x")
-        let fixture = FixtureScanner(id: "fixture_x", items: [item])
+        let fixture = FixtureScanner(
+            id: "fixture_x", trustedContainerRoots: [fixtureContainer],
+            items: [item]
+        )
         let runtime = try makeRuntime(
             scanners: [makeCategoryScanner(categories: [], home: home), fixture],
             categories: CacheCategory.allCategories,
@@ -813,7 +850,7 @@ final class CategoryScannerTests: XCTestCase {
 
     func testValidatedOutcomeRejectsForeignScannerID() throws {
         let home = try makeTempDir("home")
-        let runtime = try makeRuntime(scanners: [], home: home)
+        let runtime = try makeValidationRuntime(home: home)
         let foreign = makeContainerItem(id: "abc", scannerID: "other_scanner")
         let verdict = runtime.validatedOutcome(
             ScanOutcome(items: [foreign], errors: []), from: "fixture"
@@ -825,7 +862,7 @@ final class CategoryScannerTests: XCTestCase {
 
     func testValidatedOutcomeRejectsDuplicateItemIDs() throws {
         let home = try makeTempDir("home")
-        let runtime = try makeRuntime(scanners: [], home: home)
+        let runtime = try makeValidationRuntime(home: home)
         let a = makeContainerItem(id: "dup", scannerID: "fixture")
         let b = makeContainerItem(id: "dup", scannerID: "fixture")
         let verdict = runtime.validatedOutcome(
@@ -838,12 +875,19 @@ final class CategoryScannerTests: XCTestCase {
 
     func testValidatedOutcomeRejectsNonCLISafeItemIDs() throws {
         // The documented `ReclaimableItem.id` invariant (nonempty, no
-        // whitespace, no colon) is enforced at validation: an empty id
-        // publishes a `<scanner>:` address `parseCleanTargets` rejects —
-        // an item `scan` prints but `clean` can never target.
+        // whitespace, no colon, no NUL) is enforced at validation: an empty
+        // id publishes a `<scanner>:` address `parseCleanTargets` rejects —
+        // an item `scan` prints but `clean` can never target — and a NUL id
+        // (round 6) could never even be SPELLED as a `clean` argument:
+        // POSIX argv strings are NUL-terminated, so the documented
+        // `<scanner>:<item-id>` address is unpassable however the user
+        // quotes it.
         let home = try makeTempDir("home")
-        let runtime = try makeRuntime(scanners: [], home: home)
-        for bad in ["", " ", "with space", "with:colon", "tab\tid", "line\nid"] {
+        let runtime = try makeValidationRuntime(home: home)
+        for bad in [
+            "", " ", "with space", "with:colon", "tab\tid", "line\nid",
+            "nul\u{0000}id", "\u{0000}",
+        ] {
             let item = makeContainerItem(id: bad, scannerID: "fixture")
             let issue = malformedIssue(of: runtime.validatedOutcome(
                 ScanOutcome(items: [item], errors: []), from: "fixture"
@@ -862,6 +906,13 @@ final class CategoryScannerTests: XCTestCase {
             scannerID: "fixture", canonicalPath: "/tmp/fixture-container/x"
         )
         XCTAssertTrue(SpaceScannerRuntime.isCLISafeItemID(hex))
+
+        // The round-trip boundary is EXACT (round 6): only U+0000 is
+        // provably unpassable (argv cannot carry the byte). Other C0
+        // controls are ugly but representable on BOTH legs — the JSON
+        // envelope escapes them and argv bytes carry them — so rejecting
+        // them would over-reject ids the opaque contract allows.
+        XCTAssertTrue(SpaceScannerRuntime.isCLISafeItemID("ctl\u{01}id"))
         let good = makeContainerItem(id: hex, scannerID: "fixture")
         XCTAssertEqual(
             outcome(of: runtime.validatedOutcome(
@@ -879,8 +930,8 @@ final class CategoryScannerTests: XCTestCase {
         // confirm the records' path while `removeGuardedItem` deletes a
         // DIFFERENT descendant of the admitted container.
         let home = try makeTempDir("home")
-        let runtime = try makeRuntime(scanners: [], home: home)
-        let container = URL(fileURLWithPath: "/tmp/fixture-container")
+        let runtime = try makeValidationRuntime(home: home)
+        let container = fixtureContainer
         let target = container.appendingPathComponent("bound1")
         let elsewhere = container.appendingPathComponent("elsewhere")
 
@@ -1009,6 +1060,96 @@ final class CategoryScannerTests: XCTestCase {
         )), "a clean-empty walk (measured record, empty state) must pass")
     }
 
+    // MARK: - Origin-container binding (round 6)
+
+    func testContainerItemOriginMustBeAProducingScannersDeclaredRoot() throws {
+        // Delete-time admission checks the runtime-wide UNION by FROZEN R4
+        // design (registration alone extends admission — the zero-edit
+        // fixture proof), so the union cannot tell WHICH scanner declared
+        // a root. Scan-time publication therefore binds every container-
+        // item origin to the PRODUCING scanner's own declared roots: a
+        // mapping bug in scanner A can no longer pair its target with
+        // scanner B's registered container and ride B's registration
+        // through union admission. (Production: NodeModulesScanner's
+        // `originContainer` is always the exact search root the walk
+        // started from — an exact member of its declared set.)
+        let home = try makeTempDir("home")
+        let rootA = fixtureContainer
+        let rootB = URL(fileURLWithPath: "/tmp/other-container")
+        let runtime = try makeRuntime(
+            scanners: [
+                FixtureScanner(id: "alpha", trustedContainerRoots: [rootA]),
+                FixtureScanner(id: "beta", trustedContainerRoots: [rootB]),
+            ],
+            home: home
+        )
+        // BOTH roots are in the delete-time union — which is exactly why
+        // the scan-time check must be per-scanner, not union-wide.
+        XCTAssertEqual(
+            runtime.trustedContainerRoots.map(\.path),
+            [rootA.path, rootB.path]
+        )
+
+        // The genuine shape: origin is the producing scanner's own root.
+        let own = makeContainerItem(id: "own1", scannerID: "alpha")
+        XCTAssertEqual(
+            outcome(of: runtime.validatedOutcome(
+                ScanOutcome(items: [own], errors: []), from: "alpha"
+            ))?.items,
+            [own]
+        )
+
+        // ANOTHER registered scanner's root as origin: malformed — even
+        // though the union would admit that root at delete time (the
+        // review scenario). The deletion-target binding itself is intact
+        // (the measured record captures the target), so origin alone
+        // decides.
+        let ridesBeta = makeContainerItem(
+            id: "cross1", scannerID: "alpha",
+            admission: .containerItem(
+                originContainer: rootB,
+                requestedTargetURL: rootA.appendingPathComponent("cross1")
+            )
+        )
+        XCTAssertNotNil(malformedIssue(of: runtime.validatedOutcome(
+            ScanOutcome(items: [ridesBeta], errors: []), from: "alpha"
+        )), "an origin declared by ANOTHER scanner must not publish")
+
+        // A wholly undeclared origin: malformed.
+        let undeclared = makeContainerItem(
+            id: "und1", scannerID: "alpha",
+            admission: .containerItem(
+                originContainer: URL(fileURLWithPath: "/tmp/undeclared"),
+                requestedTargetURL: rootA.appendingPathComponent("und1")
+            )
+        )
+        XCTAssertNotNil(malformedIssue(of: runtime.validatedOutcome(
+            ScanOutcome(items: [undeclared], errors: []), from: "alpha"
+        )))
+
+        // The origin claim is registration-derived data in EVERY state —
+        // a non-deletable `.denied` item with a foreign origin is still
+        // malformed (production always emits the walked search root).
+        let deniedForeign = makeContainerItem(
+            id: "den1", scannerID: "alpha", state: .denied,
+            admission: .containerItem(
+                originContainer: rootB,
+                requestedTargetURL: rootA.appendingPathComponent("den1")
+            )
+        )
+        XCTAssertNotNil(malformedIssue(of: runtime.validatedOutcome(
+            ScanOutcome(items: [deniedForeign], errors: []), from: "alpha"
+        )))
+
+        // An UNREGISTERED producer id has declared nothing — no origin can
+        // bind (the stream can never produce this shape; the direct API
+        // must not be looser).
+        let ghost = makeContainerItem(id: "g1", scannerID: "ghost")
+        XCTAssertNotNil(malformedIssue(of: runtime.validatedOutcome(
+            ScanOutcome(items: [ghost], errors: []), from: "ghost"
+        )))
+    }
+
     func testStructuralInvariantsAreStateAware() throws {
         let home = try makeTempDir("home")
         let category = makeCategory(at: [], slug: "agg_cache")
@@ -1112,8 +1253,8 @@ final class CategoryScannerTests: XCTestCase {
         // `malformed_outcome`.
         let home = try makeTempDir("home")
         let category = makeCategory(at: [], slug: "value_cache")
-        let runtime = try makeRuntime(
-            scanners: [], categories: [category], home: home
+        let runtime = try makeValidationRuntime(
+            categories: [category], home: home
         )
         let adapterID = CategoryScanner.registeredID
 
@@ -1196,8 +1337,8 @@ final class CategoryScannerTests: XCTestCase {
         // into a zero-byte "success".
         let home = try makeTempDir("home")
         let category = makeCategory(at: [], slug: "coherent_cache")
-        let runtime = try makeRuntime(
-            scanners: [], categories: [category], home: home
+        let runtime = try makeValidationRuntime(
+            categories: [category], home: home
         )
         let adapterID = CategoryScanner.registeredID
         let root = URL(fileURLWithPath: "/tmp/fixture-root")
@@ -1467,7 +1608,7 @@ final class CategoryScannerTests: XCTestCase {
         // (container descriptor + bound measured record + matching display)
         // that a per-item scanner passes with.
         let home = try makeTempDir("home")
-        let runtime = try makeRuntime(scanners: [], home: home)
+        let runtime = try makeValidationRuntime(home: home)
         let adapterOwned = makeContainerItem(
             id: "sneaky", scannerID: CategoryScanner.registeredID
         )
@@ -1499,8 +1640,8 @@ final class CategoryScannerTests: XCTestCase {
         let commandBacked = makeCategory(
             at: [], slug: "cmd_cache", cleanCommands: [["true"]]
         )
-        let runtime = try makeRuntime(
-            scanners: [], categories: [category, commandBacked], home: home
+        let runtime = try makeValidationRuntime(
+            categories: [category, commandBacked], home: home
         )
         let adapterID = CategoryScanner.registeredID
 
@@ -1634,6 +1775,119 @@ final class CategoryScannerTests: XCTestCase {
         )
     }
 
+    // MARK: - Aggregate risk/selection-policy binding (round 6)
+
+    func testAggregatePolicyMustMatchTheRegisteredCategory() throws {
+        // The adapter mapping derives risk (`category.riskLevel`),
+        // `defaultSelected` (`category.defaultSelected`),
+        // `automaticCleanEligible` (always true), and `isStale` (always
+        // nil) FROM the registered category — but downstream trusts the
+        // CARRIED copies: Quick Clean/selectAllSafe selects
+        // `automaticCleanEligible && risk == .safe`, initial selection
+        // reads `defaultSelected`, Select Stale reads `isStale`. The
+        // matrix pins every field: a mapping regression fails closed
+        // instead of e.g. auto-cleaning a `.caution` Docker aggregate
+        // without its caution warning (the review shape).
+        let home = try makeTempDir("home")
+        let cautionCat = makeCategory(
+            at: [], slug: "docker_like", riskLevel: .caution,
+            defaultSelected: false
+        )
+        let safeCat = makeCategory(at: [], slug: "safe_cache")
+        let runtime = try makeValidationRuntime(
+            categories: [cautionCat, safeCat], home: home
+        )
+        let adapterID = CategoryScanner.registeredID
+
+        let cells: [(label: String, item: ReclaimableItem, valid: Bool)] = [
+            // ---- The review shape: a caution category carried as safe
+            // would ride Quick Clean without the caution warning.
+            ("caution category carried as safe risk",
+             makeAggregateItem(category: cautionCat, risk: .safe), false),
+            ("safe category carried as caution risk",
+             makeAggregateItem(category: safeCat, risk: .caution), false),
+            ("defaultSelected diverging from the declaration",
+             makeAggregateItem(category: safeCat, defaultSelected: false),
+             false),
+            ("defaultSelected forged on an unselected declaration",
+             makeAggregateItem(category: cautionCat, defaultSelected: true),
+             false),
+            ("automaticCleanEligible false on an aggregate",
+             makeAggregateItem(category: safeCat,
+                               automaticCleanEligible: false), false),
+            ("a staleness flag on an aggregate",
+             makeAggregateItem(category: safeCat, isStale: true), false),
+            // ---- The genuine adapter derivations pass, both risk tiers.
+            ("the genuine safe mapping",
+             makeAggregateItem(category: safeCat), true),
+            ("the genuine caution mapping",
+             makeAggregateItem(category: cautionCat), true),
+        ]
+        for cell in cells {
+            let verdict = runtime.validatedOutcome(
+                ScanOutcome(items: [cell.item], errors: []), from: adapterID
+            )
+            if cell.valid {
+                XCTAssertNotNil(
+                    outcome(of: verdict), "\(cell.label) must validate"
+                )
+                XCTAssertNil(malformedIssue(of: verdict), cell.label)
+            } else {
+                let issue = malformedIssue(of: verdict)
+                XCTAssertNotNil(issue, "\(cell.label) must be refused")
+                XCTAssertEqual(issue?.kind, .malformedOutcome, cell.label)
+                XCTAssertNil(issue?.url, cell.label)
+            }
+        }
+    }
+
+    // MARK: - Reserved malformed_outcome issue kind (round 6)
+
+    func testScannerAuthoredMalformedOutcomeIssuesAreRejected() throws {
+        // `malformed_outcome` means the scanner's ENTIRE outcome was
+        // rejected and its items excluded (wire contract). A scanner
+        // authoring the kind into its ordinary `errors` would make the CLI
+        // print its items BESIDE a malformed_outcome row — so the forgery
+        // itself malforms the outcome, and the runtime's genuinely
+        // synthesized replacement is the correct fail-closed response.
+        let home = try makeTempDir("home")
+        let runtime = try makeValidationRuntime(home: home)
+        let item = makeContainerItem(id: "ok1", scannerID: "fixture")
+        let forged = ScanIssue(
+            url: nil, kind: .malformedOutcome, detail: "scanner-authored"
+        )
+
+        // Beside a valid item: the WHOLE outcome is replaced.
+        let besideItem = runtime.validatedOutcome(
+            ScanOutcome(items: [item], errors: [forged]), from: "fixture"
+        )
+        let issue = malformedIssue(of: besideItem)
+        XCTAssertEqual(issue?.kind, .malformedOutcome)
+        XCTAssertNil(issue?.url, "no filesystem location — never a fake path")
+        XCTAssertNotEqual(
+            issue, forged,
+            "the published issue is the runtime's synthesis, not the forgery"
+        )
+
+        // With no items at all: still rejected — the kind is reserved,
+        // not merely incompatible with published items.
+        XCTAssertNotNil(malformedIssue(of: runtime.validatedOutcome(
+            ScanOutcome(items: [], errors: [forged]), from: "fixture"
+        )))
+
+        // Ordinary scanner-authored kinds pass through VERBATIM beside
+        // valid items — the reservation covers exactly one kind.
+        let benign = ScanIssue(
+            url: URL(fileURLWithPath: "/tmp/denied-root"),
+            kind: .tccDenied, detail: "fixture denial"
+        )
+        let passed = runtime.validatedOutcome(
+            ScanOutcome(items: [item], errors: [benign]), from: "fixture"
+        )
+        XCTAssertEqual(outcome(of: passed)?.items, [item])
+        XCTAssertEqual(outcome(of: passed)?.errors, [benign])
+    }
+
     func testStreamRejectsFixtureScannerForgingCategoryItems() async throws {
         let home = try makeTempDir("home")
         let registered = makeCategory(at: [], slug: "real_cache")
@@ -1731,7 +1985,8 @@ final class CategoryScannerTests: XCTestCase {
         let foreign = makeContainerItem(id: "abc", scannerID: "someone_else")
         let bad = FixtureScanner(id: "bad", items: [foreign])
         let good = FixtureScanner(
-            id: "good", items: [makeContainerItem(id: "ok", scannerID: "good")]
+            id: "good", trustedContainerRoots: [fixtureContainer],
+            items: [makeContainerItem(id: "ok", scannerID: "good")]
         )
         let runtime = try makeRuntime(scanners: [bad, good], home: home)
 
@@ -1765,7 +2020,10 @@ final class CategoryScannerTests: XCTestCase {
         let categoryA = makeProbeCountingCategory(slug: "a", dir: dirA, home: home)
         let categoryB = makeProbeCountingCategory(slug: "b", dir: dirB, home: home)
         let fixtureItem = makeContainerItem(id: "fx", scannerID: "fixture_x")
-        let fixture = FixtureScanner(id: "fixture_x", items: [fixtureItem])
+        let fixture = FixtureScanner(
+            id: "fixture_x", trustedContainerRoots: [fixtureContainer],
+            items: [fixtureItem]
+        )
         let runtime = try makeRuntime(
             scanners: [
                 makeCategoryScanner(categories: [categoryA, categoryB], home: home),

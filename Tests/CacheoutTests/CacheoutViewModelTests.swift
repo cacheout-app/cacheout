@@ -61,8 +61,25 @@ final class CacheoutViewModelTests: XCTestCase {
         )
     }
 
+    /// A `FixtureScanner` DECLARING the origin container `perItem(scanner:
+    /// id)` claims (`base/<id>`) — the runtime validator's origin binding
+    /// (round 6) checks a container-item origin against the producing
+    /// scanner's registration-declared roots, so a fixture emitting valid
+    /// per-item outcomes must declare like production does.
+    private func fixtureScanner(
+        _ id: String,
+        provide: @escaping @Sendable () async -> ScanOutcome
+    ) -> FixtureScanner {
+        FixtureScanner(
+            id: id,
+            trustedContainerRoots: [base.appendingPathComponent(id)],
+            provide: provide
+        )
+    }
+
     /// A per-item fixture `ReclaimableItem` that PASSES the runtime
-    /// validator's structural invariants (`.removeItem` + `.containerItem`).
+    /// validator's structural invariants (`.removeItem` + `.containerItem`
+    /// with the producing scanner's declared origin).
     private func perItem(
         scanner: String,
         id: String,
@@ -225,8 +242,8 @@ final class CacheoutViewModelTests: XCTestCase {
             items: [perItem(scanner: "bbb", id: "b1")], errors: []
         )
         let runtime = try makeRuntime([
-            FixtureScanner(id: "aaa") { outcomeA },
-            FixtureScanner(id: "bbb") { await gate.wait(); return outcomeB },
+            fixtureScanner("aaa") { outcomeA },
+            fixtureScanner("bbb") { await gate.wait(); return outcomeB },
         ])
         let viewModel = CacheoutViewModel(runtime: runtime)
 
@@ -251,6 +268,53 @@ final class CacheoutViewModelTests: XCTestCase {
         XCTAssertTrue(viewModel.hasScanned)
     }
 
+    // MARK: - Cancellation keeps the scan guard honest (PR #455 P2)
+
+    /// Cancelling the consuming task terminates the stream immediately, but
+    /// the producer's filesystem walk only winds down cooperatively. The
+    /// guard that every scan-start, `clean()`, and `shouldAutoRescan` read
+    /// must HOLD until the producer has ACTUALLY finished — releasing it at
+    /// stream termination let a new scan or a cleanup overlap the orphaned
+    /// walk on the same trees.
+    @MainActor
+    func testCancelledScanHoldsGuardUntilProducerActuallyFinishes() async throws {
+        let entered = ScanGate()  // fixture signals: walk underway
+        let release = ScanGate()  // test releases the blocked walk
+        let runtime = try makeRuntime([
+            fixtureScanner("slow_walk") {
+                // Simulates the non-cooperative stretch of a real walk:
+                // blocked on a continuation, NOT cancellation-responsive.
+                await entered.open()
+                await release.wait()
+                return ScanOutcome(items: [], errors: [])
+            },
+        ])
+        let viewModel = CacheoutViewModel(runtime: runtime)
+
+        let scanTask = Task { await viewModel.scan(trigger: .automatic) }
+        await entered.wait()
+        XCTAssertTrue(viewModel.isAnyScanInProgress)
+
+        // Cancel the consumer while the producer's walk is still blocked.
+        scanTask.cancel()
+
+        // Give the cancelled scan() every chance to (wrongly) release the
+        // guard — before this fix it did so promptly at stream termination.
+        try await Task.sleep(nanoseconds: 100_000_000)
+        XCTAssertTrue(viewModel.isAnyScanInProgress,
+                      "the guard must hold while the cancelled scan's producer still walks")
+        XCTAssertFalse(viewModel.shouldAutoRescan,
+                       "a reopened view must not start an overlapping scan")
+
+        // Release the walk: the producer finishes and ONLY then does the
+        // guard clear. The cancelled scan still never counts as completed.
+        await release.open()
+        await scanTask.value
+        XCTAssertFalse(viewModel.isAnyScanInProgress)
+        XCTAssertFalse(viewModel.hasScanned,
+                       "a cancelled scan never counts as a completed one")
+    }
+
     // MARK: - Mid-scan selection survival + completion-time pruning
 
     @MainActor
@@ -267,9 +331,9 @@ final class CacheoutViewModelTests: XCTestCase {
             items: [perItem(scanner: "ccc", id: "c1")], errors: []
         )
         let runtime = try makeRuntime([
-            FixtureScanner(id: "aaa") { outcomeA },
-            FixtureScanner(id: "bbb") { await gateB.wait(); return outcomeB },
-            FixtureScanner(id: "ccc") { await gateC.wait(); return outcomeC },
+            fixtureScanner("aaa") { outcomeA },
+            fixtureScanner("bbb") { await gateB.wait(); return outcomeB },
+            fixtureScanner("ccc") { await gateC.wait(); return outcomeC },
         ])
         let viewModel = CacheoutViewModel(runtime: runtime)
 
@@ -308,8 +372,8 @@ final class CacheoutViewModelTests: XCTestCase {
             items: [perItem(scanner: "bbb", id: "b1")], errors: []
         )
         let runtime = try makeRuntime([
-            FixtureScanner(id: "aaa") { await gate.wait(); return await sequenceA.next() },
-            FixtureScanner(id: "bbb") { outcomeB },
+            fixtureScanner("aaa") { await gate.wait(); return await sequenceA.next() },
+            fixtureScanner("bbb") { outcomeB },
         ])
         let viewModel = CacheoutViewModel(runtime: runtime)
 
@@ -352,8 +416,8 @@ final class CacheoutViewModelTests: XCTestCase {
             errors: []
         )
         let runtime = try makeRuntime([
-            FixtureScanner(id: "xxx") { outcomeX },
-            FixtureScanner(id: "yyy") { outcomeY },
+            fixtureScanner("xxx") { outcomeX },
+            fixtureScanner("yyy") { outcomeY },
         ])
         let viewModel = CacheoutViewModel(runtime: runtime)
 
@@ -383,7 +447,7 @@ final class CacheoutViewModelTests: XCTestCase {
             items: [perItem(scanner: "ddd", id: "d1", defaultSelected: true)],
             errors: []
         )
-        let runtime = try makeRuntime([FixtureScanner(id: "ddd") { outcome }])
+        let runtime = try makeRuntime([fixtureScanner("ddd") { outcome }])
         let viewModel = CacheoutViewModel(runtime: runtime)
 
         await viewModel.scan(trigger: .automatic)
@@ -413,7 +477,7 @@ final class CacheoutViewModelTests: XCTestCase {
         )
         let sequence = OutcomeSequence([first, second])
         let runtime = try makeRuntime([
-            FixtureScanner(id: "ddd") { await sequence.next() }
+            fixtureScanner("ddd") { await sequence.next() }
         ])
         let viewModel = CacheoutViewModel(runtime: runtime)
 
@@ -588,7 +652,7 @@ final class CacheoutViewModelTests: XCTestCase {
             items: [perItem(scanner: "other", id: "f1")], errors: []
         )
         let runtime = try makeRuntime([
-            FixtureScanner(id: "mal") { foreign }
+            fixtureScanner("mal") { foreign }
         ])
         let viewModel = CacheoutViewModel(runtime: runtime)
 
@@ -693,7 +757,7 @@ final class CacheoutViewModelTests: XCTestCase {
         )
         let sequence = OutcomeSequence([valid, foreign, valid])
         let runtime = try makeRuntime([
-            FixtureScanner(id: "mal") { await sequence.next() }
+            fixtureScanner("mal") { await sequence.next() }
         ])
         let viewModel = CacheoutViewModel(runtime: runtime)
 
@@ -736,7 +800,7 @@ final class CacheoutViewModelTests: XCTestCase {
         )
         let sequence = OutcomeSequence([valid, duplicated])
         let runtime = try makeRuntime([
-            FixtureScanner(id: "mal") { await sequence.next() }
+            fixtureScanner("mal") { await sequence.next() }
         ])
         let viewModel = CacheoutViewModel(runtime: runtime)
 
@@ -771,8 +835,8 @@ final class CacheoutViewModelTests: XCTestCase {
             items: [perItem(scanner: "ok", id: "o1", bytes: 5000)], errors: []
         )
         let runtime = try makeRuntime([
-            FixtureScanner(id: "mal") { await malSequence.next() },
-            FixtureScanner(id: "ok") { okOutcome },
+            fixtureScanner("mal") { await malSequence.next() },
+            fixtureScanner("ok") { okOutcome },
         ])
         let viewModel = CacheoutViewModel(runtime: runtime)
 
@@ -871,7 +935,7 @@ final class CacheoutViewModelTests: XCTestCase {
         )
         let malSequence = OutcomeSequence([validMal, foreign, validMal])
         let runtime = try makeRuntime([
-            FixtureScanner(id: "mal") { await malSequence.next() },
+            fixtureScanner("mal") { await malSequence.next() },
             DirectoryFixtureScanner(id: "fixture_items", container: container),
         ])
         let viewModel = CacheoutViewModel(runtime: runtime)
@@ -957,14 +1021,22 @@ final class CacheoutViewModelTests: XCTestCase {
 
 /// A `SpaceScanner` whose outcome is injected — the epic's "implement
 /// protocol + register" seam, exercised with zero production edits.
+/// `trustedContainerRoots` must cover any container-item origin the
+/// injected outcome claims (round 6 origin binding) — the test-class
+/// `fixtureScanner` helper declares `perItem`'s origin automatically.
 private struct FixtureScanner: SpaceScanner {
     let id: String
     var displayName: String { "Fixture \(id)" }
-    var trustedContainerRoots: [URL] { [] }
+    let trustedContainerRoots: [URL]
     let provide: @Sendable () async -> ScanOutcome
 
-    init(id: String, provide: @escaping @Sendable () async -> ScanOutcome) {
+    init(
+        id: String,
+        trustedContainerRoots: [URL] = [],
+        provide: @escaping @Sendable () async -> ScanOutcome
+    ) {
         self.id = id
+        self.trustedContainerRoots = trustedContainerRoots
         self.provide = provide
     }
 

@@ -50,7 +50,9 @@
 /// - **Protocol** `scan(context:)` (`SpaceScanner`) — emits one
 ///   `ReclaimableItem` per recognized candidate under the epic's COMPLETE
 ///   truth table (`.measured`/`.empty`/`.partiallyDenied`/`.denied`):
-///   candidate-attributable denials ride the ITEM's `state`/`scanError`;
+///   candidate-attributable denials AND mount boundaries (which the
+///   cleaner's R15 doctrine refuses at delete time) ride the ITEM's
+///   `state`/`scanError`;
 ///   `ScanOutcome.errors` is reserved for refused search roots and traversal
 ///   failures with NO recognized candidate.
 ///
@@ -338,6 +340,17 @@ actor NodeModulesScanner {
         var outcome = NodeModulesTraversal(candidates: [], issues: [])
         guard currentDepth < maxDepth else { return outcome }
 
+        // Cooperative cancellation (review P2): the runtime cancels the
+        // producer task when the consumer's stream terminates, and every
+        // result yielded after termination is discarded — but this walk
+        // used to run its full 10-30s course anyway. Checking at every
+        // node (recursion entry and, below, between siblings) bounds the
+        // orphaned wind-down to roughly one candidate's sizing, which is
+        // what keeps the ViewModel's honest "still scanning" guard-hold
+        // short. Truncation is safe here: cancellation only ever reaches
+        // this walk when nobody will read the result.
+        guard !Task.isCancelled else { return outcome }
+
         let candidate = directory.appendingPathComponent("node_modules")
 
         // Candidate gate (lstat, no-follow): only a REAL directory is a find.
@@ -394,6 +407,9 @@ actor NodeModulesScanner {
         }
 
         for item in contents {
+            // Same cooperative check between siblings — a wide directory
+            // must not finish probing every child once the walk is dead.
+            if Task.isCancelled { break }
             let name = item.lastPathComponent
             guard !skipDirs.contains(name) else { continue }
             // lstat gate before EVERY manual descent: a symlinked directory
@@ -477,15 +493,26 @@ extension NodeModulesScanner: SpaceScanner {
     }
 
     /// The COMPLETE recognized-candidate truth table (epic contract): every
-    /// recognized candidate emits an item, no exceptions —
+    /// recognized candidate emits an item, no exceptions. An IMPEDIMENT is
+    /// a classified walk denial OR a recorded mount boundary — the
+    /// candidate itself (`rootMountBoundary`: the tree was never
+    /// enumerated) or a mounted subtree skipped mid-walk. Boundaries fold
+    /// into the denied family exactly like denials because the cleaner's
+    /// R15 doctrine refuses ANY boundary at delete time
+    /// (`removeGuardedItem` remeasures and refuses): a clean-looking
+    /// `.measured`/`.empty` would let a dry run promise a clean the
+    /// confirmed run refuses — the known refusal must be visible BEFORE
+    /// confirmation.
     ///
     /// - clean walk + measurable content → `.measured` (nil `scanError`)
     /// - clean walk + NO measurable content → `.empty` (nil `scanError`,
     ///   zero components) — an honest terminal state, not a suppression
-    /// - denial + SOME measurable content → `.partiallyDenied` + classified
-    ///   `scanError`, carrying the readable portion's components
-    /// - denial + NO measurable content → `.denied` + classified
-    ///   `scanError`, zero components
+    /// - impediment + SOME measurable content → `.partiallyDenied` +
+    ///   classified `scanError`, carrying the readable portion's components
+    ///   (a nested boundary's subtree is uncounted — the bytes stay honest)
+    /// - impediment + NO measurable content → `.denied` + classified
+    ///   `scanError`, zero components (a boundary-at-root candidate always
+    ///   lands here — nothing was enumerated, nothing is deletable)
     ///
     /// All candidate-attributable outcomes are ITEM-level, never outcome
     /// errors. "Measurable content" is fn-1.2's rule verbatim
@@ -495,18 +522,23 @@ extension NodeModulesScanner: SpaceScanner {
     ) -> ReclaimableItem {
         let report = candidate.report
         let measuredAnything = report.itemCount > 0 || report.measuredBytes > 0
+        // `rootMountBoundary` needs no separate check: the sizer records the
+        // root itself in `mountBoundaries` for that case.
+        let impeded = !report.denials.isEmpty || !report.mountBoundaries.isEmpty
         let state: ScanState
         let scanError: ScanError?
-        if report.denials.isEmpty {
+        if !impeded {
             state = measuredAnything ? .measured : .empty
             scanError = nil
         } else {
             state = measuredAnything ? .partiallyDenied : .denied
             // Same classification path as category scans: kind from the
-            // denial's classification (tcc/permission/other).
+            // denial's classification (tcc/permission/other). A boundary
+            // with no denial to classify synthesizes its own error naming
+            // the boundary the cleaner will refuse.
             scanError = CacheScanner.deriveScanError(
                 refusals: [], denials: report.denials
-            )
+            ) ?? Self.mountBoundaryScanError(from: report)
         }
 
         // Dual canonicalization (fn-1 doctrine): `requestedURL` keeps the
@@ -521,9 +553,11 @@ extension NodeModulesScanner: SpaceScanner {
             // Frozen truth table: `.empty`/`.measured`/`.partiallyDenied`
             // candidates were admitted and walked (clean-empty and partial
             // walks count as measured); only `.denied` — admitted but
-            // nothing measurable — is `.deniedUnmeasured`. A refused search
-            // root never yields a recognized candidate, so no candidate
-            // ever maps to `.refusedAdmission`.
+            // nothing measurable, whether denied at its own top level or
+            // never enumerated behind a root mount boundary — is
+            // `.deniedUnmeasured`. A refused search root never yields a
+            // recognized candidate, so no candidate ever maps to
+            // `.refusedAdmission`.
             status: state == .denied ? .deniedUnmeasured : .measured
         )
 
@@ -589,6 +623,25 @@ extension NodeModulesScanner: SpaceScanner {
             automaticCleanEligible: false,
             isStale: NodeModulesItem.isStale(daysSinceModified: days)
         )
+    }
+
+    /// The classified impediment for a boundary-affected candidate with no
+    /// walk denial to classify. `.other` is the honest EXISTING kind: a
+    /// boundary is neither a TCC nor a BSD permission problem and no
+    /// admission was refused, and the frozen `ScanError.Kind` wire table
+    /// (`wireString`) must not silently grow a new case — the message
+    /// carries the specifics, mirroring the cleaner's delete-time refusal
+    /// wording (R15).
+    private static func mountBoundaryScanError(
+        from report: SizeReport
+    ) -> ScanError? {
+        guard let boundary = report.mountBoundaries.first else { return nil }
+        let message = report.rootMountBoundary
+            ? "\(boundary.path): item is a mount point — not measured; "
+                + "deletion would be refused"
+            : "mount boundary at \(boundary.path) — subtree not measured; "
+                + "deletion would be refused"
+        return ScanError(kind: .other, message: message)
     }
 
     /// EXACT 1:1 kind mapping for root-level and traversal issues (epic

@@ -561,10 +561,10 @@ class CacheoutViewModel: ObservableObject {
         scanningScannerIDs = Set(runtime.scanners.map(\.id))
         diskInfo = await Task.detached { DiskInfo.current() }.value
 
-        let stream = runtime.scanValidated(
+        let session = runtime.scanValidatedSession(
             context: ScanContext(trigger: trigger)
         )
-        for await event in stream {
+        for await event in session.events {
             handle(event)
         }
 
@@ -572,6 +572,16 @@ class CacheoutViewModel: ObservableObject {
         // early — some scanners never delivered. Pruning then would drop
         // selections for items whose scanner simply never reported.
         let completed = !Task.isCancelled
+
+        // Early termination only CANCELS the producer; its filesystem walks
+        // wind down cooperatively rather than instantly (review P2).
+        // `scanningScannerIDs` is the re-entrancy guard every scan-start,
+        // `clean()`, and `shouldAutoRescan` read — clearing it while the
+        // orphaned walk is still traversing would let a new scan or a
+        // cleanup overlap the same trees. Hold it until the producer has
+        // ACTUALLY finished (the await is deliberately non-cancellable; in
+        // the normal completion path it returns immediately).
+        await session.untilProducerFinishes()
         scanningScannerIDs = []
         guard completed else { return }
 

@@ -176,9 +176,10 @@ enum AdmissionDescriptor: Equatable, Sendable {
 struct ReclaimableItem: Equatable, Sendable {
     /// Scanner-DEFINED under three invariants: (1) stable across rescans for
     /// the same logical item, (2) unique within its scanner, (3) CLI-safe
-    /// opaque string (no whitespace, no colon — it must fit the
-    /// `<scanner-slug>:<item-id>` grammar slot). A category aggregate's id
-    /// is the category SLUG; per-item scanners derive ids via `stableID`.
+    /// opaque string (no whitespace, no colon, no NUL — it must fit the
+    /// `<scanner-slug>:<item-id>` grammar slot AND survive a POSIX argv
+    /// round trip). A category aggregate's id is the category SLUG;
+    /// per-item scanners derive ids via `stableID`.
     let id: String
     /// Ownership rides ON the item (epic round 4): `clean(items:)` receives
     /// bare items — ownership must travel with them, never be looked up.
@@ -285,7 +286,12 @@ struct ScanIssue: Equatable, Sendable {
         case unreadable
         /// Synthesized ONLY by `SpaceScannerRuntime.validatedOutcome` when a
         /// scanner's outcome fails ownership/structural validation — never
-        /// produced by scanners themselves.
+        /// produced by scanners themselves. RESERVED and enforced (check
+        /// (h)): a scanner-authored instance in `ScanOutcome.errors` is
+        /// itself a validation violation that malforms the whole outcome —
+        /// the wire contract says this kind means the outcome was rejected
+        /// and its items excluded, so a scanner must not be able to publish
+        /// items BESIDE a `malformed_outcome` row.
         case malformedOutcome
 
         /// FROZEN wire strings, case-by-case (epic contract).
@@ -347,6 +353,29 @@ enum ValidatedScannerEvent: Sendable {
     case malformed(scannerID: String, ScanIssue)
 }
 
+/// One RUNNING validated scan (review P2): the progressive event stream
+/// plus the unstructured producer task that drives the scan `TaskGroup`.
+/// The producer is private — a consumer can WAIT for it, never steer it
+/// (stream termination remains the one cancellation path).
+struct ValidatedScanSession {
+    /// Progressive validated events — the identical frozen contract
+    /// `scanValidated` returns (that API is now a thin wrapper over this).
+    let events: AsyncStream<ValidatedScannerEvent>
+    fileprivate let producer: Task<Void, Never>
+
+    /// Suspends until the producer task has ACTUALLY returned — scanners
+    /// finished or wound down, the group drained. Deliberately
+    /// NON-cancellable: `Task<_, Never>.value` cannot throw, so awaiting it
+    /// from an already-cancelled task still waits out the wind-down — the
+    /// entire point is to hold a "scan in progress" guard honestly PAST the
+    /// consumer's own cancellation. In the normal completion path the
+    /// producer has already finished by the time `events` ends, so the
+    /// await returns immediately.
+    func untilProducerFinishes() async {
+        await producer.value
+    }
+}
+
 /// Registration-time refusals from the runtime's folded validation.
 enum SpaceScannerRegistrationError: Error, Equatable {
     /// Scanner id does not match `[a-z0-9_]+`.
@@ -373,6 +402,15 @@ struct SpaceScannerRuntime {
     /// UNION of every scanner's declared `trustedContainerRoots`, in
     /// registration order, deduplicated by path.
     let trustedContainerRoots: [URL]
+
+    /// PER-SCANNER declared container roots, captured at registration
+    /// (round 6). Delete-time admission deliberately checks the UNION
+    /// above (frozen R4 design: registration alone extends admission), so
+    /// the union cannot tell WHICH scanner declared a root — scan-time
+    /// validation therefore binds each container-item origin claim to the
+    /// PRODUCING scanner's own declaration through this map, never the
+    /// union.
+    private let declaredContainerRoots: [String: [URL]]
 
     /// The AUTHORITATIVE category registry, keyed by slug — registered at
     /// composition time alongside the scanners. Category-backed items are
@@ -426,7 +464,9 @@ struct SpaceScannerRuntime {
 
         var union: [URL] = []
         var seenRoots = Set<String>()
+        var declared: [String: [URL]] = [:]
         for scanner in scanners {
+            declared[scanner.id] = scanner.trustedContainerRoots
             for root in scanner.trustedContainerRoots
             where seenRoots.insert(root.path).inserted {
                 union.append(root)
@@ -436,6 +476,7 @@ struct SpaceScannerRuntime {
         self.scanners = scanners
         self.registeredCategories = registered
         self.trustedContainerRoots = union
+        self.declaredContainerRoots = declared
         self.home = home
         self.provider = provider
     }
@@ -494,10 +535,12 @@ struct SpaceScannerRuntime {
     /// (a) OWNERSHIP — every item's `scannerID` equals the producing
     ///     scanner's id;
     /// (b) ID FORM — every item id is a NONEMPTY, CLI-safe opaque string
-    ///     (no whitespace, no colon — the documented `ReclaimableItem.id`
-    ///     invariant): an empty or unaddressable id would publish an item
-    ///     `scan` prints but whose `<scanner>:<item-id>` address
-    ///     `parseCleanTargets` can never accept;
+    ///     (no whitespace, no colon, no U+0000 — the documented
+    ///     `ReclaimableItem.id` invariant): an empty or unaddressable id
+    ///     would publish an item `scan` prints but whose
+    ///     `<scanner>:<item-id>` address `parseCleanTargets` can never
+    ///     accept — and a NUL id could never even be SPELLED as an argv
+    ///     token (`isCLISafeItemID` documents the exact boundary);
     /// (c) UNIQUENESS — item ids are unique within the outcome;
     /// (d) VALUE DOMAIN — every numeric field is a sane physical quantity:
     ///     byte components and `itemCount` nonnegative, `logicalBytes`
@@ -528,7 +571,13 @@ struct SpaceScannerRuntime {
     ///     "skip", while the cleaner deliberately deletes zero-byte
     ///     `.removeItem` targets — an adapter-owned `.removeItem` would let
     ///     a confirmed run delete what its preview skipped). It MUST carry
-    ///     the frozen `.containerItem` descriptor, and in the states the
+    ///     the frozen `.containerItem` descriptor, whose `originContainer`
+    ///     must be one of the PRODUCING scanner's own registration-declared
+    ///     `trustedContainerRoots` (round 6): delete-time admission checks
+    ///     the runtime-wide UNION by frozen R4 design, so without this
+    ///     per-scanner binding a mapping bug in scanner A could pair its
+    ///     target with scanner B's registered container and ride B's
+    ///     registration through union admission. In the states the
     ///     cleaner actually deletes (`.measured`/`.partiallyDenied` —
     ///     `.missing`/`.empty` skip pre-dispatch, `.denied` is refused) its
     ///     `requestedTargetURL` must be BOUND to the scan's own capture:
@@ -548,11 +597,26 @@ struct SpaceScannerRuntime {
     ///     binding, any scanner could invent a `CacheCategory` whose
     ///     declared roots or clean commands sit outside every
     ///     registration-derived policy — exactly the admission-widening the
-    ///     runtime exists to prevent. Action/argv COHERENCE rides the same
+    ///     runtime exists to prevent. RISK/SELECTION-POLICY BINDING rides
+    ///     the same trust boundary (round 6): the item's `risk`,
+    ///     `defaultSelected`, `automaticCleanEligible`, and `isStale` must
+    ///     equal exactly what the adapter mapping derives from the
+    ///     registered category (`riskLevel`, `defaultSelected`, `true`,
+    ///     `nil`) — Quick Clean selects `automaticCleanEligible && risk ==
+    ///     .safe` off the CARRIED copies, so a mapping regression could
+    ///     otherwise auto-clean a `.caution` category without its warning.
+    ///     Action/argv COHERENCE rides the same
     ///     check (fn-2.3): a `.commands` payload must equal the category's
     ///     declared `cleanCommands` (argv is registry code, never item
     ///     input) and a command-backed category can never carry
-    ///     `.removeContents`.
+    ///     `.removeContents`;
+    /// (h) RESERVED ISSUE KIND — `ScanIssue.Kind.malformedOutcome` is the
+    ///     runtime's own synthesis, never scanner-authored data: a scanner
+    ///     placing it in `ScanOutcome.errors` would publish its items
+    ///     BESIDE a `malformed_outcome` row, contradicting the wire
+    ///     contract that the kind means the whole outcome was rejected.
+    ///     The violation itself malforms the outcome (the genuinely
+    ///     synthesized replacement is the correct fail-closed response).
     ///
     /// Any violation replaces the WHOLE outcome with a synthesized path-less
     /// `.malformedOutcome` issue — nothing from a malformed outcome is
@@ -563,15 +627,19 @@ struct SpaceScannerRuntime {
     ) -> ValidatedScannerEvent {
         Self.validatedOutcome(
             outcome, from: scannerID,
+            // Registration-time declaration: an unregistered producer id
+            // has declared nothing, so no container-item origin can bind.
+            declaredContainerRoots: declaredContainerRoots[scannerID] ?? [],
             registeredCategories: registeredCategories
         )
     }
 
     /// Static core so the stream's task-group children capture only the
-    /// Sendable category map, never the runtime.
+    /// Sendable declared-roots and category maps, never the runtime.
     private static func validatedOutcome(
         _ outcome: ScanOutcome,
         from scannerID: String,
+        declaredContainerRoots: [URL],
         registeredCategories: [String: CacheCategory]
     ) -> ValidatedScannerEvent {
         var seenIDs = Set<String>()
@@ -608,6 +676,7 @@ struct SpaceScannerRuntime {
                 ?? stateCoherenceViolation(of: item)
                 ?? structuralViolation(
                     of: item, from: scannerID,
+                    declaredContainerRoots: declaredContainerRoots,
                     registeredCategories: registeredCategories
                 ) {
                 return .malformed(scannerID: scannerID, ScanIssue(
@@ -616,6 +685,20 @@ struct SpaceScannerRuntime {
                         + violation
                 ))
             }
+        }
+        // Check (h): the reserved issue kind. Runs over the ISSUE list —
+        // a scanner-authored `.malformedOutcome` would let the CLI print
+        // this scanner's items beside a `malformed_outcome` row, though
+        // the wire contract says that kind means the whole outcome was
+        // rejected. The synthesized replacement IS the contract's shape.
+        for issue in outcome.errors where issue.kind == .malformedOutcome {
+            return .malformed(scannerID: scannerID, ScanIssue(
+                url: nil, kind: .malformedOutcome,
+                detail: "scanner '\(scannerID)' authored a reserved "
+                    + "malformed_outcome issue (detail: '\(issue.detail)') "
+                    + "— the kind is synthesized only by the runtime when "
+                    + "it rejects an entire outcome"
+            ))
         }
         return .outcome(scannerID: scannerID, outcome)
     }
@@ -815,6 +898,7 @@ struct SpaceScannerRuntime {
     private static func structuralViolation(
         of item: ReclaimableItem,
         from scannerID: String,
+        declaredContainerRoots: [URL],
         registeredCategories: [String: CacheCategory]
     ) -> String? {
         switch item.action {
@@ -834,7 +918,28 @@ struct SpaceScannerRuntime {
                     + "for per-item scanners"
             }
             switch item.admission {
-            case .containerItem(_, let requestedTargetURL):
+            case .containerItem(let originContainer, let requestedTargetURL):
+                // ORIGIN BINDING (round 6): the origin-container claim must
+                // be one of the PRODUCING scanner's own registration-
+                // declared roots — in EVERY state (production always sets
+                // it to the search root the walk started from). Delete-time
+                // admission checks the runtime-wide UNION by frozen R4
+                // design (registration alone extends admission), so the
+                // union cannot tell WHICH scanner declared a root: without
+                // this scan-time narrowing, a mapping bug in scanner A
+                // could pair its target with scanner B's registered
+                // container and ride B's registration through union
+                // admission. Path equality against the declaration — never
+                // a second resolution.
+                if !declaredContainerRoots.contains(where: {
+                    $0.path == originContainer.path
+                }) {
+                    return "originContainer '\(originContainer.path)' is "
+                        + "not one of the producing scanner's declared "
+                        + "trustedContainerRoots — delete-time admission "
+                        + "checks the runtime-wide union, so an undeclared "
+                        + "origin could ride another scanner's registration"
+                }
                 // Deletion-target binding: in the states the cleaner
                 // dispatches (`removeGuardedItem` deletes the descriptor's
                 // `requestedTargetURL`, never anything read off records),
@@ -914,6 +1019,41 @@ struct SpaceScannerRuntime {
                         + "category for that slug — provenance is a claim, "
                         + "and only registered categories are trusted"
                 }
+                // RISK/SELECTION-POLICY BINDING (round 6): these four
+                // fields are the adapter mapping's DERIVATIONS from the
+                // registered category (`CategoryScanner.item(from:)`:
+                // `riskLevel`, `defaultSelected`, `true`, `nil`) — yet
+                // downstream trusts the CARRIED copies: Quick Clean /
+                // selectAllSafe selects `automaticCleanEligible && risk ==
+                // .safe`, initial selection reads `defaultSelected`, and
+                // Select Stale reads `isStale`. A mapping regression (a
+                // `.caution` Docker aggregate carried as `.safe`) would
+                // otherwise ride Quick Clean without its caution warning.
+                // Equality is against the PROVEN-registered instance —
+                // `carried` is identity-checked above.
+                if item.risk != carried.riskLevel {
+                    return "aggregate risk '\(item.risk.rawValue)' does not "
+                        + "match the registered category's declared "
+                        + "riskLevel '\(carried.riskLevel.rawValue)' — "
+                        + "risk policy derives from registration"
+                }
+                if item.defaultSelected != carried.defaultSelected {
+                    return "aggregate defaultSelected "
+                        + "\(item.defaultSelected) does not match the "
+                        + "registered category's declaration "
+                        + "(\(carried.defaultSelected)) — selection policy "
+                        + "derives from registration"
+                }
+                if !item.automaticCleanEligible {
+                    return "aggregate automaticCleanEligible must be true — "
+                        + "the adapter mapping enrolls every aggregate; a "
+                        + "divergence is a mapping regression"
+                }
+                if item.isStale != nil {
+                    return "an aggregate carries a staleness flag — "
+                        + "staleness is not applicable to category "
+                        + "aggregates (the adapter maps nil)"
+                }
                 // Action/argv coherence (fn-2.3 defense-in-depth, mirrored
                 // by the cleaner): command argv is TRUSTED REGISTRY CODE —
                 // a `.commands` payload must BE the carried category's
@@ -963,34 +1103,56 @@ struct SpaceScannerRuntime {
         scannerIDs: Set<String>? = nil,
         context: ScanContext
     ) -> AsyncStream<ValidatedScannerEvent> {
+        scanValidatedSession(scannerIDs: scannerIDs, context: context).events
+    }
+
+    /// `scanValidated` plus the producer's REAL completion (additive over
+    /// the frozen stream shape — review P2). Cancelling the task consuming
+    /// `events` terminates the stream immediately and cancels the producer,
+    /// but the scanners' filesystem walks wind down COOPERATIVELY, not
+    /// instantly — `untilProducerFinishes()` is how a stateful consumer
+    /// keeps its "scanning" guard honest until the walk has actually
+    /// stopped, instead of releasing it while an orphaned traversal is
+    /// still reading the same trees.
+    func scanValidatedSession(
+        scannerIDs: Set<String>? = nil,
+        context: ScanContext
+    ) -> ValidatedScanSession {
         let selected = scanners.filter { scanner in
             scannerIDs?.contains(scanner.id) ?? true
         }
         let registeredCategories = self.registeredCategories
-        return AsyncStream { continuation in
-            let task = Task {
-                // Parallelism must not regress: scanners run concurrently
-                // across the group (and internally parallel as today);
-                // events yield in COMPLETION order — that is the
-                // progressive-publishing contract.
-                await withTaskGroup(of: ValidatedScannerEvent.self) { group in
-                    for scanner in selected {
-                        group.addTask {
-                            let outcome = await scanner.scan(context: context)
-                            return Self.validatedOutcome(
-                                outcome, from: scanner.id,
-                                registeredCategories: registeredCategories
-                            )
-                        }
-                    }
-                    for await event in group {
-                        continuation.yield(event)
+        let declaredContainerRoots = self.declaredContainerRoots
+        let (events, continuation) =
+            AsyncStream<ValidatedScannerEvent>.makeStream()
+        let task = Task {
+            // Parallelism must not regress: scanners run concurrently
+            // across the group (and internally parallel as today);
+            // events yield in COMPLETION order — that is the
+            // progressive-publishing contract.
+            await withTaskGroup(of: ValidatedScannerEvent.self) { group in
+                for scanner in selected {
+                    group.addTask {
+                        let outcome = await scanner.scan(context: context)
+                        return Self.validatedOutcome(
+                            outcome, from: scanner.id,
+                            // The REGISTRATION-time declaration (init
+                            // capture), matching the cleaner union's
+                            // provenance — never re-read mid-scan.
+                            declaredContainerRoots:
+                                declaredContainerRoots[scanner.id] ?? [],
+                            registeredCategories: registeredCategories
+                        )
                     }
                 }
-                continuation.finish()
+                for await event in group {
+                    continuation.yield(event)
+                }
             }
-            continuation.onTermination = { _ in task.cancel() }
+            continuation.finish()
         }
+        continuation.onTermination = { _ in task.cancel() }
+        return ValidatedScanSession(events: events, producer: task)
     }
 
     // MARK: Slug & item-id syntax
@@ -1007,15 +1169,24 @@ struct SpaceScannerRuntime {
     }
 
     /// The documented `ReclaimableItem.id` invariant, enforced at scan-time
-    /// validation: a NONEMPTY opaque string with no whitespace and no colon
-    /// — anything else cannot round-trip the `<scanner-slug>:<item-id>`
-    /// address (an empty id publishes a `<scanner>:` address
-    /// `parseCleanTargets` rejects, so the item could never be cleaned
-    /// individually even by echoing `scan` output verbatim). Deliberately
-    /// LOOSER than the slug grammar: item ids are opaque (64-hex
-    /// `stableID`s and category slugs today), not slugs — the validator
-    /// must never reject an id the documented contract allows.
+    /// validation: a NONEMPTY opaque string with no whitespace, no colon,
+    /// and no U+0000 — anything else cannot round-trip the
+    /// `<scanner-slug>:<item-id>` address (an empty id publishes a
+    /// `<scanner>:` address `parseCleanTargets` rejects, so the item could
+    /// never be cleaned individually even by echoing `scan` output
+    /// verbatim; a NUL id is PROVABLY unspellable as a `clean` argument —
+    /// POSIX argv strings are NUL-terminated, so no invocation can carry
+    /// the byte, even though the JSON envelope escapes it as a \\u0000 sequence
+    /// happily). The boundary is deliberately EXACT (round 6): other C0
+    /// controls are ugly but representable on BOTH legs — JSON escapes
+    /// them and argv bytes carry them — so rejecting them would over-
+    /// reject ids the opaque contract allows. Deliberately LOOSER than
+    /// the slug grammar: item ids are opaque (64-hex `stableID`s and
+    /// category slugs today), not slugs — the validator must never reject
+    /// an id the documented contract allows.
     static func isCLISafeItemID(_ id: String) -> Bool {
-        !id.isEmpty && !id.contains { $0 == ":" || $0.isWhitespace }
+        !id.isEmpty
+            && !id.contains { $0 == ":" || $0.isWhitespace }
+            && !id.unicodeScalars.contains { $0.value == 0 }
     }
 }

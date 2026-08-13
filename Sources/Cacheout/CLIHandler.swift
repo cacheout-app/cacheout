@@ -417,15 +417,25 @@ struct CLIHandler {
     /// shell translates a failure into the INVALID_ARGUMENTS exit). Each
     /// value must be a positive integer whose unit conversion does not
     /// overflow — zero, negative, non-numeric, and overflowing values are
-    /// REJECTED (fail-safe R8), never silently defaulted.
+    /// REJECTED (fail-safe R8), never silently defaulted. A REPEATED flag
+    /// is likewise rejected: any first-/last-wins rule would silently
+    /// ignore one of two contradictory values — and skip validating the
+    /// ignored occurrence, letting `--orphan-size-floor-mb 1
+    /// --orphan-size-floor-mb garbage` slip past the malformed-value gate.
     static func parseSweepThresholdOverrides(
         from args: [String]
     ) -> Result<(sizeFloorMB: Int64?, staleAgeDays: Int64?), CLIAddressError> {
         func parse(
             _ flag: String, converts: (Int64) -> Bool
         ) -> Result<Int64?, CLIAddressError> {
-            guard let index = args.firstIndex(of: flag) else {
+            let occurrences = args.indices.filter { args[$0] == flag }
+            guard let index = occurrences.first else {
                 return .success(nil)
+            }
+            guard occurrences.count == 1 else {
+                return .failure(CLIAddressError(
+                    message: "\(flag) may be specified at most once"
+                ))
             }
             guard index + 1 < args.count else {
                 return .failure(CLIAddressError(

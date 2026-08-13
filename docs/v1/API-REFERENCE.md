@@ -604,7 +604,8 @@ protocol SpaceScanner: Sendable {
 
 Adding a scanner = implement this + register with the runtime — nothing else:
 the runtime derives delete-time admission from registration. Conformers:
-`CategoryScanner` (id `categories`), `NodeModulesScanner` (id `node_modules`).
+`CategoryScanner` (id `categories`), `NodeModulesScanner` (id `node_modules`),
+`OrphanedCachesScanner` (id `orphaned_caches`).
 
 ### `ValidatedScannerEvent` / `SpaceScannerRegistrationError`
 
@@ -635,10 +636,13 @@ struct SpaceScannerRuntime {
     let trustedContainerRoots: [URL]  // union of scanner declarations
 
     init(scanners:categories:home:provider:) throws
-    static func production(home:provider:) -> SpaceScannerRuntime
-    func makeCleaner(trashHandler:) -> CacheCleaner
+    static func production(home:provider:orphanedCachesThresholds:) -> SpaceScannerRuntime
+    func makeCleaner(snapshot: ContainerSnapshot? = nil,
+                     trashHandler:) -> CacheCleaner
     func scanValidated(scannerIDs: Set<String>? = nil,
                        context: ScanContext) -> AsyncStream<ValidatedScannerEvent>
+    func scanValidatedSession(scannerIDs: Set<String>? = nil,
+                              context: ScanContext) -> ValidatedScanSession
     static func isValidSlug(_ slug: String) -> Bool
 }
 ```
@@ -646,9 +650,10 @@ struct SpaceScannerRuntime {
 | Member | Description |
 |--------|-------------|
 | `init` | Registration + FOLDED validation as one check: scanner-id slug syntax, scanner-id uniqueness, category-slug syntax, and the combined category-slug/scanner-slug namespace collision check (covers the frozen `categories` id). Injectable for tests — registering a fixture scanner requires zero production edits |
-| `production()` | The production registry — the single place scanners are registered (`CategoryScanner` + `NodeModulesScanner` today) |
-| `makeCleaner(trashHandler:)` | Builds the `CacheCleaner` whose PathGuard container roots are the runtime union — delete-time container admission covers exactly what registration declared, never anything an item claims |
-| `scanValidated(scannerIDs:context:)` | The ONE scan-and-validate entry point: a progressive validated event stream. The scan `TaskGroup` and ALL validation live inside; each event is one scanner's validated outcome or its synthesized `malformedOutcome` issue, yielded in completion order. `scannerIDs` scopes to a scanner subset (nil = all); the context's `categoryFilter` gives category-granular scoping inside `CategoryScanner`. Consumers pick scope and consumption style, never validation |
+| `production()` | The production registry — the single place scanners are registered (`CategoryScanner` + `NodeModulesScanner` + `OrphanedCachesScanner` today). `orphanedCachesThresholds` threads the sweep's invocation-scoped config (nil resolves defaults → UserDefaults) |
+| `makeCleaner(snapshot:trashHandler:)` | Builds the `CacheCleaner` whose PathGuard container roots are the runtime union — delete-time container admission covers exactly what registration declared, never anything an item claims. `snapshot` is the producing scan session's `ContainerSnapshot` (`ValidatedScanSession.snapshot`); nil FAIL-CLOSES every `.removeItem` deletion (`container-unavailable`) — items must be cleaned with the session that produced them |
+| `scanValidatedSession(scannerIDs:context:)` | The scan-and-validate entry point returning one SESSION: the progressive validated event stream, the producer handle (`untilProducerFinishes()`), and the session's `ContainerSnapshot` — every registered container root's no-follow (device, inode), captured BEFORE any scanner task launches (absent roots omitted). Delete-time `.removeItem` admission is identity-bound to this snapshot |
+| `scanValidated(scannerIDs:context:)` | Thin wrapper over `scanValidatedSession` returning just the event stream. The scan `TaskGroup` and ALL validation live inside; each event is one scanner's validated outcome or its synthesized `malformedOutcome` issue, yielded in completion order. `scannerIDs` scopes to a scanner subset (nil = all); the context's `categoryFilter` gives category-granular scoping inside `CategoryScanner`. Consumers pick scope and consumption style, never validation |
 | `isValidSlug(_:)` | `[a-z0-9_]+` — the address grammar's slug alphabet (no colon) |
 
 Validation (applied per event, fail-closed): (a) every item's `scannerID`

@@ -821,6 +821,10 @@ final class OrphanedCachesScannerTests: XCTestCase {
             ["--orphan-stale-days", "0"],
             ["--orphan-stale-days", "garbage"],
             ["--orphan-stale-days", "\(Int64.max)"],
+            // A repeated flag is rejected outright — first-/last-wins would
+            // silently ignore (and skip validating) one occurrence.
+            ["--orphan-size-floor-mb", "1", "--orphan-size-floor-mb", "garbage"],
+            ["--orphan-stale-days", "2", "--orphan-stale-days", "3"],
         ]
         for args in bad {
             switch CLIHandler.parseSweepThresholdOverrides(from: ["scan"] + args) {

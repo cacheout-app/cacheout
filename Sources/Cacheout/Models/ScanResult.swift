@@ -31,7 +31,10 @@
 /// R11/R16). Entries carry SPLIT byte components: `exactBytes` (measured
 /// unique-inode bytes whose deletion verifiably freed them) and
 /// `estimatedUpToBytes` (hardlinked or command-freed bytes that MAY be
-/// freed). Aggregates are pure sums of the entry components. The report also
+/// freed). Aggregates are pure sums of the entry components. Since fn-2.3
+/// each entry carries its item's ownership identity (`itemID`/`scannerID`/
+/// `displayName`), errors are self-contained `ItemError` records keyed by
+/// `ItemKey`, and `scannerRollups` derives per-scanner sums. The report also
 /// carries its REQUESTED `disposal` mode, and each entry carries what
 /// ACTUALLY happened to its bytes — command-backed categories erase
 /// permanently regardless of the Move-to-Trash toggle. `headline` derives
@@ -128,6 +131,15 @@ struct ScanResult: Identifiable {
     let itemCount: Int
     /// Why the scan is `denied`/`partiallyDenied`; nil for clean states.
     let scanError: ScanError?
+    /// Per-root capture (fn-2.1, root-capture invariant): one record for
+    /// EVERY root the scan resolved, populated by `CacheScanner` AT SCAN
+    /// TIME — it already resolves and admits each root before measuring.
+    /// `CategoryScanner` carries these records onto the aggregate item
+    /// verbatim and never re-evaluates `resolvedPaths`; clean-time dispatch
+    /// (fn-2.3) deletes only `.measured` records and re-admits
+    /// `requestedURL`s. Empty for `.missing` (and for pre-capture
+    /// compatibility callers).
+    let rootRecords: [RootScanRecord]
     var isSelected: Bool
 
     /// Compatibility sum of the split components — what pre-split callers
@@ -143,7 +155,8 @@ struct ScanResult: Identifiable {
         exactBytes: Int64,
         estimatedUpToBytes: Int64,
         itemCount: Int,
-        scanError: ScanError?
+        scanError: ScanError?,
+        rootRecords: [RootScanRecord] = []
     ) {
         self.id = category.id
         self.category = category
@@ -152,6 +165,7 @@ struct ScanResult: Identifiable {
         self.estimatedUpToBytes = estimatedUpToBytes
         self.itemCount = itemCount
         self.scanError = scanError
+        self.rootRecords = rootRecords
         // Selection defaults (fn-1.4, R18): `.denied` is unselectable —
         // nothing was measurable and the cleaner refuses it regardless.
         // `.partiallyDenied` is NEVER auto-selected (its size is a floor,
@@ -220,11 +234,23 @@ struct CleanupReport {
         case trash
     }
 
-    /// One cleaned category (or node_modules item) with split components
-    /// (R16). A partially-failed category still yields ONE entry carrying
-    /// only the bytes its successful children measured.
+    /// One cleaned item with split components (R16). A partially-failed item
+    /// still yields ONE entry carrying only the bytes its successful
+    /// children measured. Identity and presentation (`itemID`/`scannerID`/
+    /// `displayName`, fn-2.3) are sourced from the cleaned
+    /// `ReclaimableItem`'s REQUIRED ownership fields — never looked up
+    /// against state that may have been rescanned since.
     struct Entry {
-        let category: String
+        /// The cleaned item's scanner-scoped id (`ReclaimableItem.id` —
+        /// category slug for aggregates, full-hash stable id for per-item
+        /// scanners).
+        let itemID: String
+        /// The owning scanner's registered id.
+        let scannerID: String
+        /// Presentation identity (aggregates: the category name; per-item
+        /// scanners: the item display name). Subsumes the pre-unification
+        /// `category` field's display role.
+        let displayName: String
         /// Measured bytes on unique inodes — deletion verifiably freed them.
         let exactBytes: Int64
         /// Hardlinked bytes (freed only if every other link goes too) and
@@ -235,8 +261,13 @@ struct CleanupReport {
         /// Move-to-Trash toggle and place nothing in the Trash, so their
         /// entries stay `.permanent` even in a Trash run.
         let disposal: Disposal
-        /// Compatibility sum for pre-split callers.
-        var bytesFreed: Int64 { exactBytes + estimatedUpToBytes }
+        /// Compatibility sum for pre-split callers — saturating (round 8):
+        /// report arithmetic must never trap, whatever the components.
+        var bytesFreed: Int64 { exactBytes.saturatingAdding(estimatedUpToBytes) }
+
+        /// The composite cross-scanner identity — report correlation and
+        /// list identity both key on it.
+        var key: ItemKey { ItemKey(scannerID: scannerID, itemID: itemID) }
 
         /// Component-derived row text (fn-1.4, R16): "X", "X + up to Y
         /// more", or "up to Z" — never a single number that launders
@@ -248,17 +279,113 @@ struct CleanupReport {
         }
     }
 
+    /// SELF-CONTAINED per-item error record (fn-2.3, epic contract): a
+    /// failed item may not exist in any post-clean rescan, so rendering
+    /// must never need to look the item up again. `key` stays the
+    /// correlation key; `displayName` and `message` carry everything a
+    /// report line needs.
+    struct ItemError: Equatable {
+        let key: ItemKey
+        let displayName: String
+        let message: String
+    }
+
+    /// Per-scanner rollup — a PURE derivation over `entries` grouped by
+    /// `scannerID` (no stored duplicates), in first-appearance order.
+    struct ScannerRollup: Equatable {
+        let scannerID: String
+        let exactBytes: Int64
+        let estimatedUpToBytes: Int64
+        /// How many entries contributed to this rollup.
+        let entryCount: Int
+        /// Saturating (round 8): report arithmetic must never trap.
+        var bytesFreed: Int64 { exactBytes.saturatingAdding(estimatedUpToBytes) }
+
+        /// Component-derived rollup text for the report sheet's section
+        /// header (fn-2.5) — the same R16 phrase entry rows use, never a
+        /// single number that launders estimates into certainty.
+        var componentSummary: String {
+            CleanupReport.componentPhrase(
+                exact: exactBytes, estimatedUpTo: estimatedUpToBytes
+            )
+        }
+    }
+
+    /// One scanner's slice of the report for rollup rendering (fn-2.5): its
+    /// rollup sums plus its entries in report order. PURE derivation — the
+    /// grouping is exactly `scannerRollups`' (by `scannerID`, first-
+    /// appearance order); nothing is stored twice.
+    struct ScannerSection {
+        let rollup: ScannerRollup
+        let entries: [Entry]
+        var scannerID: String { rollup.scannerID }
+    }
+
     /// The REQUESTED disposal mode for the run. Entries carry what actually
     /// happened — a command-backed entry is `.permanent` even when the run
     /// requested `.trash`, and `rowAnnotation(for:)` surfaces that mismatch.
     let disposal: Disposal
     let entries: [Entry]
-    let errors: [(category: String, error: String)]
+    let errors: [ItemError]
 
-    /// Pure sum of entry `exactBytes` — no other math (R16).
-    var totalFreedExact: Int64 { entries.reduce(0) { $0 + $1.exactBytes } }
+    /// Pure sum of entry `exactBytes` — no other math (R16). Saturating
+    /// (round 8): entries cross scanners, and the validator bounds each
+    /// scanner's outcome only individually — clamp instead of trap.
+    var totalFreedExact: Int64 {
+        entries.reduce(0) { $0.saturatingAdding($1.exactBytes) }
+    }
     /// Pure sum of entry `estimatedUpToBytes` — no other math (R16).
-    var totalEstimatedUpTo: Int64 { entries.reduce(0) { $0 + $1.estimatedUpToBytes } }
+    /// Saturating for the same cross-scanner reason as `totalFreedExact`.
+    var totalEstimatedUpTo: Int64 {
+        entries.reduce(0) { $0.saturatingAdding($1.estimatedUpToBytes) }
+    }
+
+    /// Per-scanner sums over `entries`, grouped by `scannerID` in order of
+    /// first appearance — pure derivation, nothing stored (fn-2.3).
+    var scannerRollups: [ScannerRollup] {
+        var order: [String] = []
+        var sums: [String: (exact: Int64, estimated: Int64, count: Int)] = [:]
+        for entry in entries {
+            if sums[entry.scannerID] == nil { order.append(entry.scannerID) }
+            var sum = sums[entry.scannerID] ?? (0, 0, 0)
+            // Saturating (round 8): report arithmetic must never trap.
+            sum.exact = sum.exact.saturatingAdding(entry.exactBytes)
+            sum.estimated = sum.estimated
+                .saturatingAdding(entry.estimatedUpToBytes)
+            sum.count += 1
+            sums[entry.scannerID] = sum
+        }
+        return order.map { scannerID in
+            let sum = sums[scannerID]!
+            return ScannerRollup(
+                scannerID: scannerID,
+                exactBytes: sum.exact,
+                estimatedUpToBytes: sum.estimated,
+                entryCount: sum.count
+            )
+        }
+    }
+
+    /// The report sheet's per-scanner sections (fn-2.5): each scanner's
+    /// rollup paired with its entries, preserving entry order within each
+    /// section and `scannerRollups`' first-appearance section order.
+    var scannerSections: [ScannerSection] {
+        scannerRollups.map { rollup in
+            ScannerSection(
+                rollup: rollup,
+                entries: entries.filter { $0.scannerID == rollup.scannerID }
+            )
+        }
+    }
+
+    /// Report error lines rendered from the SELF-CONTAINED `ItemError`
+    /// records ALONE (fn-2.5, epic contract): a failed item may no longer
+    /// exist in any post-clean rescan, so this NEVER looks an item up —
+    /// `key` correlates, it does not fetch. Positional identity in the view
+    /// because one item may carry several error lines.
+    var errorLines: [String] {
+        errors.map { "\($0.displayName): \($0.message)" }
+    }
 
     /// Entry-disposal-driven one-line summary (R11), component-derived
     /// (R16, fn-1.4): permanent entries → "Freed X" / "Freed X + up to Y
@@ -296,11 +423,14 @@ struct CleanupReport {
         return "erased permanently — not in Trash"
     }
 
-    /// R16 amount phrase over a subset of entries (one disposal's worth).
+    /// R16 amount phrase over a subset of entries (one disposal's worth) —
+    /// saturating sums (round 8): the headline must render, never trap.
     private static func amountPhrase(for subset: [Entry]) -> String {
         componentPhrase(
-            exact: subset.reduce(0) { $0 + $1.exactBytes },
-            estimatedUpTo: subset.reduce(0) { $0 + $1.estimatedUpToBytes }
+            exact: subset.reduce(0) { $0.saturatingAdding($1.exactBytes) },
+            estimatedUpTo: subset.reduce(0) {
+                $0.saturatingAdding($1.estimatedUpToBytes)
+            }
         )
     }
 

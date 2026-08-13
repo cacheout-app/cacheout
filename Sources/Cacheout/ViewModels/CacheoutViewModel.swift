@@ -3,75 +3,152 @@
 /// The central `@MainActor` view model that manages all application state and
 /// coordinates between the scanning, cleaning, and UI layers.
 ///
-/// ## State Management
+/// ## Scanner registry (fn-2.4)
 ///
-/// All `@Published` properties trigger SwiftUI view updates automatically:
-/// - `scanResults`: Current scan results for all cache categories
-/// - `nodeModulesItems`: Discovered node_modules directories
-/// - `diskInfo`: Current disk space information
-/// - `isScanning` / `isCleaning` / `isNodeModulesScanning`: Loading states
-/// - `scanGeneration`: Monotonic counter incremented on each scan completion,
-///   used by views with `.task(id:)` to react to new data
+/// The twin stacks (`scanResults` + `nodeModulesItems` with duplicate
+/// selection/total/clean helpers) are gone. The view model consumes the
+/// `SpaceScannerRuntime`'s PROGRESSIVE VALIDATED EVENT STREAM and keeps ONE
+/// selection/totals/clean model over `ReclaimableItem`:
+///
+/// - `outcomesByScannerID`: each scanner's latest VALIDATED outcome,
+///   reconciled per-scanner as events arrive (progressive publishing — the
+///   category scanner lands in ~2-5s, slower scanners later).
+/// - `selectedItemKeys: Set<ItemKey>`: the one selection surface, keyed by
+///   the composite cross-scanner identity. Selection SURVIVES rescans (this
+///   fixes a live defect — node_modules items minted `UUID()` ids per scan,
+///   so their selection reset on every rescan).
+/// - The runtime owns orchestration and validation; this view model owns
+///   presentation and reconciliation ONLY — no local TaskGroup, no direct
+///   scanner calls, no `validatedOutcome` calls, no downcasts.
+///
+/// ## Reconciliation contract (epic rounds 5-10)
+///
+/// - A valid outcome reconciles ONLY its own scanner's entry — other
+///   scanners' items and selections are never touched by it.
+/// - Previously-emitted keys keep their user-set state, selected AND
+///   deselected — an explicit deselection is user intent and a rescan must
+///   never resurrect it. `defaultSelected` applies ONLY to a key's FIRST
+///   emission in this session.
+/// - Selections for VANISHED keys are pruned when the stream COMPLETES,
+///   never mid-scan — a selection on scanner A must not vanish because
+///   scanner B's event landed first.
+/// - A `malformedOutcome` event is fail-closed: nothing published for that
+///   scanner, the path-less issue surfaced, previous items and selections
+///   RETAINED. Validation itself lives in the runtime, never here.
+///
+/// ## Selection policies (THREE, deliberately separate — epic contract)
+///
+/// (a) INITIAL selection = `defaultSelected`, first emission only.
+/// (b) Quick Clean / `selectAllSafe` = `automaticCleanEligible && risk ==
+///     .safe` on cleanly measured items — `defaultSelected` deliberately NOT
+///     consulted (today's selectAllSafe ignores it).
+/// (c) Smart-clean is EXCLUSIVELY the CLI's (fn-2.6). The GUI NEVER runs it
+///     and never auto-selects review-risk; GUI code is PROHIBITED from
+///     invoking the CLI's candidate-order helper.
+///
+/// `.denied`, `.empty`, and `.missing` items are UNSELECTABLE in every
+/// surface — nothing to clean (round 9).
 ///
 /// ## Persistence
 ///
 /// User preferences are stored in `UserDefaults` via `didSet` observers:
-/// - `scanIntervalMinutes`: How often to auto-rescan (default: 30)
-/// - `lowDiskThresholdGB`: Notification threshold (default: 10)
-/// - `launchAtLogin`: Whether to start at login
-/// - `moveToTrash`: Deletion mode preference
-///
-/// ## Scanning
-///
-/// The `scan()` method runs `CacheScanner` and `NodeModulesScanner` in parallel
-/// using `async let`. Cache scanning completes first (typically 2-5s), then
-/// node_modules scanning finishes (can take 10-30s depending on project count).
-///
-/// ## Smart Clean
-///
-/// `smartClean()` auto-selects all "Safe" categories and runs cleanup — a one-tap
-/// operation from the menubar for quick disk recovery without decision fatigue.
-///
-/// ## Docker Prune
-///
-/// `dockerPrune()` runs `docker system prune -f` and parses the output for the
-/// "Total reclaimed space" line. Handles Docker not running or not installed gracefully.
+/// `scanIntervalMinutes`, `lowDiskThresholdGB`, `launchAtLogin`,
+/// `moveToTrash`. Untouched by unification, as are Docker prune, disk info,
+/// and the memory subsystem.
 
 import Foundation
 import SwiftUI
 
-/// What set a scan in motion (fn-1.4, R9). TCC-protected search roots
-/// (Documents, Desktop, …) are enumerated ONLY for `.userInitiated` scans —
-/// a background refresh must never be the thing that fires a macOS privacy
-/// prompt.
-enum ScanTrigger: Equatable {
-    /// The user explicitly asked (Scan button, Quick Clean, confirmed
-    /// cleanup). Protected roots are included; macOS may prompt once.
-    case userInitiated
-    /// Popover/tab auto-rescan or any other background refresh. Protected
-    /// roots are skipped entirely.
-    case automatic
+// `ScanTrigger` lives in Scanner/SpaceScanner.swift (fn-2.1): the scanner
+// layer consumes it via `ScanContext`, so the declaration must not live in
+// this SwiftUI-importing file.
+
+// MARK: - Presentation row models
+
+/// One category aggregate presented through the UNCHANGED `CategoryRow`
+/// inputs (fn-2.4): the row still consumes a `ScanResult`, rebuilt from the
+/// aggregate `ReclaimableItem`'s carried category + state + components, with
+/// `isSelected` projected from the one selection set. List identity is the
+/// composite `key`, never `ScanResult.id` (a per-launch category UUID).
+struct CategoryRowModel: Identifiable {
+    let key: ItemKey
+    let result: ScanResult
+    var id: ItemKey { key }
+}
+
+/// One selected item in the clean-confirmation sheet's UNIFIED itemization
+/// (fn-2.5): category aggregates and per-item scanner rows flow through ONE
+/// row shape, and every row carries its item's `evidence` string — evidence
+/// is first-class in the sheet (epic contract; the surface fn-3/fn-4/fn-5
+/// deletion safety rests on). List identity is the composite `key`.
+struct ConfirmationRowModel: Identifiable {
+    let key: ItemKey
+    /// SF Symbol — the registered category icon for aggregates, a generic
+    /// container icon for per-item scanner rows.
+    let icon: String
+    /// Aggregates: the category name; per-item rows: "scanner: item"
+    /// (preserves the pre-unification "node_modules: <project>" labelling).
+    let label: String
+    let formattedSize: String
+    /// Rendered under the row verbatim. Aggregates carry description-grade
+    /// evidence (the category description) — honest, never padded.
+    let evidence: String
+    var id: ItemKey { key }
+}
+
+/// One per-item scanner's section (every scanner except the aggregate
+/// category adapter): header identity, its items in outcome order, its
+/// root/scanner-level issues (including a synthesized `malformedOutcome`
+/// issue when the last event was malformed), and its pending state.
+struct ScannerSectionModel: Identifiable {
+    let scannerID: String
+    let displayName: String
+    let items: [ReclaimableItem]
+    let issues: [ScanIssue]
+    let isScanning: Bool
+    var id: String { scannerID }
+
+    /// "Select Stale" renders only where staleness applies to at least one
+    /// item (`isStale == nil` = control hidden/inapplicable).
+    var supportsStaleness: Bool { items.contains { $0.isStale != nil } }
 }
 
 @MainActor
 class CacheoutViewModel: ObservableObject {
-    @Published var scanResults: [ScanResult] = []
-    @Published var isScanning = false
+
+    // MARK: - Unified scan state (fn-2.4)
+
+    /// Each scanner's latest VALIDATED outcome. A malformed event never
+    /// lands here — the previous outcome is retained (fail-closed).
+    @Published private(set) var outcomesByScannerID: [String: ScanOutcome] = [:]
+
+    /// THE selection surface — composite `ItemKey`s only (a bare item id is
+    /// unique only within one scanner and is never a key here).
+    @Published private(set) var selectedItemKeys: Set<ItemKey> = []
+
+    /// Scanners whose event has not arrived in the current scan. Replaces
+    /// the split `isScanning`/`isNodeModulesScanning` with per-scanner
+    /// state. Internal-settable so tests can pin mid-scan windows.
+    @Published var scanningScannerIDs: Set<String> = []
+
+    /// The synthesized path-less issue for a scanner whose LAST event was
+    /// `malformedOutcome` — surfaced beside the retained previous items,
+    /// cleared when a valid outcome arrives (fail-closed disposition).
+    @Published private(set) var malformedIssuesByScannerID: [String: ScanIssue] = [:]
+
+    /// Each scanner's ever-emitted key set for THIS session. `defaultSelected`
+    /// applies only to keys absent from here (first emission ever);
+    /// previously-emitted keys keep their user-set state across rescans.
+    /// Deliberately never pruned: a vanished-then-reappearing key was still
+    /// emitted this session, so it does not re-enroll in initial selection.
+    private var emittedKeysByScannerID: [String: Set<ItemKey>] = [:]
+
     @Published var isCleaning = false
     @Published var diskInfo: DiskInfo?
     @Published var showCleanConfirmation = false
     @Published var showCleanupReport = false
     @Published var lastReport: CleanupReport?
     @Published var moveToTrash = true
-
-    @Published var nodeModulesItems: [NodeModulesItem] = []
-    @Published var isNodeModulesScanning = false
-
-    /// Classified problems from the last node_modules scan (fn-1.4, R14) —
-    /// a denied `~/Documents` search root must be VISIBLE here, never an
-    /// empty section. GUI-only surfacing: the CLI does not expose
-    /// node_modules at all until fn-2.
-    @Published var nodeModulesScanIssues: [NodeModulesScanIssue] = []
 
     /// Increments on every completed scan — views can use .task(id:) to react
     @Published var scanGeneration: Int = 0
@@ -99,11 +176,11 @@ class CacheoutViewModel: ObservableObject {
         didSet { UserDefaults.standard.set(launchAtLogin, forKey: "cacheout.launchAtLogin") }
     }
 
-    /// True while ANY phase of a scan is still running (R11). The cache
-    /// phase finishes first and clears `isScanning`; node_modules can run
-    /// 10–30s longer — scan/clean controls and model guards must cover the
-    /// WHOLE window, or a clean could act on a half-built result set.
-    var isAnyScanInProgress: Bool { isScanning || isNodeModulesScanning }
+    /// True while ANY scanner's event is still pending (R11). Scan/clean
+    /// controls and model guards must cover the WHOLE window — the category
+    /// scanner finishes in seconds while node_modules can run 10-30s longer,
+    /// and a clean must never act on a half-built result set.
+    var isAnyScanInProgress: Bool { !scanningScannerIDs.isEmpty }
 
     /// Whether the menubar should trigger an auto-rescan (no results or stale data)
     var shouldAutoRescan: Bool {
@@ -113,26 +190,21 @@ class CacheoutViewModel: ObservableObject {
         return Date().timeIntervalSince(last) > scanIntervalMinutes * 60
     }
 
-    private let scanner: CacheScanner
-    private let nodeModulesScanner: NodeModulesScanner
+    /// The ONE composition source (fn-2.1): scanner instances + the cleaner
+    /// configuration derived from them. Because `clean()` uses the
+    /// runtime-constructed cleaner, a registered scanner's
+    /// `trustedContainerRoots` reach delete-time admission with ZERO view
+    /// model edits (R4).
+    private let runtime: SpaceScannerRuntime
     private let cleaner: CacheCleaner
-    private let categories: [CacheCategory]
 
-    /// - Parameters:
-    ///   - scanner/nodeModulesScanner/cleaner: injectable for hermetic tests
-    ///     (fixture homes and search roots — zero real-`$HOME` reads);
-    ///     production uses the defaults.
-    ///   - categories: the category registry to scan; tests pass fixtures.
-    init(
-        scanner: CacheScanner = CacheScanner(),
-        nodeModulesScanner: NodeModulesScanner = NodeModulesScanner(),
-        cleaner: CacheCleaner = CacheCleaner(),
-        categories: [CacheCategory] = CacheCategory.allCategories
-    ) {
-        self.scanner = scanner
-        self.nodeModulesScanner = nodeModulesScanner
-        self.cleaner = cleaner
-        self.categories = categories
+    /// - Parameter runtime: injectable for hermetic tests (fixture scanners
+    ///   and homes — zero real-`$HOME` reads); production uses the one
+    ///   production registry. This injection seam is what fn-2.7's zero-edit
+    ///   extensibility proof exercises.
+    init(runtime: SpaceScannerRuntime = .production()) {
+        self.runtime = runtime
+        self.cleaner = runtime.makeCleaner()
 
         let storedInterval = UserDefaults.standard.double(forKey: "cacheout.scanIntervalMinutes")
         self.scanIntervalMinutes = storedInterval > 0 ? storedInterval : 30
@@ -143,26 +215,258 @@ class CacheoutViewModel: ObservableObject {
         self.launchAtLogin = UserDefaults.standard.bool(forKey: "cacheout.launchAtLogin")
     }
 
-    var selectedResults: [ScanResult] {
-        scanResults.filter { $0.isSelected }
+    // MARK: - Item access
+
+    /// Registry order — the stable presentation order for sections and for
+    /// the items handed to `clean()`.
+    private var orderedScannerIDs: [String] { runtime.scanners.map(\.id) }
+
+    func items(forScanner id: String) -> [ReclaimableItem] {
+        outcomesByScannerID[id]?.items ?? []
     }
 
-    var selectedSize: Int64 {
-        // ⚡ Bolt: Chain .lazy before .filter to prevent intermediate array allocation
-        scanResults.lazy.filter(\.isSelected).reduce(0) { $0 + $1.sizeBytes }
+    func issues(forScanner id: String) -> [ScanIssue] {
+        outcomesByScannerID[id]?.errors ?? []
     }
 
-    var formattedSelectedSize: String {
-        ByteCountFormatter.sharedFile.string(fromByteCount: selectedSize)
+    func item(for key: ItemKey) -> ReclaimableItem? {
+        outcomesByScannerID[key.scannerID]?.items.first { $0.id == key.itemID }
     }
 
+    /// True while `scannerID`'s LATEST rescan was rejected as malformed.
+    /// The fail-closed disposition retains the previous items and selections
+    /// for DISPLAY (epic contract — nothing user-set is lost), but validation
+    /// rejected the scanner's current view of the world, so those retained
+    /// records must not reach any DESTRUCTIVE path until a valid outcome
+    /// replaces them (`reconcile` clears the entry, lifting the block).
+    private func isBlockedFromDestructivePaths(_ scannerID: String) -> Bool {
+        malformedIssuesByScannerID[scannerID] != nil
+    }
+
+    /// The selected items in presentation order (registry order, then each
+    /// outcome's own order) — exactly what `clean()` hands the unified entry
+    /// and what the confirmation sheet lists. Scanners whose latest rescan
+    /// was rejected as malformed are EXCLUDED: their retained selections
+    /// stay visible in the results list but never reach a destructive path.
+    var selectedItems: [ReclaimableItem] {
+        orderedScannerIDs
+            .filter { !isBlockedFromDestructivePaths($0) }
+            .flatMap { id in
+                items(forScanner: id).filter { selectedItemKeys.contains($0.key) }
+            }
+    }
+
+    /// The destructive-selection gate for the Clean button and the
+    /// confirmation sheet's item count — derived from the gated
+    /// `selectedItems`, NOT from `selectedItemKeys`, so retained
+    /// selections under a malformed rescan cannot enable or inflate the
+    /// clean controls. (`hasSelection`/`selectedCount` stay key-based for
+    /// display surfaces that mirror the visible checkmarks.)
+    var hasCleanableSelection: Bool { !selectedItems.isEmpty }
+
+    var cleanableSelectedCount: Int { selectedItems.count }
+
+    var selectedCount: Int { selectedItemKeys.count }
+
+    var hasResults: Bool {
+        outcomesByScannerID.values.contains { !$0.items.isEmpty }
+    }
+
+    /// What the results list gates on: items OR classified issues OR a
+    /// malformed-outcome surface. An issue-only scan (every root denied,
+    /// zero items) and a first-event malformed scanner both MUST render —
+    /// a denied search root is information, never an empty state (R14/D6),
+    /// and a fail-closed refusal is only fail-closed if it is visible.
+    var hasDisplayableScanOutput: Bool {
+        hasResults
+            || outcomesByScannerID.values.contains { !$0.errors.isEmpty }
+            || !malformedIssuesByScannerID.isEmpty
+    }
+
+    var hasSelection: Bool { !selectedItemKeys.isEmpty }
+
+    // MARK: - Derived rows (views render these, logic stays testable here)
+
+    /// Category aggregates through the UNCHANGED `CategoryRow` shape. The
+    /// aggregate item's admission descriptor carries the registered
+    /// `CacheCategory`, so the row model rebuilds fn-1.4's exact inputs;
+    /// selection projects from `selectedItemKeys`.
+    var categoryRows: [CategoryRowModel] {
+        items(forScanner: CategoryScanner.registeredID).compactMap { item in
+            guard case .category(let category) = item.admission else {
+                // Category-scanner items always carry category provenance
+                // (runtime-validated); anything else is unrenderable here.
+                return nil
+            }
+            var result = ScanResult(
+                category: category,
+                state: item.state,
+                exactBytes: item.exactBytes,
+                estimatedUpToBytes: item.estimatedUpToBytes,
+                itemCount: item.itemCount,
+                scanError: item.scanError,
+                rootRecords: item.rootRecords
+            )
+            result.isSelected = selectedItemKeys.contains(item.key)
+            return CategoryRowModel(key: item.key, result: result)
+        }
+    }
+
+    /// The confirmation sheet's unified itemization (fn-2.5): ONE row shape
+    /// over `selectedItems` in presentation order — aggregates and per-item
+    /// scanner rows through the same derivation, each carrying its evidence
+    /// string.
+    var confirmationRows: [ConfirmationRowModel] {
+        Self.confirmationRows(for: selectedItems)
+    }
+
+    /// Pure derivation behind `confirmationRows` — static so XCTest asserts
+    /// on it without a runtime (SwiftUI bodies are assertion-dead).
+    nonisolated static func confirmationRows(
+        for selectedItems: [ReclaimableItem]
+    ) -> [ConfirmationRowModel] {
+        selectedItems.map { item in
+            let icon: String
+            let label: String
+            switch item.admission {
+            case .category(let category):
+                // Aggregate rows keep their registered category icon and
+                // name (the admission descriptor carries the category —
+                // runtime-validated provenance, same source `categoryRows`
+                // trusts).
+                icon = category.icon
+                label = category.name
+            case .containerItem:
+                icon = "shippingbox.fill"
+                label = "\(item.scannerID): \(item.displayName)"
+            }
+            return ConfirmationRowModel(
+                key: item.key,
+                icon: icon,
+                label: label,
+                formattedSize: ByteCountFormatter.sharedFile
+                    .string(fromByteCount: item.allocatedBytes),
+                evidence: item.evidence
+            )
+        }
+    }
+
+    /// The category scanner emits no outcome-level errors by design; this
+    /// surfaces only a synthesized `malformedOutcome` (fail-closed, visible).
+    var categoryScanIssues: [ScanIssue] {
+        var all = issues(forScanner: CategoryScanner.registeredID)
+        if let malformed = malformedIssuesByScannerID[CategoryScanner.registeredID] {
+            all.append(malformed)
+        }
+        return all
+    }
+
+    /// One generic section per NON-category scanner, in registry order —
+    /// the node_modules section generalized (fn-2.4).
+    var perItemSections: [ScannerSectionModel] {
+        runtime.scanners
+            .filter { $0.id != CategoryScanner.registeredID }
+            .map { scanner in
+                var issues = issues(forScanner: scanner.id)
+                if let malformed = malformedIssuesByScannerID[scanner.id] {
+                    issues.append(malformed)
+                }
+                return ScannerSectionModel(
+                    scannerID: scanner.id,
+                    displayName: scanner.displayName,
+                    items: items(forScanner: scanner.id),
+                    issues: issues,
+                    isScanning: scanningScannerIDs.contains(scanner.id)
+                )
+            }
+    }
+
+    // MARK: - Totals (three FROZEN scopes, one shared helper — epic round 6)
+
+    /// THE aggregation helper: every byte total flows through here with
+    /// EXPLICIT predicates — scope (which scanners) and inclusion (which
+    /// items) as arguments, never copy-pasted loops. SATURATING (round 8):
+    /// the validator bounds each outcome's sum individually, but this
+    /// helper adds ACROSS scanners, where no per-outcome bound applies —
+    /// clamp at Int64.max instead of trapping (byte-identical for every
+    /// physically possible total).
+    private func aggregateBytes(
+        scannerScope: (String) -> Bool,
+        include: (ReclaimableItem) -> Bool
+    ) -> Int64 {
+        var total: Int64 = 0
+        for (scannerID, outcome) in outcomesByScannerID where scannerScope(scannerID) {
+            for item in outcome.items where include(item) {
+                total = total.saturatingAdding(item.allocatedBytes)
+            }
+        }
+        return total
+    }
+
+    /// Scope 1 (FROZEN pre-refactor parity): AGGREGATE-CATEGORY items only —
+    /// per-item scanners excluded, exactly like the old `scanResults`-only
+    /// property. `.denied` contributes nothing by construction; the explicit
+    /// filter keeps that true even if a future state carries bytes it cannot
+    /// promise (R18). The old `!isEmpty` filter is spelled out as
+    /// not-missing + measurable-bytes.
     var totalRecoverable: Int64 {
-        // `.denied` contributes nothing by construction (nothing was
-        // measurable); the explicit filter keeps that true even if a future
-        // state carries bytes it cannot promise (R18).
-        scanResults.lazy
-            .filter { !$0.isEmpty && $0.state != .denied }
-            .reduce(0) { $0 + $1.sizeBytes }
+        aggregateBytes(
+            scannerScope: { $0 == CategoryScanner.registeredID },
+            include: { $0.state != .missing && $0.state != .denied && $0.allocatedBytes > 0 }
+        )
+    }
+
+    /// Scope 2: a per-scanner SECTION total stays section-local (the old
+    /// `selectedNodeModulesSize`, generalized per scanner id).
+    func selectedSize(forScanner id: String) -> Int64 {
+        aggregateBytes(
+            scannerScope: { $0 == id },
+            include: { selectedItemKeys.contains($0.key) }
+        )
+    }
+
+    func formattedSelectedSize(forScanner id: String) -> String {
+        ByteCountFormatter.sharedFile.string(fromByteCount: selectedSize(forScanner: id))
+    }
+
+    /// Scope 3: selected bytes across EVERY scanner (the old
+    /// `selectedSize + selectedNodeModulesSize`).
+    var totalSelectedSize: Int64 {
+        aggregateBytes(
+            scannerScope: { _ in true },
+            include: { selectedItemKeys.contains($0.key) }
+        )
+    }
+
+    var formattedTotalSelectedSize: String {
+        ByteCountFormatter.sharedFile.string(fromByteCount: totalSelectedSize)
+    }
+
+    /// NOT a fourth display scope — the DESTRUCTIVE variant of scope 3 the
+    /// confirmation sheet quotes: selected bytes excluding scanners blocked
+    /// by a malformed rescan, i.e. exactly the bytes `clean()` will act on.
+    /// The three frozen scopes above stay key-based (display parity — they
+    /// mirror the visible checkmarks, retained rows included).
+    var totalCleanableSelectedSize: Int64 {
+        aggregateBytes(
+            scannerScope: { !isBlockedFromDestructivePaths($0) },
+            include: { selectedItemKeys.contains($0.key) }
+        )
+    }
+
+    var formattedTotalCleanableSelectedSize: String {
+        ByteCountFormatter.sharedFile
+            .string(fromByteCount: totalCleanableSelectedSize)
+    }
+
+    /// Section-header display total (all of one scanner's items — the old
+    /// `nodeModulesTotal`); same helper, unfiltered inclusion.
+    func totalSize(forScanner id: String) -> Int64 {
+        aggregateBytes(scannerScope: { $0 == id }, include: { _ in true })
+    }
+
+    func formattedTotalSize(forScanner id: String) -> String {
+        ByteCountFormatter.sharedFile.string(fromByteCount: totalSize(forScanner: id))
     }
 
     /// D8 disclosure shown beside every recoverable/removable total (R8):
@@ -170,82 +474,122 @@ class CacheoutViewModel: ObservableObject {
     /// not a promise.
     nonisolated var overcountCaveat: String { DiskSpaceCaveat.overcount }
 
-    /// True when the current selection includes a `.partiallyDenied`
-    /// category — the confirmation sheet must warn that its size covers
-    /// measured bytes only (R18).
+    /// True when the current selection includes a `.partiallyDenied` item —
+    /// the confirmation sheet must warn that its size covers measured bytes
+    /// only (R18).
     var hasPartiallyDeniedSelection: Bool {
-        scanResults.contains { $0.isSelected && $0.state == .partiallyDenied }
+        selectedItems.contains { $0.state == .partiallyDenied }
     }
 
-    /// True when the current selection includes a command-backed category —
-    /// its clean commands execute regardless of the Move-to-Trash toggle and
+    /// True when the current selection includes a command-backed item — its
+    /// clean commands execute regardless of the Move-to-Trash toggle and
     /// erase permanently, so the confirmation sheet must say so whenever
     /// Trash mode is on (P2).
     var hasCommandBackedSelection: Bool {
-        scanResults.contains { $0.isSelected && $0.category.cleanCommands != nil }
+        selectedItems.contains { if case .commands = $0.action { return true } else { return false } }
     }
 
-    var hasResults: Bool { !scanResults.isEmpty || !nodeModulesItems.isEmpty }
-    var hasSelection: Bool {
-        // ⚡ Bolt: Use .contains(where:) for O(1) best-case short-circuiting instead of .isEmpty on filtered array or reducing total size
-        scanResults.contains(where: \.isSelected) || nodeModulesItems.contains(where: \.isSelected)
+    /// The `.commands` Move-to-Trash disclosure the confirmation sheet
+    /// renders when non-nil (fn-2.5, epic contract): `nil` when NO selected
+    /// item cleans via commands; otherwise a string naming ONLY the
+    /// command-backed items by display name — their argv runs regardless of
+    /// the Trash toggle and places nothing in the Trash (P2), so the sheet
+    /// must say exactly which items the toggle does not cover. Items cleaned
+    /// by deletion are never named.
+    var commandsTrashDisclosure: String? {
+        Self.commandsTrashDisclosure(selectedItems: selectedItems)
     }
 
-    // MARK: - Node Modules computed properties
-
-    var nodeModulesTotal: Int64 {
-        nodeModulesItems.reduce(0) { $0 + $1.sizeBytes }
+    /// Pure derivation behind `commandsTrashDisclosure` — static so XCTest
+    /// asserts on it without a runtime.
+    nonisolated static func commandsTrashDisclosure(
+        selectedItems: [ReclaimableItem]
+    ) -> String? {
+        let names = selectedItems
+            .filter { if case .commands = $0.action { return true } else { return false } }
+            .map(\.displayName)
+        guard !names.isEmpty else { return nil }
+        if names.count == 1 {
+            return "\(names[0]) runs its own cleanup command — "
+                + "Move to Trash does not apply to it"
+        }
+        return "\(names.joined(separator: ", ")) run their own cleanup "
+            + "commands — Move to Trash does not apply to them"
     }
 
-    var formattedNodeModulesTotal: String {
-        ByteCountFormatter.sharedFile.string(fromByteCount: nodeModulesTotal)
+    /// True when the current selection includes a caution-risk item (the
+    /// confirmation sheet's warning banner).
+    var hasCautionSelection: Bool {
+        selectedItems.contains { $0.risk == .caution }
     }
 
-    var selectedNodeModulesSize: Int64 {
-        nodeModulesItems.lazy.filter(\.isSelected).reduce(0) { $0 + $1.sizeBytes }
+    /// Bytes Quick Clean would actually act on — the SAME policy (b)
+    /// predicate `selectAllSafe` applies, across every scanner, through the
+    /// one shared helper. The menubar's Quick Clean gate reads THIS, not
+    /// `totalRecoverable`: that total is category-scoped by frozen contract,
+    /// while the auto path is registry-wide — a safe eligible item on a
+    /// future per-item scanner must keep Quick Clean live even when category
+    /// bytes are zero (and bytes that policy (b) will not touch must not
+    /// light the button).
+    var automaticCleanableSize: Int64 {
+        // Malformed-blocked scanners are excluded from the SCOPE, keeping
+        // this gate equal to what `selectAllSafe` (and therefore Quick
+        // Clean) will actually act on.
+        aggregateBytes(
+            scannerScope: { !isBlockedFromDestructivePaths($0) },
+            include: Self.safeAutoSelectable
+        )
     }
 
-    var formattedSelectedNodeModulesSize: String {
-        ByteCountFormatter.sharedFile.string(fromByteCount: selectedNodeModulesSize)
-    }
+    var hasAutomaticCleanableItems: Bool { automaticCleanableSize > 0 }
 
-    var totalSelectedSize: Int64 { selectedSize + selectedNodeModulesSize }
-
-    var formattedTotalSelectedSize: String {
-        ByteCountFormatter.sharedFile.string(fromByteCount: totalSelectedSize)
-    }
+    // MARK: - Scanning
 
     /// No default trigger — every caller must classify itself (R9). A
     /// defaulted `.userInitiated` let timer-driven refreshes inherit TCC
     /// consent silently; making the argument mandatory turns a
     /// misclassified new call site into a compile error.
+    ///
+    /// Consumes fn-2.1's progressive validated event stream — ALL scanners,
+    /// nil `categoryFilter`. The trigger rides `ScanContext` (its derived
+    /// `includeProtectedRoots` is the exact TCC mapping this view model used
+    /// to special-case at the node_modules call site); orchestration,
+    /// parallelism, and validation all live inside the runtime.
     func scan(trigger: ScanTrigger) async {
         // Re-entrancy guard (R11): correctness must not depend on button
         // state — an overlapping scan would race two writers over the same
-        // published arrays while the node_modules phase is still running,
-        // and scanning DURING a cleanup would publish results mid-deletion.
+        // published state while slower scanners are still running, and
+        // scanning DURING a cleanup would publish results mid-deletion.
         // (clean()'s own post-cleanup rescan runs after isCleaning clears.)
         guard !isAnyScanInProgress && !isCleaning else { return }
-        isScanning = true
-        isNodeModulesScanning = true
+        scanningScannerIDs = Set(runtime.scanners.map(\.id))
         diskInfo = await Task.detached { DiskInfo.current() }.value
 
-        // Scan caches and node_modules in parallel. TCC gating (R9):
-        // protected search roots are enumerated only when the user asked.
-        async let cacheResults = scanner.scanAll(categories)
-        async let nmResults = nodeModulesScanner.scan(
-            includeProtectedRoots: trigger == .userInitiated
+        let session = runtime.scanValidatedSession(
+            context: ScanContext(trigger: trigger)
         )
+        for await event in session.events {
+            handle(event)
+        }
 
-        scanResults = await cacheResults
-        isScanning = false
+        // If the consuming task was cancelled the stream may have ended
+        // early — some scanners never delivered. Pruning then would drop
+        // selections for items whose scanner simply never reported.
+        let completed = !Task.isCancelled
 
-        let outcome = await nmResults
-        nodeModulesItems = outcome.items
-        // Classified scan problems are information, not noise (R14/D6) — a
-        // denied search root surfaces in the section, never as "found none".
-        nodeModulesScanIssues = outcome.errors
-        isNodeModulesScanning = false
+        // Early termination only CANCELS the producer; its filesystem walks
+        // wind down cooperatively rather than instantly (review P2).
+        // `scanningScannerIDs` is the re-entrancy guard every scan-start,
+        // `clean()`, and `shouldAutoRescan` read — clearing it while the
+        // orphaned walk is still traversing would let a new scan or a
+        // cleanup overlap the same trees. Hold it until the producer has
+        // ACTUALLY finished (the await is deliberately non-cancellable; in
+        // the normal completion path it returns immediately).
+        await session.untilProducerFinishes()
+        scanningScannerIDs = []
+        guard completed else { return }
+
+        pruneVanishedSelections()
 
         // Track scan completion for reactive UI updates
         lastScanDate = Date()
@@ -253,66 +597,160 @@ class CacheoutViewModel: ObservableObject {
         hasScanned = true
     }
 
-    func toggleSelection(for id: UUID) {
-        if let index = scanResults.firstIndex(where: { $0.id == id }) {
-            // `.denied` is unselectable (R18): nothing was measurable and
-            // the cleaner refuses it regardless — the checkbox must not
-            // pretend otherwise. `.partiallyDenied` stays manually
-            // toggleable; the confirmation sheet carries the warning.
-            guard scanResults[index].state != .denied else { return }
-            scanResults[index].isSelected.toggle()
+    /// Applies ONE stream event — the reconciliation entry point `scan()`
+    /// drives. Internal (not private) so tests seed view-model state through
+    /// the SAME path production uses, never a parallel back door.
+    func handle(_ event: ValidatedScannerEvent) {
+        switch event {
+        case .outcome(let scannerID, let outcome):
+            reconcile(outcome, from: scannerID)
+            scanningScannerIDs.remove(scannerID)
+        case .malformed(let scannerID, let issue):
+            // Fail-closed disposition (epic contract): NOTHING published for
+            // this scanner — previous items and selections RETAINED, the
+            // path-less issue surfaced. The failure is visible, nothing is
+            // corrupted, nothing user-set is lost. Validation itself
+            // happened in the runtime; this is only the disposition. While
+            // this entry is set the retained records are DISPLAY-ONLY:
+            // every destructive derivation excludes the scanner (see
+            // `isBlockedFromDestructivePaths`) until a valid outcome
+            // replaces it.
+            malformedIssuesByScannerID[scannerID] = issue
+            scanningScannerIDs.remove(scannerID)
         }
     }
 
-    func selectAllSafe() {
-        var results = scanResults
-        // R18: only cleanly `.measured` categories are auto-selected.
-        // `.partiallyDenied` is never auto-selected (smart-clean's auto
-        // path goes through here) and `.denied` is unselectable.
-        for i in results.indices
-        where results[i].category.riskLevel == .safe
-            && results[i].state == .measured
-            && !results[i].isEmpty {
-            results[i].isSelected = true
+    /// Per-scanner reconciliation against the PRIOR outcome (epic round 5):
+    /// touches ONLY this scanner's entry and selections.
+    private func reconcile(_ outcome: ScanOutcome, from scannerID: String) {
+        let previouslyEmitted = emittedKeysByScannerID[scannerID] ?? []
+        for item in outcome.items {
+            let key = item.key
+            if !Self.isSelectableState(item.state) {
+                // `.denied`/`.empty`/`.missing` are unselectable in EVERY
+                // surface (round 9): a retained selection on a now-denied
+                // item would show a selected row every path refuses. (fn-1.4
+                // parity: a rescan never leaves these selected.)
+                selectedItemKeys.remove(key)
+            } else if !previouslyEmitted.contains(key), Self.initiallySelected(item) {
+                // Policy (a): `defaultSelected` on the key's FIRST emission
+                // ever this session. Previously-emitted keys keep their
+                // user-set state — selected AND deselected — verbatim.
+                selectedItemKeys.insert(key)
+            }
         }
-        scanResults = results
+        emittedKeysByScannerID[scannerID] =
+            previouslyEmitted.union(outcome.items.map(\.key))
+        outcomesByScannerID[scannerID] = outcome
+        malformedIssuesByScannerID[scannerID] = nil
+    }
+
+    /// Vanished-key pruning, run EXACTLY at scan completion (never mid-scan
+    /// — a selection on scanner A must not vanish because scanner B's event
+    /// landed first, and must not flicker while A is still pending). A
+    /// malformed scanner's retained items stay live, so their selections
+    /// survive.
+    private func pruneVanishedSelections() {
+        var liveKeys = Set<ItemKey>()
+        for outcome in outcomesByScannerID.values {
+            for item in outcome.items { liveKeys.insert(item.key) }
+        }
+        selectedItemKeys.formIntersection(liveKeys)
+    }
+
+    // MARK: - Selection rules (fn-1.4 semantics preserved bit-for-bit)
+
+    /// `.denied`/`.empty`/`.missing` cannot be selected anywhere — nothing
+    /// to clean (round 9). `.partiallyDenied` stays manually toggleable; the
+    /// confirmation sheet carries the warning.
+    private static func isSelectableState(_ state: ScanState) -> Bool {
+        switch state {
+        case .measured, .partiallyDenied: return true
+        case .denied, .empty, .missing: return false
+        }
+    }
+
+    /// Policy (a) — the EXACT fn-1.4 initial-selection derivation
+    /// (`ScanResult.init`): defaultSelected, cleanly measured, measurable
+    /// bytes. `.partiallyDenied` is never auto-selected (its size is a
+    /// floor, not a promise).
+    private static func initiallySelected(_ item: ReclaimableItem) -> Bool {
+        item.defaultSelected && item.state == .measured && item.allocatedBytes > 0
+    }
+
+    /// Policy (b) — Quick Clean / selectAllSafe eligibility: structured
+    /// fields, not risk inference. `defaultSelected` is deliberately NOT
+    /// consulted — today's selectAllSafe ignores it, and adding it would be
+    /// a silent behavior change dressed as parity. The clean-state rules are
+    /// as-built: only cleanly `.measured` items with measurable bytes
+    /// (`.partiallyDenied` never rides an auto path — R18).
+    private static func safeAutoSelectable(_ item: ReclaimableItem) -> Bool {
+        item.automaticCleanEligible
+            && item.risk == .safe
+            && item.state == .measured
+            && item.allocatedBytes > 0
+    }
+
+    func toggleSelection(for key: ItemKey) {
+        guard let item = item(for: key) else { return }
+        // Unselectable states are no-ops for aggregate AND per-item rows
+        // alike — the checkbox must not pretend otherwise (R18/round 9).
+        guard Self.isSelectableState(item.state) else { return }
+        if selectedItemKeys.contains(key) {
+            selectedItemKeys.remove(key)
+        } else {
+            selectedItemKeys.insert(key)
+        }
+    }
+
+    /// Policy (b) across every scanner. Today only category aggregates are
+    /// `automaticCleanEligible`; node_modules ships ineligible, so behavior
+    /// is unchanged — and a future eligible safe scanner enrolls by
+    /// declaration, not by an edit here.
+    func selectAllSafe() {
+        for (scannerID, outcome) in outcomesByScannerID
+        where !isBlockedFromDestructivePaths(scannerID) {
+            // A malformed-blocked scanner's retained items are display-only:
+            // the auto path must not (re)stage them for cleaning.
+            for item in outcome.items where Self.safeAutoSelectable(item) {
+                selectedItemKeys.insert(item.key)
+            }
+        }
     }
 
     func deselectAll() {
-        var results = scanResults
-        for i in results.indices {
-            results[i].isSelected = false
+        selectedItemKeys = []
+    }
+
+    // MARK: - Per-section selection (the old node_modules quick actions,
+    // generalized per scanner id)
+
+    /// "Select Stale" operates on `isStale == true` ONLY — `isStale == nil`
+    /// means staleness is inapplicable and contributes nothing. No-op while
+    /// the scanner is malformed-blocked: bulk actions stage items for
+    /// cleaning, and a blocked scanner's retained items are display-only.
+    /// (The individual checkbox stays live — retained selection state is
+    /// the user's to curate, it just cannot reach a destructive path.)
+    func selectStale(inScanner id: String) {
+        guard !isBlockedFromDestructivePaths(id) else { return }
+        for item in items(forScanner: id)
+        where item.isStale == true && Self.isSelectableState(item.state) {
+            selectedItemKeys.insert(item.key)
         }
-        scanResults = results
-        deselectAllNodeModules()
     }
 
-    // MARK: - Node Modules selection
-
-    func toggleNodeModulesSelection(for id: UUID) {
-        if let i = nodeModulesItems.firstIndex(where: { $0.id == id }) {
-            nodeModulesItems[i].isSelected.toggle()
+    func selectAll(inScanner id: String) {
+        guard !isBlockedFromDestructivePaths(id) else { return }
+        for item in items(forScanner: id)
+        where Self.isSelectableState(item.state) {
+            selectedItemKeys.insert(item.key)
         }
     }
 
-    func selectStaleNodeModules() {
-        var items = nodeModulesItems
-        for i in items.indices where items[i].isStale {
-            items[i].isSelected = true
+    func deselectAll(inScanner id: String) {
+        for item in items(forScanner: id) {
+            selectedItemKeys.remove(item.key)
         }
-        nodeModulesItems = items
-    }
-
-    func selectAllNodeModules() {
-        var items = nodeModulesItems
-        for i in items.indices { items[i].isSelected = true }
-        nodeModulesItems = items
-    }
-
-    func deselectAllNodeModules() {
-        var items = nodeModulesItems
-        for i in items.indices { items[i].isSelected = false }
-        nodeModulesItems = items
     }
 
     /// Menu bar label: show free GB in the tray
@@ -322,11 +760,13 @@ class CacheoutViewModel: ObservableObject {
         return String(format: "%.0fGB", freeGB)
     }
 
-    /// Quick clean: a PURE auto path (R18). Any manual selections —
-    /// including a deliberately toggled `.partiallyDenied` category or
-    /// node_modules items — are cleared first, so Quick Clean acts on
-    /// exactly the auto-selected safe `.measured` set and nothing rides
-    /// along.
+    /// Quick clean: a PURE auto path (R18) and strictly policy (b). Any
+    /// manual selections — including a deliberately toggled
+    /// `.partiallyDenied` category or per-item rows — are cleared first, so
+    /// Quick Clean acts on exactly the auto-selected safe set and nothing
+    /// rides along. Policy (c) — smart-clean's safe-then-review ordering —
+    /// is EXCLUSIVELY the CLI's (fn-2.6): the GUI never invokes its
+    /// candidate-order helper and never selects review-risk.
     func smartClean() async {
         deselectAll()
         selectAllSafe()
@@ -394,17 +834,20 @@ class CacheoutViewModel: ObservableObject {
         diskInfo = await Task.detached { DiskInfo.current() }.value
     }
 
+    // MARK: - Cleaning
+
+    /// Builds `[ReclaimableItem]` from `selectedItemKeys` and drives
+    /// fn-2.3's unified entry on the RUNTIME-constructed cleaner — one
+    /// composition source, so delete-time admission covers exactly the
+    /// registered scanners' declared container roots.
     func clean() async {
         // Guard at the model, not just the buttons (R11): cleaning while
-        // any scan phase is still running would act on a half-built result
-        // set (node_modules may still be populating).
+        // any scanner is still reporting would act on a half-built result
+        // set.
         guard !isCleaning && !isAnyScanInProgress else { return }
         isCleaning = true
-        let selectedNM = nodeModulesItems.filter(\.isSelected)
         let report = await cleaner.clean(
-            results: selectedResults,
-            nodeModules: selectedNM,
-            moveToTrash: moveToTrash
+            items: selectedItems, moveToTrash: moveToTrash
         )
         lastReport = report
         isCleaning = false

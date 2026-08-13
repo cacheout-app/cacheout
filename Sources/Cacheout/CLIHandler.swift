@@ -8,8 +8,8 @@
 /// | Command       | Description                                          |
 /// |---------------|------------------------------------------------------|
 /// | `version`     | Print version info as JSON                           |
-/// | `scan`        | Scan all categories and output results as JSON       |
-/// | `clean`       | Clean specific categories by slug                    |
+/// | `scan`        | Run every registered scanner and emit the schema-4 envelope (`categories` + `scanner_items` + `scanner_errors`) |
+/// | `clean`       | Clean addressed targets: `<category-slug>`, `<scanner-slug>`, or `<scanner-slug>:<item-id>` |
 /// | `smart-clean` | Auto-clean safe categories until target GB is met    |
 /// | `disk-info`   | Show disk space information                          |
 /// | `spotlight`   | Tag cache dirs with Spotlight metadata               |
@@ -30,7 +30,13 @@
 /// - `--target-pid N`: Target process ID for signal interventions
 /// - `--target-name NAME`: Expected process name for PID validation (signal interventions)
 /// - `--top N`: Limit top-processes output to N entries (default: 10)
-/// - Category slugs are passed as positional arguments after the command
+/// - Clean targets are positional arguments after the command. A target is
+///   one of `<category-slug>` (a category aggregate), `<scanner-slug>` (ALL
+///   items of a per-item scanner, e.g. `node_modules`), or
+///   `<scanner-slug>:<item-id>` (one item — the opaque id echoed from
+///   `scan`'s `scanner_items`). The frozen aggregate scanner id
+///   `categories` is NOT a valid target; address aggregates by their
+///   category slug.
 ///
 /// ## Output Format
 ///
@@ -52,6 +58,8 @@
 /// ```bash
 /// Cacheout --cli scan
 /// Cacheout --cli clean xcode_derived_data npm_cache --confirm
+/// Cacheout --cli clean node_modules --confirm
+/// Cacheout --cli clean node_modules:3f0c…e1 --confirm
 /// Cacheout --cli clean xcode_derived_data --dry-run
 /// Cacheout --cli smart-clean 10.0 --confirm
 /// Cacheout --cli smart-clean 10.0 --dry-run
@@ -224,12 +232,17 @@ struct CLIHandler {
             ?? fallbackVersion
     }
 
-    /// Protocol schema version (PROTOCOL.md). 3 = `clean`/`smart-clean`
-    /// require `--confirm`, clean totals are exact-only with additive
-    /// estimated components, and total failure exits 1 `CLEAN_FAILED`
-    /// (fn-1.5, D5/R16). Non-private so the schema tests assert the bump
-    /// in-process.
-    static let cliSchemaVersion = 3
+    /// Protocol schema version (PROTOCOL.md). 4 = scan output becomes the
+    /// registry envelope (`categories` rows preserved field-for-field from
+    /// schema 3, additive `scanner_items`/`scanner_errors`), clean targets
+    /// follow the address grammar (`<category-slug>` | `<scanner-slug>` |
+    /// `<scanner-slug>:<item-id>`), clean/smart-clean rows gain
+    /// `scanner_id`/`item_id` identity fields, and EVERY payload
+    /// self-describes with a top-level `schema_version` (fn-2.6, R7/R8).
+    /// Schema 3's `--confirm` gate, exact-only totals, and `CLEAN_FAILED`
+    /// contract are unchanged. Non-private so the schema tests assert the
+    /// bump in-process.
+    static let cliSchemaVersion = 4
 
     private static func handleVersion() {
         let helperEnabled = HelperInstaller().status == .enabled
@@ -263,11 +276,234 @@ struct CLIHandler {
         ] as [String: Any])
     }
 
-    private static func handleScan() async {
-        let scanner = CacheScanner()
-        let results = await scanner.scanAll(CacheCategory.allCategories)
+    // MARK: - CLI runtime dependencies (fn-2.6 test seam)
 
-        outputJSON(results.map { scanItemJSON(for: $0) })
+    /// The injected dependency bundle the testable handler entry points
+    /// consume: the scanner registry plus a cleaner factory. The
+    /// process-facing handlers wire `production()` and stay thin shells;
+    /// in-process tests inject fixture runtimes so addressing, resolution,
+    /// gating, schema shape, AND the confirmed fixture deletion all run
+    /// without a subprocess (subprocess tests stay gate-framing-only).
+    struct CLIRuntimeDependencies {
+        let runtime: SpaceScannerRuntime
+        /// The registered category slugs — the aggregate half of the address
+        /// namespace. Carried here (not read off the runtime) because the
+        /// runtime keeps its category registry private; production and tests
+        /// wire the same list they registered.
+        let categorySlugs: Set<String>
+        /// Cleaner factory. The default derives the cleaner FROM the runtime
+        /// (`SpaceScannerRuntime.makeCleaner`) so delete-time container
+        /// admission is exactly the scanner-declared union — tests may
+        /// override to observe or redirect.
+        let makeCleaner: () -> CacheCleaner
+
+        init(
+            runtime: SpaceScannerRuntime,
+            categorySlugs: Set<String>,
+            makeCleaner: (() -> CacheCleaner)? = nil
+        ) {
+            self.runtime = runtime
+            self.categorySlugs = categorySlugs
+            self.makeCleaner = makeCleaner ?? { runtime.makeCleaner() }
+        }
+
+        static func production() -> CLIRuntimeDependencies {
+            CLIRuntimeDependencies(
+                runtime: .production(),
+                categorySlugs: Set(CacheCategory.allCategories.map(\.slug))
+            )
+        }
+    }
+
+    /// What a testable handler decided — the process-facing shell translates
+    /// it into stdout/stderr/exit behavior. Pure data so the in-process
+    /// tests assert the whole contract without `Foundation.exit`.
+    enum CLIOutcome {
+        case success([String: Any])
+        case failure(code: String, message: String, details: [String: Any]?)
+    }
+
+    private static func render(_ outcome: CLIOutcome) {
+        switch outcome {
+        case .success(let payload):
+            outputJSON(payload)
+        case .failure(let code, let message, let details):
+            exitWithError(code: code, message: message, details: details)
+        }
+    }
+
+    /// One collected pass over the runtime's progressive validated event
+    /// stream (the CLI is stateless: it COLLECTS to completion, unlike the
+    /// ViewModel's as-they-arrive consumption). Validation lives in the
+    /// runtime — no handler ever touches a raw outcome.
+    struct CollectedScanEvents {
+        var outcomes: [String: ScanOutcome] = [:]
+        var malformed: [String: ScanIssue] = [:]
+    }
+
+    private static func collectValidatedScan(
+        _ runtime: SpaceScannerRuntime,
+        scannerIDs: Set<String>?,
+        context: ScanContext
+    ) async -> CollectedScanEvents {
+        var collected = CollectedScanEvents()
+        for await event in runtime.scanValidated(
+            scannerIDs: scannerIDs, context: context
+        ) {
+            switch event {
+            case .outcome(let scannerID, let outcome):
+                collected.outcomes[scannerID] = outcome
+            case .malformed(let scannerID, let issue):
+                collected.malformed[scannerID] = issue
+            }
+        }
+        return collected
+    }
+
+    // MARK: - Scan (schema 4 envelope)
+
+    private static func handleScan() async {
+        outputJSON(await scanEnvelope(deps: .production()))
+    }
+
+    /// The schema-4 scan envelope (R2/R8): ALL registered scanners, nil
+    /// `categoryFilter`, a CLI invocation is an explicit user act
+    /// (`.userInitiated`). `categories` preserves schema 3's rows
+    /// field-for-field (NO identity fields — round 7); `scanner_items` and
+    /// `scanner_errors` are additive. A malformed scanner's items are
+    /// excluded from the envelope (and from addressability) and its
+    /// synthesized path-less issue lands in `scanner_errors`; the remaining
+    /// valid scanners' rows are intact.
+    static func scanEnvelope(deps: CLIRuntimeDependencies) async -> [String: Any] {
+        let collected = await collectValidatedScan(
+            deps.runtime, scannerIDs: nil,
+            context: ScanContext(trigger: .userInitiated)
+        )
+
+        var categories: [[String: Any]] = []
+        var scannerItems: [[String: Any]] = []
+        var scannerErrors: [[String: Any]] = []
+
+        // Deterministic wire order: registration order across scanners
+        // (stream events complete in nondeterministic order), outcome order
+        // within a scanner (CacheScanner.scanAll is size-descending — the
+        // schema-3 scan order, preserved).
+        for scanner in deps.runtime.scanners {
+            let scannerID = scanner.id
+            if let issue = collected.malformed[scannerID] {
+                scannerErrors.append(
+                    scannerErrorRowJSON(scannerID: scannerID, issue: issue)
+                )
+                continue
+            }
+            guard let outcome = collected.outcomes[scannerID] else { continue }
+            if scannerID == CategoryScanner.registeredID {
+                categories.append(contentsOf: outcome.items.map(categoryRowJSON(for:)))
+            } else {
+                scannerItems.append(contentsOf: outcome.items.map(scannerItemRowJSON(for:)))
+            }
+            scannerErrors.append(contentsOf: outcome.errors.map {
+                scannerErrorRowJSON(scannerID: scannerID, issue: $0)
+            })
+        }
+
+        return [
+            "schema_version": cliSchemaVersion,
+            "categories": categories,
+            "scanner_items": scannerItems,
+            "scanner_errors": scannerErrors,
+        ]
+    }
+
+    /// One `categories` row from the aggregate item — field-for-field the
+    /// schema-3 `scanItemJSON` shape (the envelope test asserts the two
+    /// stay identical on the same fixture input), sourced from the
+    /// adapter's mappings: `evidence` IS the category description and
+    /// `rebuildNote` the category's note (`CategoryScanner.item(from:)`).
+    /// Deliberately NO `scanner_id`/`item_id` here (round 7): identity
+    /// fields live on `scanner_items` and the clean/smart-clean rows ONLY.
+    static func categoryRowJSON(for item: ReclaimableItem) -> [String: Any] {
+        var row: [String: Any] = [
+            "slug": item.id,
+            "name": item.displayName,
+            "size_bytes": item.allocatedBytes,
+            "size_human": ByteCountFormatter.sharedFile.string(
+                fromByteCount: item.allocatedBytes
+            ),
+            "item_count": item.itemCount,
+            "exists": item.state != .missing,
+            "risk_level": item.risk.rawValue.lowercased(),
+            "description": item.evidence,
+            "rebuild_note": item.rebuildNote ?? "",
+            "state": item.state.rawValue,
+            "exact_bytes": item.exactBytes,
+            "estimated_up_to_bytes": item.estimatedUpToBytes,
+        ]
+        if let scanError = item.scanError {
+            row["scan_error"] = [
+                "kind": scanError.kind.wireString,
+                "message": scanError.message,
+            ] as [String: Any]
+            if scanError.kind == .tccDenied {
+                row["grant_hint"] = tccGrantHint
+            }
+        }
+        return row
+    }
+
+    /// One `scanner_items` row (additive, R8): `item_id` is the full-hash
+    /// opaque stable id, ALWAYS beside its `scanner_id` sibling (a bare
+    /// item id is meaningful only in scanner scope). `action` serializes
+    /// ONLY the wire kind — argv arrays never appear anywhere in CLI output.
+    static func scannerItemRowJSON(for item: ReclaimableItem) -> [String: Any] {
+        var row: [String: Any] = [
+            "scanner_id": item.scannerID,
+            "item_id": item.id,
+            // The resolved location when one exists; the declared spelling
+            // otherwise — never a fake resolution.
+            "path": item.url?.path ?? item.declaredDisplayPath,
+            "name": item.displayName,
+            "state": item.state.rawValue,
+            "exact_bytes": item.exactBytes,
+            "estimated_up_to_bytes": item.estimatedUpToBytes,
+            "size_bytes": item.allocatedBytes,
+            "item_count": item.itemCount,
+            "risk_level": item.risk.rawValue.lowercased(),
+            "evidence": item.evidence,
+            "action": item.action.wireString,
+        ]
+        if let scanError = item.scanError {
+            row["scan_error"] = [
+                "kind": scanError.kind.wireString,
+                "message": scanError.message,
+            ] as [String: Any]
+            if scanError.kind == .tccDenied {
+                row["grant_hint"] = tccGrantHint
+            }
+        }
+        return row
+    }
+
+    /// One `scanner_errors` row. `path` is CONDITIONAL (round 7): present
+    /// for the filesystem kinds, ABSENT for `malformed_outcome` — a fake
+    /// path must never be invented. `grant_hint` is CONDITIONAL: present
+    /// only for `tcc_denied` — the same remedy category and per-item rows
+    /// carry, since macOS denies CLI processes silently (no consent prompt).
+    static func scannerErrorRowJSON(
+        scannerID: String, issue: ScanIssue
+    ) -> [String: Any] {
+        var row: [String: Any] = [
+            "scanner_id": scannerID,
+            "kind": issue.kind.wireString,
+            "detail": issue.detail,
+        ]
+        if let url = issue.url {
+            row["path"] = url.path
+        }
+        if issue.kind == .tccDenied {
+            row["grant_hint"] = tccGrantHint
+        }
+        return row
     }
 
     /// Actionable remedy emitted with TCC-denied scan errors (fn-1.4, R9):
@@ -282,6 +518,12 @@ struct CLIHandler {
     /// (`size_bytes` stays the compatibility sum); `scan_error` (plus
     /// `grant_hint` for TCC denials) present only when the scan was
     /// impeded — a clean category carries neither key.
+    ///
+    /// Since fn-2.6 the scan wire path emits `categoryRowJSON(for:)` from
+    /// the validated aggregate items; THIS builder is the frozen schema-3
+    /// row shape, retained as the field-for-field parity comparator the
+    /// envelope tests assert against (R8 — "byte-compat rows inside the new
+    /// envelope" is checkable only against the original builder).
     static func scanItemJSON(for result: ScanResult) -> [String: Any] {
         var item: [String: Any] = [
             "slug": result.category.slug,
@@ -364,125 +606,444 @@ struct CLIHandler {
     static let partiallyDeniedCleanWarning = "Parts of this category were unreadable at scan "
         + "time; only the measured bytes were cleaned and reported — the true size may be larger."
 
-    /// What the real run would do with one requested category — the same
-    /// decisions `CacheCleaner.clean` takes (missing/empty skipped, `.denied`
-    /// refused even force-selected, `.partiallyDenied` proceeds with a
-    /// warning). Drives both the `CONFIRMATION_REQUIRED` plan and the
-    /// dry-run payload so preview and reality cannot drift.
-    static func cleanPlanAction(for result: ScanResult) -> String {
-        if result.state == .missing { return "skip" }
-        if result.state == .denied { return "refuse" }
-        if result.isEmpty { return "skip" }
-        return result.state == .partiallyDenied ? "clean_with_warning" : "clean"
+    // MARK: - Clean target grammar (R7, permanent contract)
+
+    /// A target-address refusal — the INVALID_ARGUMENTS message, typed so
+    /// the parse/resolve helpers can return `Result` values the pipeline
+    /// (and tests) branch on.
+    struct CLIAddressError: Error, Equatable {
+        let message: String
+    }
+
+    /// One parsed positional clean target. Slugs match `[a-z0-9_]+` (no
+    /// colon — the registry validates that at registration), so the FIRST
+    /// `:` splits scanner slug from item id unambiguously; item ids are
+    /// OPAQUE full-hash strings the CLI never parses or derives — callers
+    /// echo back exactly what `scan` printed.
+    enum CleanTarget: Equatable {
+        /// `<category-slug>` — one category aggregate (unchanged from
+        /// schema 3).
+        case category(String)
+        /// `<scanner-slug>` — ALL items of that per-item scanner.
+        case allScannerItems(String)
+        /// `<scanner-slug>:<item-id>` — one item.
+        case scannerItem(scannerID: String, itemID: String)
+    }
+
+    /// Parse + validate the positional targets against the registered
+    /// namespace (collision-free by the runtime's registration check, so a
+    /// bare token resolves to whichever exists). The frozen aggregate
+    /// scanner id `categories` is NOT a valid target in ANY form — a
+    /// scanner-wide token over 23 aggregates would be a mass-clean footgun
+    /// (epic contract); category aggregates are addressed by category slug
+    /// only. Duplicate tokens dedupe in argument order (schema-3 parity).
+    /// Failure returns the INVALID_ARGUMENTS message naming EVERY bad
+    /// token, mirroring the schema-3 unknown-slug behavior.
+    static func parseCleanTargets(
+        _ tokens: [String],
+        categorySlugs: Set<String>,
+        perItemScannerIDs: Set<String>
+    ) -> Result<[CleanTarget], CLIAddressError> {
+        var targets: [CleanTarget] = []
+        var invalid: [String] = []
+        var seen = Set<String>()
+        for token in tokens {
+            guard seen.insert(token).inserted else { continue }
+            let base: String
+            let itemID: String?
+            if let colon = token.firstIndex(of: ":") {
+                base = String(token[..<colon])
+                itemID = String(token[token.index(after: colon)...])
+            } else {
+                base = token
+                itemID = nil
+            }
+            // The aggregate scanner id is excluded from addressing outright
+            // — bare AND `categories:<anything>` forms both fail.
+            if base == CategoryScanner.registeredID {
+                invalid.append(token)
+                continue
+            }
+            if let itemID {
+                guard !itemID.isEmpty, perItemScannerIDs.contains(base) else {
+                    invalid.append(token)
+                    continue
+                }
+                targets.append(.scannerItem(scannerID: base, itemID: itemID))
+            } else if categorySlugs.contains(base) {
+                targets.append(.category(base))
+            } else if perItemScannerIDs.contains(base) {
+                targets.append(.allScannerItems(base))
+            } else {
+                invalid.append(token)
+            }
+        }
+        guard invalid.isEmpty else {
+            return .failure(CLIAddressError(message:
+                "Unknown or invalid target(s): \(invalid.joined(separator: ", ")). "
+                + "A target is <category-slug>, <scanner-slug>, or "
+                + "<scanner-slug>:<item-id> ('categories' is not addressable). "
+                + "Use 'scan' to list valid slugs and item ids."
+            ))
+        }
+        return .success(targets)
+    }
+
+    /// What target resolution selected: the deduped items PLUS the
+    /// root/scanner-level scan issues carried by every BARE
+    /// `<scanner-slug>` target's outcome. A scanner-wide selection is only
+    /// as complete as the scan that backed it, so its impediments travel
+    /// WITH the selection instead of being discarded — a fully-denied
+    /// scanner must be visible as an impeded no-op, never a clean success.
+    /// Explicitly addressed `<scanner>:<item>` targets carry no
+    /// scanner-level issues: the addressed item WAS discovered, so root
+    /// problems did not impede that specific operation.
+    struct ResolvedCleanSelection {
+        var items: [ReclaimableItem] = []
+        var scannerErrors: [(scannerID: String, issue: ScanIssue)] = []
+    }
+
+    /// Resolve parsed targets AGAINST THE VALIDATED SCAN RESULTS ONLY
+    /// (round 8): a malformed scanner's items are unaddressable by
+    /// construction — any target referencing one fails with the same
+    /// unknown/invalid-target message, and nothing is selected, addressed,
+    /// or deleted. Items dedupe by `ItemKey` in first-appearance order
+    /// (`clean node_modules node_modules:<id>` names the item once).
+    static func resolveCleanTargets(
+        _ targets: [CleanTarget],
+        outcomes: [String: ScanOutcome],
+        malformed: [String: ScanIssue]
+    ) -> Result<ResolvedCleanSelection, CLIAddressError> {
+        var selection = ResolvedCleanSelection()
+        var seenKeys = Set<ItemKey>()
+        var seenErrorScanners = Set<String>()
+
+        func append(_ item: ReclaimableItem) {
+            guard seenKeys.insert(item.key).inserted else { return }
+            selection.items.append(item)
+        }
+
+        for target in targets {
+            switch target {
+            case .category(let slug):
+                let adapterID = CategoryScanner.registeredID
+                if malformed[adapterID] != nil {
+                    return .failure(CLIAddressError(message: malformedTargetMessage(
+                        token: slug, scannerID: adapterID
+                    )))
+                }
+                guard let item = outcomes[adapterID]?.items
+                    .first(where: { $0.id == slug }) else {
+                    // Unreachable with the adapter registered (it emits an
+                    // item for every category, `.missing` included) — kept
+                    // fail-closed rather than assumed.
+                    return .failure(CLIAddressError(message:
+                        "Target '\(slug)' did not resolve to a scanned category. "
+                        + "Use 'scan' to list valid slugs."
+                    ))
+                }
+                append(item)
+
+            case .allScannerItems(let scannerID):
+                if malformed[scannerID] != nil {
+                    return .failure(CLIAddressError(message: malformedTargetMessage(
+                        token: scannerID, scannerID: scannerID
+                    )))
+                }
+                // Zero items is a legitimate no-op (like cleaning an empty
+                // category), not an error — but ONLY when the scan actually
+                // looked everywhere: root/scanner-level issues (TCC or
+                // permission denials, refused roots) ride along with the
+                // selection so an impeded scanner-wide clean is reported as
+                // impeded, never as a clean empty success.
+                let outcome = outcomes[scannerID]
+                for item in outcome?.items ?? [] {
+                    append(item)
+                }
+                if let outcome, !outcome.errors.isEmpty,
+                   seenErrorScanners.insert(scannerID).inserted {
+                    for issue in outcome.errors {
+                        selection.scannerErrors.append((scannerID, issue))
+                    }
+                }
+
+            case .scannerItem(let scannerID, let itemID):
+                if malformed[scannerID] != nil {
+                    return .failure(CLIAddressError(message: malformedTargetMessage(
+                        token: "\(scannerID):\(itemID)", scannerID: scannerID
+                    )))
+                }
+                guard let item = outcomes[scannerID]?.items
+                    .first(where: { $0.id == itemID }) else {
+                    return .failure(CLIAddressError(message:
+                        "Unknown item id for scanner '\(scannerID)': '\(itemID)'. "
+                        + "Item ids are opaque and echoed from 'scan' output — rescan and retry."
+                    ))
+                }
+                append(item)
+            }
+        }
+        return .success(selection)
+    }
+
+    /// The unknown/invalid-target refusal for addresses that reach a
+    /// malformed scanner (fail-closed — its items cannot be listed,
+    /// selected, addressed, or deleted through any path).
+    private static func malformedTargetMessage(
+        token: String, scannerID: String
+    ) -> String {
+        "Target '\(token)' cannot be resolved: scanner '\(scannerID)' produced "
+        + "a malformed outcome and its items are excluded (see 'scan' "
+        + "scanner_errors). Nothing was cleaned."
+    }
+
+    // MARK: - Clean plan builders (item-based, schema 4)
+
+    /// The retained `category`/`slug` wire value, frozen BY ITEM TYPE
+    /// (round 9): aggregate rows keep the category SLUG unchanged; per-item
+    /// rows carry the canonical composite ADDRESS `<scanner_id>:<item_id>` —
+    /// directly reusable as a clean target token. `scanner_id`/`item_id`
+    /// ride as separate sibling fields on every row regardless, so
+    /// consumers never parse the composite.
+    static func addressValue(for item: ReclaimableItem) -> String {
+        item.scannerID == CategoryScanner.registeredID
+            ? item.id
+            : "\(item.scannerID):\(item.id)"
+    }
+
+    /// What the real run would do with one resolved item — the same
+    /// decisions `CacheCleaner.clean(items:)` takes (missing/empty skipped,
+    /// `.denied` refused even force-selected, `.partiallyDenied` proceeds
+    /// with a warning). Drives both the `CONFIRMATION_REQUIRED` plan and
+    /// the dry-run payload so preview and reality cannot drift.
+    ///
+    /// Aggregates keep the schema-3 zero-byte "skip" (the as-built
+    /// `isEmpty` plan decision — a zero-byte aggregate clean yields no
+    /// entry either way). Per-item rows follow the unified dispatch
+    /// exactly: `.removeItem` has NO zero-byte skip (a `.measured` item
+    /// with countable-but-zero-byte content IS deleted), so only the state
+    /// gates decide.
+    static func cleanPlanAction(for item: ReclaimableItem) -> String {
+        if item.state == .missing { return "skip" }
+        if item.state == .denied { return "refuse" }
+        if item.state == .empty { return "skip" }
+        if item.scannerID == CategoryScanner.registeredID,
+           item.allocatedBytes == 0 {
+            return "skip"
+        }
+        return item.state == .partiallyDenied ? "clean_with_warning" : "clean"
     }
 
     /// One plan entry (scan-time split components — never a re-walk, R16).
-    static func cleanPlanItemJSON(for result: ScanResult) -> [String: Any] {
-        var item: [String: Any] = [
-            "slug": result.category.slug,
-            "name": result.category.name,
-            "state": result.state.rawValue,
-            "action": cleanPlanAction(for: result),
-            "exact_bytes": result.exactBytes,
-            "estimated_up_to_bytes": result.estimatedUpToBytes,
+    /// Schema-3 fields retained verbatim; `scanner_id`/`item_id` identity
+    /// fields are additive on every row (schema 4).
+    static func cleanPlanItemJSON(for item: ReclaimableItem) -> [String: Any] {
+        var row: [String: Any] = [
+            "slug": addressValue(for: item),
+            "name": item.displayName,
+            "state": item.state.rawValue,
+            "action": cleanPlanAction(for: item),
+            "exact_bytes": item.exactBytes,
+            "estimated_up_to_bytes": item.estimatedUpToBytes,
+            "scanner_id": item.scannerID,
+            "item_id": item.id,
         ]
-        if result.state == .partiallyDenied {
-            item["warning"] = partiallyDeniedCleanWarning
+        if item.state == .partiallyDenied {
+            row["warning"] = partiallyDeniedCleanWarning
         }
-        if let scanError = result.scanError {
-            item["scan_error"] = [
+        if let scanError = item.scanError {
+            row["scan_error"] = [
                 "kind": scanError.kind.wireString,
                 "message": scanError.message,
             ] as [String: Any]
         }
-        return item
+        return row
     }
 
     /// Exact-only totals over the entries the plan would actually clean.
-    private static func cleanPlanTotals(_ results: [ScanResult]) -> (exact: Int64, estimated: Int64) {
-        results.reduce(into: (exact: Int64(0), estimated: Int64(0))) { totals, result in
-            let action = cleanPlanAction(for: result)
+    /// SATURATING (round 8): a multi-target plan can span scanners, and
+    /// the validator bounds each scanner's outcome only individually —
+    /// clamp at Int64.max instead of trapping (byte-identical for every
+    /// physically possible total).
+    private static func cleanPlanTotals(_ items: [ReclaimableItem]) -> (exact: Int64, estimated: Int64) {
+        items.reduce(into: (exact: Int64(0), estimated: Int64(0))) { totals, item in
+            let action = cleanPlanAction(for: item)
             guard action == "clean" || action == "clean_with_warning" else { return }
-            totals.exact += result.exactBytes
-            totals.estimated += result.estimatedUpToBytes
+            totals.exact = totals.exact.saturatingAdding(item.exactBytes)
+            totals.estimated = totals.estimated
+                .saturatingAdding(item.estimatedUpToBytes)
         }
     }
 
     /// The `CONFIRMATION_REQUIRED` details payload for `clean` (R5): the
-    /// same per-category decisions the confirmed run would take.
-    static func cleanConfirmationDetails(for results: [ScanResult]) -> [String: Any] {
-        let totals = cleanPlanTotals(results)
-        return [
+    /// same per-item decisions the confirmed run would take.
+    /// `scannerErrors` carries the bare-scanner-target scan impediments
+    /// (additive `scanner_errors`, same frozen row shape as `scan`'s) —
+    /// present only when non-empty, so pre-existing payloads are unchanged.
+    static func cleanConfirmationDetails(
+        for items: [ReclaimableItem],
+        scannerErrors: [[String: Any]] = []
+    ) -> [String: Any] {
+        let totals = cleanPlanTotals(items)
+        var details: [String: Any] = [
             "command": "clean",
-            "plan": results.map { cleanPlanItemJSON(for: $0) },
+            "plan": items.map { cleanPlanItemJSON(for: $0) },
             "total_exact_bytes": totals.exact,
             "total_estimated_up_to_bytes": totals.estimated,
         ]
+        if !scannerErrors.isEmpty {
+            details["scanner_errors"] = scannerErrors
+        }
+        return details
     }
 
     /// Dry-run clean payload (R16): built from the SCAN-TIME split
     /// components — no re-walk, and `total_would_free` counts exact bytes
     /// only (estimates are additive, never laundered into the total).
-    static func cleanDryRunPayload(for results: [ScanResult]) -> [String: Any] {
-        let entries: [[String: Any]] = results.map { result in
-            var item = cleanPlanItemJSON(for: result)
-            let action = cleanPlanAction(for: result)
+    /// Self-describes with `schema_version` (round 8 — every payload).
+    /// `scannerErrors` (additive `scanner_errors`, `scan`'s frozen row
+    /// shape) surfaces bare-scanner-target scan impediments; the key is
+    /// present only when non-empty.
+    static func cleanDryRunPayload(
+        for items: [ReclaimableItem],
+        scannerErrors: [[String: Any]] = []
+    ) -> [String: Any] {
+        let entries: [[String: Any]] = items.map { item in
+            var row = cleanPlanItemJSON(for: item)
+            let action = cleanPlanAction(for: item)
             let cleans = action == "clean" || action == "clean_with_warning"
-            let exact = cleans ? result.exactBytes : 0
-            let estimated = cleans ? result.estimatedUpToBytes : 0
-            item["bytes_would_free"] = exact
-            item["freed_human"] = CleanupReport.componentPhrase(
+            let exact = cleans ? item.exactBytes : 0
+            let estimated = cleans ? item.estimatedUpToBytes : 0
+            row["bytes_would_free"] = exact
+            row["freed_human"] = CleanupReport.componentPhrase(
                 exact: exact, estimatedUpTo: estimated
             )
-            return item
+            return row
         }
-        let totals = cleanPlanTotals(results)
-        return [
+        let totals = cleanPlanTotals(items)
+        var payload: [String: Any] = [
+            "schema_version": cliSchemaVersion,
             "dry_run": true,
             "total_would_free": totals.exact,
             "total_estimated_up_to_bytes": totals.estimated,
             "results": entries,
         ]
+        if !scannerErrors.isEmpty {
+            payload["scanner_errors"] = scannerErrors
+        }
+        return payload
+    }
+
+    /// Additive per-scanner rollup rows (fn-2.3's report derivation on the
+    /// wire): pure sums per `scanner_id`, first-appearance order.
+    static func scannerRollupRows(_ report: CleanupReport) -> [[String: Any]] {
+        report.scannerRollups.map { rollup in
+            [
+                "scanner_id": rollup.scannerID,
+                "exact_bytes": rollup.exactBytes,
+                "estimated_up_to_bytes": rollup.estimatedUpToBytes,
+                "bytes_freed": rollup.bytesFreed,
+                "entry_count": rollup.entryCount,
+            ] as [String: Any]
+        }
     }
 
     private static func handleClean(slugs: [String], dryRun: Bool, confirmed: Bool) async {
-        // The contract requires one or more slugs — an empty list must not
-        // masquerade as a successful no-op clean.
-        guard !slugs.isEmpty else {
-            exitWithError(code: "MISSING_ARGUMENT",
-                          message: "Usage: Cacheout --cli clean <slugs...> [--confirm|--dry-run]. Use 'scan' to list valid slugs.")
+        render(await cleanCLIOutcome(
+            targets: slugs, dryRun: dryRun, confirmed: confirmed,
+            euid: geteuid(), deps: .production()
+        ))
+    }
+
+    /// The whole `clean` decision pipeline, injected and exit-free so the
+    /// in-process tests drive it end-to-end (addressing, resolution,
+    /// gating, schema shape, AND the confirmed fixture deletion). Check
+    /// order preserved from schema 3: usage → target validation → gate →
+    /// read-only scan → branch.
+    static func cleanCLIOutcome(
+        targets rawTargets: [String],
+        dryRun: Bool, confirmed: Bool, euid: uid_t,
+        deps: CLIRuntimeDependencies
+    ) async -> CLIOutcome {
+        // The contract requires one or more targets — an empty list must
+        // not masquerade as a successful no-op clean.
+        guard !rawTargets.isEmpty else {
+            return .failure(
+                code: "MISSING_ARGUMENT",
+                message: "Usage: Cacheout --cli clean <targets...> [--confirm|--dry-run]. "
+                    + "A target is <category-slug>, <scanner-slug>, or "
+                    + "<scanner-slug>:<item-id>. Use 'scan' to list them.",
+                details: nil
+            )
         }
 
-        let knownSlugs = Set(CacheCategory.allCategories.map(\.slug))
-        let unknown = slugs.filter { !knownSlugs.contains($0) }
-        guard unknown.isEmpty else {
-            exitWithError(code: "INVALID_ARGUMENTS",
-                          message: "Unknown category slug(s): \(unknown.joined(separator: ", ")). Use 'scan' to list valid slugs.")
+        let perItemScannerIDs = Set(deps.runtime.scanners.map(\.id))
+            .subtracting([CategoryScanner.registeredID])
+        let parsed: [CleanTarget]
+        switch parseCleanTargets(
+            rawTargets,
+            categorySlugs: deps.categorySlugs,
+            perItemScannerIDs: perItemScannerIDs
+        ) {
+        case .failure(let error):
+            return .failure(code: "INVALID_ARGUMENTS", message: error.message, details: nil)
+        case .success(let targets):
+            parsed = targets
         }
 
         // Gate decision BEFORE any scan (D5). The unconfirmed branch still
         // scans below — read-only — because its refusal carries the plan.
-        let decision = cleanGateDecision(confirmed: confirmed, dryRun: dryRun, euid: geteuid())
+        let decision = cleanGateDecision(confirmed: confirmed, dryRun: dryRun, euid: euid)
         if case .refuseRootUser = decision {
-            exitWithError(code: "ROOT_REFUSED", message: rootRefusalMessage)
+            return .failure(code: "ROOT_REFUSED", message: rootRefusalMessage, details: nil)
         }
 
-        // Scan only what was asked for, deduped in the user's argument order
-        // (scanAll returns size-descending).
-        var seen = Set<String>()
-        let requestedSlugs = slugs.filter { seen.insert($0).inserted }
-        let requested = CacheCategory.allCategories.filter { requestedSlugs.contains($0.slug) }
-        let scanner = CacheScanner()
-        let scanned = await scanner.scanAll(requested)
-        let bySlug = Dictionary(scanned.map { ($0.category.slug, $0) },
-                                uniquingKeysWith: { first, _ in first })
-        let toClean: [ScanResult] = requestedSlugs.compactMap { slug in
-            guard var result = bySlug[slug] else { return nil }
-            // Force-select: the CLI user named the slug explicitly. The
-            // cleaner still refuses `.denied` regardless (R18) — that
-            // refusal surfaces below as the per-item error.
-            result.isSelected = true
-            return result
+        // Target-scoped scan (R2, rounds 9-10): ONLY the scanners the
+        // parsed targets reference run, and `categoryFilter` carries
+        // EXACTLY the requested category slugs — requested-categories-only
+        // holds at BOTH granularities (a category clean never invokes a
+        // per-item scanner, and never walks unrequested categories'
+        // resolvers/probes inside CategoryScanner).
+        var requestedCategorySlugs = Set<String>()
+        var scannerSubset = Set<String>()
+        for target in parsed {
+            switch target {
+            case .category(let slug):
+                requestedCategorySlugs.insert(slug)
+                scannerSubset.insert(CategoryScanner.registeredID)
+            case .allScannerItems(let scannerID):
+                scannerSubset.insert(scannerID)
+            case .scannerItem(let scannerID, _):
+                scannerSubset.insert(scannerID)
+            }
+        }
+        let collected = await collectValidatedScan(
+            deps.runtime, scannerIDs: scannerSubset,
+            context: ScanContext(
+                trigger: .userInitiated,
+                categoryFilter: requestedCategorySlugs
+            )
+        )
+
+        // Address resolution NEVER sees unvalidated data (round 8).
+        let selection: ResolvedCleanSelection
+        switch resolveCleanTargets(
+            parsed, outcomes: collected.outcomes, malformed: collected.malformed
+        ) {
+        case .failure(let error):
+            return .failure(code: "INVALID_ARGUMENTS", message: error.message, details: nil)
+        case .success(let resolved):
+            selection = resolved
+        }
+        let items = selection.items
+        // Bare-scanner-target scan impediments as `scan`'s frozen
+        // `scanner_errors` rows — surfaced on EVERY branch below (plan,
+        // dry-run, confirmed) so a denied or partially-denied scanner-wide
+        // clean is never reported as an unimpeded success (P2). Scan-time
+        // impediments are payload DATA (the `scan` envelope precedent);
+        // exit codes stay reserved for clean-time failures.
+        let scannerErrorRows = selection.scannerErrors.map {
+            scannerErrorRowJSON(scannerID: $0.scannerID, issue: $0.issue)
         }
 
         switch decision {
@@ -491,98 +1052,150 @@ struct CLIHandler {
 
         case .refuseUnconfirmed:
             // Stdout stays EMPTY; the plan rides in the stderr details (R5).
-            exitWithError(
+            return .failure(
                 code: "CONFIRMATION_REQUIRED",
                 message: "clean deletes cache contents and requires --confirm (preview with --dry-run)",
-                details: cleanConfirmationDetails(for: toClean)
+                details: cleanConfirmationDetails(
+                    for: items, scannerErrors: scannerErrorRows
+                )
             )
 
         case .dryRun:
-            outputJSON(cleanDryRunPayload(for: toClean))
+            return .success(cleanDryRunPayload(
+                for: items, scannerErrors: scannerErrorRows
+            ))
 
         case .proceed:
-            let cleaner = CacheCleaner()
-            let report = await cleaner.clean(results: toClean, moveToTrash: false)
-
-            // Report entries/errors are keyed by category NAME; the wire
-            // reports per requested slug — including a `success: true` row
-            // for a slug that produced neither entry nor error (zero-byte
-            // success, missing/empty skip). `entries.isEmpty` is NOT a
-            // total-failure signal.
-            let entriesByName = Dictionary(report.entries.map { ($0.category, $0) },
-                                           uniquingKeysWith: { first, _ in first })
-            let errorsByName = Dictionary(grouping: report.errors, by: \.category)
-
-            let results: [[String: Any]] = toClean.map { result in
-                let name = result.category.name
-                let entry = entriesByName[name]
-                let errs = (errorsByName[name] ?? []).map(\.error)
-                let exact = entry?.exactBytes ?? 0
-                let estimated = entry?.estimatedUpToBytes ?? 0
-                var item: [String: Any] = [
-                    "category": result.category.slug,
-                    "name": name,
-                    "bytes_freed": exact,
-                    "exact_bytes": exact,
-                    "estimated_up_to_bytes": estimated,
-                    "freed_human": CleanupReport.componentPhrase(
-                        exact: exact, estimatedUpTo: estimated
-                    ),
-                    "success": errs.isEmpty,
-                ]
-                if !errs.isEmpty {
-                    item["error"] = errs.joined(separator: "; ")
-                }
-                if result.state == .partiallyDenied {
-                    item["warning"] = partiallyDeniedCleanWarning
-                }
-                return item
-            }
-
-            // Exit contract (R5): TOTAL failure — every requested slug
-            // errored and nothing was freed — exits 1 CLEAN_FAILED with an
-            // empty stdout. Partial success stays exit 0 with per-item
-            // `success` flags.
-            if cleanRunIsTotalFailure(
-                successFlags: results.map { ($0["success"] as? Bool) ?? false },
-                freedExact: report.totalFreedExact,
-                freedEstimated: report.totalEstimatedUpTo
-            ) {
-                exitWithError(code: "CLEAN_FAILED",
-                              message: "No requested category could be cleaned",
-                              details: ["results": results])
-            }
-
-            outputJSON([
-                "dry_run": false,
-                "total_freed_bytes": report.totalFreedExact,
-                "total_estimated_up_to_bytes": report.totalEstimatedUpTo,
-                "total_freed": CleanupReport.componentPhrase(
-                    exact: report.totalFreedExact,
-                    estimatedUpTo: report.totalEstimatedUpTo
-                ),
-                "results": results,
-            ] as [String: Any])
+            let cleaner = deps.makeCleaner()
+            let report = await cleaner.clean(items: items, moveToTrash: false)
+            return confirmedCleanPayload(
+                items: items, report: report, scannerErrors: scannerErrorRows
+            )
         }
     }
 
-    /// Smart-clean eligibility + order (R18): only cleanly-measured
-    /// categories with bytes qualify — `.denied` AND `.partiallyDenied` are
-    /// skipped (the auto path must never ride on a floor measurement), and
-    /// caution-risk categories are excluded entirely. Safe before review,
-    /// larger first within a tier.
-    static func smartCleanCandidates(_ results: [ScanResult]) -> [ScanResult] {
-        results
+    /// The confirmed-run wire payload. Rows correlate report entries and
+    /// errors by `ItemKey` (never display-name lookup): every resolved
+    /// aggregate gets a row — including a `success: true` row for a slug
+    /// that produced neither entry nor error (zero-byte success,
+    /// missing/empty skip; `entries.isEmpty` is NOT a total-failure
+    /// signal). Per-item `.empty`/`.missing` items are the cleaner's
+    /// silent pre-admission skip (round 9) and get NO row — nothing was
+    /// deleted and no error occurred, even when explicitly addressed.
+    /// `scannerErrors` (additive `scanner_errors`, `scan`'s frozen row
+    /// shape) reports bare-scanner-target scan impediments on BOTH result
+    /// arms — the success payload and the `CLEAN_FAILED` details — present
+    /// only when non-empty. A fully-denied scanner-wide target therefore
+    /// yields empty `results` WITH the denial rows: an impeded no-op, not
+    /// a silent success. The exit contract is unchanged — scan-time
+    /// impediments never flip the exit code (the `scan` envelope
+    /// precedent); `CLEAN_FAILED` stays a delete-time verdict.
+    private static func confirmedCleanPayload(
+        items: [ReclaimableItem], report: CleanupReport,
+        scannerErrors: [[String: Any]] = []
+    ) -> CLIOutcome {
+        let entriesByKey = Dictionary(
+            report.entries.map { ($0.key, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        let errorsByKey = Dictionary(grouping: report.errors, by: \.key)
+
+        var rows: [[String: Any]] = []
+        for item in items {
+            if item.scannerID != CategoryScanner.registeredID,
+               item.state == .empty || item.state == .missing {
+                continue
+            }
+            let entry = entriesByKey[item.key]
+            let errs = (errorsByKey[item.key] ?? []).map(\.message)
+            let exact = entry?.exactBytes ?? 0
+            let estimated = entry?.estimatedUpToBytes ?? 0
+            var row: [String: Any] = [
+                "category": addressValue(for: item),
+                "name": item.displayName,
+                "bytes_freed": exact,
+                "exact_bytes": exact,
+                "estimated_up_to_bytes": estimated,
+                "freed_human": CleanupReport.componentPhrase(
+                    exact: exact, estimatedUpTo: estimated
+                ),
+                "success": errs.isEmpty,
+                "scanner_id": item.scannerID,
+                "item_id": item.id,
+            ]
+            if !errs.isEmpty {
+                row["error"] = errs.joined(separator: "; ")
+            }
+            if item.state == .partiallyDenied {
+                row["warning"] = partiallyDeniedCleanWarning
+            }
+            rows.append(row)
+        }
+
+        // Exit contract (R5): TOTAL failure — every requested target
+        // errored and nothing was freed — exits 1 CLEAN_FAILED with an
+        // empty stdout. Partial success stays exit 0 with per-item
+        // `success` flags.
+        if cleanRunIsTotalFailure(
+            successFlags: rows.map { ($0["success"] as? Bool) ?? false },
+            freedExact: report.totalFreedExact,
+            freedEstimated: report.totalEstimatedUpTo
+        ) {
+            var details: [String: Any] = ["results": rows]
+            if !scannerErrors.isEmpty {
+                details["scanner_errors"] = scannerErrors
+            }
+            return .failure(
+                code: "CLEAN_FAILED",
+                message: "No requested target could be cleaned",
+                details: details
+            )
+        }
+
+        var payload: [String: Any] = [
+            "schema_version": cliSchemaVersion,
+            "dry_run": false,
+            "total_freed_bytes": report.totalFreedExact,
+            "total_estimated_up_to_bytes": report.totalEstimatedUpTo,
+            "total_freed": CleanupReport.componentPhrase(
+                exact: report.totalFreedExact,
+                estimatedUpTo: report.totalEstimatedUpTo
+            ),
+            "results": rows,
+            "scanner_rollups": scannerRollupRows(report),
+        ]
+        if !scannerErrors.isEmpty {
+            payload["scanner_errors"] = scannerErrors
+        }
+        return .success(payload)
+    }
+
+    /// Smart-clean eligibility + order — policy (c), EXCLUSIVELY this
+    /// handler's (epic round 10; the GUI never runs it). Preserved
+    /// byte-for-byte from schema 3 (R18): only cleanly-measured items with
+    /// bytes qualify — `.denied` AND `.partiallyDenied` are skipped (the
+    /// auto path must never ride on a floor measurement), and caution-risk
+    /// items are excluded entirely. Safe before review, larger first
+    /// within a tier. Exactly ONE addition (epic contract):
+    /// `automaticCleanEligible == false` items are excluded — in practice
+    /// only node_modules, which becoming CLI-visible must not silently
+    /// enroll in any automatic destructive path. (Vacuously true today:
+    /// smart-clean scans the `categories` scanner only, whose aggregates
+    /// are all eligible — the filter is the model-encoded guarantee, not a
+    /// behavior change.)
+    static func smartCleanCandidates(_ items: [ReclaimableItem]) -> [ReclaimableItem] {
+        items
             .filter {
-                $0.state == .measured && $0.sizeBytes > 0
-                    && $0.category.riskLevel != .caution
+                $0.state == .measured && $0.allocatedBytes > 0
+                    && $0.risk != .caution
+                    && $0.automaticCleanEligible
             }
             .sorted { a, b in
                 let riskOrder: [RiskLevel: Int] = [.safe: 0, .review: 1, .caution: 2]
-                let aOrder = riskOrder[a.category.riskLevel] ?? 99
-                let bOrder = riskOrder[b.category.riskLevel] ?? 99
+                let aOrder = riskOrder[a.risk] ?? 99
+                let bOrder = riskOrder[b.risk] ?? 99
                 if aOrder != bOrder { return aOrder < bOrder }
-                return a.sizeBytes > b.sizeBytes
+                return a.allocatedBytes > b.allocatedBytes
             }
     }
 
@@ -601,75 +1214,120 @@ struct CLIHandler {
     /// components intact. Projected totals and `target_met` count the
     /// unconditional entries only.
     static func smartCleanPlan(
-        results: [ScanResult], targetBytes: Int64
+        items: [ReclaimableItem], targetBytes: Int64
     ) -> (entries: [[String: Any]], totalExact: Int64, totalEstimated: Int64, targetMet: Bool) {
         var freedExact: Int64 = 0
         var estimated: Int64 = 0
         var entries: [[String: Any]] = []
-        for result in smartCleanCandidates(results) {
+        for item in smartCleanCandidates(items) {
             // Plan shape parity with `clean` (PROTOCOL.md details.plan):
             // every candidate passed the `.measured` filter, so the derived
             // action is "clean" — derived, not hardcoded, so the two
             // commands cannot drift — until the projection meets the
             // target, after which candidates become conditional fallbacks.
             let isFallback = freedExact >= targetBytes
-            let projectedExact = isFallback ? 0 : result.exactBytes
-            let projectedEstimated = isFallback ? 0 : result.estimatedUpToBytes
+            let projectedExact = isFallback ? 0 : item.exactBytes
+            let projectedEstimated = isFallback ? 0 : item.estimatedUpToBytes
             freedExact += projectedExact
             estimated += projectedEstimated
             entries.append([
-                "slug": result.category.slug,
-                "name": result.category.name,
-                "state": result.state.rawValue,
-                "action": isFallback ? "clean_if_needed" : cleanPlanAction(for: result),
+                "slug": addressValue(for: item),
+                "name": item.displayName,
+                "state": item.state.rawValue,
+                "action": isFallback ? "clean_if_needed" : cleanPlanAction(for: item),
                 "bytes_freed": projectedExact,
-                "exact_bytes": result.exactBytes,
-                "estimated_up_to_bytes": result.estimatedUpToBytes,
+                "exact_bytes": item.exactBytes,
+                "estimated_up_to_bytes": item.estimatedUpToBytes,
                 "freed_human": CleanupReport.componentPhrase(
                     exact: projectedExact,
                     estimatedUpTo: projectedEstimated
                 ),
+                "scanner_id": item.scannerID,
+                "item_id": item.id,
             ])
         }
         return (entries, freedExact, estimated, freedExact >= targetBytes)
     }
 
     private static func handleSmartClean(targetGB: Double, dryRun: Bool, confirmed: Bool) async {
-        // Usage validation first (parity with clean's slug guard): a
+        render(await smartCleanCLIOutcome(
+            targetGB: targetGB, dryRun: dryRun, confirmed: confirmed,
+            euid: geteuid(), deps: .production()
+        ))
+    }
+
+    /// The whole `smart-clean` decision pipeline, injected and exit-free
+    /// (test seam parity with `cleanCLIOutcome`). Scope is policy (c)'s:
+    /// the aggregate `categories` scanner ONLY — no per-item scanner is
+    /// ever invoked (round 10), so node_modules can never enter the
+    /// automatic path. Decision logic byte-identical to schema 3; target
+    /// math untouched.
+    static func smartCleanCLIOutcome(
+        targetGB: Double, dryRun: Bool, confirmed: Bool, euid: uid_t,
+        deps: CLIRuntimeDependencies
+    ) async -> CLIOutcome {
+        // Usage validation first (parity with clean's target guard): a
         // non-finite or negative target would trap in the Int64 conversion
         // below (nan/inf) or produce nonsense; a ZERO target is already met
         // before anything runs (contradictory plan/target_met semantics);
         // a target past ~8e9 GB would overflow Int64. Refuse with the
         // documented usage error instead.
         guard targetGB.isFinite, targetGB > 0, targetGB <= 1_000_000_000 else {
-            exitWithError(code: "INVALID_ARGUMENTS",
-                          message: "smart-clean target must be a finite number of GB greater than 0 and at most 1000000000, got: \(targetGB)")
+            return .failure(
+                code: "INVALID_ARGUMENTS",
+                message: "smart-clean target must be a finite number of GB greater than 0 and at most 1000000000, got: \(targetGB)",
+                details: nil
+            )
         }
         // Validate the CONVERTED value too: a positive sub-byte target
         // (e.g. 1e-20 GB) truncates to zero bytes and would recreate the
         // zero-target contradiction — target_met true, nothing cleaned.
         let targetBytes = Int64(targetGB * 1024 * 1024 * 1024)
         guard targetBytes > 0 else {
-            exitWithError(code: "INVALID_ARGUMENTS",
-                          message: "smart-clean target must convert to at least one byte, got: \(targetGB) GB")
+            return .failure(
+                code: "INVALID_ARGUMENTS",
+                message: "smart-clean target must convert to at least one byte, got: \(targetGB) GB",
+                details: nil
+            )
         }
 
         // Gate decision BEFORE any scan (D5); unconfirmed still scans
         // read-only below to build the refusal plan.
-        let decision = cleanGateDecision(confirmed: confirmed, dryRun: dryRun, euid: geteuid())
+        let decision = cleanGateDecision(confirmed: confirmed, dryRun: dryRun, euid: euid)
         if case .refuseRootUser = decision {
-            exitWithError(code: "ROOT_REFUSED", message: rootRefusalMessage)
+            return .failure(code: "ROOT_REFUSED", message: rootRefusalMessage, details: nil)
         }
-        let scanner = CacheScanner()
-        let allResults = await scanner.scanAll(CacheCategory.allCategories)
+
+        // The aggregate scanner only, all categories (nil filter), through
+        // the validated entry point. A malformed `categories` outcome fails
+        // closed LOUDLY (spotlight precedent): nothing is published, so
+        // silently deriving an empty candidate list would make a rejected
+        // scanner indistinguishable from the documented "nothing eligible"
+        // success. The check precedes the gate switch, so all three surfaces
+        // — unconfirmed plan, --dry-run, confirmed run — fail identically.
+        // (Unreachable with the production adapter, whose outcomes satisfy
+        // the validator's invariants by construction.)
+        let collected = await collectValidatedScan(
+            deps.runtime, scannerIDs: [CategoryScanner.registeredID],
+            context: ScanContext(trigger: .userInitiated)
+        )
+        if let issue = collected.malformed[CategoryScanner.registeredID] {
+            return .failure(
+                code: "MALFORMED_SCANNER_OUTPUT",
+                message: "Scanner '\(CategoryScanner.registeredID)' failed outcome validation; "
+                    + "refusing to smart-clean from unvalidated results: \(issue.detail)",
+                details: nil
+            )
+        }
+        let allItems = collected.outcomes[CategoryScanner.registeredID]?.items ?? []
 
         switch decision {
         case .refuseRootUser:
             preconditionFailure("unreachable — refused before scanning")
 
         case .refuseUnconfirmed:
-            let plan = smartCleanPlan(results: allResults, targetBytes: targetBytes)
-            exitWithError(
+            let plan = smartCleanPlan(items: allItems, targetBytes: targetBytes)
+            return .failure(
                 code: "CONFIRMATION_REQUIRED",
                 message: "smart-clean deletes cache contents and requires --confirm (preview with --dry-run)",
                 details: [
@@ -683,8 +1341,9 @@ struct CLIHandler {
             )
 
         case .dryRun:
-            let plan = smartCleanPlan(results: allResults, targetBytes: targetBytes)
-            outputJSON([
+            let plan = smartCleanPlan(items: allItems, targetBytes: targetBytes)
+            return .success([
+                "schema_version": cliSchemaVersion,
                 "target_gb": targetGB,
                 "target_met": plan.targetMet,
                 "total_freed_bytes": plan.totalExact,
@@ -694,31 +1353,29 @@ struct CLIHandler {
                 ),
                 "dry_run": true,
                 "cleaned": plan.entries,
-            ] as [String: Any])
+            ])
 
         case .proceed:
-            let cleaner = CacheCleaner()
+            let cleaner = deps.makeCleaner()
             var freedExactSoFar: Int64 = 0
             var estimatedSoFar: Int64 = 0
             var cleaned: [[String: Any]] = []
 
-            for result in smartCleanCandidates(allResults) {
+            for item in smartCleanCandidates(allItems) {
                 // Only exact (delete-time measured, unique-inode) bytes
                 // advance the target — estimated bytes never mark
                 // `target_met` (R16).
                 if freedExactSoFar >= targetBytes { break }
-                var selected = result
-                selected.isSelected = true
-                let report = await cleaner.clean(results: [selected], moveToTrash: false)
+                let report = await cleaner.clean(items: [item], moveToTrash: false)
                 let exact = report.totalFreedExact
                 let estimated = report.totalEstimatedUpTo
                 freedExactSoFar += exact
                 estimatedSoFar += estimated
 
-                let errs = report.errors.map(\.error)
-                var item: [String: Any] = [
-                    "slug": result.category.slug,
-                    "name": result.category.name,
+                let errs = report.errors.map(\.message)
+                var row: [String: Any] = [
+                    "slug": addressValue(for: item),
+                    "name": item.displayName,
                     "bytes_freed": exact,
                     "exact_bytes": exact,
                     "estimated_up_to_bytes": estimated,
@@ -726,11 +1383,13 @@ struct CLIHandler {
                         exact: exact, estimatedUpTo: estimated
                     ),
                     "success": errs.isEmpty,
+                    "scanner_id": item.scannerID,
+                    "item_id": item.id,
                 ]
                 if !errs.isEmpty {
-                    item["error"] = errs.joined(separator: "; ")
+                    row["error"] = errs.joined(separator: "; ")
                 }
-                cleaned.append(item)
+                cleaned.append(row)
             }
 
             // Exit contract (R5): total failure — every attempted category
@@ -742,12 +1401,15 @@ struct CLIHandler {
                 freedExact: freedExactSoFar,
                 freedEstimated: estimatedSoFar
             ) {
-                exitWithError(code: "CLEAN_FAILED",
-                              message: "No eligible category could be cleaned",
-                              details: ["cleaned": cleaned, "target_gb": targetGB])
+                return .failure(
+                    code: "CLEAN_FAILED",
+                    message: "No eligible category could be cleaned",
+                    details: ["cleaned": cleaned, "target_gb": targetGB]
+                )
             }
 
-            outputJSON([
+            return .success([
+                "schema_version": cliSchemaVersion,
                 "target_gb": targetGB,
                 "target_met": freedExactSoFar >= targetBytes,
                 "total_freed_bytes": freedExactSoFar,
@@ -757,7 +1419,7 @@ struct CLIHandler {
                 ),
                 "dry_run": false,
                 "cleaned": cleaned,
-            ] as [String: Any])
+            ])
         }
     }
 
@@ -767,11 +1429,51 @@ struct CLIHandler {
     /// `mdfind "kMDItemFinderComment == 'cacheout-managed'"` finds them.
     /// Also writes a `.cacheout-managed` marker file for `mdfind -name` queries.
     private static func handleSpotlight() async {
-        let scanner = CacheScanner()
-        let results = await scanner.scanAll(CacheCategory.allCategories)
-        outputJSON(spotlightPayload(
-            for: results, home: FileManager.default.homeDirectoryForCurrentUser
+        render(await spotlightOutcome(
+            deps: .production(),
+            home: FileManager.default.homeDirectoryForCurrentUser
         ))
+    }
+
+    /// The spotlight scan pass runs through the SAME validated runtime entry
+    /// point as scan/clean/smart-clean (R8 — no CLI consumer scans outside
+    /// the chokepoint), scoped to the `categories` adapter: tagging is a
+    /// category-root side effect. A malformed `categories` outcome fails
+    /// closed — tag targets are never derived from unvalidated results.
+    static func spotlightOutcome(
+        deps: CLIRuntimeDependencies, home: URL
+    ) async -> CLIOutcome {
+        let adapterID = CategoryScanner.registeredID
+        let collected = await collectValidatedScan(
+            deps.runtime, scannerIDs: [adapterID],
+            context: ScanContext(trigger: .userInitiated)
+        )
+        if let issue = collected.malformed[adapterID] {
+            return .failure(
+                code: "MALFORMED_SCANNER_OUTPUT",
+                message: "Scanner '\(adapterID)' failed outcome validation; "
+                    + "refusing to tag from unvalidated results: \(issue.detail)",
+                details: nil
+            )
+        }
+        // Validated aggregate items map back to the category results the
+        // payload consumes; the runtime guarantees `.category` admission on
+        // every adapter item, so a non-category descriptor is unreachable
+        // (kept fail-closed via compactMap rather than assumed).
+        let results = (collected.outcomes[adapterID]?.items ?? []).compactMap {
+            item -> ScanResult? in
+            guard case .category(let category) = item.admission else { return nil }
+            return ScanResult(
+                category: category,
+                state: item.state,
+                exactBytes: item.exactBytes,
+                estimatedUpToBytes: item.estimatedUpToBytes,
+                itemCount: item.itemCount,
+                scanError: item.scanError,
+                rootRecords: item.rootRecords
+            )
+        }
+        return .success(spotlightPayload(for: results, home: home))
     }
 
     /// The spotlight tagging pass (fn-1.5). Writes are side effects against

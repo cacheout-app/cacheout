@@ -4,32 +4,63 @@
 /// every deletion target passing through `PathGuard` (D4) and every freed
 /// byte measured at delete time, never assumed from pre-scan totals (D1).
 ///
-/// ## Safety model (fn-1.3)
+/// ## Unified entry (fn-2.3)
 ///
-/// 1. **Scan-state refusal (R18)**: a `.denied` scan result is refused even
-///    when force-selected — `isSelected` is mutable UI state and never
-///    overrides the scanner's verdict. `.partiallyDenied` reaches the cleaner
-///    only through explicit selection (fn-1.4 owns never-auto-selecting it)
-///    and reports measured deletions only.
-/// 2. **Mode-aware guard**: category roots are re-admitted at delete time via
-///    `admitDeletionRoot` against the category's OWN `CategoryAdmissionPolicy`;
-///    each child is then `validateContainedChild`-checked (strict descendant).
-///    node_modules items go through `admitContainer` (configured search roots
-///    only) + `validateRemovableItem` (strict descendant + deny-list re-check
-///    + cross-device refusal, R15) against their origin-container provenance.
+/// `clean(items:moveToTrash:)` is THE one clean path: every selected
+/// `ReclaimableItem` — category aggregate, per-item scanner row, command
+/// category — flows through ONE dispatch on `ReclaimAction`, with PathGuard
+/// enforced at this chokepoint via each item's admission descriptor and
+/// per-root records. The pre-unification category-vs-node_modules fork is
+/// gone; `clean(results:nodeModules:moveToTrash:)` survives only as a THIN
+/// adapter for its own compatibility tests — the ViewModel (fn-2.4) and the
+/// CLI (fn-2.6) both consume `clean(items:)` directly now (deletable once
+/// those tests migrate onto item fixtures).
+///
+/// ## Safety model (fn-1.3, reshaped by fn-2.3)
+///
+/// 0. **Structural refusal before ANY skip (frozen order, epic round 13)**:
+///    an item whose action and admission descriptor disagree — or a
+///    non-`.missing` category-backed item with ZERO root records — is
+///    refused with an item-keyed error INDEPENDENTLY of the runtime
+///    validator (defense in depth: the cleaner never assumes validation
+///    ran). Well-formed `.missing` items then skip; a skip must never mask
+///    a malformed shape.
+/// 1. **Scan-state refusal (R18)**: a `.denied` item is refused even when
+///    selected — selection is mutable UI state and never overrides the
+///    scanner's verdict. `.partiallyDenied` reaches the cleaner only
+///    through explicit selection (fn-1.4 owns never-auto-selecting it) and
+///    reports measured deletions only. `.empty` items are a pre-admission
+///    no-op for every action — no entry, never an error (round 9).
+/// 2. **Mode-aware guard**: `.removeContents` admits each `.measured` root
+///    record's `requestedURL` at delete time via `admitDeletionRoot`
+///    against the category's OWN `CategoryAdmissionPolicy` (the
+///    `refusedAdmission`/`deniedUnmeasured` statuses are NEVER deletable);
+///    each child is then `validateContainedChild`-checked (strict
+///    descendant). `.removeItem` targets go through `admitContainer`
+///    (constructor-injected container roots — the runtime's
+///    scanner-declared union, NEVER roots read off items) +
+///    `validateRemovableItem` (strict descendant + deny-list re-check +
+///    cross-device refusal, R15) against their origin-container claim.
 /// 3. **Unresolved spelling deletes; resolved spelling contains**: children
 ///    are enumerated under `AdmittedRoot.requestedURL` and deleted by their
 ///    unresolved URLs — a symlink child is removed AS a link, its target
-///    untouched (R4). Containment always compares against
-///    `AdmittedRoot.resolvedURL`, and the chain is re-validated immediately
-///    before each destructive call (TOCTOU narrowing).
-/// 4. **cleanCommands (R17)**: every resolved root is admitted BEFORE any
-///    argv runs; one refusal skips the whole command set, and an EMPTY
-///    delete-time resolution (roots vanished since the scan) is itself a
-///    refusal — a vacuous admission pass never launches argv. Paths that
-///    appear INSIDE a command's argv are trusted registry code
-///    (`Categories.swift`), not runtime input — admission covers the roots
-///    the category operates on.
+///    untouched (R4); `.removeItem` deletes the descriptor's UNRESOLVED
+///    `requestedTargetURL` (leaf never resolved — `item.url` is display
+///    state, never a destructive input). Containment always compares
+///    against the canonical resolved form, and the chain is re-validated
+///    immediately before each destructive call (TOCTOU narrowing).
+/// 4. **`.commands` (R17)**: EVERY root record's `requestedURL` — all
+///    statuses, the full scan-time capture — is re-admitted BEFORE any argv
+///    runs; ANY refusal blocks the ENTIRE command set. `.missing` items
+///    skip pre-dispatch and zero-record non-missing items are refused
+///    outright, so a vacuous admission pass (a loop over zero roots) can
+///    never launch argv — and because admission's canonical-components
+///    fallback passes a declared spelling that no longer exists, a
+///    delete-time SURVIVAL GATE additionally refuses the whole set when no
+///    captured root still exists as a real directory (pre-unification
+///    `resolvedPaths` parity; partial survival proceeds). Paths INSIDE a
+///    command's argv are trusted registry code (`Categories.swift`), not
+///    runtime input — admission covers the roots the category operates on.
 ///
 /// ## Freed-bytes accounting (D1/R8)
 ///
@@ -100,7 +131,11 @@ struct AcceptedByteComponents {
     var estimatedUpToBytes: Int64 = 0
 }
 
-/// Per-category-operation inode accounting registry (R8, D8 mitigation).
+/// Per-operation inode accounting registry (R8, D8 mitigation). Scope is
+/// preserved fn-1 behavior (fn-2.3): ONE instance per `.removeContents`
+/// aggregate (item-local — cross-category hardlinks still count per
+/// category, D8-disclosed) and ONE instance per SCANNER of `.removeItem`
+/// items, spanning all of that scanner's selected items in the operation.
 ///
 /// Deleting one hardlink DECREMENTS the survivors' `st_nlink`, so later
 /// observations of the same inode cannot be trusted for classification or
@@ -220,58 +255,141 @@ actor CacheCleaner {
         }
     }
 
-    // MARK: Clean
+    // MARK: Clean — unified entry (fn-2.3)
 
-    func clean(
-        results: [ScanResult],
-        nodeModules: [NodeModulesItem] = [],
-        moveToTrash: Bool
-    ) async -> CleanupReport {
+    /// THE one clean path. Consumes bare `ReclaimableItem`s (already
+    /// selected upstream — selection never rides the item) and dispatches
+    /// on `ReclaimAction`, enforcing PathGuard per action at this
+    /// chokepoint.
+    ///
+    /// FROZEN check order (epic round 13 — a skip must never mask a
+    /// malformed shape): (1) structural action/descriptor compatibility on
+    /// EVERY item regardless of state; (2) well-formed `.missing` skip;
+    /// (3) non-`.missing` category-backed zero-record refusal; (4) state
+    /// eligibility (`.denied` refusal, `.empty` no-op, aggregate
+    /// `.commands`/`.removeContents` zero-measured skip); (5) action
+    /// dispatch.
+    func clean(items: [ReclaimableItem], moveToTrash: Bool) async -> CleanupReport {
         var entries: [CleanupReport.Entry] = []
-        var errors: [(category: String, error: String)] = []
+        var errors: [CleanupReport.ItemError] = []
+        // Accounting scope (preserved fn-1 behavior): ONE registry per
+        // SCANNER of `.removeItem` items — two items of one scanner
+        // hardlinking the same inode transfer it once — while each
+        // `.removeContents` aggregate builds its ITEM-LOCAL registry inside
+        // its dispatch (cross-category hardlinks still count per category,
+        // D8-disclosed).
+        var scannerRegistries: [String: InodeAccountingRegistry] = [:]
 
-        for result in results where result.isSelected {
-            let name = result.category.name
-
-            // Nothing resolved on this machine — nothing to do.
-            if result.state == .missing { continue }
-
-            // R18: the scanner's verdict beats mutable selection state — a
-            // `.denied` category is refused even force-selected (the CLI
-            // force-selects), and the refusal SURFACES as an error rather
-            // than silently skipping.
-            if result.state == .denied {
-                let reason = Self.deniedRefusalReason(for: result)
-                errors.append((name, reason))
-                logRefusal(category: name, tag: "scan-denied", detail: reason)
+        for item in items {
+            // (1) Structural compatibility — FIRST, unconditional, every
+            // item, every state. Defense in depth: the runtime validator
+            // refuses the same shapes, but this chokepoint never assumes
+            // validation ran (fn-2.7's headless path reaches it directly).
+            if let refusal = Self.structuralRefusal(of: item) {
+                errors.append(Self.itemError(item, refusal))
+                logRefusal(label: item.displayName, tag: "malformed-item",
+                           detail: refusal)
                 continue
             }
 
-            // `.partiallyDenied` proceeds only via explicit selection
-            // (fn-1.4 never auto-selects it). Its freed bytes are measured
-            // deletions only — which is all this pipeline ever reports.
+            // (2) Well-formed `.missing`: nothing resolved on this machine
+            // — nothing to do, no entry, no error. Skipping BEFORE dispatch
+            // also keeps an empty record set from vacuously passing
+            // `.commands` re-admission (round 8).
+            if item.state == .missing { continue }
 
-            // Empty/zero-measured categories: nothing measurable to free.
-            if result.isEmpty { continue }
+            // (3) A non-`.missing` category-backed item with ZERO root
+            // records can only be a construction bug — never vacuously
+            // admissible (rounds 11-12). Exhaustive over the action so a
+            // future case is a compile-time decision.
+            switch item.action {
+            case .removeContents, .commands:
+                if item.rootRecords.isEmpty {
+                    let reason = "refused: no root records — nothing was captured for this item to admit"
+                    errors.append(Self.itemError(item, reason))
+                    logRefusal(label: item.displayName, tag: "no-root-records",
+                               detail: reason)
+                    continue
+                }
+            case .removeItem:
+                break
+            }
 
-            if let commands = result.category.cleanCommands {
-                let outcome = cleanViaCommands(commands, for: result)
+            // (4) State eligibility. R18: the scanner's verdict beats
+            // mutable selection state — `.denied` is refused even when
+            // selected, and the refusal SURFACES as an error rather than
+            // silently skipping.
+            if item.state == .denied {
+                let reason = Self.deniedRefusalReason(for: item.scanError)
+                errors.append(Self.itemError(item, reason))
+                logRefusal(label: item.displayName, tag: "scan-denied",
+                           detail: reason)
+                continue
+            }
+            // `.empty` has nothing to clean: a no-op BEFORE any admission
+            // for EVERY action — no entry, never an error, even when
+            // explicitly selected/addressed (round 9).
+            if item.state == .empty { continue }
+            // Aggregate zero-measured parity (the as-built `result.isEmpty`
+            // guard): no argv ever runs for an empty command category, and
+            // no children are deleted for a zero-allocated `.removeContents`
+            // aggregate — a `.measured` category holding only zero-allocation
+            // files plans as "skip" in the CLI confirmation/dry-run, and a
+            // confirmed run must never delete what its plan said it would
+            // skip. `.removeItem` deliberately has NO zero-byte skip (frozen
+            // plan parity: a measured zero-byte per-item target IS deleted).
+            // Exhaustive so a future action decides at compile time.
+            switch item.action {
+            case .commands, .removeContents:
+                if item.allocatedBytes == 0 { continue }
+            case .removeItem:
+                break
+            }
+            // `.partiallyDenied` reaches here only through explicit
+            // selection (fn-1.4/fn-2.4 own never auto-selecting it) and
+            // reports measured deletions only — which is all this pipeline
+            // ever reports.
+
+            // (5) Dispatch — exhaustive, no `default:` (fn-5 adds a
+            // composite case; that addition must be compile-time-visible).
+            switch item.action {
+            case .removeContents:
+                // The descriptor arm is guaranteed by check (1).
+                guard case .category(let category) = item.admission else { continue }
+                let outcome = await cleanContents(
+                    of: item, category: category, moveToTrash: moveToTrash
+                )
                 if let entry = outcome.entry { entries.append(entry) }
                 errors.append(contentsOf: outcome.errors)
-            } else {
-                let outcome = await cleanCategoryPaths(
-                    for: result, moveToTrash: moveToTrash
+
+            case .commands:
+                // Argv comes from the CATEGORY's declaration — check (1)
+                // refused any payload mismatch, and sourcing from the
+                // admission descriptor keeps command argv trusted registry
+                // code, never item input.
+                guard case .category(let category) = item.admission,
+                      let commands = category.cleanCommands else { continue }
+                let outcome = cleanViaCommands(commands, for: item, category: category)
+                if let entry = outcome.entry { entries.append(entry) }
+                errors.append(contentsOf: outcome.errors)
+
+            case .removeItem:
+                guard case .containerItem(let origin, let target) = item.admission else { continue }
+                let registry: InodeAccountingRegistry
+                if let existing = scannerRegistries[item.scannerID] {
+                    registry = existing
+                } else {
+                    registry = InodeAccountingRegistry()
+                    scannerRegistries[item.scannerID] = registry
+                }
+                let outcome = await removeGuardedItem(
+                    item, origin: origin, target: target,
+                    registry: registry, moveToTrash: moveToTrash
                 )
                 if let entry = outcome.entry { entries.append(entry) }
                 errors.append(contentsOf: outcome.errors)
             }
         }
-
-        let nodeModulesOutcome = await cleanNodeModulesItems(
-            nodeModules.filter(\.isSelected), moveToTrash: moveToTrash
-        )
-        entries.append(contentsOf: nodeModulesOutcome.entries)
-        errors.append(contentsOf: nodeModulesOutcome.errors)
 
         // Report-level disposal is the REQUESTED mode; each entry carries
         // what actually happened (command-backed entries stay `.permanent`
@@ -283,43 +401,228 @@ actor CacheCleaner {
         )
     }
 
-    // MARK: - Command categories (R17)
+    // MARK: Clean — compatibility adapter (pre-unification callers)
 
-    private func cleanViaCommands(
-        _ commands: [[String]], for result: ScanResult
-    ) -> (entry: CleanupReport.Entry?, errors: [(category: String, error: String)]) {
-        let name = result.category.name
-        let policy = CategoryAdmissionPolicy(category: result.category, home: home)
+    /// THIN adapter with NO production caller left (the ViewModel migrated
+    /// in fn-2.4, the CLI in fn-2.6): builds `ReclaimableItem`s and
+    /// forwards to `clean(items:moveToTrash:)` — ONE dispatch, no second
+    /// code path. Survives for its own compatibility tests; deletable once
+    /// they migrate onto item fixtures.
+    func clean(
+        results: [ScanResult],
+        nodeModules: [NodeModulesItem] = [],
+        moveToTrash: Bool
+    ) async -> CleanupReport {
+        var items: [ReclaimableItem] = []
+        var preRefusals: [CleanupReport.ItemError] = []
 
-        // Every resolved root must pass admission BEFORE any argv runs — a
-        // probed root that drifted outside the category's policy blocks the
-        // whole command set (R17). Resolution anchors to the same injected
-        // home the policy does.
-        let roots = result.category.resolvedPaths(home: home)
-
-        // A category whose roots all vanished (or became undiscoverable)
-        // between scan and confirmation resolves to NOTHING here — and a
-        // vacuous admission pass must never launch destructive argv (e.g.
-        // `simctl erase all` with no admitted Simulator root). Refuse the
-        // whole command set instead of falling through.
-        guard !roots.isEmpty else {
-            let reason = "clean commands not run — no category root resolved at delete time"
-            logRefusal(category: name, tag: "no-resolved-root", detail: reason)
-            return (nil, [(name, reason)])
+        for result in results where result.isSelected {
+            items.append(CategoryScanner.item(
+                from: result, rootRecords: compatibilityRecords(for: result)
+            ))
         }
 
-        for url in roots {
+        for nmItem in nodeModules where nmItem.isSelected {
+            let resolved = provider.canonicalize(nmItem.nodeModulesPath)
+            let id = ReclaimableItem.stableID(
+                scannerID: NodeModulesScanner.registeredID,
+                canonicalPath: resolved.path
+            )
+            // Item-mode admission requires origin-container provenance — an
+            // item that cannot name the configured search root it was
+            // discovered under is refused, not trusted. The unified
+            // descriptor makes the container non-optional, so the refusal
+            // lands here in the adapter (scanner-built items always carry
+            // provenance).
+            guard let origin = nmItem.originContainer else {
+                let reason = "refused: item carries no origin-container provenance"
+                preRefusals.append(CleanupReport.ItemError(
+                    key: ItemKey(
+                        scannerID: NodeModulesScanner.registeredID, itemID: id
+                    ),
+                    displayName: nmItem.projectName,
+                    message: reason
+                ))
+                logRefusal(label: nmItem.projectName, tag: "no-provenance",
+                           detail: "\(nmItem.nodeModulesPath.path): \(reason)")
+                continue
+            }
+            items.append(ReclaimableItem(
+                id: id,
+                scannerID: NodeModulesScanner.registeredID,
+                displayName: nmItem.projectName,
+                exactBytes: nmItem.sizeBytes,
+                estimatedUpToBytes: 0,
+                logicalBytes: nil,
+                itemCount: 0,
+                url: resolved,
+                declaredDisplayPath: nmItem.nodeModulesPath.path,
+                rootRecords: [RootScanRecord(
+                    requestedURL: nmItem.nodeModulesPath,
+                    resolvedURL: resolved,
+                    status: .measured
+                )],
+                state: .measured,
+                scanError: nil,
+                risk: .review,
+                evidence: "",
+                rebuildNote: nil,
+                action: .removeItem,
+                // Frozen arm (epic round 6): the UNRESOLVED discovered path
+                // is the deletion target — leaf never resolved.
+                admission: .containerItem(
+                    originContainer: origin,
+                    requestedTargetURL: nmItem.nodeModulesPath
+                ),
+                defaultSelected: false,
+                automaticCleanEligible: false,
+                isStale: nil
+            ))
+        }
+
+        let report = await clean(items: items, moveToTrash: moveToTrash)
+        guard !preRefusals.isEmpty else { return report }
+        return CleanupReport(
+            disposal: report.disposal,
+            entries: report.entries,
+            errors: report.errors + preRefusals
+        )
+    }
+
+    /// Root records for compatibility `ScanResult`s built WITHOUT the
+    /// fn-2.1 scan-time capture (pre-capture fixtures and legacy paths):
+    /// synthesize from the category's delete-time resolution — exactly the
+    /// roots the pre-unification cleaner operated on, admitted by the same
+    /// policy either way. Results that DO carry records keep them verbatim
+    /// (root-snapshot rule: the cleaner never re-evaluates
+    /// `resolvedPaths` for captured items).
+    private func compatibilityRecords(for result: ScanResult) -> [RootScanRecord] {
+        guard result.rootRecords.isEmpty, result.state != .missing else {
+            return result.rootRecords
+        }
+        return result.category.resolvedPaths(home: home).map { url in
+            RootScanRecord(
+                requestedURL: url,
+                resolvedURL: provider.canonicalize(url),
+                status: .measured
+            )
+        }
+    }
+
+    // MARK: - Structural refusal (defense in depth, rounds 11-13)
+
+    /// The action/descriptor shapes the runtime validator rejects, refused
+    /// HERE independently — a chokepoint that trusts its caller's
+    /// validation is not a chokepoint. Exhaustive over `ReclaimAction` (a
+    /// future case must decide its descriptor requirement at compile time).
+    /// The non-`.missing` zero-record rule is check (3) in `clean(items:)`
+    /// — it is state-aware and therefore ordered AFTER the `.missing` skip.
+    private static func structuralRefusal(of item: ReclaimableItem) -> String? {
+        switch item.action {
+        case .removeItem:
+            switch item.admission {
+            case .containerItem:
+                return nil
+            case .category:
+                return "refused: a remove_item item must carry the container-item admission descriptor"
+            }
+        case .removeContents:
+            switch item.admission {
+            case .category(let category):
+                // A command-backed category can never route through file
+                // deletion: pre-unification, the category's OWN declaration
+                // decided the path (`cleanCommands` beat contents mode), so
+                // an action/category mismatch here can only be a forged or
+                // corrupted item.
+                if category.cleanCommands != nil {
+                    return "refused: a command-backed category cleans via its declared commands, never file deletion"
+                }
+                return nil
+            case .containerItem:
+                return "refused: a \(item.action.wireString) item must carry category admission provenance"
+            }
+        case .commands(let payload):
+            switch item.admission {
+            case .category(let category):
+                // Command argv is TRUSTED REGISTRY CODE (`Categories.swift`)
+                // — never item input. The payload riding the action must BE
+                // the category's declaration; dispatch then executes the
+                // CATEGORY's argv, so a crafted payload gains nothing even
+                // if this refusal were bypassed.
+                if category.cleanCommands != payload {
+                    return "refused: the item's argv payload does not match the category's declared cleanCommands"
+                }
+                return nil
+            case .containerItem:
+                return "refused: a \(item.action.wireString) item must carry category admission provenance"
+            }
+        }
+    }
+
+    private static func itemError(
+        _ item: ReclaimableItem, _ message: String
+    ) -> CleanupReport.ItemError {
+        CleanupReport.ItemError(
+            key: item.key, displayName: item.displayName, message: message
+        )
+    }
+
+    // MARK: - Command items (R17)
+
+    private func cleanViaCommands(
+        _ commands: [[String]], for item: ReclaimableItem, category: CacheCategory
+    ) -> (entry: CleanupReport.Entry?, errors: [CleanupReport.ItemError]) {
+        let policy = CategoryAdmissionPolicy(category: category, home: home)
+
+        // EVERY record's `requestedURL` — the FULL scan-time capture, all
+        // statuses, not just `.measured` — is re-admitted BEFORE any argv
+        // runs, and ANY refusal blocks the ENTIRE command set (fn-1.3 R17
+        // parity; no per-root partial execution). A vacuous pass over zero
+        // roots is impossible here: `.missing` items skip pre-dispatch and
+        // non-missing zero-record items are refused before dispatch.
+        for record in item.rootRecords {
             do {
-                let admitted = try pathGuard.admitDeletionRoot(url, policy: policy)
-                logDriftAdmission(admitted, category: name)
+                let admitted = try pathGuard.admitDeletionRoot(
+                    record.requestedURL, policy: policy
+                )
+                logDriftAdmission(admitted, label: item.displayName)
             } catch {
                 let reason = "clean commands not run — root refused: \(error.localizedDescription)"
                 logRefusal(
-                    category: name, tag: Self.refusalTag(error),
-                    detail: "\(url.path): \(reason)"
+                    label: item.displayName, tag: Self.refusalTag(error),
+                    detail: "\(record.requestedURL.path): \(reason)"
                 )
-                return (nil, [(name, reason)])
+                return (nil, [Self.itemError(item, reason)])
             }
+        }
+
+        // DELETE-TIME SURVIVAL GATE (pre-unification parity): the old
+        // cleaner re-ran `resolvedPaths` at delete time, which filtered
+        // every root through an exists-as-directory check — a category
+        // whose roots ALL vanished (or were renamed) between scan and
+        // confirmation resolved to NOTHING and was refused rather than
+        // running destructive argv (the PR #454 "no-resolved-root"
+        // refusal; think `simctl erase all` after the Simulator root was
+        // removed). The captured-record snapshot re-admits the SPELLING,
+        // and admission's canonical-components fallback deliberately
+        // passes a nonexistent declared path — so existence is its own
+        // check, composed AFTER admission, never replacing it. At least
+        // one captured root must still exist as a real directory
+        // (canonicalized first, so a symlink root pointing at a real
+        // directory still counts — `directoryExists` parity). Partial
+        // survival proceeds, matching the old semantics where surviving
+        // roots resolved and the command set ran.
+        let anyCapturedRootSurvives = item.rootRecords.contains { record in
+            provider.probeKind(
+                of: provider.canonicalize(record.requestedURL)
+            ) == .kind(.directory)
+        }
+        guard anyCapturedRootSurvives else {
+            let reason = "clean commands not run — no captured root still exists as a directory at delete time"
+            logRefusal(
+                label: item.displayName, tag: "no-resolved-root", detail: reason
+            )
+            return (nil, [Self.itemError(item, reason)])
         }
 
         do {
@@ -327,7 +630,7 @@ actor CacheCleaner {
                 try runCleanCommand(command)
             }
         } catch {
-            return (nil, [(name, error.localizedDescription)])
+            return (nil, [Self.itemError(item, error.localizedDescription)])
         }
 
         // Nothing measures what a command frees: exact 0, estimated =
@@ -335,44 +638,63 @@ actor CacheCleaner {
         // the argv ran regardless of the Move-to-Trash toggle and placed
         // nothing in the Trash — reporting `.trash` would falsely promise
         // the bytes are recoverable by emptying it.
-        logCleanup(category: name, bytesFreed: result.sizeBytes)
-        guard result.sizeBytes > 0 else { return (nil, []) }
+        logCleanup(label: item.displayName, bytesFreed: item.allocatedBytes)
+        guard item.allocatedBytes > 0 else { return (nil, []) }
         return (
             CleanupReport.Entry(
-                category: name, exactBytes: 0,
-                estimatedUpToBytes: result.sizeBytes,
+                itemID: item.id, scannerID: item.scannerID,
+                displayName: item.displayName,
+                exactBytes: 0,
+                estimatedUpToBytes: item.allocatedBytes,
                 disposal: .permanent
             ),
             []
         )
     }
 
-    // MARK: - Category paths (contents mode)
+    // MARK: - Contents mode (.removeContents)
 
-    private func cleanCategoryPaths(
-        for result: ScanResult, moveToTrash: Bool
-    ) async -> (entry: CleanupReport.Entry?, errors: [(category: String, error: String)]) {
-        let name = result.category.name
-        let policy = CategoryAdmissionPolicy(category: result.category, home: home)
-        // Per category operation: two roots (or two children) hardlinking the
-        // same inode must transfer its bytes once.
+    private func cleanContents(
+        of item: ReclaimableItem, category: CacheCategory, moveToTrash: Bool
+    ) async -> (entry: CleanupReport.Entry?, errors: [CleanupReport.ItemError]) {
+        let policy = CategoryAdmissionPolicy(category: category, home: home)
+        // ITEM-LOCAL registry (preserved fn-1 scope): two roots (or two
+        // children) of ONE aggregate hardlinking the same inode transfer
+        // its bytes once.
         let registry = InodeAccountingRegistry()
-        var errors: [(category: String, error: String)] = []
+        var errors: [CleanupReport.ItemError] = []
         var exact: Int64 = 0
         var estimated: Int64 = 0
 
-        // Resolution anchors to the same injected home the policy does.
-        for url in result.category.resolvedPaths(home: home) {
+        // Scan-time captured records ONLY (root-snapshot rule — never a
+        // re-evaluation of `resolvedPaths`), and ONLY `status == .measured`
+        // records: `refusedAdmission` and `deniedUnmeasured` are NEVER
+        // deletable (frozen truth table); a clean-empty measured root is
+        // still processed (a no-op delete). A delete-time refusal of one
+        // root reports per-item and leaves the remaining roots cleaning —
+        // per-child isolation extends per-root.
+        for record in item.rootRecords where record.status == .measured {
             let admitted: AdmittedRoot
             do {
-                admitted = try pathGuard.admitDeletionRoot(url, policy: policy)
-                logDriftAdmission(admitted, category: name)
-            } catch {
-                errors.append((name, error.localizedDescription))
-                logRefusal(
-                    category: name, tag: Self.refusalTag(error),
-                    detail: "\(url.path): \(error.localizedDescription)"
+                admitted = try pathGuard.admitDeletionRoot(
+                    record.requestedURL, policy: policy
                 )
+                logDriftAdmission(admitted, label: item.displayName)
+            } catch {
+                let message = "\(record.requestedURL.path): \(error.localizedDescription)"
+                errors.append(Self.itemError(item, message))
+                logRefusal(
+                    label: item.displayName, tag: Self.refusalTag(error),
+                    detail: message
+                )
+                continue
+            }
+
+            // A measured root that VANISHED since the scan has nothing to
+            // enumerate — the root-level counterpart of the child ENOENT
+            // skip below (and parity with the pre-snapshot behavior, where
+            // a vanished root simply no longer resolved).
+            if provider.probeKind(of: admitted.requestedURL) == .absent {
                 continue
             }
 
@@ -386,14 +708,14 @@ actor CacheCleaner {
                     at: admitted.requestedURL, includingPropertiesForKeys: nil
                 )
             } catch {
-                errors.append((name, error.localizedDescription))
+                errors.append(Self.itemError(item, error.localizedDescription))
                 continue
             }
 
             for child in children {
                 switch await deleteGuardedChild(
                     child, of: admitted, registry: registry,
-                    moveToTrash: moveToTrash, category: name
+                    moveToTrash: moveToTrash, label: item.displayName
                 ) {
                 case .accepted(let components):
                     exact += components.exactBytes
@@ -401,18 +723,21 @@ actor CacheCleaner {
                 case .skippedAlreadyGone:
                     break
                 case .failed(let message):
-                    errors.append((name, message))
+                    errors.append(Self.itemError(item, message))
                 }
             }
         }
 
-        logCleanup(category: name, bytesFreed: exact + estimated)
-        // A partially-refused/failed category still yields ONE entry carrying
-        // the per-child accounting that actually succeeded (R1).
+        logCleanup(label: item.displayName, bytesFreed: exact + estimated)
+        // A partially-refused/failed item still yields ONE entry carrying
+        // the per-child accounting that actually succeeded (R1); a
+        // zero-byte outcome yields none (as-built no-entry behavior).
         guard exact + estimated > 0 else { return (nil, errors) }
         return (
             CleanupReport.Entry(
-                category: name, exactBytes: exact, estimatedUpToBytes: estimated,
+                itemID: item.id, scannerID: item.scannerID,
+                displayName: item.displayName,
+                exactBytes: exact, estimatedUpToBytes: estimated,
                 disposal: moveToTrash ? .trash : .permanent
             ),
             errors
@@ -431,7 +756,7 @@ actor CacheCleaner {
     private func deleteGuardedChild(
         _ child: URL, of root: AdmittedRoot,
         registry: InodeAccountingRegistry,
-        moveToTrash: Bool, category: String
+        moveToTrash: Bool, label: String
     ) async -> ChildOutcome {
         // Strict-descendant containment against the admitted root. NOTE:
         // `validateContainedChild` is descendant-only by design (fn-1.1) —
@@ -443,7 +768,7 @@ actor CacheCleaner {
             try pathGuard.validateContainedChild(child, of: root)
         } catch {
             logRefusal(
-                category: category, tag: Self.refusalTag(error),
+                label: label, tag: Self.refusalTag(error),
                 detail: "\(child.path): \(error.localizedDescription)"
             )
             return .failed(error.localizedDescription)
@@ -473,7 +798,7 @@ actor CacheCleaner {
         // category children.
         if let boundary = report.mountBoundaries.first {
             let detail = "\(child.path): mount boundary at \(boundary.path) — refused, not deleted"
-            logRefusal(category: category, tag: "mount_boundary", detail: detail)
+            logRefusal(label: label, tag: "mount_boundary", detail: detail)
             return .failed(detail)
         }
 
@@ -495,7 +820,7 @@ actor CacheCleaner {
         } catch {
             if error is PathGuardError {
                 logRefusal(
-                    category: category, tag: Self.refusalTag(error),
+                    label: label, tag: Self.refusalTag(error),
                     detail: "\(child.path): \(error.localizedDescription)"
                 )
             }
@@ -508,109 +833,93 @@ actor CacheCleaner {
         return .accepted(await registry.acceptSuccessful(token))
     }
 
-    // MARK: - node_modules items (item mode, R15)
+    // MARK: - Item mode (.removeItem, R15)
 
-    private func cleanNodeModulesItems(
-        _ items: [NodeModulesItem], moveToTrash: Bool
-    ) async -> (entries: [CleanupReport.Entry], errors: [(category: String, error: String)]) {
-        var entries: [CleanupReport.Entry] = []
-        var errors: [(category: String, error: String)] = []
-        // One registry across the node_modules group: two items hardlinking
-        // the same inode within one operation must not double-count.
-        let registry = InodeAccountingRegistry()
-
-        for item in items {
-            let label = "node_modules: \(item.projectName)"
-
-            // Item-mode admission requires origin-container provenance — an
-            // item that cannot name the configured search root it was
-            // discovered under is refused, not trusted.
-            guard let origin = item.originContainer else {
-                let reason = "refused: item carries no origin-container provenance"
-                errors.append((label, reason))
-                logRefusal(
-                    category: label, tag: "no-provenance",
-                    detail: "\(item.nodeModulesPath.path): \(reason)"
-                )
-                continue
-            }
-
-            let container: AdmittedContainer
-            do {
-                container = try pathGuard.admitContainer(origin)
-                try pathGuard.validateRemovableItem(
-                    item.nodeModulesPath, inside: container
-                )
-            } catch {
-                errors.append((label, error.localizedDescription))
-                logRefusal(
-                    category: label, tag: Self.refusalTag(error),
-                    detail: "\(item.nodeModulesPath.path): \(error.localizedDescription)"
-                )
-                continue
-            }
-
-            // Deliberately NO already-gone skip here: a missing ("ghost")
-            // item surfaces as a per-item error, preserving the pre-guard
-            // semantics — its absent leaf measures as an empty report and
-            // the deletion below reports the ENOENT.
-            let report = sizer.measure(
-                at: item.nodeModulesPath, mode: .deletionTarget,
-                knownInodes: await registry.knownIdentities
+    /// One `.removeItem` deletion. `origin` is the item's CLAIMED container
+    /// — validated by `admitContainer` against the CONSTRUCTOR-injected
+    /// container roots (the runtime's scanner-declared union; a buggy or
+    /// hostile item cannot widen admission). `target` is the FROZEN
+    /// descriptor's UNRESOLVED `requestedTargetURL` (leaf never resolved —
+    /// `item.url` is display state and never a destructive input). The
+    /// registry is the caller's per-SCANNER instance.
+    private func removeGuardedItem(
+        _ item: ReclaimableItem, origin: URL, target: URL,
+        registry: InodeAccountingRegistry, moveToTrash: Bool
+    ) async -> (entry: CleanupReport.Entry?, errors: [CleanupReport.ItemError]) {
+        let container: AdmittedContainer
+        do {
+            container = try pathGuard.admitContainer(origin)
+            try pathGuard.validateRemovableItem(target, inside: container)
+        } catch {
+            logRefusal(
+                label: item.displayName, tag: Self.refusalTag(error),
+                detail: "\(target.path): \(error.localizedDescription)"
             )
+            return (nil, [Self.itemError(item, error.localizedDescription)])
+        }
 
-            // Same mount doctrine as category children (R15): a boundary
-            // anywhere in the measured tree refuses the deletion —
-            // `validateRemovableItem` catches the item ITSELF being a mount
-            // target, but not a mount nested beneath it.
-            if let boundary = report.mountBoundaries.first {
-                let detail = "\(item.nodeModulesPath.path): mount boundary at \(boundary.path) — refused, not deleted"
-                logRefusal(category: label, tag: "mount_boundary", detail: detail)
-                errors.append((label, detail))
-                continue
-            }
+        // Deliberately NO already-gone skip here (the frozen ENOENT
+        // asymmetry): a missing ("ghost") target surfaces as an ITEM-KEYED
+        // error — its absent leaf measures as an empty report and the
+        // deletion below reports the ENOENT. The ENOENT skip exists ONLY
+        // for category children in contents mode.
+        let report = sizer.measure(
+            at: target, mode: .deletionTarget,
+            knownInodes: await registry.knownIdentities
+        )
 
-            let token = await registry.registerObservations(report.claims)
+        // Same mount doctrine as category children (R15): a boundary
+        // anywhere in the measured tree refuses the deletion —
+        // `validateRemovableItem` catches the target ITSELF being a mount
+        // point, but not a mount nested beneath it.
+        if let boundary = report.mountBoundaries.first {
+            let detail = "\(target.path): mount boundary at \(boundary.path) — refused, not deleted"
+            logRefusal(label: item.displayName, tag: "mount_boundary", detail: detail)
+            return (nil, [Self.itemError(item, detail)])
+        }
 
-            do {
-                // TOCTOU narrowing, immediately pre-delete.
-                try pathGuard.validateRemovableItem(
-                    item.nodeModulesPath, inside: container
+        let token = await registry.registerObservations(report.claims)
+
+        do {
+            // TOCTOU narrowing, immediately pre-delete.
+            try pathGuard.validateRemovableItem(target, inside: container)
+            if moveToTrash {
+                // A trash failure is an item error — it never falls through
+                // to a permanent delete (R11).
+                try await trash(target)
+            } else {
+                // Item mode deletes the target ITSELF — never its
+                // contents-with-parent-preserved (R1/R15). The UNRESOLVED
+                // spelling: a symlink target is removed AS a link (R4).
+                try await Self.removeItemConcurrently(
+                    at: target, fileManager: fileManager
                 )
-                if moveToTrash {
-                    try await trash(item.nodeModulesPath)
-                } else {
-                    // Item mode deletes the node_modules directory ITSELF —
-                    // never its contents-with-parent-preserved (R1/R15).
-                    try await Self.removeItemConcurrently(
-                        at: item.nodeModulesPath, fileManager: fileManager
-                    )
-                }
-            } catch {
-                if error is PathGuardError {
-                    logRefusal(
-                        category: label, tag: Self.refusalTag(error),
-                        detail: "\(item.nodeModulesPath.path): \(error.localizedDescription)"
-                    )
-                }
-                errors.append((label, error.localizedDescription))
-                continue
             }
+        } catch {
+            if error is PathGuardError {
+                logRefusal(
+                    label: item.displayName, tag: Self.refusalTag(error),
+                    detail: "\(target.path): \(error.localizedDescription)"
+                )
+            }
+            return (nil, [Self.itemError(item, error.localizedDescription)])
+        }
 
-            let accepted = await registry.acceptSuccessful(token)
-            entries.append(CleanupReport.Entry(
-                category: label,
+        let accepted = await registry.acceptSuccessful(token)
+        logCleanup(
+            label: "\(item.scannerID)/\(item.displayName)",
+            bytesFreed: accepted.exactBytes + accepted.estimatedUpToBytes
+        )
+        return (
+            CleanupReport.Entry(
+                itemID: item.id, scannerID: item.scannerID,
+                displayName: item.displayName,
                 exactBytes: accepted.exactBytes,
                 estimatedUpToBytes: accepted.estimatedUpToBytes,
                 disposal: moveToTrash ? .trash : .permanent
-            ))
-            logCleanup(
-                category: "node_modules/\(item.projectName)",
-                bytesFreed: accepted.exactBytes + accepted.estimatedUpToBytes
-            )
-        }
-
-        return (entries, errors)
+            ),
+            []
+        )
     }
 
     // MARK: - Refusal classification
@@ -632,19 +941,19 @@ actor CacheCleaner {
         }
     }
 
-    /// Human-readable reason a `.denied` result was refused — classified off
+    /// Human-readable reason a `.denied` item was refused — classified off
     /// the typed `ScanError.Kind`, never by matching message strings.
-    private static func deniedRefusalReason(for result: ScanResult) -> String {
+    private static func deniedRefusalReason(for scanError: ScanError?) -> String {
         let label: String
-        switch result.scanError?.kind {
+        switch scanError?.kind {
         case .admissionRefused: label = "admission refused at scan time"
         case .tccDenied: label = "macOS privacy (TCC) denial"
         case .permissionDenied: label = "permission denial"
         case .other: label = "scan failure"
         case nil: label = "no measurable access"
         }
-        var reason = "refused: the scan could not measure this category (\(label))"
-        if let message = result.scanError?.message, !message.isEmpty {
+        var reason = "refused: the scan could not measure this item (\(label))"
+        if let message = scanError?.message, !message.isEmpty {
             reason += " — \(message)"
         }
         return reason
@@ -671,15 +980,15 @@ actor CacheCleaner {
 
         try process.run()
 
-        let deadline = DispatchTime.now() + .seconds(30)
-        let group = DispatchGroup()
-        group.enter()
-        DispatchQueue.global().async {
-            process.waitUntilExit()
-            group.leave()
-        }
-
-        if group.wait(timeout: deadline) == .timedOut {
+        // Bounded poll — NEVER `waitUntilExit()` observed from a helper
+        // thread (the previous DispatchGroup pattern): `waitUntilExit` can
+        // miss its termination wakeup under concurrent process
+        // spawning/reaping (see `Process.waitForExit(within:)`), so a
+        // trivially-successful command was misreported as timed out after
+        // the full 30s — and the helper thread stayed blocked forever.
+        // Timeout contract unchanged: 30 seconds, `terminate()` on expiry,
+        // same error text, then the exit-status check.
+        guard process.waitForExit(within: 30) else {
             process.terminate()
             throw NSError(domain: "CacheCleaner", code: -1,
                           userInfo: [NSLocalizedDescriptionKey: "Clean command timed out after 30s"])
@@ -715,21 +1024,21 @@ actor CacheCleaner {
 
     // MARK: - Logging
 
-    private func logCleanup(category: String, bytesFreed: Int64) {
+    private func logCleanup(label: String, bytesFreed: Int64) {
         let size = ByteCountFormatter.sharedFile.string(fromByteCount: bytesFreed)
-        appendLog("Cleaned \(category): \(size)")
+        appendLog("Cleaned \(label): \(size)")
     }
 
-    private func logRefusal(category: String, tag: String, detail: String) {
-        appendLog("REFUSED [\(tag)] \(category): \(detail)")
+    private func logRefusal(label: String, tag: String, detail: String) {
+        appendLog("REFUSED [\(tag)] \(label): \(detail)")
     }
 
     /// A version-drift sibling admission is legitimate but noteworthy — log
     /// which declared root vouched for it.
-    private func logDriftAdmission(_ admitted: AdmittedRoot, category: String) {
+    private func logDriftAdmission(_ admitted: AdmittedRoot, label: String) {
         guard admitted.viaSiblingDrift else { return }
         appendLog(
-            "ADMITTED [version-drift] \(category): \(admitted.resolvedURL.path)"
+            "ADMITTED [version-drift] \(label): \(admitted.resolvedURL.path)"
             + " (declared: \(admitted.matchedDeclaredRoot.path))"
         )
     }

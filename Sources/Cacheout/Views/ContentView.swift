@@ -95,10 +95,12 @@ struct ContentView: View {
                     .padding(.horizontal)
             }
 
-            // Results list
-            if viewModel.hasResults {
+            // Results list — gated on DISPLAYABLE output, not just items:
+            // an issue-only scan (denied roots, malformed outcome) must
+            // render its warnings, never the empty state (R14/D6).
+            if viewModel.hasDisplayableScanOutput {
                 resultsList
-            } else if !viewModel.isScanning {
+            } else if !viewModel.isAnyScanInProgress {
                 emptyState
             }
 
@@ -140,7 +142,7 @@ struct ContentView: View {
             }
             Spacer()
 
-            if viewModel.isScanning {
+            if viewModel.isAnyScanInProgress {
                 ProgressView()
                     .scaleEffect(0.8)
                     .padding(.trailing, 4)
@@ -156,23 +158,33 @@ struct ContentView: View {
     private var resultsList: some View {
         ScrollView {
             VStack(spacing: 12) {
-                // Cache categories
+                // Cache categories — unchanged CategoryRow inputs, list
+                // identity by composite ItemKey (fn-2.4).
                 LazyVStack(spacing: 2) {
-                    ForEach(viewModel.scanResults) { result in
-                        CategoryRow(result: result) {
-                            viewModel.toggleSelection(for: result.id)
+                    ForEach(viewModel.categoryRows) { row in
+                        CategoryRow(result: row.result) {
+                            viewModel.toggleSelection(for: row.key)
                         }
                     }
                 }
 
-                // Node modules section — also shown when the scan produced
-                // only classified issues (a denied search root must be
-                // visible, never an empty section — R14/D6).
-                if !viewModel.nodeModulesItems.isEmpty
-                    || viewModel.isNodeModulesScanning
-                    || !viewModel.nodeModulesScanIssues.isEmpty {
-                    Divider().padding(.horizontal)
-                    NodeModulesSection()
+                // A malformed category outcome is fail-closed and VISIBLE:
+                // previous rows are retained above, the issue renders here.
+                if !viewModel.categoryScanIssues.isEmpty {
+                    ScanIssuesBlock(issues: viewModel.categoryScanIssues)
+                }
+
+                // One generic section per registered per-item scanner —
+                // also shown when the scan produced only classified issues
+                // (a denied search root must be visible, never an empty
+                // section — R14/D6).
+                ForEach(viewModel.perItemSections) { section in
+                    if !section.items.isEmpty
+                        || section.isScanning
+                        || !section.issues.isEmpty {
+                        Divider().padding(.horizontal)
+                        ScannerItemSection(section: section)
+                    }
                 }
             }
             .padding(.horizontal)
@@ -246,8 +258,11 @@ struct ContentView: View {
                 // Disabled while ANY scan phase runs (R11): confirming
                 // against a half-built result set would clean stale
                 // selections (the model guard in clean() backs this up).
-                .disabled(!viewModel.hasSelection || viewModel.isCleaning || viewModel.isAnyScanInProgress)
-                .help(viewModel.isCleaning ? "Cleanup in progress" : (viewModel.isAnyScanInProgress ? "Scan in progress" : (!viewModel.hasSelection ? "Select at least one item to clean" : "Clean selected items")))
+                // Gates on the CLEANABLE selection, not bare keys: retained
+                // selections under a malformed rescan are display-only and
+                // must not enable a destructive control.
+                .disabled(!viewModel.hasCleanableSelection || viewModel.isCleaning || viewModel.isAnyScanInProgress)
+                .help(viewModel.isCleaning ? "Cleanup in progress" : (viewModel.isAnyScanInProgress ? "Scan in progress" : (!viewModel.hasCleanableSelection ? "Select at least one cleanable item" : "Clean selected items")))
             }
             .padding(.horizontal)
             .padding(.vertical, 10)

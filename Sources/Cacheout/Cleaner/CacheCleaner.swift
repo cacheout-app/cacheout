@@ -295,9 +295,11 @@ actor CacheCleaner {
     ///
     /// FROZEN check order (epic round 13 — a skip must never mask a
     /// malformed shape): (1) structural action/descriptor compatibility on
-    /// EVERY item regardless of state; (2) well-formed `.missing` skip;
-    /// (3) non-`.missing` category-backed zero-record refusal; (4) state
-    /// eligibility (`.denied` refusal, `.empty` no-op, aggregate
+    /// EVERY item regardless of state; (1b) the fn-4.8 MARKED-BUT-
+    /// UNREVALIDATABLE refusal, ordered with (1) for the same reason — a
+    /// state skip must never mask it either; (2) well-formed `.missing`
+    /// skip; (3) non-`.missing` category-backed zero-record refusal;
+    /// (4) state eligibility (`.denied` refusal, `.empty` no-op, aggregate
     /// `.commands`/`.removeContents` zero-measured skip); (5) action
     /// dispatch.
     ///
@@ -332,6 +334,23 @@ actor CacheCleaner {
                 errors.append(Self.itemError(item, refusal))
                 logRefusal(label: item.displayName, tag: "malformed-item",
                            detail: refusal)
+                continue
+            }
+
+            // (1b) MARKED, but this cleaner holds no revalidator for its
+            // scanner (fn-4.8) — fail closed HERE, ordered with (1) rather
+            // than at the destructive chokepoint: a `.missing`/`.empty`
+            // skip or a `.denied` refusal below would otherwise SWALLOW the
+            // condition, and a marked item that cannot be re-inspected must
+            // always SURFACE as its own item-keyed error, never as a silent
+            // no-op or a differently-worded refusal. The chokepoint keeps
+            // the same check as defense in depth.
+            if let refusal = Self.missingRevalidatorRefusal(
+                for: item, registry: preDeleteRevalidators
+            ) {
+                errors.append(Self.itemError(item, refusal))
+                logRefusal(label: item.displayName,
+                           tag: "revalidator-unavailable", detail: refusal)
                 continue
             }
 
@@ -627,6 +646,28 @@ actor CacheCleaner {
 
     // MARK: - Pre-delete revalidation seam (fn-4.8, R17/D8)
 
+    /// The UNIFORM fail-closed refusal for an item that carries the
+    /// scanner-agnostic `requiresPreDeleteRevalidation` marker while this
+    /// cleaner holds NO revalidator for its scanner — a `CacheCleaner` built
+    /// directly (bypassing `SpaceScannerRuntime.makeCleaner`), or a scanner
+    /// that lost its declaration. `nil` for an unmarked item, and for any
+    /// item whose scanner IS registered.
+    ///
+    /// One helper, two call sites (check (1b) and the chokepoint) so the
+    /// refusal can never diverge in wording or in condition.
+    private static func missingRevalidatorRefusal(
+        for item: ReclaimableItem,
+        registry: [String: PreDeleteRevalidator]
+    ) -> String? {
+        guard item.requiresPreDeleteRevalidation,
+              registry[item.scannerID] == nil
+        else { return nil }
+        return "refused: this item requires a pre-delete revalidation, but "
+            + "no revalidator is registered for scanner "
+            + "'\(item.scannerID)' — clean it through the runtime that "
+            + "registered its scanner"
+    }
+
     /// The chokepoint's revalidation decision for ONE item, with ITS
     /// authorization entry. `nil` means "nothing here stands in the way" —
     /// never a grant (every other gate still applies).
@@ -648,18 +689,17 @@ actor CacheCleaner {
     private func preDeleteRefusal(
         for item: ReclaimableItem, authorization: String?
     ) -> (reason: String, tag: String)? {
-        guard let revalidator = preDeleteRevalidators[item.scannerID] else {
-            guard item.requiresPreDeleteRevalidation else { return nil }
-            // Fail closed: the item structurally demands a re-inspection
-            // this cleaner cannot perform.
-            return (
-                "refused: this item requires a pre-delete revalidation, but "
-                    + "no revalidator is registered for scanner "
-                    + "'\(item.scannerID)' — clean it through the runtime "
-                    + "that registered its scanner",
-                "revalidator-unavailable"
-            )
+        // DEFENSE IN DEPTH: check (1b) already refused this shape before any
+        // state skip could hide it; re-checking here keeps the destructive
+        // chokepoint independently fail-closed for any future caller,
+        // through the SAME helper so the two can never word it differently.
+        if let refusal = Self.missingRevalidatorRefusal(
+            for: item, registry: preDeleteRevalidators
+        ) {
+            return (refusal, "revalidator-unavailable")
         }
+        guard let revalidator = preDeleteRevalidators[item.scannerID]
+        else { return nil }
         guard item.requiresPreDeleteRevalidation
             || revalidator.requiresRevalidation(item: item)
         else { return nil }

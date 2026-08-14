@@ -2242,6 +2242,68 @@ final class CacheCleanerTests: XCTestCase {
         )
     }
 
+    func testMarkedItemWithoutRegistryRefusesBeforeAnyStateSkip() async throws {
+        // Review r1: the fail-closed marker check is ordered WITH the
+        // structural check, not at the destructive chokepoint — otherwise a
+        // `.missing`/`.empty` skip or a `.denied` refusal would SWALLOW it
+        // and a marked item that cannot be re-inspected would leave no
+        // trace. An empty build-artifact directory is a real emission
+        // (`.empty` items exist), so this is not a hypothetical shape.
+        let (home, _, artifact, snapshot) = try makeArtifactFixture()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let devRoot = home.appendingPathComponent("dev")
+
+        let states: [ScanState] = [.missing, .empty, .denied]
+        let marked = states.enumerated().map { index, state in
+            makeRemoveItem(
+                id: "marked-\(index)",
+                scannerID: BuildArtifactsScanner.registeredID,
+                origin: devRoot, target: artifact, state: state,
+                autoEligible: false, requiresRevalidation: true
+            )
+        }
+        let cleaner = CacheCleaner(
+            home: home, containerRoots: [devRoot], containerSnapshot: snapshot
+        )
+        let report = await cleaner.clean(items: marked, moveToTrash: false)
+
+        XCTAssertTrue(report.entries.isEmpty)
+        XCTAssertEqual(report.errors.count, states.count,
+                       "every marked item surfaces its own item-keyed error")
+        XCTAssertEqual(Set(report.errors.map(\.key)), Set(marked.map(\.key)))
+        for error in report.errors {
+            XCTAssertTrue(
+                error.message.contains("no revalidator is registered"),
+                "a state skip must not mask the fail-closed refusal: "
+                    + error.message
+            )
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: artifact.path))
+
+        // With the registry present, the SAME items behave exactly as they
+        // always did: `.missing`/`.empty` are silent no-ops and `.denied`
+        // refuses for its scan state — check (1b) changes nothing for a
+        // cleaner that can actually revalidate.
+        let equipped = CacheCleaner(
+            home: home, containerRoots: [devRoot], containerSnapshot: snapshot,
+            preDeleteRevalidators: [
+                BuildArtifactsScanner.registeredID:
+                    BuildArtifactsScanner.preDeleteRevalidator(
+                        provider: FileSystemIdentityProvider()
+                    )
+            ]
+        )
+        let second = await equipped.clean(items: marked, moveToTrash: false)
+        XCTAssertTrue(second.entries.isEmpty)
+        XCTAssertEqual(second.errors.count, 1, "only the `.denied` item errors")
+        XCTAssertEqual(second.errors.first?.key, marked[2].key)
+        XCTAssertFalse(
+            try XCTUnwrap(second.errors.first?.message)
+                .contains("no revalidator is registered"),
+            second.errors.first?.message ?? ""
+        )
+    }
+
     func testUnmarkedItemOfScannerWithoutRevalidatorIsUnaffected() async throws {
         // The no-regression half of the same contract: an UNMARKED item of
         // a scanner with no registered revalidator (and no predicate to ask)

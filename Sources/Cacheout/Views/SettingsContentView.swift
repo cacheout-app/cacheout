@@ -16,6 +16,10 @@ struct SettingsContentView: View {
     /// Optional SPUUpdater — nil in previews/tests; non-nil at runtime via CacheoutApp.
     let updater: SPUUpdater?
 
+    /// The dev-roots editor's typed path field (fn-4.6). View-local: nothing
+    /// is persisted until `addDevRoot` accepts it.
+    @State private var devRootInput = ""
+
     var body: some View {
         TabView {
             generalTab
@@ -154,6 +158,8 @@ struct SettingsContentView: View {
 
     private var advancedTab: some View {
         Form {
+            devRootsSection
+
             Section {
                 LabeledContent("Categories scanned") {
                     Text("\(CacheCategory.allCategories.count)")
@@ -196,5 +202,106 @@ struct SettingsContentView: View {
         }
         .formStyle(.grouped)
         .padding()
+    }
+
+    // MARK: - Dev roots (fn-4.6, R8/R16) — the FIRST scanner-config GUI
+
+    /// The dev-roots list editor: the folders the build-artifacts scanner
+    /// walks, with add (folder picker or typed path), remove, and
+    /// reset-to-defaults. Every mutation goes through the injected
+    /// `DevRootsStore` and then rebuilds the runtime through fn-4.10's
+    /// factory seam (`devRootsDidChange()`) — this view never constructs a
+    /// runtime and never persists anything itself.
+    ///
+    /// Add-time validation calls the SHARED container-root admission policy
+    /// through the store (R16 — no UI-local duplicate): a dangerous pick
+    /// (`/`, a volume root, `$HOME`, or a symlink alias of any of them) is
+    /// refused INLINE and changes nothing, while protected children like
+    /// `~/Documents` are legal dev roots and are accepted.
+    private var devRootsSection: some View {
+        Section {
+            if viewModel.isDevRootsEditorAvailable {
+                ForEach(viewModel.devRootRows) { row in
+                    HStack(alignment: .firstTextBaseline) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(row.displayPath)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                            // A policy-refused persisted root is never
+                            // registered and never walked — the row says so
+                            // instead of implying it is being scanned.
+                            if let detail = row.issueDetail {
+                                Label(detail, systemImage: "exclamationmark.triangle.fill")
+                                    .font(.caption2)
+                                    .foregroundStyle(.orange)
+                            }
+                        }
+                        Spacer()
+                        Button {
+                            viewModel.removeDevRoot(row.declaredPath)
+                        } label: {
+                            Image(systemName: "minus.circle")
+                        }
+                        .buttonStyle(.borderless)
+                        .help("Remove \(row.displayPath)")
+                        .accessibilityLabel("Remove \(row.displayPath)")
+                    }
+                }
+
+                HStack(spacing: 8) {
+                    TextField("~/dev or /Volumes/Work/code", text: $devRootInput)
+                        .textFieldStyle(.roundedBorder)
+                        .onSubmit { submitDevRoot() }
+                    Button("Add") { submitDevRoot() }
+                        .disabled(devRootInput.trimmingCharacters(
+                            in: .whitespacesAndNewlines
+                        ).isEmpty)
+                    Button("Choose…") { chooseDevRoot() }
+                    Spacer()
+                    Button("Reset") { viewModel.resetDevRootsToDefaults() }
+                        .help("Back to the default dev roots")
+                }
+
+                // INLINE add-time rejection — the shared policy's own reason.
+                if let rejection = viewModel.devRootRejection {
+                    Label(rejection, systemImage: "xmark.octagon.fill")
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                }
+
+                Text("Folders scanned for build artifacts (target/, "
+                     + "node_modules/, .build/, …). Changes apply to the next "
+                     + "scan.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                Text("Dev roots aren't configurable in this window.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        } header: {
+            Text("Project Dev Roots")
+        }
+    }
+
+    private func submitDevRoot() {
+        let input = devRootInput
+        viewModel.addDevRoot(input)
+        // Keep a REFUSED value in the field so the user can correct it;
+        // clear it only when the add actually landed.
+        if viewModel.devRootRejection == nil { devRootInput = "" }
+    }
+
+    /// Folder picker — an absolute path, which the shared policy validates
+    /// exactly like a typed one (the picker is a convenience, never a
+    /// bypass).
+    private func chooseDevRoot() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Add Dev Root"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        viewModel.addDevRoot(url.path)
     }
 }

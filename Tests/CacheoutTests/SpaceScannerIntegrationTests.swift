@@ -826,6 +826,208 @@ final class SpaceScannerIntegrationTests: XCTestCase {
                       "the artifact directory survives an unacknowledged CLI clean")
     }
 
+    // MARK: - fn-4.6 (R17): the sheet's authorization reaches the revalidator
+
+    /// A rust project whose `target/` holds one release DMG above the
+    /// shared allocated floor. Returns (artifact dir, dmg).
+    private func makeValuableBearingProject(
+        under dev: URL, name: String = "rust", dmg dmgName: String = "App.dmg"
+    ) throws -> (target: URL, dmg: URL) {
+        let target = try makeMarkerProject(
+            at: dev.appendingPathComponent(name),
+            marker: "Cargo.toml", artifact: "target"
+        )
+        let dmg = target.appendingPathComponent("release/bundle/\(dmgName)")
+        try fm.createDirectory(
+            at: dmg.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        try Data(
+            repeating: 0xAB,
+            count: Int(ValuablesDetector.minimumAllocatedBytes) + 1_000_000
+        ).write(to: dmg)
+        return (target, dmg)
+    }
+
+    /// THE GUI end-to-end proof (R3 + R17): the item is DISPLAYED in the
+    /// confirmation sheet with its valuable, the confirm action builds the
+    /// authorization context from exactly that displayed set, the context
+    /// travels the clean path into the cleaner, the revalidator's
+    /// delete-time recomputation MATCHES — and the directory is deleted.
+    ///
+    /// The negative control is one line away: the SAME fixture cleaned
+    /// through the unauthorized `clean()` path is refused
+    /// (`testValuableBearingItemIsRevalidatorEnforcedFromItsFirstAddressableMoment`).
+    @MainActor
+    func testSheetConfirmAuthorizesTheDisplayedSetAndDeletesTheItem() async throws {
+        let dev = base.appendingPathComponent("dev")
+        let (target, dmg) = try makeValuableBearingProject(under: dev)
+
+        let viewModel = CacheoutViewModel(runtime: productionRuntime(devRoots: [dev]))
+        viewModel.moveToTrash = false
+        await viewModel.scan(
+            trigger: .userInitiated,
+            scannerIDs: [BuildArtifactsScanner.registeredID]
+        )
+        let item = try XCTUnwrap(
+            viewModel.items(forScanner: BuildArtifactsScanner.registeredID).first
+        )
+        viewModel.toggleSelection(for: item.key)
+
+        // The SHEET displays the valuable — name, size and modified date
+        // derived from the stored identity integers, reveal bound to the
+        // discovered spelling.
+        let row = try XCTUnwrap(viewModel.confirmationRows.first)
+        XCTAssertFalse(row.isBlocked)
+        XCTAssertEqual(row.valuables.map(\.name), ["App.dmg"])
+        XCTAssertEqual(row.valuables.first?.revealURL.path, dmg.path)
+        XCTAssertFalse(
+            try XCTUnwrap(row.valuables.first?.formattedModified).isEmpty
+        )
+
+        // The context the confirm action will pass down: ONE entry, for
+        // exactly this displayed item.
+        let context = viewModel.confirmationAuthorization
+        XCTAssertEqual(Set(context.keys), [item.key])
+        XCTAssertEqual(
+            context[item.key],
+            item.valuablesDisclosure?.acknowledgementToken(for: item.key)
+        )
+
+        await viewModel.confirmClean()
+
+        let report = try XCTUnwrap(viewModel.lastReport)
+        XCTAssertEqual(report.errors.map(\.message), [],
+                       "the acknowledgement reached the revalidator")
+        XCTAssertEqual(report.entries.map(\.key), [item.key])
+        XCTAssertFalse(fm.fileExists(atPath: target.path),
+                       "an ACKNOWLEDGED valuable-bearing item deletes")
+        XCTAssertFalse(fm.fileExists(atPath: dmg.path))
+    }
+
+    /// The same path when the disclosed evidence CHANGED since the scan: the
+    /// delete-time probe recomputes a DIFFERENT token, so the sheet's
+    /// acknowledgement no longer covers what is there — a FRESH refusal with
+    /// the current valuables and a fresh token, and nothing deleted.
+    @MainActor
+    func testSheetConfirmRefusesFreshlyWhenTheValuableChangedSinceScan() async throws {
+        let dev = base.appendingPathComponent("dev")
+        let (target, dmg) = try makeValuableBearingProject(under: dev)
+
+        let viewModel = CacheoutViewModel(runtime: productionRuntime(devRoots: [dev]))
+        viewModel.moveToTrash = false
+        await viewModel.scan(
+            trigger: .userInitiated,
+            scannerIDs: [BuildArtifactsScanner.registeredID]
+        )
+        let item = try XCTUnwrap(
+            viewModel.items(forScanner: BuildArtifactsScanner.registeredID).first
+        )
+        viewModel.toggleSelection(for: item.key)
+        let scanToken = try XCTUnwrap(viewModel.confirmationAuthorization[item.key])
+
+        // A NEW build lands a second release artifact inside the directory
+        // between the sheet and the confirm — set membership changed, so the
+        // token the user acknowledged is stale by construction.
+        try Data(
+            repeating: 0xCD,
+            count: Int(ValuablesDetector.minimumAllocatedBytes) + 2_000_000
+        ).write(to: dmg.deletingLastPathComponent()
+            .appendingPathComponent("Later.pkg"))
+
+        await viewModel.confirmClean()
+
+        let report = try XCTUnwrap(viewModel.lastReport)
+        XCTAssertEqual(report.entries.map(\.key), [], "nothing was deleted")
+        let error = try XCTUnwrap(report.errors.first)
+        XCTAssertEqual(error.key, item.key)
+        let refusal = try XCTUnwrap(
+            error.refusal, "a valuables refusal carries the typed payload"
+        )
+        XCTAssertEqual(refusal.valuables.map(\.name).sorted(),
+                       ["App.dmg", "Later.pkg"],
+                       "the refusal lists the CURRENT delete-time set")
+        let freshToken = try XCTUnwrap(refusal.acknowledgementToken)
+        XCTAssertNotEqual(freshToken, scanToken,
+                          "a changed set ROTATES the token")
+        XCTAssertEqual(freshToken.count, 64)
+        XCTAssertTrue(fm.fileExists(atPath: target.path))
+        XCTAssertTrue(fm.fileExists(atPath: dmg.path))
+    }
+
+    /// R17's incomplete cell, end to end: an item whose probe could not
+    /// finish stays VISIBLE and SELECTED in the sheet in its blocked state,
+    /// the confirm action filters its key out of BOTH the authorization
+    /// context and the CLEAN SET — the cleaner provably never sees it (no
+    /// entry, no error, the directory intact) — and the OTHER selected item
+    /// is cleaned in the same invocation.
+    @MainActor
+    func testConfirmSkipsBlockedItemsEntirelyAndCleansTheRest() async throws {
+        let dev = base.appendingPathComponent("dev")
+        let (target, dmg) = try makeValuableBearingProject(under: dev)
+        let otherContainer = base.appendingPathComponent("plain")
+        let plainTarget = otherContainer.appendingPathComponent("junk")
+        try makePayloadTree(at: plainTarget)
+
+        // The REAL scanner and its REAL revalidator, with a probe entry cap
+        // of 1 so the scan-time inspection cannot finish (the production
+        // caps are unreachable from `production()`).
+        let provider = FileSystemIdentityProvider()
+        let truncated = BuildArtifactsScanner(
+            home: fixtureHome, devRoots: devRoots([dev]), provider: provider,
+            valuablesProbeEntryLimit: 1
+        )
+        let runtime = try SpaceScannerRuntime(
+            scanners: [
+                truncated,
+                TempTreeScanner(id: "fixture_e2e_tree", container: otherContainer),
+            ],
+            categories: [], home: fixtureHome, provider: provider
+        )
+        let viewModel = CacheoutViewModel(runtime: runtime)
+        viewModel.moveToTrash = false
+        await viewModel.scan(trigger: .userInitiated)
+
+        let blockedItem = try XCTUnwrap(
+            viewModel.items(forScanner: BuildArtifactsScanner.registeredID).first
+        )
+        let plainItem = try XCTUnwrap(
+            viewModel.items(forScanner: "fixture_e2e_tree").first
+        )
+        XCTAssertEqual(
+            blockedItem.valuablesDisclosure?.probeComplete, false,
+            "the capped probe could not finish"
+        )
+        viewModel.toggleSelection(for: blockedItem.key)
+        viewModel.toggleSelection(for: plainItem.key)
+
+        // SELECTION IS UNCHANGED and the blocked row is still RENDERED —
+        // deselecting would hide the very warning the user must see.
+        let rows = viewModel.confirmationRows
+        XCTAssertEqual(Set(rows.map(\.key)), [blockedItem.key, plainItem.key])
+        XCTAssertEqual(viewModel.selectedItemKeys,
+                       [blockedItem.key, plainItem.key])
+        XCTAssertTrue(
+            try XCTUnwrap(rows.first { $0.key == blockedItem.key }).isBlocked
+        )
+        XCTAssertEqual(viewModel.blockedConfirmationKeys, [blockedItem.key])
+        XCTAssertEqual(viewModel.confirmableSelectedCount, 1,
+                       "the sheet quotes only what confirm will act on")
+        XCTAssertTrue(viewModel.confirmationAuthorization.isEmpty)
+
+        await viewModel.confirmClean()
+
+        let report = try XCTUnwrap(viewModel.lastReport)
+        XCTAssertEqual(report.entries.map(\.key), [plainItem.key],
+                       "confirm proceeds for the remaining items")
+        XCTAssertEqual(report.errors.map(\.key), [],
+                       "the blocked item never reached the cleaner — not "
+                           + "even as a refusal")
+        XCTAssertTrue(fm.fileExists(atPath: target.path),
+                      "the blocked item's directory is untouched")
+        XCTAssertTrue(fm.fileExists(atPath: dmg.path))
+        XCTAssertFalse(fm.fileExists(atPath: plainTarget.path))
+    }
+
     // MARK: - R4: the zero-edit grep gate
 
     /// Registering the fixture scanners above took ZERO production edits —

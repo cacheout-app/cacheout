@@ -106,6 +106,32 @@ struct CategoryRowModel: Identifiable {
     var id: ItemKey { key }
 }
 
+/// One disclosed release artifact inside a confirmation row's item (fn-4.6,
+/// R3): what the sheet SHOWS, derived from fn-4.4's structured
+/// `DetectedValuable` — never re-probed, never re-sorted, never parsed out of
+/// an evidence string.
+///
+/// The rendered date DERIVES from the `ValuableIdentity` integers (no `Date`
+/// exists in the identity path); the wire-only identity fields
+/// (`device`/`inode`) are deliberately NOT rendered — they are token and
+/// wire material, not human evidence.
+struct ConfirmationValuableRowModel: Identifiable, Equatable {
+    /// Basename as discovered.
+    let name: String
+    let formattedSize: String
+    /// Human modification date, derived from the identity integers.
+    let formattedModified: String
+    /// The UNRESOLVED display spelling — reveal-in-Finder's only input
+    /// (`DetectedValuable.displayURL`). The canonical identity path is
+    /// wire/token material and is never revealed or rendered.
+    let revealURL: URL
+    /// List identity: the canonical identity path — unique per valuable
+    /// within an item by construction (it is the dedupe key of the
+    /// disclosure's canonical order).
+    let identityPath: String
+    var id: String { identityPath }
+}
+
 /// One selected item in the clean-confirmation sheet's UNIFIED itemization
 /// (fn-2.5): category aggregates and per-item scanner rows flow through ONE
 /// row shape, and every row carries its item's `evidence` string — evidence
@@ -123,7 +149,47 @@ struct ConfirmationRowModel: Identifiable {
     /// Rendered under the row verbatim. Aggregates carry description-grade
     /// evidence (the category description) — honest, never padded.
     let evidence: String
+    /// The item's DISCLOSED release artifacts (fn-4.4), in their STORED
+    /// canonical order — consumed as-is (R3: no re-derivation, no re-probe,
+    /// no re-sort at sheet time). Empty for every item that discloses none,
+    /// which renders exactly as it always did.
+    let valuables: [ConfirmationValuableRowModel]
+    /// Non-nil when the item's release-artifact inspection did NOT finish
+    /// (R17's uniform incomplete rule). The row STAYS VISIBLE in this
+    /// blocked/warning state with rescan guidance — selection is deliberately
+    /// unchanged, because `confirmationRows` derives live from the selection
+    /// and deselecting would hide the very warning the user must see — while
+    /// the confirm ACTION filters this key out of BOTH the authorization
+    /// context and the clean set.
+    let blockedReason: String?
+    var isBlocked: Bool { blockedReason != nil }
     var id: ItemKey { key }
+}
+
+/// One declared dev root in the Settings editor (fn-4.6, R8/R16). Pure
+/// presentation over `DevRootsStore`'s declared list plus the resolution's
+/// classified issues — SwiftUI renders this and nothing else.
+struct DevRootRowModel: Identifiable, Equatable {
+    /// Position in the declared list — LIST IDENTITY: declared strings are
+    /// user input and can repeat, so the path is not a safe id.
+    let index: Int
+    /// The exact declared string persisted (what `remove` takes).
+    let declaredPath: String
+    /// Home-collapsed spelling for display only.
+    let displayPath: String
+    /// Non-nil when the shared container-root policy REFUSED this persisted
+    /// root: it is never registered and never walked, and the row says so
+    /// instead of pretending it is being scanned (R16).
+    let issueDetail: String?
+    var isRefused: Bool { issueDetail != nil }
+    var id: Int { index }
+}
+
+/// A dev-root INPUT-FORM refusal (fn-4.6): the path the user typed is not a
+/// supported spelling. Distinct from a POLICY refusal, which comes from the
+/// shared container-root policy and carries its own reason.
+struct DevRootInputRefusal: Error, Equatable {
+    let message: String
 }
 
 /// One per-item scanner's section (every scanner except the aggregate
@@ -383,6 +449,12 @@ class CacheoutViewModel: ObservableObject {
         self.lowDiskThresholdGB = storedThreshold > 0 ? storedThreshold : 10
 
         self.launchAtLogin = UserDefaults.standard.bool(forKey: "cacheout.launchAtLogin")
+
+        // The Settings dev-roots editor renders from persisted state, so its
+        // rows exist from construction (fn-4.6). Empty — and untouched —
+        // while the reconstruction seam is unwired: there is no store to
+        // read and nothing the editor could mutate.
+        refreshDevRootRows()
     }
 
     /// THE PRODUCTION COMPOSITION (fn-4.5) — the app's one construction site
@@ -570,9 +642,144 @@ class CacheoutViewModel: ObservableObject {
                 label: label,
                 formattedSize: ByteCountFormatter.sharedFile
                     .string(fromByteCount: item.allocatedBytes),
-                evidence: item.evidence
+                evidence: item.evidence,
+                valuables: valuableRows(for: item),
+                blockedReason: blockedReason(for: item)
             )
         }
+    }
+
+    // MARK: Valuables in the sheet (fn-4.6, R3/R17)
+
+    /// The rescan guidance an INCOMPLETE-probed row carries. Absence of
+    /// valuables is meaningful only when the inspection actually finished,
+    /// so the item is unauthorizable — the row says why and what to do, and
+    /// the confirm action skips it.
+    nonisolated static let incompleteProbeSheetGuidance =
+        "Couldn't fully inspect this folder for release artifacts (.dmg, "
+        + ".pkg, .app, …), so it can't be cleaned yet — scan again and "
+        + "retry. It will be SKIPPED by this cleanup."
+
+    /// The item's DISCLOSED valuables as sheet rows — read DIRECTLY off
+    /// fn-4.4's structured field in its STORED canonical order (R3): no
+    /// re-probe, no filesystem read, no evidence-string parsing, no re-sort.
+    /// The reveal click is the sheet's only filesystem touch.
+    nonisolated static func valuableRows(
+        for item: ReclaimableItem
+    ) -> [ConfirmationValuableRowModel] {
+        (item.valuablesDisclosure?.valuables ?? []).map { valuable in
+            ConfirmationValuableRowModel(
+                name: valuable.name,
+                formattedSize: ByteCountFormatter.sharedFile
+                    .string(fromByteCount: valuable.identity.allocatedBytes),
+                formattedModified: formattedModified(valuable.identity),
+                revealURL: valuable.displayURL,
+                identityPath: valuable.canonicalIdentityPath
+            )
+        }
+    }
+
+    /// The human modification date, DERIVED from the `ValuableIdentity`
+    /// integers (fn-4.4: no `Date` exists in the identity path). Out-of-
+    /// domain integers — unreachable for anything the validator admitted —
+    /// render as unknown rather than as an invented instant.
+    nonisolated static func formattedModified(
+        _ identity: ValuableIdentity
+    ) -> String {
+        guard let nanoseconds = identity.modifiedAtNanoseconds else {
+            return "modified date unavailable"
+        }
+        let seconds = Double(nanoseconds)
+            / Double(ValuableIdentity.nanosecondsPerSecond)
+        return valuableDateFormatter
+            .string(from: Date(timeIntervalSince1970: seconds))
+    }
+
+    private nonisolated static let valuableDateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
+        return formatter
+    }()
+
+    /// Why this row is blocked, or nil. The ONE rule (R17): a probe that
+    /// could not finish is unauthorizable and tokenless everywhere. Items
+    /// with no valuables model at all (`nil` disclosure — every scanner but
+    /// `build_artifacts`) are never blocked.
+    nonisolated static func blockedReason(
+        for item: ReclaimableItem
+    ) -> String? {
+        guard let disclosure = item.valuablesDisclosure,
+              !disclosure.probeComplete else { return nil }
+        return incompleteProbeSheetGuidance
+    }
+
+    /// The keys the confirm action must filter out of BOTH the authorization
+    /// context and the clean set — exactly the rows rendered blocked above.
+    nonisolated static func blockedConfirmationKeys(
+        for selectedItems: [ReclaimableItem]
+    ) -> Set<ItemKey> {
+        Set(selectedItems.filter { blockedReason(for: $0) != nil }.map(\.key))
+    }
+
+    /// THE per-clean `[ItemKey: acknowledgement]` AUTHORIZATION CONTEXT the
+    /// confirmation sheet's confirm action produces (R17): ONE entry per
+    /// DISPLAYED, COMPLETE-probed, valuable-BEARING item, its token computed
+    /// from exactly the displayed set — acknowledgement covers precisely what
+    /// the user saw and nothing more.
+    ///
+    /// Items without valuables get NO entry (there is no empty-set token
+    /// anywhere), and an INCOMPLETE-probed item gets none either — its token
+    /// derivation returns nil by its own precondition, and the caller has
+    /// already filtered it out of the clean set.
+    nonisolated static func confirmationAuthorization(
+        for displayedItems: [ReclaimableItem]
+    ) -> PreDeleteAuthorizationContext {
+        var context: PreDeleteAuthorizationContext = [:]
+        for item in displayedItems {
+            guard let disclosure = item.valuablesDisclosure,
+                  let token = disclosure.acknowledgementToken(for: item.key)
+            else { continue }
+            context[item.key] = token
+        }
+        return context
+    }
+
+    /// The authorization context for the CURRENT sheet contents — the
+    /// view-model-level assertion surface for R17's "one entry per displayed
+    /// complete-probed valuable-bearing item".
+    var confirmationAuthorization: PreDeleteAuthorizationContext {
+        Self.confirmationAuthorization(for: confirmableSelectedItems)
+    }
+
+    /// The sheet's blocked rows (visible, warned, unauthorizable).
+    var blockedConfirmationKeys: Set<ItemKey> {
+        Self.blockedConfirmationKeys(for: selectedItems)
+    }
+
+    /// What the confirm action will ACTUALLY clean: the displayed selection
+    /// minus the blocked rows. Selection itself is untouched — only the
+    /// action filters.
+    var confirmableSelectedItems: [ReclaimableItem] {
+        let blocked = blockedConfirmationKeys
+        return selectedItems.filter { !blocked.contains($0.key) }
+    }
+
+    var confirmableSelectedCount: Int { confirmableSelectedItems.count }
+
+    /// The bytes the confirm action will act on — blocked rows excluded, so
+    /// the sheet never quotes a total it will not clean (the same honesty
+    /// rule `totalCleanableSelectedSize` encodes for malformed-blocked
+    /// scanners).
+    var confirmableSelectedSize: Int64 {
+        confirmableSelectedItems.reduce(Int64(0)) {
+            $0.saturatingAdding($1.allocatedBytes)
+        }
+    }
+
+    var formattedConfirmableSelectedSize: String {
+        ByteCountFormatter.sharedFile
+            .string(fromByteCount: confirmableSelectedSize)
     }
 
     /// The category scanner emits no outcome-level errors by design; this
@@ -784,6 +991,10 @@ class CacheoutViewModel: ObservableObject {
             devRoots: reconstruction.devRootsStore
                 .effectiveRoots(home: reconstruction.home)
         )
+        // The Settings editor's rows describe the SAME persisted state the
+        // rebuild was requested for — refreshed here, in the one funnel every
+        // mutation goes through, never inside a SwiftUI body (fn-4.6).
+        refreshDevRootRows()
     }
 
     /// Apply now, or DEFER to the end of the in-flight session
@@ -827,6 +1038,162 @@ class CacheoutViewModel: ObservableObject {
         objectWillChange.send()
         runtime = reconstruction.makeRuntime(devRoots)
         runtimeGeneration += 1
+    }
+
+    // MARK: - Dev-roots Settings editor (fn-4.6, R8/R16)
+
+    /// The declared dev roots the Settings editor renders — refreshed
+    /// through the ONE mutation funnel below (and at construction), never
+    /// re-derived inside a SwiftUI body.
+    @Published private(set) var devRootRows: [DevRootRowModel] = []
+
+    /// The INLINE add-time rejection the editor shows, or nil. Set only by
+    /// `addDevRoot` — a rejected pick is never persisted and never rebuilds
+    /// anything.
+    @Published private(set) var devRootRejection: String?
+
+    /// Whether the editor can function at all: without the reconstruction
+    /// seam there is no store to mutate and no factory to rebuild with, so
+    /// the Settings surface says so instead of pretending to persist.
+    var isDevRootsEditorAvailable: Bool { reconstruction != nil }
+
+    /// ADD (R8/R16): normalize the input to a declared string that resolves
+    /// back to the URL being validated, run the SHARED container-root
+    /// admission policy through the store (never a UI-local duplicate), and
+    /// only then persist + rebuild. A refusal sets `devRootRejection` and
+    /// changes NOTHING.
+    func addDevRoot(_ input: String) {
+        guard let reconstruction else { return }
+        let home = reconstruction.home
+        switch Self.devRootDeclaration(for: input, home: home) {
+        case .failure(let refusal):
+            devRootRejection = refusal.message
+        case .success(let declared):
+            let url = DevRootsStore.declaredURL(for: declared, home: home)
+            do {
+                try reconstruction.devRootsStore
+                    .validateCandidateRoot(url, home: home)
+            } catch {
+                devRootRejection = Self.devRootRefusal(path: url.path, error: error)
+                return
+            }
+            devRootRejection = nil
+            reconstruction.devRootsStore.add(declared)
+            devRootsDidChange()
+        }
+    }
+
+    /// REMOVE (R8): every exact-string occurrence, through the store.
+    func removeDevRoot(_ declaredPath: String) {
+        guard let reconstruction else { return }
+        devRootRejection = nil
+        reconstruction.devRootsStore.remove(declaredPath)
+        devRootsDidChange()
+    }
+
+    /// RESET (R8): back to the seeds — the persisted key is removed
+    /// entirely (seeds are a fallback, never persisted).
+    func resetDevRootsToDefaults() {
+        guard let reconstruction else { return }
+        devRootRejection = nil
+        reconstruction.devRootsStore.resetToDefaults()
+        devRootsDidChange()
+    }
+
+    /// Re-derives the editor rows from what is actually persisted. Called
+    /// at construction and after every mutation (inside `devRootsDidChange`),
+    /// so the rows and the composition in force always describe one state.
+    func refreshDevRootRows() {
+        guard let reconstruction else {
+            devRootRows = []
+            return
+        }
+        let store = reconstruction.devRootsStore
+        devRootRows = Self.devRootRows(
+            declaredPaths: store.declaredPaths(),
+            issues: store.effectiveRoots(home: reconstruction.home).issues,
+            home: reconstruction.home
+        )
+    }
+
+    /// Pure row derivation (XCTest asserts on this directly): one row per
+    /// DECLARED path, carrying the refusal detail of the `.containerRefused`
+    /// issue that names it — a policy-rejected persisted root is visible in
+    /// the editor exactly as it is visible in the scan results (R16).
+    nonisolated static func devRootRows(
+        declaredPaths: [String], issues: [ScanIssue], home: URL
+    ) -> [DevRootRowModel] {
+        let refusalsByPath = Dictionary(
+            issues
+                .filter { $0.kind == .containerRefused }
+                .compactMap { issue -> (String, String)? in
+                    guard let url = issue.url else { return nil }
+                    return (url.standardizedFileURL.path, issue.detail)
+                },
+            uniquingKeysWith: { first, _ in first }
+        )
+        return declaredPaths.enumerated().map { index, declared in
+            let url = DevRootsStore.declaredURL(for: declared, home: home)
+            return DevRootRowModel(
+                index: index,
+                declaredPath: declared,
+                displayPath: homeCollapsed(url.path, home: home),
+                issueDetail: refusalsByPath[url.standardizedFileURL.path]
+            )
+        }
+    }
+
+    /// The editor's input rule (pure, testable): ABSOLUTE paths and
+    /// `~`-EXPANDED paths are accepted; a bare name stays HOME-RELATIVE
+    /// exactly like the seeds (`Documents`), which is what the store's
+    /// declared-string convention means. A `~user`-style spelling is
+    /// REFUSED rather than silently persisted as a literal `~user`
+    /// directory name under home.
+    ///
+    /// Returns the string to PERSIST — always one that
+    /// `DevRootsStore.declaredURL` maps back to the validated URL, so the
+    /// editor can never validate one path and the scanner walk another.
+    nonisolated static func devRootDeclaration(
+        for input: String, home: URL
+    ) -> Result<String, DevRootInputRefusal> {
+        let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return .failure(DevRootInputRefusal(
+                message: "Enter a folder path, or choose one with Choose…"
+            ))
+        }
+        if trimmed == "~" {
+            return .success(home.path)
+        }
+        if trimmed.hasPrefix("~/") {
+            return .success(
+                home.appendingPathComponent(String(trimmed.dropFirst(2))).path
+            )
+        }
+        guard !trimmed.hasPrefix("~") else {
+            return .failure(DevRootInputRefusal(message:
+                "'\(trimmed)' isn't a supported path — use an absolute path "
+                + "(/Users/you/dev), a ~/ path (~/dev), or a folder name "
+                + "inside your home folder (Documents)."
+            ))
+        }
+        return .success(trimmed)
+    }
+
+    /// The INLINE refusal copy: the offending path plus the shared policy's
+    /// own reason (never a re-worded UI-side guess at why).
+    nonisolated static func devRootRefusal(path: String, error: Error) -> String {
+        let reason = (error as? LocalizedError)?.errorDescription
+            ?? String(describing: error)
+        return "\(path) can't be used as a dev root: \(reason)"
+    }
+
+    /// Display-only home collapsing (`/Users/you/dev` → `~/dev`).
+    nonisolated static func homeCollapsed(_ path: String, home: URL) -> String {
+        let homePath = home.standardizedFileURL.path
+        if path == homePath { return "~" }
+        guard path.hasPrefix(homePath + "/") else { return path }
+        return "~" + path.dropFirst(homePath.count)
     }
 
     /// Applies the deferred replacement at session end. Re-checks the guard:
@@ -1239,7 +1606,45 @@ class CacheoutViewModel: ObservableObject {
     /// fn-2.3's unified entry on the RUNTIME-constructed cleaner — one
     /// composition source, so delete-time admission covers exactly the
     /// registered scanners' declared container roots.
+    ///
+    /// UNACKNOWLEDGED by construction: this is the bare path (Quick Clean /
+    /// smart clean), and an empty authorization context is exactly what it
+    /// means — a valuable-bearing item reaching it is REFUSED by its
+    /// revalidator. The confirmation sheet's authorized path is
+    /// `confirmClean()` below.
     func clean() async {
+        await clean(items: selectedItems, authorization: [:])
+    }
+
+    /// THE confirmation sheet's confirm action (fn-4.6, R17). Three things,
+    /// in one MainActor step over ONE capture of the displayed selection:
+    ///
+    /// 1. blocked (INCOMPLETE-probed) rows are filtered out of the CLEAN SET
+    ///    — their rows stay visible and their selection stays untouched, but
+    ///    the cleaner provably never sees them;
+    /// 2. the per-clean `[ItemKey: acknowledgement]` AUTHORIZATION CONTEXT is
+    ///    built from exactly the remaining DISPLAYED items — one entry per
+    ///    complete-probed valuable-bearing item, tokens over exactly the
+    ///    disclosed sets the sheet rendered;
+    /// 3. the context is PASSED DOWN the clean path into the cleaner, where
+    ///    each item's revalidator receives its own entry. Producing the map
+    ///    is not enough — the plumbing is what authorizes a deletion.
+    func confirmClean() async {
+        let displayed = selectedItems
+        let blocked = Self.blockedConfirmationKeys(for: displayed)
+        let authorizedItems = displayed.filter { !blocked.contains($0.key) }
+        await clean(
+            items: authorizedItems,
+            authorization: Self.confirmationAuthorization(for: authorizedItems)
+        )
+    }
+
+    /// The ONE clean core both paths share — the only place the cleaner is
+    /// built and driven.
+    private func clean(
+        items: [ReclaimableItem],
+        authorization: PreDeleteAuthorizationContext
+    ) async {
         // Guard at the model, not just the buttons (R11 + fn-3.4 session
         // integrity): cleaning while any scanner is still reporting would
         // act on a half-built result set — and on items not yet paired
@@ -1247,16 +1652,18 @@ class CacheoutViewModel: ObservableObject {
         guard !isCleaning && !isAnyScanInProgress else { return }
         isCleaning = true
         // The cleaner is built PER CLEAN from the adopted session's
-        // snapshot (R9): `selectedItems` already excludes every scanner
-        // whose outcome that session did not produce, so items and
-        // snapshot are the atomic pair the session adoption established.
+        // snapshot (R9): every caller derives `items` from `selectedItems`,
+        // which already excludes every scanner whose outcome that session
+        // did not produce, so items and snapshot are the atomic pair the
+        // session adoption established.
         // No completed session (nil snapshot) fail-closes `.removeItem`.
         // After a runtime rebuild the SAME gate empties `selectedItems`
         // wholesale (fn-4.10, R8), so this current-runtime cleaner can
         // never act on a snapshot the previous composition captured.
         let cleaner = runtime.makeCleaner(snapshot: adoptedSnapshot)
         let report = await cleaner.clean(
-            items: selectedItems, moveToTrash: moveToTrash
+            items: items, moveToTrash: moveToTrash,
+            authorization: authorization
         )
         lastReport = report
         isCleaning = false

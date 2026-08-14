@@ -72,6 +72,7 @@ the full list.
 ```bash
 Cacheout --cli scan
 Cacheout --cli scan --orphan-size-floor-mb 100 --orphan-stale-days 30
+Cacheout --cli scan --dev-root ~/dev --dev-root /Volumes/Work/code
 ```
 
 **Options:**
@@ -80,11 +81,38 @@ Cacheout --cli scan --orphan-size-floor-mb 100 --orphan-stale-days 30
 |------|-------------|
 | `--orphan-size-floor-mb N` | Orphaned-caches sweep: stale-large size floor in DECIMAL megabytes (positive integer) for this invocation only — overrides the persisted `cacheout.orphanedCaches.sizeFloorMB`, never persisted. Default 50 |
 | `--orphan-stale-days N` | Orphaned-caches sweep: stale-large age in days (positive integer) for this invocation only — overrides the persisted `cacheout.orphanedCaches.staleAgeDays`, never persisted. Default 60 |
+| `--dev-root PATH` | REPEATABLE. The dev roots the `build_artifacts` scanner walks, for this invocation only — see the precedence and path-form rules below. Never persisted |
 
 Zero, negative, non-numeric, or overflowing flag values are refused with
 `INVALID_ARGUMENTS`. The two sweep flags are accepted by `scan` and `clean`
 only; every other command refuses them with `INVALID_ARGUMENTS` rather than
 silently ignoring them.
+
+#### `--dev-root` (build-artifacts dev roots)
+
+**Precedence.** When one or more `--dev-root` flags are present their values
+are the ENTIRE effective root set for that invocation: the persisted
+`cacheout.buildArtifacts.devRoots` list (and its seeds) is not consulted, and
+nothing is written back. Without the flag, the persisted list resolves exactly
+as it does for the app.
+
+**Path forms (pinned).** An ABSOLUTE path (`/Volumes/Work/code`) and a
+`~`-expanded path (`~/dev`, `~`) are accepted. ANY other relative path
+(`projects/x`) is refused with `INVALID_ARGUMENTS` naming the value — a
+cwd-relative dev root would silently depend on the directory you happened to
+run from. (The persisted list's home-relative names, e.g. `Documents`, are a
+store-internal spelling and are not a CLI input form.)
+
+**Same policy as the persisted list.** Values run the shared container-root
+admission policy: the filesystem root `/`, any volume root or mount point,
+and `$HOME` itself — in canonical AND symlink-alias spellings — are refused
+with `INVALID_ARGUMENTS` naming the offending root, and nothing is scanned.
+Protected children such as `~/Documents` remain legal dev roots. Exact
+canonical duplicates collapse (declared spellings preserved); NESTED roots
+are kept and walked INDEPENDENTLY.
+
+**Ordering.** Like every flag, `--dev-root` comes AFTER any positional
+targets (`Cacheout --cli clean build_artifacts --confirm --dev-root ~/dev`).
 
 **Output (schema 4 envelope):**
 ```json
@@ -185,6 +213,7 @@ Cacheout --cli clean xcode_derived_data --dry-run
 | `--confirm` | Actually delete. Without it (and without `--dry-run`) the command refuses: exit 1, empty stdout, `CONFIRMATION_REQUIRED` on stderr with the cleaning plan in `details` |
 | `--dry-run` | Preview what would be cleaned without deleting (wins even beside `--confirm`) |
 | `--orphan-size-floor-mb N` / `--orphan-stale-days N` | Invocation-scoped orphaned-caches sweep thresholds (same semantics as on `scan`; never persisted). Accepted by `scan` and `clean` ONLY — every other command (including `smart-clean`, which is category-only) refuses them with `INVALID_ARGUMENTS` |
+| `--dev-root PATH` | REPEATABLE. Invocation-scoped dev roots for the `build_artifacts` scanner (same precedence, path-form and policy rules as on [`scan`](#-dev-root-build-artifacts-dev-roots); never persisted). Accepted by `scan` and `clean` ONLY — every other command refuses it with `INVALID_ARGUMENTS` |
 
 Running as root (euid 0) is refused with `ROOT_REFUSED`, flags or not.
 Calling `clean` with no targets is a `MISSING_ARGUMENT` usage error; unknown

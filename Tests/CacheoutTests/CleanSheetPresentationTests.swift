@@ -90,7 +90,8 @@ final class CleanSheetPresentationTests: XCTestCase {
         state: ScanState = .measured,
         risk: RiskLevel = .review,
         evidence: String = "node_modules of projectA — ~/dev/projectA",
-        action: ReclaimAction = .removeItem
+        action: ReclaimAction = .removeItem,
+        disclosure: ValuablesDisclosure? = nil
     ) -> ReclaimableItem {
         let target = base
             .appendingPathComponent(scanner)
@@ -120,7 +121,9 @@ final class CleanSheetPresentationTests: XCTestCase {
             ),
             defaultSelected: false,
             automaticCleanEligible: false,
-            isStale: nil
+            isStale: nil,
+            valuablesDisclosure: disclosure,
+            requiresPreDeleteRevalidation: disclosure != nil
         )
     }
 
@@ -185,6 +188,241 @@ final class CleanSheetPresentationTests: XCTestCase {
             rows[1].formattedSize,
             ByteCountFormatter.sharedFile.string(fromByteCount: 8192)
         )
+    }
+
+    // MARK: - Valuables in the sheet (fn-4.6, R3/R17)
+
+    /// One disclosed valuable, with the identity integers the row derives
+    /// name/size/date from. `displayURL` is deliberately a DIFFERENT
+    /// spelling from `canonicalIdentityPath` — the sheet must reveal the
+    /// unresolved one and identify by the canonical one.
+    private func valuable(
+        name: String,
+        canonicalPath: String? = nil,
+        bytes: Int64 = 42_000_000,
+        modifiedSeconds: Int64 = 1_700_000_000,
+        modifiedNanoseconds: Int64 = 500_000_000
+    ) -> DetectedValuable {
+        DetectedValuable(
+            name: name,
+            displayURL: base.appendingPathComponent("declared/\(name)"),
+            canonicalIdentityPath: canonicalPath
+                ?? base.appendingPathComponent("canonical/\(name)").path,
+            identity: ValuableIdentity(
+                allocatedBytes: bytes,
+                device: 16_777_220,
+                inode: 987_654,
+                modifiedSeconds: modifiedSeconds,
+                modifiedNanoseconds: modifiedNanoseconds
+            )
+        )
+    }
+
+    /// The sheet CONSUMES fn-4.4's structured field: stored canonical order
+    /// preserved verbatim (never re-sorted here), name + size + MODIFIED
+    /// DATE derived from the identity integers, reveal bound to the
+    /// UNRESOLVED display spelling, and the wire-only identity fields
+    /// (device/inode) never rendered.
+    func testValuableRowsAreConsumedInStoredOrderWithDerivedDisplayFields() throws {
+        // Deliberately NOT byte-wise sorted: whatever order the disclosure
+        // stores is the order the sheet shows — a re-sort here would drift
+        // from the token preimage's order.
+        let stored = [
+            valuable(name: "Zeta.dmg", bytes: 42_000_000),
+            valuable(name: "Alpha.pkg", bytes: 7_500_000),
+        ]
+        let item = perItem(
+            scanner: "build_artifacts", id: "abc", name: "rust/target",
+            disclosure: ValuablesDisclosure(
+                valuables: stored, probeComplete: true
+            )
+        )
+
+        let row = try XCTUnwrap(
+            CacheoutViewModel.confirmationRows(for: [item]).first
+        )
+
+        XCTAssertEqual(row.valuables.map(\.name), ["Zeta.dmg", "Alpha.pkg"],
+                       "STORED canonical order, never re-sorted at sheet time")
+        XCTAssertNil(row.blockedReason, "a complete probe is not blocked")
+        XCTAssertEqual(
+            row.valuables.map(\.formattedSize),
+            [42_000_000, 7_500_000].map {
+                ByteCountFormatter.sharedFile.string(fromByteCount: $0)
+            }
+        )
+        XCTAssertEqual(row.valuables.map(\.revealURL), stored.map(\.displayURL),
+                       "reveal uses the UNRESOLVED display spelling")
+        XCTAssertEqual(row.valuables.map(\.id),
+                       stored.map(\.canonicalIdentityPath),
+                       "identity is the canonical path, not the display one")
+
+        // The modified date DERIVES from the integers (no `Date` exists in
+        // the identity path) — compared against the same derivation, so the
+        // assertion is locale/timezone-independent.
+        let expected = DateFormatter()
+        expected.dateStyle = .medium
+        expected.timeStyle = .short
+        XCTAssertEqual(
+            row.valuables.first?.formattedModified,
+            expected.string(from: Date(timeIntervalSince1970: 1_700_000_000.5))
+        )
+        // Wire-only identity fields are never human evidence.
+        for rendered in row.valuables {
+            XCTAssertFalse(rendered.formattedModified.contains("987654"))
+            XCTAssertFalse(rendered.formattedSize.contains("16777220"))
+        }
+    }
+
+    /// Out-of-domain identity integers — unreachable for anything the
+    /// validator admitted — render as unknown rather than as an invented
+    /// instant.
+    func testOutOfDomainModifiedIntegersRenderAsUnavailable() {
+        let broken = ValuableIdentity(
+            allocatedBytes: 1, device: 1, inode: 1,
+            modifiedSeconds: Int64.max, modifiedNanoseconds: 0
+        )
+        XCTAssertEqual(CacheoutViewModel.formattedModified(broken),
+                       "modified date unavailable")
+    }
+
+    /// Items with NO valuables render exactly as they always did — no
+    /// sub-list, no blocked state — whether they carry no valuables model at
+    /// all (`nil`) or a COMPLETE probe that found nothing.
+    func testValuablesFreeItemsRenderUnchanged() {
+        let noModel = perItem(id: "plain")
+        let provenClean = perItem(
+            scanner: "build_artifacts", id: "clean",
+            disclosure: .clean
+        )
+
+        let rows = CacheoutViewModel.confirmationRows(
+            for: [noModel, provenClean]
+        )
+        XCTAssertEqual(rows.map(\.valuables.count), [0, 0])
+        XCTAssertEqual(rows.compactMap(\.blockedReason), [])
+        XCTAssertTrue(
+            CacheoutViewModel.blockedConfirmationKeys(
+                for: [noModel, provenClean]
+            ).isEmpty
+        )
+        XCTAssertTrue(
+            CacheoutViewModel.confirmationAuthorization(
+                for: [noModel, provenClean]
+            ).isEmpty,
+            "no empty-set token exists anywhere — valuables-free items get "
+                + "NO authorization entry"
+        )
+    }
+
+    /// R17's uniform incomplete rule at the sheet: the row stays VISIBLE in
+    /// a blocked state with rescan guidance (selection untouched — the rows
+    /// derive live from it), and its key is excluded from the authorization
+    /// context. What WAS seen is still shown: a floor on the warning, never
+    /// a basis for authorization.
+    func testIncompleteProbeRowStaysVisibleBlockedAndUnauthorizable() throws {
+        let partial = perItem(
+            scanner: "build_artifacts", id: "partial",
+            disclosure: ValuablesDisclosure(
+                valuables: [valuable(name: "Seen.dmg")], probeComplete: false
+            )
+        )
+        let empty = perItem(
+            scanner: "build_artifacts", id: "empty",
+            disclosure: .incomplete
+        )
+
+        let rows = CacheoutViewModel.confirmationRows(for: [partial, empty])
+        XCTAssertEqual(rows.count, 2, "blocked rows STAY VISIBLE")
+        XCTAssertEqual(rows[0].valuables.map(\.name), ["Seen.dmg"],
+                       "what the truncated probe DID see is still disclosed")
+        for row in rows {
+            XCTAssertTrue(row.isBlocked)
+            let reason = try XCTUnwrap(row.blockedReason)
+            XCTAssertEqual(
+                reason, CacheoutViewModel.incompleteProbeSheetGuidance
+            )
+            XCTAssertTrue(reason.contains("scan again"),
+                          "the row carries RESCAN guidance: \(reason)")
+            XCTAssertTrue(reason.contains("SKIPPED"),
+                          "and says it will not be cleaned: \(reason)")
+        }
+
+        XCTAssertEqual(
+            CacheoutViewModel.blockedConfirmationKeys(for: [partial, empty]),
+            [partial.key, empty.key]
+        )
+        XCTAssertTrue(
+            CacheoutViewModel.confirmationAuthorization(
+                for: [partial, empty]
+            ).isEmpty,
+            "an incomplete probe is unauthorizable and TOKENLESS"
+        )
+    }
+
+    /// The authorization context covers EXACTLY the displayed
+    /// complete-probed valuable-bearing items, with the token over exactly
+    /// the displayed set — recomputed here from the shared derivation, so a
+    /// drift in either direction fails.
+    func testAuthorizationContextCoversExactlyTheDisplayedCompleteSets() throws {
+        let disclosed = ValuablesDisclosure(
+            valuables: [valuable(name: "App.dmg"), valuable(name: "Kit.pkg")],
+            probeComplete: true
+        )
+        let bearing = perItem(
+            scanner: "build_artifacts", id: "bearing", disclosure: disclosed
+        )
+        let sameSetOtherItem = perItem(
+            scanner: "build_artifacts", id: "other", disclosure: disclosed
+        )
+        let plain = perItem(id: "plain")
+        let blocked = perItem(
+            scanner: "build_artifacts", id: "blocked",
+            disclosure: ValuablesDisclosure(
+                valuables: disclosed.valuables, probeComplete: false
+            )
+        )
+
+        let context = CacheoutViewModel.confirmationAuthorization(
+            for: [bearing, sameSetOtherItem, plain, blocked]
+        )
+
+        XCTAssertEqual(Set(context.keys), [bearing.key, sameSetOtherItem.key],
+                       "one entry per DISPLAYED complete valuable-bearing item")
+        XCTAssertEqual(context[bearing.key],
+                       disclosed.acknowledgementToken(for: bearing.key))
+        XCTAssertNotEqual(
+            context[bearing.key], context[sameSetOtherItem.key],
+            "the preimage is ITEM-BOUND: the same disclosed set under two "
+                + "items yields two different tokens"
+        )
+        XCTAssertEqual(
+            context[bearing.key]?.count, 64,
+            "the full lowercase-hex SHA-256, never a prefix"
+        )
+    }
+
+    // MARK: - Reveal in Finder (fn-4.6, R3)
+
+    /// The sheet's ONE filesystem touch: an existing valuable reveals; a
+    /// VANISHED one is a silent NO-OP — nothing is re-resolved after the
+    /// scan (the self-contained-row doctrine).
+    func testRevealNoOpsForAVanishedValuable() throws {
+        let present = base.appendingPathComponent("Present.dmg")
+        try Data([0x1]).write(to: present)
+        let vanished = base.appendingPathComponent("Vanished.dmg")
+
+        var revealed: [URL] = []
+        XCTAssertTrue(
+            ValuableReveal.reveal(present, revealer: { revealed.append($0) })
+        )
+        XCTAssertEqual(revealed, [present])
+
+        XCTAssertFalse(
+            ValuableReveal.reveal(vanished, revealer: { revealed.append($0) }),
+            "a valuable that vanished by click time reveals NOTHING"
+        )
+        XCTAssertEqual(revealed, [present], "the revealer was never invoked")
     }
 
     // MARK: - .commands Move-to-Trash disclosure (R1, epic contract)

@@ -123,7 +123,39 @@ struct DevRootsStore {
         resolve(declaredRoots: declaredRoots, home: home, parseIssues: [])
     }
 
+    // MARK: - Declared-string convention (ONE definition)
+
+    /// A declared path string → its URL: absolute when `/`-prefixed,
+    /// HOME-RELATIVE otherwise (the `CategoryAdmissionPolicy` probed-fallback
+    /// convention — the seeds are home-relative names).
+    ///
+    /// The ONE definition, shared by this store's resolution and by fn-4.6's
+    /// Settings editor (which must persist a string that resolves back to the
+    /// URL it validated — a second convention would let the editor validate
+    /// one path and the scanner walk another).
+    static func declaredURL(for path: String, home: URL) -> URL {
+        path.hasPrefix("/")
+            ? URL(fileURLWithPath: path)
+            : home.appendingPathComponent(path)
+    }
+
     // MARK: - Mutations (fn-4.6 Settings surface)
+
+    /// The declared list the Settings editor renders and mutates: the valid
+    /// persisted value, else the seeds (a fresh install shows the seeds it
+    /// actually walks, and "remove one" then persists seeds-minus-one).
+    func declaredPaths() -> [String] { declaredPathList() }
+
+    /// ADD-TIME validation for the Settings editor (fn-4.6, R16): the SHARED
+    /// container-root admission policy (`PathGuard.validateContainerRoot`),
+    /// run with THIS store's provider — the very component
+    /// `effectiveRoots` runs on every resolution. Deliberately a
+    /// call-through: a UI-local re-implementation is exactly what R16
+    /// forbids, and routing the editor through the store keeps one provider
+    /// and one policy per layer.
+    func validateCandidateRoot(_ url: URL, home: URL) throws {
+        try PathGuard.validateContainerRoot(url, home: home, provider: provider)
+    }
 
     /// Append `path` to the persisted declared list (the persisted value,
     /// or the seeds when nothing valid is persisted). Exact-string no-op if
@@ -187,16 +219,13 @@ struct DevRootsStore {
 
     // MARK: - Pipeline
 
-    /// Declared strings → URLs against `home`: absolute when `/`-prefixed,
-    /// home-relative otherwise (the `CategoryAdmissionPolicy` probed-
-    /// fallback convention — the seeds are home-relative names).
+    /// Declared strings → URLs against `home` through the ONE shared
+    /// convention (`declaredURL(for:home:)`).
     private func resolve(
         declaredPaths: [String], home: URL, parseIssues: [ScanIssue]
     ) -> DevRootsResolution {
-        let declaredRoots = declaredPaths.map { path in
-            path.hasPrefix("/")
-                ? URL(fileURLWithPath: path)
-                : home.appendingPathComponent(path)
+        let declaredRoots = declaredPaths.map {
+            Self.declaredURL(for: $0, home: home)
         }
         return resolve(declaredRoots: declaredRoots, home: home,
                        parseIssues: parseIssues)

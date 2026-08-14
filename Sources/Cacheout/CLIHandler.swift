@@ -37,6 +37,20 @@
 ///   REJECTS them with `INVALID_ARGUMENTS` before dispatch. Overrides the
 ///   persisted `cacheout.orphanedCaches.*` value for this invocation;
 ///   never persisted
+/// - `--dev-root <path>`: REPEATABLE, invocation-scoped REPLACEMENT of the
+///   dev roots the build-artifacts scanner walks. Accepted by `scan` and
+///   `clean` ONLY (every other command REJECTS it with `INVALID_ARGUMENTS`
+///   before dispatch). PRECEDENCE: when present, the flag's values are the
+///   ENTIRE effective root set for this invocation — the persisted
+///   `cacheout.buildArtifacts.devRoots` list is not consulted and is never
+///   written. PATH FORMS: an ABSOLUTE path and a `~`-expanded path are
+///   accepted; any other relative path is `INVALID_ARGUMENTS` naming the
+///   value (a cwd-relative dev root would silently depend on the invocation
+///   directory). Values run the same container-root admission policy as the
+///   persisted list — a dangerous root (`/`, a volume root, `$HOME`, or a
+///   symlink alias of one) is `INVALID_ARGUMENTS` naming it; exact-canonical
+///   duplicates collapse (declared spellings preserved) and NESTED roots
+///   stay independent walks
 /// - `--acknowledge-valuables <scanner-slug>:<item-id>:<token>`: REPEATABLE,
 ///   item-bound acknowledgement of the release artifacts a `clean` refusal
 ///   (or plan row) disclosed for that item — one entry per item, accepted by
@@ -175,19 +189,27 @@ struct CLIHandler {
 
         case .scan:
             // The sweep's config flags (R8) are accepted by the commands
-            // that actually run the sweep scanner — scan and clean.
+            // that actually run the sweep scanner — scan and clean. The same
+            // holds for `--dev-root` (fn-4.6): the roots are threaded into
+            // `.production()` BEFORE the dependency bundle is built, because
+            // `trustedContainerRoots` freeze at registration (D1).
             let sweepThresholds = resolveSweepThresholds(from: args)
+            let devRoots = resolveDevRoots(invocation.values(of: devRootFlag))
             await handleScan(deps: .production(
-                orphanedCachesThresholds: sweepThresholds
+                orphanedCachesThresholds: sweepThresholds, devRoots: devRoots
             ))
 
         case .clean:
             let sweepThresholds = resolveSweepThresholds(from: args)
+            let devRoots = resolveDevRoots(invocation.values(of: devRootFlag))
             await handleClean(
                 slugs: invocation.targets,
                 acknowledgements: invocation.values(of: acknowledgeValuablesFlag),
                 dryRun: isDryRun, confirmed: isConfirmed,
-                deps: .production(orphanedCachesThresholds: sweepThresholds)
+                deps: .production(
+                    orphanedCachesThresholds: sweepThresholds,
+                    devRoots: devRoots
+                )
             )
 
         case .smartClean:
@@ -549,6 +571,23 @@ struct CLIHandler {
     /// only command that deletes items a valuables gate can guard.
     static let acknowledgeValuablesFlag = "--acknowledge-valuables"
 
+    // MARK: - Dev roots (fn-4.6, R8/R16)
+
+    /// The REPEATABLE, invocation-scoped dev-roots REPLACEMENT:
+    /// `--dev-root <path>`, accepted by `scan` and `clean` ONLY (the two
+    /// commands that walk the configured roots; every other command rejects
+    /// it up front). Every occurrence's value joins the effective set, which
+    /// REPLACES the persisted `DevRootsStore` list for this invocation and is
+    /// NEVER persisted.
+    ///
+    /// PATH FORMS (pinned): an ABSOLUTE path (`/Volumes/Work/code`) and a
+    /// `~`-EXPANDED path (`~/dev`) are accepted; ANY other relative spelling
+    /// (`projects/x`) is `INVALID_ARGUMENTS` naming the value — a
+    /// cwd-relative dev root would silently depend on the invocation
+    /// directory, and the store's home-relative SEED resolution is a
+    /// store-internal matter, never a CLI input form.
+    static let devRootFlag = "--dev-root"
+
     /// Flags whose NEXT argv token is their VALUE. The normalized parse
     /// consumes those value tokens so they are never mistaken for positional
     /// targets — the ordering rule below would otherwise reject perfectly
@@ -557,10 +596,12 @@ struct CLIHandler {
     /// `--format` is in the table deliberately: the handler ignores it
     /// (output is always JSON), but the MCP consumer appends `--format json`
     /// to EVERY invocation, so its value token must be recognized as a value.
-    /// fn-4.6 adds `--dev-root` here — one table entry, no parser change.
+    /// `--dev-root` (fn-4.6) is ONE table entry — the repeatable flag
+    /// consumes fn-4.9's grammar and adds no second parser.
     static let valuedFlags: Set<String> = [
         "--target-pid", "--target-name", "--top", "--format",
         orphanSizeFloorFlag, orphanStaleDaysFlag, acknowledgeValuablesFlag,
+        devRootFlag,
     ]
 
     /// One invocation, normalized (F3): the command, its POSITIONAL targets,
@@ -654,7 +695,20 @@ struct CLIHandler {
                 acknowledgeFlagRejectionMessage(command: command)
             )
         }
+        if command != .scan, command != .clean, args.contains(devRootFlag) {
+            return (devRootFlag, devRootFlagRejectionMessage(command: command))
+        }
         return nil
+    }
+
+    /// The INVALID_ARGUMENTS message for `--dev-root` on a command that
+    /// never walks the configured dev roots — same actionable shape as the
+    /// sweep-flag refusal (names the flag, the refusing command, and the
+    /// commands that accept it).
+    static func devRootFlagRejectionMessage(command: Command) -> String {
+        "\(devRootFlag) is not accepted by \(command.rawValue) — only scan "
+            + "and clean walk the configured dev roots; use the flag with "
+            + "scan or clean"
     }
 
     /// The INVALID_ARGUMENTS message for `--acknowledge-valuables` on a
@@ -814,6 +868,104 @@ struct CLIHandler {
         var context: PreDeleteAuthorizationContext = [:]
         for entry in entries { context[entry.key] = entry.token }
         return context
+    }
+
+    /// The PURE `--dev-root` resolution (in-process testable; the process
+    /// shell below turns a failure into the INVALID_ARGUMENTS exit).
+    ///
+    /// `nil` success = the flag was absent, so the persisted `DevRootsStore`
+    /// resolves inside the production factory exactly as it does for the
+    /// GUI. Otherwise the flag values REPLACE the effective set for this
+    /// invocation:
+    ///
+    /// 1. PATH FORM per value — absolute or `~`-expanded only (see
+    ///    `devRootFlag`); anything else is refused NAMING the value;
+    /// 2. the SHARED resolution pipeline — `DevRootsStore`'s replacement
+    ///    path, so the same container-root admission policy (R16), the same
+    ///    exact-canonical-duplicate dedupe, and the same declared-spelling
+    ///    preservation apply as for persisted roots; NESTED flag roots stay
+    ///    independent walks (D7);
+    /// 3. a POLICY-rejected value becomes an INVALID_ARGUMENTS error NAMING
+    ///    the offending root — invocation-scoped input has an immediate
+    ///    error channel, so it never degrades into a silent config issue the
+    ///    way a persisted root does.
+    ///
+    /// Nothing here reads or writes the defaults suite: the replacement path
+    /// consults no persisted value, and `--dev-root` is never persisted.
+    static func devRootsOverride(
+        from values: [String],
+        home: URL,
+        provider: FileSystemIdentityProvider = FileSystemIdentityProvider()
+    ) -> Result<DevRootsResolution?, CLIAddressError> {
+        guard !values.isEmpty else { return .success(nil) }
+
+        var declaredRoots: [URL] = []
+        for value in values {
+            switch declaredDevRoot(value, home: home) {
+            case .failure(let error):
+                return .failure(error)
+            case .success(let url):
+                declaredRoots.append(url)
+            }
+        }
+
+        let resolution = DevRootsStore(provider: provider)
+            .effectiveRoots(replacing: declaredRoots, home: home)
+        // The policy's own verdict, surfaced as a usage error (the CLI
+        // attack case: `--dev-root /`). `.configInvalid` cannot occur on the
+        // replacement path — nothing was parsed out of the defaults suite.
+        if let refused = resolution.issues.first(
+            where: { $0.kind == .containerRefused }
+        ) {
+            return .failure(CLIAddressError(message:
+                "\(devRootFlag) \(refused.url?.path ?? "") is not a usable "
+                + "dev root: \(refused.detail). Nothing was scanned."
+            ))
+        }
+        return .success(resolution)
+    }
+
+    /// ONE `--dev-root` value → its declared URL, enforcing the pinned path
+    /// forms. `~` expands against the INJECTED home (never `getpwuid`), so
+    /// the flag means the same thing in tests and in production.
+    private static func declaredDevRoot(
+        _ value: String, home: URL
+    ) -> Result<URL, CLIAddressError> {
+        func refuse(_ reason: String) -> Result<URL, CLIAddressError> {
+            .failure(CLIAddressError(message:
+                "\(devRootFlag) \(reason), got: '\(value)'. Pass an absolute "
+                + "path (/Volumes/Work/code) or a ~/ path (~/dev) — a "
+                + "relative path would depend on the current directory."
+            ))
+        }
+        guard !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else { return refuse("requires a folder path") }
+        if value == "~" { return .success(home) }
+        if value.hasPrefix("~/") {
+            return .success(
+                home.appendingPathComponent(String(value.dropFirst(2)))
+            )
+        }
+        guard value.hasPrefix("/") else {
+            return refuse("requires an ABSOLUTE or ~-expanded path")
+        }
+        return .success(URL(fileURLWithPath: value))
+    }
+
+    /// The process-facing resolution: `--dev-root` values → the
+    /// invocation-scoped replacement, exiting via the invalid-arguments
+    /// convention on a bad path form or a policy-refused root.
+    private static func resolveDevRoots(
+        _ values: [String]
+    ) -> DevRootsResolution? {
+        switch devRootsOverride(
+            from: values, home: FileManager.default.homeDirectoryForCurrentUser
+        ) {
+        case .failure(let error):
+            exitWithError(code: "INVALID_ARGUMENTS", message: error.message)
+        case .success(let resolution):
+            return resolution
+        }
     }
 
     /// The INVALID_ARGUMENTS message for a rejected sweep flag: names the

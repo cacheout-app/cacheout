@@ -2052,6 +2052,251 @@ final class CLIGateTests: XCTestCase {
         ), "scan still accepts the sweep flags")
     }
 
+    // MARK: - `--dev-root` (fn-4.6, R8/R16)
+
+    /// The repeatable dev-roots flag joins the CENTRALIZED pre-dispatch
+    /// gate: `scan` and `clean` — the two commands that walk the configured
+    /// roots — accept it; EVERY other command refuses it up front with the
+    /// flag named. Silently ignoring it would let a caller believe they
+    /// scoped an invocation they did not.
+    func testDevRootFlagPreDispatchGateMatrixAcrossAllCommands() {
+        let args = [CLIHandler.devRootFlag, "/tmp/dev"]
+        for command in CLIHandler.Command.allCases {
+            let rejection = CLIHandler.rejectedFlag(for: command, in: args)
+            if command == .scan || command == .clean {
+                XCTAssertNil(
+                    rejection,
+                    "\(command.rawValue) walks the dev roots and accepts the flag"
+                )
+                continue
+            }
+            let message = rejection?.message ?? ""
+            XCTAssertEqual(rejection?.flag, CLIHandler.devRootFlag,
+                           "\(command.rawValue) must refuse the flag")
+            XCTAssertTrue(
+                message.contains(CLIHandler.devRootFlag)
+                    && message.contains(command.rawValue)
+                    && message.contains("scan or clean"),
+                "actionable refusal: \(message)"
+            )
+            // Without the flag the gate stays silent — it never turns an
+            // ordinary invocation into a usage error.
+            XCTAssertNil(CLIHandler.rejectedFlag(
+                for: command, in: ["Cacheout", "--cli", command.rawValue]
+            ))
+        }
+    }
+
+    /// PATH-FORM MATRIX (pinned): absolute accepted, `~`-prefixed accepted
+    /// and EXPANDED against the injected home, any other relative spelling
+    /// refused with the value named.
+    func testDevRootPathFormMatrix() throws {
+        let absolute = base.appendingPathComponent("abs-dev")
+        let tilde = fixtureHome.appendingPathComponent("tilde-dev")
+        for dir in [absolute, tilde] {
+            try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        }
+
+        // (a) ABSOLUTE — accepted verbatim, declared spelling preserved.
+        switch CLIHandler.devRootsOverride(
+            from: [absolute.path], home: fixtureHome
+        ) {
+        case .failure(let error):
+            XCTFail("an absolute --dev-root must be accepted: \(error.message)")
+        case .success(let resolution):
+            XCTAssertEqual(resolution?.keptRoots.map(\.path), [absolute.path])
+            XCTAssertEqual(resolution?.issues.count, 0)
+        }
+
+        // (b) `~`-EXPANDED — expanded against the INJECTED home, never
+        // `getpwuid` (the flag means the same thing in tests and in
+        // production).
+        switch CLIHandler.devRootsOverride(
+            from: ["~/tilde-dev"], home: fixtureHome
+        ) {
+        case .failure(let error):
+            XCTFail("a ~ --dev-root must be accepted: \(error.message)")
+        case .success(let resolution):
+            XCTAssertEqual(resolution?.keptRoots.map(\.path), [tilde.path],
+                           "the tilde expands against the injected home")
+        }
+
+        // (c) BARE RELATIVE — refused, NAMING the value. A cwd-relative dev
+        // root would silently depend on the invocation directory.
+        for relative in ["projects/x", "dev", "./dev", "../dev"] {
+            switch CLIHandler.devRootsOverride(
+                from: [relative], home: fixtureHome
+            ) {
+            case .success(let resolution):
+                XCTFail("'\(relative)' must be refused, got \(String(describing: resolution))")
+            case .failure(let error):
+                XCTAssertTrue(error.message.contains("'\(relative)'"),
+                              "names the offending value: \(error.message)")
+                XCTAssertTrue(error.message.contains(CLIHandler.devRootFlag),
+                              "names the flag: \(error.message)")
+            }
+        }
+
+        // Absent flag = no replacement at all: the persisted store resolves
+        // inside the production factory exactly as it does for the app.
+        switch CLIHandler.devRootsOverride(from: [], home: fixtureHome) {
+        case .failure(let error):
+            XCTFail("no flag must resolve to nil: \(error.message)")
+        case .success(let resolution):
+            XCTAssertNil(resolution)
+        }
+    }
+
+    /// The CLI ATTACK CASE (R16): a policy-rejected value is an immediate
+    /// INVALID_ARGUMENTS naming the offending root — never a silent config
+    /// issue (that path exists only for PERSISTED roots) and never a scan.
+    /// The policy is the SHARED one, so its alias spellings are caught too.
+    func testDevRootPolicyRefusalNamesTheOffendingRoot() throws {
+        let aliasOfRoot = base.appendingPathComponent("slash-alias")
+        try fm.createSymbolicLink(
+            at: aliasOfRoot, withDestinationURL: URL(fileURLWithPath: "/")
+        )
+
+        let dangerous = ["/", fixtureHome.path, aliasOfRoot.path]
+        for root in dangerous {
+            switch CLIHandler.devRootsOverride(
+                from: [root], home: fixtureHome
+            ) {
+            case .success(let resolution):
+                XCTFail("'\(root)' must be refused, got \(String(describing: resolution))")
+            case .failure(let error):
+                XCTAssertTrue(error.message.contains(CLIHandler.devRootFlag),
+                              "names the flag: \(error.message)")
+                XCTAssertTrue(error.message.contains(root),
+                              "names the offending root: \(error.message)")
+                XCTAssertTrue(error.message.contains("Nothing was scanned"),
+                              "says nothing happened: \(error.message)")
+            }
+        }
+
+        // The LEGAL protected child admits — the seeds depend on it.
+        let documents = fixtureHome.appendingPathComponent("Documents")
+        try fm.createDirectory(at: documents, withIntermediateDirectories: true)
+        switch CLIHandler.devRootsOverride(
+            from: [documents.path], home: fixtureHome
+        ) {
+        case .failure(let error):
+            XCTFail("~/Documents is a legal dev root: \(error.message)")
+        case .success(let resolution):
+            XCTAssertEqual(resolution?.keptRoots.map(\.path), [documents.path])
+        }
+    }
+
+    /// REPLACEMENT semantics (R8): the flag's values are the WHOLE effective
+    /// set — the persisted list and its seeds are not consulted, nothing is
+    /// written — with exact-canonical-duplicate dedupe (declared spellings
+    /// preserved) and NESTED roots kept as INDEPENDENT walks (D7).
+    func testDevRootReplacesTheStoredSetWithoutPersistingAnything() throws {
+        let suiteName = "CLIGateTests-devroots-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        defaults.set(["Documents", "Code"], forKey: DevRootsStore.devRootsKey)
+
+        let outer = fixtureHome.appendingPathComponent("dev")
+        let nested = outer.appendingPathComponent("deep/inner")
+        try fm.createDirectory(at: nested, withIntermediateDirectories: true)
+        // A second SPELLING of `outer` via a symlinked ANCESTOR — legal
+        // (only the LEAF must lstat as a real directory), and an exact
+        // canonical duplicate of the first.
+        let aliasParent = base.appendingPathComponent("alias-home")
+        try fm.createSymbolicLink(at: aliasParent, withDestinationURL: fixtureHome)
+        let aliasSpelling = aliasParent.appendingPathComponent("dev")
+
+        let resolution: DevRootsResolution
+        switch CLIHandler.devRootsOverride(
+            from: [outer.path, aliasSpelling.path, nested.path],
+            home: fixtureHome
+        ) {
+        case .failure(let error):
+            return XCTFail("must resolve: \(error.message)")
+        case .success(let resolved):
+            resolution = try XCTUnwrap(resolved)
+        }
+
+        XCTAssertEqual(
+            resolution.keptRoots.map(\.path), [outer.path, nested.path],
+            "exact canonical duplicate collapsed; the NESTED root is KEPT "
+                + "as its own independent walk (D7)"
+        )
+        XCTAssertTrue(resolution.issues.isEmpty, "\(resolution.issues)")
+
+        // The persisted list is neither consulted nor rewritten.
+        XCTAssertFalse(
+            resolution.keptRoots.contains {
+                $0.lastPathComponent == "Documents" || $0.lastPathComponent == "Code"
+            },
+            "the flag REPLACES the stored set — seeds/persisted roots are "
+                + "not consulted"
+        )
+        XCTAssertEqual(
+            defaults.stringArray(forKey: DevRootsStore.devRootsKey),
+            ["Documents", "Code"],
+            "an invocation-scoped flag never persists anything"
+        )
+    }
+
+    /// The flag rides fn-4.9's NORMALIZED grammar and NOTHING else: one
+    /// `valuedFlags` entry, values collected in argv order, the
+    /// targets-before-flags rule applying to it exactly as to every other
+    /// flag — and, grep-asserted, no second parser exists to drift from.
+    func testDevRootParsesThroughTheOneNormalizedGrammar() throws {
+        XCTAssertTrue(CLIHandler.valuedFlags.contains(CLIHandler.devRootFlag),
+                      "ONE table entry is the whole registration")
+
+        guard case .success(let invocation) = CLIHandler.normalizedInvocation(
+            command: .clean, arguments: [
+                "build_artifacts", "--confirm",
+                CLIHandler.devRootFlag, "~/dev",
+                CLIHandler.devRootFlag, "/Volumes/Work/code",
+            ]
+        ) else { return XCTFail("repeatable --dev-root must parse") }
+        XCTAssertEqual(invocation.targets, ["build_artifacts"])
+        XCTAssertEqual(invocation.values(of: CLIHandler.devRootFlag),
+                       ["~/dev", "/Volumes/Work/code"],
+                       "every value, in argv order")
+
+        // Interleaved positional-after-flag: INVALID_ARGUMENTS naming the
+        // token — the value token itself is never mistaken for a target.
+        switch CLIHandler.normalizedInvocation(
+            command: .clean,
+            arguments: ["a", CLIHandler.devRootFlag, "~/dev", "stray"]
+        ) {
+        case .success(let parsed):
+            XCTFail("must be refused, parsed \(parsed.targets)")
+        case .failure(let error):
+            XCTAssertTrue(error.message.contains("'stray'"), error.message)
+        }
+
+        // GREP-ASSERTED: exactly ONE positional/flag grammar exists in the
+        // sources — a second `normalizedInvocation` (or a second copy of its
+        // ordering rule) is what "no duplicate grammar implementation" bans.
+        let sources = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()   // CacheoutTests
+            .deletingLastPathComponent()   // Tests
+            .deletingLastPathComponent()   // repo root
+            .appendingPathComponent("Sources/Cacheout/CLIHandler.swift")
+        let code = try String(contentsOf: sources, encoding: .utf8)
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .filter { !$0.trimmingCharacters(in: .whitespaces).hasPrefix("//") }
+            .joined(separator: "\n")
+        XCTAssertGreaterThan(code.count, 10_000, "the gate read real code")
+        XCTAssertEqual(
+            code.components(separatedBy: "func normalizedInvocation(").count - 1,
+            1, "exactly one normalized parse implementation"
+        )
+        XCTAssertEqual(
+            code.components(
+                separatedBy: "takes its targets BEFORE any flag"
+            ).count - 1,
+            1, "exactly one ordering-rule implementation"
+        )
+    }
+
     // MARK: - Acknowledgement FORM parsing (fn-4.9, R17 — frozen rules)
 
     func testAcknowledgementFormRulesAreFrozen() throws {
@@ -2417,6 +2662,56 @@ final class CLIGateFramingTests: XCTestCase {
             XCTAssertTrue(message.contains(command), "names the command: \(message)")
             XCTAssertTrue(message.contains("clean"),
                           "points at the command that accepts it: \(message)")
+        }
+    }
+
+    func testDevRootRejectedOnNonScanCleanCommandsFraming() throws {
+        // Read-only commands only, so even a gate regression stays
+        // side-effect-free (the in-process matrix covers every command).
+        for command in ["version", "disk-info", "memory-stats"] {
+            let run = try runCLI([
+                "--cli", command, CLIHandler.devRootFlag, "/tmp/dev",
+            ])
+            XCTAssertEqual(run.exitCode, 1, "\(command) must refuse the flag")
+            XCTAssertEqual(run.stdout, "",
+                           "stdout stays EMPTY when refused: \(command)")
+            let envelope = try parseErrorEnvelope(run.stderr)
+            let error = try XCTUnwrap(envelope["error"] as? [String: Any])
+            XCTAssertEqual(error["code"] as? String, "INVALID_ARGUMENTS")
+            let message = (error["message"] as? String) ?? ""
+            XCTAssertTrue(message.contains(CLIHandler.devRootFlag),
+                          "names the flag: \(message)")
+            XCTAssertTrue(message.contains(command), "names the command: \(message)")
+            XCTAssertTrue(message.contains("scan or clean"),
+                          "points at the commands that accept it: \(message)")
+        }
+    }
+
+    func testDevRootValueIsResolvedBeforeAnyScanFraming() throws {
+        // The PROCESS wiring, not just the pure resolver: a bad path form
+        // and a policy-refused root both fail BEFORE the clean pipeline runs
+        // (`--confirm` present on purpose — nothing is scanned or deleted,
+        // and the refusal is the dev-root one, not the confirmation gate).
+        let cases: [(String, String)] = [
+            ("projects/x", "projects/x"),   // relative → path-form refusal
+            ("/", "/"),                     // dangerous → policy refusal
+        ]
+        for (value, named) in cases {
+            let run = try runCLI([
+                "--cli", "clean", "npm_cache", "--confirm",
+                CLIHandler.devRootFlag, value,
+            ])
+            XCTAssertEqual(run.exitCode, 1, "'\(value)' must be refused")
+            XCTAssertEqual(run.stdout, "")
+            let envelope = try parseErrorEnvelope(run.stderr)
+            let error = try XCTUnwrap(envelope["error"] as? [String: Any])
+            XCTAssertEqual(error["code"] as? String, "INVALID_ARGUMENTS",
+                           "'\(value)' is a usage error, never a silent scan")
+            let message = (error["message"] as? String) ?? ""
+            XCTAssertTrue(message.contains(CLIHandler.devRootFlag),
+                          "names the flag: \(message)")
+            XCTAssertTrue(message.contains(named),
+                          "names the offending value: \(message)")
         }
     }
 

@@ -16,9 +16,9 @@ per-item scanners — implements one `SpaceScanner` protocol and registers with 
   id `categories`) wraps the data-driven registry and emits one aggregate item per
   category. Category behavior is unchanged, and adding a category is still a
   one-line `CacheCategory` entry — no scanner code involved.
-- **node_modules is the first per-item scanner** (scanner id `node_modules`),
-  emitting one item per discovered directory. Follow-on scanners (build
-  artifacts, git worktrees, temp dirs) drop into the same registry.
+- **`build_artifacts` and `orphaned_caches` are the per-item scanners**,
+  emitting one item per discovered directory or entry. Follow-on scanners
+  (git worktrees, temp dirs) drop into the same registry.
 - The CLI addresses categories by slug and per-item scanners by
   `<scanner-slug>` or `<scanner-slug>:<item-id>` — see
   [CLI-REFERENCE.md](CLI-REFERENCE.md) and the address grammar in PROTOCOL.md.
@@ -303,41 +303,82 @@ The CLI wire fields (`exact_bytes`, `estimated_up_to_bytes`, `state`,
 
 ---
 
-## node_modules Discovery
+## Project Build Artifacts
 
-In addition to cache categories, Cacheout includes a `node_modules` scanner that
-recursively searches common project directories. It is a per-item `SpaceScanner`
-(scanner id `node_modules`) in the same registry as the categories — no longer a
-GUI-only special case:
+In addition to cache categories, Cacheout runs a `build_artifacts` per-item
+`SpaceScanner` over your configured DEV ROOTS. It is a RULE TABLE, not a name
+list: a directory is reported only when an ecosystem MARKER proves what it
+is, so `build/` in a project with no build system is invisible.
 
-- **CLI-visible.** `--cli scan` lists each discovered directory as a
-  `scanner_items` row; `--cli clean node_modules --confirm` cleans all of them,
-  `--cli clean node_modules:<item-id> --confirm` cleans one. Item ids are opaque,
-  stable across rescans, and echoed back exactly as scan printed them (see
-  [CLI-REFERENCE.md](CLI-REFERENCE.md)).
-- **Risk level: Review, never auto-cleaned.** node_modules items are excluded
-  from smart-clean and Quick Clean; every deletion is an explicit selection
-  (GUI) or an explicit target with `--confirm` (CLI).
-- **Selection survives rescans.** Items carry stable ids, so a rescan preserves
-  both selections and explicit deselections.
+| Artifact | Proven by | Risk |
+|----------|-----------|------|
+| `target/` | sibling `Cargo.toml` | Safe |
+| `.build/` | sibling `Package.swift` | Safe |
+| `node_modules/` | sibling `package.json` | Review |
+| `build/` | sibling `build.gradle` / `build.gradle.kts` / `settings.gradle` / `settings.gradle.kts` | Review |
+| `.gradle/` | the same Gradle marker set | Review |
+| any directory containing `pyvenv.cfg` | its own entries (PEP 405 — `.venv`, `venv`, `env`, any name) | Review |
+| `Pods/` | sibling `Podfile` | Review |
+| `dist/` | sibling `package.json` | Review |
+| `.next/` | sibling `package.json` | Review |
+| `.turbo/` | sibling `turbo.json` | Review |
 
-### Search Roots
+(The registry in `Sources/Cacheout/Scanner/BuildArtifactRules.swift` is the
+source of truth; rows are evaluated in that order, first match wins.)
 
-The scanner checks these directories under `$HOME`:
-- Documents, Developer, Projects, Code, Sites, Desktop, Dropbox, repos, src, work
+- **CLI-visible.** `--cli scan` lists each find as a `scanner_items` row;
+  `--cli clean build_artifacts --confirm` cleans all of them,
+  `--cli clean build_artifacts:<item-id> --confirm` cleans one. Item ids are
+  opaque, stable across rescans, and echoed back exactly as scan printed them
+  (see [CLI-REFERENCE.md](CLI-REFERENCE.md)).
+- **Risk is per RULE ROW, and it narrows.** A `target/` proven by
+  `Cargo.toml` is Safe; `node_modules/` and `Pods/` are Review. Whatever the
+  row says, an
+  artifact directory holding release artifacts is forced to Review and
+  deselected. Risk here means evidence confidence — NOT clean eligibility: no
+  build-artifact item is ever part of smart-clean or Quick Clean, so every
+  deletion is an explicit selection (GUI) or an explicit target with
+  `--confirm` (CLI).
+- **Release artifacts are protected.** A bounded, no-follow inspection inside
+  each matched directory looks for `.dmg`, `.pkg`, `.ipa` files and `.app`,
+  `.xcarchive`, `.dSYM` bundles above 5 MB. Anything found is disclosed on
+  the row, the item is deselected, and deleting it requires an explicit
+  acknowledgement of exactly that set — re-verified immediately before
+  deletion, so an artifact produced AFTER the scan still stops the delete.
+  See [Release-artifact acknowledgement](CLI-REFERENCE.md#release-artifact-acknowledgement).
+- **Selection survives rescans.** Items carry stable ids, so a rescan
+  preserves both selections and explicit deselections.
+
+### Dev Roots
+
+Seeded under `$HOME` with: Documents, Developer, Projects, Code, Sites,
+Desktop, Dropbox, repos, src, work. Editable in Settings (persisted at
+`cacheout.buildArtifacts.devRoots`) and overridable per invocation with the
+repeatable `--dev-root` CLI flag. The filesystem root, any volume root or
+mount point, and `$HOME` itself are refused as dev roots — in canonical and
+symlink-alias spellings alike; protected children such as `~/Documents`
+remain legal.
 
 ### Scanning Behavior
 
-- Maximum recursion depth: 6 levels
-- Stops recursing when `node_modules` is found (no nested projects expected)
-- Skips: .Trash, .git, .hg, node_modules, .build, DerivedData, Pods, .next, dist, build, Library, .cache, .npm, .yarn
-- Deduplicates by absolute path
-- Results sorted by size descending
+- Maximum walk depth: 8 levels below each dev root
+- Matched artifact directories are PRUNED — nothing beneath a reported
+  directory is walked or reported separately
+- No name-based skip list, so a nested `packages/build/pkg/node_modules` in a
+  monorepo stays reachable; `.git` is the one hard prune
+- Nested dev roots walk INDEPENDENTLY (an ancestor's depth budget does not
+  cover what a nested root's own budget reaches); overlapping finds collapse
+  to one item by canonical identity
+- Sizes are allocated and sparse-aware; `logical_bytes` is reported
+  separately when the apparent size materially exceeds it
+- Results ordered by allocated size descending, then name, then identity
 
 ### Staleness
 
-A `node_modules` directory is considered **stale** if its modification date is older
-than 30 days. Stale directories show an age badge (e.g., "3mo old", "1y old") in the UI.
+A build-artifact directory is **stale** if its newest content is older than
+30 days. Stale directories show an age badge (e.g. "3mo old", "1y old") in
+the UI. A directory whose walk dated no content has UNKNOWN staleness — never
+a false "fresh".
 
 ---
 

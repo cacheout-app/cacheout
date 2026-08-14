@@ -20,12 +20,13 @@ business logic (scanning/cleaning), state management, and presentation.
 │                    Business Logic                           │
 │  SpaceScannerRuntime (registry + validated scan stream)     │
 │    CategoryScanner ──► CacheScanner (actor)                 │
-│    NodeModulesScanner (actor) │ CacheCleaner (actor)        │
+│    BuildArtifactsScanner │ OrphanedCachesScanner            │
+│    CacheCleaner (actor)                                     │
 ├─────────────────────────────────────────────────────────────┤
 │                     Data Models                             │
 │  ReclaimableItem │ ItemKey │ ScanOutcome │ ScanIssue        │
 │  CacheCategory │ ScanResult │ DiskInfo │ CleanupReport      │
-│  RiskLevel │ PathDiscovery │ ReclaimAction │ NodeModulesItem│
+│  RiskLevel │ PathDiscovery │ ReclaimAction │ ValuablesDisclosure│
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -44,14 +45,17 @@ Sources/Cacheout/
 ├── Models/
 │   ├── CacheCategory.swift             # Category definition + path discovery
 │   ├── DiskInfo.swift                  # Disk space reading
-│   ├── ScanResult.swift                # Scan result + cleanup report
-│   └── NodeModulesItem.swift           # node_modules directory info
+│   └── ScanResult.swift                # Scan result + cleanup report
 ├── Scanner/
 │   ├── CacheScanner.swift              # Parallel category scanner (actor)
 │   ├── Categories.swift                # Category definitions (data-driven registry)
 │   ├── CategoryScanner.swift           # SpaceScanner adapter over the category registry
 │   ├── DirectorySizer.swift            # Single sizing routine (split components + inode claims)
-│   ├── NodeModulesScanner.swift        # Recursive node_modules finder (actor, SpaceScanner)
+│   ├── ProjectTreeWalker.swift         # Reusable consumer-prunable dev-root walker
+│   ├── BuildArtifactRules.swift        # Build-artifact rule table + dev-roots store/policy
+│   ├── BuildArtifactsScanner.swift     # Project build-artifact scanner (SpaceScanner)
+│   ├── ValuablesDetector.swift         # Release-artifact probe + acknowledgement tokens
+│   ├── OrphanedCachesScanner.swift     # First-level ~/Library/Caches sweep (SpaceScanner)
 │   └── SpaceScanner.swift              # SpaceScanner protocol, ReclaimableItem model, SpaceScannerRuntime
 ├── Cleaner/
 │   ├── CacheCleaner.swift              # Guarded deletion/trash + InodeAccountingRegistry (actors)
@@ -64,7 +68,7 @@ Sources/Cacheout/
 │   ├── MenuBarView.swift               # Menubar popover UI
 │   ├── SettingsView.swift              # Settings window (3 tabs)
 │   ├── CategoryRow.swift               # Category list row + risk badge
-│   ├── NodeModulesSection.swift        # node_modules section + rows
+│   ├── ScannerItemSection.swift        # Generic per-item scanner section + rows
 │   ├── CleanConfirmation.swift         # Confirmation + report sheets
 │   ├── DiskUsageBar.swift              # Disk usage progress bar
 │   └── CheckForUpdatesButton.swift     # Sparkle update button
@@ -84,7 +88,7 @@ These actors provide thread-safe business logic:
 | Actor | Purpose | Key Methods |
 |-------|---------|-------------|
 | `CacheScanner` | Parallel category scanning (sizing delegated to `DirectorySizer`) | `scanAll()`, `scanCategory()` |
-| `NodeModulesScanner` | Recursive node_modules discovery (a `SpaceScanner`) | `scan(context:)`, `scan(maxDepth:includeProtectedRoots:)` |
+| `BuildArtifactsScanner` | Project build-artifact discovery over the dev roots (a `SpaceScanner`; a value type, listed here beside its peers) | `scan(context:)`, `preDeleteRevalidator(provider:)` |
 | `CacheCleaner` | Guarded deletion, freed-bytes accounting, logging | `clean(items:moveToTrash:)`, `runCleanCommand()` |
 | `InodeAccountingRegistry` | Per-operation claim-based freed-bytes settlement | `registerObservations(_:)`, `acceptSuccessful(_:)` |
 
@@ -130,7 +134,7 @@ Registered scanners run in parallel across the group (and stay internally
 parallel as above); each outcome is ownership- and structure-validated before
 it is yielded, and events arrive in completion order. That is the
 progressive-publishing contract: category results appear in seconds
-(typically 2-5s) while the node_modules scan keeps running (10-30s). The
+(typically 2-5s) while the dev-root project walk keeps running (10-30s). The
 ViewModel consumes events as they arrive; the CLI collects the same stream to
 completion. Consumers pick scope (a scanner subset and/or a category filter),
 never validation.
@@ -154,10 +158,10 @@ SpaceScannerRuntime.scanValidated(context:)
     │                     ▼
     │                 ScanOutcome — one aggregate ReclaimableItem per category
     │
-    ├── TaskGroup ──► NodeModulesScanner.scan(context:)
-    │                     │ (internally parallel per search root)
+    ├── TaskGroup ──► BuildArtifactsScanner.scan(context:)
+    │                     │ (walk → rule match → prune → dedupe → size)
     │                     ▼
-    │                 ScanOutcome — one ReclaimableItem per node_modules dir
+    │                 ScanOutcome — one ReclaimableItem per artifact dir
     │
     ▼
 validatedOutcome() per event: ownership, id uniqueness, structural invariants
@@ -207,7 +211,9 @@ CacheCleaner.clean(items:moveToTrash:)        ◄── selected [ReclaimableIte
     │   │   ├── re-admit EVERY record's requestedURL — ANY refusal blocks
     │   │   │   the ENTIRE command set
     │   │   └── runCleanCommand() argv via /usr/bin/env
-    │   └── .removeItem (per-item scanners, e.g. node_modules):
+    │   └── .removeItem (per-item scanners, e.g. build_artifacts):
+    │       ├── per-scanner pre-delete revalidation (fail-closed) when the
+    │       │   item is marked — release-artifact re-inspection lives here
     │       ├── PathGuard.admitContainer() against the RUNTIME's declared
     │       │   roots (never the item's claim) + validateRemovableItem()
     │       └── measure ► register ► delete ► accept (same settlement)
@@ -268,13 +274,15 @@ settings change.
 ### Why a registry of protocol conformers instead of a third bespoke stack?
 
 Cacheout used to have two parallel scanning stacks: the data-driven
-`CacheCategory` aggregate registry and the bespoke `NodeModulesScanner` (own
+`CacheCategory` aggregate registry and a bespoke node_modules scanner (own
 item model, own views, own cleaner branch — and absent from the CLI
 entirely). The planned scanners (build artifacts, git worktrees, temp dirs,
-orphaned caches) are all per-item by nature; replicating the node_modules
-pattern for each would mean ~6 touch-points per scanner and guaranteed drift
-— the pre-unification CLI gap (node_modules was never wired into the CLI at
-all) is the proof.
+orphaned caches) are all per-item by nature; replicating that pattern for
+each would mean ~6 touch-points per scanner and guaranteed drift — the
+pre-unification CLI gap (node_modules was never wired into the CLI at all)
+is the proof. The bespoke scanner has since been subsumed by
+`BuildArtifactsScanner`, whose `node_modules/` rule row covers everything it
+found, and its source deleted.
 
 Instead, every scanner implements the `SpaceScanner` protocol and registers
 with `SpaceScannerRuntime`; selection, totals, cleaning, and rendering are
@@ -291,22 +299,24 @@ item's claimed provenance can never widen admission, and a malformed
 scanner's items cannot be listed, selected, addressed, or deleted through
 any path.
 
-### Why separate CacheScanner and NodeModulesScanner?
+### Why separate CacheScanner and the project scanners?
 
 They have fundamentally different search strategies:
 - `CacheScanner`: Knows exactly where to look (predefined paths per category)
-- `NodeModulesScanner`: Must recursively search unknown project directories
+- `BuildArtifactsScanner`: Must walk unknown project trees under the
+  configured dev roots and PROVE each find with an ecosystem marker
 
 Both now sit behind the `SpaceScanner` protocol (`CacheScanner` via the
 `CategoryScanner` adapter), but the split survives: the runtime's event
 stream yields each scanner's outcome as it completes, so the cache scan
-lands quickly (2-5s) while the node_modules scan continues (10-30s),
+lands quickly (2-5s) while the dev-root project walk continues (10-30s),
 providing faster initial results to the user.
 
 ### Why a single admission chokepoint (PathGuard)?
 
-Every destructive path — category roots, contained children, node_modules
-items, cleanCommands roots — asks `PathGuard` "may I delete this URL?" before
+Every destructive path — category roots, contained children, per-item
+scanner targets, cleanCommands roots — asks `PathGuard` "may I delete this
+URL?" before
 anything runs. Guarding each call site separately is how deletion bugs ship:
 one forgotten site is enough. The chokepoint also enforces a deny list that no
 policy can override (`/`, volume roots, `$HOME`, protected first-level home
@@ -392,7 +402,7 @@ to defer update checks until a signed appcast URL is configured in Info.plist.
 - **No admin privileges**: Only accesses user-space directories (`~/Library/`, `~/.`)
 - **No network access**: No analytics, telemetry, or phoning home
 - **PathGuard admission on every destructive path**: category roots, contained
-  children, node_modules items, and cleanCommands roots are admitted against
+  children, per-item scanner targets, and cleanCommands roots are admitted against
   category-scoped policies plus an inode-identity deny list (`/`, volume
   roots, `$HOME`, protected first-level home children) before anything is
   deleted; the parent chain is re-validated immediately before each

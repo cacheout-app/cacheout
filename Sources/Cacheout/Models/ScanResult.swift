@@ -285,9 +285,50 @@ struct CleanupReport {
     /// correlation key; `displayName` and `message` carry everything a
     /// report line needs.
     struct ItemError: Equatable {
+        /// The TYPED refusal payload (fn-4.9, R17) a pre-delete
+        /// revalidation refusal carries to the wire — the transport
+        /// `PreDeleteVerdict.refuse(reason:valuables:acknowledgementToken:)`
+        /// → cleaner report assembly → `CLIHandler.confirmedCleanPayload`.
+        /// The row encoder serializes `results[].valuables` and
+        /// `results[].acknowledgement_token` from THIS, and never by parsing
+        /// the message prose.
+        struct Refusal: Equatable {
+            /// The CURRENT delete-time probe's valuables in the ONE canonical
+            /// order (already sorted at detection time — never re-sorted
+            /// downstream). Empty for a refusal with no valuables to show
+            /// (the vanished set, a revalidator with no valuables model).
+            let valuables: [DetectedValuable]
+            /// The freshly computed acknowledgement token — present ONLY for
+            /// a COMPLETE probe with a NON-EMPTY current set (the uniform R17
+            /// rule: an incomplete probe is unauthorizable and tokenless, and
+            /// a vanished set has nothing to acknowledge).
+            let acknowledgementToken: String?
+        }
+
         let key: ItemKey
         let displayName: String
         let message: String
+        /// ADDITIVE (fn-4.9, R17) and `nil` on EVERY pre-existing error path
+        /// — ordinary item errors serialize exactly as they always have. The
+        /// payload rides the record rather than a parallel channel so the
+        /// self-containment doctrine above still holds for a refusal row.
+        let refusal: Refusal?
+
+        /// EXPLICIT memberwise initializer: `refusal` defaults, so no
+        /// existing construction site changes (the `ReclaimableItem`
+        /// additive-field precedent — a synthesized memberwise init cannot
+        /// default a `let`).
+        init(
+            key: ItemKey,
+            displayName: String,
+            message: String,
+            refusal: Refusal? = nil
+        ) {
+            self.key = key
+            self.displayName = displayName
+            self.message = message
+            self.refusal = refusal
+        }
     }
 
     /// Per-scanner rollup — a PURE derivation over `entries` grouped by

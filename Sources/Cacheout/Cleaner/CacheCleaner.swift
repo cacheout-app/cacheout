@@ -688,7 +688,7 @@ actor CacheCleaner {
     /// the marker subsumes all of that.
     private func preDeleteRefusal(
         for item: ReclaimableItem, authorization: String?
-    ) -> (reason: String, tag: String)? {
+    ) -> (reason: String, tag: String, payload: CleanupReport.ItemError.Refusal?)? {
         // DEFENSE IN DEPTH: check (1b) already refused this shape before any
         // state skip could hide it; re-checking here keeps the destructive
         // chokepoint independently fail-closed for any future caller,
@@ -696,7 +696,9 @@ actor CacheCleaner {
         if let refusal = Self.missingRevalidatorRefusal(
             for: item, registry: preDeleteRevalidators
         ) {
-            return (refusal, "revalidator-unavailable")
+            // No revalidator ran, so there is no probe and no typed payload —
+            // an unrevalidatable item discloses nothing at delete time.
+            return (refusal, "revalidator-unavailable", nil)
         }
         guard let revalidator = preDeleteRevalidators[item.scannerID]
         else { return nil }
@@ -707,12 +709,13 @@ actor CacheCleaner {
         switch revalidator.revalidate(item: item, authorization: authorization) {
         case .allow:
             return nil
-        case .refuse(let reason, _, _):
-            // The typed payload (`valuables` + `acknowledgementToken`) is
-            // deliberately not consumed here: fn-4.9 transports it through
-            // `CleanupReport.ItemError` so the wire rows serialize from
-            // typed data. The REASON is item-keyed by construction and is
-            // what the error surface and the log line carry today.
+        case .refuse(let reason, let valuables, let token):
+            // The TYPED payload travels with the refusal (fn-4.9): the report's
+            // `ItemError` carries it verbatim so `confirmedCleanPayload`
+            // serializes `results[].valuables` + `results[].acknowledgement_token`
+            // from structured data on BOTH result arms — the row encoder never
+            // parses the prose. The REASON stays what the error surface and the
+            // log line carry, item-keyed by construction.
             //
             // ONE tag for the whole seam, inherited VERBATIM from the
             // orphaned-caches precedent this generalizes so the cleanup
@@ -720,15 +723,25 @@ actor CacheCleaner {
             // content is not what the deletion decision rests on — it
             // changed since the scan, could not be re-inspected, or was
             // never authorized on the content present NOW.
-            return (reason, "content-drift")
+            return (
+                reason, "content-drift",
+                CleanupReport.ItemError.Refusal(
+                    valuables: valuables, acknowledgementToken: token
+                )
+            )
         }
     }
 
+    /// The ONE item-error constructor. `refusal` is the ADDITIVE typed payload
+    /// (fn-4.9) — nil on every path but a pre-delete revalidation refusal, so
+    /// ordinary errors keep their exact as-built shape.
     private static func itemError(
-        _ item: ReclaimableItem, _ message: String
+        _ item: ReclaimableItem, _ message: String,
+        refusal: CleanupReport.ItemError.Refusal? = nil
     ) -> CleanupReport.ItemError {
         CleanupReport.ItemError(
-            key: item.key, displayName: item.displayName, message: message
+            key: item.key, displayName: item.displayName, message: message,
+            refusal: refusal
         )
     }
 
@@ -1085,7 +1098,9 @@ actor CacheCleaner {
         ) {
             logRefusal(label: item.displayName, tag: refusal.tag,
                        detail: refusal.reason)
-            return (nil, [Self.itemError(item, refusal.reason)])
+            return (nil, [Self.itemError(
+                item, refusal.reason, refusal: refusal.payload
+            )])
         }
 
         let token = await registry.registerObservations(report.claims)

@@ -443,12 +443,17 @@ enum SpotlightPresence {
 /// candidate.
 ///
 /// Thread-safe (`lock` guards the latch state; queries themselves run
-/// outside the lock — a racing duplicate canary is idempotent and
-/// harmless). Because queries run unlocked, a zero-count RECHECKS the
-/// latch before it may become `.absent`: a concurrent query's failure
-/// poisons every in-flight absence (the canary path already has this
-/// property — its verdict is recomputed under the lock, first writer
-/// wins). `@unchecked Sendable` under that discipline.
+/// outside the lock — a racing duplicate canary costs one redundant pass;
+/// divergent verdicts are settled by the absorbing rule below). Because
+/// queries run unlocked, a zero-count RECHECKS the latch before it may
+/// become `.absent`: a concurrent query's failure poisons every in-flight
+/// absence. The canary verdict write is a failure-ABSORBING latch, NOT
+/// first-writer-wins: a failed pass writes `.unavailable` unconditionally
+/// (even over a concurrent pass's already-written `.healthy`), a
+/// successful pass claims `.healthy` only from `.unprobed`, and
+/// `.unavailable` is terminal for the probe instance (PR #456 review r4 —
+/// a symmetric first-writer rule let a healthy first writer discard a
+/// failing pass's verdict). `@unchecked Sendable` under that discipline.
 final class SpotlightBundleIDProbe: @unchecked Sendable {
 
     /// Bundle ids present on every macOS installation; any one hit proves
@@ -518,8 +523,8 @@ final class SpotlightBundleIDProbe: @unchecked Sendable {
     // MARK: - Health
 
     /// One-shot canary, double-checked around the lock (canary queries run
-    /// OUTSIDE it — they spawn subprocesses; a racing duplicate computes
-    /// the same verdict).
+    /// OUTSIDE it — they spawn subprocesses; racing duplicate passes are
+    /// settled by the failure-absorbing verdict write below).
     private func ensureHealthy() -> Bool {
         lock.lock()
         let current = state
@@ -551,11 +556,26 @@ final class SpotlightBundleIDProbe: @unchecked Sendable {
         }
         let healthy = sawHit && !sawFailure
         lock.lock()
-        // First writer wins; an unavailable latch set meanwhile sticks.
-        if state == .unprobed {
-            state = healthy ? .healthy : .unavailable
+        // Failure-ABSORBING latch, not first-writer-wins (PR #456 review
+        // r4). The old symmetric rule (`if state == .unprobed` for BOTH
+        // verdicts) let a concurrent healthy pass that wrote `.healthy`
+        // first DISCARD this pass's observed failure: this pass then
+        // returned a healthy verdict, its zero-count real query minted
+        // `.absent`, and the resolver claimed `.notInstalled` despite the
+        // any-failure-poisons contract. A FAILED pass therefore latches
+        // `.unavailable` UNCONDITIONALLY — failure always wins; a
+        // SUCCESSFUL pass claims `.healthy` only from `.unprobed`, so
+        // `.unavailable` is terminal for the probe instance.
+        if !healthy {
+            state = .unavailable
+        } else if state == .unprobed {
+            state = .healthy
         }
-        let verdict = state == .healthy
+        // Belt and braces: this pass's OWN observed failure poisons its
+        // verdict directly (`healthy &&`), not only via the shared state —
+        // the caller that saw the failure must never proceed to trust a
+        // zero, regardless of what any other pass wrote.
+        let verdict = healthy && state == .healthy
         lock.unlock()
         return verdict
     }

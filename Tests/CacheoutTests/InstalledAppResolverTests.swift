@@ -631,6 +631,164 @@ final class InstalledAppResolverTests: XCTestCase {
         )
     }
 
+    // MARK: - Concurrent canary passes (failure-absorbing latch, r4)
+
+    func testProbeConcurrentCanaryFailureAbsorbsOverHealthyFirstWriter() {
+        // PR #456 review r4 — the EXACT reported race: two first-time
+        // presence calls run canary passes concurrently; pass A completes
+        // fully healthy and writes .healthy BEFORE pass B (which observed a
+        // canary failure) records its verdict. The old symmetric
+        // first-writer-wins write (`if state == .unprobed` for both
+        // verdicts) DISCARDED B's failure: B returned a healthy verdict,
+        // proceeded to a zero real query, minted .absent, and the resolver
+        // could claim .notInstalled despite the any-failure-poisons
+        // contract. Driven deterministically through the scripted runQuery
+        // seam: B's first canary re-entrantly runs pass A to completion
+        // (queries run OUTSIDE the probe's lock, so this cannot deadlock)
+        // before returning B's nil — exactly the racing schedule.
+        weak var probeRef: SpotlightBundleIDProbe?
+        var aVerdict: SpotlightPresence?
+        var queries: [String] = []
+        var finderCalls = 0
+        let probe = SpotlightBundleIDProbe(runQuery: { id in
+            queries.append(id)
+            switch id {
+            case "com.apple.finder":
+                finderCalls += 1
+                if finderCalls == 1 {
+                    // Pass B's first canary: run pass A to completion —
+                    // fully healthy canaries (the hits below) plus a clean
+                    // zero — so A writes .healthy first.
+                    aVerdict = probeRef?.presence(ofBundleID: "com.example.a-zero")
+                    return nil // then B observes its canary failure
+                }
+                return 1 // pass A's finder canary hit
+            case "com.apple.dock", "com.apple.systempreferences":
+                return 1 // pass A's remaining canaries
+            default:
+                return 0
+            }
+        })
+        probeRef = probe
+        XCTAssertEqual(
+            probe.presence(ofBundleID: "com.example.b-target"), .unavailable,
+            "B's observed canary failure must poison B's OWN verdict — a healthy first writer cannot suppress it into a trusted zero"
+        )
+        XCTAssertEqual(
+            aVerdict, .absent,
+            "the schedule is the reported one: pass A completed healthy and answered BEFORE B recorded its failure"
+        )
+        XCTAssertEqual(
+            queries,
+            ["com.apple.finder",                 // B's canary that fails
+             "com.apple.finder", "com.apple.dock",
+             "com.apple.systempreferences",      // A's healthy pass
+             "com.example.a-zero"],              // A's real query
+            "B's failure short-circuited its pass and B's real query NEVER ran"
+        )
+        XCTAssertEqual(
+            probe.presence(ofBundleID: "com.example.later"), .unavailable,
+            "the failure ABSORBS: A's .healthy does not survive — subsequent callers see the latch"
+        )
+    }
+
+    func testResolverConcurrentCanaryRaceYieldsUnknownNotNotInstalled() {
+        // The r4 race observed at the resolver level: complete census, LS
+        // off — the caller whose canary pass observed the failure must
+        // degrade its no-match to .unknown, never mint the orphan tier's
+        // positive .notInstalled.
+        weak var probeRef: SpotlightBundleIDProbe?
+        var finderCalls = 0
+        let probe = SpotlightBundleIDProbe(runQuery: { id in
+            switch id {
+            case "com.apple.finder":
+                finderCalls += 1
+                if finderCalls == 1 {
+                    _ = probeRef?.presence(ofBundleID: "com.example.a-zero")
+                    return nil
+                }
+                return 1
+            case "com.apple.dock", "com.apple.systempreferences":
+                return 1
+            default:
+                return 0
+            }
+        })
+        probeRef = probe
+        let resolver = makeResolver(spotlight: { probe.presence(ofBundleID: $0) })
+        XCTAssertEqual(
+            resolver.status(ofBundleID: "com.example.absent"), .unknown,
+            "a complete census + a concurrency-poisoned canary pass fails closed"
+        )
+    }
+
+    func testProbeConcurrentHealthyPassesStayHealthy() {
+        // Absorbing-rule sanity in the benign direction: two concurrent
+        // fully-healthy passes — the second sees the first's .healthy,
+        // claims nothing, and BOTH verdicts are healthy. No phantom latch.
+        weak var probeRef: SpotlightBundleIDProbe?
+        var aVerdict: SpotlightPresence?
+        var finderCalls = 0
+        let probe = SpotlightBundleIDProbe(runQuery: { id in
+            switch id {
+            case "com.apple.finder":
+                finderCalls += 1
+                if finderCalls == 1 {
+                    aVerdict = probeRef?.presence(ofBundleID: "com.example.a-zero")
+                }
+                return 1
+            case "com.apple.dock", "com.apple.systempreferences":
+                return 1
+            default:
+                return 0
+            }
+        })
+        probeRef = probe
+        XCTAssertEqual(
+            probe.presence(ofBundleID: "com.example.b-zero"), .absent,
+            "two healthy passes agree — B's zero stays a trustworthy clean miss"
+        )
+        XCTAssertEqual(aVerdict, .absent)
+        XCTAssertEqual(probe.presence(ofBundleID: "com.example.later"), .absent,
+                       "the probe stays healthy")
+    }
+
+    func testProbeConcurrentHealthyPassCannotOverwriteFailureLatch() {
+        // The absorbing rule in the OTHER order: pass A fails and latches
+        // .unavailable while pass B's fully-healthy canary pass is still in
+        // flight. B must neither overwrite the latch (.unavailable is
+        // terminal for the probe instance) nor return a healthy verdict.
+        weak var probeRef: SpotlightBundleIDProbe?
+        var aVerdict: SpotlightPresence?
+        var finderCalls = 0
+        let probe = SpotlightBundleIDProbe(runQuery: { id in
+            switch id {
+            case "com.apple.finder":
+                finderCalls += 1
+                if finderCalls == 1 {
+                    // B's first canary: pass A runs concurrently and FAILS
+                    // (A's own finder canary is call #2 → nil), latching
+                    // .unavailable before B's healthy pass completes.
+                    aVerdict = probeRef?.presence(ofBundleID: "com.example.a-target")
+                    return 1 // B's canary hit — B's pass is fully healthy
+                }
+                return nil // A's finder canary failure
+            case "com.apple.dock", "com.apple.systempreferences":
+                return 1
+            default:
+                return 0
+            }
+        })
+        probeRef = probe
+        XCTAssertEqual(
+            probe.presence(ofBundleID: "com.example.b-target"), .unavailable,
+            "a healthy pass completing AFTER a failure latch must not resurrect the probe"
+        )
+        XCTAssertEqual(aVerdict, .unavailable, "the failing pass latched")
+        XCTAssertEqual(probe.presence(ofBundleID: "com.example.later"), .unavailable,
+                       ".unavailable is terminal — absorbing in both orders")
+    }
+
     func testProbeQueryStringEscapesQuoteAndBackslash() {
         // A hostile cache-directory NAME must not inject query syntax: the
         // value rides inside argv (no shell) with \ and " escaped.

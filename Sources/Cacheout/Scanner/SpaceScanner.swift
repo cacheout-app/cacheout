@@ -694,9 +694,23 @@ struct SpaceScannerRuntime {
 
     /// The production registry — the single place scanners are registered.
     /// The ViewModel (fn-2.4) and CLI (fn-2.6) both consume this factory.
-    /// NodeModulesScanner's registration (fn-2.2) is what puts its search
-    /// roots in the runtime's container-root union — delete-time admission
-    /// for node_modules items derives from HERE, never from items.
+    /// A per-item scanner's registration is what puts its roots in the
+    /// runtime's container-root union — delete-time admission derives from
+    /// HERE, never from items.
+    ///
+    /// **THE ATOMIC SWAP (fn-4.5, R6/D4).** `BuildArtifactsScanner` REPLACES
+    /// `NodeModulesScanner` in ONE composition change, with no interval in
+    /// which both are registered: two registered scanners would double-list
+    /// the same directories (no cross-scanner dedupe exists — D4) AND leave
+    /// the legacy slug emitting UNMARKED, non-revalidated items for trees
+    /// that can contain `.app`/`.dmg` release artifacts (an R17 bypass).
+    /// Unregistration retires the `node_modules` slug's ADDRESSABILITY
+    /// immediately — slug addressing derives from the registered scanners —
+    /// while the class, its direct tests, and its dead source survive until
+    /// fn-4.7's migration + deletion. `node_modules/` trees are still found:
+    /// they are one row of fn-4.1's rule table, listed under
+    /// `build_artifacts` with the same `.review` risk the as-built scanner
+    /// declared.
     ///
     /// `try!` is deliberate: the registry is static configuration, so a
     /// registration-validation failure is a programmer error (a malformed or
@@ -708,18 +722,34 @@ struct SpaceScannerRuntime {
     ///   invocation-scoped layering that additionally folds in its flags
     ///   (never persisted). Thresholds are scanner-construction state by
     ///   frozen contract: they do not ride `ScanContext`.
+    /// - Parameter devRoots: the build-artifacts scanner's resolved dev
+    ///   roots (fn-4.1's `{keptRoots, issues}`) — CONSTRUCTION state, not
+    ///   `ScanContext` (D1: `trustedContainerRoots` freeze at registration,
+    ///   so changing roots REBUILDS the runtime). `nil` — the GUI's
+    ///   composition — resolves the persisted `DevRootsStore` here, exactly
+    ///   as `orphanedCachesThresholds` does; the CLI passes an
+    ///   invocation-scoped replacement (`--dev-root`, fn-4.6) that is never
+    ///   persisted. `keptRoots` become the scanner's declared container
+    ///   roots (and the walker's roots); `issues` ride EVERY scan outcome,
+    ///   so a policy-rejected persisted root stays visible while never
+    ///   registering or walking (R16).
     static func production(
         home: URL = FileManager.default.homeDirectoryForCurrentUser,
         provider: FileSystemIdentityProvider = FileSystemIdentityProvider(),
-        orphanedCachesThresholds: OrphanedCacheClassifier.Thresholds? = nil
+        orphanedCachesThresholds: OrphanedCacheClassifier.Thresholds? = nil,
+        devRoots: DevRootsResolution? = nil
     ) -> SpaceScannerRuntime {
         let categories = CacheCategory.allCategories
         let categoryScanner = CategoryScanner(
             categories: categories,
             scanner: CacheScanner(home: home, provider: provider)
         )
-        let nodeModulesScanner = NodeModulesScanner(
-            home: home, provider: provider
+        let buildArtifactsScanner = BuildArtifactsScanner(
+            home: home,
+            devRoots: devRoots
+                ?? DevRootsStore(provider: provider)
+                    .effectiveRoots(home: home),
+            provider: provider
         )
         // fn-3.3's production resolver, wired in as the classifier's
         // tri-state predicate; one instance per runtime so its lazy census
@@ -733,7 +763,9 @@ struct SpaceScannerRuntime {
             installedAppStatus: { installedAppResolver.status(ofBundleID: $0) }
         )
         return try! SpaceScannerRuntime(
-            scanners: [categoryScanner, nodeModulesScanner, orphanedCachesScanner],
+            scanners: [
+                categoryScanner, buildArtifactsScanner, orphanedCachesScanner,
+            ],
             categories: categories,
             home: home,
             provider: provider

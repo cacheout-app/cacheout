@@ -385,6 +385,48 @@ class CacheoutViewModel: ObservableObject {
         self.launchAtLogin = UserDefaults.standard.bool(forKey: "cacheout.launchAtLogin")
     }
 
+    /// THE PRODUCTION COMPOSITION (fn-4.5) — the app's one construction site
+    /// (`CacheoutApp`), and the piece fn-4.10's seam was built to receive.
+    ///
+    /// One factory closes over the production composition inputs
+    /// (home/provider → `SpaceScannerRuntime.production(devRoots:)`, which
+    /// owns the categories, thresholds, and scanner list). It builds BOTH
+    /// the INITIAL runtime and every rebuilt one, so the composition can
+    /// never drift across a Settings-triggered rebuild — and the rebuild
+    /// path is the SAME one hermetic tests drive with fixture factories (no
+    /// production-only branch anywhere).
+    ///
+    /// Dev roots are read from the persisted store HERE, at construction
+    /// (D1): `trustedContainerRoots` freeze at registration, so a roots
+    /// change means a new runtime, never a mutation of this one.
+    ///
+    /// - Parameters:
+    ///   - home: the home the whole composition anchors to (injectable —
+    ///     the house rule; production takes the account home).
+    ///   - provider: identity provider shared by every composed piece.
+    ///   - devRootsStore: the persisted dev-roots config the factory
+    ///     re-resolves on every change request (injectable suite in tests).
+    static func production(
+        home: URL = FileManager.default.homeDirectoryForCurrentUser,
+        provider: FileSystemIdentityProvider = FileSystemIdentityProvider(),
+        devRootsStore: DevRootsStore? = nil
+    ) -> CacheoutViewModel {
+        let store = devRootsStore ?? DevRootsStore(provider: provider)
+        let makeRuntime: @Sendable (DevRootsResolution) -> SpaceScannerRuntime = {
+            devRoots in
+            .production(home: home, provider: provider, devRoots: devRoots)
+        }
+        return CacheoutViewModel(
+            // The initial runtime comes from the SAME factory the rebuild
+            // path uses — one source, so the first composition and every
+            // later one are identical apart from their dev roots.
+            runtime: makeRuntime(store.effectiveRoots(home: home)),
+            reconstruction: RuntimeReconstruction(
+                devRootsStore: store, home: home, makeRuntime: makeRuntime
+            )
+        )
+    }
+
     // MARK: - Item access
 
     /// Registry order — the stable presentation order for sections and for

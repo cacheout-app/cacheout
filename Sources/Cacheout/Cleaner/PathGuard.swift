@@ -26,8 +26,12 @@
 ///    is the delete-time check, identity-bound to the scan-session
 ///    `ContainerSnapshot` — and the only way to mint the deletion-capable
 ///    `AdmittedContainer` token. Deliberately split from deletion roots — a
-///    search root like `~/Documents` is a valid place to LOOK for
-///    node_modules while remaining refused as a deletion target.
+///    search root like `~/Documents` is a valid place to LOOK for build
+///    artifacts while remaining refused as a deletion target. BOTH modes run
+///    the shared CONTAINER-ROOT ADMISSION POLICY on the matched configured
+///    root (R16 layer (c), fn-4.5): a configured `/`, volume root, or
+///    `$HOME` — in canonical or alias spelling — never admits, no matter
+///    what configuration produced it.
 ///
 /// A deny list applies regardless of policy: `/`, any volume root (device-id
 /// change against the parent — this also catches the `/System/Volumes/Data`
@@ -377,16 +381,47 @@ final class PathGuard {
 
     /// Shared root matching for both admission modes: inode identity against
     /// each configured root, resolved forms compared.
+    ///
+    /// **R16 layer (c), fn-4.5** — the CONTAINER-ROOT ADMISSION POLICY runs
+    /// HERE, on the MATCHED CONFIGURED ROOT (canonicalized first), so BOTH
+    /// admission modes (`admitSearchRoot` and `admitContainer`) enforce it
+    /// from one place: a dangerous root that slipped past every resolution
+    /// layer (persisted config, CLI flag, Settings) still cannot admit.
+    /// Without it, `matchConfiguredRoot` was inode-identity ONLY while
+    /// `denyCheck` applied solely to `validateRemovableItem` TARGETS — a
+    /// configured `/` container would have authorized deletion of nearly any
+    /// same-device descendant that passed the target-level checks.
+    ///
+    /// The check is on the CANONICAL matched root (alias doctrine): a
+    /// symlink alias of `/`, of a volume root, or of `$HOME` is caught,
+    /// while a symlinked-ANCESTOR spelling of a legal root canonicalizes to
+    /// its legal target and admits. Protected first-level children
+    /// (`~/Documents`) stay admissible as containers — the policy is
+    /// `denyCheck` MINUS the protected-children clause (the container-vs-
+    /// deletion-target split `admitSearchRoot` documents), which is why
+    /// every existing scanner's roots still admit.
     private func matchConfiguredRoot(
         _ url: URL
     ) throws -> (matched: URL, resolved: URL) {
         let resolved = provider.canonicalize(url)
         for root in containerRoots {
-            if provider.sameLocation(resolved, provider.canonicalize(root)) {
+            let canonicalRoot = provider.canonicalize(root)
+            if provider.sameLocation(resolved, canonicalRoot) {
+                try containerRootPolicyCheck(canonical: canonicalRoot)
                 return (root, resolved)
             }
         }
         throw PathGuardError.notAConfiguredContainer(path: resolved.path)
+    }
+
+    /// The shared container-root admission policy (`validateContainerRoot`)
+    /// bound to THIS guard's already-canonical home and an already-canonical
+    /// root — the identical policy body, zero re-canonicalization. One
+    /// definition, three call sites (epic R16).
+    private func containerRootPolicyCheck(canonical root: URL) throws {
+        try Self.coreDenyCheck(
+            root, resolvedHome: resolvedHome, provider: provider
+        )
     }
 
     // MARK: Containment validation

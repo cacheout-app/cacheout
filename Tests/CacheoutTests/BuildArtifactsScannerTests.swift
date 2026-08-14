@@ -210,15 +210,15 @@ final class BuildArtifactsScannerTests: XCTestCase {
     }
 
     /// Every fixture outcome must be non-malformed across all 8 check
-    /// families — through a TEST-ONLY adapter declaring the SAME id and the
-    /// SAME trusted container roots (production conformance is fn-4.5's).
+    /// families — through the scanner's OWN production `SpaceScanner`
+    /// conformance (fn-4.5), registered via the PUBLIC runtime initializer.
     private func assertRoundTripsValidator(
         _ outcome: ScanOutcome,
         scanner: BuildArtifactsScanner,
         file: StaticString = #filePath, line: UInt = #line
     ) throws {
         let runtime = try SpaceScannerRuntime(
-            scanners: [BuildArtifactsAdapterScanner(scanner: scanner)],
+            scanners: [scanner],
             categories: [],
             home: fixtureHome,
             provider: FileSystemIdentityProvider()
@@ -2412,10 +2412,16 @@ final class BuildArtifactsScannerTests: XCTestCase {
         _ item: ReclaimableItem, scanner: BuildArtifactsScanner,
         declaresRevalidator: Bool = true
     ) throws -> ValidatedScannerEvent {
+        // The production conformance registers directly; the adapter is
+        // used ONLY to strip the revalidator declaration (the
+        // no-revalidator shape).
+        let scanners: [any SpaceScanner] = declaresRevalidator
+            ? [scanner]
+            : [BuildArtifactsAdapterScanner(
+                scanner: scanner, declaresRevalidator: false
+            )]
         let runtime = try SpaceScannerRuntime(
-            scanners: [BuildArtifactsAdapterScanner(
-                scanner: scanner, declaresRevalidator: declaresRevalidator
-            )],
+            scanners: scanners,
             categories: [], home: fixtureHome,
             provider: FileSystemIdentityProvider()
         )
@@ -2480,7 +2486,7 @@ final class BuildArtifactsScannerTests: XCTestCase {
         runtime: SpaceScannerRuntime
     ) {
         let runtime = try SpaceScannerRuntime(
-            scanners: [BuildArtifactsAdapterScanner(scanner: scanner)],
+            scanners: [scanner],
             categories: [], home: fixtureHome,
             provider: FileSystemIdentityProvider()
         )
@@ -2800,6 +2806,527 @@ final class BuildArtifactsScannerTests: XCTestCase {
         let id = expectedID(of: url, provider: provider)
         return items.first { $0.id == id }
     }
+
+    // ====================================================================
+    // MARK: - fn-4.5: the deletion path + the registration story
+    // ====================================================================
+    //
+    // The scanner is registered through the PUBLIC runtime initializer by
+    // its OWN production conformance (no adapter), so every deletion below
+    // runs the production chain: registration → `trustedContainerRoots` →
+    // session `ContainerSnapshot` → `makeCleaner(snapshot:)` →
+    // `admitContainer` + `validateRemovableItem` → revalidator → removal.
+
+    /// R5 base: the artifact DIRECTORY ITSELF is removed (never its
+    /// contents-with-parent-preserved), the project and its marker survive,
+    /// and freed bytes equal an INDEPENDENT lstat measurement.
+    func testRegisteredScannerDeletesTheArtifactDirectoryAndReportsFreedBytes()
+        async throws
+    {
+        let project = dev.appendingPathComponent("rust")
+        let artifact = try makeProject(
+            at: project, marker: "Cargo.toml", artifact: "target"
+        )
+        let deeper = try writeFile(
+            artifact.appendingPathComponent("debug/build/out.o"), bytes: 16_384
+        )
+        let payload = artifact.appendingPathComponent("payload.bin")
+        let expectedExact = allocated(payload, deeper)
+
+        let (items, snapshot, runtime) = try await scanSession(makeScanner())
+        let found = try XCTUnwrap(item(from: items, at: artifact))
+        XCTAssertEqual(found.action.wireString, "remove_item")
+
+        let report = await runtime.makeCleaner(snapshot: snapshot)
+            .clean(items: [found], moveToTrash: false)
+
+        XCTAssertTrue(report.errors.isEmpty, "\(report.errors)")
+        XCTAssertEqual(report.entries.map(\.itemID), [found.id])
+        let entry = try XCTUnwrap(report.entries.first)
+        XCTAssertEqual(entry.scannerID, BuildArtifactsScanner.registeredID)
+        XCTAssertEqual(entry.disposal, .permanent)
+        XCTAssertEqual(entry.exactBytes, expectedExact,
+                       "freed bytes are the DELETION-TIME measurement")
+        XCTAssertEqual(entry.estimatedUpToBytes, 0, "no hardlinks in the fixture")
+        XCTAssertEqual(report.totalFreedExact, expectedExact)
+
+        XCTAssertFalse(fm.fileExists(atPath: artifact.path),
+                       "the artifact directory itself is gone")
+        XCTAssertTrue(fm.fileExists(atPath: project.path))
+        XCTAssertTrue(
+            fm.fileExists(atPath: project.appendingPathComponent("Cargo.toml").path),
+            "the marker that proved the match is untouched"
+        )
+    }
+
+    /// R5: the trash toggle is honored BOTH ways, and a trash FAILURE never
+    /// falls through to a permanent delete.
+    func testTrashDispositionHonoredAndTrashFailureNeverFallsThrough()
+        async throws
+    {
+        let artifact = try makeProject(
+            at: dev.appendingPathComponent("rust"),
+            marker: "Cargo.toml", artifact: "target"
+        )
+        let trashed = TrashSpy(destination: base.appendingPathComponent("trash"))
+        try mkdir(trashed.destination)
+
+        // (a) FAILURE first, on the same fixture: the item error surfaces
+        // and the target is still there — no permanent fallback.
+        let (items, snapshot, runtime) = try await scanSession(makeScanner())
+        let found = try XCTUnwrap(item(from: items, at: artifact))
+        let failing = runtime.makeCleaner(
+            snapshot: snapshot, trashHandler: { _ in
+                throw CocoaError(.fileWriteNoPermission)
+            }
+        )
+        let failedReport = await failing.clean(items: [found], moveToTrash: true)
+        XCTAssertTrue(failedReport.entries.isEmpty)
+        XCTAssertEqual(failedReport.errors.map(\.key), [found.key])
+        XCTAssertTrue(fm.fileExists(atPath: artifact.path),
+                      "a trash failure NEVER falls through to permanent delete")
+
+        // (b) SUCCESS: the injected handler receives the UNRESOLVED target
+        // and the entry records `.trash`.
+        let cleaner = runtime.makeCleaner(
+            snapshot: snapshot, trashHandler: { url in try trashed.accept(url) }
+        )
+        let report = await cleaner.clean(items: [found], moveToTrash: true)
+
+        XCTAssertTrue(report.errors.isEmpty, "\(report.errors)")
+        XCTAssertEqual(report.entries.map(\.disposal), [.trash])
+        XCTAssertEqual(report.disposal, .trash)
+        XCTAssertEqual(trashed.accepted.map(\.path), [artifact.path],
+                       "the trash seam got the unresolved deletion target")
+        XCTAssertFalse(fm.fileExists(atPath: artifact.path))
+    }
+
+    /// R5: a cleaner with NO session snapshot fails closed — the deletion
+    /// token is structurally unmintable — and a STALE snapshot (the root
+    /// replaced after capture) is refused with `containerUnavailable`.
+    func testNilAndStaleSnapshotsBothFailClosedWithNothingRemoved() async throws {
+        let artifact = try makeProject(
+            at: dev.appendingPathComponent("rust"),
+            marker: "Cargo.toml", artifact: "target"
+        )
+        let (items, snapshot, runtime) = try await scanSession(makeScanner())
+        let found = try XCTUnwrap(item(from: items, at: artifact))
+
+        // (a) nil snapshot — no fail-open path exists.
+        let unbound = await runtime.makeCleaner(snapshot: nil)
+            .clean(items: [found], moveToTrash: false)
+        XCTAssertTrue(unbound.entries.isEmpty)
+        XCTAssertEqual(unbound.errors.map(\.key), [found.key])
+        XCTAssertTrue(
+            try XCTUnwrap(unbound.errors.first?.message)
+                .contains("no scan-session container snapshot"),
+            unbound.errors.first?.message ?? ""
+        )
+        XCTAssertTrue(fm.fileExists(atPath: artifact.path))
+
+        // (b) STALE: the dev ROOT is replaced (rm + mkdir → new inode) after
+        // capture — the unmount/remount and swap shapes — so its recorded
+        // identity no longer matches. The item's own tree is rebuilt exactly
+        // as it was, so ONLY the container identity differs.
+        try fm.removeItem(at: dev)
+        let rebuilt = try makeProject(
+            at: dev.appendingPathComponent("rust"),
+            marker: "Cargo.toml", artifact: "target"
+        )
+        let stale = await runtime.makeCleaner(snapshot: snapshot)
+            .clean(items: [found], moveToTrash: false)
+        XCTAssertTrue(stale.entries.isEmpty)
+        XCTAssertEqual(stale.errors.map(\.key), [found.key])
+        XCTAssertTrue(
+            try XCTUnwrap(stale.errors.first?.message)
+                .contains("identity changed since the scan"),
+            stale.errors.first?.message ?? ""
+        )
+        XCTAssertTrue(fm.fileExists(atPath: rebuilt.path),
+                      "nothing was removed under the replaced root")
+    }
+
+    /// R5: a SPARSE artifact frees its ALLOCATED bytes (< logical) — the
+    /// 57.1G-logical / 31G-allocated field case, measured at deletion time.
+    func testSparseArtifactFreesAllocatedBytesBelowItsLogicalSize() async throws {
+        let artifact = try makeProject(
+            at: dev.appendingPathComponent("sparse"),
+            marker: "Cargo.toml", artifact: "target"
+        )
+        let sparse = artifact.appendingPathComponent("sparse.bin")
+        fm.createFile(atPath: sparse.path, contents: nil)
+        let handle = try FileHandle(forWritingTo: sparse)
+        try handle.truncate(atOffset: 50_000_000)
+        try handle.close()
+        let expectedExact = allocated(
+            artifact.appendingPathComponent("payload.bin"), sparse
+        )
+
+        let (items, snapshot, runtime) = try await scanSession(makeScanner())
+        let found = try XCTUnwrap(item(from: items, at: artifact))
+        let logical = try XCTUnwrap(found.logicalBytes)
+
+        let report = await runtime.makeCleaner(snapshot: snapshot)
+            .clean(items: [found], moveToTrash: false)
+
+        let entry = try XCTUnwrap(report.entries.first)
+        XCTAssertEqual(entry.exactBytes, expectedExact)
+        XCTAssertLessThan(entry.exactBytes, logical,
+                          "deletion frees ALLOCATED bytes, not the apparent "
+                              + "logical size")
+        XCTAssertFalse(fm.fileExists(atPath: artifact.path))
+    }
+
+    /// R5: a large-ish tree deletes green (the kondo #97 "Directory not
+    /// empty" race defense rides the existing guarded-removal path).
+    func testLargeArtifactTreeDeletesGreen() async throws {
+        let artifact = try makeProject(
+            at: dev.appendingPathComponent("big"),
+            marker: "Cargo.toml", artifact: "target"
+        )
+        for bucket in 0..<12 {
+            for file in 0..<25 {
+                try writeFile(
+                    artifact.appendingPathComponent("deps/b\(bucket)/f\(file).o"),
+                    bytes: 512
+                )
+            }
+        }
+
+        let (items, snapshot, runtime) = try await scanSession(makeScanner())
+        let found = try XCTUnwrap(item(from: items, at: artifact))
+        XCTAssertGreaterThan(found.itemCount, 300)
+
+        let report = await runtime.makeCleaner(snapshot: snapshot)
+            .clean(items: [found], moveToTrash: false)
+
+        XCTAssertTrue(report.errors.isEmpty, "\(report.errors)")
+        XCTAssertEqual(report.entries.count, 1)
+        XCTAssertFalse(fm.fileExists(atPath: artifact.path))
+    }
+
+    /// R11: every target passes delete-time `admitContainer` +
+    /// `validateRemovableItem`. A container-ESCAPING target is refused and
+    /// surfaced; the other selected item is unaffected. (Fed to the cleaner
+    /// directly: the scan-time validator's origin binding refuses this shape
+    /// one layer earlier, so this is the defense-in-depth half.)
+    func testContainerEscapingTargetIsRefusedWhileOtherItemsProceed()
+        async throws
+    {
+        let artifact = try makeProject(
+            at: dev.appendingPathComponent("rust"),
+            marker: "Cargo.toml", artifact: "target"
+        )
+        let outsider = base.appendingPathComponent("outside/victim")
+        try mkdir(outsider)
+        try writeFile(outsider.appendingPathComponent("keep.bin"), bytes: 4_096)
+
+        let (items, snapshot, runtime) = try await scanSession(makeScanner())
+        let good = try XCTUnwrap(item(from: items, at: artifact))
+        // Same scanner, same declared origin — but a target OUTSIDE it.
+        let escaping = escapingItem(origin: dev, target: outsider)
+
+        let report = await runtime.makeCleaner(snapshot: snapshot)
+            .clean(items: [escaping, good], moveToTrash: false)
+
+        XCTAssertEqual(report.errors.map(\.key), [escaping.key])
+        XCTAssertTrue(
+            try XCTUnwrap(report.errors.first?.message)
+                .contains("not strictly inside"),
+            report.errors.first?.message ?? ""
+        )
+        XCTAssertTrue(
+            fm.fileExists(atPath: outsider.appendingPathComponent("keep.bin").path),
+            "the escaping target is byte-untouched"
+        )
+        XCTAssertEqual(report.entries.map(\.itemID), [good.id],
+                       "the legitimate item in the same clean proceeds")
+        XCTAssertFalse(fm.fileExists(atPath: artifact.path))
+    }
+
+    /// R16 data path: a POLICY-REJECTED PERSISTED root is never registered
+    /// and never walked, while its classified `.containerRefused` issue
+    /// rides EVERY scan outcome — asserted across two consecutive scans, and
+    /// the stored value is never rewritten.
+    func testPolicyRejectedPersistedRootRidesEveryScanAndNeverRegisters()
+        async throws
+    {
+        let artifact = try makeProject(
+            at: dev.appendingPathComponent("rust"),
+            marker: "Cargo.toml", artifact: "target"
+        )
+        let persisted = ["/", dev.path]
+        defaults.set(persisted, forKey: DevRootsStore.devRootsKey)
+        let resolution = DevRootsStore(defaults: defaults)
+            .effectiveRoots(home: fixtureHome)
+        let scanner = BuildArtifactsScanner(
+            home: fixtureHome, devRoots: resolution
+        )
+
+        XCTAssertEqual(scanner.trustedContainerRoots.map(\.path), [dev.path],
+                       "the refused root is NEVER registered")
+
+        for pass in 1...2 {
+            let outcome = try await runScan(scanner)
+            let refusals = outcome.errors.filter { $0.kind == .containerRefused }
+            XCTAssertEqual(refusals.count, 1, "pass \(pass)")
+            XCTAssertEqual(refusals.first?.url?.path, "/", "pass \(pass)")
+            XCTAssertTrue(
+                (refusals.first?.detail ?? "").contains("filesystem root"),
+                "the issue says WHY: \(refusals.first?.detail ?? "")"
+            )
+            XCTAssertEqual(outcome.items.compactMap(\.url?.path),
+                           [identityPath(of: artifact)],
+                           "only the kept root was walked (pass \(pass))")
+        }
+
+        XCTAssertEqual(
+            defaults.array(forKey: DevRootsStore.devRootsKey) as? [String],
+            persisted,
+            "the persisted list is never rewritten by resolution"
+        )
+    }
+
+    /// R8/R12 registration story for imperfect roots: NESTED roots register
+    /// and walk independently, an ABSENT root is an honest no-item omission
+    /// that the snapshot OMITS, and a NON-DIRECTORY root is a classified
+    /// per-root issue — all with the DECLARED spellings preserved verbatim.
+    func testImperfectKeptRootsRegisterVerbatimAndClassifyAtWalkTime()
+        async throws
+    {
+        let nested = dev.appendingPathComponent("team")
+        let outer = try makeProject(
+            at: dev.appendingPathComponent("rust"),
+            marker: "Cargo.toml", artifact: "target"
+        )
+        let inner = try makeProject(
+            at: nested.appendingPathComponent("inner"),
+            marker: "Cargo.toml", artifact: "target"
+        )
+        let absent = base.appendingPathComponent("absent-root")
+        let fileRoot = try writeFile(
+            base.appendingPathComponent("file-root"), bytes: 64
+        )
+        let declared = [dev!, nested, absent, fileRoot]
+        let scanner = makeScanner(roots: declared)
+
+        XCTAssertEqual(scanner.trustedContainerRoots.map(\.path),
+                       declared.map(\.path),
+                       "kept roots are the DECLARED spellings, verbatim — "
+                           + "set-asides pass through")
+
+        // Snapshot capture OMITS the absent root (fail-closed downstream).
+        let provider = FileSystemIdentityProvider()
+        let snapshot = ContainerSnapshot.capture(
+            roots: scanner.trustedContainerRoots, provider: provider
+        )
+        XCTAssertNil(snapshot.identity(forRootPath: absent.path),
+                     "an absent root has no captured identity")
+        XCTAssertNotNil(snapshot.identity(forRootPath: dev.path))
+
+        let outcome = try await runScan(scanner)
+
+        // The absent root: NO issue (machines differ), no items.
+        XCTAssertFalse(outcome.errors.contains { $0.url?.path == absent.path },
+                       "an absent kept root is an honest no-item omission")
+        // The non-directory root: a classified per-root issue.
+        let fileIssue = try XCTUnwrap(
+            outcome.errors.first { $0.url?.path == fileRoot.path }
+        )
+        XCTAssertEqual(fileIssue.kind, .symlinkRoot)
+        // Nested roots walked independently, overlap collapsed to ONE item
+        // per canonical identity (D7).
+        XCTAssertEqual(
+            Set(outcome.items.compactMap(\.url?.path)),
+            [identityPath(of: outer), identityPath(of: inner)]
+        )
+        let innerItem = try XCTUnwrap(item(outcome, at: inner))
+        guard case .containerItem(let origin, _) = innerItem.admission else {
+            return XCTFail("a build-artifact item carries container admission")
+        }
+        XCTAssertEqual(origin.path, nested.path,
+                       "the DEEPEST declared root wins the provenance")
+    }
+
+    /// R12 unmount/permission-loss, both halves: at SCAN time the origin
+    /// root failing after admission emits a per-root CLASSIFIED issue (never
+    /// a silent zero); at CLEAN time the same disappearance is refused by
+    /// the snapshot identity gate.
+    func testOriginRootLostAfterAdmissionIsClassifiedAndRefusedAtCleanTime()
+        async throws
+    {
+        try XCTSkipIf(geteuid() == 0, "root ignores permission bits")
+        let artifact = try makeProject(
+            at: dev.appendingPathComponent("rust"),
+            marker: "Cargo.toml", artifact: "target"
+        )
+        // A clean session first — items + snapshot from a healthy scan.
+        let (items, snapshot, runtime) = try await scanSession(makeScanner())
+        let found = try XCTUnwrap(item(from: items, at: artifact))
+
+        // SCAN TIME: the root becomes unreadable mid-life (the unmount /
+        // permission-loss shape — admission needs no read permission, so it
+        // passes and the ENUMERATION is what fails).
+        try chmod000(dev)
+        let denied = try await runScan(makeScanner())
+        XCTAssertTrue(denied.items.isEmpty, "nothing could be enumerated")
+        let issue = try XCTUnwrap(
+            denied.errors.first { $0.url?.path == dev.path },
+            "the per-root issue is PRESENT — a silent skip is a failure"
+        )
+        XCTAssertEqual(issue.kind, .permissionDenied)
+
+        // CLEAN TIME: the root VANISHES entirely after capture — the
+        // snapshot identity gate refuses (`containerUnavailable`).
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dev.path)
+        try fm.removeItem(at: dev)
+        let report = await runtime.makeCleaner(snapshot: snapshot)
+            .clean(items: [found], moveToTrash: false)
+        XCTAssertTrue(report.entries.isEmpty)
+        XCTAssertEqual(report.errors.map(\.key), [found.key])
+        XCTAssertTrue(
+            try XCTUnwrap(report.errors.first?.message)
+                .contains("Container is unavailable"),
+            report.errors.first?.message ?? ""
+        )
+    }
+
+    /// R11/R16 ALIAS-ROOT matrix: a root declared through a symlinked
+    /// ANCESTOR admits, walks, and its items DELETE — the snapshot is keyed
+    /// by the DECLARED spelling while admission matches by inode identity.
+    func testAliasDeclaredRootWalksAndItsItemsDelete() async throws {
+        let real = base.appendingPathComponent("real")
+        let aliasParent = base.appendingPathComponent("aliaslink")
+        try mkdir(real)
+        try fm.createSymbolicLink(at: aliasParent, withDestinationURL: real)
+        // The declared root's LEAF is a real directory reached THROUGH a
+        // symlinked ancestor — the /var → /private/var shape.
+        let aliasRoot = aliasParent.appendingPathComponent("dev")
+        let artifact = try makeProject(
+            at: aliasRoot.appendingPathComponent("rust"),
+            marker: "Cargo.toml", artifact: "target"
+        )
+
+        let scanner = makeScanner(roots: [aliasRoot])
+        XCTAssertEqual(scanner.trustedContainerRoots.map(\.path),
+                       [aliasRoot.path], "the DECLARED spelling is registered")
+
+        let (items, snapshot, runtime) = try await scanSession(scanner)
+        XCTAssertNotNil(snapshot.identity(forRootPath: aliasRoot.path),
+                        "the snapshot is keyed by the declared spelling")
+        let found = try XCTUnwrap(item(from: items, at: artifact))
+        guard case .containerItem(let origin, _) = found.admission else {
+            return XCTFail("a build-artifact item carries container admission")
+        }
+        XCTAssertEqual(origin.path, aliasRoot.path)
+        XCTAssertEqual(found.url?.path, identityPath(of: artifact),
+                       "the published identity is the CANONICAL one")
+
+        let report = await runtime.makeCleaner(snapshot: snapshot)
+            .clean(items: [found], moveToTrash: false)
+
+        XCTAssertTrue(report.errors.isEmpty, "\(report.errors)")
+        XCTAssertEqual(report.entries.map(\.itemID), [found.id])
+        XCTAssertFalse(fm.fileExists(atPath: artifact.path))
+        XCTAssertFalse(
+            fm.fileExists(
+                atPath: real.appendingPathComponent("dev/rust/target").path
+            ),
+            "…and it is gone under the canonical spelling too"
+        )
+    }
+
+    /// R12/R16 alias doctrine, the TCC half: protection is decided on the
+    /// CANONICAL root, so an alias spelling INTO `~/Documents` is skipped by
+    /// an automatic scan exactly as `~/Documents` would be, and walked by a
+    /// user-initiated one.
+    func testAliasIntoProtectedAncestorIsGatedOnTheCanonicalRoot() async throws {
+        let documents = fixtureHome.appendingPathComponent("Documents")
+        let docLink = fixtureHome.appendingPathComponent("doclink")
+        try mkdir(documents)
+        try fm.createSymbolicLink(at: docLink, withDestinationURL: documents)
+        let aliasRoot = docLink.appendingPathComponent("code")
+        let artifact = try makeProject(
+            at: aliasRoot.appendingPathComponent("rust"),
+            marker: "Cargo.toml", artifact: "target"
+        )
+        let scanner = makeScanner(roots: [aliasRoot])
+
+        let automatic = try await runScan(scanner, trigger: .automatic)
+        XCTAssertTrue(automatic.items.isEmpty,
+                      "an alias INTO ~/Documents is TCC-protected as "
+                          + "~/Documents — automatic scans skip it")
+        XCTAssertTrue(automatic.errors.isEmpty, "a policy skip is silent")
+
+        let userInitiated = try await runScan(scanner)
+        XCTAssertEqual(userInitiated.items.compactMap(\.url?.path),
+                       [identityPath(of: artifact)],
+                       "an explicit scan walks the protected root")
+    }
+
+    // MARK: - fn-4.5 fixtures
+
+    /// A structurally-valid `.removeItem` item of THIS scanner whose target
+    /// sits OUTSIDE the declared origin container — the containment-escape
+    /// shape, marked exactly as the scanner marks its items so the cleaner's
+    /// revalidator dispatch is unchanged.
+    private func escapingItem(origin: URL, target: URL) -> ReclaimableItem {
+        let provider = FileSystemIdentityProvider()
+        let resolved = provider.resolveTargetKeepingLeaf(target)
+        return ReclaimableItem(
+            id: ReclaimableItem.stableID(
+                scannerID: BuildArtifactsScanner.registeredID,
+                canonicalPath: resolved.path
+            ),
+            scannerID: BuildArtifactsScanner.registeredID,
+            displayName: target.lastPathComponent,
+            exactBytes: 4_096, estimatedUpToBytes: 0, logicalBytes: nil,
+            itemCount: 1, url: resolved, declaredDisplayPath: target.path,
+            rootRecords: [RootScanRecord(
+                requestedURL: target, resolvedURL: resolved, status: .measured
+            )],
+            state: .measured, scanError: nil, risk: .review,
+            evidence: "escaping fixture", rebuildNote: nil,
+            action: .removeItem,
+            admission: .containerItem(
+                originContainer: origin, requestedTargetURL: target
+            ),
+            defaultSelected: false, automaticCleanEligible: false,
+            isStale: nil, valuablesDisclosure: .clean,
+            requiresPreDeleteRevalidation: true
+        )
+    }
+}
+
+/// Records what the injectable trash seam received and moves it aside — a
+/// hermetic stand-in for `FileManager.trashItem` (the production seam is
+/// never invoked in tests).
+private final class TrashSpy: @unchecked Sendable {
+    let destination: URL
+    private let lock = NSLock()
+    private var received: [URL] = []
+
+    init(destination: URL) {
+        self.destination = destination
+    }
+
+    var accepted: [URL] {
+        lock.lock()
+        defer { lock.unlock() }
+        return received
+    }
+
+    func accept(_ url: URL) throws {
+        lock.lock()
+        received.append(url)
+        lock.unlock()
+        try FileManager.default.moveItem(
+            at: url,
+            to: destination.appendingPathComponent(
+                "\(UUID().uuidString)-\(url.lastPathComponent)"
+            )
+        )
+    }
 }
 
 // MARK: - Test-only fixtures
@@ -2831,17 +3358,13 @@ private final class ThreadProbe: @unchecked Sendable {
     }
 }
 
-/// The TEST-ONLY `SpaceScanner` adapter for the R13 round-trips: the SAME
-/// id (`build_artifacts`) and the SAME declared `trustedContainerRoots` as
-/// the scanner under test, registered through the PUBLIC
-/// `SpaceScannerRuntime` initializer. Production conformance and the atomic
-/// registry swap stay in fn-4.5 — this adapter exists so the validator's
-/// origin binding is checked against a REAL registration declaration without
-/// making the scanner registrable early.
-///
-/// It also FORWARDS the scanner's own `preDeleteRevalidator` declaration
-/// (fn-4.8), so the runtime captures — and `makeCleaner(snapshot:)` injects —
-/// exactly what fn-4.5's one-line conformance will register in production.
+/// TEST-ONLY `SpaceScanner` adapter, now reduced to ONE job (fn-4.5): the
+/// scanner itself conforms and is registered directly everywhere else in
+/// this file, so this wrapper survives only to register the SAME scanner
+/// WITHOUT its `preDeleteRevalidator` declaration — the shape of a scanner
+/// that needs no delete-time revalidation, which is what proves fn-4.8's
+/// marker invariant applies to declared applicability and not to the marker
+/// alone.
 private struct BuildArtifactsAdapterScanner: SpaceScanner {
     let scanner: BuildArtifactsScanner
     /// Registration WITHOUT the declaration — the shape of every scanner

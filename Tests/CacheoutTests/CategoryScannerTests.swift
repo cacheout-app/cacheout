@@ -807,23 +807,39 @@ final class CategoryScannerTests: XCTestCase {
         }
     }
 
+    /// MIGRATED for the fn-4.5 atomic swap: `node_modules` → `build_artifacts`
+    /// in the SAME registration slot, with the same assertions (composition
+    /// order + the union being exactly the per-item scanners' declared sets).
+    /// The dev roots are INJECTED so the union is deterministic — the
+    /// standard-suite read the nil default would do is a machine-dependent
+    /// input, not a property of the composition.
     func testProductionFactoryRegistersCategoryScannerCollisionFree() throws {
         let home = try makeTempDir("home")
-        let runtime = SpaceScannerRuntime.production(home: home)
+        let suiteName = "CategoryScannerTests-\(UUID().uuidString)"
+        let suite = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { suite.removePersistentDomain(forName: suiteName) }
+        let devRoots = DevRootsStore(defaults: suite).effectiveRoots(home: home)
+        let runtime = SpaceScannerRuntime.production(
+            home: home, devRoots: devRoots
+        )
         XCTAssertEqual(
             runtime.scanners.map(\.id),
             [
                 CategoryScanner.registeredID,
-                NodeModulesScanner.registeredID,
+                BuildArtifactsScanner.registeredID,
                 OrphanedCachesScanner.registeredID,
             ]
         )
+        XCTAssertFalse(
+            runtime.scanners.contains { $0.id == NodeModulesScanner.registeredID },
+            "the atomic swap unregistered node_modules in the same change"
+        )
         XCTAssertEqual(
             runtime.trustedContainerRoots.map(\.path),
-            NodeModulesScanner.defaultSearchRoots(home: home).map(\.path)
+            devRoots.keptRoots.map(\.path)
                 + [home.appendingPathComponent("Library/Caches").path],
             "the union is the per-item scanners' declared sets in "
-                + "registration order (node_modules search roots, then the "
+                + "registration order (the kept dev roots, then the "
                 + "orphaned-caches sweep root) — CategoryScanner contributes "
                 + "no container roots"
         )

@@ -51,6 +51,10 @@ final class SpaceScannerIntegrationTests: XCTestCase {
 
     private var base: URL!
     private var fixtureHome: URL!
+    /// Injected suite for `DevRootsStore` — zero standard-suite reads or
+    /// writes (fn-4.5's production composition resolves dev roots).
+    private var defaults: UserDefaults!
+    private var suiteName: String!
     private let fm = FileManager.default
 
     override func setUpWithError() throws {
@@ -58,9 +62,14 @@ final class SpaceScannerIntegrationTests: XCTestCase {
             .appendingPathComponent("SpaceScannerIntegrationTests-\(UUID().uuidString)")
         fixtureHome = base.appendingPathComponent("home")
         try fm.createDirectory(at: fixtureHome, withIntermediateDirectories: true)
+        suiteName = "SpaceScannerIntegrationTests-\(UUID().uuidString)"
+        defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
     }
 
     override func tearDownWithError() throws {
+        if let suiteName {
+            defaults?.removePersistentDomain(forName: suiteName)
+        }
         if let base {
             try? fm.removeItem(at: base)
         }
@@ -434,6 +443,387 @@ final class SpaceScannerIntegrationTests: XCTestCase {
         XCTAssertTrue(fm.fileExists(
             atPath: undeclaredItem.appendingPathComponent("payload_a.bin").path
         ), "the undeclared-container target's payload is intact")
+    }
+
+    // ====================================================================
+    // MARK: - fn-4.5: production registration + the ATOMIC registry swap
+    // ====================================================================
+    //
+    // Everything below drives the REAL `SpaceScannerRuntime.production(...)`
+    // composition over an injected fixture home and injected dev roots. The
+    // `categories` scanner is deliberately kept OUT of every scan here: its
+    // `.probed` discovery spawns tool subprocesses, which is neither
+    // hermetic nor fast — and it declares no container roots and emits no
+    // `scanner_items`, so it can neither list nor hide a build artifact.
+    // (Its registration is asserted structurally, and the row-shape half of
+    // the envelope lives in `CLIGateTests`.)
+
+    /// A marker-sibling project under `dir`: `<dir>/<marker>` beside
+    /// `<dir>/<artifact>/payload.bin`. Returns the artifact directory.
+    @discardableResult
+    private func makeMarkerProject(
+        at dir: URL, marker: String, artifact: String, bytes: Int = 8192
+    ) throws -> URL {
+        try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        try Data(repeating: 0xC3, count: 32)
+            .write(to: dir.appendingPathComponent(marker))
+        let artifactDir = dir.appendingPathComponent(artifact)
+        try fm.createDirectory(at: artifactDir, withIntermediateDirectories: true)
+        try writeFile(artifactDir.appendingPathComponent("payload.bin"), bytes: bytes)
+        return artifactDir
+    }
+
+    /// Dev-root resolution through the REAL R16 pipeline (never a hand-built
+    /// resolution), invocation-scoped so nothing is persisted.
+    private func devRoots(_ roots: [URL]) -> DevRootsResolution {
+        DevRootsStore(defaults: defaults)
+            .effectiveRoots(replacing: roots, home: fixtureHome)
+    }
+
+    /// The production composition over the fixture home + given dev roots.
+    private func productionRuntime(devRoots roots: [URL]) -> SpaceScannerRuntime {
+        SpaceScannerRuntime.production(
+            home: fixtureHome, devRoots: devRoots(roots)
+        )
+    }
+
+    /// Every PER-ITEM scanner of a runtime (the aggregate adapter excluded).
+    private func perItemScannerIDs(_ runtime: SpaceScannerRuntime) -> Set<String> {
+        Set(runtime.scanners.map(\.id))
+            .subtracting([CategoryScanner.registeredID])
+    }
+
+    /// One validated scan of the given scanner subset, collected per scanner
+    /// — the same stream the ViewModel and the CLI consume.
+    private func collect(
+        _ runtime: SpaceScannerRuntime, scannerIDs: Set<String>?,
+        file: StaticString = #filePath, line: UInt = #line
+    ) async -> (outcomes: [String: ScanOutcome], snapshot: ContainerSnapshot) {
+        let session = runtime.scanValidatedSession(
+            scannerIDs: scannerIDs, context: ScanContext(trigger: .userInitiated)
+        )
+        var outcomes: [String: ScanOutcome] = [:]
+        for await event in session.events {
+            switch event {
+            case .outcome(let id, let outcome): outcomes[id] = outcome
+            case .malformed(let id, let issue):
+                XCTFail("\(id) malformed: \(issue.detail)", file: file, line: line)
+            }
+        }
+        return (outcomes, session.snapshot)
+    }
+
+    /// The identity path an artifact dir must publish as its `url`.
+    private func identityPath(_ url: URL) -> String {
+        FileSystemIdentityProvider().resolveTargetKeepingLeaf(url).path
+    }
+
+    /// THE SWAP, proven in ONE run: `build_artifacts` is registered and
+    /// addressable, `node_modules` is neither, and the one fixture
+    /// node_modules tree is listed EXACTLY once — under `build_artifacts`.
+    /// No commit exists in which both are registered (double-listing, D4) or
+    /// in which the legacy slug can still emit unmarked, non-revalidated
+    /// items for the same trees (an R17 bypass).
+    func testAtomicSwapRegistersBuildArtifactsAndRetiresTheNodeModulesSlug() async throws {
+        let dev = base.appendingPathComponent("dev")
+        let nodeModules = try makeMarkerProject(
+            at: dev.appendingPathComponent("web"),
+            marker: "package.json", artifact: "node_modules"
+        )
+        let target = try makeMarkerProject(
+            at: dev.appendingPathComponent("rust"),
+            marker: "Cargo.toml", artifact: "target"
+        )
+        let runtime = productionRuntime(devRoots: [dev])
+
+        // (1) COMPOSITION — one slot, swapped: the legacy scanner is gone
+        // from the registry entirely, so its slug cannot be addressed and
+        // its items cannot be emitted.
+        XCTAssertEqual(runtime.scanners.map(\.id), [
+            CategoryScanner.registeredID,
+            BuildArtifactsScanner.registeredID,
+            OrphanedCachesScanner.registeredID,
+        ])
+        XCTAssertFalse(
+            runtime.scanners.contains { $0.id == NodeModulesScanner.registeredID },
+            "the node_modules scanner is unregistered by the SAME change"
+        )
+        // Registration is what extends delete-time admission (R4).
+        XCTAssertTrue(runtime.trustedContainerRoots.contains { $0.path == dev.path })
+
+        // (2) ONE SCAN over every registered per-item scanner: the fixture
+        // node_modules tree is listed exactly ONCE, by build_artifacts.
+        let scanned = await collect(runtime, scannerIDs: perItemScannerIDs(runtime))
+        let listedBy = scanned.outcomes.filter { _, outcome in
+            outcome.items.contains { $0.url?.path == identityPath(nodeModules) }
+        }.keys.sorted()
+        XCTAssertEqual(listedBy, [BuildArtifactsScanner.registeredID],
+                       "exactly one registered scanner lists the tree")
+        let buildItems = try XCTUnwrap(
+            scanned.outcomes[BuildArtifactsScanner.registeredID]?.items
+        )
+        XCTAssertEqual(
+            Set(buildItems.compactMap(\.url?.path)),
+            [identityPath(nodeModules), identityPath(target)],
+            "both ecosystems' artifact dirs ride the ONE scanner"
+        )
+        XCTAssertTrue(buildItems.allSatisfy(\.requiresPreDeleteRevalidation),
+                      "every addressable item carries the R17 marker")
+
+        // (3) CLI ADDRESSING — the retired slug fails per the existing
+        // unknown-slug conventions (parse refuses BEFORE any scan runs), in
+        // every addressing form, while the new slug resolves.
+        let deps = CLIHandler.CLIRuntimeDependencies(
+            runtime: runtime,
+            categorySlugs: Set(CacheCategory.allCategories.map(\.slug))
+        )
+        let itemID = try XCTUnwrap(
+            buildItems.first { $0.url?.path == identityPath(nodeModules) }?.id
+        )
+        for retired in ["node_modules", "node_modules:\(itemID)"] {
+            let outcome = await CLIHandler.cleanCLIOutcome(
+                targets: [retired], dryRun: true, confirmed: false,
+                euid: 501, deps: deps
+            )
+            guard case .failure(let code, let message, _) = outcome else {
+                return XCTFail("'\(retired)' must not resolve after the swap")
+            }
+            XCTAssertEqual(code, "INVALID_ARGUMENTS")
+            XCTAssertTrue(message.contains("Unknown or invalid target"),
+                          "the frozen unknown-slug message: \(message)")
+        }
+        XCTAssertTrue(fm.fileExists(atPath: nodeModules.path),
+                      "a refused address deletes nothing")
+
+        // `<slug>:<item-id>` addressing through the real clean pipeline.
+        guard case .success(let plan) = await CLIHandler.cleanCLIOutcome(
+            targets: ["build_artifacts:\(itemID)"], dryRun: true,
+            confirmed: false, euid: 501, deps: deps
+        ) else {
+            return XCTFail("build_artifacts:<item-id> must resolve")
+        }
+        let rows = try XCTUnwrap(plan["results"] as? [[String: Any]])
+        XCTAssertEqual(rows.map { $0["slug"] as? String },
+                       ["build_artifacts:\(itemID)"])
+    }
+
+    /// The GUI half of registration (R5/R7/R15), end to end: the production
+    /// composition reaches `perItemSections`, Quick Clean picks up NOTHING
+    /// (D3 — v1 enrolls no rule row in the automatic path), and an EXPLICIT
+    /// scan → select → clean removes the artifact directory itself through
+    /// the session-bound `makeCleaner(snapshot:)`.
+    @MainActor
+    func testProductionScanSelectCleanEndToEndWhileQuickCleanSelectsNone() async throws {
+        let dev = base.appendingPathComponent("dev")
+        let target = try makeMarkerProject(
+            at: dev.appendingPathComponent("rust"),
+            marker: "Cargo.toml", artifact: "target"
+        )
+        let runtime = productionRuntime(devRoots: [dev])
+        let viewModel = CacheoutViewModel(runtime: runtime)
+
+        await viewModel.scan(
+            trigger: .userInitiated,
+            scannerIDs: [BuildArtifactsScanner.registeredID]
+        )
+
+        let section = try XCTUnwrap(viewModel.perItemSections.first {
+            $0.scannerID == BuildArtifactsScanner.registeredID
+        })
+        XCTAssertEqual(section.displayName, "Project Build Artifacts")
+        XCTAssertEqual(section.items.compactMap(\.url?.path),
+                       [identityPath(target)])
+        let item = try XCTUnwrap(section.items.first)
+        XCTAssertEqual(item.risk, .safe, "the target/ rule row's declared risk")
+        XCTAssertEqual(item.state, .measured)
+
+        // R15: `safe` RISK does not enroll anything in the automatic path —
+        // the selection triple's third member is what Quick Clean reads.
+        XCTAssertFalse(item.automaticCleanEligible)
+        viewModel.selectAllSafe()
+        XCTAssertTrue(viewModel.selectedItemKeys.isEmpty,
+                      "Quick Clean selects ZERO build-artifact items (D3)")
+        XCTAssertEqual(viewModel.automaticCleanableSize, 0)
+        XCTAssertFalse(viewModel.hasAutomaticCleanableItems)
+
+        // …while EXPLICIT selection still cleans: the artifact directory
+        // itself goes, the project and its marker stay, and the freed bytes
+        // are the deletion-time measurement.
+        let expectedExact = DirectorySizer()
+            .measure(at: target, mode: .deletionTarget).exactAllocatedBytes
+        XCTAssertGreaterThan(expectedExact, 0)
+        viewModel.moveToTrash = false  // permanent-delete, fixture-contained
+        viewModel.toggleSelection(for: item.key)
+        XCTAssertTrue(viewModel.hasCleanableSelection)
+
+        await viewModel.clean()
+
+        let report = try XCTUnwrap(viewModel.lastReport)
+        XCTAssertEqual(report.errors.map(\.message), [])
+        XCTAssertEqual(report.entries.map(\.key), [item.key])
+        XCTAssertEqual(report.entries.first?.exactBytes, expectedExact)
+        XCTAssertFalse(fm.fileExists(atPath: target.path),
+                       "the artifact directory itself is deleted")
+        XCTAssertTrue(
+            fm.fileExists(atPath: dev.appendingPathComponent("rust/Cargo.toml").path),
+            "the project and the marker that proved it survive"
+        )
+    }
+
+    /// R8/D1 end-to-end: the PRODUCTION view-model factory reads the store
+    /// at construction, and a dev-roots change rebuilds THAT composition
+    /// through fn-4.10's seam — the next scan walks the new roots.
+    @MainActor
+    func testProductionFactoryReadsStoreAndRebuildsOnDevRootsChange() async throws {
+        let devA = base.appendingPathComponent("devA")
+        let devB = base.appendingPathComponent("devB")
+        let targetA = try makeMarkerProject(
+            at: devA.appendingPathComponent("a"),
+            marker: "Cargo.toml", artifact: "target"
+        )
+        let targetB = try makeMarkerProject(
+            at: devB.appendingPathComponent("b"),
+            marker: "Cargo.toml", artifact: "target"
+        )
+        let store = DevRootsStore(defaults: defaults)
+        store.resetToDefaults()
+        // Only devA is configured at construction time.
+        defaults.set([devA.path], forKey: DevRootsStore.devRootsKey)
+
+        let viewModel = CacheoutViewModel.production(
+            home: fixtureHome, devRootsStore: store
+        )
+        let onlyBuildArtifacts: Set<String> = [BuildArtifactsScanner.registeredID]
+        await viewModel.scan(trigger: .userInitiated, scannerIDs: onlyBuildArtifacts)
+        XCTAssertEqual(
+            viewModel.items(forScanner: BuildArtifactsScanner.registeredID)
+                .compactMap(\.url?.path),
+            [identityPath(targetA)],
+            "the initial runtime came from the store, through the factory"
+        )
+
+        // Settings adds devB → the SAME factory rebuilds the SAME production
+        // composition with the new roots.
+        store.add(devB.path)
+        viewModel.devRootsDidChange()
+        XCTAssertFalse(
+            viewModel.hasCleanableSelection,
+            "a rebuild invalidates destructive freshness until a new scan adopts"
+        )
+
+        await viewModel.scan(trigger: .userInitiated, scannerIDs: onlyBuildArtifacts)
+        XCTAssertEqual(
+            Set(viewModel.items(forScanner: BuildArtifactsScanner.registeredID)
+                .compactMap(\.url?.path)),
+            [identityPath(targetA), identityPath(targetB)],
+            "the rebuilt runtime walks BOTH configured roots"
+        )
+        // Still the production registry — the factory rebuilt the same
+        // composition, not a different one.
+        XCTAssertEqual(
+            viewModel.perItemSections.map(\.scannerID),
+            [BuildArtifactsScanner.registeredID, OrphanedCachesScanner.registeredID]
+        )
+    }
+
+    /// R8, the CLI half: injected roots are threaded into `production()`
+    /// BEFORE `CLIRuntimeDependencies` is constructed — the only order that
+    /// works, since `trustedContainerRoots` freeze at registration.
+    func testCLIRuntimeDependenciesThreadInjectedDevRootsIntoProduction() throws {
+        let dev = base.appendingPathComponent("dev")
+        try fm.createDirectory(at: dev, withIntermediateDirectories: true)
+        let resolution = devRoots([dev])
+
+        let deps = CLIHandler.CLIRuntimeDependencies.production(
+            devRoots: resolution
+        )
+
+        let scanner = try XCTUnwrap(
+            deps.runtime.scanners.compactMap { $0 as? BuildArtifactsScanner }.first,
+            "the CLI composition registers the build-artifacts scanner"
+        )
+        XCTAssertEqual(scanner.trustedContainerRoots.map(\.path),
+                       resolution.keptRoots.map(\.path),
+                       "the invocation-scoped roots reach the scanner unchanged")
+        XCTAssertTrue(deps.runtime.trustedContainerRoots.contains { $0.path == dev.path },
+                      "…and therefore delete-time admission")
+        XCTAssertFalse(
+            deps.runtime.scanners.contains { $0.id == NodeModulesScanner.registeredID },
+            "the CLI composition is the swapped one too"
+        )
+    }
+
+    /// R17/R6 ordering, proven at the product boundary: a valuable-bearing
+    /// item is fail-closed from its FIRST addressable moment. The
+    /// revalidator declaration landed BEFORE conformance (fn-4.8 → fn-4.5),
+    /// so there is no scan in which such an item is deletable without an
+    /// acknowledgement — on either surface.
+    @MainActor
+    func testValuableBearingItemIsRevalidatorEnforcedFromItsFirstAddressableMoment() async throws {
+        let dev = base.appendingPathComponent("dev")
+        let target = try makeMarkerProject(
+            at: dev.appendingPathComponent("rust"),
+            marker: "Cargo.toml", artifact: "target"
+        )
+        // A release DMG inside the build directory, comfortably above the
+        // shared allocated floor.
+        let dmg = target.appendingPathComponent("release/bundle/App.dmg")
+        try fm.createDirectory(
+            at: dmg.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        try Data(
+            repeating: 0xAB,
+            count: Int(ValuablesDetector.minimumAllocatedBytes) + 1_000_000
+        ).write(to: dmg)
+
+        let runtime = productionRuntime(devRoots: [dev])
+
+        // GUI surface: scan → select → clean, with NO authorization context
+        // (fn-4.6's confirmation sheet is what populates one).
+        let viewModel = CacheoutViewModel(runtime: runtime)
+        viewModel.moveToTrash = false
+        await viewModel.scan(
+            trigger: .userInitiated,
+            scannerIDs: [BuildArtifactsScanner.registeredID]
+        )
+        let item = try XCTUnwrap(
+            viewModel.items(forScanner: BuildArtifactsScanner.registeredID).first
+        )
+        XCTAssertEqual(item.risk, .review,
+                       "the valuables gate forced the safe row off safe")
+        XCTAssertFalse(item.defaultSelected)
+        viewModel.toggleSelection(for: item.key)
+        await viewModel.clean()
+
+        let report = try XCTUnwrap(viewModel.lastReport)
+        XCTAssertEqual(report.entries.map(\.key), [], "nothing was deleted")
+        XCTAssertEqual(report.errors.map(\.key), [item.key])
+        XCTAssertTrue(
+            (report.errors.first?.message ?? "").contains("App.dmg"),
+            "the refusal names the valuable: \(report.errors.first?.message ?? "")"
+        )
+        XCTAssertTrue(fm.fileExists(atPath: dmg.path))
+        XCTAssertTrue(fm.fileExists(atPath: target.path))
+
+        // CLI surface: a plain `--confirm` of the same item refuses too.
+        let deps = CLIHandler.CLIRuntimeDependencies(
+            runtime: runtime,
+            categorySlugs: Set(CacheCategory.allCategories.map(\.slug))
+        )
+        let cliOutcome = await CLIHandler.cleanCLIOutcome(
+            targets: ["build_artifacts:\(item.id)"], dryRun: false,
+            confirmed: true, euid: 501, deps: deps
+        )
+        switch cliOutcome {
+        case .success(let payload):
+            let rows = try XCTUnwrap(payload["results"] as? [[String: Any]])
+            XCTAssertEqual(rows.map { $0["success"] as? Bool }, [false],
+                           "an unacknowledged valuable-bearing item is refused")
+        case .failure(let code, _, _):
+            XCTAssertEqual(code, "CLEAN_FAILED")
+        }
+        XCTAssertTrue(fm.fileExists(atPath: target.path),
+                      "the artifact directory survives an unacknowledged CLI clean")
     }
 
     // MARK: - R4: the zero-edit grep gate

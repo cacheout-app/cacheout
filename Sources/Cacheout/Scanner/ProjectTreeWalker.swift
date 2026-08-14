@@ -51,8 +51,12 @@
 ///   the walk root, or one `statfs`-marked as a mount root, is listed but
 ///   never descended (a boundary-nested subtree is unreachable and
 ///   undeletable anyway; boundary handling on MATCHED dirs is fn-4.3's
-///   doctrine). The ROOT itself may legitimately BE a mount point (external
-///   -volume dev roots) — the non-crossing rule applies to descent only.
+///   doctrine). The non-crossing rule applies to DESCENT only: whether a
+///   ROOT may itself be a mount point is the container-root policy's call,
+///   and since fn-4.5 that policy runs INSIDE `admitSearchRoot` (R16 layer
+///   c) — a mount-point root is refused there, with a classified per-root
+///   issue, before this walker descends anything (a dev root INSIDE an
+///   external volume stays perfectly legal).
 /// - Hidden directories are traversed; never `.skipsHiddenFiles` or
 ///   `.skipsPackageDescendants`; NO name-based skip list (the
 ///   NodeModulesScanner anti-pattern R2 bans — it made monorepo

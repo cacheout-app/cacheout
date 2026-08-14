@@ -710,6 +710,142 @@ final class CLIGateTests: XCTestCase {
         XCTAssertNotNil(rows[0]["scan_error"])
     }
 
+    /// fn-4.5 (R6/R7/R12): the SAME envelope assertions as the node_modules
+    /// twin above, on the slug that replaced it — plus the two properties
+    /// the swap adds: no `node_modules` rows can exist (the scanner is
+    /// unregistered), and the scanner's config/per-root issues ride
+    /// `scanner_errors` rather than vanishing into a silent zero.
+    ///
+    /// The registry here is fixture-composed (the CategoryScanner over an
+    /// EMPTY category list) for the usual reason: production categories run
+    /// `.probed` tool subprocesses. The production COMPOSITION itself — that
+    /// `build_artifacts` is registered and `node_modules` is not — is
+    /// asserted against the real `production(...)` factory in
+    /// `SpaceScannerIntegrationTests` and `CategoryScannerTests`.
+    func testScanEnvelopeListsBuildArtifactsItemsAndNeverNodeModulesRows()
+        async throws
+    {
+        let dev = base.appendingPathComponent("dev-\(UUID().uuidString)")
+        let project = dev.appendingPathComponent("projA")
+        let nodeModules = project.appendingPathComponent("node_modules")
+        try fm.createDirectory(at: nodeModules, withIntermediateDirectories: true)
+        try Data(repeating: 0xC3, count: 64).write(
+            to: project.appendingPathComponent("package.json")
+        )
+        try Data(repeating: 0xAB, count: 8192).write(
+            to: nodeModules.appendingPathComponent("dep.bin")
+        )
+        // A policy-rejected persisted root beside the good one: its config
+        // issue must reach `scanner_errors` on every scan (R16).
+        let suiteName = "CLIGateTests-\(UUID().uuidString)"
+        let suite = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { suite.removePersistentDomain(forName: suiteName) }
+        suite.set(["/", dev.path], forKey: DevRootsStore.devRootsKey)
+        let scanner = BuildArtifactsScanner(
+            home: fixtureHome,
+            devRoots: DevRootsStore(defaults: suite)
+                .effectiveRoots(home: fixtureHome)
+        )
+        let deps = try makeDeps(categories: [], extraScanners: [scanner])
+
+        let envelope = await CLIHandler.scanEnvelope(deps: deps)
+
+        XCTAssertEqual(envelope["schema_version"] as? Int, 4)
+        let items = try XCTUnwrap(envelope["scanner_items"] as? [[String: Any]])
+        XCTAssertEqual(items.count, 1)
+        let row = items[0]
+        XCTAssertEqual(row["scanner_id"] as? String, "build_artifacts")
+        XCTAssertFalse(
+            items.contains { $0["scanner_id"] as? String == "node_modules" },
+            "the retired slug can never author a row — it is unregistered"
+        )
+
+        let itemID = try XCTUnwrap(row["item_id"] as? String)
+        XCTAssertEqual(itemID.count, 64, "full-hash opaque id — never truncated")
+        XCTAssertEqual(itemID, itemID.lowercased())
+        XCTAssertTrue(itemID.allSatisfy { $0.isHexDigit })
+        let resolved = FileSystemIdentityProvider()
+            .resolveTargetKeepingLeaf(nodeModules)
+        XCTAssertEqual(
+            itemID,
+            ReclaimableItem.stableID(
+                scannerID: "build_artifacts", canonicalPath: resolved.path
+            ),
+            "the id IS the frozen preimage derivation — stable across rescans"
+        )
+
+        XCTAssertEqual(row["path"] as? String, resolved.path)
+        XCTAssertEqual(row["name"] as? String, "node_modules")
+        XCTAssertEqual(row["state"] as? String, "measured")
+        XCTAssertEqual(row["action"] as? String, "remove_item")
+        XCTAssertEqual(row["risk_level"] as? String, "review",
+                       "the node_modules rule row preserves the as-built risk")
+        XCTAssertTrue(((row["evidence"] as? String) ?? "")
+            .contains("beside package.json"))
+        let exact = try XCTUnwrap(row["exact_bytes"] as? Int64)
+        XCTAssertGreaterThan(exact, 0)
+        XCTAssertEqual(row["size_bytes"] as? Int64,
+                       exact + (row["estimated_up_to_bytes"] as? Int64 ?? 0),
+                       "size_bytes stays the compatibility component sum")
+
+        // R12/R16: the classified config issue is VISIBLE on the wire.
+        let errors = try XCTUnwrap(envelope["scanner_errors"] as? [[String: Any]])
+        let refusals = errors.filter {
+            $0["scanner_id"] as? String == "build_artifacts"
+                && $0["kind"] as? String == "container_refused"
+        }
+        XCTAssertEqual(refusals.count, 1, "\(errors)")
+        XCTAssertEqual(refusals[0]["path"] as? String, "/")
+    }
+
+    /// R12: a DENIED dev root is a classified, visible error on the wire —
+    /// never a silent zero. The healthy root's items still ride the same
+    /// envelope, so a partial failure is honestly partial.
+    func testScanEnvelopeSurfacesDeniedDevRootBesideHealthyItems() async throws {
+        try XCTSkipIf(geteuid() == 0, "root ignores permission bits")
+        let dev = base.appendingPathComponent("dev-\(UUID().uuidString)")
+        let denied = base.appendingPathComponent("denied-dev-\(UUID().uuidString)")
+        let project = dev.appendingPathComponent("rust")
+        let artifact = project.appendingPathComponent("target")
+        try fm.createDirectory(at: artifact, withIntermediateDirectories: true)
+        try Data(repeating: 0xC3, count: 64).write(
+            to: project.appendingPathComponent("Cargo.toml")
+        )
+        try Data(repeating: 0xAB, count: 4096).write(
+            to: artifact.appendingPathComponent("out.o")
+        )
+        try fm.createDirectory(at: denied, withIntermediateDirectories: true)
+        try fm.setAttributes([.posixPermissions: 0o000], ofItemAtPath: denied.path)
+        addTeardownBlock { [fm] in
+            try? fm.setAttributes(
+                [.posixPermissions: 0o755], ofItemAtPath: denied.path
+            )
+        }
+
+        let suiteName = "CLIGateTests-\(UUID().uuidString)"
+        let suite = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { suite.removePersistentDomain(forName: suiteName) }
+        let scanner = BuildArtifactsScanner(
+            home: fixtureHome,
+            devRoots: DevRootsStore(defaults: suite)
+                .effectiveRoots(replacing: [dev, denied], home: fixtureHome)
+        )
+        let deps = try makeDeps(categories: [], extraScanners: [scanner])
+
+        let envelope = await CLIHandler.scanEnvelope(deps: deps)
+
+        let errors = try XCTUnwrap(envelope["scanner_errors"] as? [[String: Any]])
+        let denials = errors.filter { $0["path"] as? String == denied.path }
+        XCTAssertEqual(denials.count, 1, "\(errors)")
+        XCTAssertEqual(denials[0]["scanner_id"] as? String, "build_artifacts")
+        XCTAssertEqual(denials[0]["kind"] as? String, "permission_denied")
+        XCTAssertFalse((denials[0]["detail"] as? String ?? "").isEmpty)
+
+        let items = try XCTUnwrap(envelope["scanner_items"] as? [[String: Any]])
+        XCTAssertEqual(items.map { $0["name"] as? String }, ["target"],
+                       "the readable root's items are unaffected")
+    }
+
     func testScanEnvelopeListsNodeModulesItems() async throws {
         let fixture = try makeNodeModulesFixture()
         let deps = try makeDeps(categories: [], extraScanners: [fixture.scanner])

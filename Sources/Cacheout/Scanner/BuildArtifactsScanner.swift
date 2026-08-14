@@ -6,15 +6,12 @@
 /// size what survives, derive staleness and evidence, and emit
 /// validator-coherent `ReclaimableItem`s in a deterministic TOTAL order.
 ///
-/// NOT here (deliberately): the valuables gate (fn-4.4), the pre-delete
-/// revalidator (fn-4.8), production `SpaceScanner` CONFORMANCE and the
-/// `production(devRoots:)` registration (fn-4.5), deletion, and any UI. The
-/// type exposes `id` / `displayName` / `trustedContainerRoots` / `scan` as
-/// plain members so fn-4.5's conformance is a one-line `extension
-/// BuildArtifactsScanner: SpaceScanner {}` — but until that line exists this
-/// scanner CANNOT be registered, so nothing it emits is addressable or
-/// deletable. The R13 validator round-trips run through a TEST-ONLY adapter
-/// (see `BuildArtifactsScannerTests`).
+/// NOT here (deliberately): any UI. The valuables gate (fn-4.4) and the
+/// pre-delete revalidator declaration (fn-4.8) landed BEFORE conformance on
+/// purpose; fn-4.5 adds the one-line `extension BuildArtifactsScanner:
+/// SpaceScanner {}` at the foot of this file plus the `production(devRoots:)`
+/// registration — so from the FIRST moment a `build_artifacts` item is
+/// addressable it is already revalidator-enforced (no enforcement gap, R17).
 ///
 /// ## Matching + pruning (R1/R2)
 /// The two rule SHAPES bind to different subjects of one event and therefore
@@ -94,7 +91,9 @@ struct BuildArtifactsScanner: @unchecked Sendable {
     /// Stable scanner slug — the CLI address prefix
     /// (`build_artifacts:<item-id>`), the GUI section key, and the
     /// `stableID` preimage's scanner half. Matches the address grammar
-    /// `[a-z0-9_]+`. Registration itself lands in fn-4.5.
+    /// `[a-z0-9_]+`. Registered by `SpaceScannerRuntime.production(devRoots:)`
+    /// (fn-4.5) — the SAME composition change that unregistered
+    /// `NodeModulesScanner`.
     static let registeredID = "build_artifacts"
 
     /// The dev roots this scan walks, plus the classified config issues
@@ -148,14 +147,19 @@ struct BuildArtifactsScanner: @unchecked Sendable {
         self.now = now
     }
 
-    // MARK: - Protocol surface (conformance itself lands in fn-4.5)
+    // MARK: - Protocol surface (the `SpaceScanner` conformance is at the
+    // foot of this file — these members ARE its witnesses)
 
     var id: String { Self.registeredID }
     var displayName: String { "Project Build Artifacts" }
 
     /// The KEPT effective dev roots, declared spellings verbatim — the union
-    /// of these is what extends delete-time admission once fn-4.5 registers
-    /// the scanner. Nothing item-side can widen it.
+    /// of these is what extends delete-time admission, and REGISTRATION is
+    /// the only thing that does. Nothing item-side can widen it. Roots the
+    /// R16 policy rejected are absent here by construction (they rode
+    /// `devRoots.issues` instead), and PathGuard re-applies that same policy
+    /// at admission, so an unsafe root cannot admit even if it reached this
+    /// declaration.
     var trustedContainerRoots: [URL] { devRoots.keptRoots }
 
     /// One scan: walk → match → dedupe → size → map → order.
@@ -835,3 +839,20 @@ struct BuildArtifactsScanner: @unchecked Sendable {
         return "~/" + path.dropFirst(prefix.count)
     }
 }
+
+// MARK: - SpaceScanner conformance (fn-4.5, R6/R7)
+
+/// PRODUCTION CONFORMANCE — the whole of it. Every requirement is already a
+/// member above: the slug `id`, `displayName`, `trustedContainerRoots` (the
+/// resolution's `keptRoots`, declared spellings verbatim), the
+/// `preDeleteRevalidator` declaration fn-4.8's seam captures at
+/// registration, and `scan(context:)`.
+///
+/// This empty extension is the epic's "implement the protocol + register,
+/// nothing else" (R4) taken literally, and its ORDER against fn-4.8 is
+/// deliberate (round 13/14): the revalidator declaration existed BEFORE this
+/// line, so the first moment a `build_artifacts` item is addressable is also
+/// the first moment it is fail-closed re-inspected before deletion — there
+/// is no task ordering in which an unenforced build-artifact item can be
+/// listed, addressed, or deleted.
+extension BuildArtifactsScanner: SpaceScanner {}

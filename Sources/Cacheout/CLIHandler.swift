@@ -349,12 +349,22 @@ struct CLIHandler {
         ///   thresholds (R8) — nil resolves defaults → UserDefaults inside
         ///   the runtime factory; the CLI passes the flag-layered value.
         ///   Never persisted.
+        /// - Parameter devRoots: invocation-scoped dev-roots REPLACEMENT
+        ///   (fn-4, R8/D1) — nil resolves the persisted `DevRootsStore`
+        ///   inside the runtime factory. The roots are threaded into
+        ///   `.production()` BEFORE this bundle is constructed, because
+        ///   `trustedContainerRoots` freeze at registration: a runtime is
+        ///   the only thing that can carry them, and one CLI invocation is
+        ///   one runtime. `--dev-root` parsing is fn-4.6's; nothing here is
+        ///   ever persisted.
         static func production(
-            orphanedCachesThresholds: OrphanedCacheClassifier.Thresholds? = nil
+            orphanedCachesThresholds: OrphanedCacheClassifier.Thresholds? = nil,
+            devRoots: DevRootsResolution? = nil
         ) -> CLIRuntimeDependencies {
             CLIRuntimeDependencies(
                 runtime: .production(
-                    orphanedCachesThresholds: orphanedCachesThresholds
+                    orphanedCachesThresholds: orphanedCachesThresholds,
+                    devRoots: devRoots
                 ),
                 categorySlugs: Set(CacheCategory.allCategories.map(\.slug))
             )

@@ -194,14 +194,14 @@ struct CLIHandler {
             // `.production()` BEFORE the dependency bundle is built, because
             // `trustedContainerRoots` freeze at registration (D1).
             let sweepThresholds = resolveSweepThresholds(from: args)
-            let devRoots = resolveDevRoots(invocation.values(of: devRootFlag))
+            let devRoots = resolveDevRoots(invocation, in: args)
             await handleScan(deps: .production(
                 orphanedCachesThresholds: sweepThresholds, devRoots: devRoots
             ))
 
         case .clean:
             let sweepThresholds = resolveSweepThresholds(from: args)
-            let devRoots = resolveDevRoots(invocation.values(of: devRootFlag))
+            let devRoots = resolveDevRoots(invocation, in: args)
             await handleClean(
                 slugs: invocation.targets,
                 acknowledgements: invocation.values(of: acknowledgeValuablesFlag),
@@ -892,11 +892,26 @@ struct CLIHandler {
     ///
     /// Nothing here reads or writes the defaults suite: the replacement path
     /// consults no persisted value, and `--dev-root` is never persisted.
+    ///
+    /// - Parameter occurrences: how many times the flag appears in argv.
+    ///   The normalized grammar leaves a valued flag with NO following token
+    ///   to the flag's own validation, and for THIS flag silence would be
+    ///   the dangerous direction: a trailing `--dev-root` would look exactly
+    ///   like an absent flag and quietly scan the PERSISTED roots the caller
+    ///   meant to replace. A mismatch is therefore INVALID_ARGUMENTS.
     static func devRootsOverride(
         from values: [String],
+        occurrences: Int,
         home: URL,
         provider: FileSystemIdentityProvider = FileSystemIdentityProvider()
     ) -> Result<DevRootsResolution?, CLIAddressError> {
+        guard occurrences <= values.count else {
+            return .failure(CLIAddressError(message:
+                "\(devRootFlag) requires a folder path — one occurrence has "
+                + "no value. Pass an absolute path (/Volumes/Work/code) or a "
+                + "~/ path (~/dev). Nothing was scanned."
+            ))
+        }
         guard !values.isEmpty else { return .success(nil) }
 
         var declaredRoots: [URL] = []
@@ -954,12 +969,17 @@ struct CLIHandler {
 
     /// The process-facing resolution: `--dev-root` values → the
     /// invocation-scoped replacement, exiting via the invalid-arguments
-    /// convention on a bad path form or a policy-refused root.
+    /// convention on a MISSING value, a bad path form, or a policy-refused
+    /// root. The raw argv is read for the OCCURRENCE count only (the gate's
+    /// own convention) — the values themselves always come from the one
+    /// normalized grammar.
     private static func resolveDevRoots(
-        _ values: [String]
+        _ invocation: NormalizedInvocation, in args: [String]
     ) -> DevRootsResolution? {
         switch devRootsOverride(
-            from: values, home: FileManager.default.homeDirectoryForCurrentUser
+            from: invocation.values(of: devRootFlag),
+            occurrences: args.filter { $0 == devRootFlag }.count,
+            home: FileManager.default.homeDirectoryForCurrentUser
         ) {
         case .failure(let error):
             exitWithError(code: "INVALID_ARGUMENTS", message: error.message)

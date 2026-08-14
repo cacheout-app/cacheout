@@ -2099,7 +2099,7 @@ final class CLIGateTests: XCTestCase {
 
         // (a) ABSOLUTE — accepted verbatim, declared spelling preserved.
         switch CLIHandler.devRootsOverride(
-            from: [absolute.path], home: fixtureHome
+            from: [absolute.path], occurrences: 1, home: fixtureHome
         ) {
         case .failure(let error):
             XCTFail("an absolute --dev-root must be accepted: \(error.message)")
@@ -2112,7 +2112,7 @@ final class CLIGateTests: XCTestCase {
         // `getpwuid` (the flag means the same thing in tests and in
         // production).
         switch CLIHandler.devRootsOverride(
-            from: ["~/tilde-dev"], home: fixtureHome
+            from: ["~/tilde-dev"], occurrences: 1, home: fixtureHome
         ) {
         case .failure(let error):
             XCTFail("a ~ --dev-root must be accepted: \(error.message)")
@@ -2125,7 +2125,7 @@ final class CLIGateTests: XCTestCase {
         // root would silently depend on the invocation directory.
         for relative in ["projects/x", "dev", "./dev", "../dev"] {
             switch CLIHandler.devRootsOverride(
-                from: [relative], home: fixtureHome
+                from: [relative], occurrences: 1, home: fixtureHome
             ) {
             case .success(let resolution):
                 XCTFail("'\(relative)' must be refused, got \(String(describing: resolution))")
@@ -2139,11 +2139,36 @@ final class CLIGateTests: XCTestCase {
 
         // Absent flag = no replacement at all: the persisted store resolves
         // inside the production factory exactly as it does for the app.
-        switch CLIHandler.devRootsOverride(from: [], home: fixtureHome) {
+        switch CLIHandler.devRootsOverride(
+            from: [], occurrences: 0, home: fixtureHome
+        ) {
         case .failure(let error):
             XCTFail("no flag must resolve to nil: \(error.message)")
         case .success(let resolution):
             XCTAssertNil(resolution)
+        }
+
+        // (d) A trailing `--dev-root` with NO value: the grammar collects
+        // nothing for that occurrence, and silence here would look exactly
+        // like an ABSENT flag — quietly scanning the PERSISTED roots the
+        // caller meant to replace. Refused, on the empty and partial shapes
+        // alike.
+        for (values, occurrences) in [([], 1), ([absolute.path], 2)]
+            as [([String], Int)] {
+            switch CLIHandler.devRootsOverride(
+                from: values, occurrences: occurrences, home: fixtureHome
+            ) {
+            case .success(let resolution):
+                XCTFail("a valueless occurrence must be refused, got "
+                        + "\(String(describing: resolution))")
+            case .failure(let error):
+                XCTAssertTrue(error.message.contains(CLIHandler.devRootFlag),
+                              "names the flag: \(error.message)")
+                XCTAssertTrue(error.message.contains("requires a folder path"),
+                              error.message)
+                XCTAssertTrue(error.message.contains("Nothing was scanned"),
+                              error.message)
+            }
         }
     }
 
@@ -2160,7 +2185,7 @@ final class CLIGateTests: XCTestCase {
         let dangerous = ["/", fixtureHome.path, aliasOfRoot.path]
         for root in dangerous {
             switch CLIHandler.devRootsOverride(
-                from: [root], home: fixtureHome
+                from: [root], occurrences: 1, home: fixtureHome
             ) {
             case .success(let resolution):
                 XCTFail("'\(root)' must be refused, got \(String(describing: resolution))")
@@ -2178,7 +2203,7 @@ final class CLIGateTests: XCTestCase {
         let documents = fixtureHome.appendingPathComponent("Documents")
         try fm.createDirectory(at: documents, withIntermediateDirectories: true)
         switch CLIHandler.devRootsOverride(
-            from: [documents.path], home: fixtureHome
+            from: [documents.path], occurrences: 1, home: fixtureHome
         ) {
         case .failure(let error):
             XCTFail("~/Documents is a legal dev root: \(error.message)")
@@ -2210,7 +2235,7 @@ final class CLIGateTests: XCTestCase {
         let resolution: DevRootsResolution
         switch CLIHandler.devRootsOverride(
             from: [outer.path, aliasSpelling.path, nested.path],
-            home: fixtureHome
+            occurrences: 3, home: fixtureHome
         ) {
         case .failure(let error):
             return XCTFail("must resolve: \(error.message)")
@@ -2684,6 +2709,29 @@ final class CLIGateFramingTests: XCTestCase {
             XCTAssertTrue(message.contains(command), "names the command: \(message)")
             XCTAssertTrue(message.contains("scan or clean"),
                           "points at the commands that accept it: \(message)")
+        }
+    }
+
+    func testBareDevRootFlagIsRefusedInsteadOfSilentlyUnscopedFraming() throws {
+        // A trailing `--dev-root` collects no value. Treating that like an
+        // absent flag would scan the PERSISTED roots the caller meant to
+        // replace — an UNSCOPED scan/clean dressed as a scoped one. Both
+        // accepting commands must refuse it BEFORE dispatch (read-only:
+        // nothing is scanned, `--confirm` deletes nothing).
+        for arguments in [
+            ["--cli", "scan", CLIHandler.devRootFlag],
+            ["--cli", "clean", "npm_cache", "--confirm", CLIHandler.devRootFlag],
+        ] {
+            let run = try runCLI(arguments)
+            XCTAssertEqual(run.exitCode, 1, "\(arguments) must be refused")
+            XCTAssertEqual(run.stdout, "",
+                           "stdout stays EMPTY — no scan envelope, no plan")
+            let envelope = try parseErrorEnvelope(run.stderr)
+            let error = try XCTUnwrap(envelope["error"] as? [String: Any])
+            XCTAssertEqual(error["code"] as? String, "INVALID_ARGUMENTS")
+            let message = (error["message"] as? String) ?? ""
+            XCTAssertTrue(message.contains(CLIHandler.devRootFlag), message)
+            XCTAssertTrue(message.contains("requires a folder path"), message)
         }
     }
 

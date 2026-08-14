@@ -49,6 +49,36 @@
 /// `.denied`, `.empty`, and `.missing` items are UNSELECTABLE in every
 /// surface — nothing to clean (round 9).
 ///
+/// ## Runtime reconstruction (fn-4.10, R8)
+///
+/// A dev-roots change REBUILDS the composition. The rebuild goes through an
+/// INJECTED `RuntimeReconstruction` seam (a `DevRootsStore` + a
+/// `@Sendable (DevRootsResolution) -> SpaceScannerRuntime` factory), never a
+/// bare `production(...)` call: this view model receives only a COMPLETED
+/// runtime (home, provider, thresholds and categories are unrecoverable from
+/// it), so rebuilding by re-deriving production defaults would silently swap
+/// an injected composition — a fixture one, in every hermetic test — for the
+/// production registry. There is deliberately NO production-only branch: the
+/// production convenience initializer (fn-4.5) supplies a factory closing
+/// over the production composition and travels the SAME path a fixture
+/// factory does.
+///
+/// Three rules govern the swap:
+///
+/// - **Session capture.** `scan()` captures the runtime (and its generation)
+///   ONCE, before its first suspension, and uses THAT for the whole session
+///   — an in-flight scan never continues on a replacement runtime.
+/// - **Deferred, latest-value-wins.** A replacement requested while a
+///   session is in flight is held as a PENDING resolution (newest request
+///   wins, collapsing many Settings edits into one rebuild) and applied at
+///   session end, before the next session starts.
+/// - **Destructive-freshness invalidation.** The adopted (items, snapshot)
+///   tuple records the RUNTIME generation that produced it; every
+///   destructive path stays gated (the fn-3.4 freshness gate) until a scan
+///   from the NEW runtime completes and adopts — `clean()` can never pair a
+///   new runtime's cleaner (and its revalidator registry) with an old
+///   runtime's snapshot.
+///
 /// ## Persistence
 ///
 /// User preferences are stored in `UserDefaults` via `didSet` observers:
@@ -211,7 +241,15 @@ class CacheoutViewModel: ObservableObject {
     /// runtime-constructed cleaner, a registered scanner's
     /// `trustedContainerRoots` reach delete-time admission with ZERO view
     /// model edits (R4).
-    private let runtime: SpaceScannerRuntime
+    ///
+    /// A `var` since fn-4.10: a dev-roots change REBUILDS it through the
+    /// injected factory (below). Every reader that must not straddle a
+    /// rebuild captures it first — `scan()` takes ONE session capture before
+    /// its first suspension; the display derivations (`orderedScannerIDs`,
+    /// `perItemSections`) read the composition IN FORCE on purpose, and the
+    /// destructive paths are gated by the runtime generation until a scan
+    /// from the new composition adopts.
+    private var runtime: SpaceScannerRuntime
 
     // MARK: Session provenance & snapshot pairing (fn-3.4, R9)
 
@@ -254,12 +292,89 @@ class CacheoutViewModel: ObservableObject {
     /// succeeds in a completed session).
     private var outcomeGenerationByScannerID: [String: Int] = [:]
 
+    // MARK: Runtime reconstruction (fn-4.10, R8)
+
+    /// The INJECTED runtime-reconstruction seam: everything a dev-roots
+    /// change needs to rebuild the composition it was given, and nothing
+    /// else. Bundled as ONE value so the seam can never be half-wired (a
+    /// store without a factory would silently ignore Settings edits).
+    ///
+    /// Both members are injected by the composing initializer: fn-4.5's
+    /// production convenience initializer closes the factory over the
+    /// production composition; hermetic tests close it over fixture
+    /// runtimes. The ViewModel calls it the same way for both.
+    struct RuntimeReconstruction {
+        /// The persisted dev-roots config (fn-4.1). Re-RESOLVED on every
+        /// change request, so the Settings surface owns mutation and this
+        /// view model owns only reconstruction.
+        let devRootsStore: DevRootsStore
+        /// The home the store resolves declared roots against (the store
+        /// takes it per call — the injectable-home house rule).
+        let home: URL
+        /// THE factory: one dev-roots resolution in, one complete runtime
+        /// out. `@Sendable` because the composition it closes over must be
+        /// safe to hold beyond the initializer that built it.
+        let makeRuntime: @Sendable (DevRootsResolution) -> SpaceScannerRuntime
+
+        init(
+            devRootsStore: DevRootsStore,
+            home: URL,
+            makeRuntime:
+                @escaping @Sendable (DevRootsResolution) -> SpaceScannerRuntime
+        ) {
+            self.devRootsStore = devRootsStore
+            self.home = home
+            self.makeRuntime = makeRuntime
+        }
+    }
+
+    /// nil = the seam is UNWIRED: the injected runtime is the whole story
+    /// and `devRootsDidChange()` is a no-op (every pre-fn-4.5 call site,
+    /// including the hermetic suites that inject a finished fixture
+    /// runtime). Nothing here ever falls back to production defaults.
+    private let reconstruction: RuntimeReconstruction?
+
+    /// Monotonic RUNTIME-COMPOSITION counter — a SECOND AXIS beside the
+    /// session machinery above, deliberately NOT a parallel session counter:
+    /// it counts runtime replacements, is incremented at the ONE factory
+    /// call site (`installRuntime`), is captured beside `sessionGeneration`
+    /// as an immutable local by `scan()`, is adopted in the SAME atomic step
+    /// as the snapshot, and is compared inside the ONE existing freshness
+    /// gate (`isBlockedFromDestructivePaths`). Session pairing still rides
+    /// `sessionGeneration`/`adoptedGeneration` exactly as before.
+    private var runtimeGeneration = 0
+
+    /// The RUNTIME generation that produced the adopted (items, snapshot)
+    /// tuple — recorded at COMPLETION in the same MainActor step as
+    /// `adoptedSnapshot`/`adoptedGeneration`, from the SESSION's captured
+    /// value (never the live counter, which a session-end replacement may
+    /// already have advanced). While it differs from `runtimeGeneration`,
+    /// no adopted result belongs to the composition `clean()` would build
+    /// its cleaner from, so every destructive path is fail-closed.
+    private var adoptedRuntimeGeneration = 0
+
+    /// The DEFERRED replacement: the newest dev-roots resolution requested
+    /// while a session was in flight. LATEST-VALUE-WINS — many Settings
+    /// edits during one scan collapse to ONE rebuild, applied at session end
+    /// (before the next session starts), so an in-flight scan is never
+    /// disturbed and no intermediate composition is ever built.
+    private var pendingDevRoots: DevRootsResolution?
+
     /// - Parameter runtime: injectable for hermetic tests (fixture scanners
     ///   and homes — zero real-`$HOME` reads); production uses the one
     ///   production registry. This injection seam is what fn-2.7's zero-edit
     ///   extensibility proof exercises.
-    init(runtime: SpaceScannerRuntime = .production()) {
+    /// - Parameter reconstruction: the fn-4.10 runtime-reconstruction seam
+    ///   (nil = unwired, see above). When wired, `runtime` should be the
+    ///   composition its OWN factory produced for the current resolution —
+    ///   the initial runtime and every rebuilt one then come from the same
+    ///   source.
+    init(
+        runtime: SpaceScannerRuntime = .production(),
+        reconstruction: RuntimeReconstruction? = nil
+    ) {
         self.runtime = runtime
+        self.reconstruction = reconstruction
 
         let storedInterval = UserDefaults.standard.double(forKey: "cacheout.scanIntervalMinutes")
         self.scanIntervalMinutes = storedInterval > 0 ? storedInterval : 30
@@ -290,15 +405,24 @@ class CacheoutViewModel: ObservableObject {
 
     /// True while `scannerID`'s LATEST rescan was rejected as malformed OR
     /// while its displayed outcome was not produced by the session whose
-    /// snapshot the cleaner would hold (the fn-3.4 freshness gate, R9).
+    /// snapshot the cleaner would hold (the fn-3.4 freshness gate, R9) OR
+    /// while the RUNTIME has been rebuilt since that adoption (fn-4.10, R8).
     /// The fail-closed disposition retains the previous items and selections
     /// for DISPLAY (epic contract — nothing user-set is lost), but those
     /// retained records must not reach any DESTRUCTIVE path until the
     /// scanner delivers a valid outcome in a COMPLETED session again
     /// (`reconcile` + session adoption lift the block together).
+    ///
+    /// The runtime clause is scanner-INDEPENDENT on purpose: after a rebuild
+    /// NOTHING adopted belongs to the composition `clean()` would build its
+    /// cleaner from, so the whole model is gated until a scan from the new
+    /// runtime completes and adopts (`clean()` would otherwise pair the new
+    /// runtime's cleaner and revalidator registry with the old runtime's
+    /// snapshot).
     private func isBlockedFromDestructivePaths(_ scannerID: String) -> Bool {
         malformedIssuesByScannerID[scannerID] != nil
             || outcomeGenerationByScannerID[scannerID] != adoptedGeneration
+            || adoptedRuntimeGeneration != runtimeGeneration
     }
 
     /// The selected items in presentation order (registry order, then each
@@ -601,6 +725,70 @@ class CacheoutViewModel: ObservableObject {
 
     var hasAutomaticCleanableItems: Bool { automaticCleanableSize > 0 }
 
+    // MARK: - Runtime reconstruction (fn-4.10, R8)
+
+    /// The dev-roots configuration changed — re-resolve it and rebuild the
+    /// runtime through the INJECTED factory. The Settings surface (fn-4.6)
+    /// mutates `DevRootsStore` and then calls THIS; resolution happens here
+    /// so the view model always rebuilds from what is actually persisted.
+    ///
+    /// A no-op while the seam is unwired (`reconstruction == nil`): a view
+    /// model handed a finished runtime has no configurable composition, and
+    /// inventing production defaults for it is exactly what this seam
+    /// exists to prevent.
+    func devRootsDidChange() {
+        guard let reconstruction else { return }
+        requestRuntimeReplacement(
+            devRoots: reconstruction.devRootsStore
+                .effectiveRoots(home: reconstruction.home)
+        )
+    }
+
+    /// Apply now, or DEFER to the end of the in-flight session
+    /// (latest-value-wins). Deliberately keyed on `isAnyScanInProgress` and
+    /// not on `isCleaning`: an in-flight clean already holds the cleaner and
+    /// the item list it captured before its first await, so a replacement
+    /// cannot re-pair them — and `isBlockedFromDestructivePaths`' runtime
+    /// clause gates the NEXT destructive action until a scan from the new
+    /// runtime adopts.
+    private func requestRuntimeReplacement(devRoots: DevRootsResolution) {
+        // No seam, no bookkeeping: an unwired view model must not even
+        // record a pending replacement it could never install.
+        guard reconstruction != nil else { return }
+        guard !isAnyScanInProgress else {
+            // LATEST-VALUE-WINS: the newest request simply replaces the
+            // pending one — N Settings edits during one scan cost exactly
+            // ONE rebuild, and no intermediate composition is ever built.
+            pendingDevRoots = devRoots
+            return
+        }
+        installRuntime(devRoots: devRoots)
+    }
+
+    /// THE factory call site — the only place `runtime` is replaced and the
+    /// only place `runtimeGeneration` moves. A rebuild is UNCONDITIONAL,
+    /// even for a resolution equal to the one in force: dev-roots equality
+    /// does not prove COMPOSITION equality (the factory closes over state
+    /// this view model cannot see), and over-gating is the fail-closed
+    /// direction — one rescan restores every destructive path.
+    private func installRuntime(devRoots: DevRootsResolution) {
+        guard let reconstruction else { return }
+        runtime = reconstruction.makeRuntime(devRoots)
+        runtimeGeneration += 1
+    }
+
+    /// Applies the deferred replacement at session end. Re-checks the guard:
+    /// the pending resolution outlives any window it cannot be applied in,
+    /// so a request that arrives during a session the caller does not own
+    /// still lands exactly once, at the end of the session that does.
+    private func applyPendingRuntimeReplacement() {
+        guard let pending = pendingDevRoots, !isAnyScanInProgress else {
+            return
+        }
+        pendingDevRoots = nil
+        installRuntime(devRoots: pending)
+    }
+
     // MARK: - Scanning
 
     /// No default trigger — every caller must classify itself (R9). A
@@ -632,10 +820,26 @@ class CacheoutViewModel: ObservableObject {
         // scanning DURING a cleanup would publish results mid-deletion.
         // (clean()'s own post-cleanup rescan runs after isCleaning clears.)
         guard !isAnyScanInProgress && !isCleaning else { return }
+        // Registered AFTER the re-entrancy guard on purpose: a BLOCKED
+        // attempt owns no session, so it must never install another
+        // session's deferred replacement. Every exit of a session that DID
+        // start — completed or cancelled — applies the pending replacement
+        // in the same synchronous MainActor step as its epilogue, so the
+        // next session starts on the new composition (fn-4.10, R8).
+        defer { applyPendingRuntimeReplacement() }
+        // The SESSION runtime, captured ONCE — before the first suspension,
+        // beside the session generation (fn-4.10, R8). Everything this
+        // session touches (its pending-scanner set, its event stream, its
+        // snapshot, its adoption) comes from THIS capture: reading the
+        // stored `runtime` again after the awaits below would let a
+        // replacement installed mid-session launch a different composition
+        // than the one whose scanners this session announced.
+        let sessionRuntime = runtime
+        let sessionRuntimeGeneration = runtimeGeneration
         // Pending state covers exactly the scanners this session RUNS —
         // a subset must not hold the guard hostage to scanners that will
         // never report (the runtime invokes only the named subset).
-        scanningScannerIDs = Set(runtime.scanners.map(\.id).filter {
+        scanningScannerIDs = Set(sessionRuntime.scanners.map(\.id).filter {
             scannerIDs?.contains($0) ?? true
         })
         // New session: outcomes reconciled from here on carry THIS
@@ -651,7 +855,7 @@ class CacheoutViewModel: ObservableObject {
         activeScanGeneration = generation
         diskInfo = await Task.detached { DiskInfo.current() }.value
 
-        let session = runtime.scanValidatedSession(
+        let session = sessionRuntime.scanValidatedSession(
             scannerIDs: scannerIDs,
             context: ScanContext(trigger: trigger)
         )
@@ -701,6 +905,13 @@ class CacheoutViewModel: ObservableObject {
         // visible-but-stale beats deletable-under-a-swapped-container.
         adoptedSnapshot = session.snapshot
         adoptedGeneration = generation
+        // The RUNTIME half of the same atomic adoption (fn-4.10, R8): the
+        // tuple records the composition that PRODUCED it, from this
+        // session's CAPTURE — a replacement deferred to this session's end
+        // (the `defer` above, which runs after this step) must leave the
+        // destructive paths gated, not silently vouch for a snapshot the
+        // new composition never captured.
+        adoptedRuntimeGeneration = sessionRuntimeGeneration
 
         pruneVanishedSelections()
 
@@ -988,6 +1199,9 @@ class CacheoutViewModel: ObservableObject {
         // whose outcome that session did not produce, so items and
         // snapshot are the atomic pair the session adoption established.
         // No completed session (nil snapshot) fail-closes `.removeItem`.
+        // After a runtime rebuild the SAME gate empties `selectedItems`
+        // wholesale (fn-4.10, R8), so this current-runtime cleaner can
+        // never act on a snapshot the previous composition captured.
         let cleaner = runtime.makeCleaner(snapshot: adoptedSnapshot)
         let report = await cleaner.clean(
             items: selectedItems, moveToTrash: moveToTrash

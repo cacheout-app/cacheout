@@ -727,6 +727,7 @@ final class CategoryScannerTests: XCTestCase {
         XCTAssertEqual(ScanIssue.Kind.tccDenied.wireString, "tcc_denied")
         XCTAssertEqual(ScanIssue.Kind.permissionDenied.wireString, "permission_denied")
         XCTAssertEqual(ScanIssue.Kind.unreadable.wireString, "unreadable")
+        XCTAssertEqual(ScanIssue.Kind.configInvalid.wireString, "config_invalid")
         XCTAssertEqual(ScanIssue.Kind.malformedOutcome.wireString, "malformed_outcome")
     }
 

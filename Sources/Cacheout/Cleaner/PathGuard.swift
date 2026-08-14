@@ -418,11 +418,67 @@ final class PathGuard {
         }
     }
 
+    // MARK: - Container-root admission policy (fn-4, R16)
+
+    /// The ONE shared container-root admission policy: may `url` serve as a
+    /// configured CONTAINER root (a dev root) at all? Rejects the dangerous
+    /// containers — the filesystem root `/`, any volume root / mount point,
+    /// and `$HOME` itself — each in canonical AND alias spellings (the URL
+    /// is canonicalized BEFORE the check, so a symlink alias of `/` or of
+    /// home is caught; the `$HOME` check is inode identity).
+    ///
+    /// This is `denyCheck`'s core MINUS the protected-first-level-children
+    /// clause: `~/Documents` and `~/Documents/dev` are LEGAL dev roots (the
+    /// seed list depends on this) even though they stay refused as DELETION
+    /// targets. ONE definition, three call sites (epic R16):
+    /// `DevRootsStore.effectiveRoots` (fn-4.1), CLI `--dev-root` resolution
+    /// (fn-4.6), and PathGuard admission on the matched configured root
+    /// (fn-4.5). Settings add-time validation calls this same policy —
+    /// no UI-only duplicate anywhere.
+    static func validateContainerRoot(
+        _ url: URL, home: URL, provider: FileSystemIdentityProvider
+    ) throws {
+        try coreDenyCheck(
+            provider.canonicalize(url),
+            resolvedHome: provider.canonicalize(home),
+            provider: provider
+        )
+    }
+
     // MARK: - Deny list
 
     /// Refusals that apply regardless of any policy. `resolved` must already
-    /// be canonical (root- or target-resolved by the caller).
+    /// be canonical (root- or target-resolved by the caller). The core
+    /// (`/`, volume roots, `$HOME`) is shared with the container-root
+    /// admission policy above; the protected-children clause is
+    /// deletion-target-only.
     private func denyCheck(_ resolved: URL) throws {
+        try Self.coreDenyCheck(
+            resolved, resolvedHome: resolvedHome, provider: provider
+        )
+
+        // Protected first-level children. Inode identity when the child
+        // exists; canonical-components fallback (inside sameLocation) covers
+        // protected names that do not exist in this home.
+        for name in Self.protectedFirstLevelChildren {
+            let protectedChild = resolvedHome.appendingPathComponent(name)
+            if provider.sameLocation(resolved, protectedChild) {
+                throw PathGuardError.deniedProtectedChild(
+                    path: resolved.path, name: name
+                )
+            }
+        }
+    }
+
+    /// The deny-list CORE — filesystem root, volume roots / mount points,
+    /// `$HOME` — shared verbatim by the deletion-target `denyCheck` and the
+    /// container-root admission policy (which deliberately excludes the
+    /// protected-children clause). `resolved` and `resolvedHome` must
+    /// already be canonical.
+    private static func coreDenyCheck(
+        _ resolved: URL, resolvedHome: URL,
+        provider: FileSystemIdentityProvider
+    ) throws {
         let components = resolved.pathComponents
         if components == ["/"] || components.isEmpty {
             throw PathGuardError.deniedFilesystemRoot(path: resolved.path)
@@ -452,18 +508,6 @@ final class PathGuard {
         // alias, case-variant, and NFC/NFD spellings onto one object.
         if provider.sameLocation(resolved, resolvedHome) {
             throw PathGuardError.deniedHomeDirectory(path: resolved.path)
-        }
-
-        // Protected first-level children. Inode identity when the child
-        // exists; canonical-components fallback (inside sameLocation) covers
-        // protected names that do not exist in this home.
-        for name in Self.protectedFirstLevelChildren {
-            let protectedChild = resolvedHome.appendingPathComponent(name)
-            if provider.sameLocation(resolved, protectedChild) {
-                throw PathGuardError.deniedProtectedChild(
-                    path: resolved.path, name: name
-                )
-            }
         }
     }
 

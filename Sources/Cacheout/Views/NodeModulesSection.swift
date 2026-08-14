@@ -185,8 +185,9 @@ struct ScanIssuesBlock: View {
         .padding(.bottom, 4)
     }
 
-    /// `ScanIssue.url` is nil for `.malformedOutcome` — no filesystem
-    /// location exists, and a fake path must never be invented.
+    /// `ScanIssue.url` is nil for the non-filesystem kinds
+    /// (`.malformedOutcome`, `.configInvalid`) — no filesystem location
+    /// exists, and a fake path must never be invented.
     private static func location(of issue: ScanIssue) -> String {
         guard let url = issue.url else { return "Scanner output" }
         return url.path.replacingOccurrences(
@@ -201,6 +202,7 @@ struct ScanIssuesBlock: View {
         case .tccDenied: return "access denied by macOS privacy settings"
         case .permissionDenied: return "permission denied"
         case .unreadable: return "unreadable"
+        case .configInvalid: return "invalid saved configuration — defaults in effect"
         case .malformedOutcome: return "rejected — malformed scanner output; previous results kept"
         }
     }

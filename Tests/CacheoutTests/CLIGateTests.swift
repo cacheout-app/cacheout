@@ -876,11 +876,12 @@ final class CLIGateTests: XCTestCase {
                            "argv arrays never appear in any row")
         }
 
-        // ALL SIX ScanIssue.Kind wire strings through the scanner_errors row
-        // builder — exact rows: the five filesystem kinds carry their real
-        // `path`; `malformed_outcome` has NO path key at all; `tcc_denied`
-        // ALONE additionally carries `grant_hint` (macOS denies CLI
-        // processes silently — the row must say what to do about it).
+        // ALL SEVEN ScanIssue.Kind wire strings through the scanner_errors
+        // row builder — exact rows: the five filesystem kinds carry their
+        // real `path`; the non-filesystem kinds (`malformed_outcome`,
+        // `config_invalid`) have NO path key at all; `tcc_denied` ALONE
+        // additionally carries `grant_hint` (macOS denies CLI processes
+        // silently — the row must say what to do about it).
         let url = URL(fileURLWithPath: "/tmp/wire-fixture-root")
         let filesystemKinds: [(ScanIssue.Kind, String)] = [
             (.containerRefused, "container_refused"),
@@ -920,6 +921,17 @@ final class CLIGateTests: XCTestCase {
             "kind": "malformed_outcome",
             "detail": "fixture detail",
         ] as NSDictionary, "malformed_outcome is path-less by contract")
+        let configInvalidRow = CLIHandler.scannerErrorRowJSON(
+            scannerID: "wire_scanner",
+            issue: ScanIssue(url: nil, kind: .configInvalid,
+                             detail: "fixture detail")
+        )
+        XCTAssertEqual(configInvalidRow as NSDictionary, [
+            "scanner_id": "wire_scanner",
+            "kind": "config_invalid",
+            "detail": "fixture detail",
+        ] as NSDictionary, "config_invalid is path-less by contract (fn-4 — "
+            + "a config parse failure has no honest filesystem path)")
 
         // The frozen aggregate scanner id on clean-side identity fields —
         // the literal string, not just the constant (a renamed constant

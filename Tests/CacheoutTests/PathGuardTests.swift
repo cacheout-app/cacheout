@@ -629,6 +629,145 @@ final class PathGuardTests: XCTestCase {
         }
     }
 
+    // MARK: - Container-root admission policy (fn-4.1, R16)
+
+    /// The shared policy component, tested DIRECTLY (its store call site is
+    /// covered in DevRootsStoreTests; CLI and PathGuard-admission call
+    /// sites arrive in fn-4.6 / fn-4.5). It is `denyCheck` MINUS the
+    /// protected-children clause: `/`, volume roots, and `$HOME` are
+    /// refused in canonical AND alias spellings; `~/Documents` is legal.
+
+    func testContainerRootPolicyRejectsFilesystemRoot() {
+        XCTAssertThrowsError(
+            try PathGuard.validateContainerRoot(
+                URL(fileURLWithPath: "/"), home: fixtureHome,
+                provider: FileSystemIdentityProvider()
+            )
+        ) { error in
+            XCTAssertEqual(error as? PathGuardError,
+                           .deniedFilesystemRoot(path: "/"))
+        }
+    }
+
+    func testContainerRootPolicyRejectsSymlinkAliasOfFilesystemRoot() throws {
+        // Canonicalize-then-check, proven: the alias spelling is nowhere
+        // near "/" lexically, yet resolves to it.
+        let alias = base.appendingPathComponent("rootlink")
+        try fm.createSymbolicLink(
+            at: alias, withDestinationURL: URL(fileURLWithPath: "/")
+        )
+        XCTAssertThrowsError(
+            try PathGuard.validateContainerRoot(
+                alias, home: fixtureHome,
+                provider: FileSystemIdentityProvider()
+            )
+        ) { error in
+            XCTAssertEqual(error as? PathGuardError,
+                           .deniedFilesystemRoot(path: "/"))
+        }
+    }
+
+    func testContainerRootPolicyRejectsVolumeRootBothSignals() throws {
+        // Signal (a): device-id change against the parent.
+        let deviceVolume = base.appendingPathComponent("DeviceVol")
+        try mkdir(deviceVolume)
+        let deviceProvider = DeviceInjectingProvider()
+        deviceProvider.overrides = [
+            (deviceProvider.canonicalize(deviceVolume).path, 0xD15C)
+        ]
+        XCTAssertThrowsError(
+            try PathGuard.validateContainerRoot(
+                deviceVolume, home: fixtureHome, provider: deviceProvider
+            ),
+            "device-change signal must refuse a volume root"
+        ) {
+            guard case .deniedVolumeRoot? = $0 as? PathGuardError else {
+                return XCTFail("expected deniedVolumeRoot, got \($0)")
+            }
+        }
+
+        // Signal (b): statfs mount-root detection (injected mount probe) —
+        // the firmlink case where st_dev never changes.
+        let mountVolume = base.appendingPathComponent("MountVol")
+        try mkdir(mountVolume)
+        let mountProvider = MountPointInjectingProvider()
+        mountProvider.mountPointPaths = [
+            mountProvider.canonicalize(mountVolume).path
+        ]
+        XCTAssertThrowsError(
+            try PathGuard.validateContainerRoot(
+                mountVolume, home: fixtureHome, provider: mountProvider
+            ),
+            "mount-root signal must refuse even with an unchanged device id"
+        ) {
+            guard case .deniedVolumeRoot? = $0 as? PathGuardError else {
+                return XCTFail("expected deniedVolumeRoot, got \($0)")
+            }
+        }
+    }
+
+    func testContainerRootPolicyRejectsInjectedHomeDirectAndAlias() throws {
+        let provider = FileSystemIdentityProvider()
+        // Direct spelling of the injected home.
+        XCTAssertThrowsError(
+            try PathGuard.validateContainerRoot(
+                fixtureHome, home: fixtureHome, provider: provider
+            )
+        ) {
+            guard case .deniedHomeDirectory? = $0 as? PathGuardError else {
+                return XCTFail("expected deniedHomeDirectory, got \($0)")
+            }
+        }
+
+        // Symlink alias — inode identity collapses the spellings.
+        let alias = base.appendingPathComponent("homelink")
+        try fm.createSymbolicLink(at: alias, withDestinationURL: fixtureHome)
+        XCTAssertThrowsError(
+            try PathGuard.validateContainerRoot(
+                alias, home: fixtureHome, provider: provider
+            )
+        ) {
+            guard case .deniedHomeDirectory? = $0 as? PathGuardError else {
+                return XCTFail("expected deniedHomeDirectory, got \($0)")
+            }
+        }
+    }
+
+    func testContainerRootPolicyAcceptsProtectedChildren() throws {
+        // The protected-children clause is deliberately EXCLUDED: intended
+        // dev roots like ~/Documents and ~/Documents/dev must be legal
+        // containers (the seed list depends on this) even though both stay
+        // refused as DELETION targets.
+        let documents = fixtureHome.appendingPathComponent("Documents")
+        let dev = documents.appendingPathComponent("dev")
+        try mkdir(dev)
+        let provider = FileSystemIdentityProvider()
+
+        XCTAssertNoThrow(try PathGuard.validateContainerRoot(
+            documents, home: fixtureHome, provider: provider
+        ))
+        XCTAssertNoThrow(try PathGuard.validateContainerRoot(
+            dev, home: fixtureHome, provider: provider
+        ))
+
+        // …and the SAME URL is still refused as a deletion target — the
+        // split is the point.
+        assertRefused(documents, policy: emptyPolicy, guard: makeGuard(),
+                      message: "(deletion-target admission keeps the clause)")
+    }
+
+    /// Injects statfs mount-root answers for canonical paths — hermetic
+    /// stand-in for a firmlink/APFS-group mount (device id unchanged).
+    private final class MountPointInjectingProvider:
+        FileSystemIdentityProvider
+    {
+        var mountPointPaths: Set<String> = []
+        override func isMountPoint(_ url: URL) -> Bool {
+            if mountPointPaths.contains(url.path) { return true }
+            return super.isMountPoint(url)
+        }
+    }
+
     // MARK: - Small helper
 
     /// Canonical path of a fixture URL, for exact error-payload assertions.

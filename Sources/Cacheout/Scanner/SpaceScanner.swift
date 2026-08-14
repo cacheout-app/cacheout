@@ -288,6 +288,16 @@ struct ScanIssue: Equatable, Sendable {
         case permissionDenied
         /// Enumeration or metadata failure that is not a permission problem.
         case unreadable
+        /// A PERSISTED configuration value this build cannot parse (fn-4,
+        /// R8/R16 — e.g. a `devRoots` array whose shape is invalid). The
+        /// scanner fell back to its defaults WITHOUT rewriting the stored
+        /// value; the fallback is never silent — this issue rides every
+        /// scan outcome while the corrupt value persists. A NON-filesystem
+        /// kind: a config parse failure has no honest filesystem path, so
+        /// `url` is nil and a fake path is never invented. (Policy-REJECTED
+        /// configured roots are NOT this kind — they carry their offending
+        /// path honestly under the frozen `.containerRefused`.)
+        case configInvalid
         /// Synthesized ONLY by `SpaceScannerRuntime.validatedOutcome` when a
         /// scanner's outcome fails ownership/structural validation — never
         /// produced by scanners themselves. RESERVED and enforced (check
@@ -306,14 +316,16 @@ struct ScanIssue: Equatable, Sendable {
             case .tccDenied: return "tcc_denied"
             case .permissionDenied: return "permission_denied"
             case .unreadable: return "unreadable"
+            case .configInvalid: return "config_invalid"
             case .malformedOutcome: return "malformed_outcome"
             }
         }
     }
 
-    /// Required BY CONVENTION for the filesystem kinds; nil for
-    /// `.malformedOutcome` — no filesystem location exists, and a fake path
-    /// must never be invented.
+    /// Required BY CONVENTION for the filesystem kinds; nil for the
+    /// NON-filesystem kinds (`.malformedOutcome`, `.configInvalid`) — no
+    /// filesystem location exists, and a fake path must never be invented.
+    /// The wire `path` key is conditional on the same rule.
     let url: URL?
     let kind: Kind
     let detail: String

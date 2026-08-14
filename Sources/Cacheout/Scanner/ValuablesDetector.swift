@@ -18,12 +18,27 @@
 ///
 /// ## Fail closed, always
 /// A probe that could not finish (entry cap hit, depth boundary left
-/// unexpanded, unreadable branch, unreadable metadata, a bundle whose bounded
-/// subtree sizing truncated) is INCOMPLETE. An incomplete probe has the SAME
-/// consequence as a hit: risk forced off safe, selection forced false,
-/// "couldn't fully inspect" evidence — and, uniformly across every surface, NO
-/// acknowledgement token exists. Absence of valuables is only meaningful when
-/// the inspection actually finished.
+/// unexpanded, unreadable branch, unreadable metadata, an undecodable
+/// basename, a bundle whose bounded subtree sizing truncated) is INCOMPLETE.
+/// An incomplete probe has the SAME consequence as a hit: risk forced off
+/// safe, selection forced false, "couldn't fully inspect" evidence — and,
+/// uniformly across every surface, NO acknowledgement token exists. Absence of
+/// valuables is only meaningful when the inspection actually finished.
+///
+/// ## Determinism contract (deliberately NARROW under truncation)
+/// For a COMPLETE probe the output is fully deterministic: every directory
+/// was read whole, siblings are visited byte-wise ascending, and the disclosed
+/// list is sorted byte-wise by canonical identity path.
+/// For an INCOMPLETE probe, WHICH entries were seen is deliberately
+/// UNSPECIFIED — a directory larger than the remaining entry budget is read in
+/// filesystem `readdir` order, because selecting the byte-wise smallest N
+/// would require enumerating the whole directory, which is precisely the
+/// unbounded read the budget exists to prevent. Nothing downstream may depend
+/// on that membership: an incomplete probe is unauthorizable and TOKENLESS on
+/// every surface, and its item is forced to review regardless of what was
+/// found. What IS disclosed is still shown (hiding a real DMG because the
+/// walk ran out of budget would be strictly worse) — it is a floor on the
+/// warning, never a basis for authorization.
 ///
 /// ## DISCLOSURE IS NEVER CONSENT
 /// `ValuablesDisclosure` records what the scan SAW. It is never read as
@@ -283,10 +298,12 @@ enum ValuablesDetector {
     /// they are sized as ONE subject; a valuable nested inside a flagged
     /// bundle is already covered by the bundle itself.
     ///
-    /// Determinism: siblings are visited in byte-wise basename order — files
-    /// as they come, directories descended in that same ascending order (the
-    /// stack is loaded in reverse so `popLast` yields ascending) — and the
-    /// result is sorted ONCE into the canonical order before returning.
+    /// Determinism: within every directory the budget could read WHOLE,
+    /// siblings are visited in byte-wise basename order — files as they come,
+    /// directories descended in that same ascending order (the stack is
+    /// loaded in reverse so `popLast` yields ascending) — and the result is
+    /// sorted ONCE into the canonical order before returning. Membership
+    /// under TRUNCATION is deliberately unspecified; see the file header.
     static func probe(
         at directory: URL,
         provider: FileSystemIdentityProvider,
@@ -545,8 +562,19 @@ enum ValuablesDetector {
     /// directory URL. `.` and `..` are skipped; hidden entries are INCLUDED
     /// (a `.dmg` in a dot-directory is still a release artifact).
     ///
-    /// A mid-read `readdir` FAILURE reports `truncated` — the enumeration is
-    /// unproven, which is exactly the incomplete-probe consequence.
+    /// `truncated` means the enumeration is NOT PROVEN EXHAUSTED — more
+    /// entries remained, a `readdir` failed, or an entry's name could not be
+    /// decoded. Every one of those makes the probe incomplete.
+    ///
+    /// UNDECODABLE NAMES FAIL CLOSED: `String(validatingCString:)`, never
+    /// `String(cString:)`. A repairing decode would substitute U+FFFD, and
+    /// the URL rebuilt from that lie names a DIFFERENT path — `probeKind`
+    /// would report it absent and the probe could return "complete, nothing
+    /// found" while the real entry (a `.dmg`, say) was never inspected. APFS
+    /// and HFS+ reject non-UTF-8 basenames outright (EILSEQ), but a mounted
+    /// exFAT/SMB/FUSE volume can deliver them. The read STOPS at the first
+    /// undecodable entry: the directory is already unproven, and continuing
+    /// would let a hostile directory full of such names defeat the budget.
     private static func boundedChildNames(
         of directory: URL, limit: Int
     ) -> (names: [String], truncated: Bool)? {
@@ -562,12 +590,17 @@ enum ValuablesDetector {
                 if errno != 0 { truncated = true }
                 break
             }
-            let name = withUnsafeBytes(of: entry.pointee.d_name) { raw -> String in
+            let decoded = withUnsafeBytes(of: entry.pointee.d_name) {
+                raw -> String? in
                 guard let base = raw.bindMemory(to: CChar.self).baseAddress
-                else { return "" }
-                return String(cString: base)
+                else { return nil }
+                return decodedBasename(fromCString: base)
             }
-            if name.isEmpty || name == "." || name == ".." { continue }
+            guard let name = decoded, !name.isEmpty else {
+                truncated = true
+                break
+            }
+            if name == "." || name == ".." { continue }
             guard names.count < limit else {
                 truncated = true
                 break
@@ -575,5 +608,16 @@ enum ValuablesDetector {
             names.append(name)
         }
         return (names, truncated)
+    }
+
+    /// The VALIDATING basename decode, factored out so the fail-closed policy
+    /// is testable without a non-UTF-8-capable volume (APFS/HFS+ refuse to
+    /// create such names at all). `nil` for ANY byte sequence that is not
+    /// valid UTF-8 — never a U+FFFD-repaired string, which would name a
+    /// different path than the entry it came from.
+    static func decodedBasename(
+        fromCString pointer: UnsafePointer<CChar>
+    ) -> String? {
+        String(validatingCString: pointer)
     }
 }

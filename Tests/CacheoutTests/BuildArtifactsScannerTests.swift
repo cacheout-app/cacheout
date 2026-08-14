@@ -1666,12 +1666,76 @@ final class BuildArtifactsScannerTests: XCTestCase {
         )
     }
 
+    func testBasenameDecodeRejectsInvalidUTF8InsteadOfRepairingIt() throws {
+        // The fail-closed POLICY, hermetically: a repairing decode would turn
+        // `bad\u{FF}.dmg` into a U+FFFD string whose URL names a DIFFERENT
+        // path — `probeKind` would call it absent and the probe could report
+        // "complete, nothing found" while a real DMG went uninspected.
+        func decode(_ bytes: [UInt8]) -> String? {
+            var buffer = bytes.map { CChar(bitPattern: $0) } + [0]
+            return buffer.withUnsafeBufferPointer {
+                ValuablesDetector.decodedBasename(fromCString: $0.baseAddress!)
+            }
+        }
+        XCTAssertEqual(decode(Array("Murmur.dmg".utf8)), "Murmur.dmg")
+        XCTAssertEqual(decode(Array("café.pkg".utf8)), "café.pkg",
+                       "valid multi-byte UTF-8 decodes normally")
+        XCTAssertNil(decode(Array("bad".utf8) + [0xFF] + Array(".dmg".utf8)),
+                     "an invalid byte is never repaired into a lie")
+        XCTAssertNil(decode([0xC3]), "a truncated sequence is rejected too")
+    }
+
+    func testUndecodableBasenameFailsClosedInsteadOfProbingComplete()
+        async throws
+    {
+        // A basename that is not valid UTF-8 cannot be turned into a URL that
+        // names the real entry — a REPAIRING decode would substitute U+FFFD
+        // and the probe could report "complete, nothing found" while never
+        // inspecting a DMG. APFS/HFS+ reject such names at `open(2)`
+        // (EILSEQ), so this fixture only runs on a volume that accepts them
+        // (exFAT/SMB/FUSE) — the guard exists for exactly those mounts.
+        let target = try makeProject(
+            at: dev.appendingPathComponent("proj"),
+            marker: "Cargo.toml", artifact: "target", payloadBytes: nil
+        )
+        var raw = Array("bad".utf8) + [0xFF] + Array(".dmg".utf8)
+        let created: Int32 = target.path.withCString { dirPath -> Int32 in
+            let full = String(cString: dirPath) + "/"
+            var bytes = Array(full.utf8) + raw + [0]
+            return bytes.withUnsafeMutableBufferPointer { buffer -> Int32 in
+                buffer.baseAddress!.withMemoryRebound(
+                    to: CChar.self, capacity: buffer.count
+                ) { open($0, O_CREAT | O_WRONLY, 0o644) }
+            }
+        }
+        try XCTSkipIf(
+            created < 0,
+            "this volume enforces UTF-8 basenames (errno \(errno)) — the "
+                + "fail-closed decode guards foreign mounts that do not"
+        )
+        close(created)
+        raw.removeAll()
+
+        let outcome = try await runScan(makeScanner())
+        let disclosure = try XCTUnwrap(
+            item(outcome, at: target)?.valuablesDisclosure
+        )
+        XCTAssertFalse(disclosure.probeComplete,
+                       "an undecodable basename leaves the directory UNPROVEN")
+        XCTAssertEqual(
+            try XCTUnwrap(item(outcome, at: target)).risk, .review
+        )
+    }
+
     func testTruncatedProbeDescendsSiblingsInByteWiseAscendingOrder()
         async throws
     {
         // A budget that can descend exactly ONE of two sibling directories:
         // the byte-wise FIRST one must be the one inspected, deterministically
         // (a reversed stack would silently disclose the other artifact).
+        // Both sibling names fit in the artifact dir's own read, so this cell
+        // sits inside the deterministic half of the contract — membership is
+        // only unspecified when a single directory's READ is truncated.
         let target = try makeProject(
             at: dev.appendingPathComponent("proj"),
             marker: "Cargo.toml", artifact: "target", payloadBytes: nil

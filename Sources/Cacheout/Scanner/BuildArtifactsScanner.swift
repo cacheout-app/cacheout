@@ -390,7 +390,9 @@ struct BuildArtifactsScanner: @unchecked Sendable {
         let scanError: ScanError?
         if hasBoundary {
             state = .denied
-            scanError = Self.mountBoundaryScanError(from: report)
+            scanError = Self.mountBoundaryScanError(
+                from: report, candidate: candidate.artifactDirectory
+            )
         } else if !report.denials.isEmpty {
             state = measuredAnything ? .partiallyDenied : .denied
             scanError = CacheScanner.deriveScanError(
@@ -491,10 +493,18 @@ struct BuildArtifactsScanner: @unchecked Sendable {
     /// the message NAMES the boundary, and when the walk measured readable
     /// content beside it that floor rides the message — because the item's
     /// byte components must stay zero.
+    ///
+    /// NON-OPTIONAL by construction (review r1): the `.denied` state this
+    /// arm produces REQUIRES a scanError — a nil would malform the whole
+    /// outcome at the validator and publish a silent zero-byte denied item.
+    /// The sizer records the root in `mountBoundaries` whenever it sets
+    /// `rootMountBoundary`, so the candidate fallback (the
+    /// `OrphanedCachesScanner` precedent) normally never fires — it exists
+    /// so no future sizer change can strip the message.
     private static func mountBoundaryScanError(
-        from report: SizeReport
-    ) -> ScanError? {
-        guard let boundary = report.mountBoundaries.first else { return nil }
+        from report: SizeReport, candidate: URL
+    ) -> ScanError {
+        let boundary = report.mountBoundaries.first ?? candidate
         var message = report.rootMountBoundary
             ? "\(boundary.path): item is a mount point — not measured; "
                 + "deletion would be refused"

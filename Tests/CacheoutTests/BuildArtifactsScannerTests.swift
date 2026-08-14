@@ -559,15 +559,40 @@ final class BuildArtifactsScannerTests: XCTestCase {
             at: innerRoot.appendingPathComponent("proj"),
             marker: "Cargo.toml", artifact: "target"
         )
+        // The D7 RATIONALE itself: this project sits at depth 8 below
+        // `inner` (its own budget reaches it) but depth 9 below `dev` (the
+        // ancestor's depth-8 walk does not) — dropping the nested root would
+        // make exactly this project invisible.
+        let deepTarget = try makeProject(
+            at: innerRoot.appendingPathComponent("a/b/c/d/e/f/g/proj"),
+            marker: "Cargo.toml", artifact: "target"
+        )
+
+        // CONTROL: the outer root ALONE reaches the shallow artifact (so the
+        // two-root scan below genuinely produced two candidates to collapse)
+        // and never reaches the deep one.
+        let outerOnly = try await runScan(makeScanner(roots: [dev]))
+        XCTAssertEqual(
+            itemPaths(outerOnly), [identityPath(of: target)],
+            "the ancestor walk finds the shallow artifact and nothing beyond "
+                + "its own depth budget"
+        )
 
         let provider = CanonicalizeCountingProvider()
         let outcome = try await runScan(
             makeScanner(roots: [dev, innerRoot], provider: provider)
         )
 
-        XCTAssertEqual(outcome.items.count, 1,
-                       "overlapping walks collapse to ONE canonical item")
-        let found = try XCTUnwrap(outcome.items.first)
+        XCTAssertEqual(
+            Set(itemPaths(outcome)),
+            [identityPath(of: target), identityPath(of: deepTarget)],
+            "overlapping walks collapse to ONE canonical item for the shared "
+                + "artifact, and the nested root's own budget still yields "
+                + "the deep one"
+        )
+        let found = try XCTUnwrap(
+            item(outcome, at: target, provider: provider)
+        )
         XCTAssertEqual(found.id, expectedID(of: target, provider: provider))
         guard case .containerItem(let origin, let requested) = found.admission
         else { return XCTFail("expected the frozen containerItem descriptor") }
@@ -587,12 +612,12 @@ final class BuildArtifactsScannerTests: XCTestCase {
         )
         let rerun = try await runScan(makeScanner(roots: [dev, innerRoot]))
         for other in [reversed, rerun] {
-            XCTAssertEqual(other.items.count, 1)
-            guard case .containerItem(let otherOrigin, _) =
-                try XCTUnwrap(other.items.first).admission
+            XCTAssertEqual(Set(itemPaths(other)), Set(itemPaths(outcome)))
+            let shared = try XCTUnwrap(item(other, at: target))
+            guard case .containerItem(let otherOrigin, _) = shared.admission
             else { return XCTFail("expected the containerItem descriptor") }
             XCTAssertEqual(otherOrigin.path, innerRoot.path)
-            XCTAssertEqual(other.items.first?.id, found.id)
+            XCTAssertEqual(shared.id, found.id)
         }
     }
 
@@ -975,6 +1000,41 @@ final class BuildArtifactsScannerTests: XCTestCase {
                       "the error NAMES the boundary: \(error.message)")
         XCTAssertTrue(error.message.contains("not reclaimable"),
                       "the measured floor rides the message: \(error.message)")
+    }
+
+    func testArtifactDirItselfAMountPointIsDeniedAndStillNamesTheBoundary()
+        async throws
+    {
+        // The ROOT-boundary cell (review r1): the sizer never enumerates the
+        // tree, so no nested boundary exists to name — the denied item must
+        // STILL carry its classified scanError, or the whole outcome
+        // malforms and a silent zero-byte denied item ships.
+        let target = try makeProject(
+            at: dev.appendingPathComponent("proj"),
+            marker: "Cargo.toml", artifact: "target", payloadBytes: 8_192
+        )
+
+        let provider = MountPointInjectingProvider()
+        provider.mountPointInodes.insert(
+            try XCTUnwrap(provider.identity(of: target)?.inode)
+        )
+
+        let outcome = try await runScan(makeScanner(provider: provider))
+
+        let found = try XCTUnwrap(item(outcome, at: target, provider: provider))
+        XCTAssertEqual(found.state, .denied)
+        XCTAssertEqual(found.rootRecords.map(\.status), [.deniedUnmeasured])
+        XCTAssertEqual(found.allocatedBytes, 0)
+        XCTAssertEqual(found.itemCount, 0)
+        XCTAssertNil(found.logicalBytes)
+        let error = try XCTUnwrap(
+            found.scanError, "a denied item ALWAYS carries its scanError"
+        )
+        XCTAssertEqual(error.kind, .other)
+        XCTAssertTrue(error.message.contains("target"),
+                      "the error names the boundary: \(error.message)")
+        XCTAssertTrue(error.message.contains("mount point"),
+                      "the root-boundary wording: \(error.message)")
     }
 
     func testChmod000ArtifactIsDeniedUnmeasuredWithClassifiedError()

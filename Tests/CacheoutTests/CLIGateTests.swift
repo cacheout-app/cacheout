@@ -942,6 +942,44 @@ final class CLIGateTests: XCTestCase {
         XCTAssertEqual(aggregateRow["scanner_id"] as? String, "categories")
     }
 
+    /// fn-4.4: the two ADDITIVE `scanner_items` fields, at the shared row
+    /// builder every scanner's items flow through. Absence is the DEFAULT —
+    /// an item that carries neither must emit neither key (never `null`), so
+    /// no existing scanner's envelope changes shape.
+    func testAdditiveLogicalBytesAndValuablesRowFieldsAreOmittedByDefault()
+        throws
+    {
+        let plain = makeStandaloneItem(id: "plain")
+        let plainRow = CLIHandler.scannerItemRowJSON(for: plain)
+        XCTAssertNil(plain.logicalBytes)
+        XCTAssertNil(plain.valuablesDisclosure)
+        XCTAssertFalse(plainRow.keys.contains("logical_bytes"))
+        XCTAssertFalse(plainRow.keys.contains("valuables"))
+
+        // The ONE pinned SIX-FIELD element shape, asserted as an EXACT row —
+        // plan rows and refusal rows (fn-4.9) REUSE this builder, so this is
+        // the one place the shape is pinned.
+        let valuable = DetectedValuable(
+            name: "Murmur_0.1.7_aarch64.dmg",
+            displayURL: URL(fileURLWithPath: "/alias/target/dmg/Murmur.dmg"),
+            canonicalIdentityPath: "/canonical/target/dmg/Murmur.dmg",
+            identity: ValuableIdentity(
+                allocatedBytes: 44_040_192, device: 16_777_232,
+                inode: 12_345_678, modifiedSeconds: 1_755_057_600,
+                modifiedNanoseconds: 123_456_789
+            )
+        )
+        XCTAssertEqual(CLIHandler.valuableRowJSON(for: valuable) as NSDictionary, [
+            "name": "Murmur_0.1.7_aarch64.dmg",
+            "path": "/canonical/target/dmg/Murmur.dmg",
+            "allocated_bytes": Int64(44_040_192),
+            "device": UInt64(16_777_232),
+            "inode": UInt64(12_345_678),
+            "modified_at_ns": Int64(1_755_057_600_123_456_789),
+        ] as NSDictionary, "the pinned valuables element — the display "
+            + "spelling never reaches the wire")
+    }
+
     // MARK: - Address grammar (R7)
 
     func testCleanTargetGrammarAllThreeFormsResolve() async throws {

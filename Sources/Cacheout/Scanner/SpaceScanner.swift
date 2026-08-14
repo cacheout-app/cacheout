@@ -243,6 +243,82 @@ struct ReclaimableItem: Equatable, Sendable {
     /// Nil = staleness not applicable to this item (aggregates: nil).
     let isStale: Bool?
 
+    /// ADDITIVE (fn-4.4, R3/R17) — the structural record of what the
+    /// scan-time valuables probe SAW inside this item: the disclosed valuable
+    /// identity set (already in the ONE canonical order) plus the probe's
+    /// COMPLETENESS. `nil` for every scanner that runs no such probe (every
+    /// scanner but `build_artifacts` today) — absent, never a fake "clean and
+    /// complete".
+    ///
+    /// **DISCLOSURE IS NEVER CONSENT.** This field records what was shown; it
+    /// is NEVER read as acknowledgement. Both a GUI clean and an
+    /// unacknowledged CLI clean hand the revalidator this same scanned item —
+    /// only the per-clean `[ItemKey: acknowledgement]` authorization context
+    /// distinguishes them (fn-4.6/fn-4.8/fn-4.9).
+    let valuablesDisclosure: ValuablesDisclosure?
+
+    /// ADDITIVE (fn-4.4, R17, D8) — the SCANNER-AGNOSTIC structural signal
+    /// that this item MUST be re-inspected immediately before deletion.
+    /// Default `false`: every existing scanner's items are unaffected until
+    /// fn-4.8's orphaned-caches migration. fn-4.8's generalized cleaner fails
+    /// CLOSED whenever the marker is set but no revalidator is registered for
+    /// the item's scanner — so a direct `CacheCleaner` construction without
+    /// the registry refuses marked items of ANY scanner.
+    let requiresPreDeleteRevalidation: Bool
+
+    /// EXPLICIT memberwise initializer (fn-4.4): the two additive fields
+    /// above default, so no existing construction site changes — the
+    /// `logicalBytes` additive precedent, one field-set later. Every stored
+    /// property stays `let` (a synthesized memberwise init cannot default a
+    /// `let`, which is the only reason this is written out).
+    init(
+        id: String,
+        scannerID: String,
+        displayName: String,
+        exactBytes: Int64,
+        estimatedUpToBytes: Int64,
+        logicalBytes: Int64?,
+        itemCount: Int,
+        url: URL?,
+        declaredDisplayPath: String,
+        rootRecords: [RootScanRecord],
+        state: ScanState,
+        scanError: ScanError?,
+        risk: RiskLevel,
+        evidence: String,
+        rebuildNote: String?,
+        action: ReclaimAction,
+        admission: AdmissionDescriptor,
+        defaultSelected: Bool,
+        automaticCleanEligible: Bool,
+        isStale: Bool?,
+        valuablesDisclosure: ValuablesDisclosure? = nil,
+        requiresPreDeleteRevalidation: Bool = false
+    ) {
+        self.id = id
+        self.scannerID = scannerID
+        self.displayName = displayName
+        self.exactBytes = exactBytes
+        self.estimatedUpToBytes = estimatedUpToBytes
+        self.logicalBytes = logicalBytes
+        self.itemCount = itemCount
+        self.url = url
+        self.declaredDisplayPath = declaredDisplayPath
+        self.rootRecords = rootRecords
+        self.state = state
+        self.scanError = scanError
+        self.risk = risk
+        self.evidence = evidence
+        self.rebuildNote = rebuildNote
+        self.action = action
+        self.admission = admission
+        self.defaultSelected = defaultSelected
+        self.automaticCleanEligible = automaticCleanEligible
+        self.isStale = isStale
+        self.valuablesDisclosure = valuablesDisclosure
+        self.requiresPreDeleteRevalidation = requiresPreDeleteRevalidation
+    }
+
     /// The composite cross-scanner identity.
     var key: ItemKey { ItemKey(scannerID: scannerID, itemID: id) }
 
@@ -604,7 +680,13 @@ struct SpaceScannerRuntime {
     ///     representable — two individually valid items can still claim
     ///     more than Int64.max bytes together, which no real scan can
     ///     (> 9.2 EB), and the cross-item sum is exactly what every
-    ///     single-scanner consumer total computes. Cross-SCANNER totals
+    ///     single-scanner consumer total computes. fn-4.4 extends this SAME
+    ///     family (no new family) to every numeric of the additive
+    ///     `valuablesDisclosure`: each valuable's `allocatedBytes`
+    ///     nonnegative, `modifiedNanoseconds` in `[0, 1e9)`, and
+    ///     `modifiedSeconds` inside the range where the derived
+    ///     `modified_at_ns` still fits Int64 — checked-REJECT, never
+    ///     saturated. Cross-SCANNER totals
     ///     remain consumer arithmetic, saturating by construction
     ///     (`Int64.saturatingAdding`);
     /// (e) STATE↔RECORD COHERENCE — the item's `state` must be SUPPORTED
@@ -828,6 +910,45 @@ struct SpaceScannerRuntime {
         }
         if item.itemCount < 0 {
             return "itemCount \(item.itemCount) is negative"
+        }
+        // fn-4.4 (R13/R17): the SAME value-domain family, extended to every
+        // numeric of the additive valuables field. No new check family, no
+        // state-coherence coupling — items WITHOUT the field are untouched.
+        // Every violation is REJECTED, never saturated: `modified_at_ns` is
+        // derived as `modifiedSeconds * 1e9 + modifiedNanoseconds`, so an
+        // out-of-domain pair would either publish a lie or trap its first
+        // consumer. Computed here with overflow-REPORTING arithmetic (the
+        // outcome-wide `addingReportingOverflow` precedent above) BEFORE any
+        // `modified_at_ns` access downstream.
+        for valuable in item.valuablesDisclosure?.valuables ?? [] {
+            let identity = valuable.identity
+            if identity.allocatedBytes < 0 {
+                return "valuable '\(valuable.name)' allocatedBytes "
+                    + "\(identity.allocatedBytes) is negative — byte "
+                    + "components are physical quantities"
+            }
+            if identity.modifiedNanoseconds < 0
+                || identity.modifiedNanoseconds
+                    >= ValuableIdentity.nanosecondsPerSecond {
+                return "valuable '\(valuable.name)' modifiedNanoseconds "
+                    + "\(identity.modifiedNanoseconds) is outside "
+                    + "[0, 1000000000) — a nanosecond field cannot name a "
+                    + "whole second"
+            }
+            let (scaled, scaleOverflow) = identity.modifiedSeconds
+                .multipliedReportingOverflow(
+                    by: ValuableIdentity.nanosecondsPerSecond
+                )
+            if scaleOverflow
+                || scaled.addingReportingOverflow(
+                    identity.modifiedNanoseconds
+                ).overflow {
+                return "valuable '\(valuable.name)' modifiedSeconds "
+                    + "\(identity.modifiedSeconds) is outside the range where "
+                    + "modifiedSeconds * 1000000000 + modifiedNanoseconds "
+                    + "fits Int64 — modified_at_ns would overflow, and a "
+                    + "saturated timestamp is a lie"
+            }
         }
         return nil
     }

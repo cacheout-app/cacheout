@@ -653,6 +653,53 @@ struct CLIHandler {
                 row["grant_hint"] = tccGrantHint
             }
         }
+        // ADDITIVE, fn-4.4 (no schema bump). Both keys are OMITTED — never
+        // null — when they do not apply: `logical_bytes` only when the model
+        // carries a materially diverging figure (the sparse `target/` field
+        // case), `valuables` only when the probe actually disclosed some.
+        if let logicalBytes = item.logicalBytes {
+            row["logical_bytes"] = logicalBytes
+        }
+        if let disclosure = item.valuablesDisclosure,
+           !disclosure.valuables.isEmpty {
+            // Array order IS the model's stored canonical order — no re-sort.
+            row["valuables"] = disclosure.valuables.map(valuableRowJSON(for:))
+        }
+        return row
+    }
+
+    /// The ONE pinned valuables ELEMENT shape (fn-4.4, R3/R17), six fields:
+    ///
+    ///     {"name": …, "path": …, "allocated_bytes": …,
+    ///      "device": …, "inode": …, "modified_at_ns": …}
+    ///
+    /// `path` is the CANONICAL IDENTITY PATH (`resolveTargetKeepingLeaf`) —
+    /// the same string the token preimage consumes; the unresolved display
+    /// spelling NEVER reaches the wire. `device`/`inode` serialize as
+    /// UNSIGNED decimal integers (the `FileSystemIdentityProvider.Identity`
+    /// convention). `modified_at_ns` is DERIVED as `modifiedSeconds * 1e9 +
+    /// modifiedNanoseconds` from the same integers the sheet renders its date
+    /// from — one source, no precision drift.
+    ///
+    /// Plan rows and clean-result refusal rows (fn-4.9) REUSE this builder
+    /// verbatim so scan, plan, and refusal surfaces can never drift.
+    ///
+    /// The `modified_at_ns` key is unconditional for anything real: the value
+    /// is absent only for an identity outside the pinned value domains, which
+    /// no production probe can produce (`leafMetadata` rejects it at the
+    /// `lstat`) and no validated outcome can carry (the value-domain family
+    /// malforms it first). The row omits rather than inventing a number.
+    static func valuableRowJSON(for valuable: DetectedValuable) -> [String: Any] {
+        var row: [String: Any] = [
+            "name": valuable.name,
+            "path": valuable.canonicalIdentityPath,
+            "allocated_bytes": valuable.identity.allocatedBytes,
+            "device": valuable.identity.device,
+            "inode": valuable.identity.inode,
+        ]
+        if let modifiedAtNS = valuable.identity.modifiedAtNanoseconds {
+            row["modified_at_ns"] = modifiedAtNS
+        }
         return row
     }
 

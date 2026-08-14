@@ -1,3 +1,4 @@
+import CryptoKit
 import XCTest
 import Darwin
 @testable import Cacheout
@@ -110,6 +111,44 @@ final class BuildArtifactsScannerTests: XCTestCase {
         return artifactDir
     }
 
+    /// A file of `bytes` REAL (non-sparse) bytes — multi-MB valuables
+    /// fixtures without millions of `UInt8.random` calls.
+    @discardableResult
+    private func writeBulkFile(_ url: URL, bytes: Int) throws -> URL {
+        try mkdir(url.deletingLastPathComponent())
+        try Data(repeating: 0xAB, count: bytes).write(to: url)
+        return url
+    }
+
+    /// A directory BUNDLE whose payload sits INSIDE it, so the bundle ROOT's
+    /// own inode allocation is tiny while its SUBTREE is large — the exact
+    /// shape single-lstat sizing would wrongly exempt from the floor.
+    @discardableResult
+    private func makeBundle(at url: URL, contentBytes: Int) throws -> URL {
+        try mkdir(url)
+        try writeBulkFile(
+            url.appendingPathComponent("Contents/MacOS/binary"),
+            bytes: contentBytes
+        )
+        return url
+    }
+
+    /// Comfortably above / below the shared allocated floor.
+    private var aboveFloorBytes: Int {
+        Int(ValuablesDetector.minimumAllocatedBytes) + 1_000_000
+    }
+    private let subFloorBytes = 4_096
+
+    /// Raw `lstat` of a fixture path — the independent identity math the
+    /// disclosed integers are checked against (never the code under test).
+    private func rawStat(_ url: URL) throws -> stat {
+        var st = stat()
+        guard lstat(url.path, &st) == 0 else {
+            throw XCTSkip("lstat failed for fixture \(url.path)")
+        }
+        return st
+    }
+
     /// A marker-INSIDE venv (PEP 405): any directory name, `pyvenv.cfg`
     /// among its own entries.
     @discardableResult
@@ -140,12 +179,18 @@ final class BuildArtifactsScannerTests: XCTestCase {
     private func makeScanner(
         roots: [URL]? = nil,
         provider: FileSystemIdentityProvider = FileSystemIdentityProvider(),
+        valuablesProbeDepthLimit: Int =
+            ValuablesDetector.defaultProbeDepthLimit,
+        valuablesProbeEntryLimit: Int =
+            ValuablesDetector.defaultProbeEntryLimit,
         now: @escaping @Sendable () -> Date = { Date() }
     ) -> BuildArtifactsScanner {
         BuildArtifactsScanner(
             home: fixtureHome,
             devRoots: resolution(roots ?? [dev], provider: provider),
             provider: provider,
+            valuablesProbeDepthLimit: valuablesProbeDepthLimit,
+            valuablesProbeEntryLimit: valuablesProbeEntryLimit,
             now: now
         )
     }
@@ -1219,6 +1264,1058 @@ final class BuildArtifactsScannerTests: XCTestCase {
         XCTAssertTrue(probe.sawAnyCall, "the mapping seam ran")
         XCTAssertFalse(probe.sawMainThread,
                        "the scan never touches the main actor")
+    }
+
+    // ====================================================================
+    // MARK: - fn-4.4: the valuables gate (R3/R13/R17)
+    // ====================================================================
+
+    // MARK: R3 — detection + forcing
+
+    func testFieldDMGInsideTargetForcesReviewUnselectedAndDiscloses()
+        async throws
+    {
+        // THE field case: a signed 42MB DMG that existed ONLY inside
+        // `target/release/bundle/dmg/`.
+        let target = try makeProject(
+            at: dev.appendingPathComponent("murmur"),
+            marker: "Cargo.toml", artifact: "target"
+        )
+        let dmg = try writeBulkFile(
+            target.appendingPathComponent(
+                "release/bundle/dmg/Murmur_0.1.7_aarch64.dmg"
+            ),
+            bytes: aboveFloorBytes
+        )
+        XCTAssertGreaterThanOrEqual(
+            allocated(dmg), ValuablesDetector.minimumAllocatedBytes,
+            "fixture precondition: the DMG clears the shared floor"
+        )
+
+        let outcome = try await runScan(makeScanner())
+        let found = try XCTUnwrap(item(outcome, at: target))
+
+        // The `target` rule row is SAFE — the gate forces it off safe.
+        XCTAssertEqual(BuildArtifactRules.v1[0].risk, .safe,
+                       "fixture precondition: the row under test IS safe")
+        XCTAssertEqual(found.risk, .review,
+                       "a valuable forces the row OFF safe")
+        XCTAssertFalse(found.defaultSelected,
+                       "a valuable-bearing item is never pre-selected")
+
+        let disclosure = try XCTUnwrap(found.valuablesDisclosure)
+        XCTAssertTrue(disclosure.probeComplete)
+        XCTAssertEqual(disclosure.valuables.count, 1)
+        let valuable = try XCTUnwrap(disclosure.valuables.first)
+        XCTAssertEqual(valuable.name, "Murmur_0.1.7_aarch64.dmg")
+        XCTAssertEqual(identityPath(of: valuable.displayURL),
+                       identityPath(of: dmg),
+                       "displayURL names the same object (the alias-root cell "
+                        + "proves it keeps the DISCOVERY spelling)")
+        XCTAssertEqual(valuable.canonicalIdentityPath, identityPath(of: dmg))
+        XCTAssertEqual(valuable.identity.allocatedBytes, allocated(dmg),
+                       "a regular file is sized by its LEAF allocation")
+
+        // Evidence: the pinned epic format, appended to the base clause.
+        let human = ByteCountFormatter.sharedFile
+            .string(fromByteCount: allocated(dmg))
+        XCTAssertEqual(
+            found.evidence,
+            "target/ beside Cargo.toml; last build today — WARNING: contains "
+                + "Murmur_0.1.7_aarch64.dmg (\(human)) — verify before deleting"
+        )
+    }
+
+    func testBundlesAreSizedByBoundedSubtreeWithRootIdentityAndFloor()
+        async throws
+    {
+        let target = try makeProject(
+            at: dev.appendingPathComponent("ios"),
+            marker: "Cargo.toml", artifact: "target"
+        )
+        let app = try makeBundle(
+            at: target.appendingPathComponent("release/Murmur.app"),
+            contentBytes: aboveFloorBytes
+        )
+        let archive = try makeBundle(
+            at: target.appendingPathComponent("release/Murmur.xcarchive"),
+            contentBytes: aboveFloorBytes
+        )
+        // Case-insensitive extension compare, exact otherwise.
+        let dsym = try makeBundle(
+            at: target.appendingPathComponent("release/Murmur.DSYM"),
+            contentBytes: aboveFloorBytes
+        )
+        try makeBundle(
+            at: target.appendingPathComponent("release/Stub.app"),
+            contentBytes: subFloorBytes
+        )
+
+        let outcome = try await runScan(makeScanner())
+        let found = try XCTUnwrap(item(outcome, at: target))
+        let disclosure = try XCTUnwrap(found.valuablesDisclosure)
+        XCTAssertTrue(disclosure.probeComplete)
+        XCTAssertEqual(
+            disclosure.valuables.map(\.name).sorted(),
+            ["Murmur.DSYM", "Murmur.app", "Murmur.xcarchive"],
+            "the three bundle shapes; the sub-floor .app stub is ignored"
+        )
+
+        // SPLIT sourcing: the ROOT's own allocation would never clear the
+        // floor — the subtree's does, and the identity is still the root's.
+        let payload = app.appendingPathComponent("Contents/MacOS/binary")
+        XCTAssertLessThan(
+            allocated(app), ValuablesDetector.minimumAllocatedBytes,
+            "fixture precondition: a bundle root inode is tiny"
+        )
+        let appValuable = try XCTUnwrap(
+            disclosure.valuables.first { $0.name == "Murmur.app" }
+        )
+        XCTAssertEqual(appValuable.identity.allocatedBytes, allocated(payload),
+                       "a bundle is sized by its BOUNDED SUBTREE")
+        let rootStat = try rawStat(app)
+        XCTAssertEqual(appValuable.identity.inode, UInt64(rootStat.st_ino),
+                       "identity is the bundle ROOT's no-follow lstat")
+        XCTAssertEqual(appValuable.identity.device,
+                       UInt64(bitPattern: Int64(rootStat.st_dev)))
+        XCTAssertNotEqual(appValuable.identity.inode,
+                          UInt64(try rawStat(payload).st_ino),
+                          "never the payload's inode")
+        for bundle in [archive, dsym] {
+            XCTAssertNotNil(
+                disclosure.valuables.first {
+                    $0.canonicalIdentityPath == identityPath(of: bundle)
+                },
+                "\(bundle.lastPathComponent) is a directory bundle valuable"
+            )
+        }
+    }
+
+    func testTruncatedBundleSizingMakesTheProbeIncompleteAndTokenless()
+        async throws
+    {
+        let target = try makeProject(
+            at: dev.appendingPathComponent("proj"),
+            marker: "Cargo.toml", artifact: "target", payloadBytes: nil
+        )
+        let app = target.appendingPathComponent("Big.app")
+        // Above the floor at the bundle ROOT's own level …
+        let shallow = try writeBulkFile(
+            app.appendingPathComponent("payload.bin"), bytes: aboveFloorBytes
+        )
+        // … and more bytes DEEPER than the injected depth cap can reach.
+        try writeBulkFile(
+            app.appendingPathComponent("Contents/MacOS/binary"),
+            bytes: aboveFloorBytes
+        )
+
+        // depthLimit 2: the bundle's `Contents/` expands, `MacOS/` does not.
+        // The OUTER walk has no ordinary directory at its boundary (the only
+        // child directory is the bundle itself), so the incompleteness can
+        // ONLY come from the truncated bundle sizing.
+        let outcome = try await runScan(
+            makeScanner(valuablesProbeDepthLimit: 2)
+        )
+        let found = try XCTUnwrap(item(outcome, at: target))
+        let disclosure = try XCTUnwrap(found.valuablesDisclosure)
+
+        XCTAssertFalse(disclosure.probeComplete,
+                       "a truncated bundle subtree walk is an INCOMPLETE probe")
+        XCTAssertEqual(disclosure.valuables.map(\.name), ["Big.app"])
+        XCTAssertEqual(
+            disclosure.valuables.first?.identity.allocatedBytes,
+            allocated(shallow),
+            "the truncated figure is a FLOOR — which is why it is tokenless"
+        )
+        XCTAssertNil(disclosure.acknowledgementToken(for: found.key),
+                     "no token EVER derives from a partial size")
+        XCTAssertEqual(found.risk, .review)
+        XCTAssertFalse(found.defaultSelected)
+        XCTAssertTrue(
+            found.evidence.contains("couldn't fully inspect"), found.evidence
+        )
+    }
+
+    func testPkgIpaFloorAndADMGNamedDirectoryIsNotAFileValuable()
+        async throws
+    {
+        let target = try makeProject(
+            at: dev.appendingPathComponent("proj"),
+            marker: "Cargo.toml", artifact: "target"
+        )
+        try writeBulkFile(
+            target.appendingPathComponent("release/Installer.pkg"),
+            bytes: aboveFloorBytes
+        )
+        try writeBulkFile(
+            target.appendingPathComponent("release/App.ipa"),
+            bytes: aboveFloorBytes
+        )
+        // Case-insensitive extension compare.
+        try writeBulkFile(
+            target.appendingPathComponent("release/Legacy.DMG"),
+            bytes: aboveFloorBytes
+        )
+        try writeBulkFile(
+            target.appendingPathComponent("release/Fragment.pkg"),
+            bytes: subFloorBytes
+        )
+        // A DIRECTORY named `notes.dmg` is not a file valuable, and `dmg` is
+        // no bundle extension — it is an ordinary directory, walked normally.
+        try writeBulkFile(
+            target.appendingPathComponent("release/notes.dmg/inner.bin"),
+            bytes: aboveFloorBytes
+        )
+
+        let outcome = try await runScan(makeScanner())
+        let disclosure = try XCTUnwrap(
+            try XCTUnwrap(item(outcome, at: target)).valuablesDisclosure
+        )
+        XCTAssertTrue(disclosure.probeComplete,
+                      "the dmg-NAMED directory was walked, not truncated")
+        XCTAssertEqual(
+            disclosure.valuables.map(\.name).sorted(),
+            ["App.ipa", "Installer.pkg", "Legacy.DMG"],
+            "sub-floor fragments and the dmg-named directory never qualify"
+        )
+    }
+
+    func testDatabaseAndArchiveExtensionsAreNeverFlagged() async throws {
+        // The research's FALSE-POSITIVE MAGNETS — the table proof first, so
+        // no future edit can enrol them without failing here.
+        XCTAssertTrue(
+            ValuablesDetector.fileExtensions.isDisjoint(
+                with: ValuablesDetector.deliberatelyNotFlaggedExtensions
+            )
+        )
+        XCTAssertTrue(
+            ValuablesDetector.bundleExtensions.isDisjoint(
+                with: ValuablesDetector.deliberatelyNotFlaggedExtensions
+            )
+        )
+
+        let target = try makeProject(
+            at: dev.appendingPathComponent("proj"),
+            marker: "Cargo.toml", artifact: "target"
+        )
+        for name in ["cache.db", "index.sqlite", "bundle.zip"] {
+            try writeBulkFile(
+                target.appendingPathComponent("release/\(name)"),
+                bytes: aboveFloorBytes
+            )
+        }
+
+        let outcome = try await runScan(makeScanner())
+        let found = try XCTUnwrap(item(outcome, at: target))
+        let disclosure = try XCTUnwrap(found.valuablesDisclosure)
+        XCTAssertEqual(disclosure.valuables, [],
+                       "\(disclosure.valuables.map(\.name))")
+        XCTAssertTrue(disclosure.probeComplete)
+        XCTAssertEqual(found.risk, .safe, "nothing forced anything")
+    }
+
+    func testCleanArtifactDirKeepsItsRuleRowRiskSelectionAndEvidence()
+        async throws
+    {
+        let target = try makeProject(
+            at: dev.appendingPathComponent("proj"),
+            marker: "Cargo.toml", artifact: "target"
+        )
+
+        let outcome = try await runScan(makeScanner())
+        let found = try XCTUnwrap(item(outcome, at: target))
+
+        XCTAssertEqual(found.risk, BuildArtifactRules.v1[0].risk)
+        XCTAssertEqual(found.defaultSelected,
+                       BuildArtifactRules.v1[0].defaultSelected)
+        XCTAssertEqual(found.automaticCleanEligible,
+                       BuildArtifactRules.v1[0].automaticCleanEligible)
+        XCTAssertEqual(found.evidence,
+                       "target/ beside Cargo.toml; last build today",
+                       "a clean probe appends NOTHING")
+        let disclosure = try XCTUnwrap(
+            found.valuablesDisclosure,
+            "a clean probe still discloses structurally: probed, found "
+                + "nothing, finished"
+        )
+        XCTAssertEqual(disclosure, .clean)
+        XCTAssertNil(disclosure.acknowledgementToken(for: found.key),
+                     "there is no empty-set token, anywhere")
+    }
+
+    func testIncompleteProbeFromEntryCapAndFromAnUnreadableSubtree()
+        async throws
+    {
+        // (a) ENTRY CAP — a budget of one entry cannot exhaust the tree.
+        let capped = try makeProject(
+            at: dev.appendingPathComponent("capped"),
+            marker: "Cargo.toml", artifact: "target"
+        )
+        try writeBulkFile(
+            capped.appendingPathComponent("a/b.bin"), bytes: subFloorBytes
+        )
+        let cappedOutcome = try await runScan(
+            makeScanner(roots: [dev], valuablesProbeEntryLimit: 1)
+        )
+        let cappedItem = try XCTUnwrap(item(cappedOutcome, at: capped))
+        let cappedDisclosure = try XCTUnwrap(cappedItem.valuablesDisclosure)
+        XCTAssertFalse(cappedDisclosure.probeComplete)
+        XCTAssertEqual(cappedItem.risk, .review, "fail-closed forcing")
+        XCTAssertFalse(cappedItem.defaultSelected)
+        XCTAssertEqual(
+            cappedItem.evidence,
+            "target/ beside Cargo.toml; last build today — WARNING: couldn't "
+                + "fully inspect this directory for release artifacts — "
+                + "verify before deleting"
+        )
+        XCTAssertNil(cappedDisclosure.acknowledgementToken(for: cappedItem.key),
+                     "an INCOMPLETE probe is unauthorizable and TOKENLESS")
+
+        // (b) UNREADABLE SUBTREE — chmod 000 (EACCES; EPERM needs injection).
+        try XCTSkipIf(geteuid() == 0, "root ignores permission bits")
+        let target = try makeProject(
+            at: dev.appendingPathComponent("locked"),
+            marker: "Cargo.toml", artifact: "target"
+        )
+        let locked = target.appendingPathComponent("locked-branch")
+        try mkdir(locked)
+        try chmod000(locked)
+
+        let outcome = try await runScan(makeScanner(roots: [
+            dev.appendingPathComponent("locked")
+        ]))
+        let found = try XCTUnwrap(item(outcome, at: target))
+        let disclosure = try XCTUnwrap(found.valuablesDisclosure)
+        XCTAssertFalse(disclosure.probeComplete,
+                       "an unreadable branch leaves absence UNPROVEN")
+        XCTAssertEqual(found.risk, .review)
+        XCTAssertTrue(found.evidence.contains("couldn't fully inspect"),
+                      found.evidence)
+    }
+
+    func testProbeNeverFollowsSymlinksAndTouchesOnlyMatchedDirs()
+        async throws
+    {
+        let project = dev.appendingPathComponent("proj")
+        let target = try makeProject(
+            at: project, marker: "Cargo.toml", artifact: "target"
+        )
+        // OUTSIDE the artifact dir: beside the marker, in the project root.
+        try writeBulkFile(
+            project.appendingPathComponent("Shipped.dmg"),
+            bytes: aboveFloorBytes
+        )
+        // Out-of-tree content reachable only through symlinks INSIDE it.
+        let outside = base.appendingPathComponent("outside")
+        let outsideDMG = try writeBulkFile(
+            outside.appendingPathComponent("Outside.dmg"),
+            bytes: aboveFloorBytes
+        )
+        try fm.createSymbolicLink(
+            at: target.appendingPathComponent("linked.dmg"),
+            withDestinationURL: outsideDMG
+        )
+        try fm.createSymbolicLink(
+            at: target.appendingPathComponent("linked-dir"),
+            withDestinationURL: outside
+        )
+
+        let outcome = try await runScan(makeScanner())
+        let found = try XCTUnwrap(item(outcome, at: target))
+        let disclosure = try XCTUnwrap(found.valuablesDisclosure)
+
+        XCTAssertEqual(disclosure.valuables, [],
+                       "symlinks are never followed and never valuables; the "
+                        + "probe never leaves the matched artifact dir")
+        XCTAssertTrue(disclosure.probeComplete,
+                      "an unexpanded symlink does not make a probe incomplete "
+                        + "— deleting the artifact dir removes the LINK")
+        XCTAssertEqual(found.risk, .safe)
+    }
+
+    // MARK: R3 — the ONE canonical order
+
+    func testOneCanonicalValuablesOrderSharedByEvidenceModelAndJSON()
+        async throws
+    {
+        let target = try makeProject(
+            at: dev.appendingPathComponent("proj"),
+            marker: "Cargo.toml", artifact: "target"
+        )
+        // Discovery order (depth-first over byte-wise-sorted children) is
+        // deliberately NOT the canonical path order.
+        let zeta = try writeBulkFile(
+            target.appendingPathComponent("release/zeta.dmg"),
+            bytes: aboveFloorBytes
+        )
+        let beta = try writeBulkFile(
+            target.appendingPathComponent("alpha/beta.pkg"),
+            bytes: aboveFloorBytes
+        )
+        let middle = try writeBulkFile(
+            target.appendingPathComponent("middle.ipa"),
+            bytes: aboveFloorBytes
+        )
+
+        let outcome = try await runScan(makeScanner())
+        let found = try XCTUnwrap(item(outcome, at: target))
+        let disclosure = try XCTUnwrap(found.valuablesDisclosure)
+
+        // Byte-wise ascending by CANONICAL IDENTITY PATH, computed here.
+        let expected = [beta, middle, zeta]
+            .map { identityPath(of: $0) }
+            .sorted { $0.utf8.lexicographicallyPrecedes($1.utf8) }
+        XCTAssertEqual(disclosure.valuables.map(\.canonicalIdentityPath),
+                       expected)
+
+        // The STORED order is what evidence, the model, and JSON present —
+        // three surfaces, one sort, applied once at detection.
+        let names = disclosure.valuables.map(\.name)
+        var cursor = found.evidence.startIndex
+        for name in names {
+            let range = try XCTUnwrap(
+                found.evidence.range(of: name, range: cursor..<found.evidence.endIndex),
+                "evidence lists \(name) in canonical order: \(found.evidence)"
+            )
+            cursor = range.upperBound
+        }
+        let row = CLIHandler.scannerItemRowJSON(for: found)
+        let rows = try XCTUnwrap(row["valuables"] as? [[String: Any]])
+        XCTAssertEqual(rows.compactMap { $0["path"] as? String }, expected,
+                       "the wire array is the stored order — no re-sort")
+    }
+
+    // MARK: R17 — alias-root coherence
+
+    func testAliasRootSpellingYieldsIdenticalOrderingAndIdenticalTokens()
+        async throws
+    {
+        let real = base.appendingPathComponent("real")
+        let projects = real.appendingPathComponent("projects")
+        let target = try makeProject(
+            at: projects.appendingPathComponent("proj"),
+            marker: "Cargo.toml", artifact: "target"
+        )
+        for name in ["release/One.dmg", "release/Two.pkg"] {
+            try writeBulkFile(
+                target.appendingPathComponent(name), bytes: aboveFloorBytes
+            )
+        }
+        let link = base.appendingPathComponent("link")
+        try fm.createSymbolicLink(at: link, withDestinationURL: real)
+        let aliasRoot = link.appendingPathComponent("projects")
+
+        let canonicalScan = try await runScan(makeScanner(roots: [projects]))
+        let aliasScan = try await runScan(makeScanner(roots: [aliasRoot]))
+        let canonicalItem = try XCTUnwrap(canonicalScan.items.first)
+        let aliasItem = try XCTUnwrap(aliasScan.items.first)
+
+        let canonical = try XCTUnwrap(canonicalItem.valuablesDisclosure)
+        let alias = try XCTUnwrap(aliasItem.valuablesDisclosure)
+        XCTAssertEqual(canonical.valuables.map(\.canonicalIdentityPath),
+                       alias.valuables.map(\.canonicalIdentityPath),
+                       "one identity path per valuable, whatever the spelling")
+        XCTAssertEqual(canonicalItem.id, aliasItem.id,
+                       "the ItemKey is spelling-independent too")
+        XCTAssertEqual(canonical.acknowledgementToken(for: canonicalItem.key),
+                       alias.acknowledgementToken(for: aliasItem.key))
+        XCTAssertNotNil(canonical.acknowledgementToken(for: canonicalItem.key))
+
+        // The alias spelling reaches the SHEET but never the wire.
+        XCTAssertTrue(
+            alias.valuables.allSatisfy {
+                $0.displayURL.path.hasPrefix(aliasRoot.path)
+            },
+            "displayURL keeps the unresolved discovery spelling: "
+                + "\(alias.valuables.map(\.displayURL.path)) under "
+                + "\(aliasRoot.path)"
+        )
+        let rows = try XCTUnwrap(
+            CLIHandler.scannerItemRowJSON(for: aliasItem)["valuables"]
+                as? [[String: Any]]
+        )
+        for row in rows {
+            let path = try XCTUnwrap(row["path"] as? String)
+            XCTAssertFalse(path.hasPrefix(link.path),
+                           "the wire path is the CANONICAL identity path")
+        }
+    }
+
+    // MARK: R17 — disclosure is structural, and is never consent
+
+    func testDisclosureIsStructuralAndCarriesCompletenessNotProse()
+        async throws
+    {
+        let target = try makeProject(
+            at: dev.appendingPathComponent("proj"),
+            marker: "Cargo.toml", artifact: "target"
+        )
+        let dmg = try writeBulkFile(
+            target.appendingPathComponent("release/App.dmg"),
+            bytes: aboveFloorBytes
+        )
+
+        let outcome = try await runScan(makeScanner())
+        let found = try XCTUnwrap(item(outcome, at: target))
+        let disclosure = try XCTUnwrap(found.valuablesDisclosure)
+
+        // (a) COMPLETENESS and (b) the DISCLOSED identity set, both read
+        // STRUCTURALLY — never parsed out of the evidence sentence.
+        XCTAssertTrue(disclosure.probeComplete)
+        XCTAssertEqual(Set(disclosure.valuables.map(\.canonicalIdentityPath)),
+                       [identityPath(of: dmg)])
+
+        // DISCLOSURE IS NEVER CONSENT: the structural set is what the item
+        // SHOWS. The token exists as a derivable value, but nothing on the
+        // item marks it authorized — authorization lives only in the
+        // per-clean [ItemKey: acknowledgement] context (fn-4.6/4.8/4.9).
+        let token = try XCTUnwrap(disclosure.acknowledgementToken(for: found.key))
+        XCTAssertFalse(found.evidence.contains(token),
+                       "the token is never smuggled into human evidence")
+        XCTAssertTrue(found.requiresPreDeleteRevalidation,
+                      "a disclosed item still demands re-inspection — the "
+                        + "scan-time set authorizes nothing")
+    }
+
+    // MARK: R17 — acknowledgement-token derivation (pure)
+
+    /// Hand-built valuables: the token derivation is pure math over the
+    /// `ValuableIdentity` integers, provable without any filesystem.
+    private func fixtureValuable(
+        path: String,
+        allocatedBytes: Int64 = 6_000_000,
+        device: UInt64 = 16_777_232,
+        inode: UInt64 = 12_345_678,
+        seconds: Int64 = 1_755_057_600,
+        nanoseconds: Int64 = 123_456_789
+    ) -> DetectedValuable {
+        DetectedValuable(
+            name: (path as NSString).lastPathComponent,
+            displayURL: URL(fileURLWithPath: "/display" + path),
+            canonicalIdentityPath: path,
+            identity: ValuableIdentity(
+                allocatedBytes: allocatedBytes, device: device, inode: inode,
+                modifiedSeconds: seconds, modifiedNanoseconds: nanoseconds
+            )
+        )
+    }
+
+    private func token(
+        _ valuables: [DetectedValuable],
+        scannerID: String = BuildArtifactsScanner.registeredID,
+        itemID: String = "item-a",
+        complete: Bool = true
+    ) -> String? {
+        ValuablesDisclosure.acknowledgementToken(
+            scannerID: scannerID, itemID: itemID,
+            valuables: valuables, probeComplete: complete
+        )
+    }
+
+    func testAcknowledgementTokenMatchesThePinnedPreimageAndIsDeterministic()
+        throws
+    {
+        let valuables = [
+            fixtureValuable(path: "/dev/proj/target/a.dmg"),
+            fixtureValuable(
+                path: "/dev/proj/target/b.app", allocatedBytes: 9_000_000,
+                device: 16_777_233, inode: 99, seconds: 42, nanoseconds: 7
+            ),
+        ]
+        // The preimage, spelled out INDEPENDENTLY here.
+        var preimage = "build_artifacts\u{0}item-a\u{0}"
+        preimage += "/dev/proj/target/a.dmg\u{0}6000000\u{0}16777232\u{0}"
+            + "12345678\u{0}1755057600\u{0}123456789\u{0}"
+        preimage += "/dev/proj/target/b.app\u{0}9000000\u{0}16777233\u{0}"
+            + "99\u{0}42\u{0}7\u{0}"
+        let expected = SHA256.hash(data: Data(preimage.utf8))
+            .map { String(format: "%02x", $0) }.joined()
+
+        XCTAssertEqual(token(valuables), expected)
+        XCTAssertEqual(expected.count, 64, "full hash, never truncated")
+        XCTAssertEqual(expected, expected.lowercased())
+        XCTAssertEqual(token(valuables), token(valuables),
+                       "deterministic across runs")
+    }
+
+    func testTokenRotatesOnEveryPinnedInvalidationAndIsItemBound() throws {
+        let base = [fixtureValuable(path: "/a/x.dmg")]
+        let baseline = try XCTUnwrap(token(base))
+
+        // MEMBERSHIP: added, removed.
+        XCTAssertNotEqual(
+            token(base + [fixtureValuable(path: "/a/y.pkg")]), baseline
+        )
+        XCTAssertNil(token([]), "no empty-set token exists ANYWHERE")
+
+        // SIZE, IDENTITY (in-place replacement), MTIME — each alone rotates.
+        XCTAssertNotEqual(
+            token([fixtureValuable(path: "/a/x.dmg", allocatedBytes: 6_000_001)]),
+            baseline, "a resized valuable rotates the token"
+        )
+        XCTAssertNotEqual(
+            token([fixtureValuable(path: "/a/x.dmg", inode: 12_345_679)]),
+            baseline,
+            "IN-PLACE REPLACEMENT: same path + size, new inode"
+        )
+        XCTAssertNotEqual(
+            token([fixtureValuable(path: "/a/x.dmg", device: 16_777_233)]),
+            baseline
+        )
+        XCTAssertNotEqual(
+            token([fixtureValuable(path: "/a/x.dmg", seconds: 1_755_057_601)]),
+            baseline, "a touched valuable rotates the token"
+        )
+        XCTAssertNotEqual(
+            token([fixtureValuable(path: "/a/x.dmg", nanoseconds: 123_456_790)]),
+            baseline, "nanosecond precision is IN the preimage"
+        )
+        XCTAssertNotEqual(token([fixtureValuable(path: "/a/z.dmg")]), baseline,
+                          "a moved valuable rotates the token")
+
+        // ITEM-BOUND: the preimage begins with the FULL ItemKey.
+        XCTAssertNotEqual(token(base, itemID: "item-b"), baseline,
+                          "two items with identical valuables differ")
+        XCTAssertNotEqual(token(base, scannerID: "other_scanner"), baseline,
+                          "the SAME item id under another scanner differs")
+
+        // The uniform R17 rule: an incomplete probe is TOKENLESS.
+        XCTAssertNil(token(base, complete: false))
+        XCTAssertNil(token([], complete: false))
+    }
+
+    // MARK: R17 — all-integer identity, split sourcing, round trips
+
+    func testIdentityIsAllIntegerAndRoundTripsAcrossJSONTokenAndRecompute()
+        async throws
+    {
+        let target = try makeProject(
+            at: dev.appendingPathComponent("proj"),
+            marker: "Cargo.toml", artifact: "target"
+        )
+        let dmg = try writeBulkFile(
+            target.appendingPathComponent("release/App.dmg"),
+            bytes: aboveFloorBytes
+        )
+
+        let outcome = try await runScan(makeScanner())
+        let found = try XCTUnwrap(item(outcome, at: target))
+        let disclosure = try XCTUnwrap(found.valuablesDisclosure)
+        let valuable = try XCTUnwrap(disclosure.valuables.first)
+        let identity = valuable.identity
+
+        // ALL-INTEGER, proven structurally (no Date can hide in there).
+        for child in Mirror(reflecting: identity).children {
+            let type = String(describing: Swift.type(of: child.value))
+            XCTAssertTrue(["Int64", "UInt64"].contains(type),
+                          "ValuableIdentity.\(child.label ?? "?") is \(type)")
+        }
+
+        // The integers ARE the raw lstat's.
+        let st = try rawStat(dmg)
+        XCTAssertEqual(identity.device, UInt64(bitPattern: Int64(st.st_dev)))
+        XCTAssertEqual(identity.inode, UInt64(st.st_ino))
+        XCTAssertEqual(identity.modifiedSeconds, Int64(st.st_mtimespec.tv_sec))
+        XCTAssertEqual(identity.modifiedNanoseconds,
+                       Int64(st.st_mtimespec.tv_nsec))
+        XCTAssertEqual(identity.allocatedBytes,
+                       Int64(st.st_blocks) * 512)
+
+        // (1) SCAN JSON carries the same integers, verbatim.
+        let rows = try XCTUnwrap(
+            CLIHandler.scannerItemRowJSON(for: found)["valuables"]
+                as? [[String: Any]]
+        )
+        let row = try XCTUnwrap(rows.first)
+        XCTAssertEqual(row["device"] as? UInt64, identity.device)
+        XCTAssertEqual(row["inode"] as? UInt64, identity.inode)
+        XCTAssertEqual(row["allocated_bytes"] as? Int64,
+                       identity.allocatedBytes)
+        XCTAssertEqual(
+            row["modified_at_ns"] as? Int64,
+            identity.modifiedSeconds * 1_000_000_000
+                + identity.modifiedNanoseconds
+        )
+
+        // (2) DELETE-TIME RECOMPUTATION reproduces the identical disclosure …
+        let recomputed = BuildArtifactsScanner.preDeleteValuablesProbe(
+            at: target, provider: FileSystemIdentityProvider()
+        )
+        XCTAssertEqual(recomputed, disclosure,
+                       "the same core over the same tree — bit for bit")
+
+        // (3) … and therefore the identical token.
+        XCTAssertEqual(recomputed.acknowledgementToken(for: found.key),
+                       disclosure.acknowledgementToken(for: found.key))
+        XCTAssertNotNil(recomputed.acknowledgementToken(for: found.key))
+    }
+
+    func testNoDateTypeExistsAnywhereInTheValuablesIdentityPath() throws {
+        // Grep-proof over the identity path's own file: display dates DERIVE
+        // from the integers (fn-4.6) — a `Date` in here would reintroduce the
+        // precision drift the all-integer model exists to prevent. Comment
+        // lines are stripped: the doc comments discuss `Date` on purpose.
+        let source = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()   // CacheoutTests
+            .deletingLastPathComponent()   // Tests
+            .deletingLastPathComponent()   // repo root
+            .appendingPathComponent("Sources/Cacheout/Scanner/ValuablesDetector.swift")
+        let code = try String(contentsOf: source, encoding: .utf8)
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .filter { !$0.trimmingCharacters(in: .whitespaces).hasPrefix("//") }
+            .joined(separator: "\n")
+        XCTAssertGreaterThan(code.count, 1_000, "the gate read real code")
+        XCTAssertFalse(code.contains("Date"),
+                       "no Date type in the valuables identity path")
+    }
+
+    // MARK: R17 — one probe core, one set of caps
+
+    func testScanTimeAndPreDeleteProbeShareOneCoreAndTheSameCaps()
+        async throws
+    {
+        // The caps are SHARED by construction: the scanner's init defaults
+        // and the delete-time entry point both read the detector constants.
+        // Proven behaviorally at the exact boundary — a directory chain one
+        // level shallower than the production depth cap completes on BOTH
+        // surfaces; one level deeper truncates on BOTH.
+        func chain(_ depth: Int) -> String {
+            (1...depth).map { "d\($0)" }.joined(separator: "/")
+        }
+        let limit = ValuablesDetector.defaultProbeDepthLimit
+
+        let reachable = try makeProject(
+            at: dev.appendingPathComponent("reachable"),
+            marker: "Cargo.toml", artifact: "target", payloadBytes: nil
+        )
+        try writeBulkFile(
+            reachable.appendingPathComponent("\(chain(limit - 1))/Deep.dmg"),
+            bytes: aboveFloorBytes
+        )
+        let beyond = try makeProject(
+            at: dev.appendingPathComponent("beyond"),
+            marker: "Cargo.toml", artifact: "target", payloadBytes: nil
+        )
+        try writeBulkFile(
+            beyond.appendingPathComponent("\(chain(limit))/Deep.dmg"),
+            bytes: aboveFloorBytes
+        )
+
+        let outcome = try await runScan(makeScanner())
+        let provider = FileSystemIdentityProvider()
+
+        let reachableScan = try XCTUnwrap(
+            item(outcome, at: reachable)?.valuablesDisclosure
+        )
+        let reachableDelete = BuildArtifactsScanner.preDeleteValuablesProbe(
+            at: reachable, provider: provider
+        )
+        XCTAssertTrue(reachableScan.probeComplete)
+        XCTAssertEqual(reachableScan.valuables.map(\.name), ["Deep.dmg"])
+        XCTAssertEqual(reachableScan, reachableDelete,
+                       "scan time and delete time see the SAME thing")
+
+        let beyondScan = try XCTUnwrap(
+            item(outcome, at: beyond)?.valuablesDisclosure
+        )
+        let beyondDelete = BuildArtifactsScanner.preDeleteValuablesProbe(
+            at: beyond, provider: provider
+        )
+        XCTAssertFalse(beyondScan.probeComplete,
+                       "the depth cap truncates at scan time")
+        XCTAssertFalse(beyondDelete.probeComplete,
+                       "and at delete time — the bounds cannot drift")
+        XCTAssertEqual(beyondScan, beyondDelete)
+    }
+
+    func testPreDeleteProbeKindGatingFailsClosedOnlyWhereItMust() throws {
+        let provider = FileSystemIdentityProvider()
+        // Absent: the deletion path owns its own ENOENT.
+        XCTAssertEqual(
+            BuildArtifactsScanner.preDeleteValuablesProbe(
+                at: dev.appendingPathComponent("nope"), provider: provider
+            ),
+            .clean
+        )
+        // A non-directory leaf has no contents of its own.
+        let file = try writeFile(dev.appendingPathComponent("leaf.bin"))
+        XCTAssertEqual(
+            BuildArtifactsScanner.preDeleteValuablesProbe(
+                at: file, provider: provider
+            ),
+            .clean
+        )
+        // Unprobeable → INCOMPLETE (fail closed).
+        let failing = FailingProbeProvider()
+        let dir = dev.appendingPathComponent("dir")
+        try mkdir(dir)
+        failing.failingPaths = [dir.path]
+        let verdict = BuildArtifactsScanner.preDeleteValuablesProbe(
+            at: dir, provider: failing
+        )
+        XCTAssertFalse(verdict.probeComplete)
+        XCTAssertEqual(verdict.valuables, [])
+    }
+
+    // MARK: R13 — additive model fields + the value-domain family
+
+    func testAdditiveFieldsDefaultAbsentAndValidatorRejectsEachDomainCell()
+        async throws
+    {
+        let target = try makeProject(
+            at: dev.appendingPathComponent("proj"),
+            marker: "Cargo.toml", artifact: "target"
+        )
+        let scanner = makeScanner()
+        let outcome = try await runScan(scanner)
+        let found = try XCTUnwrap(item(outcome, at: target))
+
+        // Items WITHOUT the fields (every other scanner, by construction:
+        // the initializer defaults them) stay valid, unchanged.
+        let legacy = replacing(
+            found, disclosure: nil, requiresRevalidation: false
+        )
+        XCTAssertNil(legacy.valuablesDisclosure)
+        XCTAssertFalse(legacy.requiresPreDeleteRevalidation)
+        assertValidatorAccepts(legacy, scanner: scanner)
+
+        // One malformed cell per PINNED domain — checked-REJECT, never a
+        // saturated lie and never a trap after validation.
+        // `derivable` records whether `modified_at_ns` still exists for the
+        // cell: only the TIME-domain violations make it underivable, and the
+        // wire must never invent a number for those.
+        let cells: [(label: String, identity: ValuableIdentity, derivable: Bool)] = [
+            ("negative allocatedBytes", ValuableIdentity(
+                allocatedBytes: -1, device: 1, inode: 2,
+                modifiedSeconds: 0, modifiedNanoseconds: 0
+            ), true),
+            ("nanoseconds == 1e9", ValuableIdentity(
+                allocatedBytes: 1, device: 1, inode: 2,
+                modifiedSeconds: 0, modifiedNanoseconds: 1_000_000_000
+            ), false),
+            ("nanoseconds < 0", ValuableIdentity(
+                allocatedBytes: 1, device: 1, inode: 2,
+                modifiedSeconds: 0, modifiedNanoseconds: -1
+            ), false),
+            ("seconds overflow modified_at_ns", ValuableIdentity(
+                allocatedBytes: 1, device: 1, inode: 2,
+                modifiedSeconds: Int64.max / 1_000_000_000,
+                modifiedNanoseconds: 999_999_999
+            ), false),
+        ]
+        for (label, identity, derivable) in cells {
+            let malformed = replacing(found, disclosure: ValuablesDisclosure(
+                valuables: [DetectedValuable(
+                    name: "bad", displayURL: target,
+                    canonicalIdentityPath: identityPath(of: target),
+                    identity: identity
+                )],
+                probeComplete: true
+            ))
+            XCTAssertEqual(identity.modifiedAtNanoseconds != nil, derivable,
+                           "\(label): modified_at_ns is never invented")
+            assertValidatorRejects(malformed, scanner: scanner, label: label)
+        }
+
+        // The LAST representable instant stays valid — the check REJECTS,
+        // it never narrows the honest domain.
+        let maxSeconds = (Int64.max - 999_999_999) / 1_000_000_000
+        let ok = replacing(found, disclosure: ValuablesDisclosure(
+            valuables: [DetectedValuable(
+                name: "ok", displayURL: target,
+                canonicalIdentityPath: identityPath(of: target),
+                identity: ValuableIdentity(
+                    allocatedBytes: 0, device: 0, inode: 0,
+                    modifiedSeconds: maxSeconds,
+                    modifiedNanoseconds: 999_999_999
+                )
+            )],
+            probeComplete: true
+        ))
+        XCTAssertNotNil(
+            ValuableIdentity(
+                allocatedBytes: 0, device: 0, inode: 0,
+                modifiedSeconds: maxSeconds, modifiedNanoseconds: 999_999_999
+            ).modifiedAtNanoseconds
+        )
+        assertValidatorAccepts(ok, scanner: scanner)
+    }
+
+    func testRevalidationMarkerRidesEveryBuildArtifactItemAndNothingElse()
+        async throws
+    {
+        try XCTSkipIf(geteuid() == 0, "root ignores permission bits")
+        // A mixed fixture: a measured row, an empty row, and a DENIED row —
+        // all carry the probe, so all carry the marker.
+        let measured = try makeProject(
+            at: dev.appendingPathComponent("a"),
+            marker: "Cargo.toml", artifact: "target"
+        )
+        let empty = try makeProject(
+            at: dev.appendingPathComponent("b"),
+            marker: "package.json", artifact: "node_modules",
+            payloadBytes: nil
+        )
+        let denied = try makeProject(
+            at: dev.appendingPathComponent("c"),
+            marker: "Package.swift", artifact: ".build"
+        )
+        try chmod000(denied)
+
+        let outcome = try await runScan(makeScanner())
+        XCTAssertEqual(outcome.items.count, 3)
+        for url in [measured, empty, denied] {
+            let found = try XCTUnwrap(item(outcome, at: url))
+            XCTAssertTrue(found.requiresPreDeleteRevalidation,
+                          "\(url.lastPathComponent) must be re-inspected")
+            XCTAssertNotNil(found.valuablesDisclosure)
+        }
+        XCTAssertEqual(
+            try XCTUnwrap(item(outcome, at: denied)).state, .denied
+        )
+
+        // Existing scanners are UNAFFECTED: their emissions go through the
+        // same initializer WITHOUT the new arguments, which defaults the
+        // marker off. fn-4.8 migrates the orphaned-caches entries.
+        let untouched = replacing(
+            try XCTUnwrap(item(outcome, at: measured)),
+            disclosure: nil, requiresRevalidation: false
+        )
+        XCTAssertFalse(untouched.requiresPreDeleteRevalidation)
+    }
+
+    // MARK: R3 — scan JSON rows
+
+    func testScannerItemRowCarriesLogicalBytesAndValuablesElseOmitsThem()
+        async throws
+    {
+        // DIVERGENT (sparse) AND flagged — both additive fields at once.
+        let flagged = try makeProject(
+            at: dev.appendingPathComponent("flagged"),
+            marker: "Cargo.toml", artifact: "target"
+        )
+        let sparse = flagged.appendingPathComponent("sparse.bin")
+        fm.createFile(atPath: sparse.path, contents: nil)
+        let handle = try FileHandle(forWritingTo: sparse)
+        try handle.truncate(atOffset: 50_000_000)
+        try handle.close()
+        let dmg = try writeBulkFile(
+            flagged.appendingPathComponent("release/App.dmg"),
+            bytes: aboveFloorBytes
+        )
+        let plain = try makeProject(
+            at: dev.appendingPathComponent("plain"),
+            marker: "Cargo.toml", artifact: "target"
+        )
+
+        let outcome = try await runScan(makeScanner())
+        let flaggedItem = try XCTUnwrap(item(outcome, at: flagged))
+        let plainItem = try XCTUnwrap(item(outcome, at: plain))
+
+        let flaggedRow = CLIHandler.scannerItemRowJSON(for: flaggedItem)
+        XCTAssertEqual(flaggedRow["logical_bytes"] as? Int64,
+                       flaggedItem.logicalBytes)
+        let rows = try XCTUnwrap(flaggedRow["valuables"] as? [[String: Any]])
+        XCTAssertEqual(rows.count, 1)
+        // The ONE pinned SIX-FIELD element shape, exactly.
+        let st = try rawStat(dmg)
+        XCTAssertEqual(rows[0] as NSDictionary, [
+            "name": "App.dmg",
+            "path": identityPath(of: dmg),
+            "allocated_bytes": Int64(st.st_blocks) * 512,
+            "device": UInt64(bitPattern: Int64(st.st_dev)),
+            "inode": UInt64(st.st_ino),
+            "modified_at_ns": Int64(st.st_mtimespec.tv_sec) * 1_000_000_000
+                + Int64(st.st_mtimespec.tv_nsec),
+        ] as NSDictionary)
+        // …and it survives real JSON serialization (unsigned 64-bit ids).
+        XCTAssertTrue(JSONSerialization.isValidJSONObject(flaggedRow))
+        let encoded = try JSONSerialization.data(withJSONObject: flaggedRow)
+        let decoded = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: encoded) as? [String: Any]
+        )
+        XCTAssertNotNil(decoded["valuables"])
+
+        // ABSENT — not null — for a clean, non-divergent item.
+        let plainRow = CLIHandler.scannerItemRowJSON(for: plainItem)
+        XCTAssertNil(plainItem.logicalBytes)
+        XCTAssertFalse(plainRow.keys.contains("logical_bytes"))
+        XCTAssertFalse(plainRow.keys.contains("valuables"))
+        XCTAssertEqual(
+            try XCTUnwrap(plainItem.valuablesDisclosure), .clean,
+            "the item was probed and clean — the ROW just says nothing"
+        )
+    }
+
+    // MARK: - fn-4.4 validator helpers
+
+    /// Rebuild an emitted item with a different valuables field — the only
+    /// way to express a scanner MAPPING BUG (production sources reject
+    /// out-of-domain metadata at the `lstat`).
+    private func replacing(
+        _ item: ReclaimableItem,
+        disclosure: ValuablesDisclosure?,
+        requiresRevalidation: Bool = true
+    ) -> ReclaimableItem {
+        ReclaimableItem(
+            id: item.id, scannerID: item.scannerID,
+            displayName: item.displayName,
+            exactBytes: item.exactBytes,
+            estimatedUpToBytes: item.estimatedUpToBytes,
+            logicalBytes: item.logicalBytes, itemCount: item.itemCount,
+            url: item.url, declaredDisplayPath: item.declaredDisplayPath,
+            rootRecords: item.rootRecords, state: item.state,
+            scanError: item.scanError, risk: item.risk,
+            evidence: item.evidence, rebuildNote: item.rebuildNote,
+            action: item.action, admission: item.admission,
+            defaultSelected: item.defaultSelected,
+            automaticCleanEligible: item.automaticCleanEligible,
+            isStale: item.isStale,
+            valuablesDisclosure: disclosure,
+            requiresPreDeleteRevalidation: requiresRevalidation
+        )
+    }
+
+    private func validatorVerdict(
+        _ item: ReclaimableItem, scanner: BuildArtifactsScanner
+    ) throws -> ValidatedScannerEvent {
+        let runtime = try SpaceScannerRuntime(
+            scanners: [BuildArtifactsAdapterScanner(scanner: scanner)],
+            categories: [], home: fixtureHome,
+            provider: FileSystemIdentityProvider()
+        )
+        return runtime.validatedOutcome(
+            ScanOutcome(items: [item], errors: []),
+            from: BuildArtifactsScanner.registeredID
+        )
+    }
+
+    private func assertValidatorAccepts(
+        _ item: ReclaimableItem, scanner: BuildArtifactsScanner,
+        file: StaticString = #filePath, line: UInt = #line
+    ) {
+        guard let verdict = try? validatorVerdict(item, scanner: scanner)
+        else { return XCTFail("runtime construction failed", file: file, line: line) }
+        if case .malformed(_, let issue) = verdict {
+            XCTFail("unexpectedly malformed: \(issue.detail)",
+                    file: file, line: line)
+        }
+    }
+
+    private func assertValidatorRejects(
+        _ item: ReclaimableItem, scanner: BuildArtifactsScanner,
+        label: String,
+        file: StaticString = #filePath, line: UInt = #line
+    ) {
+        guard let verdict = try? validatorVerdict(item, scanner: scanner)
+        else { return XCTFail("runtime construction failed", file: file, line: line) }
+        guard case .malformed(_, let issue) = verdict else {
+            return XCTFail("\(label) must malform the outcome",
+                           file: file, line: line)
+        }
+        XCTAssertEqual(issue.kind, .malformedOutcome, file: file, line: line)
+        XCTAssertNil(issue.url, "the synthesized issue is path-less",
+                     file: file, line: line)
     }
 }
 

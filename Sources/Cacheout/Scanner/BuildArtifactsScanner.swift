@@ -113,6 +113,12 @@ struct BuildArtifactsScanner: @unchecked Sendable {
     private let pathGuard: PathGuard
     private let sizer: DirectorySizer
     private let maxDepth: Int
+    /// Valuables-probe caps (fn-4.4) — injectable so tests can prove the
+    /// fail-closed cap behavior without thousand-file fixtures. The DEFAULTS
+    /// are the shared production constants the delete-time entry point uses,
+    /// so scan-time and delete-time bounds cannot drift.
+    private let valuablesProbeDepthLimit: Int
+    private let valuablesProbeEntryLimit: Int
     /// Injected clock for staleness — a PROVIDER (not a `Date`) because the
     /// scanner is long-lived and each scan dates content against its own
     /// "now" (the `OrphanedCachesScanner` precedent).
@@ -123,6 +129,10 @@ struct BuildArtifactsScanner: @unchecked Sendable {
         devRoots: DevRootsResolution,
         provider: FileSystemIdentityProvider = FileSystemIdentityProvider(),
         maxDepth: Int = ProjectTreeWalker.defaultMaxDepth,
+        valuablesProbeDepthLimit: Int =
+            ValuablesDetector.defaultProbeDepthLimit,
+        valuablesProbeEntryLimit: Int =
+            ValuablesDetector.defaultProbeEntryLimit,
         now: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.home = home
@@ -133,6 +143,8 @@ struct BuildArtifactsScanner: @unchecked Sendable {
         )
         self.sizer = DirectorySizer(provider: provider)
         self.maxDepth = maxDepth
+        self.valuablesProbeDepthLimit = valuablesProbeDepthLimit
+        self.valuablesProbeEntryLimit = valuablesProbeEntryLimit
         self.now = now
     }
 
@@ -379,6 +391,14 @@ struct BuildArtifactsScanner: @unchecked Sendable {
     /// honestly-`.measured` record — its denials sit INSIDE the tree;
     /// `.refusedAdmission` is for refused SEARCH ROOTS, which never yield
     /// candidates).
+    ///
+    /// ## The valuables gate (fn-4.4, R3/R17)
+    /// EVERY item runs the bounded no-follow probe and carries its disclosure
+    /// plus the `requiresPreDeleteRevalidation` marker — uniformly, including
+    /// denied ones (a denied item is refused later for other reasons; the
+    /// marker's meaning is "this item must be re-inspected", not "this item is
+    /// deletable"). Any hit OR an incomplete probe forces the item off safe,
+    /// forces selection false, and appends the warning evidence.
     private func reclaimableItem(
         from candidate: BuildArtifactCandidate, report: SizeReport
     ) -> (item: ReclaimableItem, identityPath: String) {
@@ -422,6 +442,16 @@ struct BuildArtifactsScanner: @unchecked Sendable {
             status: state == .denied ? .deniedUnmeasured : .measured
         )
 
+        // THE VALUABLES GATE. The bounded no-follow probe runs on the matched
+        // artifact dir ONLY — never a general sweep — and its result decides
+        // the forcing below. Sorted into the ONE canonical order inside the
+        // probe, so nothing here (or downstream) re-sorts.
+        let disclosure = ValuablesDetector.probe(
+            at: candidate.artifactDirectory, provider: provider,
+            depthLimit: valuablesProbeDepthLimit,
+            entryLimit: valuablesProbeEntryLimit
+        )
+
         let days = daysSinceNewestContent(report.newestContentDate)
         let item = ReclaimableItem(
             id: ReclaimableItem.stableID(
@@ -446,9 +476,14 @@ struct BuildArtifactsScanner: @unchecked Sendable {
             state: state,
             scanError: scanError,
             // The selection TRIPLE, read off the matched rule row — policy
-            // is data (D3/R15), never re-derived here.
-            risk: candidate.rule.risk,
-            evidence: Self.evidence(for: candidate, days: days),
+            // is data (D3/R15), never re-derived here — then NARROWED (never
+            // widened) by the valuables gate.
+            risk: Self.forcedRisk(
+                candidate.rule.risk, disclosure: disclosure
+            ),
+            evidence: Self.evidence(
+                for: candidate, days: days, disclosure: disclosure
+            ),
             rebuildNote: nil,
             // The artifact dir ITSELF is deleted (fn-4.5 wires the deletion
             // path); a target missing at clean time surfaces as the
@@ -462,13 +497,71 @@ struct BuildArtifactsScanner: @unchecked Sendable {
                 // The UNRESOLVED artifact spelling — leaf never resolved.
                 requestedTargetURL: candidate.artifactDirectory
             ),
-            defaultSelected: candidate.rule.defaultSelected,
+            // Belt and braces (R3): v1's rows are all `false` already, so
+            // this AND is a no-op TODAY — and load-bearing the day a row is
+            // promoted. A valuable-bearing or un-inspectable item must never
+            // arrive pre-selected.
+            defaultSelected: candidate.rule.defaultSelected
+                && !disclosure.forcesReview,
             automaticCleanEligible: candidate.rule.automaticCleanEligible,
             // Staleness is UNKNOWABLE when the walk dated no content (an
             // empty or wholly-denied tree) — nil, never a false "fresh".
-            isStale: days.map { NodeModulesItem.isStale(daysSinceModified: $0) }
+            isStale: days.map { NodeModulesItem.isStale(daysSinceModified: $0) },
+            // Structural DISCLOSURE (never consent) + the scanner-agnostic
+            // revalidation marker: EVERY build-artifact item carries the
+            // probe, so every one is marked (R17/D8).
+            valuablesDisclosure: disclosure,
+            requiresPreDeleteRevalidation: true
         )
         return (item, identity.path)
+    }
+
+    // MARK: - Valuables gate (fn-4.4, R3/R17)
+
+    /// DELETE-TIME REVALIDATION entry point (fn-4.8 wires it into the
+    /// cleaner's chokepoint seam), following the
+    /// `OrphanedCachesScanner.preDeleteUserDataProbe` precedent (`:571`)
+    /// exactly: the SAME bounded core with the PRODUCTION caps, so scan-time
+    /// and delete-time inspection bounds cannot drift. Reports the CURRENT
+    /// probe's valuables (canonical order) + completeness — fn-4.8 compares
+    /// that against the item's authorization entry and refuses fail-closed.
+    ///
+    /// Scan-time inspection alone is not enough: `ContainerSnapshot` binds the
+    /// dev ROOT's identity, not the artifact dir's contents, so a DMG can
+    /// appear after the scan (or mid-build).
+    ///
+    /// Kind gating mirrors the scan path and fn-3's precedent:
+    /// - real directory → the bounded no-follow probe;
+    /// - symlink / regular file / special → no contents of their own; the
+    ///   deletion removes the leaf as-is, never a target's tree;
+    /// - absent → nothing to disclose (the deletion path surfaces its own
+    ///   ENOENT — the probe must not preempt it);
+    /// - unprobeable → fail closed (incomplete ⇒ unauthorizable, tokenless).
+    static func preDeleteValuablesProbe(
+        at target: URL, provider: FileSystemIdentityProvider
+    ) -> ValuablesDisclosure {
+        switch provider.probeKind(of: target) {
+        case .kind(.directory):
+            return ValuablesDetector.probe(at: target, provider: provider)
+        case .kind:
+            return .clean
+        case .absent:
+            return .clean
+        case .failed:
+            return .incomplete
+        }
+    }
+
+    /// The forcing rule: a valuable hit OR an incomplete probe pushes a rule
+    /// row OFF safe. Already-review (and caution) rows stay where they are —
+    /// the gate NARROWS, never widens.
+    static func forcedRisk(
+        _ ruleRisk: RiskLevel, disclosure: ValuablesDisclosure
+    ) -> RiskLevel {
+        guard disclosure.forcesReview, ruleRisk == .safe else {
+            return ruleRisk
+        }
+        return .review
     }
 
     /// The as-built `NodeModulesScanner` logical-bytes predicate, MATCHED
@@ -538,8 +631,20 @@ struct BuildArtifactsScanner: @unchecked Sendable {
     /// (`env/ containing pyvenv.cfg`). Age variants are total: unknown dates
     /// say so rather than implying freshness, and a same-day or
     /// future-dated tree reads "today" rather than a negative age.
+    ///
+    /// The valuables gate APPENDS to that base (fn-4.4), in the pinned epic
+    /// format and the ONE canonical order — never re-sorted here, never
+    /// re-derived from prose downstream:
+    ///
+    ///     … — WARNING: contains Murmur_0.1.7_aarch64.dmg (42 MB) — verify
+    ///     before deleting
+    ///
+    /// An INCOMPLETE probe carries the same weight as a hit and says so; when
+    /// both apply, both clauses ride the one warning.
     static func evidence(
-        for candidate: BuildArtifactCandidate, days: Int?
+        for candidate: BuildArtifactCandidate,
+        days: Int?,
+        disclosure: ValuablesDisclosure = .clean
     ) -> String {
         let name = candidate.artifactDirectory.lastPathComponent
         let relation: String
@@ -547,8 +652,29 @@ struct BuildArtifactsScanner: @unchecked Sendable {
         case .markerSibling: relation = "beside"
         case .markerInside: relation = "containing"
         }
-        return "\(name)/ \(relation) \(candidate.marker); "
+        let base = "\(name)/ \(relation) \(candidate.marker); "
             + lastBuildPhrase(days: days)
+        guard let warning = valuablesWarning(disclosure) else { return base }
+        return base + " — " + warning
+    }
+
+    /// The warning clause set, or nil when the probe finished clean.
+    static func valuablesWarning(_ disclosure: ValuablesDisclosure) -> String? {
+        guard disclosure.forcesReview else { return nil }
+        var clauses: [String] = []
+        if !disclosure.valuables.isEmpty {
+            let named = disclosure.valuables.map { valuable in
+                "\(valuable.name) (\(ByteCountFormatter.sharedFile.string(fromByteCount: valuable.identity.allocatedBytes)))"
+            }
+            clauses.append("contains " + named.joined(separator: ", "))
+        }
+        if !disclosure.probeComplete {
+            clauses.append(
+                "couldn't fully inspect this directory for release artifacts"
+            )
+        }
+        return "WARNING: " + clauses.joined(separator: "; ")
+            + " — verify before deleting"
     }
 
     private static func lastBuildPhrase(days: Int?) -> String {

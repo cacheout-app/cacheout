@@ -70,6 +70,58 @@ class FileSystemIdentityProvider {
         identity(of: url)?.device
     }
 
+    /// The ALL-INTEGER no-follow metadata ONE `lstat(2)` yields (fn-4.4,
+    /// R17): inode identity, leaf allocation, and modification time as
+    /// integers. `device`/`inode` follow `Identity`'s convention exactly.
+    /// No `Date` — a `Date` round trip loses the nanosecond and is what the
+    /// valuables identity path exists to avoid.
+    struct LeafMetadata: Hashable {
+        let device: UInt64
+        let inode: UInt64
+        /// `st_blocks * 512` — the LEAF's own allocation (a directory's own
+        /// inode allocation, for a directory).
+        let allocatedBytes: Int64
+        /// `st_mtimespec.tv_sec`.
+        let modifiedSeconds: Int64
+        /// `st_mtimespec.tv_nsec`, guaranteed in `[0, 1e9)` by the accessor.
+        let modifiedNanoseconds: Int64
+    }
+
+    /// ONE no-follow `lstat` of `url` → the five integers above; `nil` when
+    /// the path is absent, unreadable, OR reports metadata OUTSIDE the pinned
+    /// value domains (a nanosecond field outside `[0, 1e9)`, a
+    /// seconds×1e9+ns product that would overflow `Int64`, or a block count
+    /// whose byte figure overflows). Fail-CLOSED at the source: a caller can
+    /// never build an out-of-domain identity from real filesystem metadata,
+    /// so a hostile or broken filesystem cannot malform a whole scan outcome
+    /// downstream — it can only make the inspection INCOMPLETE. Checked with
+    /// overflow-reporting arithmetic; nothing is ever saturated.
+    func leafMetadata(of url: URL) -> LeafMetadata? {
+        var st = stat()
+        guard lstat(url.path, &st) == 0 else { return nil }
+        let (allocated, blocksOverflow) = Int64(st.st_blocks)
+            .multipliedReportingOverflow(by: 512)
+        guard !blocksOverflow, allocated >= 0 else { return nil }
+        let seconds = Int64(st.st_mtimespec.tv_sec)
+        let nanoseconds = Int64(st.st_mtimespec.tv_nsec)
+        // The PINNED domain, named ONCE beside the model it belongs to — the
+        // source check, the derivation, and the validator cannot disagree.
+        let scale = ValuableIdentity.nanosecondsPerSecond
+        guard nanoseconds >= 0, nanoseconds < scale else { return nil }
+        let (scaled, scaleOverflow) = seconds
+            .multipliedReportingOverflow(by: scale)
+        guard !scaleOverflow,
+              !scaled.addingReportingOverflow(nanoseconds).overflow
+        else { return nil }
+        return LeafMetadata(
+            device: UInt64(bitPattern: Int64(st.st_dev)),
+            inode: UInt64(st.st_ino),
+            allocatedBytes: allocated,
+            modifiedSeconds: seconds,
+            modifiedNanoseconds: nanoseconds
+        )
+    }
+
     /// `st_nlink` of the object at `url` (no-follow). Hardlink detection:
     /// `linkCount > 1` on a regular file.
     func linkCount(of url: URL) -> UInt64? {

@@ -160,7 +160,7 @@ struct CacheCategory: Identifiable, Hashable {
                 }
 
                 // Try the probe command
-                if let probedPath = runProbe(command, home: home),
+                if let probedPath = Self.runProbe(command, home: home),
                    directoryExists(at: URL(fileURLWithPath: probedPath)) {
                     results.append(URL(fileURLWithPath: probedPath))
                     continue
@@ -220,14 +220,20 @@ struct CacheCategory: Identifiable, Hashable {
         return process.terminationStatus == 0
     }
 
-    private func runProbe(_ command: String, home: URL) -> String? {
+    /// The ONE probe-command runner — internal (not private) so the sweep's
+    /// exclusion construction (`OrphanedCachesScanner`) resolves probed
+    /// roots through the EXACT same subprocess doctrine the category scan
+    /// uses (same shell, restricted PATH, injected HOME, 2s bound, nil on
+    /// any failure). Two divergent probe runners would let the two surfaces
+    /// disagree about where a probed category lives.
+    static func runProbe(_ command: String, home: URL) -> String? {
         guard let output = shell(command, home: home) else { return nil }
         let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
     }
 
     /// Run a shell command with a 2-second timeout. Returns stdout or nil.
-    private func shell(_ command: String, home: URL) -> String? {
+    private static func shell(_ command: String, home: URL) -> String? {
         let process = Process()
         let pipe = Pipe()
 

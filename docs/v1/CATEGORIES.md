@@ -341,6 +341,40 @@ than 30 days. Stale directories show an age badge (e.g., "3mo old", "1y old") in
 
 ---
 
+## Orphaned Caches Sweep
+
+Beyond the fixed category allowlist, the `orphaned_caches` scanner sweeps the
+FIRST-LEVEL entries of `~/Library/Caches` and explains what it finds — an
+allowlist only reclaims what its authors have already seen leak (the field
+case: a 31 GB `com.apple.SwiftUI.Drag-<UUID>` directory holding a complete
+Photos-library copy, invisible to every category).
+
+- **Tiers.** Known leaks (glob table, e.g. `com.apple.SwiftUI.Drag-*`) are
+  Safe; orphaned caches (reverse-DNS name with positively NO installed app)
+  and stale-large entries are Review; the largest remaining unclassified
+  entries are listed for visibility only. Denied or mount-boundary entries
+  are always listed, never hidden by the size cut.
+- **Selection.** Only clean known leaks (no user-data-shaped content, fully
+  inspected, no denials, no mount boundaries) are ever auto-selected or
+  eligible for Quick Clean. Everything else is an explicit user choice.
+  CLI `smart-clean` never runs this scanner (it is frozen category-only).
+- **Deletion.** Cleaning deletes the entry directory itself (Trash-compatible
+  in the GUI). macOS apps recreate their cache directories on demand.
+- **Config.** Size floor (default 50 MB, decimal) and stale age (default
+  60 days) persist as `cacheout.orphanedCaches.sizeFloorMB` /
+  `cacheout.orphanedCaches.staleAgeDays` and can be overridden per
+  invocation with `--orphan-size-floor-mb` / `--orphan-stale-days` on
+  `scan` and `clean` (see [CLI-REFERENCE.md](CLI-REFERENCE.md)).
+- **Entries owned by a registered category** (e.g. `~/Library/Caches/Homebrew`)
+  are excluded — they are the category's row, not the sweep's.
+
+**Out of scope: `~/Library/Containers`.** Sandboxed apps keep their caches
+inside their app containers (`~/Library/Containers/<bundle-id>/Data/Library/
+Caches`); the sweep deliberately does not enter them. `/Library/Caches`
+(the system domain) is likewise out of scope.
+
+---
+
 ## Adding a New Category
 
 1. Edit `Sources/Cacheout/Scanner/Categories.swift`

@@ -209,7 +209,7 @@ compatibility sum.
 |-------|------|----------|-------------|
 | `schema_version` | integer | yes | Always present — every schema-4 payload self-describes |
 | `categories` | object[] | yes | Schema 3's category rows, field-for-field (table below). NO `scanner_id`/`item_id` here — identity fields live on `scanner_items` and the clean/smart-clean rows only |
-| `scanner_items` | object[] | yes | One row per PER-ITEM scanner item (node_modules today; build artifacts, git worktrees, temp dirs to follow). Empty array when no per-item scanner found anything |
+| `scanner_items` | object[] | yes | One row per PER-ITEM scanner item (node_modules and orphaned_caches today; build artifacts, git worktrees, temp dirs to follow). Empty array when no per-item scanner found anything |
 | `scanner_errors` | object[] | yes | Root/scanner-level problems that produced NO item (refused search roots, traversal failures, malformed outcomes). Empty array when clean |
 
 **`scanner_items` rows:**

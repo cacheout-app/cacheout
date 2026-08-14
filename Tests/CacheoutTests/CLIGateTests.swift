@@ -1664,6 +1664,62 @@ final class CLIGateTests: XCTestCase {
         XCTAssertTrue(fm.fileExists(atPath: survivor.path),
                       "a confirmed run against a rejected scanner deletes nothing")
     }
+
+    // MARK: - Sweep flags rejected on every non-sweep command (R8)
+
+    func testSweepFlagGateMatrixAcrossAllCommands() {
+        // The R8 sweep flags are accepted by the commands that actually
+        // run the sweep scanner — scan and clean ONLY. Every other command
+        // rejects them BEFORE dispatch: silently ignoring a threshold the
+        // caller passed would hide the flag landing on the wrong command.
+        let flags = [CLIHandler.orphanSizeFloorFlag, CLIHandler.orphanStaleDaysFlag]
+        for command in CLIHandler.Command.allCases {
+            for flag in flags {
+                let args = ["Cacheout", "--cli", command.rawValue, flag, "30"]
+                let rejected = CLIHandler.rejectedSweepFlag(for: command, in: args)
+                switch command {
+                case .scan, .clean:
+                    XCTAssertNil(
+                        rejected,
+                        "\(command.rawValue) runs the sweep and accepts \(flag)"
+                    )
+                default:
+                    XCTAssertEqual(
+                        rejected, flag,
+                        "\(command.rawValue) never runs the sweep and must reject \(flag)"
+                    )
+                }
+            }
+            // Without the flags nothing is rejected anywhere — the gate
+            // never turns an ordinary invocation into a usage error.
+            XCTAssertNil(CLIHandler.rejectedSweepFlag(
+                for: command,
+                in: ["Cacheout", "--cli", command.rawValue, "--confirm"]
+            ))
+        }
+    }
+
+    func testSweepFlagRejectionMessageIsActionable() {
+        // The refusal names the offending flag, the command that refused
+        // it, and the commands that DO accept it — the caller's next
+        // invocation should be obvious from the message alone.
+        let sampled: [CLIHandler.Command] = [
+            .version, .diskInfo, .spotlight, .memoryStats, .smartClean,
+        ]
+        for command in sampled {
+            for flag in [CLIHandler.orphanSizeFloorFlag, CLIHandler.orphanStaleDaysFlag] {
+                let message = CLIHandler.sweepFlagRejectionMessage(
+                    flag: flag, command: command
+                )
+                XCTAssertTrue(message.contains(flag),
+                              "names the flag: \(message)")
+                XCTAssertTrue(message.contains(command.rawValue),
+                              "names the refusing command: \(message)")
+                XCTAssertTrue(message.contains("scan or clean"),
+                              "points at the supported commands: \(message)")
+            }
+        }
+    }
 }
 
 /// fn-1.5 subprocess INTEGRATION tests (R5) — read-only, framing ONLY.
@@ -1865,5 +1921,66 @@ final class CLIGateFramingTests: XCTestCase {
             XCTAssertEqual(error["code"] as? String, "INVALID_ARGUMENTS",
                            "'\(target)' must be refused")
         }
+    }
+
+    func testSweepFlagsRejectedOnNonSweepCommandsFraming() throws {
+        // R8 sweep flags on commands that never run the sweep: refused
+        // BEFORE dispatch — exit 1, empty stdout, INVALID_ARGUMENTS naming
+        // the flag and the commands that accept it. Only read-only commands
+        // are sampled here so even a gate regression stays side-effect-free
+        // (`spotlight`, which writes metadata when dispatched, is covered by
+        // the in-process gate matrix instead).
+        for command in ["version", "disk-info", "memory-stats"] {
+            for flag in [CLIHandler.orphanSizeFloorFlag, CLIHandler.orphanStaleDaysFlag] {
+                let run = try runCLI(["--cli", command, flag, "30"])
+                XCTAssertEqual(run.exitCode, 1, "\(command) + \(flag) exits 1")
+                XCTAssertEqual(run.stdout, "",
+                               "stdout stays EMPTY when refused: \(command)")
+                let envelope = try parseErrorEnvelope(run.stderr)
+                XCTAssertEqual(envelope["ok"] as? Bool, false)
+                let error = try XCTUnwrap(envelope["error"] as? [String: Any])
+                XCTAssertEqual(error["code"] as? String, "INVALID_ARGUMENTS",
+                               "\(command) must refuse \(flag)")
+                let message = (error["message"] as? String) ?? ""
+                XCTAssertTrue(message.contains(flag),
+                              "the refusal names the flag: \(message)")
+                XCTAssertTrue(message.contains(command),
+                              "the refusal names the command: \(message)")
+                XCTAssertTrue(message.contains("scan or clean"),
+                              "the refusal points at the supported commands: \(message)")
+            }
+        }
+    }
+
+    func testSmartCleanStillRejectsSweepFlagsFraming() throws {
+        // The centralized gate covers smart-clean too — the frozen
+        // category-only contract (fn-2 round 10) keeps rejecting the flags
+        // pre-dispatch, before target parsing or any confirmation gate.
+        let run = try runCLI(["--cli", "smart-clean", "5", "--orphan-stale-days", "30"])
+        XCTAssertEqual(run.exitCode, 1)
+        XCTAssertEqual(run.stdout, "")
+        let envelope = try parseErrorEnvelope(run.stderr)
+        let error = try XCTUnwrap(envelope["error"] as? [String: Any])
+        XCTAssertEqual(error["code"] as? String, "INVALID_ARGUMENTS")
+        let message = (error["message"] as? String) ?? ""
+        XCTAssertTrue(message.contains("--orphan-stale-days"))
+        XCTAssertTrue(message.contains("smart-clean"))
+    }
+
+    func testCleanStillAcceptsSweepFlagsFraming() throws {
+        // The gate must NOT reject the commands that run the sweep. An
+        // unconfirmed clean with a sweep flag falls through to the ordinary
+        // CONFIRMATION_REQUIRED refusal — the flag was accepted and the
+        // invocation was gated on --confirm like any other clean (read-only).
+        let run = try runCLI([
+            "--cli", "clean", "npm_cache",
+            CLIHandler.orphanSizeFloorFlag, "100",
+        ])
+        XCTAssertEqual(run.exitCode, 1, "unconfirmed clean still exits 1")
+        XCTAssertEqual(run.stdout, "", "stdout stays EMPTY when refused (R5)")
+        let envelope = try parseErrorEnvelope(run.stderr)
+        let error = try XCTUnwrap(envelope["error"] as? [String: Any])
+        XCTAssertEqual(error["code"] as? String, "CONFIRMATION_REQUIRED",
+                       "the sweep flag is accepted — the refusal is the confirm gate, not the flag gate")
     }
 }

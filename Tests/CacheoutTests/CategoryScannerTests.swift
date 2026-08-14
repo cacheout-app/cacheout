@@ -811,13 +811,20 @@ final class CategoryScannerTests: XCTestCase {
         let runtime = SpaceScannerRuntime.production(home: home)
         XCTAssertEqual(
             runtime.scanners.map(\.id),
-            [CategoryScanner.registeredID, NodeModulesScanner.registeredID]
+            [
+                CategoryScanner.registeredID,
+                NodeModulesScanner.registeredID,
+                OrphanedCachesScanner.registeredID,
+            ]
         )
         XCTAssertEqual(
             runtime.trustedContainerRoots.map(\.path),
-            NodeModulesScanner.defaultSearchRoots(home: home).map(\.path),
-            "the union is exactly NodeModulesScanner's declared search set "
-                + "(fn-2.2) — CategoryScanner contributes no container roots"
+            NodeModulesScanner.defaultSearchRoots(home: home).map(\.path)
+                + [home.appendingPathComponent("Library/Caches").path],
+            "the union is the per-item scanners' declared sets in "
+                + "registration order (node_modules search roots, then the "
+                + "orphaned-caches sweep root) — CategoryScanner contributes "
+                + "no container roots"
         )
         // The factory reaching here at all asserts the production
         // category-slug/scanner-slug namespace is collision-free (a

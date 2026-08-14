@@ -30,6 +30,13 @@
 /// - `--target-pid N`: Target process ID for signal interventions
 /// - `--target-name NAME`: Expected process name for PID validation (signal interventions)
 /// - `--top N`: Limit top-processes output to N entries (default: 10)
+/// - `--orphan-size-floor-mb N` / `--orphan-stale-days N`: invocation-scoped
+///   orphaned-caches sweep thresholds (positive integers; decimal MB /
+///   days). Accepted by `scan` and `clean` ONLY — EVERY other command
+///   (smart-clean is frozen category-only; the rest never run the sweep)
+///   REJECTS them with `INVALID_ARGUMENTS` before dispatch. Overrides the
+///   persisted `cacheout.orphanedCaches.*` value for this invocation;
+///   never persisted
 /// - Clean targets are positional arguments after the command. A target is
 ///   one of `<category-slug>` (a category aggregate), `<scanner-slug>` (ALL
 ///   items of a per-item scanner, e.g. `node_modules`), or
@@ -122,6 +129,18 @@ struct CLIHandler {
             exitWithError(code: "UNKNOWN_COMMAND", message: "Unknown command: \(commandStr)")
         }
 
+        // Pre-dispatch gate: the sweep's config flags (R8) are accepted by
+        // the commands that actually run the sweep scanner — scan and clean
+        // ONLY. Every other command rejects them up front; silently
+        // ignoring a threshold the caller passed would hide the flag
+        // landing on the wrong command.
+        if let flag = rejectedSweepFlag(for: command, in: args) {
+            exitWithError(
+                code: "INVALID_ARGUMENTS",
+                message: sweepFlagRejectionMessage(flag: flag, command: command)
+            )
+        }
+
         switch command {
         case .version:
             handleVersion()
@@ -130,13 +149,27 @@ struct CLIHandler {
             await handleDiskInfo()
 
         case .scan:
-            await handleScan()
+            // The sweep's config flags (R8) are accepted by the commands
+            // that actually run the sweep scanner — scan and clean.
+            let sweepThresholds = resolveSweepThresholds(from: args)
+            await handleScan(deps: .production(
+                orphanedCachesThresholds: sweepThresholds
+            ))
 
         case .clean:
             let slugs = extractSlugs(from: args, after: cliIndex + 1)
-            await handleClean(slugs: slugs, dryRun: isDryRun, confirmed: isConfirmed)
+            let sweepThresholds = resolveSweepThresholds(from: args)
+            await handleClean(
+                slugs: slugs, dryRun: isDryRun, confirmed: isConfirmed,
+                deps: .production(orphanedCachesThresholds: sweepThresholds)
+            )
 
         case .smartClean:
+            // smart-clean is frozen category-only (fn-2 round 10): the
+            // sweep never runs there. Its sweep flags are a usage error,
+            // not a silent no-op — rejected by the pre-dispatch gate above
+            // along with every other non-scan/clean command.
+            //
             // An ABSENT target defaults to 5.0; a PRESENT but malformed one
             // is a usage error — silently defaulting would let
             // `smart-clean garbage --confirm` delete 5 GB the caller never
@@ -291,25 +324,38 @@ struct CLIHandler {
         /// runtime keeps its category registry private; production and tests
         /// wire the same list they registered.
         let categorySlugs: Set<String>
-        /// Cleaner factory. The default derives the cleaner FROM the runtime
+        /// Cleaner factory, taking the SCAN SESSION's container snapshot
+        /// (fn-3.4, R9 — one CLI invocation, one session: the cleaner must
+        /// hold the snapshot of the session that produced the items it
+        /// deletes; nil fail-closes every `.removeItem`). The default
+        /// derives the cleaner FROM the runtime
         /// (`SpaceScannerRuntime.makeCleaner`) so delete-time container
         /// admission is exactly the scanner-declared union — tests may
         /// override to observe or redirect.
-        let makeCleaner: () -> CacheCleaner
+        let makeCleaner: (ContainerSnapshot?) -> CacheCleaner
 
         init(
             runtime: SpaceScannerRuntime,
             categorySlugs: Set<String>,
-            makeCleaner: (() -> CacheCleaner)? = nil
+            makeCleaner: ((ContainerSnapshot?) -> CacheCleaner)? = nil
         ) {
             self.runtime = runtime
             self.categorySlugs = categorySlugs
-            self.makeCleaner = makeCleaner ?? { runtime.makeCleaner() }
+            self.makeCleaner = makeCleaner
+                ?? { runtime.makeCleaner(snapshot: $0) }
         }
 
-        static func production() -> CLIRuntimeDependencies {
+        /// - Parameter orphanedCachesThresholds: invocation-scoped sweep
+        ///   thresholds (R8) — nil resolves defaults → UserDefaults inside
+        ///   the runtime factory; the CLI passes the flag-layered value.
+        ///   Never persisted.
+        static func production(
+            orphanedCachesThresholds: OrphanedCacheClassifier.Thresholds? = nil
+        ) -> CLIRuntimeDependencies {
             CLIRuntimeDependencies(
-                runtime: .production(),
+                runtime: .production(
+                    orphanedCachesThresholds: orphanedCachesThresholds
+                ),
                 categorySlugs: Set(CacheCategory.allCategories.map(\.slug))
             )
         }
@@ -339,6 +385,10 @@ struct CLIHandler {
     struct CollectedScanEvents {
         var outcomes: [String: ScanOutcome] = [:]
         var malformed: [String: ScanIssue] = [:]
+        /// The session's container-identity snapshot (fn-3.4, R9) — the
+        /// ONE cleaner input for this invocation's confirmed run: the CLI's
+        /// single invocation pairs items and snapshot naturally.
+        var snapshot: ContainerSnapshot?
     }
 
     private static func collectValidatedScan(
@@ -347,9 +397,11 @@ struct CLIHandler {
         context: ScanContext
     ) async -> CollectedScanEvents {
         var collected = CollectedScanEvents()
-        for await event in runtime.scanValidated(
+        let session = runtime.scanValidatedSession(
             scannerIDs: scannerIDs, context: context
-        ) {
+        )
+        collected.snapshot = session.snapshot
+        for await event in session.events {
             switch event {
             case .outcome(let scannerID, let outcome):
                 collected.outcomes[scannerID] = outcome
@@ -360,10 +412,130 @@ struct CLIHandler {
         return collected
     }
 
+    // MARK: - Orphaned-caches sweep flags (fn-3.4, R8)
+
+    /// Invocation-scoped overrides for the sweep scanner's thresholds,
+    /// accepted by `scan` and `clean` ONLY (smart-clean is frozen
+    /// category-only and rejects them). Values override the persisted
+    /// UserDefaults value for this invocation and are NEVER persisted.
+    static let orphanSizeFloorFlag = "--orphan-size-floor-mb"
+    static let orphanStaleDaysFlag = "--orphan-stale-days"
+
+    /// Pure parse of both sweep flags (in-process testable; the process
+    /// shell translates a failure into the INVALID_ARGUMENTS exit). Each
+    /// value must be a positive integer whose unit conversion does not
+    /// overflow — zero, negative, non-numeric, and overflowing values are
+    /// REJECTED (fail-safe R8), never silently defaulted. A REPEATED flag
+    /// is likewise rejected: any first-/last-wins rule would silently
+    /// ignore one of two contradictory values — and skip validating the
+    /// ignored occurrence, letting `--orphan-size-floor-mb 1
+    /// --orphan-size-floor-mb garbage` slip past the malformed-value gate.
+    static func parseSweepThresholdOverrides(
+        from args: [String]
+    ) -> Result<(sizeFloorMB: Int64?, staleAgeDays: Int64?), CLIAddressError> {
+        func parse(
+            _ flag: String, converts: (Int64) -> Bool
+        ) -> Result<Int64?, CLIAddressError> {
+            let occurrences = args.indices.filter { args[$0] == flag }
+            guard let index = occurrences.first else {
+                return .success(nil)
+            }
+            guard occurrences.count == 1 else {
+                return .failure(CLIAddressError(
+                    message: "\(flag) may be specified at most once"
+                ))
+            }
+            guard index + 1 < args.count else {
+                return .failure(CLIAddressError(
+                    message: "\(flag) requires a positive integer value"
+                ))
+            }
+            let raw = args[index + 1]
+            guard let value = Int64(raw), value > 0 else {
+                return .failure(CLIAddressError(
+                    message: "\(flag) requires a positive integer value, got: \(raw)"
+                ))
+            }
+            guard converts(value) else {
+                return .failure(CLIAddressError(
+                    message: "\(flag) value \(raw) is too large — "
+                        + "the converted value overflows"
+                ))
+            }
+            return .success(value)
+        }
+
+        switch parse(orphanSizeFloorFlag, converts: {
+            OrphanedCachesSweepConfig.sizeFloorBytes(fromMB: $0) != nil
+        }) {
+        case .failure(let error):
+            return .failure(error)
+        case .success(let floorMB):
+            switch parse(orphanStaleDaysFlag, converts: {
+                OrphanedCachesSweepConfig.staleAge(fromDays: $0) != nil
+            }) {
+            case .failure(let error):
+                return .failure(error)
+            case .success(let staleDays):
+                return .success((floorMB, staleDays))
+            }
+        }
+    }
+
+    /// The first sweep flag present in an invocation of a command that
+    /// never runs the orphaned-caches sweep, or nil. Only `scan` and
+    /// `clean` run the sweep scanner — for every other command
+    /// (smart-clean is frozen category-only, fn-2 round 10; the rest have
+    /// no sweep at all) accepting the flags would be a silent no-op lie.
+    /// `run()` turns a non-nil result into INVALID_ARGUMENTS before
+    /// dispatch.
+    static func rejectedSweepFlag(for command: Command, in args: [String]) -> String? {
+        guard command != .scan, command != .clean else { return nil }
+        return [orphanSizeFloorFlag, orphanStaleDaysFlag].first(where: args.contains)
+    }
+
+    /// smart-clean's view of the pre-dispatch gate — the original fn-3.4
+    /// entry point, retained so existing callers (the OrphanedCachesScanner
+    /// test surface) keep working; the gate itself is
+    /// `rejectedSweepFlag(for:in:)`.
+    static func smartCleanRejectedSweepFlag(in args: [String]) -> String? {
+        rejectedSweepFlag(for: .smartClean, in: args)
+    }
+
+    /// The INVALID_ARGUMENTS message for a rejected sweep flag: names the
+    /// offending flag, the command that refused it, and the commands that
+    /// accept it (kept actionable — the caller's next invocation should be
+    /// obvious from the refusal alone).
+    static func sweepFlagRejectionMessage(flag: String, command: Command) -> String {
+        "\(flag) is not accepted by \(command.rawValue) — only scan and "
+            + "clean run the orphaned-caches sweep; use the flag with "
+            + "scan or clean"
+    }
+
+    /// The process-facing resolution: parse both flags (exiting via the
+    /// invalid-arguments convention on a bad value) and, when at least one
+    /// is present, layer them over UserDefaults/defaults. `nil` — no flags
+    /// — lets the production factory resolve persisted values itself.
+    private static func resolveSweepThresholds(
+        from args: [String]
+    ) -> OrphanedCacheClassifier.Thresholds? {
+        switch parseSweepThresholdOverrides(from: args) {
+        case .failure(let error):
+            exitWithError(code: "INVALID_ARGUMENTS", message: error.message)
+        case .success(let overrides):
+            guard overrides.sizeFloorMB != nil
+                || overrides.staleAgeDays != nil else { return nil }
+            return OrphanedCachesSweepConfig.resolvedThresholds(
+                sizeFloorMBOverride: overrides.sizeFloorMB,
+                staleAgeDaysOverride: overrides.staleAgeDays
+            )
+        }
+    }
+
     // MARK: - Scan (schema 4 envelope)
 
-    private static func handleScan() async {
-        outputJSON(await scanEnvelope(deps: .production()))
+    private static func handleScan(deps: CLIRuntimeDependencies) async {
+        outputJSON(await scanEnvelope(deps: deps))
     }
 
     /// The schema-4 scan envelope (R2/R8): ALL registered scanners, nil
@@ -948,10 +1120,13 @@ struct CLIHandler {
         }
     }
 
-    private static func handleClean(slugs: [String], dryRun: Bool, confirmed: Bool) async {
+    private static func handleClean(
+        slugs: [String], dryRun: Bool, confirmed: Bool,
+        deps: CLIRuntimeDependencies
+    ) async {
         render(await cleanCLIOutcome(
             targets: slugs, dryRun: dryRun, confirmed: confirmed,
-            euid: geteuid(), deps: .production()
+            euid: geteuid(), deps: deps
         ))
     }
 
@@ -1066,7 +1241,9 @@ struct CLIHandler {
             ))
 
         case .proceed:
-            let cleaner = deps.makeCleaner()
+            // One invocation, one session (R9): the cleaner holds the
+            // snapshot of the very scan that resolved these items.
+            let cleaner = deps.makeCleaner(collected.snapshot)
             let report = await cleaner.clean(items: items, moveToTrash: false)
             return confirmedCleanPayload(
                 items: items, report: report, scannerErrors: scannerErrorRows
@@ -1356,7 +1533,7 @@ struct CLIHandler {
             ])
 
         case .proceed:
-            let cleaner = deps.makeCleaner()
+            let cleaner = deps.makeCleaner(collected.snapshot)
             var freedExactSoFar: Int64 = 0
             var estimatedSoFar: Int64 = 0
             var cleaned: [[String: Any]] = []

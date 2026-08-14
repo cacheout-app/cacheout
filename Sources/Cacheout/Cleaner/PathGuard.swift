@@ -19,8 +19,13 @@
 ///    parent of `~/Library/Caches/Homebrew` is the whole cache namespace and
 ///    the parent of `~/.npm` is `$HOME` itself. `.absolutePath` roots admit
 ///    exactly, no drift.
-/// 2. **Containers** (`admitContainer`): the configured node_modules search
-///    roots, and only those. Deliberately split from deletion roots — a
+/// 2. **Containers**, in TWO type-enforced modes (fn-3.4, R9): the
+///    configured container roots (node_modules search roots, the
+///    orphaned-caches sweep root), and only those. `admitSearchRoot` is the
+///    scan-time, read-only traversal check; `admitContainer(_:snapshot:)`
+///    is the delete-time check, identity-bound to the scan-session
+///    `ContainerSnapshot` — and the only way to mint the deletion-capable
+///    `AdmittedContainer` token. Deliberately split from deletion roots — a
 ///    search root like `~/Documents` is a valid place to LOOK for
 ///    node_modules while remaining refused as a deletion target.
 ///
@@ -100,6 +105,55 @@ struct CategoryAdmissionPolicy {
     }
 }
 
+// MARK: - Scan-session container snapshot (fn-3.4, R9)
+
+/// The no-follow `(device, inode)` identity of every REGISTERED container
+/// root, captured by the runtime's validated-scan entry point BEFORE any
+/// scanner task launches. Delete-time container admission is IDENTITY-BOUND
+/// to this snapshot: cleaning a set of items must use the snapshot of the
+/// session that PRODUCED them, so a container replaced between scan and
+/// clean — symlink swap, rm+mkdir inode replacement, or an ancestor swap
+/// redirecting the resolved location — mismatches and is refused.
+///
+/// Absent roots are OMITTED at capture: a root that did not exist when the
+/// session started can never have produced items in it, and a root created
+/// later is refused fail-closed until the next session re-captures
+/// (self-healing). Capture is deliberately part of the SESSION, never of
+/// runtime construction — a container created after app launch but before a
+/// later scan must still be cleanable in that scan's session.
+struct ContainerSnapshot: Sendable {
+
+    private let identities: [String: FileSystemIdentityProvider.Identity]
+
+    private init(identities: [String: FileSystemIdentityProvider.Identity]) {
+        self.identities = identities
+    }
+
+    /// Capture the current no-follow identity of each root (keyed by the
+    /// root's declared path spelling). `lstat`-based: a symlink at a root's
+    /// path snapshots as the LINK — delete-time admission independently
+    /// refuses non-directory containers, so a link identity can never admit.
+    static func capture(
+        roots: [URL], provider: FileSystemIdentityProvider
+    ) -> ContainerSnapshot {
+        var identities: [String: FileSystemIdentityProvider.Identity] = [:]
+        for root in roots {
+            if let identity = provider.identity(of: root) {
+                identities[root.path] = identity
+            }
+        }
+        return ContainerSnapshot(identities: identities)
+    }
+
+    /// The captured identity for a registered root's declared path spelling;
+    /// nil when the root was absent at capture (refused downstream).
+    func identity(
+        forRootPath path: String
+    ) -> FileSystemIdentityProvider.Identity? {
+        identities[path]
+    }
+}
+
 // MARK: - Admission tokens
 
 /// Proof that a deletion root passed admission. Carries both spellings:
@@ -112,10 +166,27 @@ struct AdmittedRoot {
     let viaSiblingDrift: Bool
 }
 
-/// Proof that a container (node_modules search root) passed admission.
+/// Proof that a container passed SCAN-TIME (read-only) admission — the
+/// traversal check scanners run before walking a search root. Deliberately
+/// NOT a deletion capability: `validateRemovableItem` does not accept it.
+struct AdmittedSearchRoot {
+    let requestedURL: URL
+    let resolvedURL: URL
+}
+
+/// Proof that a container passed DELETE-TIME, snapshot-bound admission.
+/// The initializer is fileprivate (round 9, type-enforced): only
+/// `PathGuard.admitContainer(_:snapshot:)` can mint one, so the deletion
+/// path (`validateRemovableItem`) is structurally unreachable without a
+/// scan-session snapshot — an unbound PathGuard can traverse, never delete.
 struct AdmittedContainer {
     let requestedURL: URL
     let resolvedURL: URL
+
+    fileprivate init(requestedURL: URL, resolvedURL: URL) {
+        self.requestedURL = requestedURL
+        self.resolvedURL = resolvedURL
+    }
 }
 
 // MARK: - Errors
@@ -141,6 +212,13 @@ enum PathGuardError: Error, Equatable {
     case notADescendant(path: String, root: String)
     /// Item sits on a different device than its container (R15).
     case crossDevice(path: String, containerPath: String)
+    /// Delete-time container admission failed the identity gate (fn-3.4,
+    /// R9): the container spelling is a symlink or non-directory, its
+    /// no-follow (device, inode) no longer matches the scan-session
+    /// snapshot, the root was absent at capture, or no snapshot exists for
+    /// this clean at all. ONE case for the whole class — detail rides the
+    /// message.
+    case containerUnavailable(path: String)
 }
 
 extension PathGuardError: LocalizedError {
@@ -164,6 +242,8 @@ extension PathGuardError: LocalizedError {
             return "Path is not strictly inside \(root): \(path)"
         case .crossDevice(let path, let containerPath):
             return "Path is on a different volume than its container \(containerPath): \(path)"
+        case .containerUnavailable(let path):
+            return "Container is unavailable or its identity changed since the scan: \(path)"
         }
     }
 }
@@ -237,18 +317,73 @@ final class PathGuard {
         throw PathGuardError.outsideCategoryPolicy(path: resolved.path)
     }
 
-    // MARK: Container admission
+    // MARK: Container admission (two modes, type-enforced — fn-3.4 round 9)
 
-    /// Admit `url` as a container: it must be one of the configured search
-    /// roots (by inode identity). Containers are places to LOOK, not to
-    /// delete — items inside them go through `validateRemovableItem`, which
-    /// re-applies the deny list. This is why `~/Documents` can be a container
-    /// while `admitDeletionRoot` refuses it.
-    func admitContainer(_ url: URL) throws -> AdmittedContainer {
+    /// SCAN-TIME traversal admission: `url` must be one of the configured
+    /// search roots (by inode identity). Containers are places to LOOK, not
+    /// to delete — this check is read-only, snapshot-free (scanners never
+    /// see snapshots; `ScanContext` cannot carry one), and its token is
+    /// deliberately NOT accepted by `validateRemovableItem`. This is why
+    /// `~/Documents` can be a container while `admitDeletionRoot` refuses it.
+    func admitSearchRoot(_ url: URL) throws -> AdmittedSearchRoot {
+        let resolved = try matchConfiguredRoot(url).resolved
+        return AdmittedSearchRoot(requestedURL: url, resolvedURL: resolved)
+    }
+
+    /// DELETE-TIME container admission, IDENTITY-BOUND to the scan-session
+    /// snapshot (fn-3.4, R9 — a NARROWING of the swap window, deliberately
+    /// not full TOCTOU closure; see the epic's Decision Context). The
+    /// as-built resolution alone canonicalizes AT DELETE TIME, so a
+    /// container replaced by a symlink between scan and clean resolves both
+    /// sides through the new link and matches — this gate closes every
+    /// persistent-swap scenario:
+    ///
+    /// 1. `url` must match a configured root by inode identity (as before);
+    /// 2. the CONFIGURED root's declared spelling AND the caller's origin
+    ///    spelling must both `lstat` no-follow as REAL directories (a
+    ///    symlink or non-directory container never admits);
+    /// 3. the configured root's current no-follow `(device, inode)` must
+    ///    EQUAL its snapshot capture — an rm+mkdir replacement (new inode)
+    ///    and an ANCESTOR swap redirecting the resolved location (which a
+    ///    leaf-only lstat would miss) both mismatch; a root ABSENT from the
+    ///    snapshot is refused (fail-closed; the next session re-captures).
+    ///
+    /// Callers re-run this immediately before the destructive call. The
+    /// window between that final check and the path-based `removeItem`
+    /// remains open by explicit decision — the cleaner runs unprivileged as
+    /// the user, so a same-user racer could delete the target directly.
+    func admitContainer(
+        _ url: URL, snapshot: ContainerSnapshot
+    ) throws -> AdmittedContainer {
+        let (matchedRoot, resolved) = try matchConfiguredRoot(url)
+
+        // (2) No-follow reality gate on BOTH spellings: the configured
+        // root's declared path and the origin claim's own spelling.
+        for spelling in [matchedRoot, url]
+        where provider.probeKind(of: spelling) != .kind(.directory) {
+            throw PathGuardError.containerUnavailable(path: spelling.path)
+        }
+
+        // (3) Identity binding against the session snapshot, keyed by the
+        // configured root's declared spelling (the same spelling the
+        // runtime captured).
+        guard let captured = snapshot.identity(forRootPath: matchedRoot.path),
+              provider.identity(of: matchedRoot) == captured else {
+            throw PathGuardError.containerUnavailable(path: matchedRoot.path)
+        }
+
+        return AdmittedContainer(requestedURL: url, resolvedURL: resolved)
+    }
+
+    /// Shared root matching for both admission modes: inode identity against
+    /// each configured root, resolved forms compared.
+    private func matchConfiguredRoot(
+        _ url: URL
+    ) throws -> (matched: URL, resolved: URL) {
         let resolved = provider.canonicalize(url)
         for root in containerRoots {
             if provider.sameLocation(resolved, provider.canonicalize(root)) {
-                return AdmittedContainer(requestedURL: url, resolvedURL: resolved)
+                return (root, resolved)
             }
         }
         throw PathGuardError.notAConfiguredContainer(path: resolved.path)

@@ -136,6 +136,72 @@ final class DevRootsSettingsTests: XCTestCase {
         XCTAssertEqual(log.recorded.count, 4)
     }
 
+    /// A mutation that persists NOTHING must not rebuild: re-adding an
+    /// already-declared root, removing one that was never there, and
+    /// resetting when nothing is stored all leave the composition — and
+    /// therefore DESTRUCTIVE FRESHNESS — exactly as they found it. A real
+    /// change still gates (the non-vacuity half).
+    @MainActor
+    func testNoOpMutationsNeitherRebuildNorGateDestructivePaths() async throws {
+        let container = base.appendingPathComponent("items")
+        let junk = container.appendingPathComponent("junk")
+        try mkdir(junk)
+
+        let log = FactoryLog()
+        let runtime = try SpaceScannerRuntime(
+            scanners: [SelectableFixtureScanner(
+                id: "fixture_settings", container: container
+            )],
+            categories: [], home: fixtureHome,
+            provider: FileSystemIdentityProvider()
+        )
+        let viewModel = CacheoutViewModel(
+            runtime: runtime,
+            reconstruction: CacheoutViewModel.RuntimeReconstruction(
+                devRootsStore: makeStore(), home: fixtureHome,
+                makeRuntime: { resolution in
+                    log.record(resolution)
+                    return runtime
+                }
+            )
+        )
+        await viewModel.scan(trigger: .userInitiated)
+        let item = try XCTUnwrap(
+            viewModel.items(forScanner: "fixture_settings").first
+        )
+        viewModel.toggleSelection(for: item.key)
+        XCTAssertTrue(viewModel.hasCleanableSelection)
+
+        // (a) A duplicate add — `Documents` is already a declared seed.
+        viewModel.addDevRoot("Documents")
+        XCTAssertNil(viewModel.devRootRejection,
+                     "an already-declared root is not an error")
+        XCTAssertEqual(log.recorded.count, 0, "no rebuild for a no-op add")
+        XCTAssertTrue(viewModel.hasCleanableSelection,
+                      "destructive freshness survives a no-op")
+
+        // (b) Removing something that was never declared — and it must not
+        // materialize the seeds into the suite as a side effect.
+        viewModel.removeDevRoot("/never/declared")
+        XCTAssertEqual(log.recorded.count, 0)
+        XCTAssertNil(defaults.object(forKey: DevRootsStore.devRootsKey))
+        XCTAssertTrue(viewModel.hasCleanableSelection)
+
+        // (c) Resetting when nothing is stored.
+        viewModel.resetDevRootsToDefaults()
+        XCTAssertEqual(log.recorded.count, 0)
+        XCTAssertTrue(viewModel.hasCleanableSelection)
+
+        // NON-VACUITY: a REAL change does rebuild — and gates the
+        // destructive paths until a scan from the new composition adopts.
+        let dev = fixtureHome.appendingPathComponent("dev")
+        try mkdir(dev)
+        viewModel.addDevRoot(dev.path)
+        XCTAssertEqual(log.recorded.count, 1)
+        XCTAssertFalse(viewModel.hasCleanableSelection,
+                       "a real rebuild invalidates destructive freshness")
+    }
+
     /// The declared string the editor persists ALWAYS resolves back to the
     /// URL it validated — one convention, so the editor can never validate
     /// one path while the scanner walks another.
@@ -423,6 +489,54 @@ final class DevRootsSettingsTests: XCTestCase {
 }
 
 // MARK: - Fixture machinery
+
+/// A tiny per-item scanner over one container: one SELECTABLE `.removeItem`
+/// item per child, with the container declared as its trusted root — enough
+/// to observe destructive-freshness gating (nothing is ever cleaned here).
+private struct SelectableFixtureScanner: SpaceScanner {
+    let id: String
+    let container: URL
+    var displayName: String { "Fixture \(id)" }
+    var trustedContainerRoots: [URL] { [container] }
+
+    func scan(context: ScanContext) async -> ScanOutcome {
+        let children = ((try? FileManager.default.contentsOfDirectory(
+            at: container, includingPropertiesForKeys: nil
+        )) ?? []).sorted { $0.lastPathComponent < $1.lastPathComponent }
+        return ScanOutcome(
+            items: children.map { child in
+                ReclaimableItem(
+                    id: child.lastPathComponent,
+                    scannerID: id,
+                    displayName: child.lastPathComponent,
+                    exactBytes: 4096,
+                    estimatedUpToBytes: 0,
+                    logicalBytes: nil,
+                    itemCount: 1,
+                    url: child,
+                    declaredDisplayPath: child.path,
+                    rootRecords: [RootScanRecord(
+                        requestedURL: child, resolvedURL: child,
+                        status: .measured
+                    )],
+                    state: .measured,
+                    scanError: nil,
+                    risk: .review,
+                    evidence: "fixture item \(child.lastPathComponent)",
+                    rebuildNote: nil,
+                    action: .removeItem,
+                    admission: .containerItem(
+                        originContainer: container, requestedTargetURL: child
+                    ),
+                    defaultSelected: false,
+                    automaticCleanEligible: false,
+                    isStale: nil
+                )
+            },
+            errors: []
+        )
+    }
+}
 
 /// Marks injected canonical paths as mount roots — the statfs signal,
 /// hermetically (the `DevRootsStoreTests` idiom: a real volume root cannot

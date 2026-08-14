@@ -162,24 +162,48 @@ struct DevRootsStore {
     /// already declared. Policy enforcement stays at RESOLUTION (and at
     /// fn-4.6's add-time validation, which calls the shared policy) — the
     /// store never silently drops what the user wrote.
-    func add(_ path: String) {
+    ///
+    /// - Returns: whether the persisted value actually CHANGED. fn-4.6's
+    ///   editor rebuilds the runtime only on a real change: a rebuild is
+    ///   unconditional-by-design for an actual dev-roots change, but doing
+    ///   it for a no-op would invalidate destructive freshness (gating every
+    ///   clean until the next scan) for a configuration nobody changed.
+    @discardableResult
+    func add(_ path: String) -> Bool {
         var current = declaredPathList()
-        guard !current.contains(path) else { return }
+        guard !current.contains(path) else { return false }
         current.append(path)
         defaults.set(current, forKey: Self.devRootsKey)
+        return true
     }
 
     /// Remove every exact-string occurrence of `path` from the persisted
     /// declared list.
-    func remove(_ path: String) {
-        let current = declaredPathList().filter { $0 != path }
-        defaults.set(current, forKey: Self.devRootsKey)
+    ///
+    /// - Returns: whether the persisted value actually CHANGED. A path that
+    ///   is not declared writes NOTHING — on a fresh install that would
+    ///   otherwise materialize the seeds into the suite as a side effect of
+    ///   removing something that was never there.
+    @discardableResult
+    func remove(_ path: String) -> Bool {
+        let current = declaredPathList()
+        let remaining = current.filter { $0 != path }
+        guard remaining.count != current.count else { return false }
+        defaults.set(remaining, forKey: Self.devRootsKey)
+        return true
     }
 
     /// Back to the seeds: the key is removed entirely (seeds are a
     /// fallback, never persisted).
-    func resetToDefaults() {
+    ///
+    /// - Returns: whether anything was persisted to remove.
+    @discardableResult
+    func resetToDefaults() -> Bool {
+        guard defaults.object(forKey: Self.devRootsKey) != nil else {
+            return false
+        }
         defaults.removeObject(forKey: Self.devRootsKey)
+        return true
     }
 
     // MARK: - Parsing (CFBoolean/NSNumber-guard doctrine)

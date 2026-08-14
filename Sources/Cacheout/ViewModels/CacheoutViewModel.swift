@@ -1078,8 +1078,9 @@ class CacheoutViewModel: ObservableObject {
                 return
             }
             devRootRejection = nil
-            reconstruction.devRootsStore.add(declared)
-            devRootsDidChange()
+            // A duplicate declaration is a store no-op — and therefore a
+            // REBUILD no-op (see `applyDevRootMutation`).
+            applyDevRootMutation(reconstruction.devRootsStore.add(declared))
         }
     }
 
@@ -1087,8 +1088,7 @@ class CacheoutViewModel: ObservableObject {
     func removeDevRoot(_ declaredPath: String) {
         guard let reconstruction else { return }
         devRootRejection = nil
-        reconstruction.devRootsStore.remove(declaredPath)
-        devRootsDidChange()
+        applyDevRootMutation(reconstruction.devRootsStore.remove(declaredPath))
     }
 
     /// RESET (R8): back to the seeds — the persisted key is removed
@@ -1096,7 +1096,22 @@ class CacheoutViewModel: ObservableObject {
     func resetDevRootsToDefaults() {
         guard let reconstruction else { return }
         devRootRejection = nil
-        reconstruction.devRootsStore.resetToDefaults()
+        applyDevRootMutation(reconstruction.devRootsStore.resetToDefaults())
+    }
+
+    /// Rebuild ONLY when the store actually changed. A rebuild is
+    /// deliberately unconditional for a REAL dev-roots change (dev-roots
+    /// equality does not prove COMPOSITION equality — `installRuntime`), but
+    /// a mutation that persisted NOTHING — re-adding an already-declared
+    /// root, removing one that was never there, resetting when nothing is
+    /// stored — must not gate every destructive path until the next scan
+    /// over a configuration nobody changed. The rows refresh either way, so
+    /// the editor and the persisted state never diverge.
+    private func applyDevRootMutation(_ changed: Bool) {
+        guard changed else {
+            refreshDevRootRows()
+            return
+        }
         devRootsDidChange()
     }
 

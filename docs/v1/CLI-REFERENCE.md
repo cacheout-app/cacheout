@@ -395,10 +395,12 @@ Two refusals are deliberately **TOKENLESS**:
 **Per item, not per run.** One invocation can mix authorized deletes,
 unauthorized refusals and ordinary items; each is decided on its own entry.
 
-**Rejected up front** (`INVALID_ARGUMENTS`, nothing deleted): an entry that
-is not exactly `slug:id:token`; a token that is not exactly 64 lowercase hex
-characters; the same item named twice; an item outside this clean's
-selection; an item proven to disclose nothing. Entry FORM is validated on
+**Rejected up front** (`INVALID_ARGUMENTS`, nothing deleted): a bare
+`--acknowledge-valuables` with no following entry (a valueless occurrence
+would read as an unacknowledged clean); an entry that is not exactly
+`slug:id:token`; a token that is not exactly 64 lowercase hex characters; the
+same item named twice; an item outside this clean's selection; an item proven
+to disclose nothing. Entry FORM is validated on
 `--dry-run`, unconfirmed and confirmed runs alike; token MATCHING happens
 only on the confirmed run, against a fresh inspection taken immediately
 before deletion.

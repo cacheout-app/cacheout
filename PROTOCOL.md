@@ -758,6 +758,7 @@ nothing deleted):
 
 | Input | Refused because |
 |---|---|
+| a bare `--acknowledge-valuables` with no following token | a valueless occurrence would look exactly like an ABSENT flag and run an UNACKNOWLEDGED clean while the caller believes they authorized one |
 | not exactly two colons (`slug:id`, `slug:id:tok:extra`) | the entry shape is frozen |
 | slug not `[a-z0-9_]+`, or an empty/ill-formed item id | it cannot address an item |
 | token not exactly 64 LOWERCASE hex characters | it is compared byte-for-byte; a spelling that can never match is rejected now, not at delete time |

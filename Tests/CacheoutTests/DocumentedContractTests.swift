@@ -295,6 +295,93 @@ final class DocumentedContractTests: XCTestCase {
         ), "no partial-inspection token exists")
     }
 
+    /// The documented fail-fast rule covers a valueless occurrence too: the
+    /// pure guard rejects on the OCCURRENCE count, so a trailing flag can
+    /// never read as an absent one.
+    func testDocumentedFailFastCoversAValuelessAcknowledgementOccurrence()
+        throws
+    {
+        // One occurrence, no value → refused, naming the flag.
+        guard case .failure(let error) = CLIHandler.acknowledgementValues(
+            from: [], occurrences: 1
+        ) else {
+            return XCTFail("a valueless occurrence must be refused")
+        }
+        XCTAssertTrue(
+            error.message.contains(CLIHandler.acknowledgeValuablesFlag),
+            error.message
+        )
+        XCTAssertTrue(error.message.contains("Nothing was cleaned"),
+                      error.message)
+
+        // A mix: two occurrences, one value → still refused (the caller
+        // authorized less than they think).
+        guard case .failure = CLIHandler.acknowledgementValues(
+            from: ["build_artifacts:a:b"], occurrences: 2
+        ) else {
+            return XCTFail("a partially-valued flag list must be refused")
+        }
+
+        // The honest cases pass through untouched.
+        guard case .success(let none) = CLIHandler.acknowledgementValues(
+            from: [], occurrences: 0
+        ) else { return XCTFail("an absent flag is not an error") }
+        XCTAssertTrue(none.isEmpty)
+        guard case .success(let both) = CLIHandler.acknowledgementValues(
+            from: ["a:b:c", "d:e:f"], occurrences: 2
+        ) else { return XCTFail("well-formed occurrences pass through") }
+        XCTAssertEqual(both, ["a:b:c", "d:e:f"])
+    }
+
+    // MARK: - Shipped TCC usage strings (R9/R14)
+
+    /// The macOS privacy prompts are PRODUCT copy, generated from three
+    /// synchronized sources (the bundle.sh heredoc, Info.plist, and
+    /// project.yml). They must describe the scanner that actually walks the
+    /// protected roots — after fn-4.7 that is `build_artifacts`, not the
+    /// retired node_modules scanner — and the three copies must agree, since
+    /// a drifting one ships silently in whichever build path used it.
+    func testShippedTCCUsageStringsDescribeTheLiveScannerAndStayInSync()
+        throws
+    {
+        let sources = [
+            "Sources/Cacheout/Info.plist",
+            "project.yml",
+            "scripts/bundle.sh",
+        ]
+        let documents = "Cacheout looks for developer build-artifact folders "
+            + "(target/, node_modules/, .venv/ and similar) in Documents "
+            + "during scans you start. Nothing is deleted without your "
+            + "confirmation."
+        let desktop = "Cacheout looks for developer build-artifact folders "
+            + "(target/, node_modules/, .venv/ and similar) on your Desktop "
+            + "during scans you start. Nothing is deleted without your "
+            + "confirmation."
+
+        for source in sources {
+            let text = try document(source)
+            XCTAssertTrue(text.contains(documents),
+                          "\(source) must carry the Documents usage string")
+            XCTAssertTrue(text.contains(desktop),
+                          "\(source) must carry the Desktop usage string")
+            XCTAssertFalse(
+                text.contains("project node_modules folders"),
+                "\(source) still describes the RETIRED scanner"
+            )
+            XCTAssertFalse(
+                text.contains("NodeModulesScanner"),
+                "\(source) still points at a deleted type"
+            )
+            // Every prompting root the walker gates is covered by a key.
+            for name in ProjectTreeWalker.tccProtectedAncestorNames {
+                XCTAssertTrue(
+                    text.contains("NS\(name)FolderUsageDescription"),
+                    "\(source) is missing the \(name) usage key"
+                )
+            }
+        }
+    }
+
     // MARK: - `scanner_errors` taxonomy (R14/R16)
 
     /// The documented kind list must contain every wire string the enum can
@@ -755,6 +842,32 @@ final class DocumentedCLIFramingTests: XCTestCase {
             XCTAssertTrue(message.contains("clean"),
                           "it points at the command that accepts it: \(message)")
         }
+    }
+
+    /// A trailing `--acknowledge-valuables` collects no value. Treating that
+    /// like an ABSENT flag would run an UNACKNOWLEDGED clean while the caller
+    /// believes they authorized one — so it is refused BEFORE dispatch,
+    /// exactly as a bare `--dev-root` is (review r1). `--confirm` is present
+    /// on purpose: the refusal must beat the destructive path.
+    func testBareAcknowledgeFlagIsRefusedInsteadOfSilentlyUnacknowledgedFraming()
+        throws
+    {
+        let run = try runCLI([
+            "--cli", "clean", "npm_cache", "--confirm",
+            CLIHandler.acknowledgeValuablesFlag,
+        ])
+        XCTAssertEqual(run.exitCode, 1, "a valueless entry must be refused")
+        XCTAssertEqual(run.stdout, "",
+                       "stdout stays EMPTY — no results, nothing deleted")
+        let error = try errorEnvelope(run)
+        XCTAssertEqual(error["code"] as? String, "INVALID_ARGUMENTS")
+        let message = (error["message"] as? String) ?? ""
+        XCTAssertTrue(message.contains(CLIHandler.acknowledgeValuablesFlag),
+                      "names the flag: \(message)")
+        XCTAssertTrue(message.contains("requires an entry"),
+                      "says what is missing: \(message)")
+        XCTAssertTrue(message.contains("Nothing was cleaned"),
+                      "states the fail-fast outcome: \(message)")
     }
 
     /// The documented "Argument ordering" rule: targets come BEFORE flags,

@@ -204,7 +204,7 @@ struct CLIHandler {
             let devRoots = resolveDevRoots(invocation, in: args)
             await handleClean(
                 slugs: invocation.targets,
-                acknowledgements: invocation.values(of: acknowledgeValuablesFlag),
+                acknowledgements: resolveAcknowledgements(invocation, in: args),
                 dryRun: isDryRun, confirmed: isConfirmed,
                 deps: .production(
                     orphanedCachesThresholds: sweepThresholds,
@@ -780,6 +780,49 @@ struct CLIHandler {
             parsed.append(ParsedAcknowledgement(key: key, token: token))
         }
         return .success(parsed)
+    }
+
+    /// The OCCURRENCE-COUNT guard for the repeatable acknowledgement flag,
+    /// mirroring `--dev-root`'s (review r1). The normalized grammar leaves a
+    /// valued flag with NO following token to that flag's own validation, and
+    /// silence is the dangerous direction here too: a trailing
+    /// `--acknowledge-valuables` collects no value, so the invocation would
+    /// look exactly like an UNACKNOWLEDGED clean and proceed — the caller
+    /// believing they authorized something. An acknowledgement is destructive
+    /// authorization input; a mismatch is `INVALID_ARGUMENTS`, pre-flight,
+    /// nothing deleted (the documented fail-fast rule).
+    ///
+    /// - Parameter occurrences: how many times the flag appears in argv.
+    static func acknowledgementValues(
+        from values: [String], occurrences: Int
+    ) -> Result<[String], CLIAddressError> {
+        guard occurrences <= values.count else {
+            return .failure(CLIAddressError(message:
+                "\(acknowledgeValuablesFlag) requires an entry — one "
+                + "occurrence has no value. Pass "
+                + "<scanner-slug>:<item-id>:<token> (the address and token "
+                + "the refusal printed). Nothing was cleaned."
+            ))
+        }
+        return .success(values)
+    }
+
+    /// The process-facing resolution: the acknowledgement entry list, exiting
+    /// via the invalid-arguments convention on a MISSING value. The raw argv
+    /// is read for the OCCURRENCE count only (the `--dev-root` convention) —
+    /// the values themselves always come from the one normalized grammar.
+    private static func resolveAcknowledgements(
+        _ invocation: NormalizedInvocation, in args: [String]
+    ) -> [String] {
+        switch acknowledgementValues(
+            from: invocation.values(of: acknowledgeValuablesFlag),
+            occurrences: args.filter { $0 == acknowledgeValuablesFlag }.count
+        ) {
+        case .failure(let error):
+            exitWithError(code: "INVALID_ARGUMENTS", message: error.message)
+        case .success(let values):
+            return values
+        }
     }
 
     private static func malformedAcknowledgement(

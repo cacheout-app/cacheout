@@ -96,10 +96,20 @@ and docs/v1/CLI-REFERENCE.md) — the pre-release `node_modules` →
   plus its GUI-only item model have been deleted. Persisted node_modules
   selections do not survive the rename — selection is session-scoped anyway.
   The `cacheout-mcp` consumer was updated in the same change window (branch
-  `fn-1.3-memory-stats-mcp-tool`, commit `51b4238`); its slug sites are
-  verifiable with
-  ``grep -rnE '"node_modules"|`node_modules`|node_modules:' src tests``,
-  which returns zero matches.
+  `fn-1.3-memory-stats-mcp-tool`, commit `c4efd9b`). Its slug sites are
+  verifiable with the SOURCE-ONLY semantic gate, which returns zero matches:
+
+  ```
+  grep -rnI --exclude-dir=__pycache__ \
+    -E '"node_modules"|`node_modules`|node_modules:' src tests
+  ```
+
+  The pattern targets slug SITES only — `scanner_id` values, address
+  prefixes, backtick slug mentions — so artifact-NAME references that
+  legitimately persist under `build_artifacts` do not match and zero is
+  reachable. `-I` and `--exclude-dir` keep it scoped to source: a stale or
+  freshly written `__pycache__/*.pyc` would otherwise let the gate report on
+  build artifacts instead of on the code.
 
 ## [2.2.0] - 2026-08-06
 

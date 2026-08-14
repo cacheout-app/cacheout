@@ -161,15 +161,16 @@ final class DocumentedContractTests: XCTestCase {
         XCTAssertEqual(produced.count, 64)
         XCTAssertTrue(CLIHandler.isAcknowledgementToken(produced))
 
-        // And the documented `modified_at_ns` derivation.
+        // And the documented `modified_at_ns` derivation, verbatim.
         XCTAssertTrue(
-            text.contains("modifiedSeconds * 1_000_000_000 + modifiedNanoseconds")
-                || text.contains("seconds *\n1_000_000_000 + nanoseconds")
-                || text.contains("1_000_000_000"),
+            text.contains(
+                "`modifiedSeconds * 1_000_000_000 + modifiedNanoseconds`"
+            ),
             "PROTOCOL.md must publish the nanosecond derivation"
         )
         XCTAssertEqual(valuables[0].identity.modifiedAtNanoseconds,
-                       1_755_057_600_123_456_789)
+                       1_755_057_600_123_456_789,
+                       "…and the derivation the binary performs matches it")
     }
 
     // MARK: - The documented wire keys
@@ -331,6 +332,46 @@ final class DocumentedContractTests: XCTestCase {
             from: ["a:b:c", "d:e:f"], occurrences: 2
         ) else { return XCTFail("well-formed occurrences pass through") }
         XCTAssertEqual(both, ["a:b:c", "d:e:f"])
+    }
+
+    // MARK: - The recorded cross-repo release gate (R6)
+
+    /// The CHANGELOG records the RETIREMENT of the `node_modules` slug and,
+    /// with it, the semantic gate the unreleased `cacheout-mcp` consumer must
+    /// pass before the next release ships. That gate is a release-blocking
+    /// promise, so its recorded form has to be one whose zero-state is
+    /// REACHABLE and STABLE:
+    ///
+    /// - semantic, not a raw `grep node_modules` — the artifact RULE keeps
+    ///   that directory name, so a raw search can never reach zero;
+    /// - SOURCE-scoped — without `-I` / `--exclude-dir=__pycache__` a stale
+    ///   or freshly written `.pyc` decides the verdict, and the gate reports
+    ///   on build artifacts instead of on the code (review r2).
+    ///
+    /// The sibling checkout is not assumed to exist, so this checks the
+    /// PROMISE's shape, which is what regressed.
+    func testRecordedCrossRepoGateIsSemanticAndSourceScoped() throws {
+        let changelog = try document("CHANGELOG.md")
+        guard let unreleased = changelog.range(of: "## [Unreleased]"),
+              let released = changelog.range(of: "## [2.2.0]") else {
+            return XCTFail("CHANGELOG must carry an [Unreleased] section")
+        }
+        let section = String(changelog[unreleased.lowerBound..<released.lowerBound])
+
+        XCTAssertTrue(section.contains("PRE-RELEASE RENAME"),
+                      "the slug retirement must be recorded under [Unreleased]")
+        for fragment in [
+            #""node_modules"|"#,          // scanner_id values
+            "node_modules:",              // address prefixes
+            "-I",                         // binaries never decide the verdict
+            "--exclude-dir=__pycache__",  // build artifacts never do either
+            "src tests",                  // the consumer's source roots
+        ] {
+            XCTAssertTrue(section.contains(fragment),
+                          "the recorded gate must contain '\(fragment)'")
+        }
+        XCTAssertTrue(section.contains("zero"),
+                      "the recorded gate must state its passing state")
     }
 
     // MARK: - Shipped TCC usage strings (R9/R14)

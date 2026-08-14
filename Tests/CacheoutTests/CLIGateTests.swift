@@ -177,25 +177,32 @@ final class CLIGateTests: XCTestCase {
         )
     }
 
-    /// A real node_modules fixture: `<container>/<project>/node_modules`
-    /// (optionally with content) plus a scanner over that container.
-    private func makeNodeModulesFixture(
+    /// A real per-item fixture on the REGISTERED per-item slug (fn-4.7 —
+    /// these cases used the retired `node_modules` scanner until its source
+    /// was deleted): `<dev>/<project>/{package.json, node_modules/}` — the
+    /// build-artifact rule row's marker-sibling shape — plus a
+    /// `BuildArtifactsScanner` over that dev root. `withContent: false`
+    /// yields the `.empty` artifact-dir cell.
+    private func makeArtifactFixture(
         project: String = "projA", withContent: Bool = true
-    ) throws -> (container: URL, nodeModules: URL, scanner: NodeModulesScanner) {
-        let container = base.appendingPathComponent("container-\(UUID().uuidString)")
-        let nodeModules = container
-            .appendingPathComponent(project)
-            .appendingPathComponent("node_modules")
-        try fm.createDirectory(at: nodeModules, withIntermediateDirectories: true)
+    ) throws -> (dev: URL, artifact: URL, scanner: BuildArtifactsScanner) {
+        let dev = base.appendingPathComponent("dev-\(UUID().uuidString)")
+        let projectDir = dev.appendingPathComponent(project)
+        let artifact = projectDir.appendingPathComponent("node_modules")
+        try fm.createDirectory(at: artifact, withIntermediateDirectories: true)
+        try Data(repeating: 0xC3, count: 64).write(
+            to: projectDir.appendingPathComponent("package.json")
+        )
         if withContent {
             try Data(repeating: 0xAB, count: 8192).write(
-                to: nodeModules.appendingPathComponent("dep.bin")
+                to: artifact.appendingPathComponent("dep.bin")
             )
         }
-        let scanner = NodeModulesScanner(
-            home: fixtureHome, searchRoots: [container]
+        let scanner = BuildArtifactsScanner(
+            home: fixtureHome,
+            devRoots: DevRootsResolution(keptRoots: [dev], issues: [])
         )
-        return (container, nodeModules, scanner)
+        return (dev, artifact, scanner)
     }
 
     private func successPayload(
@@ -846,44 +853,6 @@ final class CLIGateTests: XCTestCase {
                        "the readable root's items are unaffected")
     }
 
-    func testScanEnvelopeListsNodeModulesItems() async throws {
-        let fixture = try makeNodeModulesFixture()
-        let deps = try makeDeps(categories: [], extraScanners: [fixture.scanner])
-
-        let envelope = await CLIHandler.scanEnvelope(deps: deps)
-
-        XCTAssertEqual(envelope["schema_version"] as? Int, 4)
-        let items = try XCTUnwrap(envelope["scanner_items"] as? [[String: Any]])
-        XCTAssertEqual(items.count, 1)
-        let row = items[0]
-        XCTAssertEqual(row["scanner_id"] as? String, "node_modules")
-
-        let itemID = try XCTUnwrap(row["item_id"] as? String)
-        XCTAssertEqual(itemID.count, 64, "full-hash opaque id — never truncated")
-        XCTAssertEqual(itemID, itemID.lowercased())
-        XCTAssertTrue(itemID.allSatisfy { $0.isHexDigit },
-                      "64 lowercase-hex chars, always beside its scanner_id sibling")
-        let resolved = FileSystemIdentityProvider().canonicalize(fixture.nodeModules)
-        XCTAssertEqual(
-            itemID,
-            ReclaimableItem.stableID(scannerID: "node_modules", canonicalPath: resolved.path),
-            "the id IS the frozen preimage derivation — stable across rescans"
-        )
-
-        XCTAssertEqual(row["path"] as? String, resolved.path)
-        XCTAssertEqual(row["name"] as? String, "projA")
-        XCTAssertEqual(row["state"] as? String, "measured")
-        XCTAssertEqual(row["action"] as? String, "remove_item")
-        XCTAssertEqual(row["risk_level"] as? String, "review",
-                       "the frozen node_modules risk mapping (round 11)")
-        XCTAssertTrue(((row["evidence"] as? String) ?? "").contains("projA"))
-        let exact = try XCTUnwrap(row["exact_bytes"] as? Int64)
-        XCTAssertGreaterThan(exact, 0)
-        XCTAssertEqual(row["size_bytes"] as? Int64,
-                       exact + (row["estimated_up_to_bytes"] as? Int64 ?? 0),
-                       "size_bytes stays the compatibility component sum")
-    }
-
     func testScanEnvelopeScannerErrorsBothForms() async throws {
         // Filesystem-kind issue: carries its real path.
         let refusedRoot = base.appendingPathComponent("refused-root")
@@ -1125,7 +1094,7 @@ final class CLIGateTests: XCTestCase {
             to: catRoot.appendingPathComponent("f.bin")
         )
         let category = makeCategory(name: "cat_a", path: catRoot.path)
-        let fixture = try makeNodeModulesFixture()
+        let fixture = try makeArtifactFixture()
         let deps = try makeDeps(categories: [category], extraScanners: [fixture.scanner])
 
         // Echo-back: the item id comes from scan output, never derived.
@@ -1143,15 +1112,15 @@ final class CLIGateTests: XCTestCase {
 
         // Form 2: bare per-item scanner slug — ALL its items.
         let byScanner = try successPayload(await CLIHandler.cleanCLIOutcome(
-            targets: ["node_modules"], dryRun: true, confirmed: false, euid: 501, deps: deps
+            targets: ["build_artifacts"], dryRun: true, confirmed: false, euid: 501, deps: deps
         ))
         let scannerRows = try XCTUnwrap(byScanner["results"] as? [[String: Any]])
         XCTAssertEqual(scannerRows.map { $0["slug"] as? String },
-                       ["node_modules:\(itemID)"])
+                       ["build_artifacts:\(itemID)"])
 
         // Form 3: `<scanner-slug>:<item-id>` — one item, id echoed back.
         let byAddress = try successPayload(await CLIHandler.cleanCLIOutcome(
-            targets: ["node_modules:\(itemID)"], dryRun: true, confirmed: false,
+            targets: ["build_artifacts:\(itemID)"], dryRun: true, confirmed: false,
             euid: 501, deps: deps
         ))
         let addressRows = try XCTUnwrap(byAddress["results"] as? [[String: Any]])
@@ -1160,26 +1129,29 @@ final class CLIGateTests: XCTestCase {
 
         // Mixed forms in one invocation resolve together, deduped by item.
         let mixed = try successPayload(await CLIHandler.cleanCLIOutcome(
-            targets: ["cat_a", "node_modules", "node_modules:\(itemID)"],
+            targets: ["cat_a", "build_artifacts", "build_artifacts:\(itemID)"],
             dryRun: true, confirmed: false, euid: 501, deps: deps
         ))
         let mixedRows = try XCTUnwrap(mixed["results"] as? [[String: Any]])
         XCTAssertEqual(
             mixedRows.map { $0["slug"] as? String },
-            ["cat_a", "node_modules:\(itemID)"],
+            ["cat_a", "build_artifacts:\(itemID)"],
             "an item named twice (scanner-wide + addressed) appears once, argument order kept"
         )
     }
 
     func testCleanUnknownTargetsAreInvalidArguments() async throws {
-        let fixture = try makeNodeModulesFixture()
+        let fixture = try makeArtifactFixture()
         let deps = try makeDeps(
             categories: [makeCategory(name: "cat_a")],
             extraScanners: [fixture.scanner]
         )
 
-        for target in ["nope", "node_modules:" + String(repeating: "0", count: 64),
-                       "node_modules:", "cat_a:whatever", "nope:abc"] {
+        // The RETIRED `node_modules` slug is in the matrix on purpose
+        // (fn-4.5/fn-4.7): it must be refused like any other unknown token.
+        for target in ["nope", "node_modules", "node_modules:abc",
+                       "build_artifacts:" + String(repeating: "0", count: 64),
+                       "build_artifacts:", "cat_a:whatever", "nope:abc"] {
             let failure = try failureOutcome(await CLIHandler.cleanCLIOutcome(
                 targets: [target], dryRun: true, confirmed: false, euid: 501, deps: deps
             ))
@@ -1306,10 +1278,10 @@ final class CLIGateTests: XCTestCase {
                       "the unrequested category's content is untouched")
     }
 
-    // MARK: - node_modules clean behind --confirm (R2, the acceptance headline)
+    // MARK: - Per-item clean behind --confirm (R2, the acceptance headline)
 
-    func testNodeModulesCleanWithoutConfirmIsRefusedWithPlan() async throws {
-        let fixture = try makeNodeModulesFixture()
+    func testPerItemCleanWithoutConfirmIsRefusedWithPlan() async throws {
+        let fixture = try makeArtifactFixture()
         let deps = try makeDeps(categories: [], extraScanners: [fixture.scanner])
         let envelope = await CLIHandler.scanEnvelope(deps: deps)
         let itemID = try XCTUnwrap(
@@ -1317,7 +1289,7 @@ final class CLIGateTests: XCTestCase {
         )
 
         let failure = try failureOutcome(await CLIHandler.cleanCLIOutcome(
-            targets: ["node_modules:\(itemID)"], dryRun: false, confirmed: false,
+            targets: ["build_artifacts:\(itemID)"], dryRun: false, confirmed: false,
             euid: 501, deps: deps
         ))
 
@@ -1325,31 +1297,31 @@ final class CLIGateTests: XCTestCase {
         let details = try XCTUnwrap(failure.details)
         let plan = try XCTUnwrap(details["plan"] as? [[String: Any]])
         XCTAssertEqual(plan.count, 1)
-        XCTAssertEqual(plan[0]["slug"] as? String, "node_modules:\(itemID)")
+        XCTAssertEqual(plan[0]["slug"] as? String, "build_artifacts:\(itemID)")
         XCTAssertEqual(plan[0]["action"] as? String, "clean")
-        XCTAssertTrue(fm.fileExists(atPath: fixture.nodeModules.path),
+        XCTAssertTrue(fm.fileExists(atPath: fixture.artifact.path),
                       "an unconfirmed clean deletes NOTHING")
     }
 
-    func testNodeModulesConfirmedCleanDeletesAndReportsExactRow() async throws {
-        let fixture = try makeNodeModulesFixture()
+    func testPerItemConfirmedCleanDeletesAndReportsExactRow() async throws {
+        let fixture = try makeArtifactFixture()
         let deps = try makeDeps(categories: [], extraScanners: [fixture.scanner])
         let envelope = await CLIHandler.scanEnvelope(deps: deps)
         let itemID = try XCTUnwrap(
             (envelope["scanner_items"] as? [[String: Any]])?.first?["item_id"] as? String
         )
-        let address = "node_modules:\(itemID)"
+        let address = "build_artifacts:\(itemID)"
 
         let payload = try successPayload(await CLIHandler.cleanCLIOutcome(
             targets: [address], dryRun: false, confirmed: true, euid: 501, deps: deps
         ))
 
         // The confirmed deletion, exercised IN-PROCESS through the injected
-        // bundle: the node_modules tree is gone, its project dir survives.
-        XCTAssertFalse(fm.fileExists(atPath: fixture.nodeModules.path),
-                       "the addressed node_modules tree is deleted")
+        // bundle: the artifact tree is gone, its project dir survives.
+        XCTAssertFalse(fm.fileExists(atPath: fixture.artifact.path),
+                       "the addressed artifact tree is deleted")
         XCTAssertTrue(
-            fm.fileExists(atPath: fixture.nodeModules.deletingLastPathComponent().path),
+            fm.fileExists(atPath: fixture.artifact.deletingLastPathComponent().path),
             "the project directory itself survives"
         )
 
@@ -1361,14 +1333,15 @@ final class CLIGateTests: XCTestCase {
         // composite address, with separate sibling identity fields whose
         // concatenation matches it.
         XCTAssertEqual(row["category"] as? String, address)
-        XCTAssertEqual(row["scanner_id"] as? String, "node_modules")
+        XCTAssertEqual(row["scanner_id"] as? String, "build_artifacts")
         XCTAssertEqual(row["item_id"] as? String, itemID)
         XCTAssertEqual(
             "\(row["scanner_id"] as? String ?? ""):\(row["item_id"] as? String ?? "")",
             row["category"] as? String,
             "consumers never parse the composite — the siblings reproduce it"
         )
-        XCTAssertEqual(row["name"] as? String, "projA")
+        XCTAssertEqual(row["name"] as? String, "node_modules",
+                       "the per-item display name is the ARTIFACT dir")
         XCTAssertEqual(row["success"] as? Bool, true)
         let freed = try XCTUnwrap(row["bytes_freed"] as? Int64)
         XCTAssertGreaterThan(freed, 0)
@@ -1377,7 +1350,7 @@ final class CLIGateTests: XCTestCase {
         // Per-scanner rollup rides additively (fn-2.3's report on the wire).
         let rollups = try XCTUnwrap(payload["scanner_rollups"] as? [[String: Any]])
         XCTAssertEqual(rollups.count, 1)
-        XCTAssertEqual(rollups[0]["scanner_id"] as? String, "node_modules")
+        XCTAssertEqual(rollups[0]["scanner_id"] as? String, "build_artifacts")
         XCTAssertEqual(rollups[0]["entry_count"] as? Int, 1)
         XCTAssertEqual(rollups[0]["exact_bytes"] as? Int64, freed)
     }
@@ -1386,7 +1359,7 @@ final class CLIGateTests: XCTestCase {
         // An EMPTY node_modules dir: recognized, emitted as `.empty` —
         // explicitly addressing it with --confirm deletes nothing, yields
         // NO result row, and stays a process-level success (round 9).
-        let fixture = try makeNodeModulesFixture(project: "emptyProj", withContent: false)
+        let fixture = try makeArtifactFixture(project: "emptyProj", withContent: false)
         let deps = try makeDeps(categories: [], extraScanners: [fixture.scanner])
         let envelope = await CLIHandler.scanEnvelope(deps: deps)
         let items = try XCTUnwrap(envelope["scanner_items"] as? [[String: Any]])
@@ -1395,11 +1368,11 @@ final class CLIGateTests: XCTestCase {
         let itemID = try XCTUnwrap(items.first?["item_id"] as? String)
 
         let payload = try successPayload(await CLIHandler.cleanCLIOutcome(
-            targets: ["node_modules:\(itemID)"], dryRun: false, confirmed: true,
+            targets: ["build_artifacts:\(itemID)"], dryRun: false, confirmed: true,
             euid: 501, deps: deps
         ))
 
-        XCTAssertTrue(fm.fileExists(atPath: fixture.nodeModules.path),
+        XCTAssertTrue(fm.fileExists(atPath: fixture.artifact.path),
                       "nothing is deleted for an .empty candidate")
         XCTAssertEqual((payload["results"] as? [[String: Any]])?.count, 0,
                        "no result entry — the cleaner's silent pre-admission skip surfaces as absence")

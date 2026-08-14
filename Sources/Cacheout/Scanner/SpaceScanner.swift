@@ -341,6 +341,20 @@ struct ReclaimableItem: Equatable, Sendable {
             .map { String(format: "%02x", $0) }
             .joined()
     }
+
+    /// The ONE 30-day staleness threshold behind every item's `isStale`
+    /// field and the GUI's "Select Stale (30d+)" section action — inherited
+    /// VERBATIM from the retired `NodeModulesItem` (fn-4.7), which was its
+    /// only home while node_modules was the only per-item scanner. It lives
+    /// on the item model now because the field it decides does: a scanner
+    /// that dates its content maps days-since to this predicate, and one
+    /// threshold means the badge and the selection policy can never drift.
+    /// `nil` days (nothing dated) is NEVER stale — an unknown age must not
+    /// read as an old one.
+    static func isStale(daysSinceModified days: Int?) -> Bool {
+        guard let days else { return false }
+        return days > 30
+    }
 }
 
 // MARK: - Scan outcome & issues
@@ -351,8 +365,8 @@ struct ReclaimableItem: Equatable, Sendable {
 /// problems with no recognized candidate land here.
 struct ScanIssue: Equatable, Sendable {
     /// EXTENSIBLE taxonomy (proven by `malformedOutcome`) — never write
-    /// consumers that assume the case list is closed. Generalizes
-    /// `NodeModulesScanIssue.Kind` scanner-agnostically.
+    /// consumers that assume the case list is closed. Generalizes the
+    /// retired `NodeModulesScanIssue.Kind` scanner-agnostically.
     enum Kind: Equatable, Sendable {
         /// `PathGuard.admitContainer` refused the search root.
         case containerRefused

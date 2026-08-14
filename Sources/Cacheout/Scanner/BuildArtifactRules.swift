@@ -24,8 +24,9 @@
 /// `defaultSelected: false` and `automaticCleanEligible: false`. `safe` RISK
 /// still communicates evidence confidence; eligibility is a separate,
 /// deliberate future decision. `node_modules/` stays at `.review` — the
-/// as-built NodeModulesScanner doctrine — because flipping it to safe would
-/// be a product change smuggled into a refactor.
+/// doctrine inherited verbatim from the retired node_modules scanner —
+/// because flipping it to safe would be a product change smuggled into a
+/// refactor.
 
 import Foundation
 
@@ -95,7 +96,7 @@ enum BuildArtifactRules {
                                   markers: ["Cargo.toml"]),
             risk: .safe, defaultSelected: false, automaticCleanEligible: false
         ),
-        // node_modules/ — preserves the as-built NodeModulesScanner
+        // node_modules/ — preserves the retired node_modules scanner's
         // doctrine (.review, never auto-eligible).
         BuildArtifactRule(
             shape: .markerSibling(artifactDirName: "node_modules",

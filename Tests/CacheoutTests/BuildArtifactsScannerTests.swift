@@ -1082,6 +1082,107 @@ final class BuildArtifactsScannerTests: XCTestCase {
                       "the root-boundary wording: \(error.message)")
     }
 
+    /// MIGRATED from `NodeModulesScannerTests` (fn-4.7): the retired
+    /// scanner proved that a boundary-denied item is refused END TO END, and
+    /// the subsuming scanner inherited the same `displayPath` helper and the
+    /// same `.denied` doctrine — so the proof moves here rather than dying
+    /// with its old owner. Three surfaces must AGREE (PR #455 P2): the CLI
+    /// plan verb (`refuse`, never `clean_with_warning`), the cleaner's
+    /// pre-dispatch R18 refusal, and the on-disk outcome — no deletion
+    /// entry, one SURFACED item error, readable siblings untouched. The scan
+    /// runs through the runtime's VALIDATED session, so the boundary shape
+    /// is also proven non-malformed on the real publication path.
+    func testBoundaryDeniedItemPlansRefuseAndIsRefusedWholeByTheCleaner()
+        async throws
+    {
+        let target = try makeProject(
+            at: dev.appendingPathComponent("proj"),
+            marker: "Cargo.toml", artifact: "target", payloadBytes: 8_192
+        )
+        let payload = target.appendingPathComponent("payload.bin")
+        let mounted = target.appendingPathComponent("mounted-volume")
+        try mkdir(mounted)
+
+        let provider = MountPointInjectingProvider()
+        provider.mountPointInodes.insert(
+            try XCTUnwrap(provider.identity(of: mounted)?.inode)
+        )
+
+        let session = try await scanSession(makeScanner(provider: provider))
+        let item = try XCTUnwrap(session.items.first,
+                                 "the boundary item publishes through the "
+                                    + "validated session — never malformed")
+        XCTAssertEqual(item.state, .denied)
+        XCTAssertEqual(CLIHandler.cleanPlanAction(for: item), "refuse",
+                       "dry-run and confirmation say what the confirmed run "
+                        + "does — refuse, never clean_with_warning")
+
+        let cleaner = session.runtime.makeCleaner(snapshot: session.snapshot)
+        let report = await cleaner.clean(items: [item], moveToTrash: false)
+
+        XCTAssertTrue(report.entries.isEmpty,
+                      "no deletion entry — nothing was freed")
+        XCTAssertEqual(report.errors.count, 1,
+                       "the refusal SURFACES as an item error (R18), never a "
+                        + "silent skip")
+        XCTAssertEqual(report.errors.first?.key, item.key)
+        XCTAssertTrue(
+            report.errors.first?.message.contains("refused") == true,
+            "the error says refusal: \(String(describing: report.errors.first))"
+        )
+        XCTAssertTrue(fm.fileExists(atPath: payload.path),
+                      "the readable payload is untouched — whole-target "
+                        + "refusal, not partial deletion")
+    }
+
+    // MARK: - R12: declared display path
+
+    /// MIGRATED from `NodeModulesScannerTests` (fn-4.7): this scanner
+    /// inherited the retired scanner's `displayPath` helper VERBATIM, so it
+    /// inherits the review-r1 rule it was hardened with — home shortening
+    /// requires a PATH-COMPONENT boundary. A sibling that merely
+    /// string-prefixes the home path (`/Users/d-other` beside `/Users/d`)
+    /// must render in full, never as `~-other/…`, least of all beside a
+    /// destructive `remove_item` action.
+    func testDeclaredDisplayPathShorteningRequiresAComponentBoundary()
+        async throws
+    {
+        // (a) A dev root whose path string-prefixes the fixture home.
+        let sibling = URL(fileURLWithPath: fixtureHome.path + "-other")
+        let outsideTarget = try makeProject(
+            at: sibling.appendingPathComponent("proj"),
+            marker: "Cargo.toml", artifact: "target"
+        )
+        let outside = try await runScan(makeScanner(roots: [sibling]))
+        let outsideItem = try XCTUnwrap(item(outside, at: outsideTarget))
+        XCTAssertFalse(
+            outsideItem.declaredDisplayPath.hasPrefix("~"),
+            "no component boundary, no shortening: "
+                + outsideItem.declaredDisplayPath
+        )
+        XCTAssertTrue(
+            outsideItem.declaredDisplayPath.hasSuffix("-other/proj/target"),
+            outsideItem.declaredDisplayPath
+        )
+
+        // (b) A genuine descendant of home shortens AT the boundary. Home is
+        // injected canonically because the walker lists descendants
+        // canonically (/private-resolved).
+        let canonicalHome = FileSystemIdentityProvider().canonicalize(fixtureHome)
+        let code = canonicalHome.appendingPathComponent("Code")
+        let insideTarget = try makeProject(
+            at: code.appendingPathComponent("proj2"),
+            marker: "Cargo.toml", artifact: "target"
+        )
+        let inside = try await runScan(
+            BuildArtifactsScanner(
+                home: canonicalHome, devRoots: resolution([code])
+            )
+        )
+        let insideItem = try XCTUnwrap(item(inside, at: insideTarget))
+        XCTAssertEqual(insideItem.declaredDisplayPath, "~/Code/proj2/target")
+    }
+
     func testChmod000ArtifactIsDeniedUnmeasuredWithClassifiedError()
         async throws
     {

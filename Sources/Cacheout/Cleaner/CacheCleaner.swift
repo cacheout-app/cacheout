@@ -6,15 +6,16 @@
 ///
 /// ## Unified entry (fn-2.3)
 ///
-/// `clean(items:moveToTrash:)` is THE one clean path: every selected
-/// `ReclaimableItem` — category aggregate, per-item scanner row, command
-/// category — flows through ONE dispatch on `ReclaimAction`, with PathGuard
-/// enforced at this chokepoint via each item's admission descriptor and
-/// per-root records. The pre-unification category-vs-node_modules fork is
-/// gone; `clean(results:nodeModules:moveToTrash:)` survives only as a THIN
-/// adapter for its own compatibility tests — the ViewModel (fn-2.4) and the
-/// CLI (fn-2.6) both consume `clean(items:)` directly now (deletable once
-/// those tests migrate onto item fixtures).
+/// `clean(items:moveToTrash:)` is THE one clean path — and since fn-4.7 the
+/// ONLY one: every selected `ReclaimableItem` — category aggregate, per-item
+/// scanner row, command category — flows through ONE dispatch on
+/// `ReclaimAction`, with PathGuard enforced at this chokepoint via each
+/// item's admission descriptor and per-root records. The pre-unification
+/// category-vs-node_modules fork is gone, and so is the
+/// `clean(results:nodeModules:moveToTrash:)` compatibility adapter that
+/// outlived it: its callers (the ViewModel in fn-2.4, the CLI in fn-2.6) had
+/// already migrated, and its remaining tests moved onto item fixtures when
+/// the node_modules scanner was retired.
 ///
 /// ## Safety model (fn-1.3, reshaped by fn-2.3)
 ///
@@ -249,9 +250,17 @@ actor CacheCleaner {
     ///     to, and where `.cacheout/cleanup.log` lives (injectable — tests
     ///     pass a fixture home; production the real one).
     ///   - containerRoots: configured container roots for delete-time
-    ///     `.removeItem` admission. `nil` uses the node_modules scanner's
-    ///     default list for `home`, keeping delete-time admission in
-    ///     lockstep with discovery.
+    ///     `.removeItem` admission — REQUIRED, no default (fn-4.7). Every
+    ///     production cleaner is built by
+    ///     `SpaceScannerRuntime.makeCleaner(snapshot:)` from the runtime's
+    ///     registration-derived `trustedContainerRoots` union, so delete-time
+    ///     admission covers exactly what registration declared. A
+    ///     store-reading default inside the cleaner would resolve dev-root
+    ///     configuration at the wrong layer and could admit roots the
+    ///     registered runtime never walked; direct callers (tests, the
+    ///     headless paths) pass their roots explicitly — `[]` admits no
+    ///     container item at all, which is the honest fail-closed value for a
+    ///     cleaner that owns no containers.
     ///   - containerSnapshot: the producing scan session's container
     ///     identity snapshot; `nil` refuses every `.removeItem` deletion
     ///     (fail-closed — category admission is unaffected).
@@ -264,7 +273,7 @@ actor CacheCleaner {
     ///   - trashHandler: Trash seam; `nil` uses `FileManager.trashItem`.
     init(
         home: URL = FileManager.default.homeDirectoryForCurrentUser,
-        containerRoots: [URL]? = nil,
+        containerRoots: [URL],
         containerSnapshot: ContainerSnapshot? = nil,
         preDeleteRevalidators: [String: PreDeleteRevalidator] = [:],
         provider: FileSystemIdentityProvider = FileSystemIdentityProvider(),
@@ -274,10 +283,7 @@ actor CacheCleaner {
         self.provider = provider
         self.sizer = DirectorySizer(provider: provider)
         self.pathGuard = PathGuard(
-            home: home,
-            containerRoots: containerRoots
-                ?? NodeModulesScanner.defaultSearchRoots(home: home),
-            provider: provider
+            home: home, containerRoots: containerRoots, provider: provider
         )
         self.containerSnapshot = containerSnapshot
         self.preDeleteRevalidators = preDeleteRevalidators
@@ -464,114 +470,6 @@ actor CacheCleaner {
             entries: entries,
             errors: errors
         )
-    }
-
-    // MARK: Clean — compatibility adapter (pre-unification callers)
-
-    /// THIN adapter with NO production caller left (the ViewModel migrated
-    /// in fn-2.4, the CLI in fn-2.6): builds `ReclaimableItem`s and
-    /// forwards to `clean(items:moveToTrash:)` — ONE dispatch, no second
-    /// code path. Survives for its own compatibility tests; deletable once
-    /// they migrate onto item fixtures.
-    func clean(
-        results: [ScanResult],
-        nodeModules: [NodeModulesItem] = [],
-        moveToTrash: Bool
-    ) async -> CleanupReport {
-        var items: [ReclaimableItem] = []
-        var preRefusals: [CleanupReport.ItemError] = []
-
-        for result in results where result.isSelected {
-            items.append(CategoryScanner.item(
-                from: result, rootRecords: compatibilityRecords(for: result)
-            ))
-        }
-
-        for nmItem in nodeModules where nmItem.isSelected {
-            let resolved = provider.canonicalize(nmItem.nodeModulesPath)
-            let id = ReclaimableItem.stableID(
-                scannerID: NodeModulesScanner.registeredID,
-                canonicalPath: resolved.path
-            )
-            // Item-mode admission requires origin-container provenance — an
-            // item that cannot name the configured search root it was
-            // discovered under is refused, not trusted. The unified
-            // descriptor makes the container non-optional, so the refusal
-            // lands here in the adapter (scanner-built items always carry
-            // provenance).
-            guard let origin = nmItem.originContainer else {
-                let reason = "refused: item carries no origin-container provenance"
-                preRefusals.append(CleanupReport.ItemError(
-                    key: ItemKey(
-                        scannerID: NodeModulesScanner.registeredID, itemID: id
-                    ),
-                    displayName: nmItem.projectName,
-                    message: reason
-                ))
-                logRefusal(label: nmItem.projectName, tag: "no-provenance",
-                           detail: "\(nmItem.nodeModulesPath.path): \(reason)")
-                continue
-            }
-            items.append(ReclaimableItem(
-                id: id,
-                scannerID: NodeModulesScanner.registeredID,
-                displayName: nmItem.projectName,
-                exactBytes: nmItem.sizeBytes,
-                estimatedUpToBytes: 0,
-                logicalBytes: nil,
-                itemCount: 0,
-                url: resolved,
-                declaredDisplayPath: nmItem.nodeModulesPath.path,
-                rootRecords: [RootScanRecord(
-                    requestedURL: nmItem.nodeModulesPath,
-                    resolvedURL: resolved,
-                    status: .measured
-                )],
-                state: .measured,
-                scanError: nil,
-                risk: .review,
-                evidence: "",
-                rebuildNote: nil,
-                action: .removeItem,
-                // Frozen arm (epic round 6): the UNRESOLVED discovered path
-                // is the deletion target — leaf never resolved.
-                admission: .containerItem(
-                    originContainer: origin,
-                    requestedTargetURL: nmItem.nodeModulesPath
-                ),
-                defaultSelected: false,
-                automaticCleanEligible: false,
-                isStale: nil
-            ))
-        }
-
-        let report = await clean(items: items, moveToTrash: moveToTrash)
-        guard !preRefusals.isEmpty else { return report }
-        return CleanupReport(
-            disposal: report.disposal,
-            entries: report.entries,
-            errors: report.errors + preRefusals
-        )
-    }
-
-    /// Root records for compatibility `ScanResult`s built WITHOUT the
-    /// fn-2.1 scan-time capture (pre-capture fixtures and legacy paths):
-    /// synthesize from the category's delete-time resolution — exactly the
-    /// roots the pre-unification cleaner operated on, admitted by the same
-    /// policy either way. Results that DO carry records keep them verbatim
-    /// (root-snapshot rule: the cleaner never re-evaluates
-    /// `resolvedPaths` for captured items).
-    private func compatibilityRecords(for result: ScanResult) -> [RootScanRecord] {
-        guard result.rootRecords.isEmpty, result.state != .missing else {
-            return result.rootRecords
-        }
-        return result.category.resolvedPaths(home: home).map { url in
-            RootScanRecord(
-                requestedURL: url,
-                resolvedURL: provider.canonicalize(url),
-                status: .measured
-            )
-        }
     }
 
     // MARK: - Structural refusal (defense in depth, rounds 11-13)

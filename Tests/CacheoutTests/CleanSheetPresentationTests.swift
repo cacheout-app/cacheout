@@ -501,8 +501,10 @@ final class CleanSheetPresentationTests: XCTestCase {
                     categories: [],
                     scanner: CacheScanner(home: fixtureHome, provider: provider)
                 ),
-                NodeModulesScanner(
-                    home: fixtureHome, searchRoots: [], provider: provider
+                BuildArtifactsScanner(
+                    home: fixtureHome,
+                    devRoots: DevRootsResolution(keptRoots: [], issues: []),
+                    provider: provider
                 ),
             ],
             categories: [],
@@ -512,12 +514,12 @@ final class CleanSheetPresentationTests: XCTestCase {
         let viewModel = CacheoutViewModel(runtime: runtime)
 
         let cautionRow = perItem(
-            scanner: NodeModulesScanner.registeredID,
-            id: "abc", name: "projectA", risk: .caution,
-            evidence: "node_modules of projectA — ~/dev/projectA"
+            scanner: BuildArtifactsScanner.registeredID,
+            id: "abc", name: "node_modules", risk: .caution,
+            evidence: "node_modules/ beside package.json"
         )
         viewModel.handle(.outcome(
-            scannerID: NodeModulesScanner.registeredID,
+            scannerID: BuildArtifactsScanner.registeredID,
             ScanOutcome(items: [cautionRow], errors: [])
         ))
 
@@ -532,7 +534,7 @@ final class CleanSheetPresentationTests: XCTestCase {
         XCTAssertEqual(viewModel.confirmationRows.map(\.id), [cautionRow.key])
         XCTAssertEqual(
             viewModel.confirmationRows[0].evidence,
-            "node_modules of projectA — ~/dev/projectA"
+            "node_modules/ beside package.json"
         )
     }
 

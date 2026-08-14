@@ -96,6 +96,81 @@ final class CacheCleanerTests: XCTestCase {
         ContainerSnapshot.capture(roots: roots, provider: provider)
     }
 
+    /// The ScanResult→item mapping the deleted `clean(results:nodeModules:)`
+    /// compatibility adapter performed, kept HERE (fn-4.7): the category
+    /// coverage below predates the item currency and still belongs on the ONE
+    /// clean path, so its fixtures are mapped exactly as the adapter mapped
+    /// them — `CategoryScanner.item(from:rootRecords:)` over records
+    /// synthesized from the category's own delete-time resolution when the
+    /// fixture carries no scan-time capture, and the adapter's `isSelected`
+    /// filter (selection never rides a `ReclaimableItem`).
+    private func categoryItems(
+        _ results: [ScanResult],
+        home: URL = FileManager.default.homeDirectoryForCurrentUser,
+        provider: FileSystemIdentityProvider = FileSystemIdentityProvider()
+    ) -> [ReclaimableItem] {
+        results.filter(\.isSelected).map { result in
+            let records: [RootScanRecord]
+            if result.rootRecords.isEmpty, result.state != .missing {
+                records = result.category.resolvedPaths(home: home).map { url in
+                    RootScanRecord(
+                        requestedURL: url,
+                        resolvedURL: provider.canonicalize(url),
+                        status: .measured
+                    )
+                }
+            } else {
+                records = result.rootRecords
+            }
+            return CategoryScanner.item(from: result, rootRecords: records)
+        }
+    }
+
+    /// A per-item `.removeItem` fixture — the currency the ONE clean path
+    /// consumes. The UNRESOLVED discovered target is BOTH the root record's
+    /// `requestedURL` and the `.containerItem` descriptor's
+    /// `requestedTargetURL` (leaf never resolved, fn-1 doctrine). Replaces the
+    /// `NodeModulesItem` fixtures the deleted adapter took: the cleaner's
+    /// item-mode behavior was never node_modules-specific, and the unified
+    /// descriptor makes origin-container provenance non-optional.
+    private func removableItem(
+        at target: URL,
+        originContainer: URL,
+        displayName: String = "proj",
+        scannerID: String = "fixture_scanner",
+        provider: FileSystemIdentityProvider = FileSystemIdentityProvider()
+    ) -> ReclaimableItem {
+        let resolved = provider.canonicalize(target)
+        return ReclaimableItem(
+            id: ReclaimableItem.stableID(
+                scannerID: scannerID, canonicalPath: resolved.path
+            ),
+            scannerID: scannerID,
+            displayName: displayName,
+            exactBytes: 16,
+            estimatedUpToBytes: 0,
+            logicalBytes: nil,
+            itemCount: 0,
+            url: resolved,
+            declaredDisplayPath: target.path,
+            rootRecords: [RootScanRecord(
+                requestedURL: target, resolvedURL: resolved, status: .measured
+            )],
+            state: .measured,
+            scanError: nil,
+            risk: .review,
+            evidence: "",
+            rebuildNote: nil,
+            action: .removeItem,
+            admission: .containerItem(
+                originContainer: originContainer, requestedTargetURL: target
+            ),
+            defaultSelected: false,
+            automaticCleanEligible: false,
+            isStale: nil
+        )
+    }
+
     /// Two directory entries, one inode (8192 bytes allocated).
     private func makeHardlinkPair(
         in dir: URL, name: String = "hl"
@@ -306,9 +381,9 @@ final class CacheCleanerTests: XCTestCase {
         try FileManager.default.createDirectory(at: nestedDir, withIntermediateDirectories: true)
         try writeFile(nestedDir.appendingPathComponent("inner.bin"))
 
-        let cleaner = CacheCleaner()
+        let cleaner = CacheCleaner(containerRoots: [])
         let report = await cleaner.clean(
-            results: [makeScanResult(category: makeCategory(at: tmp))],
+            items: categoryItems([makeScanResult(category: makeCategory(at: tmp))]),
             moveToTrash: false
         )
 
@@ -329,9 +404,9 @@ final class CacheCleanerTests: XCTestCase {
             try writeFile(tmp.appendingPathComponent("f-\(i)"))
         }
 
-        let cleaner = CacheCleaner()
+        let cleaner = CacheCleaner(containerRoots: [])
         let report = await cleaner.clean(
-            results: [makeScanResult(category: makeCategory(at: tmp))],
+            items: categoryItems([makeScanResult(category: makeCategory(at: tmp))]),
             moveToTrash: false
         )
 
@@ -349,8 +424,8 @@ final class CacheCleanerTests: XCTestCase {
         var result = makeScanResult(category: makeCategory(at: tmp), size: 0, items: 0)
         result.isSelected = true
 
-        let cleaner = CacheCleaner()
-        let report = await cleaner.clean(results: [result], moveToTrash: false)
+        let cleaner = CacheCleaner(containerRoots: [])
+        let report = await cleaner.clean(items: categoryItems([result]), moveToTrash: false)
 
         XCTAssertTrue(report.errors.isEmpty)
         XCTAssertTrue(FileManager.default.fileExists(atPath: tmp.path))
@@ -378,9 +453,11 @@ final class CacheCleanerTests: XCTestCase {
             riskLevel: .safe, rebuildNote: "", defaultSelected: true
         )
 
-        let cleaner = CacheCleaner(home: home)
+        let cleaner = CacheCleaner(home: home, containerRoots: [])
         let report = await cleaner.clean(
-            results: [makeScanResult(category: category)],
+            items: categoryItems(
+                [makeScanResult(category: category)], home: home
+            ),
             moveToTrash: false
         )
 
@@ -394,108 +471,70 @@ final class CacheCleanerTests: XCTestCase {
         )
     }
 
-    // MARK: - node_modules parallel deletion
+    // MARK: - Per-item parallel deletion
 
-    func testCleanNodeModulesParallelDeleteRemovesAll() async throws {
+    func testPerItemParallelDeleteRemovesAll() async throws {
         let root = try makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
 
-        var items: [NodeModulesItem] = []
+        var targets: [URL] = []
+        var items: [ReclaimableItem] = []
         for i in 0..<12 {
-            let projectDir = root.appendingPathComponent("proj-\(i)")
-            let nm = projectDir.appendingPathComponent("node_modules")
-            try FileManager.default.createDirectory(at: nm, withIntermediateDirectories: true)
-            try writeFile(nm.appendingPathComponent("pkg.json"))
-            items.append(NodeModulesItem(
-                projectName: "proj-\(i)",
-                projectPath: projectDir,
-                nodeModulesPath: nm,
-                sizeBytes: 16,
-                lastModified: nil,
-                originContainer: root,
-                isSelected: true
+            let target = root
+                .appendingPathComponent("proj-\(i)")
+                .appendingPathComponent("artifacts")
+            try FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
+            try writeFile(target.appendingPathComponent("pkg.json"))
+            targets.append(target)
+            items.append(removableItem(
+                at: target, originContainer: root, displayName: "proj-\(i)"
             ))
         }
 
         let cleaner = CacheCleaner(
             containerRoots: [root], containerSnapshot: sessionSnapshot(of: [root])
         )
-        let report = await cleaner.clean(results: [], nodeModules: items, moveToTrash: false)
+        let report = await cleaner.clean(items: items, moveToTrash: false)
 
         XCTAssertTrue(report.errors.isEmpty, "unexpected errors: \(report.errors)")
         XCTAssertEqual(report.entries.count, items.count)
-        for item in items {
-            XCTAssertFalse(FileManager.default.fileExists(atPath: item.nodeModulesPath.path),
-                           "expected \(item.nodeModulesPath.path) removed")
+        for target in targets {
+            XCTAssertFalse(FileManager.default.fileExists(atPath: target.path),
+                           "expected \(target.path) removed")
         }
     }
 
-    func testCleanNodeModulesIsolatesPerItemErrors() async throws {
+    func testPerItemCleanIsolatesPerItemErrors() async throws {
         let root = try makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
 
         // Mix one missing path between two real ones — the item pipeline must
         // surface a single error and still clean the surviving items.
-        let goodA = root.appendingPathComponent("a/node_modules")
-        let goodB = root.appendingPathComponent("b/node_modules")
+        let goodA = root.appendingPathComponent("a/artifacts")
+        let goodB = root.appendingPathComponent("b/artifacts")
         try FileManager.default.createDirectory(at: goodA, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: goodB, withIntermediateDirectories: true)
         try writeFile(goodA.appendingPathComponent("a.json"))
         try writeFile(goodB.appendingPathComponent("b.json"))
 
-        let missing = root.appendingPathComponent("ghost/node_modules")
+        let missing = root.appendingPathComponent("ghost/artifacts")
 
-        let items: [NodeModulesItem] = [
-            NodeModulesItem(projectName: "a", projectPath: goodA.deletingLastPathComponent(),
-                            nodeModulesPath: goodA, sizeBytes: 16, lastModified: nil,
-                            originContainer: root, isSelected: true),
-            NodeModulesItem(projectName: "ghost", projectPath: missing.deletingLastPathComponent(),
-                            nodeModulesPath: missing, sizeBytes: 16, lastModified: nil,
-                            originContainer: root, isSelected: true),
-            NodeModulesItem(projectName: "b", projectPath: goodB.deletingLastPathComponent(),
-                            nodeModulesPath: goodB, sizeBytes: 16, lastModified: nil,
-                            originContainer: root, isSelected: true),
+        let items = [
+            removableItem(at: goodA, originContainer: root, displayName: "a"),
+            removableItem(at: missing, originContainer: root, displayName: "ghost"),
+            removableItem(at: goodB, originContainer: root, displayName: "b"),
         ]
 
         let cleaner = CacheCleaner(
             containerRoots: [root], containerSnapshot: sessionSnapshot(of: [root])
         )
-        let report = await cleaner.clean(results: [], nodeModules: items, moveToTrash: false)
+        let report = await cleaner.clean(items: items, moveToTrash: false)
 
         XCTAssertEqual(report.errors.count, 1, "exactly one missing item should surface as error")
         XCTAssertEqual(report.errors.first?.displayName, "ghost")
         XCTAssertEqual(report.entries.count, 2, "the two real items should still be cleaned")
         XCTAssertFalse(FileManager.default.fileExists(atPath: goodA.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: goodB.path))
-    }
-
-    func testCleanNodeModulesUnselectedAreSkipped() async throws {
-        let root = try makeTempDir()
-        defer { try? FileManager.default.removeItem(at: root) }
-
-        let kept = root.appendingPathComponent("kept/node_modules")
-        try FileManager.default.createDirectory(at: kept, withIntermediateDirectories: true)
-        try writeFile(kept.appendingPathComponent("x"))
-
-        let item = NodeModulesItem(
-            projectName: "kept",
-            projectPath: kept.deletingLastPathComponent(),
-            nodeModulesPath: kept,
-            sizeBytes: 16,
-            lastModified: nil,
-            originContainer: root,
-            isSelected: false
-        )
-
-        let cleaner = CacheCleaner(
-            containerRoots: [root], containerSnapshot: sessionSnapshot(of: [root])
-        )
-        let report = await cleaner.clean(results: [], nodeModules: [item], moveToTrash: false)
-
-        XCTAssertTrue(report.entries.isEmpty)
-        XCTAssertTrue(report.errors.isEmpty)
-        XCTAssertTrue(FileManager.default.fileExists(atPath: kept.path),
-                      "unselected items must not be touched")
     }
 
     // MARK: - Honest freed bytes (R1/R16)
@@ -523,9 +562,9 @@ final class CacheCleanerTests: XCTestCase {
         XCTAssertGreaterThan(expected, 0)
 
         let category = makeCategory(at: [p1, p2])
-        let cleaner = CacheCleaner()
+        let cleaner = CacheCleaner(containerRoots: [])
         let report = await cleaner.clean(
-            results: [makeScanResult(category: category)], moveToTrash: false
+            items: categoryItems([makeScanResult(category: category)]), moveToTrash: false
         )
 
         XCTAssertTrue(report.errors.isEmpty, "unexpected errors: \(report.errors)")
@@ -562,9 +601,9 @@ final class CacheCleanerTests: XCTestCase {
         let expected = try measuredExactOfChildren(of: p1)
 
         let category = makeCategory(at: [p1, p2])
-        let cleaner = CacheCleaner()
+        let cleaner = CacheCleaner(containerRoots: [])
         let report = await cleaner.clean(
-            results: [makeScanResult(category: category)], moveToTrash: false
+            items: categoryItems([makeScanResult(category: category)]), moveToTrash: false
         )
 
         XCTAssertEqual(report.errors.count, 1, "exactly one failed child: \(report.errors)")
@@ -593,8 +632,8 @@ final class CacheCleanerTests: XCTestCase {
         )
         XCTAssertTrue(denied.isSelected, "force-selected — the cleaner must still refuse")
 
-        let cleaner = CacheCleaner(home: home)
-        let report = await cleaner.clean(results: [denied], moveToTrash: false)
+        let cleaner = CacheCleaner(home: home, containerRoots: [])
+        let report = await cleaner.clean(items: categoryItems([denied]), moveToTrash: false)
 
         XCTAssertTrue(report.entries.isEmpty)
         XCTAssertEqual(report.errors.count, 1, "the refusal must SURFACE, not silently skip")
@@ -622,8 +661,8 @@ final class CacheCleanerTests: XCTestCase {
             scanError: ScanError(kind: .permissionDenied, message: "partial denial")
         )
 
-        let cleaner = CacheCleaner()
-        let report = await cleaner.clean(results: [partial], moveToTrash: false)
+        let cleaner = CacheCleaner(containerRoots: [])
+        let report = await cleaner.clean(items: categoryItems([partial]), moveToTrash: false)
 
         XCTAssertTrue(report.errors.isEmpty, "unexpected errors: \(report.errors)")
         XCTAssertEqual(report.entries.count, 1)
@@ -648,9 +687,9 @@ final class CacheCleanerTests: XCTestCase {
         try writeFile(cacheRoot.appendingPathComponent("real.bin"), bytes: 4096)
         let expected = measured(cacheRoot.appendingPathComponent("real.bin")).exactAllocatedBytes
 
-        let cleaner = CacheCleaner()
+        let cleaner = CacheCleaner(containerRoots: [])
         let report = await cleaner.clean(
-            results: [makeScanResult(category: makeCategory(at: cacheRoot))],
+            items: categoryItems([makeScanResult(category: makeCategory(at: cacheRoot))]),
             moveToTrash: false
         )
 
@@ -664,56 +703,33 @@ final class CacheCleanerTests: XCTestCase {
         XCTAssertEqual(report.entries.first?.estimatedUpToBytes, 0)
     }
 
-    // MARK: - node_modules item mode (R1/R15)
+    // MARK: - Per-item mode (R1/R15)
 
-    func testNodeModulesItemDeletesDirectoryItself() async throws {
+    func testPerItemModeDeletesTheTargetDirectoryItself() async throws {
         let root = try makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
         let projectDir = root.appendingPathComponent("app")
-        let nm = projectDir.appendingPathComponent("node_modules")
-        try FileManager.default.createDirectory(at: nm, withIntermediateDirectories: true)
-        try writeFile(nm.appendingPathComponent("dep.js"), bytes: 4096)
-        let expected = measured(nm).exactAllocatedBytes
+        let target = projectDir.appendingPathComponent("artifacts")
+        try FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
+        try writeFile(target.appendingPathComponent("dep.js"), bytes: 4096)
+        let expected = measured(target).exactAllocatedBytes
 
-        let item = NodeModulesItem(
-            projectName: "app", projectPath: projectDir, nodeModulesPath: nm,
-            sizeBytes: 999, lastModified: nil, originContainer: root, isSelected: true
+        let item = removableItem(
+            at: target, originContainer: root, displayName: "app"
         )
         let cleaner = CacheCleaner(
             containerRoots: [root], containerSnapshot: sessionSnapshot(of: [root])
         )
-        let report = await cleaner.clean(results: [], nodeModules: [item], moveToTrash: false)
+        let report = await cleaner.clean(items: [item], moveToTrash: false)
 
         XCTAssertTrue(report.errors.isEmpty, "unexpected errors: \(report.errors)")
-        XCTAssertFalse(FileManager.default.fileExists(atPath: nm.path),
-                       "item mode deletes the node_modules directory ITSELF")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: target.path),
+                       "item mode deletes the target directory ITSELF")
         XCTAssertTrue(FileManager.default.fileExists(atPath: projectDir.path),
                       "the project directory survives")
         XCTAssertEqual(report.entries.first?.exactBytes, expected,
-                       "freed bytes are measured, not the pre-scan sizeBytes")
-    }
-
-    func testNodeModulesItemWithoutProvenanceIsRefused() async throws {
-        let root = try makeTempDir()
-        defer { try? FileManager.default.removeItem(at: root) }
-        let nm = root.appendingPathComponent("proj/node_modules")
-        try FileManager.default.createDirectory(at: nm, withIntermediateDirectories: true)
-        try writeFile(nm.appendingPathComponent("x.js"))
-
-        let item = NodeModulesItem(
-            projectName: "proj", projectPath: nm.deletingLastPathComponent(),
-            nodeModulesPath: nm, sizeBytes: 16, lastModified: nil,
-            originContainer: nil, isSelected: true
-        )
-        let cleaner = CacheCleaner(
-            containerRoots: [root], containerSnapshot: sessionSnapshot(of: [root])
-        )
-        let report = await cleaner.clean(results: [], nodeModules: [item], moveToTrash: false)
-
-        XCTAssertTrue(report.entries.isEmpty)
-        XCTAssertEqual(report.errors.count, 1)
-        XCTAssertTrue(FileManager.default.fileExists(atPath: nm.path),
-                      "an item without origin-container provenance must not be deleted")
+                       "freed bytes are measured at delete time, never the "
+                        + "item's scan-time components")
     }
 
     // MARK: - Guard refusals block all three primitives (R15/R17/R18)
@@ -727,9 +743,9 @@ final class CacheCleanerTests: XCTestCase {
         // The category literally declares $HOME — the deny list must beat
         // the policy at delete time.
         let category = makeCategory(at: home, name: "hostile")
-        let cleaner = CacheCleaner(home: home)
+        let cleaner = CacheCleaner(home: home, containerRoots: [])
         let report = await cleaner.clean(
-            results: [makeScanResult(category: category)], moveToTrash: false
+            items: categoryItems([makeScanResult(category: category)]), moveToTrash: false
         )
 
         XCTAssertTrue(report.entries.isEmpty)
@@ -752,10 +768,11 @@ final class CacheCleanerTests: XCTestCase {
         let recorder = TrashRecorder()
         let cleaner = CacheCleaner(
             home: home,
+            containerRoots: [],
             trashHandler: makeTrashSeam(into: trashDir, recorder: recorder)
         )
         let report = await cleaner.clean(
-            results: [makeScanResult(category: makeCategory(at: home, name: "hostile"))],
+            items: categoryItems([makeScanResult(category: makeCategory(at: home, name: "hostile"))]),
             moveToTrash: true
         )
 
@@ -765,41 +782,37 @@ final class CacheCleanerTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path))
     }
 
-    func testUnconfiguredContainerBlocksNodeModulesItem() async throws {
+    func testUnconfiguredContainerBlocksPerItemTarget() async throws {
         let configured = try makeTempDir("configured-container")
         let elsewhere = try makeTempDir("unconfigured-container")
         defer {
             try? FileManager.default.removeItem(at: configured)
             try? FileManager.default.removeItem(at: elsewhere)
         }
-        let nm = elsewhere.appendingPathComponent("proj/node_modules")
-        try FileManager.default.createDirectory(at: nm, withIntermediateDirectories: true)
-        try writeFile(nm.appendingPathComponent("x.js"))
+        let target = elsewhere.appendingPathComponent("proj/artifacts")
+        try FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
+        try writeFile(target.appendingPathComponent("x.js"))
 
-        let item = NodeModulesItem(
-            projectName: "proj", projectPath: nm.deletingLastPathComponent(),
-            nodeModulesPath: nm, sizeBytes: 16, lastModified: nil,
-            originContainer: elsewhere, isSelected: true
-        )
+        let item = removableItem(at: target, originContainer: elsewhere)
         let cleaner = CacheCleaner(
             containerRoots: [configured],
             containerSnapshot: sessionSnapshot(of: [configured])
         )
-        let report = await cleaner.clean(results: [], nodeModules: [item], moveToTrash: false)
+        let report = await cleaner.clean(items: [item], moveToTrash: false)
 
         XCTAssertTrue(report.entries.isEmpty)
         XCTAssertEqual(report.errors.count, 1)
-        XCTAssertTrue(FileManager.default.fileExists(atPath: nm.path),
+        XCTAssertTrue(FileManager.default.fileExists(atPath: target.path),
                       "an item under an unconfigured container must not be deleted")
     }
 
-    func testCrossDeviceNodeModulesItemRefused() async throws {
+    func testCrossDevicePerItemTargetRefused() async throws {
         let root = try makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
         let mountedProject = root.appendingPathComponent("mounted-proj")
-        let nm = mountedProject.appendingPathComponent("node_modules")
-        try FileManager.default.createDirectory(at: nm, withIntermediateDirectories: true)
-        try writeFile(nm.appendingPathComponent("x.js"))
+        let target = mountedProject.appendingPathComponent("artifacts")
+        try FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
+        try writeFile(target.appendingPathComponent("x.js"))
 
         let provider = DeviceInjectingProvider()
         // The foreign device covers the project subtree, so the item is not
@@ -808,21 +821,20 @@ final class CacheCleanerTests: XCTestCase {
             (provider.canonicalize(mountedProject).path, 0xBEEF)
         ]
 
-        let item = NodeModulesItem(
-            projectName: "mounted-proj", projectPath: mountedProject,
-            nodeModulesPath: nm, sizeBytes: 16, lastModified: nil,
-            originContainer: root, isSelected: true
+        let item = removableItem(
+            at: target, originContainer: root, displayName: "mounted-proj",
+            provider: provider
         )
         let cleaner = CacheCleaner(
             containerRoots: [root],
             containerSnapshot: sessionSnapshot(of: [root], provider: provider),
             provider: provider
         )
-        let report = await cleaner.clean(results: [], nodeModules: [item], moveToTrash: false)
+        let report = await cleaner.clean(items: [item], moveToTrash: false)
 
         XCTAssertTrue(report.entries.isEmpty)
         XCTAssertEqual(report.errors.count, 1)
-        XCTAssertTrue(FileManager.default.fileExists(atPath: nm.path),
+        XCTAssertTrue(FileManager.default.fileExists(atPath: target.path),
                       "a cross-device item must not be deleted")
     }
 
@@ -844,9 +856,9 @@ final class CacheCleanerTests: XCTestCase {
         provider.overrides = [(provider.canonicalize(mounted).path, 0xBEEF)]
 
         let category = makeCategory(at: root, name: "mount-child")
-        let cleaner = CacheCleaner(provider: provider)
+        let cleaner = CacheCleaner(containerRoots: [], provider: provider)
         let report = await cleaner.clean(
-            results: [makeScanResult(category: category)], moveToTrash: false
+            items: categoryItems([makeScanResult(category: category)]), moveToTrash: false
         )
 
         XCTAssertTrue(FileManager.default.fileExists(atPath: mounted.path),
@@ -888,9 +900,9 @@ final class CacheCleanerTests: XCTestCase {
         provider.mountPointPaths = [provider.canonicalize(innerFirmlink).path]
 
         let category = makeCategory(at: root, name: "nested-mount")
-        let cleaner = CacheCleaner(provider: provider)
+        let cleaner = CacheCleaner(containerRoots: [], provider: provider)
         let report = await cleaner.clean(
-            results: [makeScanResult(category: category)], moveToTrash: false
+            items: categoryItems([makeScanResult(category: category)]), moveToTrash: false
         )
 
         XCTAssertTrue(
@@ -912,37 +924,33 @@ final class CacheCleanerTests: XCTestCase {
         XCTAssertEqual(report.errors.count, 1)
     }
 
-    func testNestedMountBoundaryInsideNodeModulesItemRefused() async throws {
+    func testNestedMountBoundaryInsidePerItemTargetRefused() async throws {
         // Item mode has the same shape: validateRemovableItem catches the
         // item ITSELF being a mount target, but not a mount nested beneath.
-        let root = try makeTempDir("nested-mount-nm")
+        let root = try makeTempDir("nested-mount-item")
         defer { try? FileManager.default.removeItem(at: root) }
-        let nm = root.appendingPathComponent("proj/node_modules")
-        let inner = nm.appendingPathComponent("inner-mount")
+        let target = root.appendingPathComponent("proj/artifacts")
+        let inner = target.appendingPathComponent("inner-mount")
         try FileManager.default.createDirectory(
             at: inner, withIntermediateDirectories: true
         )
-        try writeFile(nm.appendingPathComponent("x.js"))
+        try writeFile(target.appendingPathComponent("x.js"))
         try writeFile(inner.appendingPathComponent("payload.bin"))
 
         let provider = DeviceInjectingProvider()
         provider.mountPointPaths = [provider.canonicalize(inner).path]
 
-        let item = NodeModulesItem(
-            projectName: "proj", projectPath: nm.deletingLastPathComponent(),
-            nodeModulesPath: nm, sizeBytes: 16, lastModified: nil,
-            originContainer: root, isSelected: true
+        let item = removableItem(
+            at: target, originContainer: root, provider: provider
         )
         let cleaner = CacheCleaner(
             containerRoots: [root],
             containerSnapshot: sessionSnapshot(of: [root], provider: provider),
             provider: provider
         )
-        let report = await cleaner.clean(
-            results: [], nodeModules: [item], moveToTrash: false
-        )
+        let report = await cleaner.clean(items: [item], moveToTrash: false)
 
-        XCTAssertTrue(FileManager.default.fileExists(atPath: nm.path),
+        XCTAssertTrue(FileManager.default.fileExists(atPath: target.path),
                       "an item with a nested mount must not be deleted")
         XCTAssertTrue(
             FileManager.default.fileExists(
@@ -966,9 +974,9 @@ final class CacheCleanerTests: XCTestCase {
             at: [home], name: "cmd-hostile",
             cleanCommands: [["/usr/bin/touch", marker.path]]
         )
-        let cleaner = CacheCleaner(home: home)
+        let cleaner = CacheCleaner(home: home, containerRoots: [])
         let report = await cleaner.clean(
-            results: [makeScanResult(category: category)], moveToTrash: false
+            items: categoryItems([makeScanResult(category: category)]), moveToTrash: false
         )
 
         XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path),
@@ -995,9 +1003,9 @@ final class CacheCleanerTests: XCTestCase {
         )
         // The scan result still claims measurable content (captured before
         // the root disappeared) and is selected.
-        let cleaner = CacheCleaner(home: home)
+        let cleaner = CacheCleaner(home: home, containerRoots: [])
         let report = await cleaner.clean(
-            results: [makeScanResult(category: category, size: 4096)],
+            items: categoryItems([makeScanResult(category: category, size: 4096)]),
             moveToTrash: false
         )
 
@@ -1022,9 +1030,9 @@ final class CacheCleanerTests: XCTestCase {
             at: [cmdRoot], name: "cmd-ok",
             cleanCommands: [["/usr/bin/touch", marker.path]]
         )
-        let cleaner = CacheCleaner(home: home)
+        let cleaner = CacheCleaner(home: home, containerRoots: [])
         let report = await cleaner.clean(
-            results: [makeScanResult(category: category, size: 2048)], moveToTrash: false
+            items: categoryItems([makeScanResult(category: category, size: 2048)]), moveToTrash: false
         )
 
         XCTAssertTrue(report.errors.isEmpty, "unexpected errors: \(report.errors)")
@@ -1055,9 +1063,9 @@ final class CacheCleanerTests: XCTestCase {
                 ["/bin/sh", "-c", "printf %s \"$HOME\" > '\(capture.path)'"]
             ]
         )
-        let cleaner = CacheCleaner(home: home)
+        let cleaner = CacheCleaner(home: home, containerRoots: [])
         let report = await cleaner.clean(
-            results: [makeScanResult(category: category, size: 1024)],
+            items: categoryItems([makeScanResult(category: category, size: 1024)]),
             moveToTrash: false
         )
 
@@ -1092,9 +1100,9 @@ final class CacheCleanerTests: XCTestCase {
             $0 + measured(cacheRoot.appendingPathComponent("ok-\($1).bin")).exactAllocatedBytes
         }
 
-        let cleaner = CacheCleaner()
+        let cleaner = CacheCleaner(containerRoots: [])
         let report = await cleaner.clean(
-            results: [makeScanResult(category: makeCategory(at: cacheRoot))],
+            items: categoryItems([makeScanResult(category: makeCategory(at: cacheRoot))]),
             moveToTrash: false
         )
 
@@ -1124,12 +1132,13 @@ final class CacheCleanerTests: XCTestCase {
 
         let recorder = TrashRecorder()
         let cleaner = CacheCleaner(
+            containerRoots: [],
             trashHandler: makeTrashSeam(
                 into: trashDir, recorder: recorder, failingNames: ["bad.bin"]
             )
         )
         let report = await cleaner.clean(
-            results: [makeScanResult(category: makeCategory(at: cacheRoot))],
+            items: categoryItems([makeScanResult(category: makeCategory(at: cacheRoot))]),
             moveToTrash: true
         )
 
@@ -1154,9 +1163,9 @@ final class CacheCleanerTests: XCTestCase {
         let canonical = measured(a).estimatedUpToBytes
         XCTAssertGreaterThan(canonical, 0)
 
-        let cleaner = CacheCleaner()
+        let cleaner = CacheCleaner(containerRoots: [])
         let report = await cleaner.clean(
-            results: [makeScanResult(category: makeCategory(at: cacheRoot))],
+            items: categoryItems([makeScanResult(category: makeCategory(at: cacheRoot))]),
             moveToTrash: false
         )
 
@@ -1363,13 +1372,13 @@ final class CacheCleanerTests: XCTestCase {
             at: [cmdRoot], name: "cat-cmd", cleanCommands: [["/usr/bin/true"]]
         )
 
-        let cleaner = CacheCleaner()
+        let cleaner = CacheCleaner(containerRoots: [])
         let report = await cleaner.clean(
-            results: [
+            items: categoryItems([
                 makeScanResult(category: exactCat),
                 makeScanResult(category: linkCat),
                 makeScanResult(category: cmdCat, size: 2048),
-            ],
+            ]),
             moveToTrash: false
         )
 
@@ -1471,9 +1480,9 @@ final class CacheCleanerTests: XCTestCase {
             at: [cmdRoot], name: "cat-cmd", cleanCommands: [["/usr/bin/true"]]
         )
 
-        let cleaner = CacheCleaner()
+        let cleaner = CacheCleaner(containerRoots: [])
         let report = await cleaner.clean(
-            results: [makeScanResult(category: category, size: 2048)],
+            items: categoryItems([makeScanResult(category: category, size: 2048)]),
             moveToTrash: true
         )
 
@@ -1488,34 +1497,30 @@ final class CacheCleanerTests: XCTestCase {
 
     // MARK: - Trash mode end-to-end via seam
 
-    func testTrashModeTrashesNodeModulesItemViaSeam() async throws {
+    func testTrashModeTrashesPerItemTargetViaSeam() async throws {
         let root = try makeTempDir()
         let trashDir = try makeTempDir("fake-trash")
         defer {
             try? FileManager.default.removeItem(at: root)
             try? FileManager.default.removeItem(at: trashDir)
         }
-        let nm = root.appendingPathComponent("proj/node_modules")
-        try FileManager.default.createDirectory(at: nm, withIntermediateDirectories: true)
-        try writeFile(nm.appendingPathComponent("dep.js"), bytes: 4096)
-        let expected = measured(nm).exactAllocatedBytes
+        let target = root.appendingPathComponent("proj/artifacts")
+        try FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
+        try writeFile(target.appendingPathComponent("dep.js"), bytes: 4096)
+        let expected = measured(target).exactAllocatedBytes
 
         let recorder = TrashRecorder()
-        let item = NodeModulesItem(
-            projectName: "proj", projectPath: nm.deletingLastPathComponent(),
-            nodeModulesPath: nm, sizeBytes: 16, lastModified: nil,
-            originContainer: root, isSelected: true
-        )
+        let item = removableItem(at: target, originContainer: root)
         let cleaner = CacheCleaner(
             containerRoots: [root],
             containerSnapshot: sessionSnapshot(of: [root]),
             trashHandler: makeTrashSeam(into: trashDir, recorder: recorder)
         )
-        let report = await cleaner.clean(results: [], nodeModules: [item], moveToTrash: true)
+        let report = await cleaner.clean(items: [item], moveToTrash: true)
 
         XCTAssertTrue(report.errors.isEmpty, "unexpected errors: \(report.errors)")
-        XCTAssertEqual(recorder.urls, [nm], "item mode trashes the directory itself")
-        XCTAssertFalse(FileManager.default.fileExists(atPath: nm.path))
+        XCTAssertEqual(recorder.urls, [target], "item mode trashes the directory itself")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: target.path))
         XCTAssertEqual(report.entries.first?.exactBytes, expected)
         XCTAssertEqual(report.disposal, .trash)
     }
@@ -1616,7 +1621,7 @@ final class CacheCleanerTests: XCTestCase {
         XCTAssertEqual(item.state, .measured)
         XCTAssertEqual(item.allocatedBytes, 0)
 
-        let report = await CacheCleaner().clean(items: [item], moveToTrash: false)
+        let report = await CacheCleaner(containerRoots: []).clean(items: [item], moveToTrash: false)
 
         XCTAssertTrue(report.entries.isEmpty,
                       "a zero-allocated aggregate yields no entry")
@@ -1654,6 +1659,7 @@ final class CacheCleanerTests: XCTestCase {
         )
 
         let cleaner = CacheCleaner(
+            containerRoots: [],
             trashHandler: makeTrashSeam(into: trashDir, recorder: recorder)
         )
         let report = await cleaner.clean(items: [item], moveToTrash: true)
@@ -1697,7 +1703,7 @@ final class CacheCleanerTests: XCTestCase {
         )
         try FileManager.default.removeItem(at: cmdRoot)
 
-        let report = await CacheCleaner(home: home).clean(
+        let report = await CacheCleaner(home: home, containerRoots: []).clean(
             items: [item], moveToTrash: false
         )
 
@@ -1736,7 +1742,7 @@ final class CacheCleanerTests: XCTestCase {
             at: cmdRoot, to: base.appendingPathComponent("cmd-root-moved")
         )
 
-        let report = await CacheCleaner(home: home).clean(
+        let report = await CacheCleaner(home: home, containerRoots: []).clean(
             items: [item], moveToTrash: false
         )
 
@@ -1774,7 +1780,7 @@ final class CacheCleanerTests: XCTestCase {
         )
         try FileManager.default.removeItem(at: vanished)
 
-        let report = await CacheCleaner().clean(items: [item], moveToTrash: false)
+        let report = await CacheCleaner(containerRoots: []).clean(items: [item], moveToTrash: false)
 
         XCTAssertTrue(report.errors.isEmpty, "unexpected errors: \(report.errors)")
         XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path),
@@ -1810,7 +1816,7 @@ final class CacheCleanerTests: XCTestCase {
             makeRecord(cleanEmpty, status: .measured),
         ])
 
-        let cleaner = CacheCleaner()
+        let cleaner = CacheCleaner(containerRoots: [])
         let report = await cleaner.clean(items: [item], moveToTrash: false)
 
         XCTAssertTrue(report.errors.isEmpty,
@@ -1850,7 +1856,7 @@ final class CacheCleanerTests: XCTestCase {
             makeRecord(declared),
         ])
 
-        let cleaner = CacheCleaner()
+        let cleaner = CacheCleaner(containerRoots: [])
         let report = await cleaner.clean(items: [item], moveToTrash: false)
 
         XCTAssertEqual(report.errors.count, 1,
@@ -1885,7 +1891,7 @@ final class CacheCleanerTests: XCTestCase {
             makeRecord(outsider),
         ], exact: 2048)
 
-        let cleaner = CacheCleaner()
+        let cleaner = CacheCleaner(containerRoots: [])
         let report = await cleaner.clean(items: [item], moveToTrash: false)
 
         XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path),
@@ -1936,7 +1942,7 @@ final class CacheCleanerTests: XCTestCase {
             category: makeCategory(at: root, name: "enoent-cat"),
             records: [makeRecord(root)]
         )
-        let cleaner = CacheCleaner(provider: provider)
+        let cleaner = CacheCleaner(containerRoots: [], provider: provider)
         let report = await cleaner.clean(items: [item], moveToTrash: false)
 
         XCTAssertTrue(report.errors.isEmpty,
@@ -2389,7 +2395,7 @@ final class CacheCleanerTests: XCTestCase {
             action: .removeContents, admission: .category(category),
             requiresRevalidation: true
         )
-        let cleaner = CacheCleaner(home: home)
+        let cleaner = CacheCleaner(home: home, containerRoots: [])
         let report = await cleaner.clean(items: [item], moveToTrash: false)
 
         XCTAssertTrue(report.entries.isEmpty)
@@ -2474,7 +2480,7 @@ final class CacheCleanerTests: XCTestCase {
             records: [makeRecord(rootB)]
         )
 
-        let cleaner = CacheCleaner()
+        let cleaner = CacheCleaner(containerRoots: [])
         let report = await cleaner.clean(items: [itemA, itemB], moveToTrash: false)
 
         XCTAssertTrue(report.errors.isEmpty, "unexpected errors: \(report.errors)")
@@ -2531,7 +2537,7 @@ final class CacheCleanerTests: XCTestCase {
             )
         )
 
-        let cleaner = CacheCleaner()
+        let cleaner = CacheCleaner(containerRoots: [])
         let report = await cleaner.clean(
             items: [
                 zeroRecordCommands, zeroRecordContents,
@@ -2579,7 +2585,7 @@ final class CacheCleanerTests: XCTestCase {
             admission: .category(category)
         )
 
-        let cleaner = CacheCleaner()
+        let cleaner = CacheCleaner(containerRoots: [])
         let report = await cleaner.clean(items: [item], moveToTrash: false)
 
         XCTAssertTrue(report.entries.isEmpty)
@@ -2612,7 +2618,7 @@ final class CacheCleanerTests: XCTestCase {
             admission: .category(category)
         )
 
-        let cleaner = CacheCleaner()
+        let cleaner = CacheCleaner(containerRoots: [])
         let report = await cleaner.clean(items: [item], moveToTrash: false)
 
         XCTAssertTrue(report.entries.isEmpty)
@@ -2646,7 +2652,7 @@ final class CacheCleanerTests: XCTestCase {
             records: [], state: .missing, exact: 0
         )
 
-        let cleaner = CacheCleaner()
+        let cleaner = CacheCleaner(containerRoots: [])
         let report = await cleaner.clean(
             items: [malformedMissing, wellFormedMissing], moveToTrash: false
         )

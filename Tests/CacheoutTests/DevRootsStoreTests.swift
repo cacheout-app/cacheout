@@ -65,9 +65,21 @@ final class DevRootsStoreTests: XCTestCase {
         )
     }
 
+    /// The ten seed roots as an INDEPENDENT fixture list, resolved against
+    /// the injected home. Until fn-4.7 this expectation was derived from
+    /// `NodeModulesScanner.defaultSearchRoots(home:)`; the retired scanner's
+    /// source is gone, and a hand-written list is the stronger fixture anyway
+    /// (it cannot silently track a change to the code under test).
+    private func expectedSeedRoots() -> [URL] {
+        [
+            "Documents", "Developer", "Projects", "Code", "Sites",
+            "Desktop", "Dropbox", "repos", "src", "work",
+        ].map { fixtureHome.appendingPathComponent($0) }
+    }
+
     // MARK: - R8: seeds
 
-    func testSeedsAreExactlyTheTenNodeModulesRootsAgainstInjectedHome() {
+    func testSeedsAreExactlyTheTenRetiredNodeModulesRootsAgainstInjectedHome() {
         // No persisted value → the seeds, resolved against the INJECTED
         // home, all kept (absent roots pass through verbatim — machines
         // differ; walk time maps absence to honest omission).
@@ -76,8 +88,8 @@ final class DevRootsStoreTests: XCTestCase {
         XCTAssertEqual(resolution.issues, [])
         XCTAssertEqual(
             resolution.keptRoots,
-            NodeModulesScanner.defaultSearchRoots(home: fixtureHome),
-            "seeds must be the NodeModulesScanner ten VERBATIM"
+            expectedSeedRoots(),
+            "seeds must be the retired node_modules scanner's ten VERBATIM"
         )
         // The literal list, frozen — and pinned against the source of truth.
         XCTAssertEqual(DevRootsStore.seedRootNames, [
@@ -208,7 +220,7 @@ final class DevRootsStoreTests: XCTestCase {
             ["ok", 7],               // ANY non-string element corrupts the whole
             [true],                  // a boolean element likewise
         ]
-        let seeds = NodeModulesScanner.defaultSearchRoots(home: fixtureHome)
+        let seeds = expectedSeedRoots()
 
         for invalid in invalidValues {
             persist(invalid)
@@ -242,7 +254,7 @@ final class DevRootsStoreTests: XCTestCase {
 
         XCTAssertEqual(
             resolution.keptRoots,
-            NodeModulesScanner.defaultSearchRoots(home: fixtureHome)
+            expectedSeedRoots()
         )
         XCTAssertEqual(resolution.issues.count, 1)
         let issue = try XCTUnwrap(resolution.issues.first)
@@ -359,8 +371,7 @@ final class DevRootsStoreTests: XCTestCase {
         var resolution = store.effectiveRoots(home: fixtureHome)
         XCTAssertEqual(
             resolution.keptRoots.map(\.path),
-            (NodeModulesScanner.defaultSearchRoots(home: fixtureHome)
-                + [extra]).map(\.path)
+            (expectedSeedRoots() + [extra]).map(\.path)
         )
         // Idempotent add — exact string already declared.
         store.add(extra.path)
@@ -373,7 +384,7 @@ final class DevRootsStoreTests: XCTestCase {
         resolution = store.effectiveRoots(home: fixtureHome)
         XCTAssertEqual(
             resolution.keptRoots,
-            NodeModulesScanner.defaultSearchRoots(home: fixtureHome)
+            expectedSeedRoots()
         )
 
         // Remove a SEED name → nine effective roots.
@@ -390,7 +401,7 @@ final class DevRootsStoreTests: XCTestCase {
         resolution = store.effectiveRoots(home: fixtureHome)
         XCTAssertEqual(
             resolution.keptRoots,
-            NodeModulesScanner.defaultSearchRoots(home: fixtureHome)
+            expectedSeedRoots()
         )
     }
 

@@ -50,8 +50,9 @@ struct DevRootsStore {
     /// (`OrphanedCachesSweepConfig`).
     static let devRootsKey = "cacheout.buildArtifacts.devRoots"
 
-    /// Seed roots — NodeModulesScanner's ten search-root names VERBATIM
-    /// (the list the build-artifacts scanner inherits when it subsumes it).
+    /// Seed roots — the retired node_modules scanner's ten search-root
+    /// names VERBATIM (the list the build-artifacts scanner inherited when
+    /// it subsumed it, fn-4.5/fn-4.7).
     /// `Documents/GitHub` is deliberately NOT seeded: `~/Documents` covers
     /// it to the walker's depth budget, and a user who needs deeper adds
     /// the nested root, which then walks independently (D7).

@@ -831,8 +831,10 @@ final class CategoryScannerTests: XCTestCase {
             ]
         )
         XCTAssertFalse(
-            runtime.scanners.contains { $0.id == NodeModulesScanner.registeredID },
-            "the atomic swap unregistered node_modules in the same change"
+            runtime.scanners.contains { $0.id == "node_modules" },
+            "the atomic swap unregistered node_modules in the same change — "
+                + "the RETIRED slug is a bare string here because fn-4.7 "
+                + "deleted the scanner that used to declare it"
         )
         XCTAssertEqual(
             runtime.trustedContainerRoots.map(\.path),
@@ -1057,8 +1059,8 @@ final class CategoryScannerTests: XCTestCase {
         // The production truth table's NON-deletable emissions still pass:
         // `.denied` carries its honest `.deniedUnmeasured` record (the
         // cleaner refuses it; demanding a measured record would break
-        // NodeModulesScanner's denied emission), and `.missing` carries
-        // zero records.
+        // the retired node_modules scanner's denied emission), and
+        // `.missing` carries zero records.
         let denied = makeContainerItem(
             id: "bound1", scannerID: "fixture", state: .denied,
             rootRecords: [RootScanRecord(
@@ -1094,8 +1096,8 @@ final class CategoryScannerTests: XCTestCase {
         // item origin to the PRODUCING scanner's own declared roots: a
         // mapping bug in scanner A can no longer pair its target with
         // scanner B's registered container and ride B's registration
-        // through union admission. (Production: NodeModulesScanner's
-        // `originContainer` is always the exact search root the walk
+        // through union admission. (Production: the retired node_modules
+        // scanner's `originContainer` was always the exact search root the walk
         // started from — an exact member of its declared set.)
         let home = try makeTempDir("home")
         let rootA = fixtureContainer
@@ -1474,7 +1476,7 @@ final class CategoryScannerTests: XCTestCase {
             ("missing aggregate (no records, zero components)",
              makeAggregateItem(category: category, state: .missing),
              adapterID, true),
-            ("denied per-item (NodeModulesScanner's denied emission)",
+            ("denied per-item (the retired node_modules denied emission)",
              makeContainerItem(id: "c1", scannerID: "fixture",
                                state: .denied),
              "fixture", true),

@@ -151,7 +151,7 @@ final class CacheoutViewModelTests: XCTestCase {
     /// The production scanner ids a rebuilt runtime must NEVER acquire.
     private static let productionScannerIDs = [
         CategoryScanner.registeredID,
-        NodeModulesScanner.registeredID,
+        BuildArtifactsScanner.registeredID,
         OrphanedCachesScanner.registeredID,
     ]
 

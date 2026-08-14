@@ -49,6 +49,13 @@ final class SpaceScannerIntegrationTests: XCTestCase {
         "fixture_e2e_tree", "fixture_e2e_refusals", "fixture_e2e_cache",
     ]
 
+    /// The RETIRED per-item scanner slug (fn-4.5 unregistered it atomically
+    /// with `build_artifacts`; fn-4.7 deleted the scanner's source). It is a
+    /// bare string on purpose — there is no type left to name, and the
+    /// negative assertions below must keep proving that this SLUG never
+    /// reappears in any registry.
+    private let retiredNodeModulesSlug = "node_modules"
+
     private var base: URL!
     private var fixtureHome: URL!
     /// Injected suite for `DevRootsStore` — zero standard-suite reads or
@@ -184,8 +191,9 @@ final class SpaceScannerIntegrationTests: XCTestCase {
         XCTAssertEqual(runtime.trustedContainerRoots, [container],
                        "the runtime union is exactly the registered declaration")
         XCTAssertFalse(
-            NodeModulesScanner.defaultSearchRoots(home: fixtureHome)
-                .contains { $0.path == container.path },
+            DevRootsStore.seedRootNames
+                .map { fixtureHome.appendingPathComponent($0).path }
+                .contains(container.path),
             "the fixture container must be a root only registration declares"
         )
 
@@ -545,8 +553,10 @@ final class SpaceScannerIntegrationTests: XCTestCase {
             OrphanedCachesScanner.registeredID,
         ])
         XCTAssertFalse(
-            runtime.scanners.contains { $0.id == NodeModulesScanner.registeredID },
-            "the node_modules scanner is unregistered by the SAME change"
+            runtime.scanners.contains { $0.id == retiredNodeModulesSlug },
+            "the node_modules scanner is unregistered by the SAME change — "
+                + "and since fn-4.7 its source no longer exists, so the slug "
+                + "survives here only as the retired STRING it is"
         )
         // Registration is what extends delete-time admission (R4).
         XCTAssertTrue(runtime.trustedContainerRoots.contains { $0.path == dev.path })
@@ -748,7 +758,7 @@ final class SpaceScannerIntegrationTests: XCTestCase {
         XCTAssertTrue(deps.runtime.trustedContainerRoots.contains { $0.path == dev.path },
                       "…and therefore delete-time admission")
         XCTAssertFalse(
-            deps.runtime.scanners.contains { $0.id == NodeModulesScanner.registeredID },
+            deps.runtime.scanners.contains { $0.id == retiredNodeModulesSlug },
             "the CLI composition is the swapped one too"
         )
     }

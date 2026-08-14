@@ -46,8 +46,9 @@
 /// Sizing runs AFTER the collapse: one artifact is never measured twice.
 ///
 /// ## Item mapping (R10/R13/R15)
-/// Cloned VERBATIM from the as-built `NodeModulesScanner` candidate truth
-/// table (`NodeModulesScanner.swift:540-590`) and `OrphanedCachesScanner`'s
+/// Cloned VERBATIM from the candidate truth table of the retired
+/// `NodeModulesScanner` (subsumed by this scanner in fn-4.5, source deleted
+/// in fn-4.7) and from `OrphanedCachesScanner`'s
 /// emission: `stableID` over the `resolveTargetKeepingLeaf` identity path,
 /// exactly ONE `RootScanRecord` binding the UNRESOLVED requested target and
 /// the resolved display URL, `.containerItem` origin = the winning declared
@@ -510,7 +511,9 @@ struct BuildArtifactsScanner: @unchecked Sendable {
             automaticCleanEligible: candidate.rule.automaticCleanEligible,
             // Staleness is UNKNOWABLE when the walk dated no content (an
             // empty or wholly-denied tree) — nil, never a false "fresh".
-            isStale: days.map { NodeModulesItem.isStale(daysSinceModified: $0) },
+            isStale: days.map {
+                ReclaimableItem.isStale(daysSinceModified: $0)
+            },
             // Structural DISCLOSURE (never consent) + the scanner-agnostic
             // revalidation marker: EVERY build-artifact item carries the
             // probe, so every one is marked (R17/D8).
@@ -676,8 +679,8 @@ struct BuildArtifactsScanner: @unchecked Sendable {
         return .review
     }
 
-    /// The as-built `NodeModulesScanner` logical-bytes predicate, MATCHED
-    /// VERBATIM (`NodeModulesScanner.swift:618-619`): publish iff the item is
+    /// The retired `NodeModulesScanner`'s logical-bytes predicate, MATCHED
+    /// VERBATIM when that scanner was subsumed: publish iff the item is
     /// deletable AND logical exceeds measured. That is the only divergence
     /// direction worth showing — deletion frees LESS than the apparent size
     /// (the 57.1G-logical vs 31G-allocated sparse `target/` field case);

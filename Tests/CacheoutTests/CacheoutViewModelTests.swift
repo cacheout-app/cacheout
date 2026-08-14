@@ -1,3 +1,4 @@
+import Combine
 import XCTest
 @testable import Cacheout
 
@@ -1628,6 +1629,44 @@ final class CacheoutViewModelTests: XCTestCase {
             + "destructive path")
     }
 
+    /// A rebuild changes PRIVATE state that published derivations read
+    /// (`perItemSections`, `hasCleanableSelection`, the clean totals), so it
+    /// must co-publish — otherwise SwiftUI keeps rendering the old
+    /// composition's sections and a live Clean control until some unrelated
+    /// `@Published` write happens to fire. `installRuntime` is the ONE
+    /// replacement site, so this covers the deferred path too.
+    @MainActor
+    func testRuntimeRebuildPublishesAnObservableChange() async throws {
+        let outcome = ScanOutcome(
+            items: [perItem(scanner: "old_alpha", id: "a1")], errors: []
+        )
+        let runtime = try makeRuntime([
+            fixtureScanner("old_alpha") { outcome },
+        ])
+        let (seam, _) = makeReconstruction()
+        let viewModel = CacheoutViewModel(
+            runtime: runtime, reconstruction: seam
+        )
+        await viewModel.scan(trigger: .userInitiated)
+
+        let recorder = ChangeRecorder()
+        let subscription = viewModel.objectWillChange.sink { _ in
+            recorder.record()
+        }
+        defer { subscription.cancel() }
+        XCTAssertEqual(recorder.count, 0)
+
+        persistDevRoots(["beta"])
+        viewModel.devRootsDidChange()
+
+        XCTAssertGreaterThan(recorder.count, 0,
+                             "a runtime rebuild must notify observers — its "
+                                 + "derived state is published, its storage "
+                                 + "is not")
+        XCTAssertEqual(viewModel.perItemSections.map(\.scannerID),
+                       ["root_beta"])
+    }
+
     /// LATEST-VALUE-WINS: three Settings edits during one session collapse
     /// to exactly ONE rebuild, from the NEWEST resolution — no intermediate
     /// composition is ever built, and the session is never disturbed.
@@ -1791,6 +1830,13 @@ private final class ResolutionLog: @unchecked Sendable {
         defer { lock.unlock() }
         return values
     }
+}
+
+/// Counts `objectWillChange` emissions — SwiftUI's ONLY signal that a
+/// published derivation may have changed.
+private final class ChangeRecorder {
+    private(set) var count = 0
+    func record() { count += 1 }
 }
 
 /// Counts `identity(of:)` calls — the SYNCHRONOUS signal that a session

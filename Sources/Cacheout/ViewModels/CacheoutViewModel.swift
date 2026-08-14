@@ -771,8 +771,18 @@ class CacheoutViewModel: ObservableObject {
     /// does not prove COMPOSITION equality (the factory closes over state
     /// this view model cannot see), and over-gating is the fail-closed
     /// direction — one rescan restores every destructive path.
+    ///
+    /// Both replaced fields are PRIVATE, so this is the one transition that
+    /// changes published derivations (`perItemSections`, `selectedItems`,
+    /// `hasCleanableSelection`, the clean totals) without any `@Published`
+    /// write to carry it — the same co-publishing obligation the session
+    /// guard has, met explicitly here. Sent BEFORE the mutation
+    /// (`objectWillChange` semantics) and on the same MainActor step, so no
+    /// SwiftUI reader can render a stale section list or a live Clean
+    /// control over a composition that no longer exists.
     private func installRuntime(devRoots: DevRootsResolution) {
         guard let reconstruction else { return }
+        objectWillChange.send()
         runtime = reconstruction.makeRuntime(devRoots)
         runtimeGeneration += 1
     }

@@ -70,7 +70,8 @@ final class OrphanedCachesScannerTests: XCTestCase {
         installedAppStatus: @escaping @Sendable (String) -> InstalledAppStatus =
             { _ in .unknown },
         now: @escaping @Sendable () -> Date = { Date() },
-        toolAvailability: (@Sendable (String) -> Bool)? = nil
+        toolAvailability: (@Sendable (String) -> Bool)? = nil,
+        probeResolver: (@Sendable (String) -> String?)? = nil
     ) -> OrphanedCachesScanner {
         OrphanedCachesScanner(
             home: home,
@@ -79,7 +80,8 @@ final class OrphanedCachesScannerTests: XCTestCase {
             thresholds: thresholds,
             installedAppStatus: installedAppStatus,
             now: now,
-            toolAvailability: toolAvailability
+            toolAvailability: toolAvailability,
+            probeResolver: probeResolver
         )
     }
 
@@ -1408,12 +1410,49 @@ final class OrphanedCachesScannerTests: XCTestCase {
         XCTAssertFalse(item.automaticCleanEligible)
 
         // Tool present: excluded from the sweep exactly as before (the
-        // category scan owns it).
+        // category scan owns it). Probe seam injected — the test must
+        // never spawn a real `brew`.
         let excluded = makeScanner(
-            categories: [category], toolAvailability: { _ in true }
+            categories: [category], toolAvailability: { _ in true },
+            probeResolver: { _ in nil }
         )
         let (byNamePresent, _) = await scanItems(excluded)
         XCTAssertNil(byNamePresent["Homebrew"])
+    }
+
+    func testProbedCustomRootNotDoubleListedThroughProtocolScan() async throws {
+        // The PR #456 round-3 case end-to-end: the tool is present and its
+        // probe resolves to an in-scope path that is NOT a declared
+        // fallback. The category scan scans exactly that path, so a sweep
+        // item for the same tree would be a DOUBLE listing — the same bytes
+        // counted twice and a confirmed clean selecting both rows
+        // operating on the target twice.
+        let category = CacheCategory(
+            name: "Homebrew Cache", slug: "homebrew_cache",
+            description: "test", icon: "mug.fill",
+            discovery: [.probed(
+                command: "brew --cache",
+                requiresTool: "brew",
+                fallbacks: ["Library/Caches/Homebrew"]
+            )],
+            riskLevel: .safe, rebuildNote: "", defaultSelected: true
+        )
+        let custom = cachesRoot.appendingPathComponent("CustomBrew")
+        try mkdir(custom)
+        try writeFile(custom.appendingPathComponent("bottle.tar.gz"))
+        let customPath = custom.path
+
+        let scanner = makeScanner(
+            categories: [category],
+            toolAvailability: { _ in true },
+            probeResolver: { _ in customPath }
+        )
+        let (byName, outcome) = await scanItems(scanner)
+        try assertValidates(outcome, scanner: scanner)
+
+        XCTAssertNil(byName["CustomBrew"],
+                     "the probe-resolved tree belongs to the category scan "
+                     + "— no second sweep row over the same bytes")
     }
 
     // MARK: - R5/R9: GUI selection policy + session gates

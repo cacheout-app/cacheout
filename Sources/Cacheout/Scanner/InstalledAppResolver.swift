@@ -48,17 +48,21 @@ import Foundation
 ///   indexed locations, so without its clean miss global absence is not
 ///   established.
 /// - `.unknown` when absence cannot be asserted: the census was INCOMPLETE
-///   (an EXISTING root that could not be enumerated, an enumeration failure
-///   partway, or a bundle whose metadata was present (or possibly present)
-///   but unreadable — see below), or Spotlight was UNAVAILABLE (disabled,
+///   (a root that could not be statted or enumerated, an enumeration
+///   failure partway, or a bundle whose metadata was present (or possibly
+///   present) but unreadable — see below), or Spotlight was UNAVAILABLE (disabled,
 ///   unhealthy index, query failure or timeout) while the other signals
 ///   produced no match. Fail closed: a partial search never asserts a
 ///   global negative.
 ///
 /// MISSING roots (no Caskroom on a non-Homebrew machine) are normal
-/// absence — they never make the census incomplete. Likewise a root that
-/// exists but is not a directory: it contains no app bundles, with
-/// certainty.
+/// absence — they never make the census incomplete. MISSING means
+/// POSITIVELY missing: the root probe stats with errno preserved, and only
+/// ENOENT/ENOTDIR (including a dangling symlinked root — the probe follows
+/// links) counts as absence. Any OTHER stat failure — EACCES, or EPERM
+/// (TCC denials surface as both), ELOOP, EIO, … — means the root may exist
+/// unread, so the census is INCOMPLETE. Likewise a root that exists but is
+/// not a directory: it contains no app bundles, with certainty.
 ///
 /// Residual gap, accepted: an app on a volume EXCLUDED from Spotlight
 /// indexing that was also never LS-registered is invisible to all three
@@ -240,19 +244,38 @@ final class InstalledAppResolver: @unchecked Sendable {
         var complete = true
 
         for root in censusRoots {
-            var isDirectory: ObjCBool = false
-            guard fileManager.fileExists(atPath: root.path, isDirectory: &isDirectory) else {
-                // MISSING root: normal absence, never incompleteness.
+            switch Self.probeRoot(atPath: root.path) {
+            case .positivelyAbsent:
+                // MISSING root (stat fails ENOENT/ENOTDIR — including a
+                // dangling symlinked root, since the probe follows links):
+                // normal absence, never incompleteness.
                 continue
-            }
-            guard isDirectory.boolValue else {
+            case .notADirectory:
                 // Exists but is not a directory: contains no app bundles,
                 // with certainty — absence stays established.
                 continue
+            case .unreadable:
+                // The root MAY exist but cannot even be statted — EACCES/
+                // EPERM from an ancestor lacking search permission (TCC
+                // denials surface as EPERM as well as EACCES), ELOOP, EIO,
+                // …. `fileExists` conflated this with ENOENT; it is NOT
+                // positive absence — apps could hide under the unreadable
+                // root, so fail closed (PR #456 review r3). Keep walking:
+                // `.installed` can still win from the remaining roots.
+                complete = false
+                continue
+            case .directory:
+                break
             }
 
+            // The probe FOLLOWS a symlinked root, but `DirectoryEnumerator`
+            // does NOT walk through a top-level symlink — resolve the root
+            // first so the follow policy actually holds (a symlinked root
+            // whose target is enumerable is a complete, ordinary root).
+            // Entries WITHIN the walk keep the enumerator's no-descend
+            // symlink semantics.
             guard let enumerator = fileManager.enumerator(
-                at: root,
+                at: root.resolvingSymlinksInPath(),
                 includingPropertiesForKeys: [],
                 // options: [] deliberately — hidden entries INCLUDED;
                 // symlinked directories are never descended regardless.
@@ -301,6 +324,45 @@ final class InstalledAppResolver: @unchecked Sendable {
             // Metadata present (or possibly present) but unreadable: this
             // bundle could hide any id — fail closed.
             complete = false
+        }
+    }
+
+    /// Errno-preserving census-root probe outcome — see `probeRoot`.
+    private enum RootProbe {
+        /// Resolves to a directory: enumerate it.
+        case directory
+        /// Resolves to something that is not a directory (a regular file,
+        /// or a symlink to one): contains no app bundles, with certainty.
+        case notADirectory
+        /// stat failed ENOENT/ENOTDIR: the root provably does not exist —
+        /// normal absence (no Caskroom on a non-Homebrew machine).
+        case positivelyAbsent
+        /// stat failed with any OTHER errno (EACCES, EPERM, ELOOP, EIO,
+        /// …): the root may exist unread — census incompleteness.
+        case unreadable
+    }
+
+    /// Stats one census root with errno preserved, because
+    /// `fileManager.fileExists` answers `false` for an unreadable root
+    /// (EACCES/EPERM on an ancestor without search permission) exactly as
+    /// it does for a genuinely missing one — and only the latter may leave
+    /// the census complete (PR #456 review r3).
+    ///
+    /// Deliberately FOLLOWS a symlinked root (`stat`, not `lstat`): the
+    /// census asks "could an app exist under this root", and enumeration
+    /// itself resolves the top-level path. A DANGLING symlinked root
+    /// therefore stats ENOENT — positive absence — while an unreadable or
+    /// cyclic target (EACCES/EPERM/ELOOP) is incompleteness.
+    private static func probeRoot(atPath path: String) -> RootProbe {
+        var st = stat()
+        guard stat(path, &st) != 0 else {
+            return (st.st_mode & S_IFMT) == S_IFDIR ? .directory : .notADirectory
+        }
+        switch errno {
+        case ENOENT, ENOTDIR:
+            return .positivelyAbsent
+        default:
+            return .unreadable
         }
     }
 
@@ -368,11 +430,15 @@ enum SpotlightPresence {
 /// `mdfind` reports a malformed query and a disabled/rebuilding index the
 /// SAME way as genuine absence: exit 0, count 0. A zero is therefore only
 /// trustworthy after a canary proves the index can see apps that exist on
-/// every macOS installation (Finder, Dock, System Settings — any ONE hit
-/// passes). The canary runs ONCE per probe instance and uses the same
-/// query shape as real queries, so a shape regression fails the canary
-/// rather than minting false absences. Any failure — canary miss, spawn
-/// error, non-zero exit, unparseable output, timeout — LATCHES the probe
+/// every macOS installation (Finder, Dock, System Settings). The pass runs
+/// EVERY canary: with no query failures, any one hit proves health; ANY
+/// canary query failure latches unavailable regardless of hits in either
+/// ordering — a hit proves the index answers some queries, not that its
+/// zeros are trustworthy (any-failure-poisons doctrine, PR #456 review
+/// r3). The canary runs ONCE per probe instance and uses the same query
+/// shape as real queries, so a shape regression fails the canary rather
+/// than minting false absences. Any failure — canary miss, spawn error,
+/// non-zero exit, unparseable output, timeout — LATCHES the probe
 /// unavailable so a broken mds costs bounded time once, not 2s per
 /// candidate.
 ///
@@ -385,8 +451,9 @@ enum SpotlightPresence {
 /// wins). `@unchecked Sendable` under that discipline.
 final class SpotlightBundleIDProbe: @unchecked Sendable {
 
-    /// Bundle ids present on every macOS installation; ANY one hit proves
-    /// the index healthy.
+    /// Bundle ids present on every macOS installation; any one hit proves
+    /// the index healthy PROVIDED no canary query failed (see the header's
+    /// any-failure-poisons rule).
     static let canaryBundleIDs = [
         "com.apple.finder",
         "com.apple.dock",
@@ -463,9 +530,26 @@ final class SpotlightBundleIDProbe: @unchecked Sendable {
         case .unprobed: break
         }
 
-        let healthy = Self.canaryBundleIDs.contains { id in
-            (runQuery(id) ?? 0) > 0
+        // Run EVERY canary — a hit must NOT short-circuit the pass. A hit
+        // proves the index answers SOME queries, not that its zeros are
+        // trustworthy, and the doctrine is any-failure-poisons: a canary
+        // failure in EITHER ordering (failure-then-hit, hit-then-failure)
+        // latches unavailable rather than being laundered into an ordinary
+        // miss (PR #456 review r3 — the canary-pass sibling of the r2
+        // post-query latch recheck). Only a FAILURE short-circuits: the
+        // verdict cannot recover, and breaking caps a broken mds at one
+        // timeout instead of three. Worst case stays 3 × queryTimeout,
+        // once per probe instance.
+        var sawHit = false
+        var sawFailure = false
+        for id in Self.canaryBundleIDs {
+            guard let count = runQuery(id) else {
+                sawFailure = true
+                break
+            }
+            if count > 0 { sawHit = true }
         }
+        let healthy = sawHit && !sawFailure
         lock.lock()
         // First writer wins; an unavailable latch set meanwhile sticks.
         if state == .unprobed {

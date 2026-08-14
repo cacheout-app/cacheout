@@ -79,7 +79,8 @@ final class OrphanedCachesSweepTests: XCTestCase {
         provider: FileSystemIdentityProvider = FileSystemIdentityProvider(),
         probeDepthLimit: Int = 3,
         probeEntryLimit: Int = 512,
-        toolAvailability: (@Sendable (String) -> Bool)? = nil
+        toolAvailability: (@Sendable (String) -> Bool)? = nil,
+        probeResolver: (@Sendable (String) -> String?)? = nil
     ) -> OrphanedCachesScanner {
         OrphanedCachesScanner(
             home: home,
@@ -87,7 +88,8 @@ final class OrphanedCachesSweepTests: XCTestCase {
             provider: provider,
             probeDepthLimit: probeDepthLimit,
             probeEntryLimit: probeEntryLimit,
-            toolAvailability: toolAvailability
+            toolAvailability: toolAvailability,
+            probeResolver: probeResolver
         )
     }
 
@@ -159,9 +161,10 @@ final class OrphanedCachesSweepTests: XCTestCase {
     func testCategoryOwnedEntriesExcludedViaProductionCategoryList() throws {
         // Homebrew's declared root is a probed FALLBACK
         // (`Library/Caches/Homebrew`) — declared roots include fallbacks
-        // WHILE the gating tool is present (injected here so the test never
-        // depends on the machine's brew installation); probe commands never
-        // run during exclusion-set construction.
+        // WHILE the gating tool is present (tool gate AND probe seam
+        // injected here so the test never depends on the machine's tool
+        // installations and never spawns the production category list's
+        // real probe commands).
         try mkdir(cachesRoot.appendingPathComponent("Homebrew"))
         try writeFile(
             cachesRoot.appendingPathComponent("Homebrew/bottle.tar.gz"), bytes: 4_096
@@ -170,31 +173,203 @@ final class OrphanedCachesSweepTests: XCTestCase {
 
         let facts = factsByName(makeScanner(
             categories: CacheCategory.allCategories,
-            toolAvailability: { _ in true }
+            toolAvailability: { _ in true },
+            probeResolver: { _ in nil }
         ))
 
         XCTAssertNil(facts["Homebrew"], "category-owned entry absent from facts")
         XCTAssertNotNil(facts["UnownedSweepEntry"], "non-owned sibling present")
     }
 
-    func testProbedCategoryContributesFallbacksWithoutRunningProbe() throws {
-        let sentinel = base.appendingPathComponent("probe-ran")
+    func testInScopeNonFallbackProbeResultIsExcluded() throws {
+        // The PR #456 round-3 case: the probe of a TOOL-PRESENT category
+        // resolves to an in-scope path that is NOT among the declared
+        // fallbacks (`brew --cache` → custom `~/Library/Caches/CustomBrew`).
+        // The category scan scans exactly that path
+        // (`CacheCategory.resolvedPaths` prefers probe stdout), so the
+        // sweep must exclude it — or the same tree is listed, sized, and
+        // cleaned TWICE.
+        let custom = cachesRoot.appendingPathComponent("CustomBrew")
+        try mkdir(custom)
+        try writeFile(custom.appendingPathComponent("bottle.tar.gz"))
+        try mkdir(cachesRoot.appendingPathComponent("Homebrew"))
+        try mkdir(cachesRoot.appendingPathComponent("Sibling"))
         let category = syntheticCategory(discovery: [
             .probed(
-                command: "touch '\(sentinel.path)'",
-                requiresTool: nil,
-                fallbacks: ["Library/Caches/ProbeFallback"]
+                command: "brew --cache",
+                requiresTool: "brew",
+                fallbacks: ["Library/Caches/Homebrew"]
             ),
         ])
-        try mkdir(cachesRoot.appendingPathComponent("ProbeFallback"))
+
+        let facts = factsByName(makeScanner(
+            categories: [category],
+            toolAvailability: { _ in true },
+            probeResolver: { _ in custom.path }
+        ))
+
+        XCTAssertNil(facts["CustomBrew"],
+                     "the probe-resolved root the category scan owns is "
+                     + "excluded even though it is not a declared fallback")
+        XCTAssertNil(facts["Homebrew"],
+                     "declared fallbacks stay excluded too — the kept set is "
+                     + "a deliberate superset of what the category captured")
+        XCTAssertNotNil(facts["Sibling"])
+    }
+
+    func testRequiresToolNilProbedEntryProbesAndExcludesResult() throws {
+        // The pip shape: `requiresTool: nil` means the category scan ALWAYS
+        // attempts the probe — so the sweep must run it too, and an
+        // in-scope result excludes exactly as in the tool-gated case.
+        let recorder = InvocationRecorder()
+        let custom = cachesRoot.appendingPathComponent("pip-custom")
+        try mkdir(custom)
+        try mkdir(cachesRoot.appendingPathComponent("pip"))
         try mkdir(cachesRoot.appendingPathComponent("Sibling"))
+        let category = syntheticCategory(discovery: [
+            .probed(
+                command: "pip3 cache dir",
+                requiresTool: nil,
+                fallbacks: ["Library/Caches/pip"]
+            ),
+        ])
+
+        let facts = factsByName(makeScanner(
+            categories: [category],
+            probeResolver: { recorder.record($0); return custom.path }
+        ))
+
+        XCTAssertEqual(recorder.names, ["pip3 cache dir"],
+                       "no tool gate — the probe is always attempted, "
+                       + "mirroring resolvedPaths")
+        XCTAssertNil(facts["pip-custom"])
+        XCTAssertNil(facts["pip"])
+        XCTAssertNotNil(facts["Sibling"])
+    }
+
+    func testProbeFailureFailsTowardVisibilityNeverCrashes() throws {
+        // Probe failure/timeout (the production seam returns nil for both):
+        // the entry SURFACES in the sweep — failing toward VISIBILITY is
+        // the safe direction, because a listed sweep row is never a
+        // deletion grant (classification and container admission still
+        // govern it), whereas failing toward exclusion would hide a tree
+        // from both surfaces. In the common failure modes the category
+        // scan's own identical probe fails too and falls back to declared
+        // fallbacks — which stay excluded (tool present), keeping the two
+        // surfaces coherent.
+        let custom = cachesRoot.appendingPathComponent("CustomBrew")
+        try mkdir(custom)
+        try mkdir(cachesRoot.appendingPathComponent("Homebrew"))
+        let category = syntheticCategory(discovery: [
+            .probed(
+                command: "brew --cache",
+                requiresTool: "brew",
+                fallbacks: ["Library/Caches/Homebrew"]
+            ),
+        ])
+
+        let facts = factsByName(makeScanner(
+            categories: [category],
+            toolAvailability: { _ in true },
+            probeResolver: { _ in nil }
+        ))
+
+        XCTAssertNotNil(facts["CustomBrew"],
+                        "a failed probe contributes no root — the entry is "
+                        + "visible, not silently suppressed")
+        XCTAssertNil(facts["Homebrew"],
+                     "declared fallbacks still excluded while the tool is "
+                     + "present")
+    }
+
+    func testOutOfScopeOrRootEqualProbeResultsExcludeNothing() throws {
+        // The scope filter applies to probe results exactly as to declared
+        // roots: an out-of-scope result contributes nothing, and a probe
+        // emitting the sweep root ITSELF must not suppress the entire
+        // sweep.
+        let outside = base.appendingPathComponent("outside-cache")
+        try mkdir(outside)
+        try mkdir(cachesRoot.appendingPathComponent("Alpha"))
+        try mkdir(cachesRoot.appendingPathComponent("Beta"))
+        let categories = [
+            syntheticCategory(name: "out-of-scope", discovery: [
+                .probed(command: "outside-probe", requiresTool: nil,
+                        fallbacks: []),
+            ]),
+            syntheticCategory(name: "root-equal", discovery: [
+                .probed(command: "root-probe", requiresTool: nil,
+                        fallbacks: []),
+            ]),
+        ]
+        let rootPath = cachesRoot.path
+
+        let facts = factsByName(makeScanner(
+            categories: categories,
+            probeResolver: { command in
+                command == "root-probe" ? rootPath : outside.path
+            }
+        ))
+
+        XCTAssertEqual(Set(facts.keys), ["Alpha", "Beta"],
+                       "all fixture entries remain present")
+    }
+
+    func testProbeMemoizedPerCommandPerEnumeration() throws {
+        // Two categories sharing one probe command spawn it once; a
+        // distinct command spawns separately — the bound that keeps the
+        // exclusion pass's subprocess count at most one per distinct
+        // tool-present probe command.
+        let recorder = InvocationRecorder()
+        let categories = [
+            syntheticCategory(name: "a", discovery: [
+                .probed(command: "shared-probe", requiresTool: nil,
+                        fallbacks: []),
+            ]),
+            syntheticCategory(name: "b", discovery: [
+                .probed(command: "shared-probe", requiresTool: nil,
+                        fallbacks: []),
+            ]),
+            syntheticCategory(name: "c", discovery: [
+                .probed(command: "distinct-probe", requiresTool: nil,
+                        fallbacks: []),
+            ]),
+        ]
+
+        _ = factsByName(makeScanner(
+            categories: categories,
+            probeResolver: { recorder.record($0); return nil }
+        ))
+
+        XCTAssertEqual(recorder.names, ["shared-probe", "distinct-probe"],
+                       "one probe run per distinct command per enumeration")
+    }
+
+    func testProductionProbeSeamResolvesInScopeCustomRootViaRealShell() throws {
+        // The DEFAULT (uninjected) probe seam end-to-end, tool-free: a
+        // probe command that just echoes an in-scope non-fallback path runs
+        // through the real `CacheCategory.runProbe` doctrine. The premise
+        // half proves the double-count hazard is real — the category scan
+        // captures the probed root — and the fix half proves the sweep
+        // excludes the same root.
+        let custom = cachesRoot.appendingPathComponent("EchoedCustomRoot")
+        try mkdir(custom)
+        try writeFile(custom.appendingPathComponent("payload.bin"))
+        let category = syntheticCategory(discovery: [
+            .probed(
+                command: "echo '\(custom.path)'",
+                requiresTool: nil,
+                fallbacks: ["Library/Caches/NoSuchFallback"]
+            ),
+        ])
+
+        XCTAssertEqual(category.resolvedPaths(home: home).map(\.path),
+                       [custom.path],
+                       "premise: the category scan scans the probed root")
 
         let facts = factsByName(makeScanner(categories: [category]))
-
-        XCTAssertNil(facts["ProbeFallback"], "probed fallback root excludes")
-        XCTAssertNotNil(facts["Sibling"])
-        XCTAssertFalse(fm.fileExists(atPath: sentinel.path),
-                       "probe stdout contributes NOTHING — the command never runs")
+        XCTAssertNil(facts["EchoedCustomRoot"],
+                     "the sweep's production probe seam resolves the same "
+                     + "root and excludes it")
     }
 
     func testProbedFallbackWithAbsentToolIsSwept() throws {
@@ -223,10 +398,14 @@ final class OrphanedCachesSweepTests: XCTestCase {
         XCTAssertNotNil(facts["UninstalledTool"],
                         "a fallback the category scan provably skipped is swept")
         XCTAssertFalse(fm.fileExists(atPath: sentinel.path),
-                       "probe commands still never run during exclusion")
+                       "an absent tool gates the WHOLE entry — the probe "
+                       + "never runs (through the real production seam)")
     }
 
     func testProbedFallbackWithPresentToolStaysExcluded() throws {
+        // Tool present: fallbacks stay excluded, and (round 3) the probe
+        // now RUNS through the production seam — this one emits nothing on
+        // stdout, so it contributes no additional root.
         let sentinel = base.appendingPathComponent("probe-ran")
         let category = syntheticCategory(discovery: [
             .probed(
@@ -246,16 +425,19 @@ final class OrphanedCachesSweepTests: XCTestCase {
                      "tool present — the category scan owns the entry; "
                      + "excluded exactly as before")
         XCTAssertNotNil(facts["Sibling"])
-        XCTAssertFalse(fm.fileExists(atPath: sentinel.path),
-                       "the gate is tool PRESENCE only — probe stdout still "
-                       + "contributes nothing")
+        XCTAssertTrue(fm.fileExists(atPath: sentinel.path),
+                      "tool present — the probe RUNS during exclusion "
+                      + "(round-3 reversal), because the category scan will "
+                      + "scan wherever it resolves")
     }
 
-    func testToolGateScopeFilteredAndMemoized() throws {
-        // The `which` gate is bounded: consulted only for fallbacks inside
-        // the sweep root (scope filter runs FIRST), and once per distinct
-        // tool per enumeration — never per fallback.
-        let recorder = ToolCheckRecorder()
+    func testToolGateMemoizedAndConsultedForEveryProbedEntry() throws {
+        // The `which` gate runs once per DISTINCT tool per enumeration —
+        // never per fallback — and (round 3) for EVERY probed entry, even
+        // one whose fallbacks are all out of scope: its probe could still
+        // resolve INTO the sweep root, so tool presence must be known
+        // before deciding whether to probe.
+        let recorder = InvocationRecorder()
         let categories = [
             syntheticCategory(name: "in-scope-a", discovery: [
                 .probed(command: "true", requiresTool: "shared-tool",
@@ -274,12 +456,13 @@ final class OrphanedCachesSweepTests: XCTestCase {
 
         _ = factsByName(makeScanner(
             categories: categories,
-            toolAvailability: { recorder.record($0); return false }
+            toolAvailability: { recorder.record($0); return false },
+            probeResolver: { _ in nil }
         ))
 
-        XCTAssertEqual(recorder.names, ["shared-tool"],
-                       "one check per in-scope tool; out-of-scope fallbacks "
-                       + "never consult the gate")
+        XCTAssertEqual(recorder.names, ["shared-tool", "out-of-scope-tool"],
+                       "once per distinct tool; every probed entry consults "
+                       + "the gate")
     }
 
     func testProductionToolGateAbsentToolViaRealWhich() throws {
@@ -709,10 +892,10 @@ final class OrphanedCachesSweepTests: XCTestCase {
     }
 }
 
-/// Thread-safe tool-name recorder for the exclusion tool gate (the gate
-/// closure is `@Sendable` by type; the test reads after the synchronous
-/// enumeration returns).
-private final class ToolCheckRecorder: @unchecked Sendable {
+/// Thread-safe invocation recorder for the exclusion seams — tool-gate
+/// names and probe commands alike (the closures are `@Sendable` by type;
+/// the tests read after the synchronous enumeration returns).
+private final class InvocationRecorder: @unchecked Sendable {
     private let lock = NSLock()
     private var recorded: [String] = []
     var names: [String] {

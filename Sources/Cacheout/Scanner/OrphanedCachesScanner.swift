@@ -44,17 +44,27 @@
 ///
 /// Entries already owned by an existing `CacheCategory` are filtered out
 /// BEFORE the facts list is returned (no double listing or double counting).
-/// The exclusion set is built from DECLARED discovery roots — never probe
-/// stdout — with ONE gate (PR #456 review): a `.probed` entry's fallbacks
-/// are excluded only while its `requiresTool` is PRESENT, because a missing
-/// tool makes `CacheCategory.resolvedPaths(home:)` skip the whole discovery
-/// entry (fallbacks included), so the category scan provably does not own
-/// the fallback this session — and the stale cache an uninstalled tool left
-/// behind (the exact case this epic exists for) must surface HERE instead
-/// of being invisible to both surfaces. Tool presence is the same bounded
-/// `which` check the category scan gates on, memoized per enumeration and
-/// consulted only for fallbacks inside the sweep root; probe COMMANDS still
-/// never run during exclusion-set construction.
+/// The exclusion set is built from DECLARED discovery roots plus — for
+/// `.probed` entries the category scan will actually attempt — the probe's
+/// own resolved path, under ONE gate (PR #456 review, two rounds): a
+/// `.probed` entry contributes NOTHING while its `requiresTool` is ABSENT,
+/// because a missing tool makes `CacheCategory.resolvedPaths(home:)` skip
+/// the whole discovery entry (probe and fallbacks alike), so the category
+/// scan provably does not own those roots this session — and the stale
+/// cache an uninstalled tool left behind (the exact case this epic exists
+/// for) must surface HERE instead of being invisible to both surfaces.
+/// While the tool IS present (or no tool is required), the category scan
+/// WILL run the probe and scan wherever it resolves — so the sweep runs the
+/// SAME bounded probe during exclusion-set construction and excludes an
+/// in-scope result even when it is not among the declared fallbacks
+/// (`brew --cache` pointed at a custom `~/Library/Caches/CustomBrew` must
+/// not be listed by both surfaces and cleaned twice). Probe stdout is
+/// nondeterministic input, which is tolerable here ONLY because of the
+/// direction it can fail: an exclusion root can HIDE a sweep row, never
+/// widen deletion — and a probe that fails/times out simply contributes no
+/// root (the entry surfaces; visibility, not a deletion grant). Tool
+/// presence is the same bounded `which` check the category scan gates on;
+/// both checks and probe runs are memoized per enumeration.
 
 import Foundation
 import Darwin
@@ -218,12 +228,24 @@ struct OrphanedCachesScanner: @unchecked Sendable {
     /// because the scanner is long-lived and each scan must classify
     /// against its own "now".
     private let now: @Sendable () -> Date
-    /// Tool-presence gate for probed-fallback exclusion (R3, PR #456
-    /// review) — injectable so tests stay hermetic; the production default
-    /// mirrors `CacheCategory.toolExists` (same `which`, same PATH/HOME
+    /// Tool-presence gate for probed-entry exclusion (R3, PR #456 review) —
+    /// injectable so tests stay hermetic; the production default mirrors
+    /// `CacheCategory.toolExists` (same `which`, same PATH/HOME
     /// environment, same bounded wait), because the two MUST agree on
     /// whether the category scan attempts a probed discovery entry.
+    /// Consulted once per distinct tool per enumeration — for EVERY probed
+    /// entry, not only those with in-scope fallbacks, because the probe of
+    /// any tool-present entry can resolve into the sweep root.
     private let toolIsAvailable: @Sendable (String) -> Bool
+    /// Probe runner for probed-entry exclusion (R3, PR #456 review round 3):
+    /// command in, trimmed stdout path (or nil on failure/timeout/empty)
+    /// out. Injectable so tests never spawn real tools; the production
+    /// default IS `CacheCategory.runProbe` — the same subprocess doctrine
+    /// the category scan resolves with, so the two surfaces agree on where
+    /// a tool-present probed category lives. Failure direction: nil
+    /// contributes no exclusion root, so the entry SURFACES in the sweep —
+    /// visibility, never a deletion grant.
+    private let probeResolvedPath: @Sendable (String) -> String?
 
     init(
         home: URL,
@@ -237,7 +259,8 @@ struct OrphanedCachesScanner: @unchecked Sendable {
         installedAppStatus: @escaping @Sendable (String) -> InstalledAppStatus =
             { _ in .unknown },
         now: @escaping @Sendable () -> Date = { Date() },
-        toolAvailability: (@Sendable (String) -> Bool)? = nil
+        toolAvailability: (@Sendable (String) -> Bool)? = nil,
+        probeResolver: (@Sendable (String) -> String?)? = nil
     ) {
         self.home = home
         self.cachesRoot = cachesRoot
@@ -252,6 +275,8 @@ struct OrphanedCachesScanner: @unchecked Sendable {
         self.now = now
         self.toolIsAvailable = toolAvailability
             ?? { Self.productionToolAvailability($0, home: home) }
+        self.probeResolvedPath = probeResolver
+            ?? { CacheCategory.runProbe($0, home: home) }
     }
 
     // MARK: - Enumeration
@@ -350,73 +375,97 @@ struct OrphanedCachesScanner: @unchecked Sendable {
 
     // MARK: - Category-owned exclusion (R3)
 
-    /// Declared category roots kept for exclusion, as standardized path
-    /// components. Path construction mirrors BOTH
-    /// `CategoryAdmissionPolicy(category:home:)` and
-    /// `CacheCategory.resolvedPaths(home:)` — all three `PathDiscovery`
+    /// Category roots kept for exclusion, as standardized path components.
+    /// Path construction mirrors BOTH `CategoryAdmissionPolicy(category:home:)`
+    /// and `CacheCategory.resolvedPaths(home:)` — all three `PathDiscovery`
     /// kinds, `.staticPath` and non-`/`-prefixed probed fallbacks anchored
-    /// to the injected home, probe stdout contributing nothing.
+    /// to the injected home, probe results resolved exactly as
+    /// `resolvedPaths` resolves them (`URL(fileURLWithPath:)`).
     ///
-    /// Step 1 — scope filter: keep ONLY roots STRICTLY below the sweep
-    /// root. A root outside the sweep root, or EQUAL to it, contributes
-    /// NOTHING — otherwise a category declaring e.g. `~/Library` (an
-    /// ancestor of every entry) would silently suppress the entire sweep.
+    /// Scope filter (every candidate root, declared or probed): keep ONLY
+    /// roots STRICTLY below the sweep root. A root outside the sweep root,
+    /// or EQUAL to it, contributes NOTHING — otherwise a category declaring
+    /// e.g. `~/Library` (an ancestor of every entry), or a probe emitting
+    /// the sweep root itself, would silently suppress the entire sweep.
     ///
-    /// Step 1b — tool gate on probed fallbacks (PR #456 review): a
-    /// `.probed` entry with an ABSENT `requiresTool` is skipped ENTIRELY by
-    /// the category scan (`CacheCategory.resolvedPaths`), fallbacks
-    /// included, so excluding them here would hide the stale cache an
-    /// uninstalled tool left behind from BOTH surfaces. Gate order is
-    /// deliberate — scope filter FIRST, so the bounded `which` runs only
-    /// for fallbacks that could actually contribute (production: 4 distinct
-    /// tools), memoized per enumeration. While the tool IS present the
-    /// exclusion deliberately stays a SUPERSET of what the category scan
-    /// captured (all declared fallbacks, even when the probe resolved
-    /// elsewhere or a later fallback lost the first-match cut) —
-    /// conservative against double listing, and a declared-but-uncaptured
-    /// root remains attributable to its category by declaration. A probed
-    /// entry with NO `requiresTool` is always attempted by the category
-    /// scan, so its fallbacks stay unconditionally excluded, exactly as
-    /// before.
+    /// Tool gate on probed entries (PR #456 review): a `.probed` entry
+    /// whose `requiresTool` is ABSENT is skipped ENTIRELY by the category
+    /// scan (`CacheCategory.resolvedPaths`), probe and fallbacks alike, so
+    /// excluding any of its roots here would hide the stale cache an
+    /// uninstalled tool left behind from BOTH surfaces. The gate runs FIRST
+    /// (it governs the whole entry), once per distinct tool per
+    /// enumeration, for EVERY probed entry — not only those with in-scope
+    /// fallbacks, because a tool-present probe can resolve INTO the sweep
+    /// root from anywhere (production: 9 distinct tools, `which` answers in
+    /// milliseconds).
+    ///
+    /// Probe step (PR #456 review round 3): while the tool IS present (or
+    /// no tool is required) the category scan WILL run the probe and scan
+    /// wherever it resolves — a result inside the sweep root that is NOT
+    /// among the declared fallbacks (`brew --cache` → custom
+    /// `~/Library/Caches/CustomBrew`) would otherwise be listed and sized
+    /// by both surfaces and cleaned twice. So the sweep runs the SAME
+    /// bounded probe (`CacheCategory.runProbe` doctrine via the injectable
+    /// seam, memoized per command per enumeration) and keeps an in-scope
+    /// result. Nondeterministic stdout is tolerable ONLY because exclusion
+    /// is fail-safe by direction: a root can HIDE a sweep row, never widen
+    /// deletion; a probe failure/timeout contributes no root and the entry
+    /// surfaces (visibility, not a deletion grant). The kept set
+    /// deliberately stays a SUPERSET of what the category scan captured
+    /// (probe result AND all declared fallbacks, even when the probe
+    /// resolved elsewhere, its result does not exist on disk, or a later
+    /// fallback lost the first-match cut) — conservative against double
+    /// listing, and a declared-but-uncaptured root remains attributable to
+    /// its category by declaration.
     private func categoryExclusionRoots() -> [[String]] {
         let rootComponents = cachesRoot.standardizedFileURL.pathComponents
         var toolPresence: [String: Bool] = [:]
+        var probeOutputs: [String: String?] = [:]
         var kept: [[String]] = []
+
+        func keepIfInScope(_ url: URL) {
+            let components = url.standardizedFileURL.pathComponents
+            guard components.count > rootComponents.count,
+                  components.starts(with: rootComponents)
+            else { return }
+            kept.append(components)
+        }
+        func toolPresent(_ tool: String) -> Bool {
+            if let cached = toolPresence[tool] { return cached }
+            let present = toolIsAvailable(tool)
+            toolPresence[tool] = present
+            return present
+        }
+
         for category in categories {
             for entry in category.discovery {
-                let declared: [URL]
-                let gatingTool: String?
                 switch entry {
                 case .staticPath(let relative):
-                    declared = [home.appendingPathComponent(relative)]
-                    gatingTool = nil
+                    keepIfInScope(home.appendingPathComponent(relative))
                 case .absolutePath(let absolute):
-                    declared = [URL(fileURLWithPath: absolute)]
-                    gatingTool = nil
-                case .probed(_, let requiresTool, let fallbacks):
-                    declared = fallbacks.map {
-                        $0.hasPrefix("/")
-                            ? URL(fileURLWithPath: $0)
-                            : home.appendingPathComponent($0)
+                    keepIfInScope(URL(fileURLWithPath: absolute))
+                case .probed(let command, let requiresTool, let fallbacks):
+                    if let tool = requiresTool, !toolPresent(tool) {
+                        // The category scan provably skips this whole
+                        // entry — none of its roots are excluded, and
+                        // the probe never runs.
+                        continue
                     }
-                    gatingTool = requiresTool
-                }
-                for url in declared {
-                    let components = url.standardizedFileURL.pathComponents
-                    guard components.count > rootComponents.count,
-                          components.starts(with: rootComponents)
-                    else { continue }
-                    if let tool = gatingTool {
-                        let present: Bool
-                        if let cached = toolPresence[tool] {
-                            present = cached
-                        } else {
-                            present = toolIsAvailable(tool)
-                            toolPresence[tool] = present
-                        }
-                        guard present else { continue }
+                    for fallback in fallbacks {
+                        keepIfInScope(fallback.hasPrefix("/")
+                            ? URL(fileURLWithPath: fallback)
+                            : home.appendingPathComponent(fallback))
                     }
-                    kept.append(components)
+                    let output: String?
+                    if let memoized = probeOutputs[command] {
+                        output = memoized
+                    } else {
+                        output = probeResolvedPath(command)
+                        probeOutputs[command] = output
+                    }
+                    if let probedPath = output, !probedPath.isEmpty {
+                        keepIfInScope(URL(fileURLWithPath: probedPath))
+                    }
                 }
             }
         }

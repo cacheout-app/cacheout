@@ -170,6 +170,47 @@ final class InstalledAppResolverTests: XCTestCase {
         )
     }
 
+    func testRootUnderRegularFileAncestorStaysComplete() throws {
+        // ENOTDIR arm of the r3 errno-preserving root probe: a root path
+        // routed through a regular file is POSITIVELY absent, same as
+        // ENOENT — absence stays established.
+        let fileAncestor = base.appendingPathComponent("plain-file")
+        try Data("x".utf8).write(to: fileAncestor)
+        let resolver = makeResolver(
+            roots: [fileAncestor.appendingPathComponent("Applications")])
+        XCTAssertEqual(
+            resolver.status(ofBundleID: "com.example.absent"), .notInstalled,
+            "ENOTDIR is positive absence — the census stays complete"
+        )
+    }
+
+    func testDanglingSymlinkCensusRootStaysComplete() throws {
+        // The root probe FOLLOWS symlinks (stat, not lstat) — deliberate
+        // r3 choice: the census asks "could an app exist under this root",
+        // and a dangling link resolves ENOENT — positively nothing can be
+        // installed under it.
+        let link = base.appendingPathComponent("ghost-link")
+        try fm.createSymbolicLink(
+            at: link, withDestinationURL: base.appendingPathComponent("gone"))
+        let resolver = makeResolver(roots: [link])
+        XCTAssertEqual(
+            resolver.status(ofBundleID: "com.example.absent"), .notInstalled,
+            "a dangling symlinked root is positive absence, not incompleteness"
+        )
+    }
+
+    func testSymlinkedCensusRootIsFollowed() throws {
+        // The follow-symlinks flip side: a symlinked root that RESOLVES to
+        // a real directory is enumerated through its target.
+        try makeApp(at: appsRoot.appendingPathComponent("Bar.app"),
+                    bundleID: "com.example.bar")
+        let link = base.appendingPathComponent("apps-link")
+        try fm.createSymbolicLink(at: link, withDestinationURL: appsRoot)
+        let resolver = makeResolver(roots: [link])
+        XCTAssertEqual(resolver.status(ofBundleID: "com.example.bar"), .installed,
+                       "a symlinked root resolves to its target directory")
+    }
+
     // MARK: - Incomplete census → unknown (fail closed)
 
     func testUnreadableExistingRootMakesNoMatchUnknown() throws {
@@ -189,6 +230,50 @@ final class InstalledAppResolverTests: XCTestCase {
         XCTAssertEqual(
             resolver.status(ofBundleID: "com.example.bar"), .installed,
             "installed wins even over an incomplete census"
+        )
+    }
+
+    func testUnreadableAncestorCensusRootMakesNoMatchUnknown() throws {
+        try XCTSkipIf(geteuid() == 0, "root ignores permission bits")
+        // PR #456 review r3: an ancestor without search permission makes
+        // stat on the root fail EACCES — which `fileExists` answers with
+        // the same `false` as ENOENT. That is NOT positive absence: apps
+        // could hide under the unreadable root (the same shape as a TCC
+        // denial, which surfaces as EPERM/EACCES), so the census must go
+        // incomplete and the no-match degrade to .unknown even though LS
+        // is off and the scripted Spotlight cleanly misses.
+        try makeApp(at: appsRoot.appendingPathComponent("Bar.app"),
+                    bundleID: "com.example.bar")
+        let locked = base.appendingPathComponent("locked-ancestor")
+        let hidden = locked.appendingPathComponent("Applications")
+        try fm.createDirectory(at: hidden, withIntermediateDirectories: true)
+        try chmod000(locked)
+        defer { restorePerms(locked) }
+
+        let resolver = makeResolver(roots: [appsRoot, hidden])
+        XCTAssertEqual(
+            resolver.status(ofBundleID: "com.example.absent"), .unknown,
+            "EACCES on a census root is incompleteness, not absence — fail closed"
+        )
+        XCTAssertEqual(
+            resolver.status(ofBundleID: "com.example.bar"), .installed,
+            "installed still wins from the readable roots"
+        )
+    }
+
+    func testSymlinkCycleCensusRootMakesNoMatchUnknown() throws {
+        // ELOOP arm — a non-ENOENT/ENOTDIR stat failure with no permission
+        // bits involved (so this runs under euid 0 too): the root path
+        // cannot be resolved at all, which is not positive absence.
+        let a = base.appendingPathComponent("loop-a")
+        let b = base.appendingPathComponent("loop-b")
+        try fm.createSymbolicLink(at: a, withDestinationURL: b)
+        try fm.createSymbolicLink(at: b, withDestinationURL: a)
+
+        let resolver = makeResolver(roots: [a])
+        XCTAssertEqual(
+            resolver.status(ofBundleID: "com.example.absent"), .unknown,
+            "ELOOP is incompleteness, not absence — fail closed"
         )
     }
 
@@ -374,8 +459,8 @@ final class InstalledAppResolverTests: XCTestCase {
         })
         XCTAssertEqual(probe.presence(ofBundleID: "com.example.gone"), .absent)
         XCTAssertEqual(
-            queries, ["com.apple.finder", "com.example.gone"],
-            "the canary runs FIRST (short-circuiting on its first hit) and shares the real query path"
+            queries, SpotlightBundleIDProbe.canaryBundleIDs + ["com.example.gone"],
+            "the canary pass runs FIRST, runs EVERY canary (a hit must not short-circuit — a later failure would still poison, r3), and shares the real query path"
         )
         XCTAssertEqual(probe.presence(ofBundleID: "com.example.here.too"), .absent,
                        "the canary verdict is one-shot — not re-probed per query")
@@ -404,7 +489,8 @@ final class InstalledAppResolverTests: XCTestCase {
         var queries: [String] = []
         let probe = SpotlightBundleIDProbe(runQuery: { id in
             queries.append(id)
-            return id == "com.apple.finder" ? 1 : nil // healthy canary, then failure
+            // FULLY healthy canary pass, then the real query fails.
+            return SpotlightBundleIDProbe.canaryBundleIDs.contains(id) ? 1 : nil
         })
         XCTAssertEqual(probe.presence(ofBundleID: "com.example.gone"), .unavailable,
                        "a spawn/timeout/parse failure can never support an absence claim")
@@ -412,6 +498,78 @@ final class InstalledAppResolverTests: XCTestCase {
         XCTAssertEqual(probe.presence(ofBundleID: "com.example.other"), .unavailable)
         XCTAssertEqual(queries.count, callsAfterFirst,
                        "one failure latches the probe — a broken mds costs bounded time once")
+    }
+
+    func testProbeCanaryFailureThenLaterHitLatchesUnavailable() {
+        // PR #456 review r3: a canary query failure must not be laundered
+        // into an ordinary miss by a LATER canary hit. Under the old
+        // `runQuery(id) ?? 0` coalescing, finder's nil became 0, dock's hit
+        // marked the probe healthy, and a subsequent zero-count could mint
+        // the .absent that lets the resolver claim .notInstalled.
+        var queries: [String] = []
+        let probe = SpotlightBundleIDProbe(runQuery: { id in
+            queries.append(id)
+            switch id {
+            case "com.apple.finder": return nil // failure FIRST
+            case "com.apple.dock": return 1     // later hit must not rescue
+            default: return 0
+            }
+        })
+        XCTAssertEqual(
+            probe.presence(ofBundleID: "com.example.gone"), .unavailable,
+            "a canary failure latches even though a later canary would have hit"
+        )
+        XCTAssertEqual(
+            queries, ["com.apple.finder"],
+            "a canary FAILURE short-circuits the pass (the verdict cannot recover; bounds a broken mds) and the real query never runs"
+        )
+        XCTAssertEqual(probe.presence(ofBundleID: "com.example.other"), .unavailable)
+        XCTAssertEqual(queries, ["com.apple.finder"],
+                       "the latch sticks — no further subprocess cost")
+    }
+
+    func testProbeCanaryHitThenLaterFailureLatchesUnavailable() {
+        // The ordering sibling: an EARLY canary hit proves the index
+        // answers SOME queries, not that its zeros are trustworthy — the
+        // doctrine is any-failure-poisons, so the pass runs EVERY canary
+        // and a failure AFTER the hit still latches.
+        var queries: [String] = []
+        let probe = SpotlightBundleIDProbe(runQuery: { id in
+            queries.append(id)
+            switch id {
+            case "com.apple.finder": return 1   // hit FIRST
+            case "com.apple.dock": return nil   // then failure
+            default: return 0
+            }
+        })
+        XCTAssertEqual(
+            probe.presence(ofBundleID: "com.example.gone"), .unavailable,
+            "an early hit does not immunize the canary pass against a later failure"
+        )
+        XCTAssertEqual(queries, ["com.apple.finder", "com.apple.dock"],
+                       "the pass stopped at the failure; the real query never ran")
+        XCTAssertEqual(probe.presence(ofBundleID: "com.example.other"), .unavailable)
+        XCTAssertEqual(queries, ["com.apple.finder", "com.apple.dock"],
+                       "the latch sticks for all later queries")
+    }
+
+    func testResolverCanaryFailureWithLaterHitYieldsUnknownNotNotInstalled() {
+        // The r3 scenario observed at the resolver level: complete census,
+        // LS off, canary pass contains a failure that a later canary hit
+        // would previously have laundered — the no-match must degrade to
+        // .unknown, never mint the orphan tier's positive .notInstalled.
+        let probe = SpotlightBundleIDProbe(runQuery: { id in
+            switch id {
+            case "com.apple.finder": return nil
+            case "com.apple.dock": return 1
+            default: return 0
+            }
+        })
+        let resolver = makeResolver(spotlight: { probe.presence(ofBundleID: $0) })
+        XCTAssertEqual(
+            resolver.status(ofBundleID: "com.example.absent"), .unknown,
+            "a complete census + a canary-poisoned Spotlight zero fails closed"
+        )
     }
 
     func testProbeConcurrentFailureLatchPoisonsInFlightZero() {

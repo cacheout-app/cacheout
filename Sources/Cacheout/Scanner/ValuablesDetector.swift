@@ -283,7 +283,9 @@ enum ValuablesDetector {
     /// they are sized as ONE subject; a valuable nested inside a flagged
     /// bundle is already covered by the bundle itself.
     ///
-    /// Determinism: children are visited in byte-wise basename order, and the
+    /// Determinism: siblings are visited in byte-wise basename order — files
+    /// as they come, directories descended in that same ascending order (the
+    /// stack is loaded in reverse so `popLast` yields ascending) — and the
     /// result is sorted ONCE into the canonical order before returning.
     static func probe(
         at directory: URL,
@@ -291,7 +293,6 @@ enum ValuablesDetector {
         depthLimit: Int = defaultProbeDepthLimit,
         entryLimit: Int = defaultProbeEntryLimit
     ) -> ValuablesDisclosure {
-        let fileManager = FileManager.default
         var found: [DetectedValuable] = []
         var complete = true
         // The GLOBAL entry budget, shared with every bundle subtree walk.
@@ -299,24 +300,33 @@ enum ValuablesDetector {
         var stack: [(url: URL, depth: Int)] = [(directory, 0)]
 
         walk: while let (dir, depth) = stack.popLast() {
-            let names: [String]
-            do {
-                // BASENAMES, deliberately (`contentsOfDirectory(atPath:)`):
-                // the `(at:)` overload returns FULLY RESOLVED child URLs, and
-                // `displayURL` must keep the walk's own UNRESOLVED spelling
-                // for the sheet's reveal-in-Finder. Hidden entries included —
-                // a `.dmg` in a dot-directory is still a release artifact.
-                names = try fileManager.contentsOfDirectory(atPath: dir.path)
-                    .sorted { $0.utf8.lexicographicallyPrecedes($1.utf8) }
-            } catch {
+            let remaining = entryLimit - visited
+            guard remaining > 0 else {
+                // Budget exhausted with directories still unexplored.
+                complete = false
+                break walk
+            }
+            guard let read = boundedChildNames(of: dir, limit: remaining)
+            else {
                 // Unreadable branch: absence of valuables is UNPROVEN.
                 complete = false
                 continue
             }
+            if read.truncated {
+                // More entries existed than the remaining budget could read.
+                complete = false
+            }
+            // Sorting a slice bounded by the REMAINING budget, never a whole
+            // million-entry build directory.
+            let names = read.names
+                .sorted { $0.utf8.lexicographicallyPrecedes($1.utf8) }
+            // Descend in ascending order: collected here, pushed reversed.
+            var pendingDirectories: [(url: URL, depth: Int)] = []
 
             for name in names {
                 guard visited < entryLimit else {
-                    // Entry cap hit before exhausting the tree.
+                    // The shared budget can still run out mid-directory —
+                    // a bundle's subtree sizing spends from the same pot.
                     complete = false
                     break walk
                 }
@@ -347,7 +357,7 @@ enum ValuablesDetector {
                     guard bundleExtensions.contains(ext) else {
                         let childDepth = depth + 1
                         if childDepth < depthLimit {
-                            stack.append((child, childDepth))
+                            pendingDirectories.append((child, childDepth))
                         } else {
                             // A directory left unexpanded at the depth
                             // boundary: a valuable could hide just past it.
@@ -393,6 +403,8 @@ enum ValuablesDetector {
                     complete = false
                 }
             }
+            // Reversed, so `popLast` descends siblings in ASCENDING order.
+            stack.append(contentsOf: pendingDirectories.reversed())
         }
 
         // THE ONE canonical order, applied ONCE here: byte-wise ascending by
@@ -454,22 +466,26 @@ enum ValuablesDetector {
         entryLimit: Int,
         visited: inout Int
     ) -> (allocatedBytes: Int64, complete: Bool) {
-        let fileManager = FileManager.default
         var total: Int64 = 0
         var complete = true
         var stack: [(url: URL, depth: Int)] = [(bundleRoot, 0)]
 
         walk: while let (dir, depth) = stack.popLast() {
-            let names: [String]
-            do {
-                // Basenames, for the same spelling-preservation reason as the
-                // outer walk (and one less URL allocation per entry).
-                names = try fileManager.contentsOfDirectory(atPath: dir.path)
-                    .sorted { $0.utf8.lexicographicallyPrecedes($1.utf8) }
-            } catch {
+            let remaining = entryLimit - visited
+            guard remaining > 0 else {
+                complete = false
+                break walk
+            }
+            guard let read = boundedChildNames(of: dir, limit: remaining)
+            else {
                 complete = false
                 continue
             }
+            if read.truncated { complete = false }
+            let names = read.names
+                .sorted { $0.utf8.lexicographicallyPrecedes($1.utf8) }
+            var pendingDirectories: [(url: URL, depth: Int)] = []
+
             for name in names {
                 guard visited < entryLimit else {
                     complete = false
@@ -496,7 +512,7 @@ enum ValuablesDetector {
                 case .kind(.directory):
                     let childDepth = depth + 1
                     if childDepth < depthLimit {
-                        stack.append((child, childDepth))
+                        pendingDirectories.append((child, childDepth))
                     } else {
                         complete = false
                     }
@@ -509,7 +525,55 @@ enum ValuablesDetector {
                     complete = false
                 }
             }
+            stack.append(contentsOf: pendingDirectories.reversed())
         }
         return (total, complete)
+    }
+
+    /// BOUNDED directory read: at most `limit` basenames, plus whether MORE
+    /// entries remained unread. `nil` when the directory could not be opened
+    /// (the caller's fail-closed "unreadable branch" arm).
+    ///
+    /// `opendir`/`readdir` rather than `FileManager` on purpose — BOTH
+    /// Foundation overloads materialize the WHOLE directory before any cap
+    /// can apply, which would let a build directory with a million entries
+    /// spike memory and CPU inside the very probe whose contract is to stay
+    /// bounded (`contentsOfDirectory(at:)` additionally returns fully
+    /// RESOLVED child URLs, while `displayURL` must keep the walk's own
+    /// unresolved spelling for reveal-in-Finder). Reading basenames also
+    /// keeps the spelling question moot: the caller appends them to ITS OWN
+    /// directory URL. `.` and `..` are skipped; hidden entries are INCLUDED
+    /// (a `.dmg` in a dot-directory is still a release artifact).
+    ///
+    /// A mid-read `readdir` FAILURE reports `truncated` — the enumeration is
+    /// unproven, which is exactly the incomplete-probe consequence.
+    private static func boundedChildNames(
+        of directory: URL, limit: Int
+    ) -> (names: [String], truncated: Bool)? {
+        guard let handle = opendir(directory.path) else { return nil }
+        defer { closedir(handle) }
+        var names: [String] = []
+        var truncated = false
+        while true {
+            // `readdir` returns nil for BOTH end-of-stream and error; errno
+            // is the only discriminator, so it is cleared before each call.
+            errno = 0
+            guard let entry = readdir(handle) else {
+                if errno != 0 { truncated = true }
+                break
+            }
+            let name = withUnsafeBytes(of: entry.pointee.d_name) { raw -> String in
+                guard let base = raw.bindMemory(to: CChar.self).baseAddress
+                else { return "" }
+                return String(cString: base)
+            }
+            if name.isEmpty || name == "." || name == ".." { continue }
+            guard names.count < limit else {
+                truncated = true
+                break
+            }
+            names.append(name)
+        }
+        return (names, truncated)
     }
 }

@@ -1633,6 +1633,67 @@ final class BuildArtifactsScannerTests: XCTestCase {
         XCTAssertEqual(found.risk, .safe)
     }
 
+    func testEntryBudgetBoundsTheDirectoryReadItselfAtTheExactCap()
+        async throws
+    {
+        // The cap bounds the READ, not just the processing: a directory with
+        // more entries than the remaining budget is never materialized whole,
+        // and the unread remainder is what makes the probe incomplete.
+        let target = try makeProject(
+            at: dev.appendingPathComponent("proj"),
+            marker: "Cargo.toml", artifact: "target", payloadBytes: nil
+        )
+        for name in ["f1.bin", "f2.bin", "f3.bin", "f4.bin"] {
+            try writeFile(target.appendingPathComponent(name), bytes: 512)
+        }
+
+        let atCap = try await runScan(
+            makeScanner(valuablesProbeEntryLimit: 4)
+        )
+        XCTAssertTrue(
+            try XCTUnwrap(item(atCap, at: target)?.valuablesDisclosure)
+                .probeComplete,
+            "a budget that exactly covers the tree finishes it"
+        )
+
+        let underCap = try await runScan(
+            makeScanner(valuablesProbeEntryLimit: 3)
+        )
+        XCTAssertFalse(
+            try XCTUnwrap(item(underCap, at: target)?.valuablesDisclosure)
+                .probeComplete,
+            "one entry short leaves the directory UNREAD, so unproven"
+        )
+    }
+
+    func testTruncatedProbeDescendsSiblingsInByteWiseAscendingOrder()
+        async throws
+    {
+        // A budget that can descend exactly ONE of two sibling directories:
+        // the byte-wise FIRST one must be the one inspected, deterministically
+        // (a reversed stack would silently disclose the other artifact).
+        let target = try makeProject(
+            at: dev.appendingPathComponent("proj"),
+            marker: "Cargo.toml", artifact: "target", payloadBytes: nil
+        )
+        try writeBulkFile(
+            target.appendingPathComponent("a/First.dmg"), bytes: aboveFloorBytes
+        )
+        try writeBulkFile(
+            target.appendingPathComponent("b/Second.pkg"), bytes: aboveFloorBytes
+        )
+
+        let outcome = try await runScan(
+            makeScanner(valuablesProbeEntryLimit: 3)
+        )
+        let disclosure = try XCTUnwrap(
+            item(outcome, at: target)?.valuablesDisclosure
+        )
+        XCTAssertFalse(disclosure.probeComplete, "the budget ran out")
+        XCTAssertEqual(disclosure.valuables.map(\.name), ["First.dmg"],
+                       "siblings are descended in ascending order")
+    }
+
     // MARK: R3 — the ONE canonical order
 
     func testOneCanonicalValuablesOrderSharedByEvidenceModelAndJSON()

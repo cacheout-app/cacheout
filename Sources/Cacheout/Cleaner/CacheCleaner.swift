@@ -235,6 +235,13 @@ actor CacheCleaner {
     /// fail-open path; the cleaner for a set of items must hold the
     /// snapshot of the session that produced them.
     private let containerSnapshot: ContainerSnapshot?
+    /// The REGISTRATION-captured per-scanner revalidator registry (fn-4.8,
+    /// R17/D8), injected by `SpaceScannerRuntime.makeCleaner(snapshot:)` —
+    /// never global state, never read off items. Empty for a cleaner built
+    /// directly: such a cleaner then REFUSES every item carrying
+    /// `requiresPreDeleteRevalidation` (fail-closed), because it cannot
+    /// perform the re-inspection the item structurally demands.
+    private let preDeleteRevalidators: [String: PreDeleteRevalidator]
     private nonisolated let trashHandler: TrashHandler
 
     /// - Parameters:
@@ -248,6 +255,10 @@ actor CacheCleaner {
     ///   - containerSnapshot: the producing scan session's container
     ///     identity snapshot; `nil` refuses every `.removeItem` deletion
     ///     (fail-closed — category admission is unaffected).
+    ///   - preDeleteRevalidators: the runtime's registration-captured
+    ///     per-scanner revalidator registry (fn-4.8). The DEFAULT (empty)
+    ///     is fail-closed for items carrying `requiresPreDeleteRevalidation`
+    ///     — a cleaner that cannot re-inspect a marked item refuses it.
     ///   - provider: identity provider shared with `PathGuard` and the sizer
     ///     (tests may subclass to inject devices/kinds).
     ///   - trashHandler: Trash seam; `nil` uses `FileManager.trashItem`.
@@ -255,6 +266,7 @@ actor CacheCleaner {
         home: URL = FileManager.default.homeDirectoryForCurrentUser,
         containerRoots: [URL]? = nil,
         containerSnapshot: ContainerSnapshot? = nil,
+        preDeleteRevalidators: [String: PreDeleteRevalidator] = [:],
         provider: FileSystemIdentityProvider = FileSystemIdentityProvider(),
         trashHandler: TrashHandler? = nil
     ) {
@@ -268,6 +280,7 @@ actor CacheCleaner {
             provider: provider
         )
         self.containerSnapshot = containerSnapshot
+        self.preDeleteRevalidators = preDeleteRevalidators
         self.trashHandler = trashHandler ?? { url in
             try FileManager.default.trashItem(at: url, resultingItemURL: nil)
         }
@@ -287,7 +300,19 @@ actor CacheCleaner {
     /// eligibility (`.denied` refusal, `.empty` no-op, aggregate
     /// `.commands`/`.removeContents` zero-measured skip); (5) action
     /// dispatch.
-    func clean(items: [ReclaimableItem], moveToTrash: Bool) async -> CleanupReport {
+    ///
+    /// - Parameter authorization: the PER-CLEAN `[ItemKey: acknowledgement]`
+    ///   context (fn-4.8, R17). Each item's revalidator receives ITS OWN
+    ///   entry (nil when absent) — the item's structural
+    ///   `valuablesDisclosure` is disclosure only and is never read as
+    ///   acknowledgement. Defaults to EMPTY: an unacknowledged clean, which
+    ///   is exactly what a GUI clean without the confirmation sheet's
+    ///   population (fn-4.6) and a plain CLI `--confirm` (fn-4.9) are.
+    func clean(
+        items: [ReclaimableItem],
+        moveToTrash: Bool,
+        authorization: PreDeleteAuthorizationContext = [:]
+    ) async -> CleanupReport {
         var entries: [CleanupReport.Entry] = []
         var errors: [CleanupReport.ItemError] = []
         // Accounting scope (preserved fn-1 behavior): ONE registry per
@@ -402,7 +427,10 @@ actor CacheCleaner {
                 }
                 let outcome = await removeGuardedItem(
                     item, origin: origin, target: target,
-                    registry: registry, moveToTrash: moveToTrash
+                    registry: registry, moveToTrash: moveToTrash,
+                    // THIS item's own entry — never another item's, never
+                    // the item's structural disclosure.
+                    authorization: authorization[item.key]
                 )
                 if let entry = outcome.entry { entries.append(entry) }
                 errors.append(contentsOf: outcome.errors)
@@ -536,6 +564,26 @@ actor CacheCleaner {
     /// The non-`.missing` zero-record rule is check (3) in `clean(items:)`
     /// — it is state-aware and therefore ordered AFTER the `.missing` skip.
     private static func structuralRefusal(of item: ReclaimableItem) -> String? {
+        // The revalidation marker (fn-4.8) is a PER-TARGET contract: the
+        // seam re-inspects the ONE `.containerItem` target immediately
+        // before deleting it. An aggregate carrying the marker could never
+        // be re-inspected that way, so it is refused here rather than
+        // deleted through a path the marker does not cover — the marked-item
+        // guarantee ("nothing marked is ever deleted without passing the
+        // seam") must hold for EVERY action, not just the one that has a
+        // seam. No production scanner emits this shape; a forged or
+        // regressed item cannot use it to slip past revalidation.
+        let revalidatableAction: Bool
+        switch item.action {
+        case .removeItem: revalidatableAction = true
+        case .removeContents, .commands: revalidatableAction = false
+        }
+        if item.requiresPreDeleteRevalidation, !revalidatableAction {
+            return "refused: requiresPreDeleteRevalidation is a per-target "
+                + "contract — only a remove_item item can be re-inspected "
+                + "immediately before its deletion"
+        }
+
         switch item.action {
         case .removeItem:
             switch item.admission {
@@ -574,6 +622,65 @@ actor CacheCleaner {
             case .containerItem:
                 return "refused: a \(item.action.wireString) item must carry category admission provenance"
             }
+        }
+    }
+
+    // MARK: - Pre-delete revalidation seam (fn-4.8, R17/D8)
+
+    /// The chokepoint's revalidation decision for ONE item, with ITS
+    /// authorization entry. `nil` means "nothing here stands in the way" —
+    /// never a grant (every other gate still applies).
+    ///
+    /// DISPATCH IS BELT-AND-BRACES. The item's structural
+    /// `requiresPreDeleteRevalidation` marker (braces) and the registered
+    /// revalidator's own `requiresRevalidation(item:)` predicate (belt) are
+    /// OR-ed: a mapping regression that stops setting the marker on an
+    /// applicable item is STILL re-probed here — the protection the old
+    /// hard-coded gate gave orphaned caches is never lost — and the marker
+    /// alone is enough for a scanner whose predicate is narrower.
+    ///
+    /// The marker is ALSO the uniform FAIL-CLOSED signal: a marked item
+    /// whose scanner has NO registry entry (a `CacheCleaner` built directly,
+    /// bypassing `SpaceScannerRuntime.makeCleaner`, or a scanner that lost
+    /// its declaration) is refused outright. The cleaner never inspects
+    /// scanner-specific fields to decide whether revalidation was expected —
+    /// the marker subsumes all of that.
+    private func preDeleteRefusal(
+        for item: ReclaimableItem, authorization: String?
+    ) -> (reason: String, tag: String)? {
+        guard let revalidator = preDeleteRevalidators[item.scannerID] else {
+            guard item.requiresPreDeleteRevalidation else { return nil }
+            // Fail closed: the item structurally demands a re-inspection
+            // this cleaner cannot perform.
+            return (
+                "refused: this item requires a pre-delete revalidation, but "
+                    + "no revalidator is registered for scanner "
+                    + "'\(item.scannerID)' — clean it through the runtime "
+                    + "that registered its scanner",
+                "revalidator-unavailable"
+            )
+        }
+        guard item.requiresPreDeleteRevalidation
+            || revalidator.requiresRevalidation(item: item)
+        else { return nil }
+
+        switch revalidator.revalidate(item: item, authorization: authorization) {
+        case .allow:
+            return nil
+        case .refuse(let reason, _, _):
+            // The typed payload (`valuables` + `acknowledgementToken`) is
+            // deliberately not consumed here: fn-4.9 transports it through
+            // `CleanupReport.ItemError` so the wire rows serialize from
+            // typed data. The REASON is item-keyed by construction and is
+            // what the error surface and the log line carry today.
+            //
+            // ONE tag for the whole seam, inherited VERBATIM from the
+            // orphaned-caches precedent this generalizes so the cleanup
+            // log's grammar gains no new token: the item's delete-time
+            // content is not what the deletion decision rests on — it
+            // changed since the scan, could not be re-inspected, or was
+            // never authorized on the content present NOW.
+            return (reason, "content-drift")
         }
     }
 
@@ -859,10 +966,12 @@ actor CacheCleaner {
     /// hostile item cannot widen admission). `target` is the FROZEN
     /// descriptor's UNRESOLVED `requestedTargetURL` (leaf never resolved —
     /// `item.url` is display state and never a destructive input). The
-    /// registry is the caller's per-SCANNER instance.
+    /// registry is the caller's per-SCANNER instance. `authorization` is
+    /// THIS item's entry from the per-clean authorization context (fn-4.8).
     private func removeGuardedItem(
         _ item: ReclaimableItem, origin: URL, target: URL,
-        registry: InodeAccountingRegistry, moveToTrash: Bool
+        registry: InodeAccountingRegistry, moveToTrash: Bool,
+        authorization: String?
     ) async -> (entry: CleanupReport.Entry?, errors: [CleanupReport.ItemError]) {
         // The scan-session snapshot is the delete-time identity anchor
         // (fn-3.4, R9). A cleaner built WITHOUT one refuses fail-closed:
@@ -913,52 +1022,30 @@ actor CacheCleaner {
             return (nil, [Self.itemError(item, detail)])
         }
 
-        // DELETE-TIME SAFETY REVALIDATION (PR #456 review): the snapshot
-        // admission above binds the CONTAINER's identity, not the entry's —
-        // a sweep entry removed and recreated at the same name since the
-        // scan passes every check so far while holding content the scan
-        // never inspected. An orphaned-caches item still carrying the CLEAN
-        // PROMISE (`automaticCleanEligible` is set by the classifier ONLY
-        // when the scan-time user-data probe found nothing AND completed)
-        // therefore re-runs the same bounded no-follow probe here,
-        // immediately pre-delete, and is refused unless the promise
-        // re-establishes — fail-closed, the scan-time doctrine ("an
-        // inspection that could not finish is treated like a caution")
-        // applied at delete time. Non-eligible sweep items reach this point
-        // only through conscious per-item confirmation against DISPLAYED
-        // caution evidence (the verified-Photos-library field case);
-        // re-refusing them on the same disclosed state would make them
-        // permanently undeletable, so they keep the epic's accepted
-        // conscious-confirmation TOCTOU residual. Direction-safe either
-        // way: a revalidation can only REFUSE, never widen admission — a
-        // forged `automaticCleanEligible == false` merely opts back into
-        // today's behavior. The scanner-keyed coupling is deliberate and
-        // minimal (the scanner owns its probe; the cleaner owns the
-        // chokepoint) — generalize into a per-scanner revalidator seam when
-        // fn-4/fn-5 scanners need one.
-        if item.scannerID == OrphanedCachesScanner.registeredID,
-           item.automaticCleanEligible {
-            let probe = OrphanedCachesScanner.preDeleteUserDataProbe(
-                at: target, provider: provider
-            )
-            if !probe.matches.isEmpty {
-                let names = probe.matches.joined(separator: ", ")
-                let detail = "\(target.path): contents changed since scan — "
-                    + "user-data-shaped content (\(names)) present at delete "
-                    + "time; refused, re-scan required"
-                logRefusal(label: item.displayName, tag: "content-drift",
-                           detail: detail)
-                return (nil, [Self.itemError(item, detail)])
-            }
-            if !probe.complete {
-                let detail = "\(target.path): couldn't fully re-inspect "
-                    + "contents at delete time — refused (an inspection that "
-                    + "could not finish is treated like a change since scan); "
-                    + "re-scan required"
-                logRefusal(label: item.displayName, tag: "content-drift",
-                           detail: detail)
-                return (nil, [Self.itemError(item, detail)])
-            }
+        // DELETE-TIME REVALIDATION SEAM (fn-4.8, R17/D8 — the generalization
+        // the previous hard-coded orphaned-caches gate here promised).
+        //
+        // Why anything runs here at all: the snapshot admission above binds
+        // the CONTAINER's identity, not the target's CONTENTS — a sweep
+        // entry removed and recreated at the same name, or a DMG written
+        // into a build directory mid-build, passes every check so far while
+        // holding content the scan never inspected. The scanner that owns
+        // the probe declares a `PreDeleteRevalidator`; the runtime captures
+        // it at REGISTRATION; the cleaner runs it HERE, at the one
+        // chokepoint, immediately pre-delete — after admission, containment
+        // and mount-boundary checks (a revalidator must never inspect a
+        // path this cleaner would refuse to touch) and before any deletion.
+        //
+        // Direction-safe by construction: a revalidation can only REFUSE,
+        // never widen admission. An item of a scanner with no revalidator,
+        // unmarked and deemed inapplicable, behaves exactly as it did
+        // before this seam existed.
+        if let refusal = preDeleteRefusal(
+            for: item, authorization: authorization
+        ) {
+            logRefusal(label: item.displayName, tag: refusal.tag,
+                       detail: refusal.reason)
+            return (nil, [Self.itemError(item, refusal.reason)])
         }
 
         let token = await registry.registerObservations(report.claims)

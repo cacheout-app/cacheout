@@ -2196,13 +2196,20 @@ final class BuildArtifactsScannerTests: XCTestCase {
         let found = try XCTUnwrap(item(outcome, at: target))
 
         // Items WITHOUT the fields (every other scanner, by construction:
-        // the initializer defaults them) stay valid, unchanged.
+        // the initializer defaults them) stay valid, unchanged. Registered
+        // WITHOUT a revalidator declaration, because that is what "every
+        // other scanner" means once fn-4.8's marker invariant exists: a
+        // scanner that declares one must mark the items its predicate deems
+        // applicable (proven in
+        // `testUnmarkedBuildArtifactItemFailsRuntimeValidation`).
         let legacy = replacing(
             found, disclosure: nil, requiresRevalidation: false
         )
         XCTAssertNil(legacy.valuablesDisclosure)
         XCTAssertFalse(legacy.requiresPreDeleteRevalidation)
-        assertValidatorAccepts(legacy, scanner: scanner)
+        assertValidatorAccepts(
+            legacy, scanner: scanner, declaresRevalidator: false
+        )
 
         // One malformed cell per PINNED domain — checked-REJECT, never a
         // saturated lie and never a trap after validation.
@@ -2402,10 +2409,13 @@ final class BuildArtifactsScannerTests: XCTestCase {
     }
 
     private func validatorVerdict(
-        _ item: ReclaimableItem, scanner: BuildArtifactsScanner
+        _ item: ReclaimableItem, scanner: BuildArtifactsScanner,
+        declaresRevalidator: Bool = true
     ) throws -> ValidatedScannerEvent {
         let runtime = try SpaceScannerRuntime(
-            scanners: [BuildArtifactsAdapterScanner(scanner: scanner)],
+            scanners: [BuildArtifactsAdapterScanner(
+                scanner: scanner, declaresRevalidator: declaresRevalidator
+            )],
             categories: [], home: fixtureHome,
             provider: FileSystemIdentityProvider()
         )
@@ -2417,9 +2427,12 @@ final class BuildArtifactsScannerTests: XCTestCase {
 
     private func assertValidatorAccepts(
         _ item: ReclaimableItem, scanner: BuildArtifactsScanner,
+        declaresRevalidator: Bool = true,
         file: StaticString = #filePath, line: UInt = #line
     ) {
-        guard let verdict = try? validatorVerdict(item, scanner: scanner)
+        guard let verdict = try? validatorVerdict(
+            item, scanner: scanner, declaresRevalidator: declaresRevalidator
+        )
         else { return XCTFail("runtime construction failed", file: file, line: line) }
         if case .malformed(_, let issue) = verdict {
             XCTFail("unexpectedly malformed: \(issue.detail)",
@@ -2441,6 +2454,351 @@ final class BuildArtifactsScannerTests: XCTestCase {
         XCTAssertEqual(issue.kind, .malformedOutcome, file: file, line: line)
         XCTAssertNil(issue.url, "the synthesized issue is path-less",
                      file: file, line: line)
+    }
+
+    // ====================================================================
+    // MARK: - fn-4.8: the pre-delete revalidator seam (R17/D8)
+    // ====================================================================
+    //
+    // `build_artifacts` is NOT registered in production yet (fn-4.5 owns the
+    // atomic swap), so every proof below runs through the same TEST-ONLY
+    // adapter the R13 round-trips use — now also surfacing the scanner's own
+    // `preDeleteRevalidator` declaration — registered via the PUBLIC
+    // `SpaceScannerRuntime(scanners:…)` initializer. The runtime captures the
+    // declaration at registration and `makeCleaner(snapshot:)` injects it, so
+    // these are the production wiring, one conformance line early.
+
+    /// A validated scan SESSION through the adapter-registered runtime: the
+    /// items, the session's container snapshot, and the runtime that will
+    /// build the cleaner.
+    private func scanSession(
+        _ scanner: BuildArtifactsScanner,
+        file: StaticString = #filePath, line: UInt = #line
+    ) async throws -> (
+        items: [ReclaimableItem],
+        snapshot: ContainerSnapshot,
+        runtime: SpaceScannerRuntime
+    ) {
+        let runtime = try SpaceScannerRuntime(
+            scanners: [BuildArtifactsAdapterScanner(scanner: scanner)],
+            categories: [], home: fixtureHome,
+            provider: FileSystemIdentityProvider()
+        )
+        let session = runtime.scanValidatedSession(
+            context: ScanContext(trigger: .userInitiated)
+        )
+        var items: [ReclaimableItem] = []
+        for await event in session.events {
+            switch event {
+            case .outcome(_, let outcome):
+                items = outcome.items
+            case .malformed(_, let issue):
+                XCTFail("outcome malformed: \(issue.detail)",
+                        file: file, line: line)
+            }
+        }
+        return (items, session.snapshot, runtime)
+    }
+
+    private func cleanupLog() -> String {
+        (try? String(
+            contentsOf: fixtureHome.appendingPathComponent(".cacheout/cleanup.log"),
+            encoding: .utf8
+        )) ?? ""
+    }
+
+    /// The revalidator exactly as the runtime captured it.
+    private var revalidator: PreDeleteRevalidator {
+        BuildArtifactsScanner.preDeleteRevalidator(
+            provider: FileSystemIdentityProvider()
+        )
+    }
+
+    /// A directory chain deep enough that the PRODUCTION-capped delete-time
+    /// probe leaves its last directory unexpanded — the fail-closed
+    /// "couldn't finish" fixture, deterministic and permission-free.
+    private func plantDepthBoundary(in artifact: URL) throws {
+        let deep = (1...ValuablesDetector.defaultProbeDepthLimit)
+            .reduce(artifact) { $0.appendingPathComponent("d\($1)") }
+        try mkdir(deep)
+    }
+
+    func testValuablePlantedAfterScanRefusesThatItemAndOthersProceed()
+        async throws
+    {
+        // The seam's headline case: `ContainerSnapshot` binds the dev ROOT's
+        // identity, not the artifact dir's CONTENTS, so a DMG written after
+        // the scan (or mid-build) passes every pre-existing gate. The
+        // revalidator re-probes at the chokepoint and refuses FAIL-CLOSED —
+        // an item-keyed error plus a REFUSED log line, never a silent skip —
+        // while every OTHER selected item deletes normally.
+        let guarded = try makeProject(
+            at: dev.appendingPathComponent("murmur"),
+            marker: "Cargo.toml", artifact: "target"
+        )
+        let plain = try makeProject(
+            at: dev.appendingPathComponent("plain"),
+            marker: "Cargo.toml", artifact: "target"
+        )
+
+        let (items, snapshot, runtime) = try await scanSession(makeScanner())
+        let guardedItem = try XCTUnwrap(item(from: items, at: guarded))
+        let plainItem = try XCTUnwrap(item(from: items, at: plain))
+        XCTAssertEqual(
+            try XCTUnwrap(guardedItem.valuablesDisclosure).valuables.count, 0,
+            "fixture precondition: nothing valuable existed at scan time"
+        )
+
+        // AFTER the scan: a release artifact lands inside the guarded dir.
+        let dmg = try writeBulkFile(
+            guarded.appendingPathComponent(
+                "release/bundle/dmg/Murmur_0.1.7_aarch64.dmg"
+            ),
+            bytes: aboveFloorBytes
+        )
+
+        let cleaner = runtime.makeCleaner(snapshot: snapshot)
+        let report = await cleaner.clean(
+            items: [guardedItem, plainItem], moveToTrash: false
+        )
+
+        XCTAssertEqual(report.errors.count, 1)
+        let error = try XCTUnwrap(report.errors.first)
+        XCTAssertEqual(error.key, guardedItem.key, "the refusal is ITEM-KEYED")
+        XCTAssertTrue(error.message.contains("Murmur_0.1.7_aarch64.dmg"),
+                      error.message)
+        XCTAssertTrue(error.message.contains("not covered by an acknowledgement"),
+                      error.message)
+        XCTAssertTrue(fm.fileExists(atPath: dmg.path),
+                      "the release artifact is byte-untouched")
+        XCTAssertTrue(fm.fileExists(atPath: guarded.path))
+        XCTAssertTrue(cleanupLog().contains("REFUSED [content-drift]"),
+                      "the refusal is LOGGED, never a silent skip")
+
+        XCTAssertEqual(report.entries.map(\.itemID), [plainItem.id],
+                       "other selected items proceed unaffected")
+        XCTAssertFalse(fm.fileExists(atPath: plain.path))
+    }
+
+    func testIncompleteDeleteTimeProbeRefusesWithIncompleteReasonAndNoToken()
+        async throws
+    {
+        // The uniform R17 rule at delete time: an inspection that could not
+        // finish is UNAUTHORIZABLE and TOKENLESS. The scan-time probe
+        // completed (the item is honest); only the delete-time state is
+        // un-inspectable.
+        let artifact = try makeProject(
+            at: dev.appendingPathComponent("deep"),
+            marker: "Cargo.toml", artifact: "target"
+        )
+        let (items, snapshot, runtime) = try await scanSession(makeScanner())
+        let found = try XCTUnwrap(item(from: items, at: artifact))
+        XCTAssertTrue(
+            try XCTUnwrap(found.valuablesDisclosure).probeComplete,
+            "fixture precondition: the SCAN-time probe finished"
+        )
+
+        try plantDepthBoundary(in: artifact)
+
+        // (a) The TYPED verdict — the payload fn-4.9 serializes from.
+        switch revalidator.revalidate(item: found, authorization: nil) {
+        case .allow:
+            XCTFail("an unfinished inspection must refuse")
+        case .refuse(let reason, let valuables, let token):
+            XCTAssertTrue(reason.contains("couldn't fully re-inspect"), reason)
+            XCTAssertNil(token, "an INCOMPLETE probe is tokenless everywhere")
+            XCTAssertTrue(valuables.isEmpty,
+                          "nothing above the floor was found before the cap")
+        }
+
+        // (b) The same refusal through the cleaner: fail-closed, logged.
+        let cleaner = runtime.makeCleaner(snapshot: snapshot)
+        let report = await cleaner.clean(items: [found], moveToTrash: false)
+
+        XCTAssertTrue(report.entries.isEmpty, "nothing may be deleted")
+        XCTAssertEqual(report.errors.count, 1)
+        XCTAssertEqual(report.errors.first?.key, found.key)
+        XCTAssertTrue(
+            try XCTUnwrap(report.errors.first?.message)
+                .contains("couldn't fully re-inspect"),
+            report.errors.first?.message ?? ""
+        )
+        XCTAssertTrue(fm.fileExists(atPath: artifact.path))
+        XCTAssertTrue(cleanupLog().contains("REFUSED [content-drift]"))
+    }
+
+    func testAuthorizationContextEntryMatchingCurrentProbeAllowsDeletion()
+        async throws
+    {
+        // The cleaner is driven DIRECTLY with an INJECTED authorization
+        // context (CLI construction is fn-4.9, sheet population fn-4.6). A
+        // token computed from the CURRENT delete-time probe — and ONLY that
+        // one — lets an acknowledged valuable-bearing item delete.
+        let artifact = try makeProject(
+            at: dev.appendingPathComponent("murmur"),
+            marker: "Cargo.toml", artifact: "target"
+        )
+        let (items, snapshot, runtime) = try await scanSession(makeScanner())
+        let found = try XCTUnwrap(item(from: items, at: artifact))
+
+        try writeBulkFile(
+            artifact.appendingPathComponent("release/Shipped.dmg"),
+            bytes: aboveFloorBytes
+        )
+
+        // The token derives from the DELETE-TIME probe, recomputed here
+        // independently of the verdict.
+        let current = BuildArtifactsScanner.preDeleteValuablesProbe(
+            at: artifact, provider: FileSystemIdentityProvider()
+        )
+        XCTAssertTrue(current.probeComplete)
+        let expected = try XCTUnwrap(current.acknowledgementToken(for: found.key))
+
+        // A WRONG entry is not an acknowledgement.
+        let wrong = runtime.makeCleaner(snapshot: snapshot)
+        let refused = await wrong.clean(
+            items: [found], moveToTrash: false,
+            authorization: [found.key: String(repeating: "0", count: 64)]
+        )
+        XCTAssertTrue(refused.entries.isEmpty)
+        XCTAssertEqual(refused.errors.count, 1)
+        XCTAssertTrue(fm.fileExists(atPath: artifact.path))
+
+        // The matching entry proceeds — authorized valuables stay deletable.
+        let cleaner = runtime.makeCleaner(snapshot: snapshot)
+        let report = await cleaner.clean(
+            items: [found], moveToTrash: false,
+            authorization: [found.key: expected]
+        )
+
+        XCTAssertTrue(report.errors.isEmpty, "\(report.errors)")
+        XCTAssertEqual(report.entries.map(\.itemID), [found.id])
+        XCTAssertFalse(fm.fileExists(atPath: artifact.path))
+    }
+
+    func testVanishedValuableSetRefusesOnceWithNoTokenThenRescanDeletes()
+        async throws
+    {
+        // The VANISHED-SET contract: no empty-set token exists anywhere, so
+        // an item whose disclosed valuables are gone refuses ONCE with no
+        // token; the caller re-scans and retries WITHOUT acknowledgement.
+        let artifact = try makeProject(
+            at: dev.appendingPathComponent("murmur"),
+            marker: "Cargo.toml", artifact: "target"
+        )
+        let dmg = try writeBulkFile(
+            artifact.appendingPathComponent("release/Shipped.dmg"),
+            bytes: aboveFloorBytes
+        )
+
+        let (items, snapshot, runtime) = try await scanSession(makeScanner())
+        let found = try XCTUnwrap(item(from: items, at: artifact))
+        XCTAssertEqual(
+            try XCTUnwrap(found.valuablesDisclosure).valuables.count, 1,
+            "fixture precondition: the scan disclosed the DMG"
+        )
+
+        try fm.removeItem(at: dmg)
+
+        switch revalidator.revalidate(item: found, authorization: nil) {
+        case .allow:
+            XCTFail("a vanished disclosed set refuses once")
+        case .refuse(let reason, let valuables, let token):
+            XCTAssertTrue(reason.contains("no longer there"), reason)
+            XCTAssertNil(token, "there is nothing left to acknowledge")
+            XCTAssertTrue(valuables.isEmpty)
+        }
+
+        let report = await runtime.makeCleaner(snapshot: snapshot)
+            .clean(items: [found], moveToTrash: false)
+        XCTAssertTrue(report.entries.isEmpty)
+        XCTAssertEqual(report.errors.count, 1)
+        XCTAssertTrue(fm.fileExists(atPath: artifact.path))
+
+        // Re-scan: the item is now valuables-free and needs no
+        // acknowledgement at all.
+        let (fresh, freshSnapshot, freshRuntime) =
+            try await scanSession(makeScanner())
+        let refreshed = try XCTUnwrap(item(from: fresh, at: artifact))
+        XCTAssertTrue(
+            try XCTUnwrap(refreshed.valuablesDisclosure).valuables.isEmpty
+        )
+        let second = await freshRuntime.makeCleaner(snapshot: freshSnapshot)
+            .clean(items: [refreshed], moveToTrash: false)
+        XCTAssertTrue(second.errors.isEmpty, "\(second.errors)")
+        XCTAssertFalse(fm.fileExists(atPath: artifact.path))
+    }
+
+    func testRefuseVerdictCarriesCurrentValuablesInCanonicalOrderWithToken()
+        async throws
+    {
+        // The typed payload is what fn-4.9 serializes: the CURRENT probe's
+        // valuables in the ONE canonical order (byte-wise ascending
+        // `canonicalIdentityPath`) plus the token — present here because the
+        // probe is COMPLETE and the set NON-EMPTY.
+        let artifact = try makeProject(
+            at: dev.appendingPathComponent("murmur"),
+            marker: "Cargo.toml", artifact: "target"
+        )
+        let (items, _, _) = try await scanSession(makeScanner())
+        let found = try XCTUnwrap(item(from: items, at: artifact))
+
+        for name in ["release/zeta.dmg", "release/alpha.pkg"] {
+            try writeBulkFile(
+                artifact.appendingPathComponent(name), bytes: aboveFloorBytes
+            )
+        }
+        let current = BuildArtifactsScanner.preDeleteValuablesProbe(
+            at: artifact, provider: FileSystemIdentityProvider()
+        )
+
+        switch revalidator.revalidate(item: found, authorization: nil) {
+        case .allow:
+            XCTFail("an unacknowledged valuable-bearing item refuses")
+        case .refuse(_, let valuables, let token):
+            XCTAssertEqual(valuables, current.valuables,
+                           "the payload IS the current probe's set")
+            XCTAssertEqual(valuables.map(\.name), ["alpha.pkg", "zeta.dmg"],
+                           "canonical order, not discovery order")
+            XCTAssertEqual(
+                token, current.acknowledgementToken(for: found.key),
+                "a COMPLETE, non-empty current set carries its fresh token"
+            )
+            XCTAssertNotNil(token)
+        }
+    }
+
+    func testUnmarkedBuildArtifactItemFailsRuntimeValidation() async throws {
+        // The runtime's marker invariant, this scanner's face: its
+        // revalidator deems EVERY item applicable, so an item emitted
+        // WITHOUT `requiresPreDeleteRevalidation` is a structural violation —
+        // a marker-forgetting mapping regression can never publish items.
+        let artifact = try makeProject(
+            at: dev.appendingPathComponent("murmur"),
+            marker: "Cargo.toml", artifact: "target"
+        )
+        let scanner = makeScanner()
+        let outcome = try await runScan(scanner)
+        let found = try XCTUnwrap(item(outcome, at: artifact))
+
+        assertValidatorRejects(
+            replacing(
+                found, disclosure: found.valuablesDisclosure,
+                requiresRevalidation: false
+            ),
+            scanner: scanner,
+            label: "an applicable-but-unmarked build-artifact item"
+        )
+    }
+
+    /// Session items are already validated — index them the same way the
+    /// outcome helper does.
+    private func item(
+        from items: [ReclaimableItem], at url: URL,
+        provider: FileSystemIdentityProvider = FileSystemIdentityProvider()
+    ) -> ReclaimableItem? {
+        let id = expectedID(of: url, provider: provider)
+        return items.first { $0.id == id }
     }
 }
 
@@ -2480,12 +2838,23 @@ private final class ThreadProbe: @unchecked Sendable {
 /// registry swap stay in fn-4.5 — this adapter exists so the validator's
 /// origin binding is checked against a REAL registration declaration without
 /// making the scanner registrable early.
+///
+/// It also FORWARDS the scanner's own `preDeleteRevalidator` declaration
+/// (fn-4.8), so the runtime captures — and `makeCleaner(snapshot:)` injects —
+/// exactly what fn-4.5's one-line conformance will register in production.
 private struct BuildArtifactsAdapterScanner: SpaceScanner {
     let scanner: BuildArtifactsScanner
+    /// Registration WITHOUT the declaration — the shape of every scanner
+    /// that needs no delete-time revalidation, used to prove that such a
+    /// scanner's unmarked items stay valid under fn-4.8's marker invariant.
+    var declaresRevalidator = true
 
     var id: String { scanner.id }
     var displayName: String { scanner.displayName }
     var trustedContainerRoots: [URL] { scanner.trustedContainerRoots }
+    var preDeleteRevalidator: PreDeleteRevalidator? {
+        declaresRevalidator ? scanner.preDeleteRevalidator : nil
+    }
 
     func scan(context: ScanContext) async -> ScanOutcome {
         await scanner.scan(context: context)

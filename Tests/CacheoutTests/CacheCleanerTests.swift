@@ -226,7 +226,8 @@ final class CacheCleanerTests: XCTestCase {
         scanError: ScanError? = nil,
         action: ReclaimAction,
         admission: AdmissionDescriptor,
-        autoEligible: Bool = true
+        autoEligible: Bool = true,
+        requiresRevalidation: Bool = false
     ) -> ReclaimableItem {
         ReclaimableItem(
             id: id, scannerID: scannerID, displayName: displayName,
@@ -237,7 +238,8 @@ final class CacheCleanerTests: XCTestCase {
             risk: .safe, evidence: "", rebuildNote: nil,
             action: action, admission: admission,
             defaultSelected: true, automaticCleanEligible: autoEligible,
-            isStale: nil
+            isStale: nil,
+            requiresPreDeleteRevalidation: requiresRevalidation
         )
     }
 
@@ -276,7 +278,8 @@ final class CacheCleanerTests: XCTestCase {
         origin: URL, target: URL,
         state: ScanState = .measured,
         exact: Int64 = 1024,
-        autoEligible: Bool = true
+        autoEligible: Bool = true,
+        requiresRevalidation: Bool = false
     ) -> ReclaimableItem {
         makeItem(
             id: id, scannerID: scannerID, displayName: displayName,
@@ -285,7 +288,8 @@ final class CacheCleanerTests: XCTestCase {
             admission: .containerItem(
                 originContainer: origin, requestedTargetURL: target
             ),
-            autoEligible: autoEligible
+            autoEligible: autoEligible,
+            requiresRevalidation: requiresRevalidation
         )
     }
 
@@ -1977,6 +1981,23 @@ final class CacheCleanerTests: XCTestCase {
     }
 
     // MARK: - Delete-time auto-clean revalidation (sweep items, PR #456)
+    //
+    // fn-4.8 migrated these onto the generalized per-scanner revalidator
+    // seam: the cleaner no longer hard-codes the sweep scanner's id, so the
+    // fixtures now register the sweep scanner's OWN declared revalidator —
+    // exactly what `SpaceScannerRuntime.makeCleaner(snapshot:)` injects in
+    // production — and the sweep items carry the marker their emission now
+    // sets. Same fixtures, same assertions, same refusal messages.
+
+    /// The registration-captured registry a runtime-built cleaner would
+    /// hold for the sweep scanner, spelled out for the DIRECT constructions
+    /// in this file.
+    private var sweepRevalidators: [String: PreDeleteRevalidator] {
+        [OrphanedCachesScanner.registeredID:
+            OrphanedCachesScanner.preDeleteRevalidator(
+                provider: FileSystemIdentityProvider()
+            )]
+    }
 
     /// A fixture "~/Library/Caches" container plus one sweep entry holding
     /// plain cache content, with the session snapshot captured while that
@@ -2011,10 +2032,12 @@ final class CacheCleanerTests: XCTestCase {
         let item = makeRemoveItem(
             scannerID: OrphanedCachesScanner.registeredID,
             displayName: entry.lastPathComponent,
-            origin: caches, target: entry
+            origin: caches, target: entry,
+            requiresRevalidation: true
         )
         let cleaner = CacheCleaner(
-            home: home, containerRoots: [caches], containerSnapshot: snapshot
+            home: home, containerRoots: [caches], containerSnapshot: snapshot,
+            preDeleteRevalidators: sweepRevalidators
         )
         let report = await cleaner.clean(items: [item], moveToTrash: false)
 
@@ -2048,10 +2071,12 @@ final class CacheCleanerTests: XCTestCase {
         let item = makeRemoveItem(
             scannerID: OrphanedCachesScanner.registeredID,
             displayName: entry.lastPathComponent,
-            origin: caches, target: entry
+            origin: caches, target: entry,
+            requiresRevalidation: true
         )
         let cleaner = CacheCleaner(
-            home: home, containerRoots: [caches], containerSnapshot: snapshot
+            home: home, containerRoots: [caches], containerSnapshot: snapshot,
+            preDeleteRevalidators: sweepRevalidators
         )
         let report = await cleaner.clean(items: [item], moveToTrash: false)
 
@@ -2072,10 +2097,12 @@ final class CacheCleanerTests: XCTestCase {
         let item = makeRemoveItem(
             scannerID: OrphanedCachesScanner.registeredID,
             displayName: entry.lastPathComponent,
-            origin: caches, target: entry
+            origin: caches, target: entry,
+            requiresRevalidation: true
         )
         let cleaner = CacheCleaner(
-            home: home, containerRoots: [caches], containerSnapshot: snapshot
+            home: home, containerRoots: [caches], containerSnapshot: snapshot,
+            preDeleteRevalidators: sweepRevalidators
         )
         let report = await cleaner.clean(items: [item], moveToTrash: false)
 
@@ -2123,7 +2150,8 @@ final class CacheCleanerTests: XCTestCase {
         )
         let cleaner = CacheCleaner(
             home: home, containerRoots: [caches],
-            containerSnapshot: sessionSnapshot(of: [caches])
+            containerSnapshot: sessionSnapshot(of: [caches]),
+            preDeleteRevalidators: sweepRevalidators
         )
         let report = await cleaner.clean(
             items: [reviewedItem, otherItem], moveToTrash: false
@@ -2135,6 +2163,186 @@ final class CacheCleanerTests: XCTestCase {
                        "a consciously-confirmed review item still deletes")
         XCTAssertFalse(FileManager.default.fileExists(atPath: other.path),
                        "the sweep-keyed revalidation never fires for other scanners")
+    }
+
+    // MARK: - Pre-delete revalidator seam (fn-4.8, R17/D8)
+
+    /// A build-artifact-shaped fixture: a "dev root" container holding one
+    /// artifact directory whose contents the item never bound.
+    private func makeArtifactFixture(
+        _ label: String = #function
+    ) throws -> (home: URL, devRoot: URL, artifact: URL, snapshot: ContainerSnapshot) {
+        let home = try makeTempDir(label)
+        let devRoot = home.appendingPathComponent("dev")
+        let artifact = devRoot.appendingPathComponent("proj/target")
+        try FileManager.default.createDirectory(
+            at: artifact, withIntermediateDirectories: true
+        )
+        try writeFile(artifact.appendingPathComponent("build.o"), bytes: 4096)
+        return (home, devRoot, artifact, sessionSnapshot(of: [devRoot]))
+    }
+
+    func testMarkedItemsOfBothScannersRefusedByCleanerWithoutRegistry() async throws {
+        // THE fail-closed guarantee the scanner-agnostic marker exists for:
+        // a `CacheCleaner` built DIRECTLY — bypassing the runtime that
+        // captures the revalidator registry — cannot perform the
+        // re-inspection a marked item structurally demands, so it refuses
+        // it. Proven for BOTH scanners in ONE clean, so the orphaned-caches
+        // migration provably does not weaken what the hard-coded gate gave
+        // that scanner: an auto-clean-eligible sweep entry and a
+        // build-artifact directory are both refused, both untouched.
+        let (home, caches, entry, _) = try makeSweepFixture()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let artifact = home.appendingPathComponent("dev/proj/target")
+        try FileManager.default.createDirectory(
+            at: artifact, withIntermediateDirectories: true
+        )
+        try writeFile(artifact.appendingPathComponent("build.o"), bytes: 2048)
+        let devRoot = home.appendingPathComponent("dev")
+
+        let sweepItem = makeRemoveItem(
+            id: "sweep", scannerID: OrphanedCachesScanner.registeredID,
+            displayName: entry.lastPathComponent,
+            origin: caches, target: entry,
+            requiresRevalidation: true
+        )
+        let artifactItem = makeRemoveItem(
+            id: "artifact", scannerID: BuildArtifactsScanner.registeredID,
+            displayName: "target", origin: devRoot, target: artifact,
+            autoEligible: false, requiresRevalidation: true
+        )
+        // A cleaner with the container roots and the session snapshot — the
+        // registry is the ONLY thing missing.
+        let cleaner = CacheCleaner(
+            home: home, containerRoots: [caches, devRoot],
+            containerSnapshot: sessionSnapshot(of: [caches, devRoot])
+        )
+        let report = await cleaner.clean(
+            items: [sweepItem, artifactItem], moveToTrash: false
+        )
+
+        XCTAssertTrue(report.entries.isEmpty, "nothing may be deleted")
+        XCTAssertEqual(report.errors.count, 2)
+        XCTAssertEqual(
+            Set(report.errors.map(\.key)),
+            [sweepItem.key, artifactItem.key],
+            "both refusals are ITEM-KEYED"
+        )
+        for error in report.errors {
+            XCTAssertTrue(
+                error.message.contains("no revalidator is registered"),
+                error.message
+            )
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: entry.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: artifact.path))
+        XCTAssertTrue(
+            logContents(home: home).contains("REFUSED [revalidator-unavailable]"),
+            "the fail-closed refusal is logged, never a silent skip"
+        )
+    }
+
+    func testUnmarkedItemOfScannerWithoutRevalidatorIsUnaffected() async throws {
+        // The no-regression half of the same contract: an UNMARKED item of
+        // a scanner with no registered revalidator (and no predicate to ask)
+        // deletes exactly as it did before the seam existed — the whole
+        // pre-fn-4.8 behaviour of every other scanner.
+        let (home, _, artifact, snapshot) = try makeArtifactFixture()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let devRoot = home.appendingPathComponent("dev")
+
+        let item = makeRemoveItem(
+            scannerID: "fixture_scanner", origin: devRoot, target: artifact
+        )
+        let cleaner = CacheCleaner(
+            home: home, containerRoots: [devRoot], containerSnapshot: snapshot,
+            preDeleteRevalidators: sweepRevalidators
+        )
+        let report = await cleaner.clean(items: [item], moveToTrash: false)
+
+        XCTAssertTrue(report.errors.isEmpty, "\(report.errors)")
+        XCTAssertEqual(report.entries.count, 1)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: artifact.path))
+    }
+
+    func testMarkerForgottenSweepItemStillReProbesViaRegistryPredicate() async throws {
+        // BELT-AND-BRACES, the cleaner half. A mapping regression emits an
+        // `automaticCleanEligible` sweep entry but FORGETS the marker. The
+        // registry's own applicability predicate still says "re-probe", so
+        // the protection the removed hard-coded gate provided is not lost:
+        // the recreated user data is refused, untouched. (The scan-time half
+        // — the same shape failing `validatedOutcome` — is proven in
+        // `OrphanedCachesScannerTests`.)
+        let (home, caches, entry, snapshot) = try makeSweepFixture()
+        defer { try? FileManager.default.removeItem(at: home) }
+
+        try FileManager.default.removeItem(at: entry)
+        let library = entry.appendingPathComponent("Photos Library.photoslibrary")
+        try FileManager.default.createDirectory(
+            at: library, withIntermediateDirectories: true
+        )
+        let victim = library.appendingPathComponent("database.db")
+        try writeFile(victim, bytes: 4096)
+
+        let unmarked = makeRemoveItem(
+            scannerID: OrphanedCachesScanner.registeredID,
+            displayName: entry.lastPathComponent,
+            origin: caches, target: entry,
+            requiresRevalidation: false
+        )
+        XCTAssertTrue(unmarked.automaticCleanEligible)
+        XCTAssertFalse(unmarked.requiresPreDeleteRevalidation,
+                       "the regression fixture is deliberately unmarked")
+
+        let cleaner = CacheCleaner(
+            home: home, containerRoots: [caches], containerSnapshot: snapshot,
+            preDeleteRevalidators: sweepRevalidators
+        )
+        let report = await cleaner.clean(items: [unmarked], moveToTrash: false)
+
+        XCTAssertTrue(report.entries.isEmpty, "nothing may be deleted")
+        XCTAssertEqual(report.errors.count, 1)
+        let message = try XCTUnwrap(report.errors.first?.message)
+        XCTAssertTrue(message.contains("contents changed since scan"), message)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: victim.path),
+                      "the recreated content is byte-untouched")
+        XCTAssertTrue(logContents(home: home).contains("REFUSED [content-drift]"))
+    }
+
+    func testMarkedAggregateItemIsStructurallyRefused() async throws {
+        // The marker is a PER-TARGET contract: the seam re-inspects the one
+        // `.containerItem` target. An aggregate carrying it could never be
+        // re-inspected that way, so it is refused at the structural check
+        // rather than deleted through a path the marker does not cover.
+        let home = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let root = home.appendingPathComponent("cat-root")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try writeFile(root.appendingPathComponent("f.bin"), bytes: 1024)
+
+        let category = makeCategory(at: [root], name: "marked-cat")
+        let item = makeItem(
+            id: category.slug, scannerID: "categories",
+            displayName: category.name, records: [makeRecord(root)],
+            action: .removeContents, admission: .category(category),
+            requiresRevalidation: true
+        )
+        let cleaner = CacheCleaner(home: home)
+        let report = await cleaner.clean(items: [item], moveToTrash: false)
+
+        XCTAssertTrue(report.entries.isEmpty)
+        XCTAssertEqual(report.errors.count, 1)
+        XCTAssertTrue(
+            try XCTUnwrap(report.errors.first?.message)
+                .contains("per-target contract"),
+            report.errors.first?.message ?? ""
+        )
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: root.appendingPathComponent("f.bin").path
+            ),
+            "nothing under the aggregate is touched"
+        )
     }
 
     // MARK: - Unified entry: accounting-registry scope

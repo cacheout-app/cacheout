@@ -413,6 +413,90 @@ struct ScanOutcome: Sendable {
     var errors: [ScanIssue]
 }
 
+// MARK: - Pre-delete revalidator seam (fn-4.8, R17/D8)
+
+/// One revalidator's answer for ONE item, immediately before its deletion.
+///
+/// A revalidation can only ever REFUSE — it NEVER widens admission (the
+/// as-built chokepoint doctrine, preserved verbatim through the
+/// generalization). Everything a refusal needs downstream is TYPED: fn-4.9's
+/// wire rows serialize from this payload, never by parsing the prose reason.
+enum PreDeleteVerdict: Equatable, Sendable {
+    /// Nothing the delete-time inspection saw stands in the way. The
+    /// deletion still faces every other gate (admission, snapshot identity,
+    /// containment, mount boundaries).
+    case allow
+    /// FAIL-CLOSED refusal. `reason` is the item-keyed human detail (the
+    /// error surface + the REFUSED log line); `valuables` is the CURRENT
+    /// probe's set in the ONE canonical order (empty for revalidators with
+    /// no valuables model, e.g. orphaned caches); `acknowledgementToken` is
+    /// present ONLY for a COMPLETE probe with a NON-EMPTY current set —
+    /// the uniform R17 rule (an incomplete probe is unauthorizable and
+    /// tokenless; a vanished set has nothing to acknowledge).
+    case refuse(
+        reason: String,
+        valuables: [DetectedValuable],
+        acknowledgementToken: String?
+    )
+}
+
+/// The per-clean `[ItemKey: acknowledgement]` AUTHORIZATION CONTEXT.
+///
+/// Built ONCE per clean invocation by the surface that obtained the user's
+/// acknowledgement (fn-4.6's confirmation sheet, fn-4.9's
+/// `--acknowledge-valuables` flags) and handed down the deletion path so
+/// each item's revalidator receives ITS OWN entry (nil when absent). The
+/// item's structural `valuablesDisclosure` is DISCLOSURE ONLY and is NEVER
+/// read as acknowledgement — otherwise an unacknowledged CLI clean of the
+/// same scanned item would count as acknowledged.
+typealias PreDeleteAuthorizationContext = [ItemKey: String]
+
+/// The GENERALIZED per-scanner revalidator (the seam the as-built cleaner
+/// comment promised fn-4/fn-5). A `Sendable` VALUE with exactly two members,
+/// declared by the scanner that owns the probe and captured by the runtime
+/// at registration — the cleaner owns the chokepoint, the scanner owns what
+/// "still safe to delete" means for its own items.
+///
+/// Runs SYNCHRONOUSLY on the cleaner's execution context (off the main
+/// actor), bounded by its scanner's shared probe caps.
+struct PreDeleteRevalidator: Sendable {
+    /// PURE, DETERMINISTIC item-SHAPE predicate — no filesystem access, no
+    /// state, no I/O of any kind. It is called during SCAN-TIME validation
+    /// (the applicable-but-unmarked structural invariant below) as well as
+    /// at the chokepoint, so it must answer identically in both places from
+    /// the item alone. ALL probing belongs in `revalidate`.
+    private let applicability: @Sendable (ReclaimableItem) -> Bool
+
+    /// The delete-time inspection. `authorization` is the item's OWN entry
+    /// from the per-clean authorization context (nil when absent).
+    private let inspection:
+        @Sendable (ReclaimableItem, String?) -> PreDeleteVerdict
+
+    init(
+        requiresRevalidation: @escaping @Sendable (ReclaimableItem) -> Bool,
+        revalidate:
+            @escaping @Sendable (ReclaimableItem, String?) -> PreDeleteVerdict
+    ) {
+        self.applicability = requiresRevalidation
+        self.inspection = revalidate
+    }
+
+    /// The registry's OWN applicability opinion — the BELT half of the
+    /// belt-and-braces dispatch (the `requiresPreDeleteRevalidation` marker
+    /// is the braces): an item this returns true for is re-probed at the
+    /// chokepoint even if a mapping regression forgot to mark it.
+    func requiresRevalidation(item: ReclaimableItem) -> Bool {
+        applicability(item)
+    }
+
+    /// The delete-time verdict for ONE item, with ITS authorization entry.
+    func revalidate(
+        item: ReclaimableItem, authorization: String?
+    ) -> PreDeleteVerdict {
+        inspection(item, authorization)
+    }
+}
+
 // MARK: - SpaceScanner protocol
 
 /// One space scanner. Conformers are actors or value types (`Sendable`).
@@ -430,7 +514,19 @@ protocol SpaceScanner: Sendable {
     /// scanners with none (CategoryScanner: its admission is
     /// category-policy).
     var trustedContainerRoots: [URL] { get }
+    /// This scanner's DELETE-TIME revalidator (fn-4.8, R17/D8) — DEFAULT
+    /// NIL, so a scanner that needs none changes zero lines. Captured by
+    /// the runtime AT REGISTRATION into a scanner-ID-keyed registry and
+    /// injected into the cleaner's constructor; never read off items, never
+    /// global state.
+    var preDeleteRevalidator: PreDeleteRevalidator? { get }
     func scan(context: ScanContext) async -> ScanOutcome
+}
+
+extension SpaceScanner {
+    /// The default: no delete-time revalidation. Every scanner that existed
+    /// before fn-4.8 inherits this unchanged.
+    var preDeleteRevalidator: PreDeleteRevalidator? { nil }
 }
 
 // MARK: - Runtime
@@ -519,6 +615,15 @@ struct SpaceScannerRuntime {
     /// registration-derived policy.
     private let registeredCategories: [String: CacheCategory]
 
+    /// PER-SCANNER delete-time revalidators (fn-4.8, R17/D8), captured AT
+    /// CONSTRUCTION from each scanner's default-nil declaration. Two
+    /// consumers, one source: `makeCleaner(snapshot:)` injects this map into
+    /// the cleaner's constructor (never global state), and scan-time
+    /// validation reads the PRODUCING scanner's entry to enforce the
+    /// applicable-but-unmarked structural invariant. A scanner without a
+    /// declaration is absent here — its items behave exactly as before.
+    private let preDeleteRevalidators: [String: PreDeleteRevalidator]
+
     private let home: URL
     private let provider: FileSystemIdentityProvider
 
@@ -565,8 +670,13 @@ struct SpaceScannerRuntime {
         var union: [URL] = []
         var seenRoots = Set<String>()
         var declared: [String: [URL]] = [:]
+        var revalidators: [String: PreDeleteRevalidator] = [:]
         for scanner in scanners {
             declared[scanner.id] = scanner.trustedContainerRoots
+            // Captured ONCE, here — the same registration act that extends
+            // delete-time admission also declares how this scanner's items
+            // are re-inspected before deletion (fn-4.8).
+            revalidators[scanner.id] = scanner.preDeleteRevalidator
             for root in scanner.trustedContainerRoots
             where seenRoots.insert(root.path).inserted {
                 union.append(root)
@@ -577,6 +687,7 @@ struct SpaceScannerRuntime {
         self.registeredCategories = registered
         self.trustedContainerRoots = union
         self.declaredContainerRoots = declared
+        self.preDeleteRevalidators = revalidators
         self.home = home
         self.provider = provider
     }
@@ -638,6 +749,11 @@ struct SpaceScannerRuntime {
     ///   (`ValidatedScanSession.snapshot`). `nil` is FAIL-CLOSED: every
     ///   `.removeItem` deletion is refused (`container-unavailable`) —
     ///   there is deliberately no fail-open path.
+    ///
+    /// The REGISTRATION-captured revalidator registry rides along beside the
+    /// snapshot (fn-4.8): a cleaner built THROUGH the runtime can always
+    /// honour a `requiresPreDeleteRevalidation` marker, and a cleaner built
+    /// without one fails closed on marked items.
     func makeCleaner(
         snapshot: ContainerSnapshot? = nil,
         trashHandler: CacheCleaner.TrashHandler? = nil
@@ -646,6 +762,7 @@ struct SpaceScannerRuntime {
             home: home,
             containerRoots: trustedContainerRoots,
             containerSnapshot: snapshot,
+            preDeleteRevalidators: preDeleteRevalidators,
             provider: provider,
             trashHandler: trashHandler
         )
@@ -756,6 +873,14 @@ struct SpaceScannerRuntime {
     ///     contract that the kind means the whole outcome was rejected.
     ///     The violation itself malforms the outcome (the genuinely
     ///     synthesized replacement is the correct fail-closed response).
+    /// (i) REVALIDATION MARKER (fn-4.8, R17/D8) — when the PRODUCING
+    ///     scanner declared a `preDeleteRevalidator`, every item that
+    ///     revalidator's pure `requiresRevalidation(item:)` predicate deems
+    ///     applicable must carry `requiresPreDeleteRevalidation`. A mapping
+    ///     regression that emits an applicable item WITHOUT the marker is a
+    ///     structural violation here — the invariant whose landing is what
+    ///     allowed the old hard-coded orphaned-caches cleaner gate to be
+    ///     removed in the same change (`revalidationMarkerViolation`).
     ///
     /// Any violation replaces the WHOLE outcome with a synthesized path-less
     /// `.malformedOutcome` issue — nothing from a malformed outcome is
@@ -769,7 +894,8 @@ struct SpaceScannerRuntime {
             // Registration-time declaration: an unregistered producer id
             // has declared nothing, so no container-item origin can bind.
             declaredContainerRoots: declaredContainerRoots[scannerID] ?? [],
-            registeredCategories: registeredCategories
+            registeredCategories: registeredCategories,
+            preDeleteRevalidator: preDeleteRevalidators[scannerID]
         )
     }
 
@@ -779,7 +905,8 @@ struct SpaceScannerRuntime {
         _ outcome: ScanOutcome,
         from scannerID: String,
         declaredContainerRoots: [URL],
-        registeredCategories: [String: CacheCategory]
+        registeredCategories: [String: CacheCategory],
+        preDeleteRevalidator: PreDeleteRevalidator?
     ) -> ValidatedScannerEvent {
         var seenIDs = Set<String>()
         // Check (d), outcome-wide half: running `allocatedBytes` sum.
@@ -819,6 +946,9 @@ struct SpaceScannerRuntime {
                     of: item, from: scannerID,
                     declaredContainerRoots: declaredContainerRoots,
                     registeredCategories: registeredCategories
+                )
+                ?? revalidationMarkerViolation(
+                    of: item, revalidator: preDeleteRevalidator
                 ) {
                 return .malformed(scannerID: scannerID, ScanIssue(
                     url: nil, kind: .malformedOutcome,
@@ -862,6 +992,40 @@ struct SpaceScannerRuntime {
             ))
         }
         return .outcome(scannerID: scannerID, outcome)
+    }
+
+    /// Check (i), STRUCTURE — the REVALIDATION-MARKER invariant (fn-4.8,
+    /// R17/D8). For an outcome whose PRODUCING scanner declared a
+    /// `preDeleteRevalidator`, any item that revalidator's own
+    /// `requiresRevalidation(item:)` predicate deems APPLICABLE must ALSO
+    /// carry the structural `requiresPreDeleteRevalidation` marker: a
+    /// scanner's output has to match its declared applicability.
+    ///
+    /// This is the check the orphaned-caches migration is ORDERED against:
+    /// the old hard-coded cleaner gate could only be removed in the SAME
+    /// change that landed this invariant, so at no commit does a
+    /// marker-forgotten mapping regression escape both. The chokepoint's
+    /// belt-and-braces dispatch (marker OR predicate) still re-probes such
+    /// an item if one ever reached the cleaner directly — this check makes
+    /// sure it never reaches ANY consumer through a validated scan.
+    ///
+    /// The converse is deliberately NOT enforced: an item MARKED while the
+    /// predicate says inapplicable is safe (the marker only ever adds a
+    /// re-inspection), and the marker is also the fail-closed signal for
+    /// cleaners built without the registry, so nothing may discourage it.
+    /// Scanners with NO declared revalidator are untouched here — their
+    /// items were never in this contract.
+    private static func revalidationMarkerViolation(
+        of item: ReclaimableItem, revalidator: PreDeleteRevalidator?
+    ) -> String? {
+        guard let revalidator,
+              !item.requiresPreDeleteRevalidation,
+              revalidator.requiresRevalidation(item: item)
+        else { return nil }
+        return "the scanner's registered pre-delete revalidator deems this "
+            + "item applicable, but it does not carry "
+            + "requiresPreDeleteRevalidation — a scanner's items must match "
+            + "its declared delete-time applicability (R17)"
     }
 
     /// Check (d): the value-domain invariants over EVERY numeric field on
@@ -1346,6 +1510,7 @@ struct SpaceScannerRuntime {
         }
         let registeredCategories = self.registeredCategories
         let declaredContainerRoots = self.declaredContainerRoots
+        let preDeleteRevalidators = self.preDeleteRevalidators
         let (events, continuation) =
             AsyncStream<ValidatedScannerEvent>.makeStream()
         let task = Task {
@@ -1364,7 +1529,13 @@ struct SpaceScannerRuntime {
                             // provenance — never re-read mid-scan.
                             declaredContainerRoots:
                                 declaredContainerRoots[scanner.id] ?? [],
-                            registeredCategories: registeredCategories
+                            registeredCategories: registeredCategories,
+                            // The same registration capture the cleaner's
+                            // injected registry reads (fn-4.8) — scan-time
+                            // applicability and delete-time dispatch can
+                            // never disagree about who has a revalidator.
+                            preDeleteRevalidator:
+                                preDeleteRevalidators[scanner.id]
                         )
                     }
                 }

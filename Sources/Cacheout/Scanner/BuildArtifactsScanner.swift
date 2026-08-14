@@ -552,6 +552,114 @@ struct BuildArtifactsScanner: @unchecked Sendable {
         }
     }
 
+    // MARK: - Pre-delete revalidator (fn-4.8, R17/D8)
+
+    /// This scanner's DELETE-TIME revalidator declaration. Read by fn-4.5's
+    /// one-line `SpaceScanner` conformance (and, until it exists, by the
+    /// TEST-ONLY adapter) — so `build_artifacts` items are enforced from
+    /// their first addressable moment: the seam lands BEFORE registration on
+    /// purpose, and registration never opens an enforcement gap.
+    var preDeleteRevalidator: PreDeleteRevalidator? {
+        Self.preDeleteRevalidator(provider: provider)
+    }
+
+    /// The revalidator VALUE, constructible without a scanner instance.
+    ///
+    /// APPLICABILITY (the pure predicate — no filesystem access, no state):
+    /// EVERY build-artifact item. The scan probes them all, marks them all
+    /// (`requiresPreDeleteRevalidation: true`), and none of them may be
+    /// deleted on scan-time inspection alone — the artifact dir's CONTENTS
+    /// are what a valuable appears in, and no snapshot binds those.
+    ///
+    /// VERDICT, from the CURRENT delete-time probe (production caps, the
+    /// SAME bounded core the scan used) and the item's OWN authorization
+    /// entry:
+    /// - INCOMPLETE probe → refuse; the payload carries what was still seen
+    ///   (a floor on the warning, never a basis for authorization) and NO
+    ///   token — the uniform R17 rule that an unfinished inspection is
+    ///   unauthorizable;
+    /// - COMPLETE + EMPTY current set, when the item DISCLOSED valuables at
+    ///   scan time → the VANISHED-SET refusal: refuse ONCE with no token
+    ///   (there is nothing to acknowledge); the caller re-scans and retries
+    ///   WITHOUT acknowledgement, since the item is then valuables-free;
+    /// - COMPLETE + EMPTY current set with nothing disclosed → `.allow`
+    ///   (the ordinary build directory);
+    /// - COMPLETE + NON-EMPTY current set → the token recomputed from THIS
+    ///   probe must EQUAL the authorization entry; anything else (a missing
+    ///   entry, a stale entry, an entry for another item) refuses and hands
+    ///   back the fresh token with the current valuables.
+    ///
+    /// Acknowledgement is never inferred: the item's structural
+    /// `valuablesDisclosure` is read ONLY to detect the vanished set, never
+    /// as consent.
+    static func preDeleteRevalidator(
+        provider: FileSystemIdentityProvider
+    ) -> PreDeleteRevalidator {
+        PreDeleteRevalidator(
+            requiresRevalidation: { _ in true },
+            revalidate: { item, authorization in
+                guard case .containerItem(_, let target) = item.admission else {
+                    // Structurally unreachable (the validator and the
+                    // cleaner both refuse a `.removeItem` item without the
+                    // container descriptor) — fail closed rather than
+                    // assume a target.
+                    return .refuse(
+                        reason: "refused: a build-artifact item without a "
+                            + "container-item target cannot be re-inspected "
+                            + "before deletion",
+                        valuables: [], acknowledgementToken: nil
+                    )
+                }
+                let current = preDeleteValuablesProbe(
+                    at: target, provider: provider
+                )
+                guard current.probeComplete else {
+                    return .refuse(
+                        reason: "\(target.path): couldn't fully re-inspect "
+                            + "the directory for release artifacts at delete "
+                            + "time — refused (an inspection that could not "
+                            + "finish is treated like a change since scan); "
+                            + "re-scan required",
+                        valuables: current.valuables,
+                        acknowledgementToken: nil
+                    )
+                }
+                guard !current.valuables.isEmpty else {
+                    let disclosed =
+                        item.valuablesDisclosure?.valuables.isEmpty == false
+                    guard disclosed else { return .allow }
+                    return .refuse(
+                        reason: "\(target.path): the release artifacts this "
+                            + "item disclosed are no longer there — refused "
+                            + "once; re-scan and clean again (nothing is "
+                            + "left to acknowledge)",
+                        valuables: [], acknowledgementToken: nil
+                    )
+                }
+                // COMPLETE + non-empty: the token is derived from THIS
+                // probe, so any membership/path/size/identity/mtime change
+                // since the acknowledgement rotates it.
+                let token = ValuablesDisclosure.acknowledgementToken(
+                    scannerID: item.scannerID, itemID: item.id,
+                    valuables: current.valuables, probeComplete: true
+                )
+                if let token, let authorization, authorization == token {
+                    return .allow
+                }
+                let names = current.valuables.map(\.name)
+                    .joined(separator: ", ")
+                return .refuse(
+                    reason: "\(target.path): release artifacts (\(names)) are "
+                        + "inside this directory at delete time and are not "
+                        + "covered by an acknowledgement — refused, nothing "
+                        + "deleted",
+                    valuables: current.valuables,
+                    acknowledgementToken: token
+                )
+            }
+        )
+    }
+
     /// The forcing rule: a valuable hit OR an incomplete probe pushes a rule
     /// row OFF safe. Already-review (and caution) rows stay where they are —
     /// the gate NARROWS, never widens.

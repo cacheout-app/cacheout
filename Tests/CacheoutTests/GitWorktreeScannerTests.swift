@@ -1415,6 +1415,65 @@ final class GitWorktreeScannerTests: XCTestCase {
         try assertNonMalformed(user, from: userScanner)
     }
 
+    func testProtectedFirstRecordDefersSilentlyRatherThanFailingCrossValidation()
+        async throws
+    {
+        // The stage-2 cell only a SPLIT repository can express: the common git
+        // directory and the worktree are unprotected (so the listing runs),
+        // while the porcelain FIRST RECORD — the `-C` target of the
+        // default-branch ladder — sits under a protected ancestor.
+        //
+        // Cross-validation INSPECTS that first record (`<firstRecord>/.git`),
+        // so on an automatic scan the deferring provider reports it absent. Were
+        // the gate to run after cross-validation, the repository would publish a
+        // VISIBLE membership refusal for what is a silent policy deferral.
+        let protectedHome = dev.appendingPathComponent("home")
+        try fm.createDirectory(
+            at: protectedHome.appendingPathComponent("Documents"),
+            withIntermediateDirectories: true
+        )
+        let gitDirectory = dev.appendingPathComponent("gitdir")
+        let workingTree = protectedHome.appendingPathComponent("Documents/wd")
+        let worktree = dev.appendingPathComponent("wt")
+        try makeSplitRepository(
+            gitDirectory: gitDirectory, workingTree: workingTree, worktree: worktree
+        )
+        let listing = Self.porcelain([
+            ["worktree \(workingTree.path)", "HEAD \(String(repeating: "a", count: 40))", "branch refs/heads/main"],
+            ["worktree \(worktree.path)", "HEAD \(String(repeating: "a", count: 40))", "branch refs/heads/feature"],
+        ])
+
+        let automaticRunner = ScriptedGitRunner(listing: listing)
+        let automatic = await makeScanner(
+            runner: automaticRunner, home: protectedHome
+        ).scan(context: ScanContext(trigger: .automatic))
+        XCTAssertTrue(automatic.items.isEmpty)
+        XCTAssertTrue(
+            automatic.errors.isEmpty,
+            "a deferral must never surface as a membership refusal: \(automatic.errors)"
+        )
+        XCTAssertTrue(
+            automaticRunner.requests(mentioning: workingTree.path).isEmpty,
+            "NO git argv may touch the protected parent: \(automaticRunner.requests)"
+        )
+
+        let userRunner = ScriptedGitRunner(listing: listing)
+        let userScanner = makeScanner(runner: userRunner, home: protectedHome)
+        let user = await userScanner.scan(context: ScanContext(trigger: .userInitiated))
+        XCTAssertEqual(user.items.count, 1, "the user asked: \(user.errors)")
+        XCTAssertFalse(
+            userRunner.requests(mentioning: workingTree.path)
+                .filter { $0.contains("symbolic-ref") }.isEmpty,
+            "the ladder queries the first record: \(userRunner.requests)"
+        )
+        let reclaim = try plan(of: try XCTUnwrap(user.items.first))
+        XCTAssertEqual(
+            reclaim.parentRepoWorkingDir.resolvingSymlinksInPath().path,
+            workingTree.resolvingSymlinksInPath().path
+        )
+        try assertNonMalformed(user, from: userScanner)
+    }
+
     func testAutomaticScanNeverInspectsAProtectedAdminDirectoryWhileAttributing()
         async throws
     {

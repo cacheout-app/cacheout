@@ -576,7 +576,20 @@ struct GitWorktreeScanner: @unchecked Sendable {
             return .processed
         }
 
-        // (c) CROSS-VALIDATION, fn-5.1's own rule (both branches — a bare repo
+        // (c) SECONDARY TCC GATE, stage 2 — the parent working directory is
+        //     the `-C` target of the D6 default-branch ladder and is only
+        //     knowable AFTER the listing. It is checked HERE, before
+        //     cross-validation, because cross-validation INSPECTS it
+        //     (`<firstRecord>/.git`): on `.automatic` the deferring provider
+        //     would report that path absent and the refusal below would publish
+        //     a VISIBLE membership issue for what is actually a silent policy
+        //     deferral. A protected parent defers the repository's REMAINING
+        //     work entirely — every per-worktree conclusion below rests on an
+        //     assessment we deliberately did not run, and the prune item's plan
+        //     points git at this same deferred path.
+        if isDeferred(mainRecord.path, context: context) { return .processed }
+
+        // (d) CROSS-VALIDATION, fn-5.1's own rule (both branches — a bare repo
         //     has no `<bare>/.git`). Without it the group's git directory and
         //     the porcelain first record would be two unrelated claims, and the
         //     admin container derived from the former would mutate data the
@@ -592,7 +605,7 @@ struct GitWorktreeScanner: @unchecked Sendable {
             return .processed
         }
 
-        // (d) REPO DEDUPE on the canonical FIRST-RECORD path (the authoritative
+        // (e) REPO DEDUPE on the canonical FIRST-RECORD path (the authoritative
         //     key; the git-directory grouping above is the fetch-once
         //     mechanism, not the identity).
         let parentRepoWorkingDir = mainRecord.path
@@ -605,16 +618,6 @@ struct GitWorktreeScanner: @unchecked Sendable {
         // not live there (D13 revised).
         let adminContainer = group.gitDirectory
             .appendingPathComponent(GitWorktreeGitdirResolver.adminContainerName)
-
-        // (e) SECONDARY TCC GATE, stage 2 — the parent working directory is the
-        //     `-C` target of the D6 default-branch ladder and is only knowable
-        //     after the listing. A protected parent defers the repository's
-        //     REMAINING work entirely: every per-worktree conclusion below rests
-        //     on an assessment we deliberately did not run, and the prune item's
-        //     plan points git at this same deferred path.
-        if isDeferred(parentRepoWorkingDir, context: context) {
-            return .processed
-        }
 
         // (f) STALE TIER — driven by the porcelain records, which are git's own
         //     authority on what worktrees exist.

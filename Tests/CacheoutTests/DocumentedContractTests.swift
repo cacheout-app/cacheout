@@ -879,6 +879,53 @@ final class DocumentedContractTests: XCTestCase {
 
              ## [2.2.0] - 2026-08-06
              """, false),
+            // The satisfied form is matched to its END, not by prefix
+            // (reviews r7-r8): a regex that stopped at the first closing
+            // `**` accepts both of these. After the token the line must STOP
+            // or continue with WHITESPACE — anything attached means the
+            // token is something else.
+            ("satisfied-with-a-mangled-closing-token", """
+             # Changelog
+
+             ## [Unreleased]
+
+               **RELEASE-BLOCKING gate A**
+               Status: **SATISFIED at 63edbfc***
+
+             ## [2.2.0] - 2026-08-06
+             """, false),
+            ("satisfied-with-a-character-attached-to-the-token", """
+             # Changelog
+
+             ## [Unreleased]
+
+               **RELEASE-BLOCKING gate A**
+               Status: **SATISFIED at 63edbfc**x
+
+             ## [2.2.0] - 2026-08-06
+             """, false),
+            ("satisfied-with-too-short-a-commit", """
+             # Changelog
+
+             ## [Unreleased]
+
+               **RELEASE-BLOCKING gate A**
+               Status: **SATISFIED at 63ed**
+
+             ## [2.2.0] - 2026-08-06
+             """, false),
+            // …while ordinary trailing prose after the bold token is fine —
+            // the documented one-line edit leaves the sentence's tail behind.
+            ("satisfied-with-trailing-prose", """
+             # Changelog
+
+             ## [Unreleased]
+
+               **RELEASE-BLOCKING gate A**
+               Status: **SATISFIED at 63edbfc** — adopted 2026-08-15
+
+             ## [2.2.0] - 2026-08-06
+             """, true),
             // Nothing recorded at all is the ordinary, releasable state.
             ("no-gates-recorded", """
              # Changelog

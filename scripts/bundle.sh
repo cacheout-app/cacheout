@@ -338,6 +338,12 @@ notarize_dmg() {
 #     Status: **NOT SATISFIED**            → blocks
 #     Status: **SATISFIED at <hex7-40>**   → passes
 #
+# The satisfied form is matched to its END, not by prefix. After the closing
+# `**` the line must either STOP or continue with WHITESPACE — the documented
+# one-line edit leaves the sentence's tail in place, so ` — adopted <date>`
+# is fine. Anything ATTACHED to the token (`**x`, `***`) means the token is
+# something else entirely and the status cannot be read as satisfied.
+#
 # EVERYTHING ELSE BLOCKS — a missing [Unreleased] section, a gate whose
 # status line was deleted, a duplicate or orphan status line, a typo, or
 # `Status: **SATISFIED**` with no commit to check. Searching only for the
@@ -422,7 +428,7 @@ check_release_gates() {
     open_count=$(printf '%s\n' "$status_lines" |
         grep -cE '^[[:space:]]*Status: \*\*NOT SATISFIED\*\*' || true)
     satisfied_count=$(printf '%s\n' "$status_lines" |
-        grep -cE '^[[:space:]]*Status: \*\*SATISFIED at [0-9a-f]{7,40}\*\*' || true)
+        grep -cE '^[[:space:]]*Status: \*\*SATISFIED at [0-9a-f]{7,40}\*\*([[:space:]].*)?$' || true)
 
     if [ "$open_count" -gt 0 ]; then
         echo "❌ An open release-blocking gate in CHANGELOG.md [Unreleased]:"
@@ -435,7 +441,7 @@ check_release_gates() {
         echo "❌ Malformed release-gate status in CHANGELOG.md [Unreleased]"
         echo "   ($gate_count gate(s), $satisfied_count well-formed status line(s)):"
         printf '%s\n' "$status_lines" |
-            grep -vE '^[[:space:]]*Status: \*\*SATISFIED at [0-9a-f]{7,40}\*\*' || true
+            grep -vE '^[[:space:]]*Status: \*\*SATISFIED at [0-9a-f]{7,40}\*\*([[:space:]].*)?$' || true
         echo "   Admissible: 'Status: **NOT SATISFIED**' or"
         echo "   'Status: **SATISFIED at <commit-hash>**' (7-40 hex characters)."
         echo "   Anything else is unverifiable and therefore blocks."

@@ -1429,6 +1429,91 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         )
     }
 
+    // MARK: - R6/R8: the BARE-PARENT fixture
+
+    func testABareParentExecutesThroughTheCarriedAdminContainer() async throws {
+        // D13 revised: a bare parent's git directory does NOT live at
+        // `<wd>/.git`, and a linked worktree of a bare main is not itself
+        // `bare`, so G1 never excludes the shape — a `<wd>/.git/worktrees`
+        // reconstruction would silently mis-path the mutation scope. Both
+        // modes must therefore execute through the RESOLVER-CARRIED
+        // `<parentGitDir>/worktrees`.
+        let source = try makeRepository(named: "source")
+        let bare = container.appendingPathComponent("bare.git")
+        XCTAssertEqual(
+            try GitFixture.git(
+                ["clone", "--bare", source.path, bare.path], home: home
+            ).status, 0, "bare clone failed"
+        )
+        let stale = container.appendingPathComponent("bare-wt")
+        XCTAssertEqual(
+            try GitFixture.git(
+                ["-C", bare.path, "worktree", "add", stale.path, "-b", "feature"],
+                home: home
+            ).status, 0
+        )
+        let membership = try membership(of: stale, in: bare)
+
+        // The carried container is `<bare.git>/worktrees` — and the
+        // reconstruction that would have been used instead does not even
+        // exist on disk, which is exactly why it is forbidden.
+        XCTAssertEqual(
+            membership.parentAdminContainer.path,
+            bare.appendingPathComponent("worktrees").path
+        )
+        XCTAssertEqual(membership.parentRepoWorkingDir.path, bare.path)
+        XCTAssertFalse(
+            fm.fileExists(atPath: bare.appendingPathComponent(".git").path),
+            "a bare parent has no <wd>/.git to reconstruct from"
+        )
+
+        // (a) STALE removal through the bare parent.
+        let stalePlan = staleplan(worktree: stale, membership: membership)
+        let staleRunner = InterceptingGitRunner(wrapping: realRunner())
+        let staleReport = await makeCleaner(runner: staleRunner)
+            .clean(items: [item(stalePlan, id: "bare-stale")], moveToTrash: false)
+        XCTAssertTrue(staleReport.errors.isEmpty, "\(staleReport.errorLines)")
+        XCTAssertFalse(fm.fileExists(atPath: stale.path))
+        XCTAssertFalse(fm.fileExists(
+            atPath: membership.parentAdminContainer
+                .appendingPathComponent("bare-wt").path
+        ))
+        XCTAssertTrue(try branchExists("feature", in: bare))
+        XCTAssertEqual(
+            try XCTUnwrap(staleRunner.argvs.first)[4], bare.path,
+            "git must be pointed at the bare repository itself"
+        )
+
+        // (b) PRUNE-ONLY through the same carried container.
+        let orphanCheckout = container.appendingPathComponent("bare-gone")
+        XCTAssertEqual(
+            try GitFixture.git(
+                ["-C", bare.path, "worktree", "add", orphanCheckout.path,
+                 "-b", "gone"], home: home
+            ).status, 0
+        )
+        try fm.removeItem(at: orphanCheckout)
+        let orphanAdmin = membership.parentAdminContainer
+            .appendingPathComponent("bare-gone")
+        XCTAssertTrue(fm.fileExists(atPath: orphanAdmin.path))
+
+        let prune = prunePlan(membership: membership, disclosed: [orphanAdmin])
+        let pruneRunner = InterceptingGitRunner(wrapping: realRunner())
+        let pruneReport = await makeCleaner(runner: pruneRunner)
+            .clean(items: [item(prune, id: "bare-prune")], moveToTrash: false)
+
+        XCTAssertTrue(pruneReport.errors.isEmpty, "\(pruneReport.errorLines)")
+        XCTAssertFalse(fm.fileExists(atPath: orphanAdmin.path),
+                       "the bare parent's admin entry must actually be pruned")
+        XCTAssertEqual(pruneReport.entries.count, 1)
+        let pruneArgv = try XCTUnwrap(
+            pruneRunner.argvs.first { $0.contains("prune") }
+        )
+        XCTAssertEqual(pruneArgv[4], bare.path)
+        XCTAssertTrue(pruneArgv.contains("--expire=now"))
+        assertNoForbiddenArgv(pruneRunner)
+    }
+
     func testNoProductionPathEverRemovesAnAdminDirectoryDirectly() async throws {
         // The prune tier mutates the registry ONLY through git — a direct rm
         // would bypass git's own bookkeeping (an alternative the epic

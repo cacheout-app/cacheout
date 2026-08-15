@@ -331,32 +331,84 @@ notarize_dmg() {
 # mode builds an unsigned .app for local testing and produces no
 # distributable artifact, so it deliberately does not.
 #
-# THE GATE KEYS ON THE STATUS LINE ALONE — a line whose first non-blank
-# content is `Status: **NOT SATISFIED`. Keying on any occurrence of the
-# phrase would mean the paragraph EXPLAINING the mechanism (or a future
-# entry quoting it) could never be written without blocking every release.
-# Closing a gate is therefore one edit with one meaning: replace that
-# line's `**NOT SATISFIED**` with `**SATISFIED at <commit-hash>**`.
+# RECORDED FORM, and it is CHECKED — not merely searched for. Each gate is a
+# `**RELEASE-BLOCKING` marker in [Unreleased] paired with exactly ONE status
+# line, and a status line has exactly two admissible forms:
 #
-# Fail-closed by construction: an unreadable or missing CHANGELOG stops the
-# build too — an unverifiable gate is never a passed one.
+#     Status: **NOT SATISFIED**            → blocks
+#     Status: **SATISFIED at <hex7-40>**   → passes
+#
+# EVERYTHING ELSE BLOCKS — a missing [Unreleased] section, a gate whose
+# status line was deleted, a duplicate or orphan status line, a typo, or
+# `Status: **SATISFIED**` with no commit to check. Searching only for the
+# open marker would FAIL OPEN on every one of those: deleting the status
+# line would "close" the gate. Enumerating the admissible states instead
+# means only a provably-satisfied gate lets a distribution build run.
+#
+# Keying on the status LINE (not on any occurrence of the phrase) is what
+# lets the paragraphs above explain the mechanism — and lets a future entry
+# quote it — without blocking every release.
 check_release_gates() {
     changelog="$PROJECT_DIR/CHANGELOG.md"
     if [ ! -f "$changelog" ]; then
         echo "❌ CHANGELOG.md not found — release gates cannot be verified"
         return 1
     fi
-    # The [Unreleased] section only: closed gates in shipped sections are
-    # history, not preconditions.
-    unreleased=$(awk '/^## \[Unreleased\]/{inside=1; next} /^## \[/{inside=0} inside' "$changelog")
-    if printf '%s\n' "$unreleased" | grep -qE '^[[:space:]]*Status: \*\*NOT SATISFIED'; then
-        echo "❌ A RELEASE-BLOCKING gate in CHANGELOG.md [Unreleased] is still open:"
-        printf '%s\n' "$unreleased" | grep -nE '^[[:space:]]*Status: \*\*NOT SATISFIED'
-        echo "   Run the gate's recorded verification, then replace that line's"
-        echo "   **NOT SATISFIED** with **SATISFIED at <commit-hash>**."
+    if ! grep -qE '^## \[Unreleased\]' "$changelog"; then
+        echo "❌ CHANGELOG.md has no [Unreleased] section — release gates cannot be verified"
         return 1
     fi
-    echo "✅ No open release-blocking gates in CHANGELOG.md [Unreleased]"
+    # The [Unreleased] section only: gates in shipped sections are history,
+    # not preconditions.
+    unreleased=$(awk '/^## \[Unreleased\]/{inside=1; next} /^## \[/{inside=0} inside' "$changelog")
+
+    gate_count=$(printf '%s\n' "$unreleased" | grep -cE '\*\*RELEASE-BLOCKING' || true)
+    status_lines=$(printf '%s\n' "$unreleased" | grep -E '^[[:space:]]*Status: \*\*' || true)
+    status_count=$(printf '%s\n' "$status_lines" | grep -c '[^[:space:]]' || true)
+
+    if [ "$gate_count" -ne "$status_count" ]; then
+        echo "❌ CHANGELOG.md [Unreleased]: $gate_count release-blocking gate(s) but $status_count status line(s)."
+        echo "   Every gate carries EXACTLY ONE status line, either"
+        echo "   'Status: **NOT SATISFIED**' or 'Status: **SATISFIED at <commit-hash>**'."
+        echo "   A missing, extra or renamed status is an UNVERIFIABLE gate, and an"
+        echo "   unverifiable gate never passes."
+        return 1
+    fi
+
+    if [ "$gate_count" -eq 0 ]; then
+        echo "✅ No release-blocking gates recorded in CHANGELOG.md [Unreleased]"
+        return 0
+    fi
+
+    # Enumerate the admissible states; anything else is refused by name.
+    while IFS= read -r line; do
+        case "$line" in
+            *[![:space:]]*) ;;
+            *) continue ;;
+        esac
+        case "$line" in
+            *"Status: **NOT SATISFIED**"*)
+                echo "❌ An open release-blocking gate in CHANGELOG.md [Unreleased]:"
+                echo "  $line"
+                echo "   Run the gate's recorded verification, then replace that line's"
+                echo "   **NOT SATISFIED** with **SATISFIED at <commit-hash>**."
+                return 1
+                ;;
+        esac
+        if ! printf '%s\n' "$line" |
+             grep -qE '^[[:space:]]*Status: \*\*SATISFIED at [0-9a-f]{7,40}\*\*'; then
+            echo "❌ Malformed release-gate status in CHANGELOG.md [Unreleased]:"
+            echo "  $line"
+            echo "   Admissible: 'Status: **NOT SATISFIED**' or"
+            echo "   'Status: **SATISFIED at <commit-hash>**' (7-40 hex characters)."
+            echo "   Anything else is unverifiable and therefore blocks."
+            return 1
+        fi
+    done <<STATUS_LINES
+$status_lines
+STATUS_LINES
+
+    echo "✅ Every release-blocking gate in CHANGELOG.md [Unreleased] is satisfied"
 }
 
 # Main

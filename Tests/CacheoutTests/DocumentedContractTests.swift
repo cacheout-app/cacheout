@@ -730,48 +730,85 @@ final class DocumentedContractTests: XCTestCase {
             return dir
         }
 
-        // (1) OPEN — the CHANGELOG exactly as it ships today.
-        XCTAssertNotEqual(
-            try runGate(projectDir: fixture("open", changelog: changelog)), 0,
-            "an open gate must stop the build"
-        )
-
-        // (2) CLOSED — the documented edit, applied verbatim. THE assertion:
-        // following the instruction actually unblocks the pipeline.
+        // THE CLOSED CASE, from the documented edit applied verbatim: the
+        // instruction must actually unblock the pipeline, and prose that
+        // still MENTIONS the phrase must not keep it shut.
         let closed = changelog.replacingOccurrences(
             of: openMarker, with: closedMarker
         )
         XCTAssertNotEqual(closed, changelog, "the documented edit must apply")
-        XCTAssertEqual(
-            try runGate(projectDir: fixture("closed", changelog: closed)), 0,
-            "the documented close must actually open the release path — "
-                + "prose still MENTIONING the phrase must not keep it shut"
-        )
 
-        // (3) MISSING — fail-closed: an unverifiable gate is not a passed one.
-        XCTAssertNotEqual(
-            try runGate(projectDir: fixture("missing", changelog: nil)), 0,
-            "a missing CHANGELOG must abort"
-        )
+        // Every state the checker can face, and the ONLY one that may pass is
+        // a provably-satisfied gate. Searching for the open marker alone
+        // would FAIL OPEN on rows 3-6: deleting the status line would read as
+        // "closed" (review r4).
+        let cases: [(name: String, changelog: String?, passes: Bool)] = [
+            ("open", changelog, false),
+            ("closed", closed, true),
+            ("missing-file", nil, false),
+            ("status-deleted",
+             changelog.replacingOccurrences(of: openMarker, with: ""), false),
+            ("section-renamed",
+             changelog.replacingOccurrences(
+                of: "## [Unreleased]", with: "## [Whatever]"
+             ), false),
+            ("satisfied-without-a-commit",
+             changelog.replacingOccurrences(
+                of: openMarker, with: "Status: **SATISFIED**"
+             ), false),
+            ("satisfied-with-a-non-hex-commit",
+             changelog.replacingOccurrences(
+                of: openMarker, with: "Status: **SATISFIED at zzzzzzz**"
+             ), false),
+            // An orphan status with no gate marker: the recorded form is
+            // broken, so the gate it belonged to cannot be verified.
+            ("status-without-a-gate", """
+             # Changelog
 
-        // (4) A CLOSED gate in a SHIPPED section is history, never a blocker.
-        let historical = """
-        # Changelog
+             ## [Unreleased]
 
-        ## [Unreleased]
+               Status: **SATISFIED at 63edbfc**
 
-        - nothing pending
+             ## [2.2.0] - 2026-08-06
+             """, false),
+            // Nothing recorded at all is the ordinary, releasable state.
+            ("no-gates-recorded", """
+             # Changelog
 
-        ## [2.2.0] - 2026-08-06
+             ## [Unreleased]
 
-          **RELEASE-BLOCKING cross-repo gate.**
-          Status: **NOT SATISFIED** — this shipped long ago.
-        """
-        XCTAssertEqual(
-            try runGate(projectDir: fixture("historical", changelog: historical)),
-            0,
-            "only [Unreleased] gates block"
-        )
+             - nothing pending
+
+             ## [2.2.0] - 2026-08-06
+             """, true),
+            // A gate in a SHIPPED section is history, never a blocker.
+            ("historical-gate-only", """
+             # Changelog
+
+             ## [Unreleased]
+
+             - nothing pending
+
+             ## [2.2.0] - 2026-08-06
+
+               **RELEASE-BLOCKING cross-repo gate.**
+               Status: **NOT SATISFIED** — this shipped long ago.
+             """, true),
+        ]
+
+        for testCase in cases {
+            let status = try runGate(
+                projectDir: fixture(testCase.name, changelog: testCase.changelog)
+            )
+            if testCase.passes {
+                XCTAssertEqual(status, 0,
+                               "'\(testCase.name)' must let the build proceed")
+            } else {
+                XCTAssertNotEqual(status, 0,
+                                  "'\(testCase.name)' must STOP the build — an "
+                                      + "unverifiable gate is never a passed one")
+            }
+        }
     }
 
     /// PROTOCOL.md's `risk_level` note must no longer claim a per-SCANNER

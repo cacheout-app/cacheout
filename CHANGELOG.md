@@ -175,9 +175,12 @@ below are both part of that coordination, and the latter BLOCKS this release.
 
   **To close (ONE edit, one meaning):** run the verification below, then
   replace that status line's `**NOT SATISFIED**` with
-  `**SATISFIED at <commit-hash>**`. Nothing else needs editing: the release
-  script keys on the `Status:` LINE alone, so this paragraph — and any future
-  entry quoting the phrase — never blocks a build.
+  `**SATISFIED at <commit-hash>**` (7-40 hex characters — a commit anyone can
+  check out). Nothing else needs editing: the release script keys on the
+  `Status:` LINE alone, so this paragraph — and any future entry quoting the
+  phrase — never blocks a build. Those two spellings are the ONLY admissible
+  statuses: a deleted, duplicated, renamed or hash-less status line is an
+  unverifiable gate and blocks exactly like an open one.
 
   **Deferred to the release path, deliberately — and ENFORCED there.**
   Merging this work with the gate open is intentional: the scanner ships to

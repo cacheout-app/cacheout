@@ -838,6 +838,31 @@ final class DocumentedContractTests: XCTestCase {
 
              ## [2.2.0] - 2026-08-06
              """, true),
+            // A MALFORMED status must not be skipped as prose (review r6):
+            // if the parser only saw well-formed lines, the typo'd open
+            // status would be ignored and the valid one below it would close
+            // a gate that was meant to stay shut.
+            ("a-typo-open-status-above-a-valid-one", """
+             # Changelog
+
+             ## [Unreleased]
+
+               **RELEASE-BLOCKING gate A**
+               Status: *NOT SATISFIED*
+               Status: **SATISFIED at 63edbfc**
+
+             ## [2.2.0] - 2026-08-06
+             """, false),
+            ("a-status-in-neither-admissible-spelling", """
+             # Changelog
+
+             ## [Unreleased]
+
+               **RELEASE-BLOCKING gate A**
+               Status: pending
+
+             ## [2.2.0] - 2026-08-06
+             """, false),
             // Nothing recorded at all is the ordinary, releasable state.
             ("no-gates-recorded", """
              # Changelog

@@ -367,12 +367,20 @@ check_release_gates() {
     # equivalent: two gates where one carries two statuses and the other none
     # would balance out, leaving an unverified gate. Positional pairing is
     # what the recorded form actually claims, so that is what is checked.
+    #
+    # A STATUS LINE IS ANY `Status:` LINE, well-formed or not. Recognizing
+    # only the well-formed spelling here would let a typo'd line
+    # (`Status: *NOT SATISFIED*`) be skipped as prose, so a valid status
+    # beneath it would close a gate the typo was trying to hold open.
+    # Structure first over every candidate, spelling second — a malformed
+    # status is then either an ORPHAN (two under one gate) or refused by
+    # name in pass (b).
     pairing=$(printf '%s\n' "$unreleased" | awk '
         /\*\*RELEASE-BLOCKING/ {
             if (awaiting) { print "MISSING_STATUS"; exit }
             awaiting = 1; gates++; next
         }
-        /^[ \t]*Status: \*\*/ {
+        /^[ \t]*Status:/ {
             if (!awaiting) { print "ORPHAN_STATUS\t" $0; exit }
             awaiting = 0; next
         }
@@ -401,7 +409,7 @@ check_release_gates() {
     fi
 
     # (b) SPELLING — every paired status is one of the two admissible forms.
-    status_lines=$(printf '%s\n' "$unreleased" | grep -E '^[[:space:]]*Status: \*\*' || true)
+    status_lines=$(printf '%s\n' "$unreleased" | grep -E '^[[:space:]]*Status:' || true)
 
     # Enumerate the admissible states; anything else is refused by name.
     while IFS= read -r line; do

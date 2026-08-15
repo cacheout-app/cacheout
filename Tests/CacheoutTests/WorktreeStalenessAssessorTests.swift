@@ -33,9 +33,10 @@ import XCTest
 /// `main`, an ancestral HEAD, and a readable commit date.
 private struct GitScript: Sendable {
     var status: GitCommandOutcome = .success(stdout: Data())
-    var symbolicRef: GitCommandOutcome = .failure(
-        exitCode: 128, stderr: "fatal: ref refs/remotes/origin/HEAD is not a symbolic ref\n"
-    )
+    /// Exit 1 is what `symbolic-ref -q` answers for an UNSET origin/HEAD —
+    /// the common shape on fetched repos, and the only class that continues
+    /// the ladder.
+    var symbolicRef: GitCommandOutcome = .failure(exitCode: 1, stderr: "")
     var revParseMain: GitCommandOutcome = .success(
         stdout: Data("221c2f088de2c34c76347bde00820accad4f529c\n".utf8)
     )
@@ -560,10 +561,17 @@ final class WorktreeStalenessAssessorTests: XCTestCase {
         }
         XCTAssertEqual(ladder.count, 2, "origin/HEAD, then refs/heads/main — and stop")
         XCTAssertTrue(ladder[0].argv.contains("refs/remotes/origin/HEAD"))
+        XCTAssertTrue(
+            ladder[0].argv.contains("-q"),
+            "-q is what makes an unset origin/HEAD exit 1 instead of a fatal 128"
+        )
         guard case .failure(let exitCode, _) = ladder[0].outcome else {
             return XCTFail("expected the origin/HEAD probe to fail, got \(ladder[0].outcome)")
         }
-        XCTAssertEqual(exitCode, 128, "real git answers an unset origin/HEAD with exit 128")
+        XCTAssertEqual(
+            exitCode, 1,
+            "real git answers an unset origin/HEAD under -q with the MISS exit, not a fatal"
+        )
         XCTAssertTrue(ladder[1].argv.contains("refs/heads/main"))
         XCTAssertFalse(
             recorder.invocations.contains { $0.argv.contains("refs/heads/master") },
@@ -692,6 +700,60 @@ final class WorktreeStalenessAssessorTests: XCTestCase {
         XCTAssertTrue(runner.requests(containing: "merge-base").isEmpty)
     }
 
+    /// A FATAL rung is NOT a miss. The dangerous shape this pins: `main`
+    /// cannot be read but `master` still resolves — promoting `master` to
+    /// "the default branch" would judge the worktree against a branch that
+    /// is not this repository's default, and a worktree unmerged into `main`
+    /// could pass G3.
+    func testFatalLadderRungFailsClosedInsteadOfPromotingTheNextRung() async throws {
+        let fatal = GitCommandOutcome.failure(
+            exitCode: 128, stderr: "fatal: not a git repository\n"
+        )
+        let cases: [(name: String, script: GitScript, reason: String, forbidden: String)] = [
+            (
+                "origin/HEAD fatal",
+                { var script = GitScript(); script.symbolicRef = fatal; return script }(),
+                "refs/remotes/origin/HEAD lookup failed "
+                    + "(git exit 128: fatal: not a git repository)",
+                "rev-parse"
+            ),
+            (
+                "main fatal while master resolves",
+                {
+                    var script = GitScript()
+                    script.revParseMain = fatal
+                    script.revParseMaster = .success(
+                        stdout: Data("221c2f088de2c34c76347bde00820accad4f529c\n".utf8)
+                    )
+                    return script
+                }(),
+                "refs/heads/main lookup failed (git exit 128: fatal: not a git repository)",
+                "refs/heads/master"
+            ),
+            (
+                "master fatal after main is absent",
+                {
+                    var script = GitScript()
+                    script.revParseMain = .failure(exitCode: 1, stderr: "")
+                    script.revParseMaster = fatal
+                    return script
+                }(),
+                "refs/heads/master lookup failed (git exit 128: fatal: not a git repository)",
+                "merge-base"
+            )
+        ]
+
+        for (name, script, expected, forbidden) in cases {
+            let (assessment, runner) = try await scriptedAssessment(script)
+            XCTAssertFalse(assessment.isCandidate, "\(name) must never yield a candidate")
+            XCTAssertEqual(try reason(assessment, .merged), expected, name)
+            XCTAssertTrue(
+                runner.requests(containing: forbidden).isEmpty,
+                "\(name): the ladder must stop — \(forbidden) must not run"
+            )
+        }
+    }
+
     /// A SUCCESSFUL `symbolic-ref` whose output is not a ref is an anomaly,
     /// not the benign "unset" case — it must not fall through into the local
     /// ladder as though the pointer were merely absent.
@@ -764,7 +826,8 @@ final class WorktreeStalenessAssessorTests: XCTestCase {
         XCTAssertEqual(clauses.count, 4, "a non-candidate carries the four clauses and no tail")
         for (index, gate) in WorktreeGate.allCases.enumerated() {
             XCTAssertTrue(
-                clauses[index].hasPrefix("\(gate.rawValue) "), "clause \(index): \(clauses[index])"
+                clauses[index].hasPrefix("\(gate.rawValue) "),
+                "clause \(index): \(clauses[index])"
             )
         }
         XCTAssertFalse(assessment.evidence.contains("branch ref survives removal"))

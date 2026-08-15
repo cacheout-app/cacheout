@@ -31,7 +31,11 @@
 ///   `git -C <wt> merge-base --is-ancestor HEAD <default>` decides. Exit 0
 ///   is the only pass; exit 1 is git's ANSWER "not an ancestor" and exit 128
 ///   is "could not answer" — they are never conflated, and neither passes.
-///   No network anywhere (the Boundaries forbid `fetch`/`remote prune`).
+///   The same discipline governs the ladder itself: only exit 1 ("this ref
+///   is not there") moves to the next rung, while a FATAL rung fails the
+///   gate closed rather than silently promoting a lower rung to default
+///   branch. No network anywhere (the Boundaries forbid `fetch`/`remote
+///   prune`).
 /// - **G4 not locked** — porcelain `locked`. A locked worktree is NEVER a
 ///   candidate; this epic has no lock handling at all (`--force`, including
 ///   the "twice for locked" trick, is a Boundaries violation).
@@ -293,6 +297,11 @@ struct WorktreeStalenessAssessor: Sendable {
     /// fetched (non-cloned) repositories — the local fallback below is the
     /// common path, not the exception.
     static let originHeadRef = "refs/remotes/origin/HEAD"
+    /// The exit code BOTH ladder commands use for "this ref is not there"
+    /// (`symbolic-ref -q`: unset, deleted, or not symbolic;
+    /// `rev-parse --verify --quiet`: absent). It is the ONLY nonzero exit
+    /// that continues the ladder — see `resolveDefaultBranch`.
+    static let refMissingExitCode: Int32 = 1
     /// Step (b) and (c). A `develop`/`trunk` repository without
     /// `origin/HEAD` resolves to nothing and is never a candidate — accepted
     /// (repairing it would need `fetch`, which the no-network boundary
@@ -482,15 +491,27 @@ struct WorktreeStalenessAssessor: Sendable {
     /// `refs/remotes/origin/HEAD` → `refs/heads/main` → `refs/heads/master`
     /// → fail closed.
     ///
-    /// Failure classes are enumerated rather than absorbed. A NONZERO EXIT is
-    /// the one class that continues the ladder, because it is the benign,
-    /// common shape (`symbolic-ref` exits 128 when `origin/HEAD` is unset —
-    /// verified on git 2.50.1 — and `rev-parse --verify --quiet` exits 1 for
-    /// an absent ref) and because continuing can never fail OPEN: the ladder
-    /// can only end in a PASS via a successful `rev-parse` here AND a
-    /// successful `--is-ancestor` above, neither of which a repository too
-    /// broken to answer `symbolic-ref` can produce. A TIMEOUT or a
-    /// gitUnavailable stops the ladder immediately: firing two more
+    /// EVERY failure class is enumerated, and exactly ONE of them continues
+    /// the ladder: **exit 1**, which is each command's "this rung is not
+    /// there" answer. Everything else stops it.
+    ///
+    /// - `symbolic-ref -q <ref>` exits **1** when the ref is unset, deleted,
+    ///   or present-but-not-symbolic (the common shape on fetched,
+    ///   non-cloned repos) and **128** when git could not look at all — not
+    ///   a repository, or an unreadable/garbage ref file. Verified on git
+    ///   2.50.1; the `-q` is what SPLITS those two, because without it the
+    ///   ordinary unset case also dies with 128 and becomes indistinguishable
+    ///   from a broken repository.
+    /// - `rev-parse --verify --quiet <ref>` exits **1** for an absent (or
+    ///   git-ignorable broken) ref and **128** for a fatal condition.
+    ///
+    /// Treating a FATAL rung as a miss would be a real fail-open, not a
+    /// conservative refusal: a repository whose `refs/heads/main` cannot be
+    /// read but whose `refs/heads/master` still resolves would silently be
+    /// judged against `master`, and a worktree unmerged into the actual
+    /// default branch could pass G3. So a fatal rung fails the gate CLOSED
+    /// with the rung and the exit NAMED. A TIMEOUT or a gitUnavailable stops
+    /// the ladder for the same reason plus one more: firing two further
     /// subprocesses at a wedged or absent git would only relabel a real
     /// failure as "default branch unresolvable".
     private func resolveDefaultBranch(
@@ -498,7 +519,9 @@ struct WorktreeStalenessAssessor: Sendable {
     ) async -> DefaultBranchResolution {
         let parent = parentRepoWorkingDir.path
 
-        let symbolic = await run(["-C", parent, "symbolic-ref", Self.originHeadRef])
+        let symbolic = await run(
+            ["-C", parent, "symbolic-ref", "-q", Self.originHeadRef]
+        )
         switch symbolic.outcome {
         case .success(let stdout):
             guard let ref = Self.firstLine(of: stdout), ref.hasPrefix("refs/") else {
@@ -510,8 +533,16 @@ struct WorktreeStalenessAssessor: Sendable {
                 )
             }
             return .resolved(ref: ref)
-        case .failure:
-            break // Unset (the common shape) — continue the ladder.
+        case .failure(let exitCode, let stderr):
+            guard exitCode == Self.refMissingExitCode else {
+                let summary = GitCommandFailureSummary.describe(
+                    exitCode: exitCode, stderr: stderr
+                )
+                return .unresolved(
+                    reason: "\(Self.originHeadRef) lookup failed (\(summary))"
+                )
+            }
+            break // The ONLY continuing class: the ref is not there.
         case .timeout:
             return .unresolved(reason: "default branch lookup timed out")
         case .gitUnavailable:
@@ -523,7 +554,16 @@ struct WorktreeStalenessAssessor: Sendable {
             switch verify.outcome {
             case .success:
                 return .resolved(ref: ref)
-            case .failure:
+            case .failure(let exitCode, let stderr):
+                guard exitCode == Self.refMissingExitCode else {
+                    // A FATAL rung is not a miss: falling through to the next
+                    // ref would judge the worktree against a branch that is
+                    // not this repository's default.
+                    let summary = GitCommandFailureSummary.describe(
+                        exitCode: exitCode, stderr: stderr
+                    )
+                    return .unresolved(reason: "\(ref) lookup failed (\(summary))")
+                }
                 continue // The ref is absent — try the next rung.
             case .timeout:
                 return .unresolved(reason: "default branch lookup timed out")

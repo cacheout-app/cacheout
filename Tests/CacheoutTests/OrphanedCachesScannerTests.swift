@@ -1753,6 +1753,123 @@ final class OrphanedCachesScannerTests: XCTestCase {
         )
     }
 
+    // MARK: - The open itself is no-follow (PR #458 review r5)
+
+    /// Collapses the swap RACE into a lie, so no timing is involved: it
+    /// reports `.kind(.directory)` for a path that is really a symlink,
+    /// which is precisely the state the walk is in between its `lstat` and
+    /// its `opendir` when a concurrent writer swaps the leaf. The window
+    /// cannot be closed by re-`lstat`ing — only the open can refuse — so
+    /// the test drives the real open against a real symlink.
+    private final class SwapSimulatingProvider: FileSystemIdentityProvider {
+        /// Paths this provider lies about, reporting them as directories.
+        var reportedAsDirectory: Set<String> = []
+        private(set) var probedPaths: [String] = []
+
+        override func probeKind(of url: URL) -> KindProbe {
+            probedPaths.append(url.path)
+            if reportedAsDirectory.contains(url.path) {
+                return .kind(.directory)
+            }
+            return super.probeKind(of: url)
+        }
+
+        func touchedAnythingBelow(_ url: URL) -> Bool {
+            probedPaths.contains { $0.hasPrefix(url.path + "/") }
+        }
+    }
+
+    /// A child that passed the no-follow kind check and was then replaced
+    /// by a symlink must not be followed by the open that comes next. Left
+    /// open, the probe reads up to the whole entry budget OUTSIDE the cache
+    /// tree — the exact boundary the no-follow rule exists to hold — and
+    /// attributes what it finds there to the cache entry.
+    func testOpenRefusesALeafSwappedForASymlink() throws {
+        let external = base.appendingPathComponent("outside-the-cache-tree")
+        try mkdir(external.appendingPathComponent("Pictures/Photos Library.photoslibrary"))
+        try writeFile(external.appendingPathComponent("secret.bin"))
+
+        let entry = cachesRoot.appendingPathComponent("com.example.Swapped")
+        try mkdir(entry)
+        try writeFile(entry.appendingPathComponent("payload.bin"))
+        let swapped = entry.appendingPathComponent("sub")
+        try fm.createSymbolicLink(at: swapped, withDestinationURL: external)
+
+        let provider = SwapSimulatingProvider()
+        provider.reportedAsDirectory.insert(swapped.path)
+
+        let probe = OrphanedCachesScanner.preDeleteUserDataProbe(
+            at: entry, provider: provider
+        )
+
+        XCTAssertFalse(
+            provider.touchedAnythingBelow(swapped),
+            "the walk followed the swapped link and read outside the cache "
+                + "tree: \(provider.probedPaths)"
+        )
+        XCTAssertTrue(
+            probe.matches.isEmpty,
+            "user-data shapes from OUTSIDE the tree must not be attributed "
+                + "to this entry: \(probe.matches)"
+        )
+        // A swap is the tree changing under the walk — the same class as the
+        // ENOENT/ENOTDIR vanish race, and just as retryable.
+        XCTAssertEqual(probe.obstructions, [.transientFailure])
+        let guidance = OrphanedCachesScanner.remediationGuidance(
+            for: probe.obstructions
+        )
+        XCTAssertTrue(guidance.hasSuffix("Re-scan and try again."), guidance)
+    }
+
+    /// Reports a bogus INODE for chosen paths, keeping the real device so
+    /// the mount arm stays silent: the hermetic stand-in for a directory
+    /// replaced by a DIFFERENT directory between the vetting `lstat` and the
+    /// open, which `O_NOFOLLOW` alone cannot catch.
+    private final class WrongIdentityProvider: FileSystemIdentityProvider {
+        var bogusInodeFor: Set<String> = []
+        private(set) var probedPaths: [String] = []
+
+        override func identity(of url: URL) -> Identity? {
+            guard let real = super.identity(of: url) else { return nil }
+            guard bogusInodeFor.contains(url.path) else { return real }
+            return Identity(device: real.device, inode: real.inode &+ 1)
+        }
+
+        override func probeKind(of url: URL) -> KindProbe {
+            probedPaths.append(url.path)
+            return super.probeKind(of: url)
+        }
+
+        func touchedAnythingBelow(_ url: URL) -> Bool {
+            probedPaths.contains { $0.hasPrefix(url.path + "/") }
+        }
+    }
+
+    /// The belt-and-braces half: what we opened must BE what we vetted. A
+    /// directory swapped for another directory keeps passing every path
+    /// check there is, so only the descriptor's own identity can catch it.
+    func testOpenRefusesADirectorySwappedForADifferentDirectory() throws {
+        let entry = cachesRoot.appendingPathComponent("com.example.Restat")
+        let sub = entry.appendingPathComponent("sub")
+        try mkdir(sub.appendingPathComponent("Pictures"))
+        try writeFile(entry.appendingPathComponent("payload.bin"))
+
+        let provider = WrongIdentityProvider()
+        provider.bogusInodeFor.insert(sub.path)
+
+        let probe = OrphanedCachesScanner.preDeleteUserDataProbe(
+            at: entry, provider: provider
+        )
+
+        XCTAssertFalse(
+            provider.touchedAnythingBelow(sub),
+            "nothing inside an unvetted directory may be read: "
+                + "\(provider.probedPaths)"
+        )
+        XCTAssertTrue(probe.matches.isEmpty)
+        XCTAssertEqual(probe.obstructions, [.transientFailure])
+    }
+
     // MARK: - The budget bounds WORK, not just attention (PR #458 review)
 
     /// The entry budget must bound what the walk MATERIALIZES, not only what
@@ -1761,13 +1878,16 @@ final class OrphanedCachesScannerTests: XCTestCase {
     /// directory with millions of entries could spike memory and stall the
     /// scan while only 20,000 entries were ever looked at.
     func testBoundedDirectoryReadStopsAtTheBudgetAndReportsTruncation() throws {
+        let plainProvider = FileSystemIdentityProvider()
         let wide = cachesRoot.appendingPathComponent("wide")
         try mkdir(wide)
         for index in 0..<2_000 {
             try writeFile(wide.appendingPathComponent("f\(index).bin"), bytes: 1)
         }
 
-        let bounded = OrphanedCachesScanner.boundedChildNames(of: wide, limit: 5)
+        let bounded = OrphanedCachesScanner.boundedChildNames(
+            of: wide, limit: 5, vettedIdentity: nil, provider: plainProvider
+        )
         guard case .read(let names, let truncatedBy) = bounded else {
             return XCTFail("expected a bounded read, got \(bounded)")
         }
@@ -1782,7 +1902,10 @@ final class OrphanedCachesScannerTests: XCTestCase {
         try mkdir(small)
         try writeFile(small.appendingPathComponent("only.bin"), bytes: 1)
         XCTAssertEqual(
-            OrphanedCachesScanner.boundedChildNames(of: small, limit: 5),
+            OrphanedCachesScanner.boundedChildNames(
+                of: small, limit: 5, vettedIdentity: nil,
+                provider: plainProvider
+            ),
             .read(["only.bin"], truncatedBy: [])
         )
 
@@ -1793,7 +1916,10 @@ final class OrphanedCachesScannerTests: XCTestCase {
         try chmod000(locked)
         defer { restorePerms(locked) }
         XCTAssertEqual(
-            OrphanedCachesScanner.boundedChildNames(of: locked, limit: 5),
+            OrphanedCachesScanner.boundedChildNames(
+                of: locked, limit: 5, vettedIdentity: nil,
+                provider: plainProvider
+            ),
             .unreadable(.accessDenied)
         )
     }
@@ -1833,7 +1959,8 @@ final class OrphanedCachesScannerTests: XCTestCase {
         }
 
         let bounded = OrphanedCachesScanner.boundedChildNames(
-            of: wide, limit: limit, decode: sentinelUndecodable
+            of: wide, limit: limit, vettedIdentity: nil,
+            provider: FileSystemIdentityProvider(), decode: sentinelUndecodable
         )
 
         guard case .read(let names, let causes) = bounded else {
@@ -1876,7 +2003,8 @@ final class OrphanedCachesScannerTests: XCTestCase {
         }
 
         let bounded = OrphanedCachesScanner.boundedChildNames(
-            of: wide, limit: 4, decode: firstUndecodable
+            of: wide, limit: 4, vettedIdentity: nil,
+            provider: FileSystemIdentityProvider(), decode: firstUndecodable
         )
 
         XCTAssertEqual(bounded, .read([], truncatedBy: [.undecodableName]),

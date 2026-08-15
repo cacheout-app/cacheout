@@ -70,6 +70,33 @@ class FileSystemIdentityProvider {
         identity(of: url)?.device
     }
 
+    /// `(st_dev, st_ino)` of an OPEN DESCRIPTOR — the same identity model as
+    /// `identity(of:)`, read from the object a caller actually holds open
+    /// rather than from a path, which a concurrent writer can re-point
+    /// between the check and the open.
+    ///
+    /// This is the only way to prove that what was opened IS what was
+    /// vetted: a path check followed by a path open has an irreducible
+    /// window between them, and re-checking the path only re-opens it. A
+    /// leaf swapped for a symlink is refused by `O_NOFOLLOW` at the open
+    /// itself; a leaf swapped for a DIFFERENT DIRECTORY passes every path
+    /// check there is, and only this comparison catches it. Overridable
+    /// alongside `identity(of:)` so both sides go through one seam.
+    ///
+    /// PAIRING RULE for tests: production reads both sides from the same
+    /// object (`lstat` then `fstat`), so they always agree. A test that
+    /// overrides `identity(of:)` for a directory the walk actually OPENS
+    /// must override this in step, or the re-proof sees a divergence
+    /// production cannot produce and refuses.
+    func identity(ofDescriptor descriptor: Int32) -> Identity? {
+        var st = stat()
+        guard fstat(descriptor, &st) == 0 else { return nil }
+        return Identity(
+            device: UInt64(bitPattern: Int64(st.st_dev)),
+            inode: UInt64(st.st_ino)
+        )
+    }
+
     /// `st_nlink` of the object at `url` (no-follow). Hardlink detection:
     /// `linkCount > 1` on a regular file.
     func linkCount(of url: URL) -> UInt64? {

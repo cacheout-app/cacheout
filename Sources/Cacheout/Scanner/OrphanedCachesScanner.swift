@@ -768,6 +768,33 @@ struct OrphanedCachesScanner: @unchecked Sendable {
     /// reachable at all only because the depth cap is gone (e9de405) — and
     /// an unchanged tree reproduces it exactly, so "re-scan and try again"
     /// was a loop that could never terminate.
+    /// errno → obstruction for a NO-FOLLOW OPEN, which needs one
+    /// disambiguation the path router cannot make (PR #458 review r5).
+    ///
+    /// `O_NOFOLLOW` reports `ELOOP` for two different things: the leaf we
+    /// asked for is itself a symlink RIGHT NOW — a mid-walk swap — or path
+    /// resolution ran out of link depth in the ANCESTORS, which is
+    /// structural. The plain router must keep answering `.unaddressablePath`
+    /// for the second (an unchanged tree reproduces it exactly), while a
+    /// swap belongs with `ENOENT`/`ENOTDIR`: the tree changed under the
+    /// walk, and a re-scan genuinely re-describes it — next time the leaf
+    /// `lstat`s as a symlink, is matched by name, is never descended, and
+    /// does not even make the probe incomplete, because deleting a link
+    /// removes only the link.
+    ///
+    /// One extra `lstat`, on a failed-open path only, tells them apart.
+    private static func openObstruction(
+        forErrno code: Int32,
+        at directory: URL,
+        provider: FileSystemIdentityProvider
+    ) -> UserDataProbeObstruction {
+        guard code == ELOOP else { return obstruction(forErrno: code) }
+        if case .kind(.symlink) = provider.probeKind(of: directory) {
+            return .transientFailure
+        }
+        return .unaddressablePath
+    }
+
     static func obstruction(forErrno code: Int32) -> UserDataProbeObstruction {
         switch code {
         // GRANTABLE — a retry reproduces it, a grant clears it. `EPERM` is
@@ -927,7 +954,11 @@ struct OrphanedCachesScanner: @unchecked Sendable {
         // this arm. Canonicalization is confined to this one expression and
         // to `crossesMountBoundary`; it never touches traversal, matching,
         // or identity, where the unresolved spelling is the whole point.
-        let rootDevice = provider.deviceID(of: entryURL)
+        // ONE `lstat` of the root, used for BOTH the device arm below and
+        // the open-time identity re-proof (PR #458 review r5) — the walk
+        // root is as swappable as any child.
+        let rootIdentity = provider.identity(of: entryURL)
+        let rootDevice = rootIdentity?.device
         let parentDevice = provider.deviceID(
             of: entryURL.deletingLastPathComponent()
         )
@@ -950,10 +981,12 @@ struct OrphanedCachesScanner: @unchecked Sendable {
         // that point.
         //
         // Depth-first, byte-wise ascending within each directory the budget
-        // could read whole.
-        var stack: [URL] = [entryURL]
+        // could read whole. Each stacked directory carries the identity its
+        // discovery `lstat` saw, which the open re-proves.
+        var stack: [(url: URL, vetted: FileSystemIdentityProvider.Identity?)]
+            = [(entryURL, rootIdentity)]
 
-        walk: while let dir = stack.popLast() {
+        walk: while let (dir, vetted) = stack.popLast() {
             let remaining = entryLimit - visited
             guard remaining > 0 else {
                 // Budget spent with directories still unexplored — and the
@@ -962,7 +995,10 @@ struct OrphanedCachesScanner: @unchecked Sendable {
                 break walk
             }
             let names: [String]
-            switch boundedChildNames(of: dir, limit: remaining) {
+            switch boundedChildNames(
+                of: dir, limit: remaining,
+                vettedIdentity: vetted, provider: provider
+            ) {
             case .unreadable(let cause):
                 // Unreadable branch: absence of matches is unproven.
                 obstructions.insert(cause)
@@ -978,7 +1014,8 @@ struct OrphanedCachesScanner: @unchecked Sendable {
                 }
             }
             // Descend in ascending order: collected here, pushed reversed.
-            var pendingDirectories: [URL] = []
+            var pendingDirectories:
+                [(url: URL, vetted: FileSystemIdentityProvider.Identity?)] = []
 
             for name in names {
                 guard visited < entryLimit else {
@@ -1013,10 +1050,15 @@ struct OrphanedCachesScanner: @unchecked Sendable {
 
                 switch provider.probeKind(of: child) {
                 case .kind(.directory):
+                    // ONE `lstat` for the device arm AND the identity the
+                    // open will re-prove — the same count as before, reused
+                    // rather than repeated.
+                    let childIdentity = provider.identity(of: child)
                     // MOUNT BOUNDARY: never crossed, whatever is on the far
                     // side (see the NO-CROSS rule above).
                     guard !crossesMountBoundary(
-                        child, rootDevice: rootDevice, provider: provider
+                        child, childDevice: childIdentity?.device,
+                        rootDevice: rootDevice, provider: provider
                     ) else {
                         // We did not look past it: unproven, exactly like
                         // an unreadable branch.
@@ -1028,7 +1070,7 @@ struct OrphanedCachesScanner: @unchecked Sendable {
                     // everything that follows. Refusing to look past some
                     // fixed level is what stranded ordinary caches (see the
                     // doc above).
-                    pendingDirectories.append(child)
+                    pendingDirectories.append((child, childIdentity))
                 case .kind:
                     // Symlink / regular file / special: matched by name
                     // above, never descended (see the no-follow rule).
@@ -1098,10 +1140,10 @@ struct OrphanedCachesScanner: @unchecked Sendable {
     /// enumerates the same tree unbounded.
     private static func crossesMountBoundary(
         _ child: URL,
+        childDevice: UInt64?,
         rootDevice: UInt64?,
         provider: FileSystemIdentityProvider
     ) -> Bool {
-        let childDevice = provider.deviceID(of: child)
         if rootDevice != nil && childDevice != nil
             && childDevice != rootDevice {
             return true
@@ -1152,14 +1194,57 @@ struct OrphanedCachesScanner: @unchecked Sendable {
     /// read STOPS at the first undecodable entry: the directory is already
     /// unproven, and continuing would let a directory full of such names
     /// spend the budget for nothing.
+    ///
+    /// THE OPEN IS NO-FOLLOW AND IDENTITY-CHECKED (PR #458 review r5) — see
+    /// the inline notes; this is the only place the walk touches the
+    /// filesystem by path after the discovery `lstat`, so it is the only
+    /// place the swap race can be closed.
     static func boundedChildNames(
         of directory: URL,
         limit: Int,
+        vettedIdentity: FileSystemIdentityProvider.Identity?,
+        provider: FileSystemIdentityProvider,
         decode: (UnsafePointer<CChar>) -> String? = decodedBasename(fromCString:)
     ) -> BoundedDirectoryRead {
-        guard let handle = opendir(directory.path) else {
-            return .unreadable(obstruction(forErrno: errno))
+        // NO-FOLLOW OPEN. `opendir(path)` follows a symlink, and the walk's
+        // `lstat`-based directory check happened EARLIER — when this
+        // directory was discovered as a child. A concurrent writer that
+        // replaces it with a symlink in between makes the plain open read up
+        // to the whole entry budget OUTSIDE the cache tree and attribute
+        // whatever it finds there to the cache entry: the no-follow/privacy
+        // boundary broken by a window no amount of re-`lstat`ing can close,
+        // because every path check re-opens the same window. Only the open
+        // itself can refuse, so it does — `O_NOFOLLOW` fails with `ELOOP`
+        // the moment the leaf is a link.
+        let descriptor = open(
+            directory.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW
+        )
+        guard descriptor >= 0 else {
+            return .unreadable(
+                openObstruction(forErrno: errno, at: directory, provider: provider)
+            )
         }
+        // IDENTITY RE-PROOF: what we opened must BE what we vetted.
+        // `O_NOFOLLOW` catches a swap to a SYMLINK; a swap to a different
+        // DIRECTORY passes every path check there is, and so does an
+        // ANCESTOR re-pointed under us, where resolution lands somewhere
+        // else entirely. Comparing the descriptor's OWN identity against the
+        // one the discovery `lstat` recorded catches both. Unprovable on
+        // either side ⇒ refuse: reading a directory we cannot vet is exactly
+        // what this closes.
+        if let vettedIdentity {
+            guard provider.identity(ofDescriptor: descriptor) == vettedIdentity
+            else {
+                close(descriptor)
+                return .unreadable(.transientFailure)
+            }
+        }
+        guard let handle = fdopendir(descriptor) else {
+            let code = errno
+            close(descriptor)
+            return .unreadable(obstruction(forErrno: code))
+        }
+        // `closedir` closes the descriptor `fdopendir` took ownership of.
         defer { closedir(handle) }
         var names: [String] = []
         var truncated: Set<UserDataProbeObstruction> = []

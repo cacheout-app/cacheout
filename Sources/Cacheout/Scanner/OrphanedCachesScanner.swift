@@ -928,6 +928,16 @@ struct OrphanedCachesScanner: @unchecked Sendable {
             )
         }
 
+        // ACCUMULATE, NEVER PREEMPT (PR #458 review r3). Every stop below
+        // records what it proved into `obstructions` and then `break`s or
+        // `continue`s; the ONLY `return` past this point is the single exit
+        // at the end, which carries the whole set. A guard that returns
+        // ahead of the bookkeeping silently keeps whichever cause the
+        // control flow reached first — exactly how the sentinel read came
+        // to drop a budget exhaustion it had already proven. The root check
+        // above may return early only because nothing is established yet at
+        // that point.
+        //
         // Depth-first, byte-wise ascending within each directory the budget
         // could read whole.
         var stack: [URL] = [entryURL]
@@ -946,8 +956,10 @@ struct OrphanedCachesScanner: @unchecked Sendable {
                 // Unreadable branch: absence of matches is unproven.
                 obstructions.insert(cause)
                 continue
-            case .read(let read, let cause):
-                if let cause { obstructions.insert(cause) }
+            case .read(let read, let causes):
+                // EVERY cause the read established, never just the first —
+                // one read can prove several at once (PR #458 review r3).
+                obstructions.formUnion(causes)
                 // Sorting a slice bounded by the REMAINING budget — never a
                 // whole million-entry cache directory.
                 names = read.sorted {
@@ -1059,10 +1071,16 @@ struct OrphanedCachesScanner: @unchecked Sendable {
 
     /// The outcome of ONE bounded directory read.
     enum BoundedDirectoryRead: Equatable {
-        /// The basenames read — at most `limit` of them. The obstruction is
-        /// `nil` iff the directory was PROVEN exhausted; otherwise it says
-        /// why the rest of the directory is unproven.
-        case read([String], truncatedBy: UserDataProbeObstruction?)
+        /// The basenames read — at most `limit` of them — and EVERY reason
+        /// the rest of the directory is unproven, deduplicated and in
+        /// declaration order. Empty iff the directory was PROVEN exhausted.
+        ///
+        /// A list rather than one slot (PR #458 review r3): a single read
+        /// can establish more than one cause at once — the sentinel entry
+        /// that proves the directory is over budget can ALSO be the one
+        /// whose name will not decode — and a single slot silently kept
+        /// whichever the control flow reached first.
+        case read([String], truncatedBy: [UserDataProbeObstruction])
         /// The directory could not be opened at all.
         case unreadable(UserDataProbeObstruction)
     }
@@ -1095,43 +1113,69 @@ struct OrphanedCachesScanner: @unchecked Sendable {
     /// unproven, and continuing would let a directory full of such names
     /// spend the budget for nothing.
     static func boundedChildNames(
-        of directory: URL, limit: Int
+        of directory: URL,
+        limit: Int,
+        decode: (UnsafePointer<CChar>) -> String? = decodedBasename(fromCString:)
     ) -> BoundedDirectoryRead {
         guard let handle = opendir(directory.path) else {
             return .unreadable(obstruction(forErrno: errno))
         }
         defer { closedir(handle) }
         var names: [String] = []
-        while true {
+        var truncated: Set<UserDataProbeObstruction> = []
+
+        read: while true {
             // `readdir` returns nil for BOTH end-of-stream and error; errno
             // is the only discriminator, so it is cleared before each call.
             errno = 0
             guard let entry = readdir(handle) else {
                 if errno != 0 {
                     // A failed read mid-directory: the rest is unproven, and
-                    // an I/O error is honestly retryable.
-                    return .read(names, truncatedBy: obstruction(forErrno: errno))
+                    // an I/O error is honestly retryable. Deliberately NOT
+                    // also budget exhaustion, even at a full `names` — the
+                    // read FAILED, so no further entry was ever proven to
+                    // exist. Only claim what was actually established.
+                    truncated.insert(obstruction(forErrno: errno))
                 }
-                return .read(names, truncatedBy: nil)
+                break read
             }
             let decoded = withUnsafeBytes(of: entry.pointee.d_name) {
                 raw -> String? in
                 guard let base = raw.bindMemory(to: CChar.self).baseAddress
                 else { return nil }
-                return decodedBasename(fromCString: base)
+                return decode(base)
             }
             guard let name = decoded, !name.isEmpty else {
-                return .read(names, truncatedBy: .undecodableName)
+                truncated.insert(.undecodableName)
+                // AND the budget, when this entry is the SENTINEL (PR #458
+                // review r3). `.` and `..` both decode, so an undecodable
+                // entry is always a REAL one: meeting it on a full `names`
+                // proves the directory holds more than the budget allows,
+                // exactly as a decodable entry there would. Losing that
+                // proof to the decode guard left the walk reporting only
+                // "rename it and re-inspect" — while the unchanged entry
+                // count still exceeds the budget, so the next scan refuses
+                // again and the irreducible remedy is never offered. The
+                // causes are CONJUNCTIVE and both survive clearing the
+                // other (raise the budget and this name still stops the
+                // walk; rename it and the count still does), so both are
+                // recorded and the remedy ordering picks the closing.
+                if names.count >= limit { truncated.insert(.budgetExhausted) }
+                break read
             }
             if name == "." || name == ".." { continue }
             guard names.count < limit else {
                 // A real entry existed beyond the budget — the ONLY way this
                 // read reports budget exhaustion, and it costs one `readdir`
                 // rather than the whole directory.
-                return .read(names, truncatedBy: .budgetExhausted)
+                truncated.insert(.budgetExhausted)
+                break read
             }
             names.append(name)
         }
+        // ONE exit, carrying everything proven — no guard can preempt the
+        // bookkeeping by returning ahead of it.
+        return .read(names, truncatedBy: truncated.sorted())
     }
 
     /// The VALIDATING basename decode, factored out so the fail-closed

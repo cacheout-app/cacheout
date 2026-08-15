@@ -1633,7 +1633,7 @@ final class OrphanedCachesScannerTests: XCTestCase {
         }
         XCTAssertEqual(names.count, 5,
                        "at most `limit` basenames are ever held in memory")
-        XCTAssertEqual(truncatedBy, .budgetExhausted,
+        XCTAssertEqual(truncatedBy, [.budgetExhausted],
                        "and the read reports that more entries remained")
 
         // Read whole when it fits, and PROVEN exhausted — the completeness
@@ -1643,7 +1643,7 @@ final class OrphanedCachesScannerTests: XCTestCase {
         try writeFile(small.appendingPathComponent("only.bin"), bytes: 1)
         XCTAssertEqual(
             OrphanedCachesScanner.boundedChildNames(of: small, limit: 5),
-            .read(["only.bin"], truncatedBy: nil)
+            .read(["only.bin"], truncatedBy: [])
         )
 
         // An unopenable directory is reported as such, attributed.
@@ -1656,6 +1656,118 @@ final class OrphanedCachesScannerTests: XCTestCase {
             OrphanedCachesScanner.boundedChildNames(of: locked, limit: 5),
             .unreadable(.accessDenied)
         )
+    }
+
+    /// The SENTINEL read — the one extra `readdir` whose only job is to
+    /// prove the directory holds more than the budget allows — must not
+    /// lose that proof to the decode guard sitting in front of the capacity
+    /// check. Both facts are true of the same entry, both survive clearing
+    /// the other (raise the budget and the name still stops the walk;
+    /// rename it and the entry count still exceeds the budget), so both
+    /// must reach the remedy ordering.
+    ///
+    /// The fixture cannot be built on this filesystem — APFS and HFS+
+    /// reject non-UTF-8 basenames outright (EILSEQ), which is why the
+    /// production code needs the validating decode in the first place — so
+    /// the DECODE is injected rather than the bytes. The loop under test is
+    /// the real one, including the exact guard ordering at issue, and the
+    /// injection is keyed to the sentinel's POSITION rather than to a name,
+    /// so the test does not depend on `readdir` order.
+    func testUndecodableSentinelStillRecordsTheBudgetItProved() throws {
+        let wide = cachesRoot.appendingPathComponent("sentinel")
+        try mkdir(wide)
+        for index in 0..<6 {
+            try writeFile(wide.appendingPathComponent("f\(index).bin"), bytes: 1)
+        }
+        let limit = 4
+        var realEntriesSeen = 0
+        // The (limit + 1)-th REAL entry — whichever one `readdir` puts
+        // there — is the undecodable one. `.` and `..` stay decodable, as
+        // they always are on a real volume.
+        let sentinelUndecodable: (UnsafePointer<CChar>) -> String? = { pointer in
+            guard let name = OrphanedCachesScanner
+                .decodedBasename(fromCString: pointer) else { return nil }
+            if name == "." || name == ".." { return name }
+            realEntriesSeen += 1
+            return realEntriesSeen > limit ? nil : name
+        }
+
+        let bounded = OrphanedCachesScanner.boundedChildNames(
+            of: wide, limit: limit, decode: sentinelUndecodable
+        )
+
+        guard case .read(let names, let causes) = bounded else {
+            return XCTFail("expected a bounded read, got \(bounded)")
+        }
+        XCTAssertEqual(names.count, limit)
+        XCTAssertEqual(
+            causes, [.budgetExhausted, .undecodableName],
+            "the extra readdir PROVED the directory is over budget — an "
+                + "undecodable name on that same entry does not erase it"
+        )
+
+        // The user-visible half: renaming the entry leaves the folder just
+        // as over-budget, so the closing must be the irreducible one.
+        let guidance = OrphanedCachesScanner.remediationGuidance(for: causes)
+        XCTAssertTrue(guidance.contains("will not clear this"), guidance)
+        XCTAssertTrue(guidance.contains("explicit per-item confirmation"),
+                      guidance)
+        XCTAssertFalse(guidance.hasSuffix("Clear that, then re-scan."), guidance)
+    }
+
+    /// The other direction, so the fix cannot become over-recording: an
+    /// undecodable entry met BEFORE the budget is spent proves nothing
+    /// about capacity. The read stops there, so the entries behind it were
+    /// never counted — claiming budget exhaustion would be inventing a
+    /// cause, which is the same sin in reverse.
+    func testUndecodableEntryBeforeTheBudgetClaimsOnlyItself() throws {
+        let wide = cachesRoot.appendingPathComponent("early-undecodable")
+        try mkdir(wide)
+        for index in 0..<6 {
+            try writeFile(wide.appendingPathComponent("f\(index).bin"), bytes: 1)
+        }
+        var realEntriesSeen = 0
+        let firstUndecodable: (UnsafePointer<CChar>) -> String? = { pointer in
+            guard let name = OrphanedCachesScanner
+                .decodedBasename(fromCString: pointer) else { return nil }
+            if name == "." || name == ".." { return name }
+            realEntriesSeen += 1
+            return realEntriesSeen == 1 ? nil : name
+        }
+
+        let bounded = OrphanedCachesScanner.boundedChildNames(
+            of: wide, limit: 4, decode: firstUndecodable
+        )
+
+        XCTAssertEqual(bounded, .read([], truncatedBy: [.undecodableName]),
+                       "the directory really does hold more than 4 entries, "
+                           + "but this read never established that")
+    }
+
+    /// And the plumbing above it: obstructions established in DIFFERENT
+    /// layers of one walk — the bounded read and the per-child kind probe —
+    /// must union rather than overwrite. `sub` truncates on budget while
+    /// both entries it did read fail their kind probe, so a single-slot
+    /// hand-off would drop one of them.
+    func testWalkUnionsObstructionsFromEveryLayer() throws {
+        let entry = cachesRoot.appendingPathComponent("com.example.Layered")
+        let sub = entry.appendingPathComponent("sub")
+        try mkdir(sub)
+        let provider = ErrnoInjectingProvider()
+        for index in 0..<4 {
+            let file = sub.appendingPathComponent("f\(index).bin")
+            try writeFile(file, bytes: 1)
+            provider.failures[file.standardizedFileURL.path] = EIO
+        }
+
+        // Budget 3: reading the root spends 1 on `sub`, leaving 2 for a
+        // directory holding 4.
+        let probe = OrphanedCachesScanner.boundedUserDataShapeWalk(
+            at: entry, provider: provider, entryLimit: 3
+        )
+
+        XCTAssertEqual(probe.obstructions,
+                       [.budgetExhausted, .transientFailure])
     }
 
     /// A directory the budget cannot afford is never OPENED — the visible

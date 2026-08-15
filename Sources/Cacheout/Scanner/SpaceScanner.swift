@@ -266,8 +266,25 @@ struct ReclaimableItem: Equatable, Sendable {
     /// the registry refuses marked items of ANY scanner.
     let requiresPreDeleteRevalidation: Bool
 
-    /// EXPLICIT memberwise initializer (fn-4.4): the two additive fields
-    /// above default, so no existing construction site changes — the
+    /// ADDITIVE (PR #457 review r3) — the STRUCTURAL PROPERTY that made this
+    /// item a candidate, preserved verbatim so its scanner's delete-time
+    /// revalidator can RE-PROVE it rather than trust the scan.
+    ///
+    /// `nil` for every scanner with no such property (every scanner but
+    /// `build_artifacts` today) — absent, never a fake "still proven". The
+    /// `valuablesDisclosure` precedent, one field-set later: a typed
+    /// structural record the OWNING scanner's revalidator interprets, and
+    /// which nothing else reads. It is not an authorization and not a
+    /// display surface; it never reaches any wire.
+    ///
+    /// Why it must ride the ITEM: a revalidator is a `Sendable` VALUE
+    /// captured at REGISTRATION, before any scan runs — it cannot hold
+    /// per-item scan state, so anything delete time must re-check has to
+    /// travel on the item itself.
+    let artifactProof: BuildArtifactProof?
+
+    /// EXPLICIT memberwise initializer (fn-4.4): the additive fields above
+    /// default, so no existing construction site changes — the
     /// `logicalBytes` additive precedent, one field-set later. Every stored
     /// property stays `let` (a synthesized memberwise init cannot default a
     /// `let`, which is the only reason this is written out).
@@ -293,7 +310,8 @@ struct ReclaimableItem: Equatable, Sendable {
         automaticCleanEligible: Bool,
         isStale: Bool?,
         valuablesDisclosure: ValuablesDisclosure? = nil,
-        requiresPreDeleteRevalidation: Bool = false
+        requiresPreDeleteRevalidation: Bool = false,
+        artifactProof: BuildArtifactProof? = nil
     ) {
         self.id = id
         self.scannerID = scannerID
@@ -317,6 +335,7 @@ struct ReclaimableItem: Equatable, Sendable {
         self.isStale = isStale
         self.valuablesDisclosure = valuablesDisclosure
         self.requiresPreDeleteRevalidation = requiresPreDeleteRevalidation
+        self.artifactProof = artifactProof
     }
 
     /// The composite cross-scanner identity.

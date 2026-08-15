@@ -354,6 +354,21 @@ enum ValuablesDetector {
     /// reading it would spend the entry budget on a network/removable/FUSE
     /// volume outside the configured dev root (see the file header).
     ///
+    /// ROOT KIND GATE (PR #457 review r3), applied HERE in the shared core
+    /// rather than on one face: `opendir` FOLLOWS a symlink leaf, so a
+    /// supplied root that is a symlink would have the probe read — and
+    /// disclose — a tree the deletion never touches (deleting the leaf
+    /// removes the link only). The delete-time face already gated this and
+    /// the scan-time face did not; a check on one face of a two-faced walk is
+    /// exactly the scan/delete drift the one-core rule exists to prevent, so
+    /// the gate lives in the core and both faces inherit it:
+    /// - real directory → the bounded walk below;
+    /// - symlink / regular file / special → `.clean`: no contents OF THEIR
+    ///   OWN are removed by deleting the leaf, so nothing went uninspected;
+    /// - absent → `.clean` (nothing to disclose; the deletion path surfaces
+    ///   its own ENOENT and the probe must not preempt it);
+    /// - unprobeable → `.incomplete`, fail closed.
+    ///
     /// Determinism: within every directory the budget could read WHOLE,
     /// siblings are visited in byte-wise basename order — files as they come,
     /// directories descended in that same ascending order (the stack is
@@ -365,6 +380,14 @@ enum ValuablesDetector {
         provider: FileSystemIdentityProvider,
         entryLimit: Int = defaultProbeEntryLimit
     ) -> ValuablesDisclosure {
+        // THE ROOT KIND GATE, no-follow and BEFORE anything is opened (see
+        // the doc comment). One `lstat`, shared by both faces.
+        switch provider.probeKind(of: directory) {
+        case .kind(.directory): break
+        case .kind, .absent: return .clean
+        case .failed: return .incomplete
+        }
+
         var found: [DetectedValuable] = []
         var complete = true
         // The GLOBAL entry budget, shared with every bundle subtree walk —

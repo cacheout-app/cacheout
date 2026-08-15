@@ -36,7 +36,13 @@
 /// over the UNION of all walks' candidates:
 /// 1. **Ancestor drop** — a candidate strictly inside another candidate's
 ///    artifact dir is dropped, keyed on canonicalized `pathComponents`
-///    prefixes, never string `hasPrefix` (PathGuard doctrine).
+///    prefixes, never string `hasPrefix` (PathGuard doctrine) — UNLESS a
+///    mount boundary sits between the two (review r3). The drop exists to
+///    stop double-counting and nested deletion, and a boundary already stops
+///    both (the sizer skips the subtree uncounted; the cleaner refuses any
+///    tree containing one whole), so across a boundary it only suppresses a
+///    reclaimable inner item in favour of an outer one that is `.denied` for
+///    that very boundary.
 /// 2. **Canonical-identity collapse** — candidates sharing one identity path
 ///    (`resolveTargetKeepingLeaf`) collapse to ONE item; the DEEPEST
 ///    (most-specific) origin root wins, byte-wise `originRoot.path` breaking
@@ -198,8 +204,34 @@ struct BuildArtifactsScanner: @unchecked Sendable {
             // Cooperative cancellation between candidates: a cancelled scan
             // must not keep sizing multi-GB trees nobody will read.
             if Task.isCancelled { break }
+            // THE FRESH KIND GATE (PR #457 review r3). The walker proved this
+            // subject was a real DIRECTORY at its event; this pass runs after
+            // the WHOLE walk, so the subject can have been replaced since —
+            // and a leaf-following sizing or probe would then measure and
+            // disclose a tree outside the configured dev root while deletion
+            // removes only the unresolved leaf. Re-`lstat` no-follow, and
+            // reject a subject the matcher itself would no longer match:
+            // - directory → the matched subject, unchanged; proceed;
+            // - symlink/regular/special → REPLACED: it is not the artifact
+            //   dir any more, so it produces no candidate at all (the same
+            //   answer the walker's matcher gives, and strictly the
+            //   fail-closed one: nothing is listed, so nothing is offered);
+            // - absent → a benign mid-scan vanish, and `.failed` an
+            //   impediment the sizer classifies and denies — both keep their
+            //   as-built emission rather than disappearing silently.
+            if case .kind(let kind) = provider
+                .probeKind(of: candidate.artifactDirectory),
+               kind != .directory {
+                continue
+            }
+            // `.deletionTarget`, never `.scanRoot`: the sizing subject IS the
+            // deletion target, so the identity doctrine applies to it —
+            // canonical parent chain, leaf NEVER resolved. Identical to
+            // `.scanRoot` for the real directory the matcher proved (the leaf
+            // resolves to itself); different exactly when the leaf was swapped
+            // out from under us, which is the case that must not follow.
             let report = sizer.measure(
-                at: candidate.artifactDirectory, mode: .scanRoot
+                at: candidate.artifactDirectory, mode: .deletionTarget
             )
             emissions.append(reclaimableItem(from: candidate, report: report))
         }
@@ -309,8 +341,33 @@ struct BuildArtifactsScanner: @unchecked Sendable {
             var insideAnother = false
             // STRICT ancestors only (`1..<count`): an identical identity is
             // never its own ancestor — those collapse in pass 2 instead.
-            for length in 1..<max(components.count, 1)
-            where allKeys.contains(componentKey(Array(components.prefix(length)))) {
+            for length in 1..<max(components.count, 1) {
+                let ancestor = Array(components.prefix(length))
+                guard allKeys.contains(componentKey(ancestor)) else { continue }
+                // A MOUNT BOUNDARY between the two voids the drop (PR #457
+                // review r3). The drop exists for exactly two reasons —
+                // double-counting and nested deletion — and NEITHER can
+                // happen across a boundary: the sizer records the boundary
+                // and skips its subtree uncounted, and the cleaner refuses
+                // any tree containing one whole (`CacheCleaner.swift:875,970`).
+                // So across a boundary the drop buys nothing and costs the
+                // user everything: the ancestor is `.denied` for that same
+                // boundary while the descendant — legal because it sits
+                // INSIDE the external volume under its own configured root,
+                // not at the mount point — would have been cleanable, and the
+                // only row left is an undeletable one.
+                //
+                // Deletability itself cannot be consulted here (the drop
+                // precedes sizing, by design: sizing after the collapse is
+                // what stops one artifact being measured twice), so the
+                // boundary is consulted instead — the same two signals as the
+                // sizer, the walker, and the valuables probe, on the path
+                // BETWEEN the two candidates. It is the one condition under
+                // which an ancestor cannot reach its descendant at all.
+                guard !boundarySeparates(
+                    ancestor: ancestor, descendant: components,
+                    provider: provider
+                ) else { continue }
                 insideAnother = true
                 break
             }
@@ -345,6 +402,43 @@ struct BuildArtifactsScanner: @unchecked Sendable {
     /// component-array equality.
     private static func componentKey(_ components: [String]) -> String {
         components.joined(separator: "\u{0}")
+    }
+
+    /// Does a MOUNT BOUNDARY sit on the path from `ancestor` down to
+    /// `descendant` (exclusive of the ancestor, inclusive of the descendant)?
+    ///
+    /// The house rule VERBATIM, no third notion invented: device-id change
+    /// against the ANCESTOR, plus the `statfs` mount-root check that catches
+    /// the same-`st_dev` firmlink mounts device comparison is blind to
+    /// (`DirectorySizer.swift:287`, `ProjectTreeWalker.swift:376`,
+    /// `ValuablesDetector.swift`). A `nil` device on either side disables only
+    /// the first arm, exactly as it does there — which is also why synthetic
+    /// candidates over paths that do not exist behave as they always did:
+    /// nothing reports a boundary, so the drop stands.
+    ///
+    /// Called ONLY for a pair the lexical test already matched, so its cost
+    /// is bounded by the depth between two overlapping candidates and is paid
+    /// only when overlapping roots actually produced one.
+    private static func boundarySeparates(
+        ancestor: [String],
+        descendant: [String],
+        provider: FileSystemIdentityProvider
+    ) -> Bool {
+        guard let root = ancestor.first else { return false }
+        var current = URL(fileURLWithPath: root)
+        for component in ancestor.dropFirst() {
+            current.appendPathComponent(component)
+        }
+        let ancestorDevice = provider.deviceID(of: current)
+        for component in descendant.dropFirst(ancestor.count) {
+            current.appendPathComponent(component)
+            let device = provider.deviceID(of: current)
+            if ancestorDevice != nil, device != nil, device != ancestorDevice {
+                return true
+            }
+            if provider.isMountPoint(current) { return true }
+        }
+        return false
     }
 
     /// The pinned provenance rule when one canonical identity is reachable
@@ -400,6 +494,14 @@ struct BuildArtifactsScanner: @unchecked Sendable {
     /// marker's meaning is "this item must be re-inspected", not "this item is
     /// deletable"). Any hit OR an incomplete probe forces the item off safe,
     /// forces selection false, and appends the warning evidence.
+    ///
+    /// ## The rule proof (review r3)
+    /// EVERY item also carries its `BuildArtifactProof` — the matched rule
+    /// SHAPE, structurally — because the marker, not the contents, is the
+    /// safety property these ambiguous directory names have. Valuables are
+    /// the SECONDARY property: re-checking them while trusting the rule is
+    /// what let a `Cargo.toml`-less, repurposed `target/` full of ordinary
+    /// files delete on a clean, complete probe.
     private func reclaimableItem(
         from candidate: BuildArtifactCandidate, report: SizeReport
     ) -> (item: ReclaimableItem, identityPath: String) {
@@ -513,7 +615,14 @@ struct BuildArtifactsScanner: @unchecked Sendable {
             // revalidation marker: EVERY build-artifact item carries the
             // probe, so every one is marked (R17/D8).
             valuablesDisclosure: disclosure,
-            requiresPreDeleteRevalidation: true
+            requiresPreDeleteRevalidation: true,
+            // The MATCHED RULE, carried STRUCTURALLY (review r3): the marker
+            // is the safety property these ambiguous directory names have,
+            // and the revalidator re-proves THIS shape at delete time rather
+            // than guessing a rule from the name.
+            artifactProof: BuildArtifactProof(
+                shape: candidate.rule.shape, marker: candidate.marker
+            )
         )
         return (item, identity.path)
     }
@@ -539,19 +648,18 @@ struct BuildArtifactsScanner: @unchecked Sendable {
     /// - absent → nothing to disclose (the deletion path surfaces its own
     ///   ENOENT — the probe must not preempt it);
     /// - unprobeable → fail closed (incomplete ⇒ unauthorizable, tokenless).
+    ///
+    /// That gate now lives INSIDE the shared core (PR #457 review r3), which
+    /// is why this face is a straight call-through: it used to be the only
+    /// face that had it, and a check on one face of a two-faced walk is the
+    /// scan/delete drift the one-core rule exists to prevent. This entry
+    /// point stays because it NAMES the delete-time face — the production
+    /// caps are the core's defaults, so the two inspections' bounds and now
+    /// their kind gating are the same code, not the same intent.
     static func preDeleteValuablesProbe(
         at target: URL, provider: FileSystemIdentityProvider
     ) -> ValuablesDisclosure {
-        switch provider.probeKind(of: target) {
-        case .kind(.directory):
-            return ValuablesDetector.probe(at: target, provider: provider)
-        case .kind:
-            return .clean
-        case .absent:
-            return .clean
-        case .failed:
-            return .incomplete
-        }
+        ValuablesDetector.probe(at: target, provider: provider)
     }
 
     // MARK: - Pre-delete revalidator (fn-4.8, R17/D8)
@@ -573,9 +681,22 @@ struct BuildArtifactsScanner: @unchecked Sendable {
     /// deleted on scan-time inspection alone — the artifact dir's CONTENTS
     /// are what a valuable appears in, and no snapshot binds those.
     ///
-    /// VERDICT, from the CURRENT delete-time probe (production caps, the
-    /// SAME bounded core the scan used) and the item's OWN authorization
-    /// entry:
+    /// VERDICT — the RULE first, then the contents (review r3). The item's
+    /// structural `artifactProof` is re-proven against the CURRENT filesystem
+    /// before anything is probed, because the marker is the PRIMARY safety
+    /// property (`target/` and `build/` are ambiguous names; the rule table
+    /// leans on the sibling/interior marker precisely because of that) while
+    /// valuables are the secondary one. A revalidator that re-checked only
+    /// the contents was trusting the property it exists to guard: a
+    /// `Cargo.toml` deleted and the `target/` repurposed into ordinary files
+    /// probes CLEAN and COMPLETE, and every one of those files would have
+    /// been deleted. A missing or unprovable proof refuses fail-closed, and
+    /// the refusal is CLEARABLE (restore the marker, or re-scan — a re-scan
+    /// simply stops producing the item, since the walker's matcher rejects
+    /// the same subject for the same reason).
+    ///
+    /// Then, from the CURRENT delete-time probe (production caps, the SAME
+    /// bounded core the scan used) and the item's OWN authorization entry:
     /// - INCOMPLETE probe → refuse; the payload carries what was still seen
     ///   (a floor on the warning, never a basis for authorization) and NO
     ///   token — the uniform R17 rule that an unfinished inspection is
@@ -609,6 +730,37 @@ struct BuildArtifactsScanner: @unchecked Sendable {
                         reason: "refused: a build-artifact item without a "
                             + "container-item target cannot be re-inspected "
                             + "before deletion",
+                        valuables: [], acknowledgementToken: nil
+                    )
+                }
+                // THE RULE RE-PROOF, FIRST (review r3). The marker is the
+                // PRIMARY safety property — these directory names are
+                // ambiguous and only the sibling/interior marker separates
+                // build output from someone's data — so it is re-proven
+                // before the secondary (valuables) property is even probed.
+                // Checking valuables while TRUSTING the rule is what let a
+                // repurposed `target/` full of ordinary files delete on a
+                // clean probe.
+                guard let proof = item.artifactProof else {
+                    // Structurally unreachable: this scanner stamps the proof
+                    // on every item it emits. A mapping regression that
+                    // dropped it must not delete on an unproven rule.
+                    return .refuse(
+                        reason: "\(target.path): this item carries no record "
+                            + "of the build-artifact rule that matched it, so "
+                            + "the rule cannot be re-proven before deletion — "
+                            + "refused; re-scan required",
+                        valuables: [], acknowledgementToken: nil
+                    )
+                }
+                if let lost = proof.failureDetail(
+                    target: target, provider: provider
+                ) {
+                    return .refuse(
+                        reason: "\(target.path): \(lost) — this directory is "
+                            + "no longer proven to be build output, so it is "
+                            + "refused, nothing deleted; restore it or "
+                            + "re-scan",
                         valuables: [], acknowledgementToken: nil
                     )
                 }

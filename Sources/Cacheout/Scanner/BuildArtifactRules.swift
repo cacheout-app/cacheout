@@ -82,6 +82,134 @@ struct BuildArtifactMatch: Equatable, Sendable {
     let target: Target
 }
 
+// MARK: - Structural proof (PR #457 review r3, thread A)
+
+/// The STRUCTURAL SAFETY PROPERTY one matched artifact directory rests on,
+/// preserved VERBATIM on the emitted item so the delete-time revalidator can
+/// RE-PROVE it instead of trusting the scan.
+///
+/// This exists because the artifact-dir NAMES are ambiguous by themselves —
+/// `target/`, `build/`, `dist/` are whatever their owner put there — and the
+/// sibling/interior MARKER is the only thing that distinguishes build output
+/// from someone's data (D6). Scan-time inspection alone cannot carry that: a
+/// `Cargo.toml` deleted (or a whole project repurposed) between the scan and
+/// the clean voids the proof, and the valuables probe cannot see it happen —
+/// ordinary files carry no flagged extension, so a repurposed `target/` full
+/// of documents probes CLEAN and COMPLETE.
+///
+/// Carried STRUCTURALLY (never re-derived from the evidence prose, never
+/// guessed from the directory name at delete time): the shape that claimed
+/// this directory is the shape that must claim it again.
+struct BuildArtifactProof: Equatable, Sendable {
+    /// The rule SHAPE that claimed the directory. The re-proof runs THIS
+    /// shape's own predicate — the same one the scan applied — so scan time
+    /// and delete time agree by construction: a Gradle project that swapped
+    /// `build.gradle` for `build.gradle.kts` between the two still matches,
+    /// exactly as a re-scan would match it.
+    let shape: BuildArtifactRule.Shape
+    /// The marker the SCAN named in its evidence ("target/ beside
+    /// Cargo.toml"). Names the loss in a refusal so the message matches what
+    /// the user was shown; the PREDICATE is the shape's whole marker set,
+    /// never this one name.
+    let marker: String
+
+    /// RE-PROOF at delete time. `nil` when the property still holds;
+    /// otherwise the fail-closed detail naming what can no longer be proven.
+    ///
+    /// BOUNDED BY CONSTRUCTION: at most one `lstat` per declared marker name
+    /// (four, for the Gradle rows) plus one for the target itself. Nothing is
+    /// enumerated, so no budget, no depth, and no truncation verdict exists
+    /// here — unlike the valuables probe, this predicate reads only names it
+    /// already knows.
+    ///
+    /// Every arm mirrors the scan-time matcher (`BuildArtifactRules.matches`)
+    /// exactly:
+    /// - the subject must still be a real DIRECTORY (the matcher's
+    ///   `entry.kind == .directory` gate — a symlink never matched, and a
+    ///   symlink must never be deleted as though it were the tree it names);
+    /// - sibling shape: the leaf name must still equal the rule's artifact
+    ///   dir name, and at least one declared marker must sit BESIDE it as a
+    ///   regular file (never itself the artifact dir name);
+    /// - inside shape: the declared marker must still be a regular file
+    ///   INSIDE it.
+    ///
+    /// ABSENT is deliberately NOT a failure: a target that vanished between
+    /// scan and clean has nothing left to prove, and the deletion path owns
+    /// that ENOENT (the `preDeleteValuablesProbe` precedent — the re-proof
+    /// must not preempt it).
+    ///
+    /// CLEARABLE, never a permanent strand: restore the marker and the proof
+    /// holds again; or re-scan, in which case the item is simply not produced
+    /// (the walker's matcher rejects the same subject for the same reason).
+    /// Nothing here is deterministic-and-forever.
+    func failureDetail(
+        target: URL, provider: FileSystemIdentityProvider
+    ) -> String? {
+        switch provider.probeKind(of: target) {
+        case .kind(.directory):
+            break
+        case .absent:
+            // Nothing to prove; the deletion path surfaces its own ENOENT.
+            return nil
+        case .kind(let kind):
+            return "it is \(Self.phrase(for: kind)) now, not the directory "
+                + "the scan matched"
+        case .failed(let code):
+            return "couldn't re-read it (\(String(cString: strerror(code))))"
+        }
+
+        switch shape {
+        case .markerSibling(let artifactDirName, let markers):
+            guard target.lastPathComponent == artifactDirName else {
+                return "it is named '\(target.lastPathComponent)' now, not "
+                    + "'\(artifactDirName)'"
+            }
+            let parent = target.deletingLastPathComponent()
+            var unreadable: String?
+            for name in markers where name != artifactDirName {
+                switch provider.probeKind(of: parent.appendingPathComponent(name)) {
+                case .kind(.regularFile):
+                    return nil
+                case .kind, .absent:
+                    continue
+                case .failed(let code):
+                    // Record and keep looking: another declared marker may
+                    // still be readable and prove the rule outright.
+                    unreadable = unreadable ?? "couldn't re-read '\(name)' "
+                        + "beside it (\(String(cString: strerror(code))))"
+                }
+            }
+            if let unreadable { return unreadable }
+            return "the \(marker) that proved it is build output is no "
+                + "longer beside it"
+
+        case .markerInside(let interior):
+            let markerURL = target.appendingPathComponent(interior)
+            switch provider.probeKind(of: markerURL) {
+            case .kind(.regularFile):
+                return nil
+            case .kind, .absent:
+                return "the \(interior) that proved it is build output is no "
+                    + "longer inside it"
+            case .failed(let code):
+                return "couldn't re-read '\(interior)' inside it "
+                    + "(\(String(cString: strerror(code))))"
+            }
+        }
+    }
+
+    private static func phrase(
+        for kind: FileSystemIdentityProvider.FileKind
+    ) -> String {
+        switch kind {
+        case .directory: return "a directory"
+        case .regularFile: return "a regular file"
+        case .symlink: return "a symlink"
+        case .other: return "a special file"
+        }
+    }
+}
+
 // MARK: - Table + matcher
 
 enum BuildArtifactRules {

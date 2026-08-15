@@ -331,15 +331,33 @@ final class BuildArtifactsScannerTests: XCTestCase {
         }
     }
 
-    /// Counts `canonicalize` calls per requested path — the sizer resolves
-    /// its `.scanRoot` exactly once per measurement, so the count over an
-    /// artifact path IS the number of times that artifact was sized.
+    /// Counts how many times a tree was SIZED, spelling-independently.
+    ///
+    /// `linkCount(of:)` has exactly ONE caller in the whole codebase —
+    /// `DirectorySizer.recordRegularFile`, once per measured regular file —
+    /// so the count over a payload file IS the number of measurement walks
+    /// that reached it. (The earlier proxy counted `canonicalize` of the
+    /// artifact path, which stopped being one-per-measure when the sizing
+    /// mode became `.deletionTarget` and the LEAF stopped being resolved;
+    /// this seam is mode-independent and unaffected by the `/var` →
+    /// `/private/var` fixture aliasing, since it matches on a suffix.)
     private final class CanonicalizeCountingProvider: FileSystemIdentityProvider {
         private(set) var canonicalizeCounts: [String: Int] = [:]
+        private(set) var measuredFilePaths: [String] = []
 
         override func canonicalize(_ url: URL) -> URL {
             canonicalizeCounts[url.path, default: 0] += 1
             return super.canonicalize(url)
+        }
+
+        override func linkCount(of url: URL) -> UInt64? {
+            measuredFilePaths.append(url.path)
+            return super.linkCount(of: url)
+        }
+
+        /// How many measurement walks reached a file at `suffix`.
+        func measurements(of suffix: String) -> Int {
+            measuredFilePaths.filter { $0.hasSuffix(suffix) }.count
         }
     }
 
@@ -671,7 +689,7 @@ final class BuildArtifactsScannerTests: XCTestCase {
                        "provenance: the DEEPEST (most-specific) root wins")
         XCTAssertEqual(requested.path, target.path)
         XCTAssertEqual(
-            provider.canonicalizeCounts[target.path], 1,
+            provider.measurements(of: "/inner/proj/target/payload.bin"), 1,
             "the artifact is sized exactly ONCE — sizing runs after the "
                 + "collapse"
         )
@@ -3628,6 +3646,342 @@ final class BuildArtifactsScannerTests: XCTestCase {
         XCTAssertEqual(userInitiated.items.compactMap(\.url?.path),
                        [identityPath(of: artifact)],
                        "an explicit scan walks the protected root")
+    }
+
+    // ====================================================================
+    // MARK: - PR #457 review r3: the scan-time proof must still hold later
+    // ====================================================================
+
+    /// Swaps the filesystem out from under the scanner at a DETERMINISTIC
+    /// point: the first `canonicalize` of `trigger`, which the scanner reaches
+    /// only in the POST-WALK dedupe pass (the walker canonicalizes roots and
+    /// home names, never an interior directory). That is exactly the window
+    /// thread B names — after the walker event, before the sizing pass.
+    private final class PostWalkSwappingProvider: FileSystemIdentityProvider {
+        var trigger = ""
+        var swap: (() -> Void)?
+        private(set) var swapped = false
+
+        override func canonicalize(_ url: URL) -> URL {
+            if !swapped, Self.trimmed(url.path) == Self.trimmed(trigger) {
+                swapped = true
+                swap?()
+            }
+            return super.canonicalize(url)
+        }
+
+        private static func trimmed(_ path: String) -> String {
+            path.count > 1 && path.hasSuffix("/")
+                ? String(path.dropLast()) : path
+        }
+    }
+
+    /// THREAD A. The marker is the safety property: `target/` is an ambiguous
+    /// name and only the sibling `Cargo.toml` proves it is build output. If
+    /// the marker disappears between the scan and the clean, the item's
+    /// PROOF is gone — and the valuables probe cannot see that, because the
+    /// repurposed contents are ordinary files no extension rule covers.
+    func testMarkerVanishedAfterScanRefusesTheDeletionFailClosed()
+        async throws
+    {
+        let project = dev.appendingPathComponent("proj")
+        let artifact = try makeProject(
+            at: project, marker: "Cargo.toml", artifact: "target"
+        )
+        // Repurposed content: nothing the valuables table covers, so the
+        // valuables probe reports a clean, COMPLETE inspection.
+        let repurposed = try writeFile(
+            artifact.appendingPathComponent("tax-returns.txt")
+        )
+
+        let (items, snapshot, runtime) = try await scanSession(makeScanner())
+        let found = try XCTUnwrap(item(from: items, at: artifact))
+
+        // The marker goes away; `target/` is no longer proven build output.
+        try fm.removeItem(at: project.appendingPathComponent("Cargo.toml"))
+
+        switch revalidator.revalidate(item: found, authorization: nil) {
+        case .allow:
+            XCTFail("the artifact rule no longer matches — deletion must be "
+                    + "refused, not allowed on a clean valuables probe")
+        case .refuse(let reason, let valuables, let token):
+            XCTAssertTrue(reason.contains("Cargo.toml"),
+                          "the refusal names the missing marker: \(reason)")
+            XCTAssertTrue(valuables.isEmpty)
+            XCTAssertNil(token, "there is nothing to acknowledge — the "
+                            + "refusal is not about valuables")
+        }
+
+        let cleaner = runtime.makeCleaner(snapshot: snapshot)
+        let report = await cleaner.clean(items: [found], moveToTrash: false)
+        XCTAssertTrue(report.entries.isEmpty, "nothing may be deleted")
+        XCTAssertEqual(report.errors.count, 1)
+        XCTAssertEqual(report.errors.first?.key, found.key)
+        XCTAssertTrue(fm.fileExists(atPath: repurposed.path),
+                      "the repurposed directory is byte-untouched")
+    }
+
+    /// THREAD A, the other rule SHAPE and the other kind of loss: the
+    /// interior marker (PEP 405) and a target swapped for a symlink. Both
+    /// void the same proof, and the proof is what the revalidator re-runs.
+    func testInteriorMarkerLossAndKindChangeBothRefuseAtDeleteTime()
+        async throws
+    {
+        let venv = try makeVenv(at: dev.appendingPathComponent("env"))
+        let rust = try makeProject(
+            at: dev.appendingPathComponent("proj"),
+            marker: "Cargo.toml", artifact: "target"
+        )
+        let items = try await scanSession(makeScanner()).items
+        let venvItem = try XCTUnwrap(item(from: items, at: venv))
+        let rustItem = try XCTUnwrap(item(from: items, at: rust))
+
+        // (a) The INSIDE shape: `pyvenv.cfg` is the whole proof.
+        try fm.removeItem(at: venv.appendingPathComponent("pyvenv.cfg"))
+        switch revalidator.revalidate(item: venvItem, authorization: nil) {
+        case .allow:
+            XCTFail("a directory with no pyvenv.cfg inside it is not a venv")
+        case .refuse(let reason, _, let token):
+            XCTAssertTrue(reason.contains("pyvenv.cfg"), reason)
+            XCTAssertNil(token)
+        }
+
+        // (b) The KIND change: the matcher never matched a symlink, so the
+        // re-proof must not accept one either — deleting it would remove a
+        // link the user made, and the tree it names was never inspected.
+        let outside = base.appendingPathComponent("outside")
+        try mkdir(outside)
+        try fm.removeItem(at: rust)
+        try fm.createSymbolicLink(at: rust, withDestinationURL: outside)
+        switch revalidator.revalidate(item: rustItem, authorization: nil) {
+        case .allow:
+            XCTFail("the artifact dir is a symlink now — refuse")
+        case .refuse(let reason, _, let token):
+            XCTAssertTrue(reason.contains("symlink"), reason)
+            XCTAssertNil(token)
+        }
+        XCTAssertTrue(fm.fileExists(atPath: outside.path))
+    }
+
+    /// THREAD A's other half — the re-proof must not be STRICTER than the
+    /// scan, or it invents refusals nothing can clear. The predicate is the
+    /// rule SHAPE's whole declared marker set, never the single marker the
+    /// evidence happened to name: a Gradle project that migrated
+    /// `build.gradle` → `settings.gradle.kts` between scan and clean is still
+    /// matched by the same row, exactly as a re-scan would match it.
+    func testRuleReproofUsesTheShapesMarkerSetNotTheNamedMarker()
+        async throws
+    {
+        let project = dev.appendingPathComponent("gradle-app")
+        let artifact = try makeProject(
+            at: project, marker: "build.gradle", artifact: "build"
+        )
+        let items = try await scanSession(makeScanner()).items
+        let found = try XCTUnwrap(item(from: items, at: artifact))
+        XCTAssertTrue(found.evidence.contains("build.gradle"),
+                      "fixture precondition: the evidence named THAT marker")
+
+        try fm.removeItem(at: project.appendingPathComponent("build.gradle"))
+        try writeFile(
+            project.appendingPathComponent("settings.gradle.kts"), bytes: 32
+        )
+
+        XCTAssertEqual(
+            revalidator.revalidate(item: found, authorization: nil), .allow,
+            "another declared marker of the SAME row still proves the rule — "
+                + "scan time and delete time must agree"
+        )
+    }
+
+    /// The proof is STRUCTURAL: it rides every emitted item, and an item that
+    /// lost it is refused rather than deleted on an unproven rule.
+    func testProofRidesEveryItemAndItsAbsenceFailsClosed() async throws {
+        let artifact = try makeProject(
+            at: dev.appendingPathComponent("proj"),
+            marker: "Cargo.toml", artifact: "target"
+        )
+        try makeVenv(at: dev.appendingPathComponent("env"))
+        let outcome = try await runScan(makeScanner())
+
+        XCTAssertEqual(outcome.items.count, 2)
+        for emitted in outcome.items {
+            let proof = try XCTUnwrap(
+                emitted.artifactProof,
+                "every build-artifact item carries the rule that matched it"
+            )
+            XCTAssertFalse(proof.marker.isEmpty)
+        }
+        let found = try XCTUnwrap(item(outcome, at: artifact))
+        XCTAssertEqual(
+            found.artifactProof,
+            BuildArtifactProof(
+                shape: .markerSibling(
+                    artifactDirName: "target", markers: ["Cargo.toml"]
+                ),
+                marker: "Cargo.toml"
+            ),
+            "the MATCHED row's shape, carried verbatim"
+        )
+
+        // A mapping regression that dropped it must not delete.
+        let stripped = replacing(found, disclosure: found.valuablesDisclosure)
+        XCTAssertNil(stripped.artifactProof, "fixture precondition")
+        switch revalidator.revalidate(item: stripped, authorization: nil) {
+        case .allow:
+            XCTFail("an item with no recorded rule cannot be re-proven")
+        case .refuse(let reason, _, let token):
+            XCTAssertTrue(
+                reason.contains("no record of the build-artifact rule"), reason
+            )
+            XCTAssertNil(token)
+        }
+    }
+
+    /// THREAD B, the core half. The probe's ONE bounded core must gate its
+    /// own root with a no-follow `lstat` — the delete-time face already did,
+    /// the scan-time face did not, and only the core is shared.
+    func testValuablesProbeNeverOpensASymlinkedRoot() throws {
+        let outside = base.appendingPathComponent("outside")
+        try writeBulkFile(
+            outside.appendingPathComponent("Shipped.dmg"),
+            bytes: aboveFloorBytes
+        )
+        let link = base.appendingPathComponent("link")
+        try fm.createSymbolicLink(at: link, withDestinationURL: outside)
+
+        let disclosure = ValuablesDetector.probe(
+            at: link, provider: FileSystemIdentityProvider()
+        )
+
+        XCTAssertTrue(
+            disclosure.valuables.isEmpty,
+            "the probe followed a symlink leaf and disclosed a tree the "
+                + "deletion would never touch: "
+                + disclosure.valuables.map(\.name).joined(separator: ", ")
+        )
+    }
+
+    /// THREAD B, the scanner half. The candidate is replaced by a symlink
+    /// after its walker event and before the post-walk sizing pass; neither
+    /// walk may follow the leaf, so no byte and no valuable of the external
+    /// tree can reach the item.
+    func testCandidateSwappedForASymlinkBeforeSizingIsNeverFollowed()
+        async throws
+    {
+        let outside = base.appendingPathComponent("outside")
+        try writeBulkFile(
+            outside.appendingPathComponent("Shipped.dmg"),
+            bytes: aboveFloorBytes
+        )
+        try writeFile(outside.appendingPathComponent("bulk.bin"), bytes: 65_536)
+
+        let project = dev.appendingPathComponent("proj")
+        let artifact = try makeProject(
+            at: project, marker: "Cargo.toml", artifact: "target",
+            payloadBytes: 8_192
+        )
+
+        let provider = PostWalkSwappingProvider()
+        provider.trigger = project.path
+        let manager = fm
+        provider.swap = {
+            try? manager.removeItem(at: artifact)
+            try? manager.createSymbolicLink(
+                at: artifact, withDestinationURL: outside
+            )
+        }
+
+        let outcome = try await runScan(makeScanner(provider: provider))
+        XCTAssertTrue(provider.swapped,
+                      "fixture precondition: the swap ran, post-walk")
+        XCTAssertEqual(
+            try fm.destinationOfSymbolicLink(atPath: artifact.path),
+            outside.path,
+            "fixture precondition: the candidate is a symlink now"
+        )
+
+        // The subject the matcher proved is gone, so it produces no candidate
+        // — the same answer the walker's matcher gives, and the fail-closed
+        // one: nothing is listed, so nothing is offered.
+        XCTAssertNil(
+            item(outcome, at: artifact),
+            "a candidate replaced by a symlink is not the artifact dir the "
+                + "rule matched and must not be emitted"
+        )
+        XCTAssertTrue(outcome.items.isEmpty, itemPaths(outcome).description)
+        XCTAssertEqual(
+            outcome.items.reduce(Int64(0)) { $0 + $1.allocatedBytes }, 0,
+            "not one byte of the external tree may be published"
+        )
+        XCTAssertTrue(
+            outcome.items.allSatisfy {
+                ($0.valuablesDisclosure?.valuables ?? []).isEmpty
+            },
+            "the external tree's release artifacts must never be disclosed"
+        )
+        XCTAssertTrue(
+            fm.fileExists(atPath:
+                outside.appendingPathComponent("Shipped.dmg").path),
+            "the external tree is untouched"
+        )
+
+        // …and the two walks themselves never follow a leaf either, so a swap
+        // in the remaining nanoseconds still discloses nothing (belt and
+        // braces — the gate above is one `lstat` earlier).
+        let sized = DirectorySizer(provider: FileSystemIdentityProvider())
+            .measure(at: artifact, mode: .deletionTarget)
+        XCTAssertEqual(sized.measuredBytes, 0)
+        XCTAssertEqual(sized.itemCount, 0)
+        XCTAssertTrue(
+            ValuablesDetector.probe(
+                at: artifact, provider: FileSystemIdentityProvider()
+            ).valuables.isEmpty
+        )
+    }
+
+    /// THREAD C. Overlapping roots: the outer artifact holds a mount
+    /// boundary, and a SEPARATELY configured root inside that volume owns an
+    /// artifact of its own. The outer item is denied for the boundary, so the
+    /// lexical ancestor drop must not take the inner candidate with it —
+    /// neither sizing nor deletion crosses the boundary, so nothing the drop
+    /// exists to prevent can happen across it.
+    func testDescendantBeyondAMountBoundarySurvivesTheAncestorDrop()
+        async throws
+    {
+        let outer = try makeProject(
+            at: dev.appendingPathComponent("proj"),
+            marker: "Cargo.toml", artifact: "target", payloadBytes: 8_192
+        )
+        let mounted = outer.appendingPathComponent("volume")
+        let innerRoot = mounted.appendingPathComponent("code")
+        let inner = try makeProject(
+            at: innerRoot.appendingPathComponent("proj2"),
+            marker: "Cargo.toml", artifact: "target", payloadBytes: 16_384
+        )
+
+        let provider = MountPointInjectingProvider()
+        provider.mountPointInodes.insert(
+            try XCTUnwrap(provider.identity(of: mounted)?.inode)
+        )
+
+        let outcome = try await runScan(
+            makeScanner(roots: [dev, innerRoot], provider: provider)
+        )
+
+        let outerItem = try XCTUnwrap(
+            item(outcome, at: outer, provider: provider)
+        )
+        XCTAssertEqual(outerItem.state, .denied,
+                       "the boundary voids the outer target")
+
+        let innerItem = try XCTUnwrap(
+            item(outcome, at: inner, provider: provider),
+            "the inner artifact — under its OWN configured root, inside the "
+                + "external volume rather than at the mount point — is "
+                + "cleanable and must survive the ancestor drop"
+        )
+        XCTAssertEqual(innerItem.state, .measured)
+        XCTAssertGreaterThan(innerItem.allocatedBytes, 0)
     }
 
     // MARK: - fn-4.5 fixtures

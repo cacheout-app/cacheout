@@ -1788,23 +1788,58 @@ final class OrphanedCachesScannerTests: XCTestCase {
             OrphanedCachesScanner.remediationGuidance(for: [.transientFailure])
                 .contains("Re-scan and try again."))
 
-        // Mixed sets take the BEST available remedy and stay deterministic.
-        let mixed = OrphanedCachesScanner.remediationGuidance(
-            for: [.transientFailure, .budgetExhausted]
-        )
-        XCTAssertFalse(mixed.contains("will not clear"), mixed)
-        XCTAssertTrue(mixed.hasSuffix("Re-scan and try again."), mixed)
-        XCTAssertEqual(
-            mixed,
-            OrphanedCachesScanner.remediationGuidance(
-                for: [.budgetExhausted, .transientFailure]
-            ),
-            "guidance order is the declaration order, whatever the input order"
-        )
-
         XCTAssertTrue(
             OrphanedCachesScanner.remediationGuidance(for: []).isEmpty,
             "a complete probe has nothing to remediate")
+    }
+
+    /// Causes are CONJUNCTIVE: the user has to clear every one of them, so
+    /// the closing advice must be the MOST DEMANDING remedy in the set, not
+    /// the easiest one present. Closing a budget-plus-transient set with
+    /// "Re-scan and try again" sends the user around a loop that can never
+    /// succeed — the transient error clears, the over-budget folder does
+    /// not, and the delete-time probe refuses again with no remedy ever
+    /// offered. That is the stranding shape this branch exists to remove.
+    func testMixedGuidanceKeepsTheMostDemandingRemedy() {
+        let mixed = OrphanedCachesScanner.remediationGuidance(
+            for: [.transientFailure, .budgetExhausted]
+        )
+        // Both causes are still described…
+        XCTAssertTrue(mixed.contains("inspection budget allows"), mixed)
+        XCTAssertTrue(mixed.contains("temporary error"), mixed)
+        // …but the closing belongs to the one a retry cannot fix.
+        XCTAssertFalse(
+            mixed.hasSuffix("Re-scan and try again."),
+            "the over-budget folder still refuses after the retry: \(mixed)"
+        )
+        XCTAssertTrue(mixed.contains("will not clear this"), mixed)
+        XCTAssertTrue(mixed.contains("explicit per-item confirmation"), mixed)
+
+        // Same rule one rung down: a user action outranks a bare retry.
+        let actionable = OrphanedCachesScanner.remediationGuidance(
+            for: [.transientFailure, .accessDenied]
+        )
+        XCTAssertFalse(actionable.hasSuffix("Re-scan and try again."), actionable)
+        XCTAssertTrue(actionable.contains("then re-scan"), actionable)
+        XCTAssertFalse(actionable.contains("will not clear"), actionable)
+
+        // And an irreducible cause outranks a user action too.
+        let both = OrphanedCachesScanner.remediationGuidance(
+            for: [.accessDenied, .budgetExhausted]
+        )
+        XCTAssertTrue(both.contains("will not clear this"), both)
+        XCTAssertTrue(both.contains("granting access"),
+                      "the clearable cause is still described: \(both)")
+
+        // Order-independent and duplicate-proof.
+        XCTAssertEqual(
+            mixed,
+            OrphanedCachesScanner.remediationGuidance(
+                for: [.budgetExhausted, .transientFailure, .budgetExhausted]
+            ),
+            "guidance is the declaration order whatever the input order, and "
+                + "a repeated cause is stated once"
+        )
     }
 
     /// Fail-closed is untouched: a GENUINELY obstructed probe — a branch

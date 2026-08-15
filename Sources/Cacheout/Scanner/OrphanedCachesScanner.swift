@@ -201,22 +201,29 @@ enum UserDataProbeObstruction: CaseIterable, Comparable, Sendable {
     /// `EACCES`/`EPERM` on a directory or a child — TCC or POSIX
     /// permissions. A bare retry reproduces it; GRANTING access clears it.
     case accessDenied
-    /// An I/O error, a resource shortage, or the tree changing under the
-    /// walk (a directory removed between being pushed and being popped).
-    /// The one genuinely RETRYABLE class: once the race or the obstruction
-    /// is gone, a re-scan completes.
+    /// An I/O error, a resource shortage, an unreachable network volume, or
+    /// the tree changing under the walk (a directory removed between being
+    /// pushed and being popped). The genuinely RETRYABLE class: once the
+    /// race or the obstruction is gone, a re-scan completes.
     case transientFailure
 
     /// What can actually change this — the whole point of distinguishing.
-    enum Remedy: Sendable {
+    ///
+    /// Ordered LEAST → MOST demanding, with `Comparable` synthesized off
+    /// that order so a mixed set can take the most demanding remedy
+    /// present. Causes are CONJUNCTIVE — the user must clear every one of
+    /// them — so "best available" is the wrong operator: it closes a
+    /// budget-plus-transient set with "re-scan and try again" and sends the
+    /// user around a loop that can never succeed.
+    enum Remedy: Comparable, Sendable {
         /// A re-scan alone can succeed.
         case retryAlone
         /// A user action first (unmount, grant access, rename), then a
         /// re-scan.
         case userActionThenRetry
-        /// Neither: it reproduces exactly until policy or an explicit
-        /// per-item confirmation changes the outcome. (Spelled out rather
-        /// than `none`, which reads as `Optional.none` at a glance.)
+        /// Nothing available: it reproduces exactly until policy or an
+        /// explicit per-item confirmation changes the outcome. (Spelled out
+        /// rather than `none`, which reads as `Optional.none` at a glance.)
         case irreducible
     }
 
@@ -1096,23 +1103,34 @@ struct OrphanedCachesScanner: @unchecked Sendable {
     static func remediationGuidance(
         for obstructions: [UserDataProbeObstruction]
     ) -> String {
-        guard !obstructions.isEmpty else { return "" }
-        var sentences = obstructions.sorted().map(\.guidance)
-        // The closing sentence is keyed to the BEST available remedy: if any
-        // cause is retryable the user should retry, and only a set with no
-        // remedy at all earns the "this will not change" claim.
-        if obstructions.contains(where: { $0.remedy == .retryAlone }) {
+        // Deduplicated and ordered, so a caller that hands over a repeated
+        // cause still gets each one stated once, in declaration order.
+        let causes = Set(obstructions).sorted()
+        // CONJUNCTIVE, not best-of: the user has to clear EVERY cause, so
+        // the closing advice is the MOST DEMANDING remedy present, never
+        // the easiest. Best-of closed a budget-plus-transient set with
+        // "re-scan and try again" — the transient clears, the over-budget
+        // folder does not, the probe refuses again, and no remedy is ever
+        // offered: the exact stranding loop this work exists to remove.
+        // Every cause is still described above the closing, so the easier
+        // remedies are not lost — only the promise that they suffice.
+        guard let binding = causes.map(\.remedy).max() else { return "" }
+        var sentences = causes.map(\.guidance)
+
+        switch binding {
+        case .retryAlone:
             sentences.append("Re-scan and try again.")
-        } else if obstructions.contains(
-            where: { $0.remedy == .userActionThenRetry }
-        ) {
-            sentences.append("Clear that, then re-scan.")
-        } else {
+        case .userActionThenRetry:
+            sentences.append(causes.count == 1
+                ? "Clear that, then re-scan."
+                : "Clear all of the above, then re-scan.")
+        case .irreducible:
             sentences.append(
-                "Re-scanning alone will not clear this — the same tree under "
-                + "the same budget reports the same thing every time; remove "
-                + "this item by explicit per-item confirmation once a "
-                + "re-scan lists it at review risk."
+                "Re-scanning will not clear this — an unchanged folder is "
+                + "inspected the same way and reports the same thing every "
+                + "time, whatever else is fixed first; remove this item by "
+                + "explicit per-item confirmation once a re-scan lists it at "
+                + "review risk."
             )
         }
         return sentences.joined(separator: " ")

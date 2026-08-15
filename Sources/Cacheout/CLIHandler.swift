@@ -1953,51 +1953,11 @@ struct CLIHandler {
                item.state == .empty || item.state == .missing {
                 continue
             }
-            let entry = entriesByKey[item.key]
-            let itemErrors = errorsByKey[item.key] ?? []
-            let errs = itemErrors.map(\.message)
-            // The TYPED refusal payload (fn-4.9, R17), transported through
-            // `CleanupReport.ItemError` — the row NEVER parses message prose.
-            // At most one revalidation refusal exists per item (the seam
-            // returns immediately), so the first payload IS the payload.
-            let refusal = itemErrors.compactMap(\.refusal).first
-            let exact = entry?.exactBytes ?? 0
-            let estimated = entry?.estimatedUpToBytes ?? 0
-            var row: [String: Any] = [
-                "category": addressValue(for: item),
-                "name": item.displayName,
-                "bytes_freed": exact,
-                "exact_bytes": exact,
-                "estimated_up_to_bytes": estimated,
-                "freed_human": CleanupReport.componentPhrase(
-                    exact: exact, estimatedUpTo: estimated
-                ),
-                "success": errs.isEmpty,
-                "scanner_id": item.scannerID,
-                "item_id": item.id,
-            ]
-            if !errs.isEmpty {
-                row["error"] = errs.joined(separator: "; ")
-            }
-            if item.state == .partiallyDenied {
-                row["warning"] = partiallyDeniedCleanWarning
-            }
-            // ADDITIVE refusal fields (R17), from the typed payload only —
-            // ABSENT on every ordinary error row and on every success row, so
-            // pre-existing row shapes are unchanged. `valuables` is omitted
-            // when the refusal disclosed none (a VANISHED set), and
-            // `acknowledgement_token` unless the refusal carries a non-empty
-            // current set from a COMPLETE delete-time probe (vanished-set and
-            // incomplete-probe refusals are tokenless — the uniform R17 rule).
-            if let refusal {
-                if !refusal.valuables.isEmpty {
-                    row["valuables"] = refusal.valuables.map(valuableRowJSON(for:))
-                }
-                if let token = refusal.acknowledgementToken {
-                    row["acknowledgement_token"] = token
-                }
-            }
-            rows.append(row)
+            rows.append(confirmedCleanRowJSON(
+                item: item,
+                entry: entriesByKey[item.key],
+                errors: errorsByKey[item.key] ?? []
+            ))
         }
 
         // Exit contract (R5): TOTAL failure — every requested target
@@ -2036,6 +1996,77 @@ struct CLIHandler {
             payload["scanner_errors"] = scannerErrors
         }
         return .success(payload)
+    }
+
+    /// ONE confirmed-clean result row. Extracted from the payload loop
+    /// (fn-5.4) so the row SHAPE — in particular the two-source `warning`
+    /// merge below — is unit-testable without driving a whole destructive
+    /// run; the loop above is now purely correlation and iteration.
+    ///
+    /// `success` is `errors.isEmpty` (the frozen derivation, and precisely
+    /// why D11 gave `CleanupReport.Entry` a `warning` field instead of a
+    /// "non-fatal ItemError": an error of any kind flips a successful
+    /// removal's row to `success: false`).
+    ///
+    /// THE `warning` KEY HAS TWO SOURCES and they COMPOSE (fn-5.4, D11):
+    /// the scan-time `.partiallyDenied` note and the entry's own delete-time
+    /// warning. When both apply they are joined with `"; "` — the row must
+    /// never drop one because the other happened to be there.
+    static func confirmedCleanRowJSON(
+        item: ReclaimableItem,
+        entry: CleanupReport.Entry?,
+        errors: [CleanupReport.ItemError]
+    ) -> [String: Any] {
+        let errs = errors.map(\.message)
+        // The TYPED refusal payload (fn-4.9, R17), transported through
+        // `CleanupReport.ItemError` — the row NEVER parses message prose.
+        // At most one revalidation refusal exists per item (the seam
+        // returns immediately), so the first payload IS the payload.
+        let refusal = errors.compactMap(\.refusal).first
+        let exact = entry?.exactBytes ?? 0
+        let estimated = entry?.estimatedUpToBytes ?? 0
+        var row: [String: Any] = [
+            "category": addressValue(for: item),
+            "name": item.displayName,
+            "bytes_freed": exact,
+            "exact_bytes": exact,
+            "estimated_up_to_bytes": estimated,
+            "freed_human": CleanupReport.componentPhrase(
+                exact: exact, estimatedUpTo: estimated
+            ),
+            "success": errs.isEmpty,
+            "scanner_id": item.scannerID,
+            "item_id": item.id,
+        ]
+        if !errs.isEmpty {
+            row["error"] = errs.joined(separator: "; ")
+        }
+        var warnings: [String] = []
+        if item.state == .partiallyDenied {
+            warnings.append(partiallyDeniedCleanWarning)
+        }
+        if let warning = entry?.warning, !warning.isEmpty {
+            warnings.append(warning)
+        }
+        if !warnings.isEmpty {
+            row["warning"] = warnings.joined(separator: "; ")
+        }
+        // ADDITIVE refusal fields (R17), from the typed payload only —
+        // ABSENT on every ordinary error row and on every success row, so
+        // pre-existing row shapes are unchanged. `valuables` is omitted
+        // when the refusal disclosed none (a VANISHED set), and
+        // `acknowledgement_token` unless the refusal carries a non-empty
+        // current set from a COMPLETE delete-time probe (vanished-set and
+        // incomplete-probe refusals are tokenless — the uniform R17 rule).
+        if let refusal {
+            if !refusal.valuables.isEmpty {
+                row["valuables"] = refusal.valuables.map(valuableRowJSON(for:))
+            }
+            if let token = refusal.acknowledgementToken {
+                row["acknowledgement_token"] = token
+            }
+        }
+        return row
     }
 
     /// Smart-clean eligibility + order — policy (c), EXCLUSIVELY this

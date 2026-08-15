@@ -428,6 +428,41 @@ struct GitWorktreeGitdirResolver {
     }
 }
 
+// MARK: - The orphaned-admin ORACLE (D10)
+
+/// The ONE spelling of the orphaned-admin oracle listing — the read-only
+/// command whose `prunable` annotations detection (fn-5.5) and execution
+/// (fn-5.4's delete-time recompute and its final pre-subprocess check) both
+/// consume. One argv, like the one mapper below: if detection and execution
+/// asked git differently, they could disagree about a repository-wide side
+/// effect.
+///
+/// `-c gc.worktreePruneExpire=now` is pinned (D10, empirically re-verified on
+/// git 2.50.1): a freshly orphaned checkout is annotated `prunable` even
+/// without the override, but OTHER orphan classes are expire-gated, the 2.39
+/// floor is not locally verifiable, and detection must match the `--expire=now`
+/// the execution prune pins — otherwise a detected fresh orphan survives
+/// execution as a recurring ~0-byte "success".
+///
+/// The MUTATION argv (`worktree remove` / `worktree prune`) deliberately does
+/// NOT live here: it belongs to the one component allowed to mutate,
+/// `WorktreeReclaimPerformer` (fn-5.4).
+enum GitWorktreeOracle {
+
+    /// The config override that makes every expire-gated orphan class visible.
+    static let pruneExpireOverride = "gc.worktreePruneExpire=now"
+
+    /// `git -C <repo> -c gc.worktreePruneExpire=now worktree list --porcelain -z`
+    /// — read-only by D17 classification, so the runner applies
+    /// `GIT_OPTIONAL_LOCKS=0` + `-c core.fsmonitor=false` wherever it runs.
+    static func listArguments(forRepositoryAt repository: URL) -> [String] {
+        [
+            "-C", repository.path, "-c", pruneExpireOverride,
+            "worktree", "list", "--porcelain", "-z",
+        ]
+    }
+}
+
 // MARK: - Shared oracle → admin-directory mapper (epic round 10)
 
 /// Whether the prunable set could be mapped COMPLETELY onto admin

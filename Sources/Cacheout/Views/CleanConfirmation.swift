@@ -290,10 +290,19 @@ struct CleanupReportSheet: View {
                                         Text(entry.componentSummary)
                                             .foregroundStyle(.secondary)
                                     }
-                                    // P2 honesty marker: in a Trash run, a
-                                    // command-erased entry put nothing in
-                                    // the Trash.
-                                    if let note = report.rowAnnotation(for: entry) {
+                                    // Row annotations come from the PURE
+                                    // presentation helper (fn-5.4): the P2
+                                    // disposal honesty marker (in a Trash
+                                    // run, a command-erased entry put
+                                    // nothing in the Trash) and the D11
+                                    // warning an otherwise-successful entry
+                                    // carries. The body renders, it never
+                                    // derives — `rowAnnotations(for:)` is
+                                    // the tested surface.
+                                    ForEach(
+                                        report.rowAnnotations(for: entry),
+                                        id: \.self
+                                    ) { note in
                                         Text(note)
                                             .font(.caption2)
                                             .foregroundStyle(.orange)

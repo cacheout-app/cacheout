@@ -4,15 +4,23 @@ import XCTest
 /// fn-5.3 coverage: the composite `ReclaimAction.gitWorktreeReclaim` case and
 /// its `GitWorktreeReclaimPlan` payload, the EIGHT exhaustive switch sites it
 /// compiles through, the structural rule set enforced INDEPENDENTLY by the
-/// cleaner and the runtime validator, the fail-closed placeholder dispatch
-/// plus its runner seam, and the new `ScanIssue.Kind.toolUnavailable`.
+/// cleaner and the runtime validator, the dispatch arm's fail-closed
+/// preconditions plus its runner seam, and the new
+/// `ScanIssue.Kind.toolUnavailable`.
+///
+/// UPDATED BY fn-5.4 where the behaviour it pinned deliberately moved: the
+/// dispatch arm is now `WorktreeReclaimPerformer` rather than a placeholder
+/// (so "reached dispatch" is observed through the performer's first
+/// fail-closed gate), and site 8's `revalidatableAction` flipped to TRUE for
+/// the composite because that performer routes the item through the
+/// revalidator seam. Everything else here is untouched fn-5.3 contract.
 ///
 /// THE SITE CENSUS (compile-through proof, this tree, 2026-08-14). Adding the
 /// case with every site unpatched produced `switch must be exhaustive` at
 /// exactly these — no more, no fewer:
 ///   1. `CacheCleaner.clean` check (3), zero-root-record guard
 ///   2. `CacheCleaner.clean` check (4), zero-byte skip (composite EXCLUDED)
-///   3. `CacheCleaner.clean` check (5), execution dispatch (placeholder)
+///   3. `CacheCleaner.clean` check (5), execution dispatch
 ///   4. `CacheCleaner.structuralRefusal`, the action/descriptor switch
 ///   5. `ReclaimAction.wireString`
 ///   6. `SpaceScannerRuntime.structuralViolation`, the outer switch
@@ -275,9 +283,17 @@ final class GitWorktreeReclaimActionTests: XCTestCase {
     }
 
     /// A well-formed item passes BOTH sites' structural rules: the validator
-    /// publishes it, and the cleaner reaches DISPATCH — where this task's
-    /// placeholder refuses it by design.
-    private func assertReachesPlaceholderDispatch(
+    /// publishes it, and the cleaner reaches DISPATCH.
+    ///
+    /// UPDATED BY fn-5.4: dispatch is no longer a placeholder but the real
+    /// `WorktreeReclaimPerformer`, so "it reached dispatch" is now observed
+    /// through the performer's OWN first fail-closed gate — these cleaners
+    /// are built WITHOUT a scan-session snapshot, which the composite arm
+    /// refuses exactly as `removeGuardedItem` does (items must be cleaned
+    /// with the session that produced them). Structural refusals never reach
+    /// that message, so the cell still proves what it always proved; and
+    /// git is STILL never executed, which is the other half.
+    private func assertReachesExecutionDispatch(
         _ subject: ReclaimableItem,
         file: StaticString = #filePath, line: UInt = #line
     ) async throws {
@@ -297,14 +313,16 @@ final class GitWorktreeReclaimActionTests: XCTestCase {
             .clean(items: [subject], moveToTrash: false)
         XCTAssertTrue(report.entries.isEmpty, file: file, line: line)
         XCTAssertEqual(report.errors.count, 1, file: file, line: line)
-        XCTAssertEqual(
-            report.errors.first?.message,
-            "refused: git_worktree_reclaim execution is not wired up in this "
-                + "build — nothing was reclaimed",
+        XCTAssertTrue(
+            report.errors.first?.message.contains(
+                "no scan-session container snapshot"
+            ) ?? false,
+            "expected the snapshot-less delete-time refusal, got: "
+                + "\(report.errors.first?.message ?? "<none>")",
             file: file, line: line
         )
         XCTAssertTrue(runner.invocations.isEmpty,
-                      "the placeholder must not execute git",
+                      "a snapshot-less cleaner must not execute git",
                       file: file, line: line)
     }
 
@@ -422,8 +440,8 @@ final class GitWorktreeReclaimActionTests: XCTestCase {
     // MARK: - The valid cells (both modes)
 
     func testWellFormedStaleAndPruneItemsPassBothSites() async throws {
-        try await assertReachesPlaceholderDispatch(item(plan(.removeStaleWorktree)))
-        try await assertReachesPlaceholderDispatch(
+        try await assertReachesExecutionDispatch(item(plan(.removeStaleWorktree)))
+        try await assertReachesExecutionDispatch(
             item(plan(.pruneOrphanedAdmin), id: "prune-item")
         )
     }
@@ -451,7 +469,7 @@ final class GitWorktreeReclaimActionTests: XCTestCase {
             parentAdminContainer: atRoot.parentAdminContainer,
             disclosedAdminDirectories: []
         )
-        try await assertReachesPlaceholderDispatch(item(legal))
+        try await assertReachesExecutionDispatch(item(legal))
 
         // The admin container is held to STRICT descent: equal to the
         // container would put the whole dev root in the mutation scope.
@@ -719,7 +737,7 @@ final class GitWorktreeReclaimActionTests: XCTestCase {
 
             // A record whose resolution honestly FAILED displays the
             // declared spelling: nil matches nil, and that stays valid.
-            try await assertReachesPlaceholderDispatch(
+            try await assertReachesExecutionDispatch(
                 item(subject, id: "\(mode)-nil-resolution",
                      rootRecords: [RootScanRecord(
                         requestedURL: target, resolvedURL: nil,
@@ -773,7 +791,7 @@ final class GitWorktreeReclaimActionTests: XCTestCase {
         // The validator's value-domain family accepts it (a `.measured` item
         // with itemCount >= 1 has "measured something"), which is what makes
         // fn-5.5's `.measured` emission policy viable.
-        try await assertReachesPlaceholderDispatch(zeroByte)
+        try await assertReachesExecutionDispatch(zeroByte)
 
         // The contrast that proves the arm is doing work: an AGGREGATE with
         // zero bytes is still skipped silently.
@@ -818,14 +836,16 @@ final class GitWorktreeReclaimActionTests: XCTestCase {
                           + "prune items are emitted `.measured`")
     }
 
-    // MARK: - Site 3: the fail-closed placeholder + runner seam (R4)
+    // MARK: - Site 3: the dispatch arm's fail-closed preconditions (R4)
 
-    func testThePlaceholderRefusesPerItemAndNamesTheMissingRunnerSeparately()
+    func testDispatchRefusesPerItemAndNamesTheMissingRunnerSeparately()
         async throws
     {
         // Both causes are per-item ERRORS — never a silent skip — and they
-        // are worded apart so a composition regression (no runner threaded
-        // through) cannot hide behind "not implemented yet".
+        // stay worded APART so a composition regression (no runner threaded
+        // through) cannot hide behind the other refusal. fn-5.4 replaced the
+        // placeholder's second cause with the performer's own first gate: a
+        // cleaner holding the runner but NO scan-session snapshot.
         let subject = item(plan(.removeStaleWorktree))
 
         let withoutRunner = await makeCleaner()
@@ -845,10 +865,12 @@ final class GitWorktreeReclaimActionTests: XCTestCase {
             .clean(items: [subject], moveToTrash: false)
         XCTAssertTrue(withRunner.entries.isEmpty)
         XCTAssertEqual(withRunner.errors.count, 1)
-        XCTAssertEqual(
-            withRunner.errors.first?.message,
-            "refused: git_worktree_reclaim execution is not wired up in this "
-                + "build — nothing was reclaimed"
+        XCTAssertTrue(
+            withRunner.errors.first?.message.contains(
+                "no scan-session container snapshot"
+            ) ?? false,
+            "expected the snapshot-less refusal, got: "
+                + "\(withRunner.errors.first?.message ?? "<none>")"
         )
         XCTAssertNotEqual(withoutRunner.errors.first?.message,
                           withRunner.errors.first?.message,
@@ -856,7 +878,7 @@ final class GitWorktreeReclaimActionTests: XCTestCase {
         XCTAssertTrue(runner.invocations.isEmpty)
     }
 
-    func testThePlaceholderDeletesNothingOnDisk() async throws {
+    func testAFailClosedDispatchDeletesNothingOnDisk() async throws {
         // "Never a silent no-op" cuts both ways: it must also never be a
         // silent DELETION. The worktree and the admin data survive intact.
         let tree = worktree
@@ -904,24 +926,33 @@ final class GitWorktreeReclaimActionTests: XCTestCase {
 
     // MARK: - Site 8: the fn-4.8 revalidation marker (R4)
 
-    func testAMarkedCompositeItemIsRefusedWhileThisBuildHasNoPerformer()
+    func testAMarkedCompositeItemWithoutARegisteredRevalidatorIsRefused()
         async throws
     {
         // `requiresPreDeleteRevalidation` promises "nothing marked is ever
-        // deleted without passing the seam". This build has no composite
-        // performer at all, so the only way to keep that promise is to
-        // refuse — fn-5.4 revisits the arm when it wires one.
+        // deleted without passing the seam". fn-5.3 kept that promise by
+        // refusing every marked composite item (there was no performer to
+        // route one through the seam); fn-5.4 FLIPPED the arm because its
+        // performer runs the seam in BOTH modes before anything destructive,
+        // so the marker is now honoured rather than refused outright.
+        //
+        // The fail-closed half is what this cell pins: a marked item whose
+        // scanner has NO registered revalidator is still refused — by check
+        // (1b), the uniform scanner-agnostic refusal — and git never runs.
         let marked = item(plan(.removeStaleWorktree), id: "marked",
                           requiresPreDeleteRevalidation: true)
-        let report = await makeCleaner(gitRunner: RecordingRunner())
+        let runner = RecordingRunner()
+        let report = await makeCleaner(gitRunner: runner)
             .clean(items: [marked], moveToTrash: false)
         XCTAssertTrue(report.entries.isEmpty)
         XCTAssertEqual(
             report.errors.first?.message,
-            "refused: requiresPreDeleteRevalidation is a per-target contract "
-                + "— only a remove_item item can be re-inspected immediately "
-                + "before its deletion"
+            "refused: this item requires a pre-delete revalidation, but no "
+                + "revalidator is registered for scanner 'git_worktrees' — "
+                + "clean it through the runtime that registered its scanner"
         )
+        XCTAssertTrue(runner.invocations.isEmpty,
+                      "an unrevalidatable marked item never reaches git")
     }
 
     // MARK: - Validator-only rules (R4/R8)

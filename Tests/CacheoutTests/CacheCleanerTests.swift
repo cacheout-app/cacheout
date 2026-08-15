@@ -1473,6 +1473,65 @@ final class CacheCleanerTests: XCTestCase {
         XCTAssertNil(permanentRun.rowAnnotation(for: commandEntry))
     }
 
+    // MARK: - D11 warning channel: the PURE presentation helper (fn-5.4)
+
+    func testRowAnnotationsComposeTheDisposalMarkerAndTheEntryWarning() {
+        // SwiftUI bodies are not unit-testable, so `rowAnnotations(for:)` IS
+        // the assertion surface (the house "Row presentation (testable)"
+        // pattern) and `CleanupReportSheet` merely renders what it returns.
+        let plain = CleanupReport.Entry(
+            itemID: "wt", scannerID: "git_worktrees", displayName: "wt",
+            exactBytes: 4096, estimatedUpToBytes: 0, disposal: .permanent
+        )
+        XCTAssertNil(plain.warning, "the field defaults to nil — additive")
+        let warned = CleanupReport.Entry(
+            itemID: "wt", scannerID: "git_worktrees", displayName: "wt",
+            exactBytes: 4096, estimatedUpToBytes: 0, disposal: .permanent,
+            warning: "prune skipped — orphaned admin data remains"
+        )
+
+        // (a) nothing to say.
+        XCTAssertEqual(
+            CleanupReport(disposal: .permanent, entries: [plain], errors: [])
+                .rowAnnotations(for: plain),
+            []
+        )
+        // (b) the D11 warning alone, in a matching-disposal run.
+        XCTAssertEqual(
+            CleanupReport(disposal: .permanent, entries: [warned], errors: [])
+                .rowAnnotations(for: warned),
+            ["prune skipped — orphaned admin data remains"]
+        )
+        // (c) the disposal honesty marker alone.
+        XCTAssertEqual(
+            CleanupReport(disposal: .trash, entries: [plain], errors: [])
+                .rowAnnotations(for: plain),
+            ["erased permanently — not in Trash"]
+        )
+        // (d) BOTH, in pinned order — neither annotation may swallow the
+        // other: a Trash run whose git-removal entry was erased permanently
+        // AND left admin data behind has two true things to say.
+        XCTAssertEqual(
+            CleanupReport(disposal: .trash, entries: [warned], errors: [])
+                .rowAnnotations(for: warned),
+            [
+                "erased permanently — not in Trash",
+                "prune skipped — orphaned admin data remains",
+            ]
+        )
+        // An empty warning string is not an annotation.
+        let blank = CleanupReport.Entry(
+            itemID: "wt", scannerID: "git_worktrees", displayName: "wt",
+            exactBytes: 1, estimatedUpToBytes: 0, disposal: .permanent,
+            warning: ""
+        )
+        XCTAssertEqual(
+            CleanupReport(disposal: .permanent, entries: [blank], errors: [])
+                .rowAnnotations(for: blank),
+            []
+        )
+    }
+
     func testCommandCategoryReportsPermanentDisposalInTrashRun() async throws {
         let cmdRoot = try makeTempDir("cmd-trash-run")
         defer { try? FileManager.default.removeItem(at: cmdRoot) }

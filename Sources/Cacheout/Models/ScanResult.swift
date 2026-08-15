@@ -261,6 +261,22 @@ struct CleanupReport {
         /// Move-to-Trash toggle and place nothing in the Trash, so their
         /// entries stay `.permanent` even in a Trash run.
         let disposal: Disposal
+        /// ADDITIVE (fn-5.4, D11) — a NON-FATAL condition attached to an entry
+        /// that DID succeed. Today's only producer is the stale-worktree
+        /// post-fallback prune: the tree is gone and its bytes are genuinely
+        /// freed, but the repository's orphaned admin data was left behind
+        /// (the prune was conservatively skipped, or it failed after the
+        /// deletion had already succeeded).
+        ///
+        /// Why a field and not an `ItemError`: the CLI derives a row's
+        /// `success` from `errs.isEmpty` (`CLIHandler.confirmedCleanRowJSON`),
+        /// so a "non-fatal error" would misreport a successful removal as a
+        /// failed row; log-only would hide what R5 requires reported.
+        ///
+        /// A `var` with a default so every existing memberwise construction
+        /// site compiles unchanged (the `ReclaimableItem` additive-field
+        /// precedent). Placed LAST so positional callers keep working too.
+        var warning: String? = nil
         /// Compatibility sum for pre-split callers — saturating (round 8):
         /// report arithmetic must never trap, whatever the components.
         var bytesFreed: Int64 { exactBytes.saturatingAdding(estimatedUpToBytes) }
@@ -462,6 +478,28 @@ struct CleanupReport {
     func rowAnnotation(for entry: Entry) -> String? {
         guard disposal == .trash, entry.disposal == .permanent else { return nil }
         return "erased permanently — not in Trash"
+    }
+
+    /// EVERY annotation one report row shows, in pinned order: the disposal
+    /// honesty marker first, then the entry's own D11 `warning`.
+    ///
+    /// The house "Row presentation (testable)" pattern (`ScanResult.statusLabel`,
+    /// `rowAnnotation(for:)`): SwiftUI bodies are not unit-testable, so the
+    /// derivation lives HERE as a pure function and `CleanupReportSheet`'s body
+    /// merely renders what it returns. THIS is the assertion surface.
+    ///
+    /// Both annotations can apply at once and neither replaces the other: a
+    /// Trash-mode run whose git-removal entry was erased permanently AND left
+    /// orphaned admin data behind must say both things.
+    func rowAnnotations(for entry: Entry) -> [String] {
+        var annotations: [String] = []
+        if let disposalMarker = rowAnnotation(for: entry) {
+            annotations.append(disposalMarker)
+        }
+        if let warning = entry.warning, !warning.isEmpty {
+            annotations.append(warning)
+        }
+        return annotations
     }
 
     /// R16 amount phrase over a subset of entries (one disposal's worth) —

@@ -47,6 +47,13 @@
 /// - `validateRemovableItem(_:inside:)` — strict descendant of an admitted
 ///   container PLUS the deny-list re-check (including volume-root/mount-point
 ///   and cross-device refusal, R15).
+/// - `validateSubprocessTraversalDirectory(_:inside:containment:)` (fn-5.4,
+///   D13) — for a directory handed to a SUBPROCESS that FOLLOWS it. The leaf
+///   IS resolved here, deliberately: the two operations above leave it
+///   unresolved because a deletion target must be removed as the link it is,
+///   but git follows what it is handed, so an unresolved-leaf check would
+///   pass a symlink-swapped leaf and point the subprocess outside the
+///   container.
 ///
 /// All location comparisons go through `FileSystemIdentityProvider` inodes,
 /// never strings. Deletion itself always uses the UNRESOLVED URL (the caller's
@@ -223,6 +230,10 @@ enum PathGuardError: Error, Equatable {
     /// this clean at all. ONE case for the whole class — detail rides the
     /// message.
     case containerUnavailable(path: String)
+    /// SUBPROCESS-TRAVERSAL refusal (fn-5.4, D13): a path a subprocess will
+    /// FOLLOW does not `lstat` as a real directory — a symlink leaf, a
+    /// regular file, or a leaf that cannot be inspected at all.
+    case notATraversableDirectory(path: String)
 }
 
 extension PathGuardError: LocalizedError {
@@ -248,6 +259,8 @@ extension PathGuardError: LocalizedError {
             return "Path is on a different volume than its container \(containerPath): \(path)"
         case .containerUnavailable(let path):
             return "Container is unavailable or its identity changed since the scan: \(path)"
+        case .notATraversableDirectory(let path):
+            return "Path is not a real directory a subprocess may be pointed at: \(path)"
         }
     }
 }
@@ -449,6 +462,101 @@ final class PathGuard {
            itemDevice != containerDevice {
             throw PathGuardError.crossDevice(
                 path: resolved.path, containerPath: container.resolvedURL.path
+            )
+        }
+    }
+
+    // MARK: Subprocess-traversal validation (fn-5.4, D13)
+
+    /// Which containment relationship a traversed path must hold to its
+    /// admitted container.
+    enum SubprocessTraversalContainment: Equatable {
+        /// The default for every MUTATED path — the admin container, a
+        /// worktree, an affected admin directory.
+        case strictDescendant
+        /// `parentRepoWorkingDir` ALONE (epic round 4): a dev root that IS a
+        /// repository is a legal, common shape — git is pointed at it with
+        /// `-C`, but only its strictly-contained admin data is mutated.
+        case descendantOrEqual
+    }
+
+    /// Validate a directory that is about to be handed to a SUBPROCESS which
+    /// FOLLOWS it (`git -C <dir>`, `git worktree remove <dir>`) — the D13
+    /// guard, run immediately before EVERY such invocation.
+    ///
+    /// `validateRemovableItem` is the WRONG check here and the difference is
+    /// the whole point: it deliberately leaves the LEAF unresolved because a
+    /// deletion target must be removed as the link it is. Git has no such
+    /// rule — it follows the path it is handed — so a leaf swapped to a
+    /// symlink after the scan would satisfy an unresolved-spelling
+    /// containment check and still point git at another repository.
+    ///
+    /// Four gates, in order:
+    /// 1. the LEAF must `lstat` (no-follow) as a REAL directory — a symlink,
+    ///    a regular file, an absent path, and an un-inspectable one all
+    ///    refuse;
+    /// 2. the path is FULLY canonicalized (leaf included — the opposite of
+    ///    `resolveTargetKeepingLeaf`);
+    /// 3. the canonical form must sit inside the container's canonical
+    ///    identity under `containment`, compared as `pathComponents` arrays
+    ///    (never `hasPrefix`);
+    /// 4. it must share the container's device — and, unlike
+    ///    `validateRemovableItem`'s cross-device rule, an UNREADABLE device
+    ///    id on either side refuses too: a path this guard cannot prove is
+    ///    on-device is not a path a subprocess may be pointed at.
+    ///
+    /// The deny list is deliberately NOT re-run: `matchConfiguredRoot`
+    /// already applied the container-root admission policy to the container
+    /// itself, and the protected-first-level-children clause would refuse the
+    /// LEGAL `parentRepoWorkingDir == ~/Documents` shape that
+    /// `.descendantOrEqual` exists to allow (containers are places to look,
+    /// deletion targets are not — PathGuard's standing split).
+    func validateSubprocessTraversalDirectory(
+        _ url: URL,
+        inside container: AdmittedContainer,
+        containment: SubprocessTraversalContainment = .strictDescendant
+    ) throws {
+        // (1) Real directory, no-follow, on the spelling git will receive.
+        guard provider.probeKind(of: url) == .kind(.directory) else {
+            throw PathGuardError.notATraversableDirectory(path: url.path)
+        }
+
+        // (2) Full canonicalization — the leaf too.
+        let canonical = provider.canonicalize(url)
+
+        // (3) Canonical containment.
+        let canonicalComponents = canonical.pathComponents
+        let containerComponents = container.resolvedURL.pathComponents
+        let isEqual = canonicalComponents == containerComponents
+        let isStrictDescendant =
+            canonicalComponents.count > containerComponents.count
+            && Array(canonicalComponents.prefix(containerComponents.count))
+                == containerComponents
+        switch containment {
+        case .strictDescendant:
+            if isEqual {
+                throw PathGuardError.isRootItself(path: canonical.path)
+            }
+            guard isStrictDescendant else {
+                throw PathGuardError.notADescendant(
+                    path: canonical.path, root: container.resolvedURL.path
+                )
+            }
+        case .descendantOrEqual:
+            guard isEqual || isStrictDescendant else {
+                throw PathGuardError.notADescendant(
+                    path: canonical.path, root: container.resolvedURL.path
+                )
+            }
+        }
+
+        // (4) Same device, provably — FAIL CLOSED on an unreadable id.
+        guard let device = provider.deviceID(of: canonical),
+              let containerDevice = provider.deviceID(of: container.resolvedURL),
+              device == containerDevice
+        else {
+            throw PathGuardError.crossDevice(
+                path: canonical.path, containerPath: container.resolvedURL.path
             )
         }
     }

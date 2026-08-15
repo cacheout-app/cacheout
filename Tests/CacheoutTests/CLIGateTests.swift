@@ -372,6 +372,68 @@ final class CLIGateTests: XCTestCase {
         XCTAssertEqual(row["item_id"] as? String, "abc123")
     }
 
+    // MARK: - Confirmed-clean row: the TWO-SOURCE warning key (fn-5.4, D11)
+
+    func testConfirmedCleanRowMergesTheEntryWarningWithoutFlippingSuccess()
+        throws
+    {
+        // D11's whole reason for existing: the row's `success` is
+        // `errors.isEmpty`, so a warning must NOT be an error — a successful
+        // removal that left orphaned admin data behind is `success: true`
+        // WITH a `warning`.
+        let item = makeStandaloneItem(id: "wt1", scannerID: "git_worktrees")
+        let entry = CleanupReport.Entry(
+            itemID: "wt1", scannerID: "git_worktrees", displayName: "wt1",
+            exactBytes: 4096, estimatedUpToBytes: 0, disposal: .permanent,
+            warning: "prune skipped — orphaned admin data remains"
+        )
+        let row = CLIHandler.confirmedCleanRowJSON(
+            item: item, entry: entry, errors: []
+        )
+        XCTAssertEqual(row["success"] as? Bool, true)
+        XCTAssertEqual(row["bytes_freed"] as? Int64, 4096)
+        XCTAssertEqual(
+            row["warning"] as? String,
+            "prune skipped — orphaned admin data remains"
+        )
+        XCTAssertNil(row["error"])
+
+        // A row with neither warning source carries NO warning key at all —
+        // the pre-existing shape is unchanged.
+        let plain = CLIHandler.confirmedCleanRowJSON(
+            item: item,
+            entry: CleanupReport.Entry(
+                itemID: "wt1", scannerID: "git_worktrees", displayName: "wt1",
+                exactBytes: 4096, estimatedUpToBytes: 0, disposal: .permanent
+            ),
+            errors: []
+        )
+        XCTAssertNil(plain["warning"])
+    }
+
+    func testConfirmedCleanRowJoinsBothWarningSourcesWhenBothApply() throws {
+        // The partiallyDenied precedent and the D11 entry warning COMPOSE:
+        // neither may drop the other.
+        let partial = makeStandaloneItem(
+            id: "wt2", scannerID: "git_worktrees", state: .partiallyDenied
+        )
+        let row = CLIHandler.confirmedCleanRowJSON(
+            item: partial,
+            entry: CleanupReport.Entry(
+                itemID: "wt2", scannerID: "git_worktrees", displayName: "wt2",
+                exactBytes: 1024, estimatedUpToBytes: 0, disposal: .permanent,
+                warning: "orphaned admin data remains; next scan will offer it"
+            ),
+            errors: []
+        )
+        XCTAssertEqual(
+            row["warning"] as? String,
+            CLIHandler.partiallyDeniedCleanWarning
+                + "; orphaned admin data remains; next scan will offer it"
+        )
+        XCTAssertEqual(row["success"] as? Bool, true)
+    }
+
     // MARK: - Dry-run payload: exact-only totals, scan-time components (R16)
 
     func testCleanDryRunPayloadIsExactOnlyWithComponents() throws {

@@ -215,6 +215,21 @@ actor InodeAccountingRegistry {
     }
 }
 
+// MARK: - Pre-delete seam refusal
+
+/// One pre-delete revalidation refusal, as the chokepoint consumes it: the
+/// item-keyed `reason`, the cleanup-log `tag`, and the TYPED wire `payload`.
+///
+/// A named type rather than a tuple (fn-5.4) because it now travels to a
+/// SECOND consumer — `WorktreeReclaimPerformer` runs the same seam for the
+/// composite action — and one shape is what keeps the two from wording the
+/// same refusal differently.
+struct PreDeleteSeamRefusal {
+    let reason: String
+    let tag: String
+    let payload: CleanupReport.ItemError.Refusal?
+}
+
 // MARK: - CacheCleaner
 
 actor CacheCleaner {
@@ -252,6 +267,12 @@ actor CacheCleaner {
     /// injection seam, so tests inject doubles and production injects the one
     /// instance the scanner already shares.
     private let gitRunner: (any GitCommandRunning)?
+    /// The DELETE-TIME per-invocation git budget (fn-5.4) — pinned at
+    /// `WorktreeReclaimPerformer.deleteTimeGitTimeout` (300 s), NEVER
+    /// fn-5.1's ~10 s scan default: a mid-removal timeout on a multi-GB tree
+    /// leaves a partially-deleted tree. Injectable so tests can prove the
+    /// budget is passed per invocation without waiting for it.
+    private let gitTimeout: TimeInterval
     private nonisolated let trashHandler: TrashHandler
 
     /// - Parameters:
@@ -294,7 +315,8 @@ actor CacheCleaner {
         preDeleteRevalidators: [String: PreDeleteRevalidator] = [:],
         provider: FileSystemIdentityProvider = FileSystemIdentityProvider(),
         trashHandler: TrashHandler? = nil,
-        gitRunner: (any GitCommandRunning)? = nil
+        gitRunner: (any GitCommandRunning)? = nil,
+        gitTimeout: TimeInterval = WorktreeReclaimPerformer.deleteTimeGitTimeout
     ) {
         self.home = home
         self.provider = provider
@@ -305,6 +327,7 @@ actor CacheCleaner {
         self.containerSnapshot = containerSnapshot
         self.preDeleteRevalidators = preDeleteRevalidators
         self.gitRunner = gitRunner
+        self.gitTimeout = gitTimeout
         self.trashHandler = trashHandler ?? { url in
             try FileManager.default.trashItem(at: url, resultingItemURL: nil)
         }
@@ -496,35 +519,61 @@ actor CacheCleaner {
                 if let entry = outcome.entry { entries.append(entry) }
                 errors.append(contentsOf: outcome.errors)
 
-            // SITE 3 of 8 (fn-5.3): the FAIL-CLOSED PLACEHOLDER. fn-5.4
-            // replaces this arm with the real performer; until then a
-            // composite item that reaches dispatch produces a per-item
-            // ERROR and nothing else — never a silent `continue`. A
-            // registered-but-unwired action that skipped quietly would be
-            // reported as a successful clean that freed nothing, which is
-            // exactly the lie this project's reporting exists to prevent.
-            //
-            // The two causes are kept APART on purpose: a cleaner built
-            // without the runner seam is a COMPOSITION fault (the runtime
-            // did not thread it through), while a cleaner that has the
-            // runner is blocked by this unimplemented arm. Collapsing them
-            // into one message would hide a wiring regression behind a
-            // "not implemented yet" that fn-5.4 is about to delete.
-            case .gitWorktreeReclaim:
-                let reason: String
-                let tag: String
-                if gitRunner == nil {
-                    reason = "refused: no git runner is available to this "
+            // SITE 3 of 8: the composite EXECUTION arm (fn-5.4 replaced
+            // fn-5.3's fail-closed placeholder). Two fail-closed
+            // preconditions come first and are kept APART on purpose — a
+            // cleaner without the runner seam is a COMPOSITION fault (the
+            // runtime never threaded it through), while a cleaner without
+            // the session snapshot is the `removeGuardedItem` doctrine's own
+            // refusal (items must be cleaned with the session that produced
+            // them). Collapsing them would hide a wiring regression behind
+            // an identity refusal.
+            case .gitWorktreeReclaim(let plan):
+                // The descriptor arm is guaranteed by check (1).
+                guard case .containerItem(let origin, let target) = item.admission
+                else { continue }
+                guard let gitRunner else {
+                    let reason = "refused: no git runner is available to this "
                         + "cleaner — a git_worktree_reclaim item can only be "
                         + "cleaned through a cleaner built with one"
-                    tag = "git-runner-unavailable"
-                } else {
-                    reason = "refused: git_worktree_reclaim execution is not "
-                        + "wired up in this build — nothing was reclaimed"
-                    tag = "action-not-implemented"
+                    errors.append(Self.itemError(item, reason))
+                    logRefusal(label: item.displayName,
+                               tag: "git-runner-unavailable", detail: reason)
+                    continue
                 }
-                errors.append(Self.itemError(item, reason))
-                logRefusal(label: item.displayName, tag: tag, detail: reason)
+                guard let snapshot = containerSnapshot else {
+                    let error = PathGuardError.containerUnavailable(path: origin.path)
+                    let detail = "\(target.path): \(error.localizedDescription) "
+                        + "(no scan-session container snapshot — items must be "
+                        + "cleaned with the session that produced them)"
+                    errors.append(Self.itemError(item, detail))
+                    logRefusal(label: item.displayName,
+                               tag: Self.refusalTag(error), detail: detail)
+                    continue
+                }
+                // The SAME per-scanner registry `.removeItem` items of this
+                // scanner use: two items of one scanner hardlinking an inode
+                // transfer it once.
+                let registry: InodeAccountingRegistry
+                if let existing = scannerRegistries[item.scannerID] {
+                    registry = existing
+                } else {
+                    registry = InodeAccountingRegistry()
+                    scannerRegistries[item.scannerID] = registry
+                }
+                let performer = makePerformer(
+                    for: item, runner: gitRunner, snapshot: snapshot,
+                    moveToTrash: moveToTrash,
+                    // THIS item's own entry — never another item's, never
+                    // the item's structural disclosure.
+                    authorization: authorization[item.key]
+                )
+                let outcome = await performer.perform(
+                    item: item, plan: plan, origin: origin, target: target,
+                    registry: registry
+                )
+                if let entry = outcome.entry { entries.append(entry) }
+                errors.append(contentsOf: outcome.errors)
             }
         }
 
@@ -559,18 +608,25 @@ actor CacheCleaner {
         //
         // SITE 8 of 8 (fn-5.3) — the site the epic census MISSED: fn-4.8
         // added this second exhaustive switch INSIDE `structuralRefusal`,
-        // so the function holds two, not one. The composite decides FALSE:
-        // this build has no composite performer at all (dispatch is the
-        // fail-closed placeholder below), so a marked composite item could
-        // not be re-inspected immediately before its reclaim even in
-        // principle, and the marker's guarantee — "nothing marked is ever
-        // deleted without passing the seam" — is only kept by refusing it.
-        // fn-5.4 revisits this line deliberately if its performer routes the
-        // stale target through the seam.
+        // so the function holds two, not one.
+        //
+        // FLIPPED TO TRUE BY fn-5.4, deliberately and on the condition
+        // fn-5.3 named: `WorktreeReclaimPerformer` now routes the composite
+        // item through the SAME seam this marker guards, in BOTH modes, at
+        // the same position `removeGuardedItem` uses — after admission,
+        // containment and the mount-boundary check, and before ANY claim
+        // registration, git invocation or filesystem delete. The marker's
+        // guarantee ("nothing marked is ever deleted without passing the
+        // seam") therefore holds for the composite by construction, and the
+        // fail-closed half still holds too: check (1b) refuses a MARKED
+        // composite item whose scanner has no registered revalidator.
+        //
+        // `.removeContents`/`.commands` stay FALSE — an aggregate cannot be
+        // re-inspected per target, which is what the marker means.
         let revalidatableAction: Bool
         switch item.action {
-        case .removeItem: revalidatableAction = true
-        case .removeContents, .commands, .gitWorktreeReclaim:
+        case .removeItem, .gitWorktreeReclaim: revalidatableAction = true
+        case .removeContents, .commands:
             revalidatableAction = false
         }
         if item.requiresPreDeleteRevalidation, !revalidatableAction {
@@ -674,9 +730,14 @@ actor CacheCleaner {
     /// its declaration) is refused outright. The cleaner never inspects
     /// scanner-specific fields to decide whether revalidation was expected —
     /// the marker subsumes all of that.
-    private func preDeleteRefusal(
+    /// `nonisolated` (fn-5.4): it reads only immutable `let` state
+    /// (`preDeleteRevalidators`) and runs a pure, synchronous scanner-declared
+    /// closure, so the composite performer can call it as a plain function
+    /// from its own execution context instead of forcing a hop back onto the
+    /// actor mid-deletion.
+    nonisolated private func preDeleteRefusal(
         for item: ReclaimableItem, authorization: String?
-    ) -> (reason: String, tag: String, payload: CleanupReport.ItemError.Refusal?)? {
+    ) -> PreDeleteSeamRefusal? {
         // DEFENSE IN DEPTH: check (1b) already refused this shape before any
         // state skip could hide it; re-checking here keeps the destructive
         // chokepoint independently fail-closed for any future caller,
@@ -686,7 +747,9 @@ actor CacheCleaner {
         ) {
             // No revalidator ran, so there is no probe and no typed payload —
             // an unrevalidatable item discloses nothing at delete time.
-            return (refusal, "revalidator-unavailable", nil)
+            return PreDeleteSeamRefusal(
+                reason: refusal, tag: "revalidator-unavailable", payload: nil
+            )
         }
         guard let revalidator = preDeleteRevalidators[item.scannerID]
         else { return nil }
@@ -711,9 +774,9 @@ actor CacheCleaner {
             // content is not what the deletion decision rests on — it
             // changed since the scan, could not be re-inspected, or was
             // never authorized on the content present NOW.
-            return (
-                reason, "content-drift",
-                CleanupReport.ItemError.Refusal(
+            return PreDeleteSeamRefusal(
+                reason: reason, tag: "content-drift",
+                payload: CleanupReport.ItemError.Refusal(
                     valuables: valuables, acknowledgementToken: token
                 )
             )
@@ -723,7 +786,11 @@ actor CacheCleaner {
     /// The ONE item-error constructor. `refusal` is the ADDITIVE typed payload
     /// (fn-4.9) — nil on every path but a pre-delete revalidation refusal, so
     /// ordinary errors keep their exact as-built shape.
-    private static func itemError(
+    ///
+    /// Internal (fn-5.4) so `WorktreeReclaimPerformer` builds its per-item
+    /// errors through the SAME constructor — a second one would be a second
+    /// place for the item-keying invariant to rot.
+    static func itemError(
         _ item: ReclaimableItem, _ message: String,
         refusal: CleanupReport.ItemError.Refusal? = nil
     ) -> CleanupReport.ItemError {
@@ -1139,11 +1206,67 @@ actor CacheCleaner {
         )
     }
 
+    // MARK: - Composite item mode (.gitWorktreeReclaim, fn-5.4)
+
+    /// Build the composite performer for ONE item, handing it this cleaner's
+    /// own primitives: the guard, the sizer, the trash seam, the deletion
+    /// primitive, the cleanup log, and the pre-delete revalidator seam bound
+    /// to THIS item's authorization entry.
+    ///
+    /// A factory rather than a stored property because three of the seams are
+    /// per-item or per-run (`moveToTrash`, the item's label, its
+    /// authorization) — and because the performer must be unbuildable without
+    /// the runner and the session snapshot, which the dispatch arm has just
+    /// proven present.
+    private func makePerformer(
+        for item: ReclaimableItem,
+        runner: any GitCommandRunning,
+        snapshot: ContainerSnapshot,
+        moveToTrash: Bool,
+        authorization: String?
+    ) -> WorktreeReclaimPerformer {
+        let sizer = self.sizer
+        let fileManager = self.fileManager
+        let handler = self.trashHandler
+        let label = item.displayName
+        return WorktreeReclaimPerformer(
+            pathGuard: pathGuard,
+            provider: provider,
+            snapshot: snapshot,
+            runner: runner,
+            mapper: GitWorktreeAdminMapper(identity: provider),
+            measure: { url, mode, knownInodes in
+                sizer.measure(at: url, mode: mode, knownInodes: knownInodes)
+            },
+            gitTimeout: gitTimeout,
+            moveToTrash: moveToTrash,
+            trash: { url in try await MainActor.run { try handler(url) } },
+            removeTree: { url in
+                try await Self.removeItemConcurrently(
+                    at: url, fileManager: fileManager
+                )
+            },
+            revalidate: { [self] subject in
+                preDeleteRefusal(for: subject, authorization: authorization)
+            },
+            logRefusal: { [self] tag, detail in
+                logRefusal(label: label, tag: tag, detail: detail)
+            },
+            logCleaned: { [self] bytesFreed in
+                logCleanup(
+                    label: "\(item.scannerID)/\(label)", bytesFreed: bytesFreed
+                )
+            }
+        )
+    }
+
     // MARK: - Refusal classification
 
     /// Stable log tag for a refusal — switched over the TYPED
-    /// `PathGuardError` cases, never derived from message strings.
-    private static func refusalTag(_ error: Error) -> String {
+    /// `PathGuardError` cases, never derived from message strings. Internal
+    /// (fn-5.4) so the composite performer classifies its own PathGuard
+    /// refusals through the same switch.
+    static func refusalTag(_ error: Error) -> String {
         guard let guardError = error as? PathGuardError else { return "error" }
         switch guardError {
         case .deniedFilesystemRoot: return "filesystem-root"
@@ -1156,6 +1279,7 @@ actor CacheCleaner {
         case .notADescendant: return "not-a-descendant"
         case .crossDevice: return "cross-device"
         case .containerUnavailable: return "container-unavailable"
+        case .notATraversableDirectory: return "not-a-traversable-directory"
         }
     }
 
@@ -1242,18 +1366,22 @@ actor CacheCleaner {
 
     // MARK: - Logging
 
-    private func logCleanup(label: String, bytesFreed: Int64) {
+    /// The log helpers are `nonisolated` (fn-5.4): they read only the
+    /// immutable injected `home` and append to a file under it, so the
+    /// composite performer can log from its own execution context without an
+    /// actor hop mid-deletion. Every existing isolated caller is unchanged.
+    nonisolated private func logCleanup(label: String, bytesFreed: Int64) {
         let size = ByteCountFormatter.sharedFile.string(fromByteCount: bytesFreed)
         appendLog("Cleaned \(label): \(size)")
     }
 
-    private func logRefusal(label: String, tag: String, detail: String) {
+    nonisolated private func logRefusal(label: String, tag: String, detail: String) {
         appendLog("REFUSED [\(tag)] \(label): \(detail)")
     }
 
     /// A version-drift sibling admission is legitimate but noteworthy — log
     /// which declared root vouched for it.
-    private func logDriftAdmission(_ admitted: AdmittedRoot, label: String) {
+    nonisolated private func logDriftAdmission(_ admitted: AdmittedRoot, label: String) {
         guard admitted.viaSiblingDrift else { return }
         appendLog(
             "ADMITTED [version-drift] \(label): \(admitted.resolvedURL.path)"
@@ -1261,7 +1389,7 @@ actor CacheCleaner {
         )
     }
 
-    private func appendLog(_ message: String) {
+    nonisolated private func appendLog(_ message: String) {
         let logDir = home.appendingPathComponent(".cacheout")
         try? FileManager.default.createDirectory(at: logDir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
 

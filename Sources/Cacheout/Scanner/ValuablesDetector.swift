@@ -9,21 +9,38 @@
 /// authorization paths (GUI confirm, CLI flag) share.
 ///
 /// ## One bounded core, two call sites (R17 drift-proofing)
-/// `probe(at:provider:depthLimit:entryLimit:)` is the ONLY walk. The scan-time
-/// face (`BuildArtifactsScanner`, injectable caps) and the delete-time face
-/// (`BuildArtifactsScanner.preDeleteValuablesProbe`, PRODUCTION caps) both
+/// `probe(at:provider:entryLimit:)` is the ONLY walk. The scan-time face
+/// (`BuildArtifactsScanner`, injectable cap) and the delete-time face
+/// (`BuildArtifactsScanner.preDeleteValuablesProbe`, the PRODUCTION cap) both
 /// route through it, exactly as `OrphanedCachesScanner`'s user-data probe does
 /// (`OrphanedCachesScanner.swift:193,571`) — scan-time and delete-time bounds
-/// CANNOT drift, because there is only one set of bounds.
+/// CANNOT drift, because there is only one bound.
 ///
 /// ## Fail closed, always
-/// A probe that could not finish (entry cap hit, depth boundary left
-/// unexpanded, unreadable branch, unreadable metadata, an undecodable
-/// basename, a bundle whose bounded subtree sizing truncated) is INCOMPLETE.
+/// A probe that could not finish (entry budget exhausted, unreadable branch,
+/// unreadable metadata, an undecodable basename, a bundle whose bounded
+/// subtree sizing truncated) is INCOMPLETE.
 /// An incomplete probe has the SAME consequence as a hit: risk forced off
 /// safe, selection forced false, "couldn't fully inspect" evidence — and,
 /// uniformly across every surface, NO acknowledgement token exists. Absence of
 /// valuables is only meaningful when the inspection actually finished.
+///
+/// ## ONE budget, and NO depth cap (PR #457 review)
+/// The shared ENTRY budget is the probe's only bound, and it alone guarantees
+/// termination: every directory the walk descends into cost one entry to
+/// discover, so at most `entryLimit` directories are ever popped — true even
+/// of a hypothetical directory cycle. A fixed depth cap therefore bounded
+/// nothing the budget did not already bound. What it DID do was manufacture
+/// INCOMPLETE verdicts on ordinary artifact trees, and those verdicts were
+/// unescapable: a depth boundary is DETERMINISTIC, so every re-scan and every
+/// delete-time re-probe reproduced it, while an incomplete probe is tokenless
+/// — the GUI filtered the item out and the revalidator refused it forever,
+/// and the "re-scan and retry" guidance every surface prints could not
+/// possibly help. Real trees crossed eight levels constantly (this repo's own
+/// `.build` nests thirteen deep, well inside the entry budget), so the cap
+/// stranded exactly the build directories this scanner exists to reclaim.
+/// Depth is now spent FROM the one budget: a tree the budget can afford is
+/// PROVEN, and only a tree it genuinely cannot afford stays unproven.
 ///
 /// ## Determinism contract (deliberately NARROW under truncation)
 /// For a COMPLETE probe the output is fully deterministic: every directory
@@ -269,21 +286,19 @@ enum ValuablesDetector {
     /// release artifact worth guarding. Named once and shared by both shapes.
     static let minimumAllocatedBytes: Int64 = 5_000_000
 
-    // MARK: Pinned caps (shared by scan time AND delete time)
+    // MARK: The pinned cap (shared by scan time AND delete time)
 
-    /// PRODUCTION probe caps — ONE definition, consumed by the scanner's init
-    /// defaults AND by the delete-time entry point
+    /// The PRODUCTION probe cap — ONE definition, consumed by the scanner's
+    /// init default AND by the delete-time entry point
     /// (`BuildArtifactsScanner.preDeleteValuablesProbe`), so the two
     /// inspections' bounds can never drift apart (the
     /// `OrphanedCachesScanner.swift:193` doctrine).
     ///
-    /// Depth 8 clears the deep real layouts release artifacts actually live
-    /// in (`target/release/bundle/dmg/…`, `build/Release-iphoneos/…`); the
-    /// entry cap is the GLOBAL bound on the probe's total work — it is shared
-    /// across the outer walk and every bundle's subtree sizing, so the whole
-    /// probe visits at most this many directory entries no matter how the
-    /// depth budget is spent.
-    static let defaultProbeDepthLimit = 8
+    /// This is the GLOBAL bound on the probe's total work AND the sole
+    /// guarantee that it terminates — it is shared across the outer walk and
+    /// every bundle's subtree sizing, so the whole probe visits at most this
+    /// many directory entries however deep the tree runs (see the file
+    /// header on why there is no second, depth-shaped bound).
     static let defaultProbeEntryLimit = 20_000
 
     // MARK: The ONE bounded probe core
@@ -307,16 +322,16 @@ enum ValuablesDetector {
     static func probe(
         at directory: URL,
         provider: FileSystemIdentityProvider,
-        depthLimit: Int = defaultProbeDepthLimit,
         entryLimit: Int = defaultProbeEntryLimit
     ) -> ValuablesDisclosure {
         var found: [DetectedValuable] = []
         var complete = true
-        // The GLOBAL entry budget, shared with every bundle subtree walk.
+        // The GLOBAL entry budget, shared with every bundle subtree walk —
+        // and the ONE bound on this walk (see the file header).
         var visited = 0
-        var stack: [(url: URL, depth: Int)] = [(directory, 0)]
+        var stack: [URL] = [directory]
 
-        walk: while let (dir, depth) = stack.popLast() {
+        walk: while let dir = stack.popLast() {
             let remaining = entryLimit - visited
             guard remaining > 0 else {
                 // Budget exhausted with directories still unexplored.
@@ -338,7 +353,7 @@ enum ValuablesDetector {
             let names = read.names
                 .sorted { $0.utf8.lexicographicallyPrecedes($1.utf8) }
             // Descend in ascending order: collected here, pushed reversed.
-            var pendingDirectories: [(url: URL, depth: Int)] = []
+            var pendingDirectories: [URL] = []
 
             for name in names {
                 guard visited < entryLimit else {
@@ -372,14 +387,11 @@ enum ValuablesDetector {
 
                 case .kind(.directory):
                     guard bundleExtensions.contains(ext) else {
-                        let childDepth = depth + 1
-                        if childDepth < depthLimit {
-                            pendingDirectories.append((child, childDepth))
-                        } else {
-                            // A directory left unexpanded at the depth
-                            // boundary: a valuable could hide just past it.
-                            complete = false
-                        }
+                        // ALWAYS descended: discovering this directory
+                        // already cost an entry, and the budget bounds what
+                        // follows. Refusing to look at some fixed level is
+                        // what stranded deep trees (see the file header).
+                        pendingDirectories.append(child)
                         break
                     }
                     // BUNDLE. Identity from the bundle ROOT's ONE lstat;
@@ -387,8 +399,7 @@ enum ValuablesDetector {
                     // walk deliberately does not descend it.
                     let sized = boundedSubtreeAllocation(
                         at: child, provider: provider,
-                        depthLimit: depthLimit, entryLimit: entryLimit,
-                        visited: &visited
+                        entryLimit: entryLimit, visited: &visited
                     )
                     if !sized.complete {
                         // A truncated bundle sizing makes the whole probe
@@ -470,24 +481,26 @@ enum ValuablesDetector {
     ///
     /// Counts REGULAR FILES' allocated bytes only (directory inodes are not
     /// counted — the same stance as the shared `DirectorySizer`), never
-    /// follows symlinks, and shares the caller's GLOBAL entry budget so the
-    /// whole probe stays bounded. `complete == false` on an unreadable
-    /// branch, an unexpanded depth boundary, unreadable file metadata, the
-    /// entry cap, or an allocation sum that would overflow `Int64` — every
-    /// one of which makes the returned figure a FLOOR, never a truth, so no
-    /// token may derive from it.
+    /// follows symlinks, and shares the caller's GLOBAL entry budget — the
+    /// one bound here too, so the whole probe stays bounded. `complete ==
+    /// false` on an unreadable branch, unreadable file metadata, the entry
+    /// cap, or an allocation sum that would overflow `Int64` — every one of
+    /// which makes the returned figure a FLOOR, never a truth, so no token
+    /// may derive from it. A deep bundle (`Contents/Frameworks/…
+    /// /Versions/A/Resources/…` runs long) is sized WHOLE while the budget
+    /// lasts: an under-counted bundle would fall below the floor and vanish
+    /// from the disclosure entirely.
     private static func boundedSubtreeAllocation(
         at bundleRoot: URL,
         provider: FileSystemIdentityProvider,
-        depthLimit: Int,
         entryLimit: Int,
         visited: inout Int
     ) -> (allocatedBytes: Int64, complete: Bool) {
         var total: Int64 = 0
         var complete = true
-        var stack: [(url: URL, depth: Int)] = [(bundleRoot, 0)]
+        var stack: [URL] = [bundleRoot]
 
-        walk: while let (dir, depth) = stack.popLast() {
+        walk: while let dir = stack.popLast() {
             let remaining = entryLimit - visited
             guard remaining > 0 else {
                 complete = false
@@ -501,7 +514,7 @@ enum ValuablesDetector {
             if read.truncated { complete = false }
             let names = read.names
                 .sorted { $0.utf8.lexicographicallyPrecedes($1.utf8) }
-            var pendingDirectories: [(url: URL, depth: Int)] = []
+            var pendingDirectories: [URL] = []
 
             for name in names {
                 guard visited < entryLimit else {
@@ -527,12 +540,7 @@ enum ValuablesDetector {
                     }
                     total = sum
                 case .kind(.directory):
-                    let childDepth = depth + 1
-                    if childDepth < depthLimit {
-                        pendingDirectories.append((child, childDepth))
-                    } else {
-                        complete = false
-                    }
+                    pendingDirectories.append(child)
                 case .kind:
                     // Symlink / special: 0 bytes, never followed.
                     break

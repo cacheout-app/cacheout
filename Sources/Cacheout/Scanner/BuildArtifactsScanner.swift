@@ -113,11 +113,10 @@ struct BuildArtifactsScanner: @unchecked Sendable {
     private let pathGuard: PathGuard
     private let sizer: DirectorySizer
     private let maxDepth: Int
-    /// Valuables-probe caps (fn-4.4) — injectable so tests can prove the
-    /// fail-closed cap behavior without thousand-file fixtures. The DEFAULTS
-    /// are the shared production constants the delete-time entry point uses,
+    /// The valuables-probe cap (fn-4.4) — injectable so tests can prove the
+    /// fail-closed cap behavior without thousand-file fixtures. The DEFAULT
+    /// is the shared production constant the delete-time entry point uses,
     /// so scan-time and delete-time bounds cannot drift.
-    private let valuablesProbeDepthLimit: Int
     private let valuablesProbeEntryLimit: Int
     /// Injected clock for staleness — a PROVIDER (not a `Date`) because the
     /// scanner is long-lived and each scan dates content against its own
@@ -129,8 +128,6 @@ struct BuildArtifactsScanner: @unchecked Sendable {
         devRoots: DevRootsResolution,
         provider: FileSystemIdentityProvider = FileSystemIdentityProvider(),
         maxDepth: Int = ProjectTreeWalker.defaultMaxDepth,
-        valuablesProbeDepthLimit: Int =
-            ValuablesDetector.defaultProbeDepthLimit,
         valuablesProbeEntryLimit: Int =
             ValuablesDetector.defaultProbeEntryLimit,
         now: @escaping @Sendable () -> Date = { Date() }
@@ -143,7 +140,6 @@ struct BuildArtifactsScanner: @unchecked Sendable {
         )
         self.sizer = DirectorySizer(provider: provider)
         self.maxDepth = maxDepth
-        self.valuablesProbeDepthLimit = valuablesProbeDepthLimit
         self.valuablesProbeEntryLimit = valuablesProbeEntryLimit
         self.now = now
     }
@@ -453,7 +449,6 @@ struct BuildArtifactsScanner: @unchecked Sendable {
         // probe, so nothing here (or downstream) re-sorts.
         let disclosure = ValuablesDetector.probe(
             at: candidate.artifactDirectory, provider: provider,
-            depthLimit: valuablesProbeDepthLimit,
             entryLimit: valuablesProbeEntryLimit
         )
 

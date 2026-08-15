@@ -179,8 +179,6 @@ final class BuildArtifactsScannerTests: XCTestCase {
     private func makeScanner(
         roots: [URL]? = nil,
         provider: FileSystemIdentityProvider = FileSystemIdentityProvider(),
-        valuablesProbeDepthLimit: Int =
-            ValuablesDetector.defaultProbeDepthLimit,
         valuablesProbeEntryLimit: Int =
             ValuablesDetector.defaultProbeEntryLimit,
         now: @escaping @Sendable () -> Date = { Date() }
@@ -189,7 +187,6 @@ final class BuildArtifactsScannerTests: XCTestCase {
             home: fixtureHome,
             devRoots: resolution(roots ?? [dev], provider: provider),
             provider: provider,
-            valuablesProbeDepthLimit: valuablesProbeDepthLimit,
             valuablesProbeEntryLimit: valuablesProbeEntryLimit,
             now: now
         )
@@ -1504,18 +1501,19 @@ final class BuildArtifactsScannerTests: XCTestCase {
         let shallow = try writeBulkFile(
             app.appendingPathComponent("payload.bin"), bytes: aboveFloorBytes
         )
-        // … and more bytes DEEPER than the injected depth cap can reach.
+        // … and more bytes BEYOND what the injected budget can reach.
         try writeBulkFile(
             app.appendingPathComponent("Contents/MacOS/binary"),
             bytes: aboveFloorBytes
         )
 
-        // depthLimit 2: the bundle's `Contents/` expands, `MacOS/` does not.
-        // The OUTER walk has no ordinary directory at its boundary (the only
-        // child directory is the bundle itself), so the incompleteness can
+        // A budget of 3 buys exactly `Big.app` (outer walk) plus its two
+        // children: `Contents/` is DISCOVERED but never expanded, so
+        // `Contents/MacOS/binary` never joins the sum. The OUTER walk's only
+        // child directory is the bundle itself, so the incompleteness can
         // ONLY come from the truncated bundle sizing.
         let outcome = try await runScan(
-            makeScanner(valuablesProbeDepthLimit: 2)
+            makeScanner(valuablesProbeEntryLimit: 3)
         )
         let found = try XCTUnwrap(item(outcome, at: target))
         let disclosure = try XCTUnwrap(found.valuablesDisclosure)
@@ -2195,63 +2193,128 @@ final class BuildArtifactsScannerTests: XCTestCase {
                        "no Date type in the valuables identity path")
     }
 
-    // MARK: R17 — one probe core, one set of caps
+    // MARK: R17 — one probe core, one cap
 
-    func testScanTimeAndPreDeleteProbeShareOneCoreAndTheSameCaps()
+    /// A directory chain far deeper than the retired eight-level depth cap —
+    /// the shape real `node_modules` and Swift `.build` trees reach routinely
+    /// (this repo's own `.build` nests thirteen deep).
+    private func deepChain(_ levels: Int) -> String {
+        (1...levels).map { "d\($0)" }.joined(separator: "/")
+    }
+
+    func testScanTimeAndPreDeleteProbeShareOneCoreAndTheSameCap()
         async throws
     {
-        // The caps are SHARED by construction: the scanner's init defaults
-        // and the delete-time entry point both read the detector constants.
-        // Proven behaviorally at the exact boundary — a directory chain one
-        // level shallower than the production depth cap completes on BOTH
-        // surfaces; one level deeper truncates on BOTH.
-        func chain(_ depth: Int) -> String {
-            (1...depth).map { "d\($0)" }.joined(separator: "/")
-        }
-        let limit = ValuablesDetector.defaultProbeDepthLimit
-
-        let reachable = try makeProject(
-            at: dev.appendingPathComponent("reachable"),
+        // The cap is SHARED by construction: the scanner's init default and
+        // the delete-time entry point both read the detector constant.
+        // Proven behaviorally on a tree DEEPER than any fixed level budget —
+        // both surfaces walk it whole and disclose exactly the same thing.
+        let deep = try makeProject(
+            at: dev.appendingPathComponent("deep"),
             marker: "Cargo.toml", artifact: "target", payloadBytes: nil
         )
         try writeBulkFile(
-            reachable.appendingPathComponent("\(chain(limit - 1))/Deep.dmg"),
-            bytes: aboveFloorBytes
-        )
-        let beyond = try makeProject(
-            at: dev.appendingPathComponent("beyond"),
-            marker: "Cargo.toml", artifact: "target", payloadBytes: nil
-        )
-        try writeBulkFile(
-            beyond.appendingPathComponent("\(chain(limit))/Deep.dmg"),
+            deep.appendingPathComponent("\(deepChain(14))/Deep.dmg"),
             bytes: aboveFloorBytes
         )
 
         let outcome = try await runScan(makeScanner())
         let provider = FileSystemIdentityProvider()
 
-        let reachableScan = try XCTUnwrap(
-            item(outcome, at: reachable)?.valuablesDisclosure
+        let scanned = try XCTUnwrap(
+            item(outcome, at: deep)?.valuablesDisclosure
         )
-        let reachableDelete = BuildArtifactsScanner.preDeleteValuablesProbe(
-            at: reachable, provider: provider
+        let atDelete = BuildArtifactsScanner.preDeleteValuablesProbe(
+            at: deep, provider: provider
         )
-        XCTAssertTrue(reachableScan.probeComplete)
-        XCTAssertEqual(reachableScan.valuables.map(\.name), ["Deep.dmg"])
-        XCTAssertEqual(reachableScan, reachableDelete,
+        XCTAssertTrue(scanned.probeComplete,
+                      "the entry budget covers this tree, so it is PROVEN")
+        XCTAssertEqual(scanned.valuables.map(\.name), ["Deep.dmg"],
+                       "a valuable is found however deep it is buried")
+        XCTAssertEqual(scanned, atDelete,
                        "scan time and delete time see the SAME thing")
+    }
 
-        let beyondScan = try XCTUnwrap(
-            item(outcome, at: beyond)?.valuablesDisclosure
+    func testDeepArtifactTreeWithoutValuablesIsProvenCleanAndStaysCleanable()
+        async throws
+    {
+        // PR #457 review — the STRANDING regression. A depth-shaped bound
+        // marked an ordinary deep chain incomplete even with nothing to
+        // find, and that verdict was DETERMINISTIC: the GUI filtered the row
+        // out, the revalidator refused it, no token could ever exist for it,
+        // and the "re-scan and retry" guidance every surface prints could
+        // not clear it. The tree here is deeper than the retired cap and
+        // holds nothing valuable, so the probe must PROVE it clean.
+        let artifact = try makeProject(
+            at: dev.appendingPathComponent("deep"),
+            marker: "Cargo.toml", artifact: "target", payloadBytes: nil
         )
-        let beyondDelete = BuildArtifactsScanner.preDeleteValuablesProbe(
-            at: beyond, provider: provider
+        try writeFile(
+            artifact.appendingPathComponent("\(deepChain(14))/chunk.js"),
+            bytes: 512
         )
-        XCTAssertFalse(beyondScan.probeComplete,
-                       "the depth cap truncates at scan time")
-        XCTAssertFalse(beyondDelete.probeComplete,
-                       "and at delete time — the bounds cannot drift")
-        XCTAssertEqual(beyondScan, beyondDelete)
+
+        let (items, snapshot, runtime) = try await scanSession(makeScanner())
+        let found = try XCTUnwrap(item(from: items, at: artifact))
+        let disclosure = try XCTUnwrap(found.valuablesDisclosure)
+
+        XCTAssertEqual(disclosure, .clean,
+                       "nothing valuable, inspection FINISHED")
+        XCTAssertEqual(found.risk, .safe,
+                       "the rule row's own risk — the gate never fired")
+        XCTAssertFalse(
+            found.evidence.contains("couldn't fully inspect"), found.evidence
+        )
+        // The GUI shows it as an ordinary row: nothing to acknowledge, and
+        // nothing blocking it.
+        XCTAssertNil(CacheoutViewModel.blockedReason(for: found))
+        XCTAssertNil(disclosure.acknowledgementToken(for: found.key),
+                     "still no empty-set token, anywhere")
+
+        // And it actually deletes — the delete-time revalidator allows it.
+        let cleaner = runtime.makeCleaner(snapshot: snapshot)
+        let report = await cleaner.clean(items: [found], moveToTrash: false)
+        XCTAssertTrue(report.errors.isEmpty,
+                      report.errors.map(\.message).joined(separator: "; "))
+        XCTAssertEqual(report.entries.count, 1)
+        XCTAssertFalse(fm.fileExists(atPath: artifact.path))
+    }
+
+    func testDeepBundleIsSizedWholeSoItClearsTheFloorAndIsDisclosed()
+        async throws
+    {
+        // The other half of the retired depth cap: a bundle's subtree sizing
+        // truncated at a fixed level UNDER-counts, and an under-counted
+        // bundle falls below the floor and vanishes from the disclosure —
+        // the probe would then have hidden a real release artifact rather
+        // than merely refusing to clean one. `.app` bundles nest deeply by
+        // construction (`Contents/Frameworks/…/Versions/A/Resources/…`).
+        let artifact = try makeProject(
+            at: dev.appendingPathComponent("proj"),
+            marker: "Cargo.toml", artifact: "target", payloadBytes: nil
+        )
+        let app = artifact.appendingPathComponent("Shipped.app")
+        let buried = try writeBulkFile(
+            app.appendingPathComponent(
+                "Contents/Frameworks/Dep.framework/Versions/A/Resources/"
+                    + "Base.lproj/payload.bin"
+            ),
+            bytes: aboveFloorBytes
+        )
+
+        let outcome = try await runScan(makeScanner())
+        let found = try XCTUnwrap(item(outcome, at: artifact))
+        let disclosure = try XCTUnwrap(found.valuablesDisclosure)
+
+        XCTAssertTrue(disclosure.probeComplete)
+        XCTAssertEqual(disclosure.valuables.map(\.name), ["Shipped.app"])
+        XCTAssertEqual(
+            disclosure.valuables.first?.identity.allocatedBytes,
+            allocated(buried),
+            "the WHOLE subtree is summed, so the bundle clears the floor"
+        )
+        XCTAssertNotNil(disclosure.acknowledgementToken(for: found.key),
+                       "a COMPLETE probe of a real hit IS acknowledgeable")
     }
 
     func testPreDeleteProbeKindGatingFailsClosedOnlyWhereItMust() throws {
@@ -2621,13 +2684,15 @@ final class BuildArtifactsScannerTests: XCTestCase {
         )
     }
 
-    /// A directory chain deep enough that the PRODUCTION-capped delete-time
-    /// probe leaves its last directory unexpanded — the fail-closed
-    /// "couldn't finish" fixture, deterministic and permission-free.
-    private func plantDepthBoundary(in artifact: URL) throws {
-        let deep = (1...ValuablesDetector.defaultProbeDepthLimit)
-            .reduce(artifact) { $0.appendingPathComponent("d\($1)") }
-        try mkdir(deep)
+    /// An unreadable branch inside the artifact dir — the fail-closed
+    /// "couldn't finish" fixture at PRODUCTION caps. A depth boundary used
+    /// to serve here; it no longer exists (PR #457 review), and GENUINE
+    /// uncertainty is what must still refuse. chmod 000 is meaningless as
+    /// root, so callers skip there.
+    private func plantUnreadableBranch(in artifact: URL) throws {
+        let locked = artifact.appendingPathComponent("locked-branch")
+        try mkdir(locked)
+        try chmod000(locked)
     }
 
     func testValuablePlantedAfterScanRefusesThatItemAndOthersProceed()
@@ -2693,7 +2758,9 @@ final class BuildArtifactsScannerTests: XCTestCase {
         // The uniform R17 rule at delete time: an inspection that could not
         // finish is UNAUTHORIZABLE and TOKENLESS. The scan-time probe
         // completed (the item is honest); only the delete-time state is
-        // un-inspectable.
+        // un-inspectable. GENUINE uncertainty — unlike the retired depth
+        // boundary, which was merely a budget we declined to spend.
+        try XCTSkipIf(geteuid() == 0, "root ignores permission bits")
         let artifact = try makeProject(
             at: dev.appendingPathComponent("deep"),
             marker: "Cargo.toml", artifact: "target"
@@ -2705,7 +2772,7 @@ final class BuildArtifactsScannerTests: XCTestCase {
             "fixture precondition: the SCAN-time probe finished"
         )
 
-        try plantDepthBoundary(in: artifact)
+        try plantUnreadableBranch(in: artifact)
 
         // (a) The TYPED verdict — the payload fn-4.9 serializes from.
         switch revalidator.revalidate(item: found, authorization: nil) {
@@ -2715,7 +2782,7 @@ final class BuildArtifactsScannerTests: XCTestCase {
             XCTAssertTrue(reason.contains("couldn't fully re-inspect"), reason)
             XCTAssertNil(token, "an INCOMPLETE probe is tokenless everywhere")
             XCTAssertTrue(valuables.isEmpty,
-                          "nothing above the floor was found before the cap")
+                          "nothing above the floor was readable")
         }
 
         // (b) The same refusal through the cleaner: fail-closed, logged.

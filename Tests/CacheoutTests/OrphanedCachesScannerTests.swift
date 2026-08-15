@@ -1486,6 +1486,272 @@ final class OrphanedCachesScannerTests: XCTestCase {
         XCTAssertEqual(fact.userDataShapeMatches, probe.matches)
     }
 
+    // MARK: - Mount boundaries stop the probe (PR #458 review)
+
+    /// Records every no-follow kind probe — the walk's ONE per-entry syscall
+    /// — and injects boundary conditions by inode, so "did not cross" is
+    /// proven by the ABSENCE of any touch beyond the boundary rather than by
+    /// an empty result (which an unrelated bug would also produce).
+    private final class RecordingBoundaryProvider: FileSystemIdentityProvider {
+        var deviceOverridesByInode: [UInt64: UInt64] = [:]
+        var mountPointInodes: Set<UInt64> = []
+        private(set) var probedPaths: [String] = []
+
+        override func identity(of url: URL) -> Identity? {
+            guard let id = super.identity(of: url) else { return nil }
+            if let device = deviceOverridesByInode[id.inode] {
+                return Identity(device: device, inode: id.inode)
+            }
+            return id
+        }
+
+        override func isMountPoint(_ url: URL) -> Bool {
+            if let id = identity(of: url), mountPointInodes.contains(id.inode) {
+                return true
+            }
+            return super.isMountPoint(url)
+        }
+
+        override func probeKind(of url: URL) -> KindProbe {
+            probedPaths.append(url.standardizedFileURL.path)
+            return super.probeKind(of: url)
+        }
+
+        func reset() { probedPaths = [] }
+
+        /// Did anything STRICTLY BELOW `url` get touched?
+        func touchedAnythingBelow(_ url: URL) -> Bool {
+            let prefix = url.standardizedFileURL.path + "/"
+            return probedPaths.contains { $0.hasPrefix(prefix) }
+        }
+    }
+
+    /// A real mount point nested inside a cache entry must stop the walk.
+    /// Removing the depth cap is what exposed this: the walk now descends
+    /// every directory it can afford, so without this check it reads a
+    /// foreign volume — latency, and privacy-sensitive access to a
+    /// filesystem the user never pointed this scanner at — on an item the
+    /// cleaner refuses whole anyway.
+    func testProbeStopsAtANestedMountBoundaryAndNeverReadsPastIt() throws {
+        let entry = cachesRoot.appendingPathComponent("com.example.NestedMount")
+        try mkdir(entry)
+        try writeFile(entry.appendingPathComponent("payload.bin"))
+        let mounted = entry.appendingPathComponent("volume")
+        try mkdir(mounted.appendingPathComponent("Pictures/Photos Library.photoslibrary"))
+
+        let provider = RecordingBoundaryProvider()
+        let inode = try XCTUnwrap(provider.identity(of: mounted)?.inode)
+        provider.mountPointInodes.insert(inode)
+        provider.reset()
+
+        let probe = OrphanedCachesScanner.preDeleteUserDataProbe(
+            at: entry, provider: provider
+        )
+
+        XCTAssertFalse(
+            provider.touchedAnythingBelow(mounted),
+            "not one entry of the mounted filesystem may be read: "
+                + "\(provider.probedPaths)"
+        )
+        XCTAssertTrue(probe.matches.isEmpty,
+                      "nothing past an uncrossed boundary may be claimed")
+        XCTAssertFalse(probe.complete,
+                       "UNCROSSED means UNPROVEN — never 'clean'")
+    }
+
+    /// The device-id arm of the same rule (a foreign volume mounted with its
+    /// own `st_dev`), on the SCAN-time face — which runs BEFORE the sizing
+    /// pass that would mark the item review-only, so it cannot lean on it.
+    func testScanTimeProbeStopsAtAForeignDeviceSubtree() throws {
+        let entry = cachesRoot.appendingPathComponent("com.example.ForeignDevice")
+        try mkdir(entry)
+        try writeFile(entry.appendingPathComponent("payload.bin"))
+        let mounted = entry.appendingPathComponent("volume")
+        try mkdir(mounted.appendingPathComponent("Documents"))
+
+        let provider = RecordingBoundaryProvider()
+        let inode = try XCTUnwrap(provider.identity(of: mounted)?.inode)
+        provider.deviceOverridesByInode[inode] = 0xDEAD_BEEF
+        provider.reset()
+
+        guard case .entries(let facts) =
+            makeScanner(provider: provider).enumerateFacts() else {
+            return XCTFail("expected facts")
+        }
+        let fact = try XCTUnwrap(facts.first { $0.name == entry.lastPathComponent })
+
+        XCTAssertFalse(
+            provider.touchedAnythingBelow(mounted),
+            "the scan-time probe read the foreign volume: \(provider.probedPaths)"
+        )
+        XCTAssertTrue(fact.userDataShapeMatches.isEmpty)
+        XCTAssertFalse(fact.userDataProbeComplete,
+                       "an uncrossed boundary fails closed like any other "
+                           + "branch the walk could not read")
+    }
+
+    /// A cache entry that IS a mount root is never opened at all — the same
+    /// stance `DirectorySizer` takes on its own root.
+    func testProbeRootThatIsItselfAMountIsNeverOpened() throws {
+        let entry = cachesRoot.appendingPathComponent("com.example.MountedEntry")
+        try mkdir(entry.appendingPathComponent("Pictures"))
+
+        let provider = RecordingBoundaryProvider()
+        let inode = try XCTUnwrap(provider.identity(of: entry)?.inode)
+        provider.mountPointInodes.insert(inode)
+        provider.reset()
+
+        let probe = OrphanedCachesScanner.preDeleteUserDataProbe(
+            at: entry, provider: provider
+        )
+
+        XCTAssertFalse(
+            provider.touchedAnythingBelow(entry),
+            "a mount-root target must not be enumerated: \(provider.probedPaths)"
+        )
+        XCTAssertTrue(probe.matches.isEmpty)
+        XCTAssertFalse(probe.complete)
+    }
+
+    // MARK: - The budget bounds WORK, not just attention (PR #458 review)
+
+    /// The entry budget must bound what the walk MATERIALIZES, not only what
+    /// it inspects. `contentsOfDirectory(at:).sorted` read and sorted every
+    /// child before any per-entry guard could fire, so a single cache
+    /// directory with millions of entries could spike memory and stall the
+    /// scan while only 20,000 entries were ever looked at.
+    func testBoundedDirectoryReadStopsAtTheBudgetAndReportsTruncation() throws {
+        let wide = cachesRoot.appendingPathComponent("wide")
+        try mkdir(wide)
+        for index in 0..<2_000 {
+            try writeFile(wide.appendingPathComponent("f\(index).bin"), bytes: 1)
+        }
+
+        let bounded = OrphanedCachesScanner.boundedChildNames(of: wide, limit: 5)
+        guard case .read(let names, let truncatedBy) = bounded else {
+            return XCTFail("expected a bounded read, got \(bounded)")
+        }
+        XCTAssertEqual(names.count, 5,
+                       "at most `limit` basenames are ever held in memory")
+        XCTAssertEqual(truncatedBy, .budgetExhausted,
+                       "and the read reports that more entries remained")
+
+        // Read whole when it fits, and PROVEN exhausted — the completeness
+        // signal the fail-closed rule depends on.
+        let small = cachesRoot.appendingPathComponent("narrow")
+        try mkdir(small)
+        try writeFile(small.appendingPathComponent("only.bin"), bytes: 1)
+        XCTAssertEqual(
+            OrphanedCachesScanner.boundedChildNames(of: small, limit: 5),
+            .read(["only.bin"], truncatedBy: nil)
+        )
+
+        // An unopenable directory is reported as such, attributed.
+        try XCTSkipIf(geteuid() == 0, "root ignores permission bits")
+        let locked = cachesRoot.appendingPathComponent("locked")
+        try mkdir(locked)
+        try chmod000(locked)
+        defer { restorePerms(locked) }
+        XCTAssertEqual(
+            OrphanedCachesScanner.boundedChildNames(of: locked, limit: 5),
+            .unreadable(.accessDenied)
+        )
+    }
+
+    /// A directory the budget cannot afford is never OPENED — the visible
+    /// half of the same fix. `a` is unreadable, so had the walk popped and
+    /// read it (as it did while the read came before the guard) the verdict
+    /// would carry an access obstruction too.
+    func testABudgetSpentMeansTheNextDirectoryIsNeverOpened() throws {
+        try XCTSkipIf(geteuid() == 0, "root ignores permission bits")
+        let entry = cachesRoot.appendingPathComponent("com.example.SpentBudget")
+        let unreadable = entry.appendingPathComponent("a")
+        try mkdir(unreadable.appendingPathComponent("child"))
+        try chmod000(unreadable)
+        defer { restorePerms(unreadable) }
+
+        let probe = OrphanedCachesScanner.boundedUserDataShapeWalk(
+            at: entry, provider: FileSystemIdentityProvider(), entryLimit: 1
+        )
+
+        XCTAssertEqual(probe.obstructions, [.budgetExhausted],
+                       "discovering `a` spent the budget; it must not then "
+                           + "be opened, so nothing may be attributed to "
+                           + "having read it")
+        XCTAssertFalse(probe.complete)
+    }
+
+    // MARK: - Obstructions are distinguished, not flattened (PR #458 review)
+
+    /// Fails one child's kind probe with a chosen errno — the hermetic
+    /// stand-in for a transient I/O error mid-walk.
+    private final class ErrnoInjectingProvider: FileSystemIdentityProvider {
+        var failures: [String: Int32] = [:]
+
+        override func probeKind(of url: URL) -> KindProbe {
+            if let code = failures[url.standardizedFileURL.path] {
+                return .failed(errno: code)
+            }
+            return super.probeKind(of: url)
+        }
+    }
+
+    /// The walk must be ABLE to tell its causes apart: a bare `Bool` forced
+    /// every message downstream to flatten a retryable race together with a
+    /// bound that reproduces exactly, and both flattenings shipped a wrong
+    /// remedy.
+    func testProbeAttributesEachObstructionToItsOwnCause() throws {
+        try XCTSkipIf(geteuid() == 0, "root ignores permission bits")
+        let plain = FileSystemIdentityProvider()
+
+        // (a) Budget exhausted — deterministic on a static tree.
+        let wide = cachesRoot.appendingPathComponent("com.example.Wide")
+        try mkdir(wide)
+        for index in 0..<4 {
+            try writeFile(wide.appendingPathComponent("f\(index).bin"), bytes: 1)
+        }
+        XCTAssertEqual(
+            OrphanedCachesScanner.boundedUserDataShapeWalk(
+                at: wide, provider: plain, entryLimit: 2
+            ).obstructions,
+            [.budgetExhausted]
+        )
+
+        // (b) Access denied — clearable by a GRANT, not by a bare retry.
+        let blocked = cachesRoot.appendingPathComponent("com.example.Blocked")
+        let locked = blocked.appendingPathComponent("locked-sub")
+        try mkdir(locked)
+        try chmod000(locked)
+        defer { restorePerms(locked) }
+        XCTAssertEqual(
+            OrphanedCachesScanner.preDeleteUserDataProbe(
+                at: blocked, provider: plain
+            ).obstructions,
+            [.accessDenied]
+        )
+
+        // (c) A transient I/O failure — the class a re-scan really does
+        // clear, and the one the previous message called permanent.
+        let flaky = cachesRoot.appendingPathComponent("com.example.Flaky")
+        let child = flaky.appendingPathComponent("sub")
+        try mkdir(child)
+        let provider = ErrnoInjectingProvider()
+        provider.failures[child.standardizedFileURL.path] = EIO
+        XCTAssertEqual(
+            OrphanedCachesScanner.preDeleteUserDataProbe(
+                at: flaky, provider: provider
+            ).obstructions,
+            [.transientFailure]
+        )
+
+        // (d) A vanished directory — the mid-walk RACE the review named —
+        // is fail-closed but honestly retryable, never "deterministic".
+        XCTAssertEqual(OrphanedCachesScanner.obstruction(forErrno: ENOENT),
+                       .transientFailure)
+        XCTAssertEqual(OrphanedCachesScanner.obstruction(forErrno: EPERM),
+                       .accessDenied)
+    }
+
     /// Fail-closed is untouched: a GENUINELY obstructed probe — a branch
     /// the walk cannot read — still refuses at delete time, and the refusal
     /// no longer prescribes a re-scan it knows cannot help.

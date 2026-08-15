@@ -164,6 +164,119 @@ struct UserDataShapePattern: Equatable {
     let glob: String
 }
 
+// MARK: - Probe obstructions (PR #458 review)
+
+/// ONE reason a bounded user-data probe could not prove the absence of user
+/// data — carrying the single fact any remediation guidance turns on:
+/// **whether trying again can change it**.
+///
+/// The probe used to report incompleteness as a bare `Bool`, which forced
+/// every surface downstream to FLATTEN causes that genuinely differ. Both
+/// flattened messages this scanner has shipped were wrong in mirror-image
+/// ways: "re-scan required" prescribed a retry for a bound that reproduces
+/// exactly, and its replacement asserted "re-scanning will not clear this"
+/// over a set that includes a mid-walk race and transient I/O — which a
+/// re-scan clears routinely. Steering a user toward the riskier
+/// explicit-confirmation path on a merely transient failure is the harm; so
+/// the walk now DISTINGUISHES its causes rather than the message guessing.
+///
+/// Declaration order is the guidance order (`Comparable` is synthesized from
+/// it), so a multi-cause message is deterministic.
+enum UserDataProbeObstruction: CaseIterable, Comparable, Sendable {
+    /// The entry budget ran out before the tree did. DETERMINISTIC for a
+    /// static tree — an orphaned cache is by definition abandoned, so the
+    /// next walk spends the same budget on the same entries and stops in the
+    /// same place. Nothing but a policy change or an explicit per-item
+    /// confirmation clears it.
+    case budgetExhausted
+    /// A basename that is not valid UTF-8, so the walk cannot address the
+    /// entry safely (a repairing decode would name a DIFFERENT path). A
+    /// property of the tree: it reproduces until the entry is renamed.
+    case undecodableName
+    /// A mount boundary the walk refuses to cross (either signal: a device-id
+    /// change against the walk root, or the `statfs` mount-root check).
+    /// CLEARABLE in the way a bound never is — unmount and the next walk
+    /// reads the tree whole.
+    case mountBoundary
+    /// `EACCES`/`EPERM` on a directory or a child — TCC or POSIX
+    /// permissions. A bare retry reproduces it; GRANTING access clears it.
+    case accessDenied
+    /// An I/O error, a resource shortage, or the tree changing under the
+    /// walk (a directory removed between being pushed and being popped).
+    /// The one genuinely RETRYABLE class: once the race or the obstruction
+    /// is gone, a re-scan completes.
+    case transientFailure
+
+    /// What can actually change this — the whole point of distinguishing.
+    enum Remedy: Sendable {
+        /// A re-scan alone can succeed.
+        case retryAlone
+        /// A user action first (unmount, grant access, rename), then a
+        /// re-scan.
+        case userActionThenRetry
+        /// Neither: it reproduces exactly until policy or an explicit
+        /// per-item confirmation changes the outcome. (Spelled out rather
+        /// than `none`, which reads as `Optional.none` at a glance.)
+        case irreducible
+    }
+
+    var remedy: Remedy {
+        switch self {
+        case .budgetExhausted: return .irreducible
+        case .undecodableName, .mountBoundary, .accessDenied:
+            return .userActionThenRetry
+        case .transientFailure: return .retryAlone
+        }
+    }
+
+    /// The cause clause — what happened, and what would clear it. One
+    /// sentence, composed by `OrphanedCachesScanner.remediationGuidance`.
+    var guidance: String {
+        switch self {
+        case .budgetExhausted:
+            return "This folder holds more entries than the inspection "
+                + "budget allows, so part of it was never looked at."
+        case .undecodableName:
+            return "An entry here has a name that is not valid text, which "
+                + "the inspection will not address; renaming it allows a "
+                + "full inspection."
+        case .mountBoundary:
+            return "A volume is mounted inside this folder and the "
+                + "inspection never crosses a mount boundary; unmounting it "
+                + "allows a full inspection."
+        case .accessDenied:
+            return "Part of this folder could not be read; granting access "
+                + "to it (Full Disk Access, or its permissions) allows a "
+                + "full inspection."
+        case .transientFailure:
+            return "The inspection hit a temporary error, or the folder "
+                + "changed while it was being read."
+        }
+    }
+}
+
+/// One bounded user-data probe's verdict: what it matched, and — when it
+/// could not finish — exactly WHY, so guidance never has to guess.
+///
+/// `complete` is DERIVED, never stored: absence of matches is meaningful iff
+/// nothing obstructed the walk, which is the fail-closed rule the classifier
+/// (R4) and the delete-time revalidation both read.
+struct UserDataProbeResult: Equatable {
+    /// Matched pattern NAMES in table order, deduplicated.
+    let matches: [String]
+    /// Deduplicated and sorted in declaration order — deterministic output
+    /// for a deterministic message. Empty iff the walk finished.
+    let obstructions: [UserDataProbeObstruction]
+
+    /// FAIL-CLOSED completeness (epic rule).
+    var complete: Bool { obstructions.isEmpty }
+
+    /// The clean, finished verdict.
+    static func complete(matches: [String] = []) -> UserDataProbeResult {
+        UserDataProbeResult(matches: matches, obstructions: [])
+    }
+}
+
 // MARK: - OrphanedCachesScanner (enumeration core)
 
 /// `@unchecked Sendable` under the same discipline as the other scanners
@@ -350,27 +463,26 @@ struct OrphanedCachesScanner: @unchecked Sendable {
             // sweep output"; no double listing or double counting).
             if isCategoryOwned(child, keptRoots: exclusionRoots) { continue }
 
-            let matches: [String]
-            let probeComplete: Bool
+            let probe: UserDataProbeResult
             switch provider.probeKind(of: child) {
             case .absent:
                 // Deleted between enumeration and probe — a benign mid-scan
                 // race, not a denial.
                 continue
             case .kind(.directory):
-                (matches, probeComplete) = probeUserDataShapes(at: child)
+                probe = probeUserDataShapes(at: child)
             case .kind:
                 // Symlink / regular file / special: no contents of their
                 // own to probe — complete by construction. A symlink is
                 // NEVER followed: deleting the entry removes the link, not
                 // its target, so nothing deletable went uninspected.
-                matches = []
-                probeComplete = true
-            case .failed:
+                probe = .complete()
+            case .failed(let code):
                 // Cannot even establish the kind — fail closed; the sizing
                 // pass below records the classified denial for the facts.
-                matches = []
-                probeComplete = false
+                probe = UserDataProbeResult(
+                    matches: [], obstructions: [Self.obstruction(forErrno: code)]
+                )
             }
 
             // `.deletionTarget`, not `.scanRoot`: lstat-dispatches the leaf
@@ -391,8 +503,8 @@ struct OrphanedCachesScanner: @unchecked Sendable {
                 denials: report.denials,
                 mountBoundaries: report.mountBoundaries,
                 rootMountBoundary: report.rootMountBoundary,
-                userDataShapeMatches: matches,
-                userDataProbeComplete: probeComplete
+                userDataShapeMatches: probe.matches,
+                userDataProbeComplete: probe.complete
             ))
         }
 
@@ -569,7 +681,7 @@ struct OrphanedCachesScanner: @unchecked Sendable {
     /// Bounded walk of one REAL-DIRECTORY entry — the instance (scan-time)
     /// face of the shared static core below, using the injectable
     /// per-instance cap.
-    private func probeUserDataShapes(at entryURL: URL) -> (matches: [String], complete: Bool) {
+    private func probeUserDataShapes(at entryURL: URL) -> UserDataProbeResult {
         Self.boundedUserDataShapeWalk(
             at: entryURL, provider: provider, entryLimit: probeEntryLimit
         )
@@ -592,10 +704,11 @@ struct OrphanedCachesScanner: @unchecked Sendable {
     ///   as-is, never a target's tree);
     /// - absent → clean and complete: the deletion path surfaces its own
     ///   ENOENT (frozen ghost asymmetry) — the probe must not preempt it;
-    /// - unprobeable → fail closed (incomplete).
+    /// - unprobeable → fail closed (incomplete), attributed by errno so the
+    ///   guidance can say whether a retry helps.
     static func preDeleteUserDataProbe(
         at target: URL, provider: FileSystemIdentityProvider
-    ) -> (matches: [String], complete: Bool) {
+    ) -> UserDataProbeResult {
         switch provider.probeKind(of: target) {
         case .kind(.directory):
             return boundedUserDataShapeWalk(
@@ -603,19 +716,87 @@ struct OrphanedCachesScanner: @unchecked Sendable {
                 entryLimit: defaultProbeEntryLimit
             )
         case .kind:
-            return ([], true)
+            return .complete()
         case .absent:
-            return ([], true)
-        case .failed:
-            return ([], false)
+            return .complete()
+        case .failed(let code):
+            return UserDataProbeResult(
+                matches: [], obstructions: [obstruction(forErrno: code)]
+            )
+        }
+    }
+
+    /// errno → obstruction, in ONE place, so scan time and delete time
+    /// classify identically.
+    ///
+    /// `EACCES`/`EPERM` are the grantable ones (POSIX permissions and TCC
+    /// respectively). `ENOENT`/`ENOTDIR` mean the thing moved or was removed
+    /// between being pushed and being read — the mid-walk RACE the review
+    /// named, still fail-closed (a rename can move content the parent was
+    /// already read past) but honestly retryable. Everything else (EIO,
+    /// ESTALE, ETIMEDOUT, EMFILE, …) is transient by nature: the walk must
+    /// not tell a user that a disk hiccup is a permanent verdict.
+    static func obstruction(forErrno code: Int32) -> UserDataProbeObstruction {
+        switch code {
+        case EACCES, EPERM: return .accessDenied
+        default: return .transientFailure
         }
     }
 
     /// The ONE bounded user-data-shape walk, shared by the scan-time probe
     /// and the delete-time revalidation so the two can never drift. Matches
     /// basenames against `userDataShapePatterns`, returning the matched
-    /// pattern NAMES (in table order, deduplicated) and the fail-closed
-    /// completeness flag.
+    /// pattern NAMES (in table order, deduplicated) and — when the walk
+    /// could not finish — the ATTRIBUTED obstructions behind the
+    /// fail-closed verdict.
+    ///
+    /// Internal rather than private ONLY so tests can drive it at a small
+    /// budget; both PRODUCTION callers (`probeUserDataShapes` and
+    /// `preDeleteUserDataProbe`) read `defaultProbeEntryLimit`, so the
+    /// scan-time and delete-time bounds still cannot drift.
+    ///
+    /// ## The budget bounds what is MATERIALIZED, not just what is INSPECTED
+    /// (PR #458 review)
+    /// Every directory is read through `boundedChildNames`, which stops
+    /// after the REMAINING budget's worth of `readdir` entries. The previous
+    /// `contentsOfDirectory(at:).sorted` read and sorted every child of a
+    /// directory BEFORE the per-entry guard could fire, so one cache
+    /// directory with millions of entries could spike memory and stall the
+    /// scan even though only `entryLimit` entries were ever inspected — the
+    /// budget was a bound on ATTENTION, not on WORK. The retired depth cap
+    /// had been hiding that for anything below its boundary. A directory is
+    /// also no longer opened at all once the budget is spent (`remaining >
+    /// 0` is checked before the read, not after it).
+    ///
+    /// Under truncation, WHICH entries were read is deliberately
+    /// UNSPECIFIED: a directory bigger than the remaining budget is read in
+    /// filesystem `readdir` order, because selecting the byte-wise smallest
+    /// N would require the whole enumeration the budget exists to prevent.
+    /// Nothing may depend on that membership — a truncated probe is
+    /// fail-closed on every surface. Within a directory the budget could
+    /// read WHOLE, order is byte-wise ascending (children first, then
+    /// subdirectories descended in that same order), so a complete walk is
+    /// fully deterministic.
+    ///
+    /// NO-CROSS rule (safety — PR #458 review, matching the sizer's own
+    /// root check at `DirectorySizer.swift:205` and its within-walk check at
+    /// `DirectorySizer.swift:289`): mount boundaries are never crossed, at
+    /// the root or anywhere beneath it, and an uncrossed boundary makes the
+    /// probe INCOMPLETE. The same two
+    /// signals as everywhere else in this codebase — a device-id change
+    /// against the WALK ROOT, plus the `statfs` mount-root check that
+    /// catches same-`st_dev` firmlink mounts — and no third notion of
+    /// "mount boundary" is invented here. Enforced INSIDE this shared core,
+    /// not at a call site: at scan time the probe runs BEFORE the sizing
+    /// pass that would mark the item review-only, and at delete time
+    /// `preDeleteUserDataProbe` is handed a bare URL with no size report to
+    /// consult, with a volume mountable between the scan and the clean.
+    /// What crossing costs is real and buys nothing: up to `entryLimit`
+    /// reads on network/removable/FUSE storage the user never pointed this
+    /// scanner at, on an item a boundary already makes uncleanable
+    /// (`CacheCleaner.swift:911`). UNCROSSED ⇒ INCOMPLETE, never "clean" —
+    /// and unlike a depth cap it is CLEARABLE: unmount, and the next walk
+    /// reads the tree whole.
     ///
     /// NO-FOLLOW rule (safety — mirrors `.deletionTarget` sizing): the
     /// caller lstat-gates the probe root, and every descent below is
@@ -656,39 +837,78 @@ struct OrphanedCachesScanner: @unchecked Sendable {
     /// bought nothing. Depth is now spent FROM the one budget: a tree the
     /// budget can afford is PROVEN, and only a tree it genuinely cannot
     /// afford stays unproven.
-    private static func boundedUserDataShapeWalk(
+    static func boundedUserDataShapeWalk(
         at entryURL: URL,
         provider: FileSystemIdentityProvider,
         entryLimit: Int
-    ) -> (matches: [String], complete: Bool) {
-        let fileManager = FileManager.default
+    ) -> UserDataProbeResult {
         var matched = Set<String>()
-        var complete = true
+        var obstructions = Set<UserDataProbeObstruction>()
         var visited = 0
-        // Depth-first with sorted children — deterministic order.
+
+        // MOUNT BOUNDARY AT THE ROOT, before anything is opened — the same
+        // pair of signals `DirectorySizer.swift:205` applies to its own
+        // root. An entry that IS a mount is not enumerated at all: not one
+        // entry of the foreign filesystem is read, and the verdict is
+        // INCOMPLETE precisely because we did not look.
+        let rootDevice = provider.deviceID(of: entryURL)
+        let parentDevice = provider.deviceID(
+            of: entryURL.deletingLastPathComponent()
+        )
+        if (rootDevice != nil && parentDevice != nil
+                && rootDevice != parentDevice)
+            || provider.isMountPoint(entryURL) {
+            return UserDataProbeResult(
+                matches: [], obstructions: [.mountBoundary]
+            )
+        }
+
+        // Depth-first, byte-wise ascending within each directory the budget
+        // could read whole.
         var stack: [URL] = [entryURL]
 
         walk: while let dir = stack.popLast() {
-            let children: [URL]
-            do {
-                // Hidden entries included, same stance as the enumeration.
-                children = try fileManager.contentsOfDirectory(
-                    at: dir, includingPropertiesForKeys: nil, options: []
-                ).sorted { $0.lastPathComponent < $1.lastPathComponent }
-            } catch {
-                // Unreadable branch: absence of matches is unproven.
-                complete = false
-                continue
+            let remaining = entryLimit - visited
+            guard remaining > 0 else {
+                // Budget spent with directories still unexplored — and the
+                // directory is NOT opened to discover that.
+                obstructions.insert(.budgetExhausted)
+                break walk
             }
-            for child in children {
+            let names: [String]
+            switch boundedChildNames(of: dir, limit: remaining) {
+            case .unreadable(let cause):
+                // Unreadable branch: absence of matches is unproven.
+                obstructions.insert(cause)
+                continue
+            case .read(let read, let cause):
+                if let cause { obstructions.insert(cause) }
+                // Sorting a slice bounded by the REMAINING budget — never a
+                // whole million-entry cache directory.
+                names = read.sorted {
+                    $0.utf8.lexicographicallyPrecedes($1.utf8)
+                }
+            }
+            // Descend in ascending order: collected here, pushed reversed.
+            var pendingDirectories: [URL] = []
+
+            for name in names {
                 guard visited < entryLimit else {
-                    // Entry cap hit before exhausting the tree.
-                    complete = false
+                    // Defense in depth: the read above is already bounded by
+                    // the REMAINING budget, so this cannot fire today. It
+                    // stays because `visited` is the invariant that matters
+                    // — anything that ever spends from the same pot
+                    // mid-directory keeps the bound true through here.
+                    obstructions.insert(.budgetExhausted)
                     break walk
                 }
                 visited += 1
 
-                let name = child.lastPathComponent
+                // The walk's OWN spelling, never a resolved one: the child
+                // is `lstat`-probed at exactly the path the deletion would
+                // remove (`contentsOfDirectory(at:)` handed back RESOLVED
+                // URLs, which is the wrong path for a no-follow probe).
+                let child = dir.appendingPathComponent(name)
                 // FNM_CASEFOLD (PR #456 review): the guard protects user
                 // content in ANY casing (`Photos Library.PHOTOSLIBRARY`,
                 // `pictures`, `DOCUMENTS`) — the stored spelling is
@@ -705,29 +925,161 @@ struct OrphanedCachesScanner: @unchecked Sendable {
 
                 switch provider.probeKind(of: child) {
                 case .kind(.directory):
-                    // ALWAYS descended: discovering this directory already
-                    // cost an entry, and the budget bounds everything that
-                    // follows. Refusing to look past some fixed level is
-                    // what stranded ordinary caches (see the doc above).
-                    stack.append(child)
+                    // MOUNT BOUNDARY: never crossed, whatever is on the far
+                    // side (see the NO-CROSS rule above).
+                    guard !crossesMountBoundary(
+                        child, rootDevice: rootDevice, provider: provider
+                    ) else {
+                        // We did not look past it: unproven, exactly like
+                        // an unreadable branch.
+                        obstructions.insert(.mountBoundary)
+                        break
+                    }
+                    // ALWAYS descended otherwise: discovering this directory
+                    // already cost an entry, and the budget bounds
+                    // everything that follows. Refusing to look past some
+                    // fixed level is what stranded ordinary caches (see the
+                    // doc above).
+                    pendingDirectories.append(child)
                 case .kind:
                     // Symlink / regular file / special: matched by name
                     // above, never descended (see the no-follow rule).
                     break
                 case .absent:
-                    // Vanished mid-probe — benign race.
+                    // Vanished mid-probe — benign race: it holds nothing
+                    // deletable any more.
                     break
-                case .failed:
-                    // Could not establish the kind — fail closed.
-                    complete = false
+                case .failed(let code):
+                    // Could not establish the kind — fail closed, attributed.
+                    obstructions.insert(obstruction(forErrno: code))
                 }
             }
+            stack.append(contentsOf: pendingDirectories.reversed())
         }
 
-        // Table order, deduplicated — deterministic output for fn-3.2.
+        // Table order, deduplicated — deterministic output for fn-3.2, and
+        // obstructions in declaration order for a deterministic message.
         let names = userDataShapePatterns.map(\.name).filter(matched.contains)
-        return (names, complete)
+        return UserDataProbeResult(
+            matches: names, obstructions: obstructions.sorted()
+        )
     }
+
+    /// Does descending into `child` cross a mount boundary?
+    ///
+    /// The house rule VERBATIM — both signals, no third notion invented
+    /// here: (a) device-id change against the WALK ROOT, which catches
+    /// foreign volumes and injected test devices, and (b) the `statfs`
+    /// mount-root check, required because a unified APFS volume group
+    /// presents ONE `st_dev` across the system/Data pair, so a firmlink
+    /// mount is invisible to (a). Identical to `DirectorySizer.swift:289`;
+    /// a `nil` device on either side disables only arm (a), exactly as it
+    /// does there.
+    ///
+    /// `child` is `lstat`-probed as a real directory before this runs, so a
+    /// symlink pointing AT a volume root never reaches here (and is never
+    /// followed regardless — the no-follow rule).
+    private static func crossesMountBoundary(
+        _ child: URL,
+        rootDevice: UInt64?,
+        provider: FileSystemIdentityProvider
+    ) -> Bool {
+        let childDevice = provider.deviceID(of: child)
+        if rootDevice != nil && childDevice != nil
+            && childDevice != rootDevice {
+            return true
+        }
+        return provider.isMountPoint(child)
+    }
+
+    /// The outcome of ONE bounded directory read.
+    enum BoundedDirectoryRead: Equatable {
+        /// The basenames read — at most `limit` of them. The obstruction is
+        /// `nil` iff the directory was PROVEN exhausted; otherwise it says
+        /// why the rest of the directory is unproven.
+        case read([String], truncatedBy: UserDataProbeObstruction?)
+        /// The directory could not be opened at all.
+        case unreadable(UserDataProbeObstruction)
+    }
+
+    /// BOUNDED directory read: at most `limit` basenames, plus whether the
+    /// enumeration was PROVEN exhausted.
+    ///
+    /// `opendir`/`readdir` rather than `FileManager` on purpose — both
+    /// `contentsOfDirectory` overloads materialize the WHOLE directory
+    /// before any cap can apply, which is exactly the unbounded read this
+    /// probe's contract forbids (PR #458 review): a cache directory with
+    /// millions of entries would spike memory and stall the scan inside a
+    /// walk that only ever inspects `entryLimit` of them. Reading BASENAMES
+    /// also keeps the walk's own spelling: the caller appends them to ITS
+    /// OWN directory URL, so a no-follow `lstat` lands on the path the
+    /// deletion would remove rather than a resolved one. `.` and `..` are
+    /// skipped; hidden entries are INCLUDED (user data in a dot-directory is
+    /// still user data), matching the enumeration's `options: []` stance.
+    ///
+    /// Internal for the bound test — nothing outside this file calls it.
+    ///
+    /// UNDECODABLE NAMES FAIL CLOSED: `String(validatingCString:)`, never
+    /// `String(cString:)`. A repairing decode substitutes U+FFFD, and the
+    /// URL rebuilt from that lie names a DIFFERENT path — `probeKind` would
+    /// report it absent and the probe could return "complete, nothing found"
+    /// while the real entry (a `Photos Library.photoslibrary`, say) was
+    /// never inspected. APFS and HFS+ reject non-UTF-8 basenames outright
+    /// (EILSEQ), but a mounted exFAT/SMB/FUSE volume can deliver them. The
+    /// read STOPS at the first undecodable entry: the directory is already
+    /// unproven, and continuing would let a directory full of such names
+    /// spend the budget for nothing.
+    static func boundedChildNames(
+        of directory: URL, limit: Int
+    ) -> BoundedDirectoryRead {
+        guard let handle = opendir(directory.path) else {
+            return .unreadable(obstruction(forErrno: errno))
+        }
+        defer { closedir(handle) }
+        var names: [String] = []
+        while true {
+            // `readdir` returns nil for BOTH end-of-stream and error; errno
+            // is the only discriminator, so it is cleared before each call.
+            errno = 0
+            guard let entry = readdir(handle) else {
+                if errno != 0 {
+                    // A failed read mid-directory: the rest is unproven, and
+                    // an I/O error is honestly retryable.
+                    return .read(names, truncatedBy: obstruction(forErrno: errno))
+                }
+                return .read(names, truncatedBy: nil)
+            }
+            let decoded = withUnsafeBytes(of: entry.pointee.d_name) {
+                raw -> String? in
+                guard let base = raw.bindMemory(to: CChar.self).baseAddress
+                else { return nil }
+                return decodedBasename(fromCString: base)
+            }
+            guard let name = decoded, !name.isEmpty else {
+                return .read(names, truncatedBy: .undecodableName)
+            }
+            if name == "." || name == ".." { continue }
+            guard names.count < limit else {
+                // A real entry existed beyond the budget — the ONLY way this
+                // read reports budget exhaustion, and it costs one `readdir`
+                // rather than the whole directory.
+                return .read(names, truncatedBy: .budgetExhausted)
+            }
+            names.append(name)
+        }
+    }
+
+    /// The VALIDATING basename decode, factored out so the fail-closed
+    /// policy is testable without a non-UTF-8-capable volume (APFS/HFS+
+    /// refuse to create such names at all). `nil` for ANY byte sequence that
+    /// is not valid UTF-8 — never a U+FFFD-repaired string, which would name
+    /// a different path than the entry it came from.
+    static func decodedBasename(
+        fromCString pointer: UnsafePointer<CChar>
+    ) -> String? {
+        String(validatingCString: pointer)
+    }
+
 }
 
 // MARK: - Config surface (fn-3.4, R8)

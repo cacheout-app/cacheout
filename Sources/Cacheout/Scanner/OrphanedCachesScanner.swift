@@ -193,6 +193,11 @@ enum UserDataProbeObstruction: CaseIterable, Comparable, Sendable {
     /// entry safely (a repairing decode would name a DIFFERENT path). A
     /// property of the tree: it reproduces until the entry is renamed.
     case undecodableName
+    /// A path this walk cannot address — `ENAMETOOLONG` (an absolute path
+    /// past `PATH_MAX`, which only relative creation can build, and which
+    /// retiring the depth cap made reachable) or `ELOOP`. A property of the
+    /// PATH, so it reproduces exactly until the tree is restructured.
+    case unaddressablePath
     /// A mount boundary the walk refuses to cross (either signal: a device-id
     /// change against the walk root, or the `statfs` mount-root check).
     /// CLEARABLE in the way a bound never is — unmount and the next walk
@@ -206,6 +211,11 @@ enum UserDataProbeObstruction: CaseIterable, Comparable, Sendable {
     /// pushed and being popped). The genuinely RETRYABLE class: once the
     /// race or the obstruction is gone, a re-scan completes.
     case transientFailure
+    /// An errno the router does not recognize. Claims NEITHER retryability
+    /// nor permanence — see `OrphanedCachesScanner.obstruction(forErrno:)`
+    /// for why an unknown cause gets its own class rather than falling into
+    /// either default.
+    case unclassifiedFailure
 
     /// What can actually change this — the whole point of distinguishing.
     ///
@@ -221,6 +231,8 @@ enum UserDataProbeObstruction: CaseIterable, Comparable, Sendable {
         /// A user action first (unmount, grant access, rename), then a
         /// re-scan.
         case userActionThenRetry
+        /// Unknown: neither promise can be made honestly.
+        case unknown
         /// Nothing available: it reproduces exactly until policy or an
         /// explicit per-item confirmation changes the outcome. (Spelled out
         /// rather than `none`, which reads as `Optional.none` at a glance.)
@@ -230,9 +242,11 @@ enum UserDataProbeObstruction: CaseIterable, Comparable, Sendable {
     var remedy: Remedy {
         switch self {
         case .budgetExhausted: return .irreducible
-        case .undecodableName, .mountBoundary, .accessDenied:
+        case .undecodableName, .unaddressablePath, .mountBoundary,
+             .accessDenied:
             return .userActionThenRetry
         case .transientFailure: return .retryAlone
+        case .unclassifiedFailure: return .unknown
         }
     }
 
@@ -247,6 +261,11 @@ enum UserDataProbeObstruction: CaseIterable, Comparable, Sendable {
             return "An entry here has a name that is not valid text, which "
                 + "the inspection will not address; renaming it allows a "
                 + "full inspection."
+        case .unaddressablePath:
+            return "Part of this folder sits at a path the inspection "
+                + "cannot address — it is too long, or it resolves through "
+                + "too many links; shortening or renaming it allows a full "
+                + "inspection."
         case .mountBoundary:
             return "A volume is mounted inside this folder and the "
                 + "inspection never crosses a mount boundary; unmounting it "
@@ -258,6 +277,9 @@ enum UserDataProbeObstruction: CaseIterable, Comparable, Sendable {
         case .transientFailure:
             return "The inspection hit a temporary error, or the folder "
                 + "changed while it was being read."
+        case .unclassifiedFailure:
+            return "The inspection failed for a reason it could not "
+                + "classify."
         }
     }
 }
@@ -736,17 +758,53 @@ struct OrphanedCachesScanner: @unchecked Sendable {
     /// errno → obstruction, in ONE place, so scan time and delete time
     /// classify identically.
     ///
-    /// `EACCES`/`EPERM` are the grantable ones (POSIX permissions and TCC
-    /// respectively). `ENOENT`/`ENOTDIR` mean the thing moved or was removed
-    /// between being pushed and being read — the mid-walk RACE the review
-    /// named, still fail-closed (a rename can move content the parent was
-    /// already read past) but honestly retryable. Everything else (EIO,
-    /// ESTALE, ETIMEDOUT, EMFILE, …) is transient by nature: the walk must
-    /// not tell a user that a disk hiccup is a permanent verdict.
+    /// Every class is decided on the SAME question the guidance turns on —
+    /// can a retry, unaided, change this? — rather than on how the failure
+    /// felt. The previous shape answered it for `EACCES`/`EPERM` and then
+    /// swept everything else into "transient", which is the fail-open
+    /// pattern this codebase keeps getting bitten by: one genuinely benign
+    /// cause (the mid-walk race) justifying a catch-all that then absorbs
+    /// every class nobody enumerated. `ENAMETOOLONG` was the live example —
+    /// reachable at all only because the depth cap is gone (e9de405) — and
+    /// an unchanged tree reproduces it exactly, so "re-scan and try again"
+    /// was a loop that could never terminate.
     static func obstruction(forErrno code: Int32) -> UserDataProbeObstruction {
         switch code {
-        case EACCES, EPERM: return .accessDenied
-        default: return .transientFailure
+        // GRANTABLE — a retry reproduces it, a grant clears it. `EPERM` is
+        // what TCC returns; `EACCES` is POSIX permissions.
+        case EACCES, EPERM:
+            return .accessDenied
+
+        // STRUCTURAL — a property of the PATH, reproduced by every re-scan
+        // of an unchanged tree. `ENAMETOOLONG`: an absolute path past
+        // `PATH_MAX`, which only relative creation (`mkdirat`) can build.
+        // `ELOOP`: symlink resolution depth, reachable here only through an
+        // ancestor, since this walk itself never follows a link. Clearable
+        // by restructuring, never by a retry.
+        case ENAMETOOLONG, ELOOP:
+            return .unaddressablePath
+
+        // GENUINELY RETRYABLE — the mid-walk race (the tree changed under
+        // the walk: `ENOENT`/`ENOTDIR`, still fail-closed because a rename
+        // can move content past a parent already read), I/O and media
+        // errors, resource shortages, and the network/removable-volume
+        // family. A later scan can find every one of these gone.
+        case ENOENT, ENOTDIR, EIO, EINTR, EAGAIN, EMFILE, ENFILE, ENOMEM,
+             ENODEV, ENXIO, EBUSY, ESTALE, ETIMEDOUT, ENOTCONN, ECONNRESET,
+             ENETDOWN, ENETUNREACH, EHOSTDOWN, EHOSTUNREACH:
+            return .transientFailure
+
+        // EVERYTHING ELSE CLAIMS NEITHER. Defaulting the unknown to
+        // "transient" is what this comment opened with. Defaulting it to
+        // "permanent" would be just as unearned, and that direction costs
+        // more: it steers the user to explicit per-item confirmation — the
+        // RISKIER path — on a guess. So an unrecognized errno (`EINVAL`,
+        // `EOVERFLOW`, anything a future OS adds) says exactly what is
+        // true: we do not know whether this repeats. The refusal itself is
+        // identical either way — only the advice differs, and unearned
+        // advice is what the whole review thread is about.
+        default:
+            return .unclassifiedFailure
         }
     }
 
@@ -1124,6 +1182,12 @@ struct OrphanedCachesScanner: @unchecked Sendable {
             sentences.append(causes.count == 1
                 ? "Clear that, then re-scan."
                 : "Clear all of the above, then re-scan.")
+        case .unknown:
+            sentences.append(
+                "Re-scanning may or may not clear this; if it repeats, "
+                + "remove this item by explicit per-item confirmation once a "
+                + "re-scan lists it at review risk."
+            )
         case .irreducible:
             sentences.append(
                 "Re-scanning will not clear this — an unchanged folder is "

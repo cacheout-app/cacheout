@@ -1764,7 +1764,8 @@ final class OrphanedCachesScannerTests: XCTestCase {
                       permanent)
 
         for clearable: UserDataProbeObstruction in
-            [.mountBoundary, .accessDenied, .transientFailure, .undecodableName] {
+            [.mountBoundary, .accessDenied, .transientFailure,
+             .undecodableName, .unaddressablePath] {
             let guidance = OrphanedCachesScanner.remediationGuidance(
                 for: [clearable]
             )
@@ -1839,6 +1840,103 @@ final class OrphanedCachesScannerTests: XCTestCase {
             ),
             "guidance is the declaration order whatever the input order, and "
                 + "a repeated cause is stated once"
+        )
+    }
+
+    // MARK: - errno routing (PR #458 review r2)
+
+    /// The errno router must decide EVERY class on the same test the
+    /// guidance turns on — can a retry, unaided, change this? — instead of
+    /// letting one benign case (the mid-walk race) justify a catch-all
+    /// default that absorbs structural failures too.
+    func testErrnoRoutingSeparatesPermanentFromTransientFailures() {
+        // Grantable.
+        for code in [EACCES, EPERM] {
+            XCTAssertEqual(OrphanedCachesScanner.obstruction(forErrno: code),
+                           .accessDenied, "errno \(code)")
+        }
+        // STRUCTURAL — a retry on an unchanged tree reproduces these
+        // exactly, so they must never be reported as temporary.
+        for code in [ENAMETOOLONG, ELOOP] {
+            XCTAssertEqual(OrphanedCachesScanner.obstruction(forErrno: code),
+                           .unaddressablePath, "errno \(code)")
+        }
+        // Genuinely retryable: the mid-walk race, I/O, resource shortage,
+        // and the network-volume family.
+        for code in [ENOENT, ENOTDIR, EIO, EINTR, EAGAIN, EMFILE, ENFILE,
+                     ENOMEM, ESTALE, ETIMEDOUT, ENOTCONN, EBUSY] {
+            XCTAssertEqual(OrphanedCachesScanner.obstruction(forErrno: code),
+                           .transientFailure, "errno \(code)")
+        }
+        // An errno the router cannot reason about claims NEITHER — it is
+        // not obviously retryable, and asserting permanence we cannot prove
+        // would steer the user to the riskier path on a guess.
+        for code in [EINVAL, EBADF, EOVERFLOW, EFAULT, 0] {
+            XCTAssertEqual(OrphanedCachesScanner.obstruction(forErrno: code),
+                           .unclassifiedFailure, "errno \(code)")
+        }
+        let unknown = OrphanedCachesScanner.remediationGuidance(
+            for: [.unclassifiedFailure]
+        )
+        XCTAssertFalse(unknown.contains("will not clear"), unknown)
+        XCTAssertFalse(unknown.hasSuffix("Re-scan and try again."), unknown)
+    }
+
+    /// Builds a directory chain whose ABSOLUTE path exceeds `PATH_MAX`, the
+    /// only way one can exist: `mkdirat` against a directory descriptor, so
+    /// each individual name stays legal while the absolute path does not.
+    /// Real trees reach this the same way (deep relative creation), and
+    /// retiring the depth cap is what let the probe walk far enough to meet
+    /// one. Returns the descriptor chain so it can be torn down the same
+    /// way — `FileManager.removeItem` cannot address it either.
+    private func makeOverlongChain(
+        under root: URL, segment: String, levels: Int
+    ) throws -> [Int32] {
+        var fds = [open(root.path, O_RDONLY | O_DIRECTORY)]
+        guard fds[0] >= 0 else {
+            throw XCTSkip("cannot open fixture root: \(errno)")
+        }
+        for _ in 0..<levels {
+            guard mkdirat(fds.last!, segment, 0o755) == 0 else {
+                throw XCTSkip("mkdirat failed: \(errno)")
+            }
+            let next = openat(fds.last!, segment, O_RDONLY | O_DIRECTORY)
+            guard next >= 0 else { throw XCTSkip("openat failed: \(errno)") }
+            fds.append(next)
+        }
+        return fds
+    }
+
+    private func teardownOverlongChain(_ fds: [Int32], segment: String) {
+        for index in stride(from: fds.count - 2, through: 0, by: -1) {
+            unlinkat(fds[index], segment, AT_REMOVEDIR)
+        }
+        for fd in fds { close(fd) }
+    }
+
+    /// End to end: a path the walk cannot address is DETERMINISTIC, so the
+    /// delete-time refusal must not tell the user to re-scan and retry.
+    func testOverlongPathIsNotReportedAsATemporaryFailure() throws {
+        let entry = cachesRoot.appendingPathComponent("com.example.Overlong")
+        try mkdir(entry)
+        // 7 × 200 characters clears PATH_MAX (1024) from any temp root.
+        let segment = String(repeating: "n", count: 200)
+        let fds = try makeOverlongChain(under: entry, segment: segment, levels: 7)
+        defer { teardownOverlongChain(fds, segment: segment) }
+
+        let probe = OrphanedCachesScanner.preDeleteUserDataProbe(
+            at: entry, provider: FileSystemIdentityProvider()
+        )
+
+        XCTAssertFalse(probe.complete, "fail-closed is untouched")
+        XCTAssertEqual(probe.obstructions, [.unaddressablePath])
+        let guidance = OrphanedCachesScanner.remediationGuidance(
+            for: probe.obstructions
+        )
+        XCTAssertFalse(
+            guidance.hasSuffix("Re-scan and try again."),
+            "an unchanged tree reproduces this error exactly — promising a "
+                + "retry is the same wrong remedy the review removed: \(guidance)"
         )
     }
 

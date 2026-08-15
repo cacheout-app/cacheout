@@ -973,6 +973,72 @@ final class PathGuardTests: XCTestCase {
         }
     }
 
+    // MARK: - Ownership probe (fn-6.2, epic D12)
+
+    /// The probe feeds the ephemeral-temp scanner's sticky-root gate, and its
+    /// three-way split is the whole point: a `uid_t?` would collapse absence,
+    /// races and denials into one silent nil, hiding present-but-denied
+    /// entries against the visible-denial doctrine.
+
+    func testOwnerProbeReportsTheCurrentUserForOwnFixtures() throws {
+        let file = fixtureHome.appendingPathComponent("owned.txt")
+        try Data("x".utf8).write(to: file)
+
+        XCTAssertEqual(
+            FileSystemIdentityProvider().ownerProbe(of: file),
+            .owner(geteuid())
+        )
+    }
+
+    func testOwnerProbeIsAbsentForAMissingPath() {
+        XCTAssertEqual(
+            FileSystemIdentityProvider().ownerProbe(
+                of: fixtureHome.appendingPathComponent("nothing-here")
+            ),
+            .absent
+        )
+    }
+
+    /// NO-FOLLOW: a DANGLING symlink still reports the LINK's own owner — a
+    /// `stat`-based probe would fail with ENOENT here. A link's owner is the
+    /// link's, never its target's.
+    func testOwnerProbeDoesNotFollowSymlinks() throws {
+        let link = fixtureHome.appendingPathComponent("dangling")
+        try fm.createSymbolicLink(
+            at: link,
+            withDestinationURL: fixtureHome.appendingPathComponent("gone")
+        )
+
+        XCTAssertEqual(
+            FileSystemIdentityProvider().ownerProbe(of: link),
+            .owner(geteuid())
+        )
+    }
+
+    /// A present entry whose OWNERSHIP cannot be established is `.failed` with
+    /// the errno RETAINED — the caller classifies it (EACCES ⇒ permission
+    /// denied) and keeps it visible instead of silently excluding it.
+    func testOwnerProbeRetainsErrnoWhenTheParentDeniesSearch() throws {
+        try XCTSkipIf(geteuid() == 0, "chmod-000 denies nothing under euid 0")
+        let directory = fixtureHome.appendingPathComponent("sealed")
+        try mkdir(directory)
+        let child = directory.appendingPathComponent("inside.txt")
+        try Data("x".utf8).write(to: child)
+        try fm.setAttributes(
+            [.posixPermissions: 0o000], ofItemAtPath: directory.path
+        )
+        addTeardownBlock { [fm] in
+            try? fm.setAttributes(
+                [.posixPermissions: 0o755], ofItemAtPath: directory.path
+            )
+        }
+
+        XCTAssertEqual(
+            FileSystemIdentityProvider().ownerProbe(of: child),
+            .failed(errno: EACCES)
+        )
+    }
+
     // MARK: - Small helper
 
     /// Canonical path of a fixture URL, for exact error-payload assertions.

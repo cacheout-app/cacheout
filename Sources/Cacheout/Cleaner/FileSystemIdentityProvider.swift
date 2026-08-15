@@ -193,6 +193,43 @@ class FileSystemIdentityProvider {
         return nil
     }
 
+    // MARK: - Ownership (fn-6.2, epic D12 — override point for tests)
+
+    /// Errno-aware OWNERSHIP probe result. Deliberately NOT a `uid_t?`: a nil
+    /// would collapse three outcomes a caller must route differently —
+    /// absence (a benign race), a permission/IO failure (which has to stay
+    /// VISIBLE, per the app's no-silent-zero doctrine), and a genuinely
+    /// observed foreign owner. Mirrors `KindProbe`'s split exactly.
+    enum OwnerProbe: Equatable {
+        /// The owning uid actually read from the entry itself (no-follow).
+        case owner(uid_t)
+        /// ENOENT/ENOTDIR — the path simply is not there.
+        case absent
+        /// `lstat` failed for a reason other than absence (EACCES, EPERM, …).
+        case failed(errno: Int32)
+    }
+
+    /// `st_uid` of the object at `url` ITSELF (`lstat`, no-follow — a
+    /// symlink's owner is the link's, never its target's), with errno
+    /// retained on failure.
+    ///
+    /// Its one consumer today is the ephemeral-temp scanner's sticky-root
+    /// ownership gate (epic D12): under a world-writable temp root, another
+    /// user's entry is readable yet UNDELETABLE by sticky-directory rules, so
+    /// listing it would claim reclaimable bytes known false at scan time.
+    /// This is the override point for tests — a genuine cross-user fixture
+    /// cannot be created from a single uid.
+    func ownerProbe(of url: URL) -> OwnerProbe {
+        var st = stat()
+        guard lstat(url.path, &st) == 0 else {
+            let code = errno
+            return (code == ENOENT || code == ENOTDIR)
+                ? .absent
+                : .failed(errno: code)
+        }
+        return .owner(st.st_uid)
+    }
+
     // MARK: - Canonicalization
 
     /// `realpath(3)` of `path`; `nil` when it fails (typically ENOENT).

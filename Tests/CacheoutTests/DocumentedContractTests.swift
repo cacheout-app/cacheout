@@ -391,6 +391,12 @@ final class DocumentedContractTests: XCTestCase {
             "Sources/Cacheout/Info.plist",
             "project.yml",
             "scripts/bundle.sh",
+            // The GENERATED fourth copy, checked in and shipped by the Xcode
+            // build path. It drifted silently when project.yml changed
+            // (found in fn-5.6): a generated artifact still ships, so it is
+            // held to the same sync rule — a failure here means the checked-in
+            // project is stale and `xcodegen generate` was not re-run.
+            "Cacheout.xcodeproj/project.pbxproj",
         ]
         let documents = "Cacheout looks for developer build-artifact folders "
             + "(target/, node_modules/, .venv/ and similar) and stale git "

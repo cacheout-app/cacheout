@@ -71,6 +71,7 @@
 		9891100B0B90E4B88DBE923E /* CacheCleaner.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1230916736A41CCED07F35CA /* CacheCleaner.swift */; };
 		9AEB2C0D8F19C4470F26CF15 /* CacheoutViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = D564143E7CC34F104D9274A0 /* CacheoutViewModel.swift */; };
 		A0358BB924BC7F234052EC60 /* WorktreeReclaimPerformer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 379987CF5B79ABDF997B7DC1 /* WorktreeReclaimPerformer.swift */; };
+		A2F30550AAFBE3C54CB029CA /* GitWorktreeScanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = E76EC93CDCAC20AF891B84DD /* GitWorktreeScanner.swift */; };
 		A33E0DD02A3A4774BB09DFE7 /* ScanResult.swift in Sources */ = {isa = PBXBuildFile; fileRef = BC4E35BBC87E2364C890D8EB /* ScanResult.swift */; };
 		A43CF960F06EEC4A6F9C4C1D /* MenuBarIconTemplate.png in Resources */ = {isa = PBXBuildFile; fileRef = B878A98009FCF82EC164CFFD /* MenuBarIconTemplate.png */; };
 		A4E06C2EC0CFD54C2BDA25FE /* MemoryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 478B5454F1D3E7D6047E1E6C /* MemoryView.swift */; };
@@ -286,6 +287,7 @@
 		E638A9E7E14DFE181F014833 /* HealthScore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HealthScore.swift; sourceTree = "<group>"; };
 		E67941938A2005282222342F /* JetsamPriorityEntryDTO.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JetsamPriorityEntryDTO.swift; sourceTree = "<group>"; };
 		E6EE7823FD0C101186B28314 /* main.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = main.swift; sourceTree = "<group>"; };
+		E76EC93CDCAC20AF891B84DD /* GitWorktreeScanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GitWorktreeScanner.swift; sourceTree = "<group>"; };
 		E88E2595E9EE04EB9B26FFC0 /* MenuBarView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MenuBarView.swift; sourceTree = "<group>"; };
 		E9BFFD7E10C4A7542DB9FC2E /* GitWorktreeInventory.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GitWorktreeInventory.swift; sourceTree = "<group>"; };
 		EF1F365F6A2B91448060F8D6 /* AgentDetector.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentDetector.swift; sourceTree = "<group>"; };
@@ -350,6 +352,7 @@
 				7A7C712109CDC8595E0BB9A1 /* DirectorySizer.swift */,
 				14FAD15AA744620E0BEFE581 /* GitCommandRunner.swift */,
 				E9BFFD7E10C4A7542DB9FC2E /* GitWorktreeInventory.swift */,
+				E76EC93CDCAC20AF891B84DD /* GitWorktreeScanner.swift */,
 				B69D25090E909C3A91ED47CB /* InstalledAppResolver.swift */,
 				4498672B01BC7DADFF0A5D0E /* OrphanedCacheClassifier.swift */,
 				406A840A809552F909991D62 /* OrphanedCachesScanner.swift */,
@@ -807,6 +810,7 @@
 				249C9634CFBAD37F324B7B43 /* Formatters.swift in Sources */,
 				DB3D6FA8B8C895D201EAA115 /* GitCommandRunner.swift in Sources */,
 				07C439BB8299EED3B6E1782F /* GitWorktreeInventory.swift in Sources */,
+				A2F30550AAFBE3C54CB029CA /* GitWorktreeScanner.swift in Sources */,
 				C048F0DFA7681A952CA103A5 /* HealthScore.swift in Sources */,
 				A62B3A2B794E7B29FCBCED8D /* HelperInstaller.swift in Sources */,
 				BAD850782EDBBC4BEC43C12E /* InstalledAppResolver.swift in Sources */,

@@ -747,11 +747,22 @@ struct SpaceScannerRuntime {
     ///   roots (and the walker's roots); `issues` ride EVERY scan outcome,
     ///   so a policy-rejected persisted root stays visible while never
     ///   registering or walking (R16).
+    /// - Parameter ephemeralTempThresholds: the ephemeral temp scanner's size
+    ///   floor + stale age (fn-6, R7). `nil` — the GUI's composition —
+    ///   resolves defaults → UserDefaults HERE, exactly like
+    ///   `orphanedCachesThresholds`; the CLI passes an invocation-scoped
+    ///   layering that folds in its `--tmp-*` flags (never persisted).
+    ///   Construction state by frozen contract: thresholds do not ride
+    ///   `ScanContext`. The scanner's ROOTS are not a parameter — they are
+    ///   the closed 3-root confstr declaration (`EphemeralTempRoots`), which
+    ///   resolves them here and hands the canonical spellings straight to
+    ///   `trustedContainerRoots`.
     static func production(
         home: URL = FileManager.default.homeDirectoryForCurrentUser,
         provider: FileSystemIdentityProvider = FileSystemIdentityProvider(),
         orphanedCachesThresholds: OrphanedCacheClassifier.Thresholds? = nil,
-        devRoots: DevRootsResolution? = nil
+        devRoots: DevRootsResolution? = nil,
+        ephemeralTempThresholds: EphemeralTempSweepConfig.Thresholds? = nil
     ) -> SpaceScannerRuntime {
         let categories = CacheCategory.allCategories
         let categoryScanner = CategoryScanner(
@@ -776,9 +787,24 @@ struct SpaceScannerRuntime {
                 ?? OrphanedCachesSweepConfig.resolvedThresholds(),
             installedAppStatus: { installedAppResolver.status(ofBundleID: $0) }
         )
+        // fn-6: registration is the ONLY admission-widening lever — declaring
+        // the resolved temp roots here is what puts them in the session
+        // snapshot and in delete-time container admission. A root that
+        // confstr could not resolve is simply absent from the set (never a
+        // hardcoded `/var/folders` guess), and the scanner defers entirely on
+        // `.automatic` triggers, so registering it costs a background scan
+        // nothing.
+        let ephemeralTempScanner = EphemeralTempScanner(
+            roots: EphemeralTempRoots.resolve(provider: provider),
+            home: home,
+            thresholds: ephemeralTempThresholds
+                ?? EphemeralTempSweepConfig.resolvedThresholds(),
+            provider: provider
+        )
         return try! SpaceScannerRuntime(
             scanners: [
                 categoryScanner, buildArtifactsScanner, orphanedCachesScanner,
+                ephemeralTempScanner,
             ],
             categories: categories,
             home: home,

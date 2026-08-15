@@ -14,12 +14,13 @@ Built for developers on space-constrained Macs (especially the 256GB M4 Mac Mini
 
 - **Built-in cache categories** — Xcode, Docker, npm, Yarn, pnpm, Homebrew, Playwright, CocoaPods, Swift PM, Gradle, browser caches, VS Code, Electron, pip, and more (the full list lives in [docs/v1/CATEGORIES.md](docs/v1/CATEGORIES.md))
 - **Project build-artifact scanner** — Walks your configured dev roots for build output proven by an ecosystem marker file (`target/` beside `Cargo.toml`, `node_modules/` beside `package.json`, `.venv/` containing `pyvenv.cfg`, and more), shows size and staleness (30d+), and refuses to delete a directory holding release artifacts (`.dmg`, `.pkg`, `.ipa`, `.app`, `.xcarchive`, `.dSYM`) until you acknowledge them
+- **Ephemeral temp sweep** — Lists stale scratch directories in the temp locations macOS does not reliably prune (`/private/tmp` and your per-user temp/cache containers), aged by their newest content so anything in use stays put. Scanned only when you explicitly ask, never selected for you
 - **Risk-level indicators** — Each category rated Safe / Review / Caution so you know what's risk-free
 - **Async parallel scanning** — Scans all categories concurrently for fast results
 - **Sparse file awareness** — Reports allocated (on-disk) usage everywhere, so sparse files — Docker's disk image, simulator disk images, and anything else logically larger than it really is — show what they actually consume, not inflated logical sizes
 - **Move to Trash option** — Recoverable deletion instead of permanent removal
 - **Cleanup logging** — All actions logged to `~/.cacheout/cleanup.log`
-- **No admin privileges** — Only touches user-space caches (`~/Library/`, `~/.`)
+- **No admin privileges** — Runs entirely as you: user-space caches (`~/Library/`, `~/.`), your dev roots, and the ephemeral temp locations (`/private/tmp` and your own per-user temp/cache containers); another user's temp files are never listed
 - **No network access** — No analytics, no telemetry, no update checks
 - **Native SwiftUI** — Lightweight, fast, feels like a first-party macOS app
 
@@ -106,9 +107,25 @@ Headless too: `--cli scan` lists every find as a `scanner_items` row, and
 `build_artifacts:<item-id>` for one) deletes them. See
 [docs/v1/CLI-REFERENCE.md](docs/v1/CLI-REFERENCE.md).
 
+## Ephemeral Temp Files
+
+`/private/tmp` and your per-user temp and cache containers collect scratch
+directories that nothing on modern macOS reliably cleans up — a month-old
+build sandbox or agent workspace can sit there through reboots. Cacheout
+lists the stale ones: an entry qualifies when its NEWEST content is older
+than the age threshold (7 days by default) and it is at least 10 MB, so a
+directory holding one fresh file deep inside is left alone, and so is
+anything the current session just wrote.
+
+These locations are scanned only when you explicitly press Scan (or run
+`--cli scan`) — automatic background refreshes never touch them. Findings
+are always Review risk and never selected for you, temp files another user
+owns are never listed, and anything Cacheout could not read is reported
+rather than quietly counted as empty.
+
 ## How it works
 
-Cacheout scans known cache directories in your home folder (`~/Library/Caches`, `~/Library/Developer`, `~/.npm`, etc.) and calculates actual disk usage using `totalFileAllocatedSize` (which correctly handles sparse files like Docker's disk image).
+Cacheout scans known cache directories in your home folder (`~/Library/Caches`, `~/Library/Developer`, `~/.npm`, etc.), your configured dev roots, and the ephemeral temp locations above, and calculates actual disk usage using `totalFileAllocatedSize` (which correctly handles sparse files like Docker's disk image).
 
 You select which caches to clean, confirm the action, and Cacheout either moves them to Trash or permanently deletes them. All cleanup actions are logged.
 

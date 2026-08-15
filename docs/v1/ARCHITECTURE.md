@@ -21,6 +21,7 @@ business logic (scanning/cleaning), state management, and presentation.
 │  SpaceScannerRuntime (registry + validated scan stream)     │
 │    CategoryScanner ──► CacheScanner (actor)                 │
 │    BuildArtifactsScanner │ OrphanedCachesScanner            │
+│    EphemeralTempScanner                                     │
 │    CacheCleaner (actor)                                     │
 ├─────────────────────────────────────────────────────────────┤
 │                     Data Models                             │
@@ -56,6 +57,8 @@ Sources/Cacheout/
 │   ├── BuildArtifactsScanner.swift     # Project build-artifact scanner (SpaceScanner)
 │   ├── ValuablesDetector.swift         # Release-artifact probe + acknowledgement tokens
 │   ├── OrphanedCachesScanner.swift     # First-level ~/Library/Caches sweep (SpaceScanner)
+│   ├── EphemeralTempRoots.swift        # confstr-resolved temp roots + their sweep config
+│   ├── EphemeralTempScanner.swift      # First-level ephemeral temp sweep (SpaceScanner)
 │   └── SpaceScanner.swift              # SpaceScanner protocol, ReclaimableItem model, SpaceScannerRuntime
 ├── Cleaner/
 │   ├── CacheCleaner.swift              # Guarded deletion/trash + InodeAccountingRegistry (actors)
@@ -89,6 +92,7 @@ These actors provide thread-safe business logic:
 |-------|---------|-------------|
 | `CacheScanner` | Parallel category scanning (sizing delegated to `DirectorySizer`) | `scanAll()`, `scanCategory()` |
 | `BuildArtifactsScanner` | Project build-artifact discovery over the dev roots (a `SpaceScanner`; a value type, listed here beside its peers) | `scan(context:)`, `preDeleteRevalidator(provider:)` |
+| `EphemeralTempScanner` | Stale first-level entries in the three ephemeral temp roots (a `SpaceScanner`; a value type, listed here beside its peers). Runs on user-initiated scans only | `scan(context:)` |
 | `CacheCleaner` | Guarded deletion, freed-bytes accounting, logging | `clean(items:moveToTrash:)`, `runCleanCommand()` |
 | `InodeAccountingRegistry` | Per-operation claim-based freed-bytes settlement | `registerObservations(_:)`, `acceptSuccessful(_:)` |
 
@@ -276,8 +280,9 @@ settings change.
 Cacheout used to have two parallel scanning stacks: the data-driven
 `CacheCategory` aggregate registry and a bespoke node_modules scanner (own
 item model, own views, own cleaner branch — and absent from the CLI
-entirely). The planned scanners (build artifacts, git worktrees, temp dirs,
-orphaned caches) are all per-item by nature; replicating that pattern for
+entirely). The per-item scanners (build artifacts, orphaned caches,
+ephemeral temp files, and git worktrees still to come) are all per-item by
+nature; replicating that pattern for
 each would mean ~6 touch-points per scanner and guaranteed drift — the
 pre-unification CLI gap (node_modules was never wired into the CLI at all)
 is the proof. The bespoke scanner has since been subsumed by
@@ -399,7 +404,14 @@ to defer update checks until a signed appcast URL is configured in Info.plist.
 
 ## Security Model
 
-- **No admin privileges**: Only accesses user-space directories (`~/Library/`, `~/.`)
+- **No admin privileges**: everything runs as the invoking user, with no
+  helper and no elevation on any scan or clean path. The reach is user-space
+  caches (`~/Library/`, `~/.`), the configured dev roots, and — since the
+  ephemeral temp scanner — the world-writable `/private/tmp` plus this
+  user's own `…/T` and `…/C` containers under `/private/var/folders`. Those
+  temp roots are read only on user-initiated scans, and an entry another
+  user owns is never listed (sticky-directory rules make it undeletable, so
+  claiming its bytes would be a lie)
 - **No network access**: No analytics, telemetry, or phoning home
 - **PathGuard admission on every destructive path**: category roots, contained
   children, per-item scanner targets, and cleanCommands roots are admitted against
@@ -415,7 +427,9 @@ to defer update checks until a signed appcast URL is configured in Info.plist.
   before any surface can address their items, and the cleaner independently
   refuses the same malformed shapes at dispatch (defense in depth)
 - **TCC-respecting scans**: privacy-protected roots (Documents / Desktop /
-  Downloads) are enumerated only on user-initiated scans, with usage strings
+  Downloads) — and the ephemeral temp roots, which are same-user-writable and
+  therefore cannot honor the background no-prompt guarantee — are enumerated
+  only on user-initiated scans, with usage strings
   in the Info.plist; the CLI surfaces denials as `scan_error` + `grant_hint`
   instead of reading zero
 - **Sandboxed shell commands**: Probe commands run with a restricted PATH and 2s timeout

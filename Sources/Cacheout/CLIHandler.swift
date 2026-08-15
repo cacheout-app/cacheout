@@ -37,6 +37,12 @@
 ///   REJECTS them with `INVALID_ARGUMENTS` before dispatch. Overrides the
 ///   persisted `cacheout.orphanedCaches.*` value for this invocation;
 ///   never persisted
+/// - `--tmp-age-days N` / `--tmp-min-size-mb N`: invocation-scoped
+///   ephemeral temp-scanner thresholds (positive integers; days / decimal
+///   MB), governed by the SAME family gate as the sweep pair — accepted by
+///   `scan` and `clean` ONLY, every other command REJECTS them with
+///   `INVALID_ARGUMENTS` before dispatch. Overrides the persisted
+///   `cacheout.ephemeralTmp.*` value for this invocation; never persisted
 /// - `--dev-root <path>`: REPEATABLE, invocation-scoped REPLACEMENT of the
 ///   dev roots the build-artifacts scanner walks. Accepted by `scan` and
 ///   `clean` ONLY (every other command REJECTS it with `INVALID_ARGUMENTS`
@@ -195,28 +201,35 @@ struct CLIHandler {
             // `trustedContainerRoots` freeze at registration (D1).
             let sweepThresholds = resolveSweepThresholds(from: args)
             let devRoots = resolveDevRoots(invocation, in: args)
+            let tempThresholds = resolveEphemeralTempThresholds(from: args)
             await handleScan(deps: .production(
-                orphanedCachesThresholds: sweepThresholds, devRoots: devRoots
+                orphanedCachesThresholds: sweepThresholds, devRoots: devRoots,
+                ephemeralTempThresholds: tempThresholds
             ))
 
         case .clean:
             let sweepThresholds = resolveSweepThresholds(from: args)
             let devRoots = resolveDevRoots(invocation, in: args)
+            let tempThresholds = resolveEphemeralTempThresholds(from: args)
             await handleClean(
                 slugs: invocation.targets,
                 acknowledgements: resolveAcknowledgements(invocation, in: args),
                 dryRun: isDryRun, confirmed: isConfirmed,
                 deps: .production(
                     orphanedCachesThresholds: sweepThresholds,
-                    devRoots: devRoots
+                    devRoots: devRoots,
+                    ephemeralTempThresholds: tempThresholds
                 )
             )
 
         case .smartClean:
-            // smart-clean is frozen category-only (fn-2 round 10): the
-            // sweep never runs there. Its sweep flags are a usage error,
-            // not a silent no-op — rejected by the pre-dispatch gate above
-            // along with every other non-scan/clean command.
+            // smart-clean is frozen category-only (fn-2 round 10): NO
+            // per-item scanner runs there — not the sweep, not the ephemeral
+            // temp scanner (whose items are `.review`, unselected and never
+            // automatically clean-eligible by construction). Every
+            // scanner-threshold flag is therefore a usage error here, not a
+            // silent no-op — rejected by the pre-dispatch gate above along
+            // with every other non-scan/clean command.
             //
             // An ABSENT target defaults to 5.0; a PRESENT but malformed one
             // is a usage error — silently defaulting would let
@@ -405,14 +418,20 @@ struct CLIHandler {
         ///   the only thing that can carry them, and one CLI invocation is
         ///   one runtime. `--dev-root` parsing is fn-4.6's; nothing here is
         ///   ever persisted.
+        /// - Parameter ephemeralTempThresholds: invocation-scoped ephemeral
+        ///   temp thresholds (fn-6, R7) — nil resolves defaults →
+        ///   UserDefaults inside the runtime factory, exactly like the sweep
+        ///   pair. Never persisted.
         static func production(
             orphanedCachesThresholds: OrphanedCacheClassifier.Thresholds? = nil,
-            devRoots: DevRootsResolution? = nil
+            devRoots: DevRootsResolution? = nil,
+            ephemeralTempThresholds: EphemeralTempSweepConfig.Thresholds? = nil
         ) -> CLIRuntimeDependencies {
             CLIRuntimeDependencies(
                 runtime: .production(
                     orphanedCachesThresholds: orphanedCachesThresholds,
-                    devRoots: devRoots
+                    devRoots: devRoots,
+                    ephemeralTempThresholds: ephemeralTempThresholds
                 ),
                 categorySlugs: Set(CacheCategory.allCategories.map(\.slug))
             )
@@ -479,48 +498,72 @@ struct CLIHandler {
     static let orphanSizeFloorFlag = "--orphan-size-floor-mb"
     static let orphanStaleDaysFlag = "--orphan-stale-days"
 
-    /// Pure parse of both sweep flags (in-process testable; the process
-    /// shell translates a failure into the INVALID_ARGUMENTS exit). Each
-    /// value must be a positive integer whose unit conversion does not
-    /// overflow — zero, negative, non-numeric, and overflowing values are
-    /// REJECTED (fail-safe R8), never silently defaulted. A REPEATED flag
-    /// is likewise rejected: any first-/last-wins rule would silently
-    /// ignore one of two contradictory values — and skip validating the
-    /// ignored occurrence, letting `--orphan-size-floor-mb 1
+    /// ONE scanner-threshold flag's value, for EVERY threshold family (fn-6:
+    /// the sweep's two flags and the ephemeral temp scanner's two share this
+    /// body verbatim, so the two families cannot drift in validation or in
+    /// wording).
+    ///
+    /// The value must be a positive integer whose unit conversion does not
+    /// overflow — zero, negative, non-numeric, MISSING, and overflowing
+    /// values are REJECTED (fail-safe R8), never silently defaulted. A
+    /// REPEATED flag is likewise rejected: any first-/last-wins rule would
+    /// silently ignore one of two contradictory values — and skip validating
+    /// the ignored occurrence, letting `--orphan-size-floor-mb 1
     /// --orphan-size-floor-mb garbage` slip past the malformed-value gate.
+    ///
+    /// A flag in LAST argv position collects no value, and silence there
+    /// would read exactly like an ABSENT flag — the caller would believe
+    /// they narrowed a scan they did not (the fn-4.6/fn-4.7 bug shape). The
+    /// occurrence-count guard below is what makes the trailing shape a loud
+    /// refusal instead: the flag is PRESENT (occurrence found) but has no
+    /// following token, so it fails rather than resolving to `nil`.
+    ///
+    /// There is deliberately NO truncate-to-zero branch: a positive `Int64`
+    /// times a positive unit multiplier either overflows (rejected above) or
+    /// lands at or above the multiplier — integer multiplication cannot
+    /// truncate toward zero the way the smart-clean `Double`-GB path can.
+    static func positiveIntegerFlagValue(
+        _ flag: String, in args: [String], converts: (Int64) -> Bool
+    ) -> Result<Int64?, CLIAddressError> {
+        let occurrences = args.indices.filter { args[$0] == flag }
+        guard let index = occurrences.first else {
+            return .success(nil)
+        }
+        guard occurrences.count == 1 else {
+            return .failure(CLIAddressError(
+                message: "\(flag) may be specified at most once"
+            ))
+        }
+        guard index + 1 < args.count else {
+            return .failure(CLIAddressError(
+                message: "\(flag) requires a positive integer value"
+            ))
+        }
+        let raw = args[index + 1]
+        guard let value = Int64(raw), value > 0 else {
+            return .failure(CLIAddressError(
+                message: "\(flag) requires a positive integer value, got: \(raw)"
+            ))
+        }
+        guard converts(value) else {
+            return .failure(CLIAddressError(
+                message: "\(flag) value \(raw) is too large — "
+                    + "the converted value overflows"
+            ))
+        }
+        return .success(value)
+    }
+
+    /// Pure parse of both sweep flags (in-process testable; the process
+    /// shell translates a failure into the INVALID_ARGUMENTS exit), through
+    /// the shared threshold-flag parse above.
     static func parseSweepThresholdOverrides(
         from args: [String]
     ) -> Result<(sizeFloorMB: Int64?, staleAgeDays: Int64?), CLIAddressError> {
         func parse(
             _ flag: String, converts: (Int64) -> Bool
         ) -> Result<Int64?, CLIAddressError> {
-            let occurrences = args.indices.filter { args[$0] == flag }
-            guard let index = occurrences.first else {
-                return .success(nil)
-            }
-            guard occurrences.count == 1 else {
-                return .failure(CLIAddressError(
-                    message: "\(flag) may be specified at most once"
-                ))
-            }
-            guard index + 1 < args.count else {
-                return .failure(CLIAddressError(
-                    message: "\(flag) requires a positive integer value"
-                ))
-            }
-            let raw = args[index + 1]
-            guard let value = Int64(raw), value > 0 else {
-                return .failure(CLIAddressError(
-                    message: "\(flag) requires a positive integer value, got: \(raw)"
-                ))
-            }
-            guard converts(value) else {
-                return .failure(CLIAddressError(
-                    message: "\(flag) value \(raw) is too large — "
-                        + "the converted value overflows"
-                ))
-            }
-            return .success(value)
+            positiveIntegerFlagValue(flag, in: args, converts: converts)
         }
 
         switch parse(orphanSizeFloorFlag, converts: {
@@ -540,16 +583,132 @@ struct CLIHandler {
         }
     }
 
+    // MARK: - Ephemeral temp thresholds (fn-6.4, R7)
+
+    /// Invocation-scoped overrides for the ephemeral temp scanner's
+    /// thresholds, accepted by `scan` and `clean` ONLY — exactly like the
+    /// sweep's pair. Values override the persisted
+    /// `cacheout.ephemeralTmp.*` value for this invocation and are NEVER
+    /// persisted.
+    static let tmpAgeDaysFlag = "--tmp-age-days"
+    static let tmpMinSizeMBFlag = "--tmp-min-size-mb"
+
+    /// Pure parse of both `--tmp-*` flags — the sweep parse's twin, sharing
+    /// its validation body (`positiveIntegerFlagValue`) so the two families
+    /// accept and refuse identically.
+    static func parseEphemeralTempThresholdOverrides(
+        from args: [String]
+    ) -> Result<(ageDays: Int64?, minSizeMB: Int64?), CLIAddressError> {
+        func parse(
+            _ flag: String, converts: (Int64) -> Bool
+        ) -> Result<Int64?, CLIAddressError> {
+            positiveIntegerFlagValue(flag, in: args, converts: converts)
+        }
+
+        switch parse(tmpAgeDaysFlag, converts: {
+            EphemeralTempSweepConfig.staleAge(fromDays: $0) != nil
+        }) {
+        case .failure(let error):
+            return .failure(error)
+        case .success(let ageDays):
+            switch parse(tmpMinSizeMBFlag, converts: {
+                EphemeralTempSweepConfig.sizeFloorBytes(fromMB: $0) != nil
+            }) {
+            case .failure(let error):
+                return .failure(error)
+            case .success(let minSizeMB):
+                return .success((ageDays, minSizeMB))
+            }
+        }
+    }
+
+    // MARK: - Scanner-threshold flag families (fn-6.4 generalization)
+
+    /// ONE scanner's invocation-scoped threshold flags as a FAMILY: which
+    /// flags it owns, which commands accept them, and — derived from those
+    /// same commands — its refusal wording.
+    ///
+    /// fn-3.4 shipped this gate sweep-specific in BOTH its flag list and its
+    /// message text. A second scanner with the same need had two options: a
+    /// parallel rejection function with its own `run()` call site (where a
+    /// future command joins one gate and not the other — silent drift), or
+    /// this: declare the family, keep ONE gate call. The sweep family's
+    /// message is BYTE-IDENTICAL to fn-3.4's, and the phrases are built from
+    /// `acceptingCommands`, so a refusal can never name a command set the
+    /// gate does not actually enforce.
+    struct ScannerThresholdFlagFamily: Sendable {
+        /// The family's flags, in the order a refusal reports them.
+        let flags: [String]
+        /// The commands that RUN this scanner and therefore accept the
+        /// flags — the single source for both the gate and its wording.
+        let acceptingCommands: [Command]
+        /// What the accepting commands do, e.g. "run the orphaned-caches
+        /// sweep" — the middle clause of the refusal.
+        let work: String
+
+        func accepts(_ command: Command) -> Bool {
+            acceptingCommands.contains(command)
+        }
+
+        /// The first of this family's flags present in an invocation of a
+        /// command that does not accept it, or nil. Accepting the flags
+        /// anywhere else would be a silent no-op lie.
+        func rejectedFlag(for command: Command, in args: [String]) -> String? {
+            guard !accepts(command) else { return nil }
+            return flags.first(where: args.contains)
+        }
+
+        /// The INVALID_ARGUMENTS message: names the offending flag, the
+        /// command that refused it, and the commands that accept it — the
+        /// caller's next invocation should be obvious from the refusal
+        /// alone.
+        func rejectionMessage(flag: String, command: Command) -> String {
+            "\(flag) is not accepted by \(command.rawValue) — only "
+                + commandPhrase(joinedBy: "and") + " \(work); use the flag "
+                + "with " + commandPhrase(joinedBy: "or")
+        }
+
+        /// "scan and clean" / "scan or clean" — the accepted set spelled out
+        /// in prose. Two accepting commands is the only shape that exists
+        /// today; a longer list would read "a and b and c", which is
+        /// clumsy but never wrong.
+        private func commandPhrase(joinedBy joiner: String) -> String {
+            acceptingCommands.map(\.rawValue).joined(separator: " \(joiner) ")
+        }
+    }
+
+    /// The orphaned-caches sweep's family (fn-3.4). Only `scan` and `clean`
+    /// run the sweep scanner — for every other command (smart-clean is
+    /// frozen category-only, fn-2 round 10; the rest have no sweep at all)
+    /// the flags are refused pre-dispatch.
+    static let sweepThresholdFlagFamily = ScannerThresholdFlagFamily(
+        flags: [orphanSizeFloorFlag, orphanStaleDaysFlag],
+        acceptingCommands: [.scan, .clean],
+        work: "run the orphaned-caches sweep"
+    )
+
+    /// The ephemeral temp scanner's family (fn-6.4). Same accepting set: the
+    /// two commands that run the scanner. `smart-clean` is frozen
+    /// category-only and never runs it, so its flags are refused there too.
+    static let ephemeralTempThresholdFlagFamily = ScannerThresholdFlagFamily(
+        flags: [tmpAgeDaysFlag, tmpMinSizeMBFlag],
+        acceptingCommands: [.scan, .clean],
+        work: "run the ephemeral temp scanner"
+    )
+
+    /// Every scanner-threshold family, in gate order. The sweep stays FIRST
+    /// so an invocation carrying flags from both families reports the sweep
+    /// flag exactly as it did before fn-6.
+    static let scannerThresholdFlagFamilies: [ScannerThresholdFlagFamily] = [
+        sweepThresholdFlagFamily, ephemeralTempThresholdFlagFamily,
+    ]
+
     /// The first sweep flag present in an invocation of a command that
-    /// never runs the orphaned-caches sweep, or nil. Only `scan` and
-    /// `clean` run the sweep scanner — for every other command
-    /// (smart-clean is frozen category-only, fn-2 round 10; the rest have
-    /// no sweep at all) accepting the flags would be a silent no-op lie.
-    /// `run()` turns a non-nil result into INVALID_ARGUMENTS before
-    /// dispatch.
+    /// never runs the orphaned-caches sweep, or nil — the family gate,
+    /// under fn-3.4's name (the OrphanedCachesScanner test surface and
+    /// `smartCleanRejectedSweepFlag` call it).
     static func rejectedSweepFlag(for command: Command, in args: [String]) -> String? {
-        guard command != .scan, command != .clean else { return nil }
-        return [orphanSizeFloorFlag, orphanStaleDaysFlag].first(where: args.contains)
+        sweepThresholdFlagFamily.rejectedFlag(for: command, in: args)
     }
 
     /// smart-clean's view of the pre-dispatch gate — the original fn-3.4
@@ -597,11 +756,12 @@ struct CLIHandler {
     /// (output is always JSON), but the MCP consumer appends `--format json`
     /// to EVERY invocation, so its value token must be recognized as a value.
     /// `--dev-root` (fn-4.6) is ONE table entry — the repeatable flag
-    /// consumes fn-4.9's grammar and adds no second parser.
+    /// consumes fn-4.9's grammar and adds no second parser. So do fn-6.4's
+    /// `--tmp-*` thresholds: a table entry each, never a second grammar.
     static let valuedFlags: Set<String> = [
         "--target-pid", "--target-name", "--top", "--format",
         orphanSizeFloorFlag, orphanStaleDaysFlag, acknowledgeValuablesFlag,
-        devRootFlag,
+        devRootFlag, tmpAgeDaysFlag, tmpMinSizeMBFlag,
     ]
 
     /// One invocation, normalized (F3): the command, its POSITIONAL targets,
@@ -678,16 +838,24 @@ struct CLIHandler {
 
     /// The CENTRALIZED pre-dispatch flag gate: the first flag present in an
     /// invocation of a command that does not accept it, with its refusal
-    /// message. Sweep flags (`scan`/`clean`) are checked first, preserving
-    /// fn-3.4's exact behavior and wording; `--acknowledge-valuables` is
-    /// clean-ONLY. Silently ignoring a flag the caller passed would hide it
-    /// landing on the wrong command — and for an acknowledgement, that is a
-    /// destructive-authorization input going nowhere.
+    /// message. The scanner-threshold FAMILIES are checked first, in
+    /// declaration order, preserving fn-3.4's exact behavior and wording for
+    /// the sweep; `--acknowledge-valuables` is clean-ONLY. Silently ignoring
+    /// a flag the caller passed would hide it landing on the wrong command —
+    /// and for an acknowledgement, that is a destructive-authorization input
+    /// going nowhere. `run()` has exactly ONE call site for this gate, and a
+    /// new threshold family joins by declaring itself, never by adding a
+    /// second call.
     static func rejectedFlag(
         for command: Command, in args: [String]
     ) -> (flag: String, message: String)? {
-        if let flag = rejectedSweepFlag(for: command, in: args) {
-            return (flag, sweepFlagRejectionMessage(flag: flag, command: command))
+        for family in scannerThresholdFlagFamilies {
+            if let flag = family.rejectedFlag(for: command, in: args) {
+                return (
+                    flag,
+                    family.rejectionMessage(flag: flag, command: command)
+                )
+            }
         }
         if command != .clean, args.contains(acknowledgeValuablesFlag) {
             return (
@@ -1031,14 +1199,33 @@ struct CLIHandler {
         }
     }
 
-    /// The INVALID_ARGUMENTS message for a rejected sweep flag: names the
-    /// offending flag, the command that refused it, and the commands that
-    /// accept it (kept actionable — the caller's next invocation should be
-    /// obvious from the refusal alone).
+    /// The INVALID_ARGUMENTS message for a rejected sweep flag — fn-3.4's
+    /// name for its family's wording, BYTE-IDENTICAL across the fn-6.4
+    /// generalization (asserted against the literal in the tests).
     static func sweepFlagRejectionMessage(flag: String, command: Command) -> String {
-        "\(flag) is not accepted by \(command.rawValue) — only scan and "
-            + "clean run the orphaned-caches sweep; use the flag with "
-            + "scan or clean"
+        sweepThresholdFlagFamily.rejectionMessage(flag: flag, command: command)
+    }
+
+    /// The process-facing resolution for the `--tmp-*` flags: parse both
+    /// (exiting via the invalid-arguments convention on a bad value) and,
+    /// when at least one is present, layer them over UserDefaults/defaults.
+    /// `nil` — no flags — lets the production factory resolve persisted
+    /// values itself, exactly as it does for the GUI. Nothing here writes
+    /// the defaults suite: an override is invocation-scoped, period.
+    private static func resolveEphemeralTempThresholds(
+        from args: [String]
+    ) -> EphemeralTempSweepConfig.Thresholds? {
+        switch parseEphemeralTempThresholdOverrides(from: args) {
+        case .failure(let error):
+            exitWithError(code: "INVALID_ARGUMENTS", message: error.message)
+        case .success(let overrides):
+            guard overrides.ageDays != nil
+                || overrides.minSizeMB != nil else { return nil }
+            return EphemeralTempSweepConfig.resolvedThresholds(
+                minSizeMBOverride: overrides.minSizeMB,
+                ageDaysOverride: overrides.ageDays
+            )
+        }
     }
 
     /// The process-facing resolution: parse both flags (exiting via the

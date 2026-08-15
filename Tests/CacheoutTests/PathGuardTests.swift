@@ -921,7 +921,9 @@ final class PathGuardTests: XCTestCase {
         // THE NO-REGRESSION CELL: the policy runs on every configured root
         // of every registered scanner, so the production union itself has to
         // pass it — seeded dev roots (several of them protected first-level
-        // children) plus the orphaned-caches sweep root.
+        // children), the orphaned-caches sweep root, and (fn-6.4) the
+        // machine's REAL confstr-resolved ephemeral temp roots, which are the
+        // first registered roots that live OUTSIDE `$HOME`.
         let suiteName = "PathGuardTests-\(UUID().uuidString)"
         let suite = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         defer { suite.removePersistentDomain(forName: suiteName) }
@@ -934,7 +936,18 @@ final class PathGuardTests: XCTestCase {
         let roots = runtime.trustedContainerRoots
         // Non-vacuity: the union must actually carry the seeded roots AND a
         // protected first-level child (the case the policy must NOT reject).
-        XCTAssertEqual(roots.count, DevRootsStore.seedRootNames.count + 1)
+        // The temp roots are counted through their own declaration, so the
+        // expectation stays a property of the composition rather than of this
+        // machine's confstr answers.
+        let tempRoots = EphemeralTempRoots.resolve(provider: provider)
+        XCTAssertEqual(
+            roots.count,
+            DevRootsStore.seedRootNames.count + 1 + tempRoots.count
+        )
+        XCTAssertTrue(
+            tempRoots.contains { $0.url.path == "/private/tmp" },
+            "the shared temp root is always in the declared set"
+        )
         XCTAssertTrue(
             roots.contains { $0.path == fixtureHome.appendingPathComponent("Documents").path },
             "~/Documents is a seeded dev root — the legal protected child"

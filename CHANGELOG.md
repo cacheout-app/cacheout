@@ -41,6 +41,29 @@ and docs/v1/CLI-REFERENCE.md) — the pre-release `node_modules` →
   An inspection that could not finish is treated exactly like a change:
   refused, tokenless, re-scan required. Full contract in PROTOCOL.md and
   `docs/v1/CLI-REFERENCE.md`.
+- **Ephemeral temp files in the GUI and the CLI.** An `ephemeral_tmp`
+  per-item scanner lists STALE first-level entries in the three ephemeral
+  locations macOS does not reliably prune: `/private/tmp` and the per-user
+  temp (`…/T`) and cache (`…/C`) containers, resolved from the OS rather
+  than hardcoded. An entry qualifies when its NEWEST content is older than
+  the age threshold (default 7 days) and it meets the size floor (default
+  10 MB) — a directory holding one fresh file deep inside is not stale, so
+  live workspaces (including the running session's own scratch directory)
+  stay put. Findings are Review risk, never default-selected, and never part
+  of Quick Clean or `smart-clean`. Entries another user owns are never
+  listed — sticky-directory rules make them undeletable, so claiming their
+  bytes would be false; anything unreadable is reported instead of silently
+  counted as empty. `--cli scan` reports each find as a `scanner_items` row
+  and `--cli clean` accepts `ephemeral_tmp` or `ephemeral_tmp:<item-id>`,
+  with `--confirm` required as everywhere else. **These locations are
+  scanned only on EXPLICIT user-initiated scans** — the app's automatic
+  background refreshes never enumerate them, and a CLI scan is always
+  user-initiated. Thresholds persist as `cacheout.ephemeralTmp.ageDays` /
+  `cacheout.ephemeralTmp.minSizeMB` and take invocation-scoped
+  `--tmp-age-days` / `--tmp-min-size-mb` overrides on `scan` and `clean`
+  (never persisted; refused on every other command, `smart-clean`
+  included). No schema change: `schema_version` stays 4 and every addition
+  is additive.
 - **Configurable dev roots.** Settings gains a dev-roots editor and the CLI a
   repeatable `--dev-root PATH` (invocation-scoped, never persisted). The
   filesystem root, any volume root or mount point, and `$HOME` itself are

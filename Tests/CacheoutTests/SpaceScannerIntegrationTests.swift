@@ -495,10 +495,19 @@ final class SpaceScannerIntegrationTests: XCTestCase {
         )
     }
 
-    /// Every PER-ITEM scanner of a runtime (the aggregate adapter excluded).
+    /// Every PER-ITEM scanner of a runtime that this fixture may drive (the
+    /// aggregate adapter excluded, and `ephemeral_tmp` with it): fn-6.4
+    /// registers the temp scanner over the machine's REAL confstr roots
+    /// (`/private/tmp`, `…/T`, `…/C`), so including it here would walk live
+    /// system state — neither hermetic nor fast. Its registration is asserted
+    /// structurally, and its scan/clean behavior over INJECTED fixture roots
+    /// lives in `EphemeralTempRegistrationTests`.
     private func perItemScannerIDs(_ runtime: SpaceScannerRuntime) -> Set<String> {
         Set(runtime.scanners.map(\.id))
-            .subtracting([CategoryScanner.registeredID])
+            .subtracting([
+                CategoryScanner.registeredID,
+                EphemeralTempScanner.registeredID,
+            ])
     }
 
     /// One validated scan of the given scanner subset, collected per scanner
@@ -551,6 +560,7 @@ final class SpaceScannerIntegrationTests: XCTestCase {
             CategoryScanner.registeredID,
             BuildArtifactsScanner.registeredID,
             OrphanedCachesScanner.registeredID,
+            EphemeralTempScanner.registeredID,
         ])
         XCTAssertFalse(
             runtime.scanners.contains { $0.id == retiredNodeModulesSlug },
@@ -729,10 +739,17 @@ final class SpaceScannerIntegrationTests: XCTestCase {
             "the rebuilt runtime walks BOTH configured roots"
         )
         // Still the production registry — the factory rebuilt the same
-        // composition, not a different one.
+        // composition, not a different one. (Every registered per-item
+        // scanner gets a section, whether or not this scan requested it:
+        // `ephemeral_tmp` is here with no items because only
+        // `build_artifacts` was scanned.)
         XCTAssertEqual(
             viewModel.perItemSections.map(\.scannerID),
-            [BuildArtifactsScanner.registeredID, OrphanedCachesScanner.registeredID]
+            [
+                BuildArtifactsScanner.registeredID,
+                OrphanedCachesScanner.registeredID,
+                EphemeralTempScanner.registeredID,
+            ]
         )
     }
 

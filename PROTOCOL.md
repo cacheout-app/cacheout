@@ -70,8 +70,8 @@ The MCP server discovers CacheOut capabilities before invoking commands. This en
 - `scan` output changes from a top-level array to the **scan envelope**
   (`{schema_version, categories, scanner_items, scanner_errors}`). The
   `categories` rows are field-for-field the schema-3 rows; the other keys
-  are additive (per-item scanners — `build_artifacts` and
-  `orphaned_caches` today — become visible for the first time).
+  are additive (per-item scanners — `build_artifacts`, `orphaned_caches`
+  and `ephemeral_tmp` today — become visible for the first time).
 - `clean` accepts the **target address grammar** (`<category-slug>` |
   `<scanner-slug>` | `<scanner-slug>:<item-id>`) — bare category slugs work
   exactly as in schema 3.
@@ -157,6 +157,29 @@ unique inodes whose deletion verifiably frees them; `estimated_up_to_bytes`
 are hardlinked bytes that MAY be freed. `size_bytes` remains their
 compatibility sum.
 
+**Arguments:**
+- `--orphan-size-floor-mb N` / `--orphan-stale-days N` -- invocation-scoped
+  orphaned-caches sweep thresholds (positive integers; decimal MB / days).
+  They override the persisted `cacheout.orphanedCaches.*` values for this
+  invocation and are never persisted
+- `--tmp-age-days N` / `--tmp-min-size-mb N` -- invocation-scoped ephemeral
+  temp-scanner thresholds (positive integers; days / decimal MB). They
+  override the persisted `cacheout.ephemeralTmp.*` values for this
+  invocation and are never persisted
+- `--dev-root <path>` -- REPEATABLE, invocation-scoped REPLACEMENT of the dev
+  roots the build-artifacts scanner walks (never persisted)
+
+Each threshold flag is a SCANNER-THRESHOLD FLAG: accepted by `scan` and
+`clean` only, and refused pre-dispatch everywhere else — see
+[Scanner-threshold flags](#scanner-threshold-flags). A zero, negative,
+non-numeric, missing, repeated, or overflowing value is `INVALID_ARGUMENTS`
+naming the flag; nothing is scanned.
+
+**Trigger.** A CLI scan is always an explicit user act, so it runs with the
+user-initiated trigger: `--cli scan` covers every registered scanner,
+including `ephemeral_tmp`, which defers entirely on the app's background
+refreshes.
+
 **Output schema (envelope):**
 
 ```json
@@ -241,7 +264,7 @@ compatibility sum.
 |-------|------|----------|-------------|
 | `schema_version` | integer | yes | Always present — every schema-4 payload self-describes |
 | `categories` | object[] | yes | Schema 3's category rows, field-for-field (table below). NO `scanner_id`/`item_id` here — identity fields live on `scanner_items` and the clean/smart-clean rows only |
-| `scanner_items` | object[] | yes | One row per PER-ITEM scanner item (`build_artifacts` and `orphaned_caches` today; git worktrees and temp dirs to follow). Empty array when no per-item scanner found anything |
+| `scanner_items` | object[] | yes | One row per PER-ITEM scanner item (`build_artifacts`, `orphaned_caches` and `ephemeral_tmp` today; git worktrees to follow). Empty array when no per-item scanner found anything |
 | `scanner_errors` | object[] | yes | Root/scanner-level problems that produced NO item (refused search roots, traversal failures, malformed outcomes). Empty array when clean |
 
 **`scanner_items` rows:**
@@ -382,13 +405,23 @@ A positional target token is ONE of:
   one entry per item. Authorizes deletion of an item that discloses release
   artifacts. Accepted by `clean` ONLY — see
   [the acknowledgement contract](#valuables-acknowledgement-contract-schema-4)
+- `--orphan-size-floor-mb N` / `--orphan-stale-days N` -- invocation-scoped
+  orphaned-caches sweep thresholds (same semantics as on `scan`; never
+  persisted). `clean` re-scans before it deletes, so these decide which
+  entries a bare `orphaned_caches` target covers
+- `--tmp-age-days N` / `--tmp-min-size-mb N` -- invocation-scoped ephemeral
+  temp-scanner thresholds (same semantics as on `scan`; never persisted).
+  They likewise decide which entries a bare `ephemeral_tmp` target covers
+- `--dev-root <path>` -- REPEATABLE, invocation-scoped dev-roots REPLACEMENT
+  for the build-artifacts scanner (never persisted)
 
 **Argument ordering (schema 4 — frozen):** every command takes its
 POSITIONAL targets BEFORE any flag. A positional token appearing after the
 first `--`-prefixed token is `INVALID_ARGUMENTS` naming the token, rather
 than being silently dropped as it was before schema 4. Flags whose next argv
 token is their VALUE (`--acknowledge-valuables`, `--dev-root`,
-`--orphan-size-floor-mb`, `--orphan-stale-days`, `--format`, `--top`,
+`--orphan-size-floor-mb`, `--orphan-stale-days`, `--tmp-age-days`,
+`--tmp-min-size-mb`, `--format`, `--top`,
 `--target-pid`, `--target-name`) consume that token, so it is never mistaken
 for a positional; every documented shape — including a trailing
 `--format json` — is already targets-first and keeps its exact meaning.
@@ -637,8 +670,8 @@ never been scanned.
   colon-joined form parses unambiguously.
 - **`clean` ONLY.** Every other command refuses it PRE-DISPATCH with
   `INVALID_ARGUMENTS` naming the flag — the same centralized gate that
-  refuses `--orphan-size-floor-mb` / `--orphan-stale-days` outside
-  `scan`/`clean` and `--dev-root` outside `scan`/`clean`. A destructive
+  refuses the [scanner-threshold flags](#scanner-threshold-flags) and
+  `--dev-root` outside `scan`/`clean`. A destructive
   authorization silently landing on a command that ignores it would be worse
   than a usage error.
 - It is a FLAG, so like every flag it comes AFTER the positional targets
@@ -1300,6 +1333,33 @@ All CLI commands follow a consistent error reporting contract.
 | `SCAN_FAILED` | Cache scan failed |
 | `CLEAN_FAILED` | TOTAL clean failure: every requested/attempted category errored and nothing was freed (partial failures exit 0 with per-item `success` flags — schema 3) |
 | `MALFORMED_SCANNER_OUTPUT` | A scanner's outcome failed runtime validation — `spotlight` and `smart-clean` (all three surfaces) refuse to act on unvalidated results (schema 4) |
+
+### Scanner-threshold flags
+
+A per-item scanner may expose invocation-scoped THRESHOLD flags. Each such
+scanner owns a FAMILY of flags, and every family follows the same contract:
+
+| Family | Flags | Overrides |
+|--------|-------|-----------|
+| Orphaned-caches sweep | `--orphan-size-floor-mb N`, `--orphan-stale-days N` | `cacheout.orphanedCaches.*` |
+| Ephemeral temp scanner | `--tmp-age-days N`, `--tmp-min-size-mb N` | `cacheout.ephemeralTmp.*` |
+
+- **`scan` and `clean` ONLY** — the two commands that actually run the
+  scanners. EVERY other command refuses a family's flag PRE-DISPATCH with
+  `INVALID_ARGUMENTS`, in a message naming the flag, the refusing command,
+  and the commands that accept it. `smart-clean` is included: it is frozen
+  category-only and runs no per-item scanner at all. Accepting a threshold
+  the caller passed and then ignoring it would hide the flag landing on the
+  wrong command.
+- **Positive integers only.** A zero, negative, non-numeric, missing,
+  REPEATED, or unit-overflowing value is `INVALID_ARGUMENTS` naming the
+  flag. `INVALID_ARGUMENTS` is the only code these failures produce — a
+  malformed threshold is never a `USAGE_ERROR` and never silently defaulted.
+  A flag written last with no following value is refused too: reading it as
+  an absent flag would scan with the persisted thresholds the caller meant
+  to override.
+- **Invocation-scoped.** An override wins over the persisted value for that
+  invocation only; nothing is ever written back to the defaults suite.
 
 ### Subprocess Timeout
 

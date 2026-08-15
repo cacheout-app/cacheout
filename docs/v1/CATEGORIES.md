@@ -16,9 +16,9 @@ per-item scanners — implements one `SpaceScanner` protocol and registers with 
   id `categories`) wraps the data-driven registry and emits one aggregate item per
   category. Category behavior is unchanged, and adding a category is still a
   one-line `CacheCategory` entry — no scanner code involved.
-- **`build_artifacts` and `orphaned_caches` are the per-item scanners**,
-  emitting one item per discovered directory or entry. Follow-on scanners
-  (git worktrees, temp dirs) drop into the same registry.
+- **`build_artifacts`, `orphaned_caches` and `ephemeral_tmp` are the
+  per-item scanners**, emitting one item per discovered directory or entry.
+  Follow-on scanners (git worktrees) drop into the same registry.
 - The CLI addresses categories by slug and per-item scanners by
   `<scanner-slug>` or `<scanner-slug>:<item-id>` — see
   [CLI-REFERENCE.md](CLI-REFERENCE.md) and the address grammar in PROTOCOL.md.
@@ -413,6 +413,86 @@ Photos-library copy, invisible to every category).
 inside their app containers (`~/Library/Containers/<bundle-id>/Data/Library/
 Caches`); the sweep deliberately does not enter them. `/Library/Caches`
 (the system domain) is likewise out of scope.
+
+---
+
+## Ephemeral Temp Files
+
+The `ephemeral_tmp` scanner lists stale FIRST-LEVEL entries in the three
+ephemeral locations macOS does not reliably prune. Long-lived scratch
+directories accumulate there unnoticed — a month-old build sandbox or agent
+scratchpad survives reboots and shows up in no cache category.
+
+**Roots (exactly three, resolved at runtime).** `/private/tmp`, plus the
+per-user temp (`…/T`) and cache (`…/C`) containers under
+`/private/var/folders`, whose machine-specific paths come from the OS rather
+than being hardcoded. A root that is missing at scan time is skipped
+silently; a root that is present but unreadable is reported as a scan issue,
+never a silent zero. Nothing below the first level is listed: the entry
+itself is the unit.
+
+**Per-root note on OS cleanup**, shown as item evidence:
+
+| Root | Note |
+|------|------|
+| `/private/tmp` | no periodic reaper on modern macOS |
+| `…/C` (per-user cache container) | macOS does not routinely prune this location during normal operation |
+| `…/T` (per-user temp container) | macOS may reap older untouched files here; this age gate is more conservative |
+
+**Scanned only when YOU ask.** This is the one scanner with a trigger
+policy: it runs on EXPLICIT user-initiated scans only.
+Automatic background refreshes — the scan timer, opening the menubar
+popover, switching tabs — never include it, for any root; they enumerate
+nothing there at all.
+Press Scan (or run `--cli scan`, which is always user-initiated) to see temp
+findings. See [CLI-REFERENCE.md](CLI-REFERENCE.md).
+
+**Staleness (the primary shield).** An entry qualifies when its NEWEST
+content is older than the age threshold — not the directory's own timestamp
+alone. An old directory holding one fresh file deep inside is NOT stale, and
+neither is a directory whose own timestamp is fresh. Anything the current
+session (Cacheout included) has just written is fresh by construction, which
+is exactly what keeps a live session's own scratch directory off the list —
+there is no separate exclusion list to fall out of date.
+
+**Size floor.** Only entries at or above the floor are listed, so ordinary
+small temp files never appear.
+
+**Entries other users own are never listed.** `/private/tmp` is shared and
+sticky: another user's entry may be readable but is not yours to delete, so
+listing it would claim bytes that cannot be freed. Those entries are skipped
+silently — that is normal multi-user background noise, not an anomaly. The
+per-user `T`/`C` containers are yours by construction, so the rule is
+vacuous there.
+
+**Entries in use are skipped** when a process holds an advisory lock on the
+entry itself. That check is a narrow supplement, not a guarantee: it does
+not detect a process merely holding a file open somewhere inside. Age is the
+real protection.
+
+**Unreadable entries are reported, not explained away.** If something cannot
+be inspected, the scan says so and names it. Cacheout does not claim a
+privacy-permission cause it cannot prove from what the filesystem returned —
+a bare "operation not permitted" is reported neutrally as unreadable, while a
+genuine macOS privacy denial keeps its Full Disk Access remedy hint.
+
+**Selection and deletion.** Every temp item is Review risk, unselected by
+default, and never part of Quick Clean or `smart-clean` — deleting one is
+always an explicit choice. Cleaning removes the entry directory (or file)
+itself; the root is never a target. In the GUI, deletion follows the
+Move-to-Trash toggle exactly like every other item, and if a move to Trash
+fails, that item is reported as an error and left in place — it is never
+silently deleted permanently instead. CLI cleanup is always permanent.
+
+**Config.** Age (default 7 days) and size floor (default 10 MB, decimal)
+persist as `cacheout.ephemeralTmp.ageDays` /
+`cacheout.ephemeralTmp.minSizeMB` and can be overridden per invocation with
+`--tmp-age-days` / `--tmp-min-size-mb` on `scan` and `clean` (see
+[CLI-REFERENCE.md](CLI-REFERENCE.md) and
+[CONFIGURATION.md](CONFIGURATION.md)).
+
+**Out of scope.** `/var/vm`, swap and sleep-image files, `/Library/Caches`,
+and the `…/0` per-user directory are not scanned.
 
 ---
 

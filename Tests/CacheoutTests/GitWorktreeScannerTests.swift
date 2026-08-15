@@ -196,6 +196,27 @@ private final class MountPointInjectingProvider: FileSystemIdentityProvider {
     }
 }
 
+/// Records every lstat PROBE (the operation that precedes every read the
+/// resolver and the mapper perform) so a test can prove nothing under a
+/// protected ancestor was ever inspected.
+private final class ProbeRecordingProvider: FileSystemIdentityProvider {
+    private let lock = NSLock()
+    private var probed: [String] = []
+
+    var probedPaths: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return probed
+    }
+
+    override func probeKind(of url: URL) -> KindProbe {
+        lock.lock()
+        probed.append(url.path)
+        lock.unlock()
+        return super.probeKind(of: url)
+    }
+}
+
 /// Forces `.failed` lstat probes for exact paths — EPERM cannot be fixtured
 /// from an unentitled process.
 private final class FailingProbeProvider: FileSystemIdentityProvider {
@@ -1378,9 +1399,7 @@ final class GitWorktreeScannerTests: XCTestCase {
         XCTAssertTrue(automatic.items.isEmpty)
         XCTAssertTrue(automatic.errors.isEmpty, "silent: \(automatic.errors)")
         XCTAssertTrue(
-            automaticRunner.requests(mentioning: gitDirectory.path).isEmpty
-                && automaticRunner.requests.isEmpty,
-            "no git ran at all: \(automaticRunner.requests)"
+            automaticRunner.requests.isEmpty, "no git ran at all: \(automaticRunner.requests)"
         )
 
         let userRunner = ScriptedGitRunner(listing: listing)
@@ -1393,6 +1412,78 @@ final class GitWorktreeScannerTests: XCTestCase {
             gitDirectory.appendingPathComponent("worktrees")
                 .resolvingSymlinksInPath().path
         )
+        try assertNonMalformed(user, from: userScanner)
+    }
+
+    func testAutomaticScanNeverInspectsAProtectedAdminDirectoryWhileAttributing()
+        async throws
+    {
+        // The gate's DISCOVERY-time face. Learning which repository a worktree
+        // belongs to means FOLLOWING its `.git` pointer, and the pointer's
+        // target is unknowable until it is read — so an ungated resolution
+        // would inspect (and open) protected git admin files with no git
+        // subprocess for a `requests` assertion to catch.
+        //
+        // The protected git directory sits OUTSIDE the dev root here on
+        // purpose: only the RESOLVER can reach it, so every probe of it is
+        // attributable to the resolution under test. (In the cell above the
+        // fixture home lives inside the dev root, so the WALKER enumerates the
+        // same subtree by fn-4's own per-root contract — which would make this
+        // assertion untestable there.)
+        let protectedHome = base.appendingPathComponent("protected-home")
+        let gitDirectory = protectedHome.appendingPathComponent("Documents/repo.git")
+        let workingTree = dev.appendingPathComponent("wd")
+        let worktree = dev.appendingPathComponent("wt")
+        try makeSplitRepository(
+            gitDirectory: gitDirectory, workingTree: workingTree, worktree: worktree
+        )
+        let listing = Self.porcelain([
+            ["worktree \(workingTree.path)", "HEAD \(String(repeating: "a", count: 40))", "branch refs/heads/main"],
+            ["worktree \(worktree.path)", "HEAD \(String(repeating: "a", count: 40))", "branch refs/heads/feature"],
+        ])
+
+        // Both spellings: the resolver probes the CANONICAL pointer target,
+        // while the fixture path carries the `/var` alias macOS temp dirs live
+        // under — matching only one of them would make the assertion vacuous.
+        let protectedPrefixes = [
+            gitDirectory.path,
+            FileSystemIdentityProvider().canonicalize(gitDirectory).path,
+        ]
+        func protectedProbes(_ provider: ProbeRecordingProvider) -> [String] {
+            provider.probedPaths.filter { path in
+                protectedPrefixes.contains { path.hasPrefix($0) }
+            }
+        }
+
+        let automaticProvider = ProbeRecordingProvider()
+        let automaticRunner = ScriptedGitRunner(listing: listing)
+        let automatic = await makeScanner(
+            runner: automaticRunner, provider: automaticProvider, home: protectedHome
+        ).scan(context: ScanContext(trigger: .automatic))
+        XCTAssertTrue(automatic.items.isEmpty)
+        XCTAssertTrue(automatic.errors.isEmpty, "a deferral is silent: \(automatic.errors)")
+        XCTAssertTrue(automaticRunner.requests.isEmpty)
+        XCTAssertTrue(
+            protectedProbes(automaticProvider).isEmpty,
+            "protected admin paths were inspected: \(protectedProbes(automaticProvider))"
+        )
+
+        // The very same fixture under a user-initiated scan DOES inspect it —
+        // the deferral is policy, not a capability. No item can exist either
+        // way here (the admin container is outside every declared root, D13),
+        // and the refusal is published because the assessment was reached.
+        let userProvider = ProbeRecordingProvider()
+        let userScanner = makeScanner(
+            runner: ScriptedGitRunner(listing: listing), provider: userProvider,
+            home: protectedHome
+        )
+        let user = await userScanner.scan(context: ScanContext(trigger: .userInitiated))
+        XCTAssertFalse(
+            protectedProbes(userProvider).isEmpty,
+            "a user-initiated scan follows the pointer"
+        )
+        XCTAssertTrue(user.items.isEmpty, "the admin container is outside every root")
+        XCTAssertTrue(user.errors.contains { $0.kind == .containerRefused })
         try assertNonMalformed(user, from: userScanner)
     }
 

@@ -38,7 +38,12 @@
 ///    scan-time git command, the paths that command traverses are classified
 ///    with the SAME helper; on `.automatic` a protected path silently DEFERS
 ///    the affected work — no git runs against it and no issue is published
-///    (D17 neutralizes locks and fsmonitor, not filesystem privacy).
+///    (D17 neutralizes locks and fsmonitor, not filesystem privacy). The gate
+///    has a DISCOVERY-time face too: the gitdir resolver must follow a
+///    worktree's `.git` pointer before that pointer's target is knowable, so on
+///    `.automatic` it runs on a provider that reports deferred paths as absent
+///    (`DeferringIdentityProvider`) — a git-argv assertion alone would never
+///    have caught a protected admin directory being READ.
 ///
 /// Policy skips stay SILENT (they are scanned when the user asks); genuine
 /// access denials during the walk remain VISIBLE classified issues. The two
@@ -106,6 +111,71 @@
 
 import Foundation
 import os
+
+// MARK: - The secondary gate's discovery-time face
+
+/// A provider that reports every DEFERRED path as absent.
+///
+/// It exists for one job: the gitdir resolver has to FOLLOW a worktree's `.git`
+/// pointer to learn which repository the worktree belongs to, and the pointer
+/// can name a path under a TCC-protected ancestor. The path is unknowable
+/// before the pointer is read, so the gate cannot precede the resolution — it
+/// is applied INSIDE it, by making the deferred paths look like they are not
+/// there. The resolver probes each pointer target before it opens anything, so
+/// on an automatic scan nothing under a protected ancestor is ever opened,
+/// enumerated or read.
+///
+/// What DOES still happen on a deferred path is `canonicalize` — `realpath(3)`,
+/// the same operation fn-4's pinned protected-root classification performs on a
+/// protected root before skipping it (`ProjectTreeWalker.isProtectedRoot`
+/// canonicalizes first, by design). The house doctrine already draws the line
+/// there, and this wrapper does not move it.
+///
+/// `.absent` rather than `.failed` deliberately: a policy deferral is not a
+/// problem to report (the walker skips a vanished entry quietly for the same
+/// reason), and every consumer reads absence as "not attributable" — which is
+/// precisely what a deferral means here.
+private final class DeferringIdentityProvider: FileSystemIdentityProvider {
+
+    private let wrapped: FileSystemIdentityProvider
+    private let isDeferred: (URL) -> Bool
+
+    init(
+        wrapping wrapped: FileSystemIdentityProvider,
+        isDeferred: @escaping (URL) -> Bool
+    ) {
+        self.wrapped = wrapped
+        self.isDeferred = isDeferred
+        super.init()
+    }
+
+    override func probeKind(of url: URL) -> KindProbe {
+        isDeferred(url) ? .absent : wrapped.probeKind(of: url)
+    }
+
+    override func identity(of url: URL) -> Identity? {
+        isDeferred(url) ? nil : wrapped.identity(of: url)
+    }
+
+    override func leafMetadata(of url: URL) -> LeafMetadata? {
+        isDeferred(url) ? nil : wrapped.leafMetadata(of: url)
+    }
+
+    override func linkCount(of url: URL) -> UInt64? {
+        isDeferred(url) ? nil : wrapped.linkCount(of: url)
+    }
+
+    override func isMountPoint(_ url: URL) -> Bool {
+        isDeferred(url) ? false : wrapped.isMountPoint(url)
+    }
+
+    // Path arithmetic is delegated UNCHANGED so an injected test provider's
+    // aliasing still flows through (and so the deferral above is the only
+    // behavioural difference).
+    override func realPath(of path: String) -> String? { wrapped.realPath(of: path) }
+
+    override func canonicalize(_ url: URL) -> URL { wrapped.canonicalize(url) }
+}
 
 // MARK: - Discovery
 
@@ -199,7 +269,6 @@ struct GitWorktreeScanner: @unchecked Sendable {
     /// own; scan-time admission is read-only and snapshot-free).
     private let pathGuard: PathGuard
     private let sizer: DirectorySizer
-    private let resolver: GitWorktreeGitdirResolver
     /// fn-5.1's SHARED oracle→admin mapper — the SAME component fn-5.4 calls at
     /// delete time. A second mapping implementation would let detection and
     /// execution disagree about a repository-wide side effect.
@@ -236,7 +305,6 @@ struct GitWorktreeScanner: @unchecked Sendable {
             home: home, containerRoots: devRoots.keptRoots, provider: provider
         )
         self.sizer = DirectorySizer(provider: provider)
-        self.resolver = GitWorktreeGitdirResolver(identity: provider)
         self.mapper = GitWorktreeAdminMapper(identity: provider)
         self.assessor = WorktreeStalenessAssessor(
             runner: runner, timeout: gitTimeout, timeZone: timeZone
@@ -289,11 +357,17 @@ struct GitWorktreeScanner: @unchecked Sendable {
         var log = GitWorktreeAssessmentLog()
         var processedRepoKeys = Set<String>()
         let bindings = rootBindings()
+        // The resolver is PER-SCAN because the secondary gate is: on
+        // `.automatic` it follows pointers through a provider that reports every
+        // deferred path as absent (see `DeferringIdentityProvider`).
+        let resolver = GitWorktreeGitdirResolver(identity: identityProvider(for: context))
 
-        for group in Self.repositoryGroups(from: discoveries, resolver: resolver, provider: provider) {
+        for group in Self.repositoryGroups(
+            from: discoveries, resolver: resolver, provider: provider
+        ) {
             if Task.isCancelled { break }
             let outcome = await process(
-                group, context: context, bindings: bindings,
+                group, context: context, bindings: bindings, resolver: resolver,
                 processedRepoKeys: &processedRepoKeys,
                 issues: &issues, emissions: &emissions, log: &log
             )
@@ -440,6 +514,7 @@ struct GitWorktreeScanner: @unchecked Sendable {
         _ group: RepositoryGroup,
         context: ScanContext,
         bindings: [RootBinding],
+        resolver: GitWorktreeGitdirResolver,
         processedRepoKeys: inout Set<String>,
         issues: inout [ScanIssue],
         emissions: inout [(item: ReclaimableItem, identityPath: String)],
@@ -557,7 +632,7 @@ struct GitWorktreeScanner: @unchecked Sendable {
                 parentRepoWorkingDir: parentRepoWorkingDir,
                 adminContainer: adminContainer,
                 groupGitDirectory: group.gitDirectory,
-                context: context, bindings: bindings,
+                context: context, bindings: bindings, resolver: resolver,
                 issues: &issues, emissions: &emissions, log: &log
             )
         }
@@ -583,6 +658,7 @@ struct GitWorktreeScanner: @unchecked Sendable {
         groupGitDirectory: URL,
         context: ScanContext,
         bindings: [RootBinding],
+        resolver: GitWorktreeGitdirResolver,
         issues: inout [ScanIssue],
         emissions: inout [(item: ReclaimableItem, identityPath: String)],
         log: inout GitWorktreeAssessmentLog
@@ -1149,6 +1225,31 @@ struct GitWorktreeScanner: @unchecked Sendable {
     private func isDeferred(_ path: URL, context: ScanContext) -> Bool {
         guard !context.includeProtectedRoots else { return false }
         return ProjectTreeWalker.isProtectedRoot(path, home: home, provider: provider)
+    }
+
+    /// The provider the per-scan RESOLVER runs on.
+    ///
+    /// The gate above can only be applied to a path once the path is KNOWN, and
+    /// a linked worktree's admin directory is not knowable until its `.git`
+    /// pointer has been followed — which is itself an access. The parent
+    /// repository of a worktree in an unprotected dev root very often lives in
+    /// `~/Documents`, so following that pointer with an ungated provider would
+    /// let an AUTOMATIC scan read protected git admin files: the exact prompt
+    /// the doctrine exists to prevent, and one no `git argv` assertion would
+    /// ever catch.
+    ///
+    /// So on `.automatic` the resolver runs on a provider that reports every
+    /// deferred path as ABSENT. The resolver is fail-closed by construction —
+    /// it `probeKind`s each pointer target BEFORE reading it — so the deferral
+    /// lands before any `open`, and the worktree simply attributes nowhere
+    /// (silent, exactly like every other policy skip).
+    private func identityProvider(for context: ScanContext) -> FileSystemIdentityProvider {
+        guard !context.includeProtectedRoots else { return provider }
+        let home = self.home
+        let base = provider
+        return DeferringIdentityProvider(wrapping: base) { url in
+            ProjectTreeWalker.isProtectedRoot(url, home: home, provider: base)
+        }
     }
 
     // MARK: - Item mapping helpers

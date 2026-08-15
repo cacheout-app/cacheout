@@ -612,7 +612,6 @@ final class DocumentedContractTests: XCTestCase {
 
         for fragment in [
             "RELEASE-BLOCKING",           // it blocks, it is not advisory
-            "NOT SATISFIED",              // …and its CURRENT state is stated
             "cacheout-mcp",               // the named consumer
             "Owner:",                     // a person, not "someone"
             "Baseline verified at",        // the defect was observed, not assumed
@@ -627,6 +626,18 @@ final class DocumentedContractTests: XCTestCase {
             XCTAssertTrue(section.contains(fragment),
                           "the recorded gate must contain '\(fragment)'")
         }
+        // …and its CURRENT state is stated, in one of the two admissible
+        // spellings. Asserting the literal open marker would pin a transient
+        // condition: the gate is MEANT to close, and closing it must not turn
+        // this test red. What must never happen is a gate whose status is
+        // absent or unparseable — that is the unverifiable case the release
+        // script refuses, so it is what this asserts against.
+        let statusPattern =
+            #"(?m)^[ \t]*Status: \*\*(NOT SATISFIED|SATISFIED at [0-9a-f]{7,40})\*\*"#
+        XCTAssertNotNil(
+            section.range(of: statusPattern, options: .regularExpression),
+            "the recorded gate must state its status in an admissible spelling: \(section)"
+        )
         // The rule the consumer has to adopt is stated here too, not just
         // referenced — a release engineer reading the CHANGELOG alone must be
         // able to tell whether the gate is met.
@@ -677,12 +688,32 @@ final class DocumentedContractTests: XCTestCase {
         // The DOCUMENTED transition, quoted from the CHANGELOG itself.
         let openMarker = "Status: **NOT SATISFIED**"
         let closedMarker = "Status: **SATISFIED at 63edbfc**"
-        XCTAssertTrue(changelog.contains(openMarker),
-                      "the gate's status line must be the documented one")
         XCTAssertTrue(
             changelog.contains("`**SATISFIED at <commit-hash>**`"),
             "the CHANGELOG must publish the exact closing edit"
         )
+
+        // The live gate may be OPEN or CLOSED — a gate exists to be closed,
+        // and closing it must not turn this test red. So the real document is
+        // normalized to the open state and the transition is driven from
+        // there: every fixture below stays anchored to the SHIPPED changelog's
+        // structure (its real markers, sections and prose) while none of them
+        // depends on today's status. Pinning the live state instead would make
+        // this test assert "nobody has done the work yet", which is not a
+        // property of the gate machinery.
+        let liveStatus = try XCTUnwrap(
+            changelog.range(
+                of: #"(?m)^[ \t]*Status: \*\*(NOT SATISFIED|SATISFIED at [0-9a-f]{7,40})\*\*.*$"#,
+                options: .regularExpression
+            ),
+            "the gate's status line must be one of the two admissible spellings"
+        )
+        let indent = changelog[liveStatus].prefix { $0 == " " || $0 == "\t" }
+        let changelogOpen = changelog.replacingCharacters(
+            in: liveStatus, with: indent + openMarker
+        )
+        XCTAssertTrue(changelogOpen.contains(openMarker),
+                      "normalizing to the open state must produce the open marker")
 
         // Extract the function so the REAL shell runs, not a paraphrase.
         let start = try XCTUnwrap(script.range(of: "check_release_gates() {"))
@@ -749,31 +780,32 @@ final class DocumentedContractTests: XCTestCase {
         // THE CLOSED CASE, from the documented edit applied verbatim: the
         // instruction must actually unblock the pipeline, and prose that
         // still MENTIONS the phrase must not keep it shut.
-        let closed = changelog.replacingOccurrences(
+        let closed = changelogOpen.replacingOccurrences(
             of: openMarker, with: closedMarker
         )
-        XCTAssertNotEqual(closed, changelog, "the documented edit must apply")
+        XCTAssertNotEqual(closed, changelogOpen, "the documented edit must apply")
 
         // Every state the checker can face, and the ONLY one that may pass is
         // a provably-satisfied gate. Searching for the open marker alone
         // would FAIL OPEN on rows 3-6: deleting the status line would read as
         // "closed" (review r4).
         let cases: [(name: String, changelog: String?, passes: Bool)] = [
-            ("open", changelog, false),
+            ("open", changelogOpen, false),
             ("closed", closed, true),
+            ("live", changelog, true),
             ("missing-file", nil, false),
             ("status-deleted",
-             changelog.replacingOccurrences(of: openMarker, with: ""), false),
+             changelogOpen.replacingOccurrences(of: openMarker, with: ""), false),
             ("section-renamed",
-             changelog.replacingOccurrences(
+             changelogOpen.replacingOccurrences(
                 of: "## [Unreleased]", with: "## [Whatever]"
              ), false),
             ("satisfied-without-a-commit",
-             changelog.replacingOccurrences(
+             changelogOpen.replacingOccurrences(
                 of: openMarker, with: "Status: **SATISFIED**"
              ), false),
             ("satisfied-with-a-non-hex-commit",
-             changelog.replacingOccurrences(
+             changelogOpen.replacingOccurrences(
                 of: openMarker, with: "Status: **SATISFIED at zzzzzzz**"
              ), false),
             // An orphan status with no gate marker: the recorded form is

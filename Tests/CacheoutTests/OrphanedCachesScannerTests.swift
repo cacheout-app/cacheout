@@ -1752,6 +1752,61 @@ final class OrphanedCachesScannerTests: XCTestCase {
                        .accessDenied)
     }
 
+    /// The guidance may claim a verdict is permanent ONLY when every cause
+    /// behind it really is. Steering a user toward the riskier
+    /// explicit-confirmation path over a transient failure is the harm.
+    func testRemediationGuidanceOnlyClaimsPermanenceWhenNothingCanClearIt() {
+        let permanent = OrphanedCachesScanner.remediationGuidance(
+            for: [.budgetExhausted]
+        )
+        XCTAssertTrue(permanent.contains("will not clear this"), permanent)
+        XCTAssertTrue(permanent.contains("explicit per-item confirmation"),
+                      permanent)
+
+        for clearable: UserDataProbeObstruction in
+            [.mountBoundary, .accessDenied, .transientFailure, .undecodableName] {
+            let guidance = OrphanedCachesScanner.remediationGuidance(
+                for: [clearable]
+            )
+            XCTAssertFalse(
+                guidance.contains("will not clear"),
+                "\(clearable) is clearable — the guidance must not call the "
+                    + "result permanent: \(guidance)"
+            )
+            XCTAssertTrue(guidance.lowercased().contains("re-scan"),
+                          "it must point at the retry that DOES help: \(guidance)")
+        }
+
+        // Cause-specific remedies, not one blanket instruction.
+        XCTAssertTrue(
+            OrphanedCachesScanner.remediationGuidance(for: [.mountBoundary])
+                .contains("unmounting it"))
+        XCTAssertTrue(
+            OrphanedCachesScanner.remediationGuidance(for: [.accessDenied])
+                .contains("granting access"))
+        XCTAssertTrue(
+            OrphanedCachesScanner.remediationGuidance(for: [.transientFailure])
+                .contains("Re-scan and try again."))
+
+        // Mixed sets take the BEST available remedy and stay deterministic.
+        let mixed = OrphanedCachesScanner.remediationGuidance(
+            for: [.transientFailure, .budgetExhausted]
+        )
+        XCTAssertFalse(mixed.contains("will not clear"), mixed)
+        XCTAssertTrue(mixed.hasSuffix("Re-scan and try again."), mixed)
+        XCTAssertEqual(
+            mixed,
+            OrphanedCachesScanner.remediationGuidance(
+                for: [.budgetExhausted, .transientFailure]
+            ),
+            "guidance order is the declaration order, whatever the input order"
+        )
+
+        XCTAssertTrue(
+            OrphanedCachesScanner.remediationGuidance(for: []).isEmpty,
+            "a complete probe has nothing to remediate")
+    }
+
     /// Fail-closed is untouched: a GENUINELY obstructed probe — a branch
     /// the walk cannot read — still refuses at delete time, and the refusal
     /// no longer prescribes a re-scan it knows cannot help.
@@ -1785,8 +1840,17 @@ final class OrphanedCachesScannerTests: XCTestCase {
         XCTAssertTrue(message.contains("couldn't fully inspect"), message)
         XCTAssertFalse(
             message.contains("re-scan required"),
-            "the probe is deterministic — a re-scan reproduces the same "
-                + "incompleteness, so prescribing one is misleading: \(message)"
+            "a bare retry does not clear a permission obstruction, so "
+                + "prescribing one alone is misleading: \(message)"
+        )
+        // The guidance names THIS cause and its actual remedy — a grant —
+        // rather than a blanket claim about the class (PR #458 review).
+        XCTAssertTrue(message.contains("granting access"), message)
+        XCTAssertFalse(
+            message.contains("will not clear"),
+            "an unreadable branch is clearable by granting access — calling "
+                + "the verdict permanent pushes the user to the riskier "
+                + "explicit-confirmation path for nothing: \(message)"
         )
         restorePerms(locked)
         XCTAssertTrue(fm.fileExists(atPath: victim.path),

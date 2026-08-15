@@ -1080,6 +1080,43 @@ struct OrphanedCachesScanner: @unchecked Sendable {
         String(validatingCString: pointer)
     }
 
+    // MARK: - Remediation guidance (PR #458 review)
+
+    /// The delete-time remediation guidance for an incomplete probe:
+    /// what actually obstructed it, and what — honestly — would clear it.
+    ///
+    /// The rule is one sentence long: NEVER claim a verdict is permanent
+    /// unless every cause behind it really is. A mid-walk race and a
+    /// transient I/O or permission error clear on retry; a mount boundary
+    /// clears on unmount; an exhausted budget on a static tree clears on
+    /// neither, and only THAT case may steer a user toward the riskier
+    /// explicit-confirmation path. The previous message asserted permanence
+    /// for the whole set, which is how a disk hiccup came to read as "this
+    /// will never work, confirm it manually".
+    static func remediationGuidance(
+        for obstructions: [UserDataProbeObstruction]
+    ) -> String {
+        guard !obstructions.isEmpty else { return "" }
+        var sentences = obstructions.sorted().map(\.guidance)
+        // The closing sentence is keyed to the BEST available remedy: if any
+        // cause is retryable the user should retry, and only a set with no
+        // remedy at all earns the "this will not change" claim.
+        if obstructions.contains(where: { $0.remedy == .retryAlone }) {
+            sentences.append("Re-scan and try again.")
+        } else if obstructions.contains(
+            where: { $0.remedy == .userActionThenRetry }
+        ) {
+            sentences.append("Clear that, then re-scan.")
+        } else {
+            sentences.append(
+                "Re-scanning alone will not clear this — the same tree under "
+                + "the same budget reports the same thing every time; remove "
+                + "this item by explicit per-item confirmation once a "
+                + "re-scan lists it at review risk."
+            )
+        }
+        return sentences.joined(separator: " ")
+    }
 }
 
 // MARK: - Config surface (fn-3.4, R8)

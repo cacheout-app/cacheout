@@ -951,25 +951,27 @@ actor CacheCleaner {
                 return (nil, [Self.itemError(item, detail)])
             }
             if !probe.complete {
-                // Remediation guidance deliberately does NOT say "re-scan"
-                // (PR #456 follow-up): every remaining cause of an
-                // incomplete probe — an unreadable branch, a child whose
-                // kind cannot be established, an exhausted entry budget —
-                // is a property of the TREE, not of the scan, so a re-scan
-                // reproduces it exactly. What a re-scan does do is
-                // re-describe the item at review risk carrying the same
-                // reason, after which it is removable only by explicit
-                // per-item confirmation. Say that, instead of prescribing
-                // a remedy that provably cannot work.
+                // Remediation guidance is derived from WHAT ACTUALLY
+                // OBSTRUCTED the probe (PR #458 review), never from a
+                // blanket claim about the whole class. This message has now
+                // been wrong in both directions: it first prescribed
+                // "re-scan required" for causes a re-scan reproduces
+                // exactly, then — over-correcting — asserted the opposite
+                // for a set that includes a mid-walk race and transient I/O,
+                // which a re-scan clears routinely. Both FLATTENED causes
+                // that genuinely differ, and the second flattening is the
+                // more dangerous one: it steers a user toward the riskier
+                // explicit-confirmation path over a disk hiccup. The walk
+                // now distinguishes its causes
+                // (`UserDataProbeObstruction`), so the guidance can simply
+                // say which one happened and what clears it.
                 let detail = "\(target.path): couldn't fully inspect "
                     + "contents at delete time — refused (an inspection that "
                     + "could not finish is treated like a change since "
-                    + "scan). Re-scanning will not clear this — the "
-                    + "inspection is bounded and deterministic, so it "
-                    + "reports the same thing every time. Grant access to "
-                    + "any unreadable subfolder, or remove this item by "
-                    + "explicit per-item confirmation once a re-scan lists "
-                    + "it at review risk."
+                    + "scan). "
+                    + OrphanedCachesScanner.remediationGuidance(
+                        for: probe.obstructions
+                    )
                 logRefusal(label: item.displayName, tag: "content-drift",
                            detail: detail)
                 return (nil, [Self.itemError(item, detail)])

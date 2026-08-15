@@ -2072,15 +2072,78 @@ final class CacheCleanerTests: XCTestCase {
         XCTAssertTrue(message.contains("couldn't fully inspect"), message)
         XCTAssertFalse(
             message.contains("re-scan required"),
-            "the probe is deterministic — prescribing a re-scan that "
-                + "reproduces the same verdict is misleading: \(message)"
+            "a bare retry does not clear a permission obstruction, so "
+                + "prescribing one alone is misleading: \(message)"
         )
+        // Cause-specific guidance (PR #458 review): this obstruction is
+        // clearable by a GRANT, so the message must say so and must not
+        // claim the verdict is permanent.
+        XCTAssertTrue(message.contains("granting access"), message)
+        XCTAssertFalse(message.contains("will not clear"), message)
         try FileManager.default.setAttributes(
             [.posixPermissions: 0o755], ofItemAtPath: locked.path
         )
         XCTAssertTrue(FileManager.default.fileExists(atPath: survivor.path),
                       "content behind the uninspectable branch survives")
         XCTAssertTrue(logContents(home: home).contains("REFUSED [content-drift]"))
+    }
+
+    /// The mirror-image harm the PR #458 review named: a TRANSIENT
+    /// obstruction — a mid-walk race, an I/O error — must not be reported as
+    /// a deterministic verdict. Telling a user "re-scanning reports the same
+    /// thing every time" over a disk hiccup steers them onto the riskier
+    /// explicit-per-item-confirmation path for no reason.
+    func testTransientProbeFailureAtDeleteTimeKeepsRetryGuidance() async throws {
+        let (home, caches, entry, snapshot) = try makeSweepFixture()
+        defer { try? FileManager.default.removeItem(at: home) }
+
+        let child = entry.appendingPathComponent("sub")
+        try FileManager.default.createDirectory(
+            at: child, withIntermediateDirectories: true
+        )
+        // The child's kind probe fails with EIO — the hermetic stand-in for
+        // a transient failure or a directory that changed under the walk.
+        let provider = FailingChildKindProvider()
+        provider.failures[child.standardizedFileURL.path] = EIO
+
+        let item = makeRemoveItem(
+            scannerID: OrphanedCachesScanner.registeredID,
+            displayName: entry.lastPathComponent,
+            origin: caches, target: entry
+        )
+        let cleaner = CacheCleaner(
+            home: home, containerRoots: [caches], containerSnapshot: snapshot,
+            provider: provider
+        )
+        let report = await cleaner.clean(items: [item], moveToTrash: false)
+
+        XCTAssertTrue(report.entries.isEmpty, "fail-closed is untouched")
+        XCTAssertEqual(report.errors.count, 1)
+        let message = try XCTUnwrap(report.errors.first?.message)
+        XCTAssertTrue(message.contains("couldn't fully inspect"), message)
+        XCTAssertTrue(message.contains("temporary error"), message)
+        XCTAssertTrue(message.contains("Re-scan and try again."), message)
+        XCTAssertFalse(
+            message.contains("will not clear"),
+            "a transient failure is cleared by a re-scan — calling it "
+                + "deterministic is exactly backwards: \(message)"
+        )
+        XCTAssertFalse(
+            message.contains("explicit per-item confirmation"),
+            "and it must not steer the user to the riskier path: \(message)"
+        )
+    }
+
+    /// Fails a chosen path's kind probe with a chosen errno.
+    private final class FailingChildKindProvider: FileSystemIdentityProvider {
+        var failures: [String: Int32] = [:]
+
+        override func probeKind(of url: URL) -> KindProbe {
+            if let code = failures[url.standardizedFileURL.path] {
+                return .failed(errno: code)
+            }
+            return super.probeKind(of: url)
+        }
     }
 
     func testAutoEligibleSweepItemUnchangedStillDeletes() async throws {

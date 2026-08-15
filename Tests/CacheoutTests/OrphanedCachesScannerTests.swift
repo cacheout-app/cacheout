@@ -1613,6 +1613,146 @@ final class OrphanedCachesScannerTests: XCTestCase {
         XCTAssertFalse(probe.complete)
     }
 
+    // MARK: - Aliased spellings vs the mount check (PR #458 review r4)
+
+    /// Mirrors the PRODUCTION `isMountPoint` contract rather than injecting
+    /// by inode: `statfs` resolves whatever path it is handed and reports
+    /// the CANONICAL mount root, so the real helper answers `true` only for
+    /// a canonical spelling (`FileSystemIdentityProvider.swift:94`, whose
+    /// own doc requires canonical input). A provider that answered by inode
+    /// would hide precisely the defect under test. Devices are deliberately
+    /// NOT overridden, so both sides share one `st_dev` — the firmlink
+    /// shape, where the device arm cannot fire either and `statfs` is the
+    /// only signal left.
+    private final class CanonicalSpellingMountProvider: FileSystemIdentityProvider {
+        var canonicalMountPoints: Set<String> = []
+        private(set) var probedPaths: [String] = []
+
+        override func isMountPoint(_ url: URL) -> Bool {
+            canonicalMountPoints.contains(url.path)
+        }
+
+        override func probeKind(of url: URL) -> KindProbe {
+            probedPaths.append(url.path)
+            return super.probeKind(of: url)
+        }
+
+        func reset() { probedPaths = [] }
+
+        func touchedAnythingBelow(_ url: URL) -> Bool {
+            probedPaths.contains { $0.hasPrefix(url.path + "/") }
+        }
+    }
+
+    /// A fixture reachable by TWO spellings of the same object: the real
+    /// path, and one through a symlinked ancestor. Returns the aliased
+    /// spelling, which is what a delete-time target or a symlinked home
+    /// hands the probe.
+    private func aliasedEntry(named name: String) throws -> (aliased: URL, real: URL) {
+        let realHome = base.appendingPathComponent("aliased-home")
+        let realCaches = realHome.appendingPathComponent("Library/Caches")
+        let real = realCaches.appendingPathComponent(name)
+        try mkdir(real)
+        let alias = base.appendingPathComponent("alias")
+        if !fm.fileExists(atPath: alias.path) {
+            try fm.createSymbolicLink(at: alias, withDestinationURL: realHome)
+        }
+        let aliased = alias
+            .appendingPathComponent("Library/Caches")
+            .appendingPathComponent(name)
+        return (aliased, real)
+    }
+
+    /// BOTH boundary signals fail at once on a firmlink-shaped nested mount
+    /// reached through a symlinked ancestor: the device arm is silent
+    /// because the mount shares the root's `st_dev`, and the `statfs` arm is
+    /// silent because it was handed the walk's deliberately unresolved
+    /// spelling, which never equals `f_mntonname`. The walk then enumerates
+    /// the mounted tree — the exact thing the boundary rule exists to stop.
+    func testNestedMountIsDetectedThroughAnAliasedSpelling() throws {
+        let (aliased, real) = try aliasedEntry(named: "com.example.AliasedMount")
+        try writeFile(real.appendingPathComponent("payload.bin"))
+        let realMount = real.appendingPathComponent("volume")
+        try mkdir(realMount.appendingPathComponent("Pictures/Photos Library.photoslibrary"))
+
+        let provider = CanonicalSpellingMountProvider()
+        provider.canonicalMountPoints.insert(provider.canonicalize(realMount).path)
+        // Precondition: the two spellings really do differ, or the fixture
+        // is not exercising the alias at all.
+        let aliasedMount = aliased.appendingPathComponent("volume")
+        try XCTSkipIf(
+            provider.canonicalize(aliasedMount).path == aliasedMount.path,
+            "fixture is already canonical — nothing aliased to test"
+        )
+        provider.reset()
+
+        let probe = OrphanedCachesScanner.preDeleteUserDataProbe(
+            at: aliased, provider: provider
+        )
+
+        XCTAssertFalse(
+            provider.touchedAnythingBelow(aliasedMount),
+            "not one entry of the mounted filesystem may be read: "
+                + "\(provider.probedPaths)"
+        )
+        XCTAssertTrue(probe.matches.isEmpty,
+                      "nothing past an uncrossed boundary may be claimed")
+        XCTAssertEqual(probe.obstructions, [.mountBoundary])
+
+        // …and the TRAVERSAL still used the walk's own unresolved spelling.
+        // Canonicalizing for the boundary check must never leak into the
+        // paths the walk lstats — those are the ones a deletion removes
+        // (the `resolveTargetKeepingLeaf` doctrine).
+        XCTAssertTrue(
+            provider.probedPaths.allSatisfy { $0.hasPrefix(aliased.path) },
+            "traversal must keep the unresolved spelling: \(provider.probedPaths)"
+        )
+    }
+
+    /// The same hole at the ROOT arm, which has its own copy of the rule.
+    func testRootMountIsDetectedThroughAnAliasedSpelling() throws {
+        let (aliased, real) = try aliasedEntry(named: "com.example.AliasedRoot")
+        try mkdir(real.appendingPathComponent("Pictures"))
+
+        let provider = CanonicalSpellingMountProvider()
+        provider.canonicalMountPoints.insert(provider.canonicalize(real).path)
+        try XCTSkipIf(provider.canonicalize(aliased).path == aliased.path,
+                      "fixture is already canonical")
+        provider.reset()
+
+        let probe = OrphanedCachesScanner.preDeleteUserDataProbe(
+            at: aliased, provider: provider
+        )
+
+        XCTAssertFalse(
+            provider.touchedAnythingBelow(aliased),
+            "a mount-root target must not be enumerated: \(provider.probedPaths)"
+        )
+        XCTAssertTrue(probe.matches.isEmpty)
+        XCTAssertEqual(probe.obstructions, [.mountBoundary])
+    }
+
+    /// The guard against over-correcting: an ordinary aliased tree with no
+    /// mount anywhere still probes COMPLETE, and every path the walk
+    /// touched is the unresolved spelling it was given.
+    func testAliasedTreeWithoutAMountStaysCompleteAndUnresolved() throws {
+        let (aliased, real) = try aliasedEntry(named: "com.example.AliasedClean")
+        try mkdir(real.appendingPathComponent("sub/deeper"))
+        try writeFile(real.appendingPathComponent("sub/deeper/payload.bin"))
+
+        let provider = CanonicalSpellingMountProvider()
+        let probe = OrphanedCachesScanner.preDeleteUserDataProbe(
+            at: aliased, provider: provider
+        )
+
+        XCTAssertTrue(probe.complete, "\(probe.obstructions)")
+        XCTAssertTrue(probe.matches.isEmpty)
+        XCTAssertTrue(
+            provider.probedPaths.allSatisfy { $0.hasPrefix(aliased.path) },
+            "no canonical spelling may leak into the walk: \(provider.probedPaths)"
+        )
+    }
+
     // MARK: - The budget bounds WORK, not just attention (PR #458 review)
 
     /// The entry budget must bound what the walk MATERIALIZES, not only what

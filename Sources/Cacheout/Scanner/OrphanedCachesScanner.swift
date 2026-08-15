@@ -916,13 +916,24 @@ struct OrphanedCachesScanner: @unchecked Sendable {
         // root. An entry that IS a mount is not enumerated at all: not one
         // entry of the foreign filesystem is read, and the verdict is
         // INCOMPLETE precisely because we did not look.
+        //
+        // CANONICAL INPUT for the `statfs` arm (PR #458 review r4): the
+        // sizer hands that arm its already-`resolved` root, and
+        // `isMountPoint` requires it — it compares `f_mntonname`, always
+        // canonical, against the path it is given, so an aliased spelling
+        // silently answers `false`. This walk deliberately keeps the
+        // UNRESOLVED spelling everywhere else (see the doc), which is what
+        // made a root reached through a symlinked ancestor invisible to
+        // this arm. Canonicalization is confined to this one expression and
+        // to `crossesMountBoundary`; it never touches traversal, matching,
+        // or identity, where the unresolved spelling is the whole point.
         let rootDevice = provider.deviceID(of: entryURL)
         let parentDevice = provider.deviceID(
             of: entryURL.deletingLastPathComponent()
         )
         if (rootDevice != nil && parentDevice != nil
                 && rootDevice != parentDevice)
-            || provider.isMountPoint(entryURL) {
+            || provider.isMountPoint(provider.canonicalize(entryURL)) {
             return UserDataProbeResult(
                 matches: [], obstructions: [.mountBoundary]
             )
@@ -1056,6 +1067,35 @@ struct OrphanedCachesScanner: @unchecked Sendable {
     /// `child` is `lstat`-probed as a real directory before this runs, so a
     /// symlink pointing AT a volume root never reaches here (and is never
     /// followed regardless — the no-follow rule).
+    ///
+    /// ## Arm (b) gets a CANONICAL path, and ONLY arm (b) (PR #458 review r4)
+    /// `isMountPoint` compares `statfs`'s `f_mntonname` — always canonical —
+    /// against the path handed to it, and documents that requirement
+    /// (`FileSystemIdentityProvider.swift:94`); the sizer satisfies it by
+    /// passing its already-`resolved` URLs. This walk cannot: it keeps the
+    /// UNRESOLVED spelling on purpose, because that is the path a deletion
+    /// removes and the one a no-follow `lstat` must land on. So an aliased
+    /// spelling (a `cachesRoot`, or a delete-time target, reached through a
+    /// symlinked ancestor) never equalled `f_mntonname`, and arm (b)
+    /// answered `false` for a real mount.
+    ///
+    /// On its own that is a false negative behind a working arm (a) — but
+    /// the two fail TOGETHER on a firmlink-shaped mount that shares the
+    /// walk root's `st_dev`, which is exactly the case arm (b) exists to
+    /// catch. Both silent means the probe enumerates the mounted volume and
+    /// calls the result COMPLETE: a "proven clean" verdict derived from a
+    /// filesystem the user never pointed this scanner at.
+    ///
+    /// The canonical spelling is therefore computed HERE, as an argument,
+    /// and discarded. It is never returned, never stored, never appended to
+    /// the stack, and never reaches an item — canonicalizing the traversal
+    /// would break the `resolveTargetKeepingLeaf` doctrine (identity is the
+    /// canonical PARENT chain plus the UNRESOLVED leaf) and point the walk
+    /// at paths the deletion does not touch, which is a worse bug than the
+    /// one this fixes. Cost is one `realpath` per DIRECTORY child, on the
+    /// arm-(a)-silent path only, inside a walk already bounded to
+    /// `entryLimit` entries and beside a `DirectorySizer` pass that
+    /// enumerates the same tree unbounded.
     private static func crossesMountBoundary(
         _ child: URL,
         rootDevice: UInt64?,
@@ -1066,7 +1106,7 @@ struct OrphanedCachesScanner: @unchecked Sendable {
             && childDevice != rootDevice {
             return true
         }
-        return provider.isMountPoint(child)
+        return provider.isMountPoint(provider.canonicalize(child))
     }
 
     /// The outcome of ONE bounded directory read.

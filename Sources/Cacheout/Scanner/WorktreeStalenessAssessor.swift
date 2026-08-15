@@ -15,16 +15,18 @@
 ///
 /// - **G1 not-main/not-bare** — porcelain POSITION (`isMain`) and the `bare`
 ///   attribute. No git call.
-/// - **G2 clean** — `git -C <wt> status --porcelain --ignore-submodules=none`
-///   with EMPTY stdout. The flag is not decoration: it is what git's own
-///   `check_clean_worktree` (builtin/worktree.c) passes, and the bare default
-///   honours the repository's `submodule.<name>.ignore` / `diff.ignoreSubmodules`
-///   settings — verified on git 2.50.1, a worktree whose submodule has a
-///   modified tracked file reports EMPTY under the bare default and ` M sub`
-///   under this flag when the repo committed `submodule.sub.ignore = all`.
-///   Exported standalone as `GitWorktreeCleanCheck` because fn-5.4's
-///   revalidator re-runs exactly this check immediately before the
-///   filesystem fallback; one implementation, two call sites.
+/// - **G2 clean** — `git -C <wt> status --porcelain --ignore-submodules=none
+///   --untracked-files=normal` with EMPTY stdout. Neither flag is
+///   decoration: a repository can CONFIGURE its way to a false "clean", and
+///   this gate authorises a deletion. `--ignore-submodules=none` is what
+///   git's own `check_clean_worktree` (builtin/worktree.c) passes and
+///   overrides `submodule.<name>.ignore` / `diff.ignoreSubmodules`;
+///   `--untracked-files=normal` overrides `status.showUntrackedFiles=no`.
+///   Both holes are verified on git 2.50.1 and both are proven by fixtures
+///   that assert the bare-default command reports the tree CLEAN. Exported
+///   standalone as `GitWorktreeCleanCheck` because fn-5.4's revalidator
+///   re-runs exactly this check immediately before the filesystem fallback;
+///   one implementation, two call sites.
 /// - **G3 merged** — LOCAL ancestry only. The default branch is resolved in
 ///   the PARENT repo (`refs/remotes/origin/HEAD` → `refs/heads/main` →
 ///   `refs/heads/master` → fail closed, D6) and then
@@ -188,11 +190,30 @@ enum WorktreeCleanVerdict: Equatable, Sendable {
 /// whether a tree is clean.
 enum GitWorktreeCleanCheck {
 
-    /// The command, minus the `-C <worktree>` prefix. `--ignore-submodules=none`
-    /// is REQUIRED (see the file header): it matches git's own
-    /// `check_clean_worktree` and overrides any repository-configured
-    /// submodule ignore setting, which the bare default honours.
-    static let statusArguments = ["status", "--porcelain", "--ignore-submodules=none"]
+    /// The command, minus the `-C <worktree>` prefix.
+    ///
+    /// BOTH flags exist to defeat repository CONFIGURATION, which the bare
+    /// defaults honour and which would otherwise decide what "clean" means
+    /// for a deletion gate:
+    ///
+    /// - `--ignore-submodules=none` matches git's own `check_clean_worktree`
+    ///   and overrides `submodule.<name>.ignore` / `diff.ignoreSubmodules`.
+    /// - `--untracked-files=normal` overrides `status.showUntrackedFiles=no`,
+    ///   which otherwise hides untracked files entirely — verified on git
+    ///   2.50.1, a worktree holding only untracked work reports EMPTY under
+    ///   that setting. Untracked files are exactly the work that exists
+    ///   nowhere else.
+    ///
+    /// `normal` rather than `all` deliberately: for a gate that only asks
+    /// "is there ANY output", listing every file inside an untracked
+    /// directory instead of the directory itself changes nothing except
+    /// cost — and this scanner's whole subject matter is worktrees carrying
+    /// multi-GB untracked build trees, where the extra walk could exhaust
+    /// the scan budget and fail the gate closed on a perfectly ordinary
+    /// tree.
+    static let statusArguments = [
+        "status", "--porcelain", "--ignore-submodules=none", "--untracked-files=normal"
+    ]
 
     /// Full argv for one worktree. `-C <path>` rather than a CWD change: the
     /// runner never changes directory, and the shared PATH/`env` shape stays

@@ -508,6 +508,50 @@ final class WorktreeStalenessAssessorTests: XCTestCase {
         XCTAssertEqual(try reason(assessment, .clean), "dirty: 1 modified/untracked entries")
     }
 
+    /// The second configuration hole in the same family: a repository that
+    /// sets `status.showUntrackedFiles = no` hides untracked work from the
+    /// bare-default command — and untracked work is precisely the work that
+    /// exists nowhere else.
+    func testUntrackedWorkHiddenByRepositoryConfigIsStillSeen() async throws {
+        let repository = try makeRepository(named: "repo")
+        XCTAssertEqual(
+            try GitFixture.git(
+                ["-C", repository.path, "config", "status.showUntrackedFiles", "no"], home: home
+            ).status, 0
+        )
+        let worktree = try addWorktree(named: "wt", in: repository, arguments: ["-b", "feature"])
+        try fm.createDirectory(
+            at: worktree.appendingPathComponent("newdir"), withIntermediateDirectories: true
+        )
+        try "unsaved work\n".write(
+            to: worktree.appendingPathComponent("newdir/important.txt"),
+            atomically: true, encoding: .utf8
+        )
+
+        // The premise, proven rather than assumed.
+        let configuredDefault = try GitFixture.git(
+            ["-C", worktree.path, "status", "--porcelain", "--ignore-submodules=none"],
+            home: home
+        )
+        XCTAssertTrue(
+            configuredDefault.stdout.isEmpty,
+            "premise: the configured default HIDES this untracked work"
+        )
+
+        let assessment = try await assessLinked(of: repository)
+        XCTAssertFalse(
+            assessment.isCandidate,
+            "untracked work must never be deleted because a repo config hid it"
+        )
+        XCTAssertEqual(try reason(assessment, .clean), "dirty: 1 modified/untracked entries")
+
+        // The exported surface fn-5.4 re-checks through carries the same flag.
+        let verdict = await GitWorktreeCleanCheck.run(
+            worktreeAt: worktree, using: realRunner()
+        )
+        XCTAssertEqual(verdict, .dirty(entryCount: 1))
+    }
+
     // MARK: - R3: the default-branch ladder
 
     func testOriginHeadResolvesTheDefaultBranch() async throws {
@@ -994,7 +1038,8 @@ final class WorktreeStalenessAssessorTests: XCTestCase {
         let worktree = URL(fileURLWithPath: "/repos/wt")
         XCTAssertEqual(
             GitWorktreeCleanCheck.arguments(forWorktreeAt: worktree),
-            ["-C", "/repos/wt", "status", "--porcelain", "--ignore-submodules=none"]
+            ["-C", "/repos/wt", "status", "--porcelain",
+             "--ignore-submodules=none", "--untracked-files=normal"]
         )
     }
 
@@ -1083,6 +1128,10 @@ final class WorktreeStalenessAssessorTests: XCTestCase {
         XCTAssertTrue(status.argv.contains("--porcelain"))
         XCTAssertTrue(
             status.argv.contains("--ignore-submodules=none"),
+            "the G2 argv is pinned: \(status.argv)"
+        )
+        XCTAssertTrue(
+            status.argv.contains("--untracked-files=normal"),
             "the G2 argv is pinned: \(status.argv)"
         )
     }

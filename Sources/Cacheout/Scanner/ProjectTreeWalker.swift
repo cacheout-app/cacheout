@@ -373,10 +373,36 @@ struct ProjectTreeWalker {
             // the sizer: device change against the WALK ROOT, and the
             // statfs mount-root check that catches same-st_dev firmlink
             // mounts.
+            //
+            // CANONICAL INPUT for the statfs arm (PR #457 review r4).
+            // `isMountPoint` compares `f_mntonname` — always canonical —
+            // against the path it is handed, and requires canonical input
+            // (`FileSystemIdentityProvider.swift:143`). This walk canonicalizes
+            // ONLY to compare a root against the TCC-protected ancestors
+            // (`isProtectedRoot`) and then descends from the ORIGINAL root
+            // spelling, deliberately: `originRoot` and every event carry the
+            // DECLARED spelling verbatim, which is what the guard, the
+            // snapshot, and the deletion target are all keyed on. So every
+            // child inherits the root's aliasing — a dev root declared as
+            // `/tmp/work`, or any home reached through a symlink — and this
+            // arm silently answered `false` for a real mount. It is not
+            // defense-in-depth behind the device arm: on a firmlink-shaped
+            // mount that SHARES the root's `st_dev` the device arm cannot
+            // fire at all, which is the very case this arm exists for, so
+            // both go silent together and the walk descends into the mounted
+            // volume.
+            //
+            // The canonical value is an ARGUMENT and is discarded — `child`
+            // is what descends, what consumers see, and what items derive
+            // from. Safe here because the lstat gate directly above already
+            // proved `child` a REAL directory (`canonicalize` resolves the
+            // leaf too, so a symlink child must never reach this call — and
+            // never does), and a real directory's own name is its canonical
+            // name.
             let childDevice = provider.deviceID(of: child)
             if (rootDevice != nil && childDevice != nil
                     && childDevice != rootDevice)
-                || provider.isMountPoint(child) {
+                || provider.isMountPoint(provider.canonicalize(child)) {
                 continue
             }
 

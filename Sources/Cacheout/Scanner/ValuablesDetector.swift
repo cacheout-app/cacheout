@@ -401,13 +401,26 @@ enum ValuablesDetector {
         // mounted volume. Nothing is opened: not one entry of a foreign
         // filesystem is read, and the verdict is INCOMPLETE because we did
         // not look.
+        //
+        // CANONICAL INPUT for the `statfs` arm (PR #457 review r4): the sizer
+        // hands that arm its already-resolved root, and `isMountPoint`
+        // REQUIRES it — it compares `f_mntonname`, always canonical, against
+        // the path it is given, so an aliased spelling silently answers
+        // `false`. This probe is handed the walker's (or the cleaner's frozen
+        // target's) deliberately UNRESOLVED spelling, which is what made an
+        // artifact dir reached through a symlinked ancestor invisible to this
+        // arm. Safe HERE because the ROOT KIND GATE above already proved
+        // `directory` a REAL directory, so no symlink leaf can reach this
+        // call and a real directory's own name is its canonical name. The
+        // canonical value is an ARGUMENT and is discarded: `directory` itself
+        // is what gets walked, sorted, and turned into items.
         let rootDevice = provider.deviceID(of: directory)
         let parentDevice = provider.deviceID(
             of: directory.deletingLastPathComponent()
         )
         if (rootDevice != nil && parentDevice != nil
                 && rootDevice != parentDevice)
-            || provider.isMountPoint(directory) {
+            || provider.isMountPoint(provider.canonicalize(directory)) {
             return .incomplete
         }
 
@@ -671,13 +684,51 @@ enum ValuablesDetector {
     /// volumes and injected test devices, and (b) the `statfs` mount-root
     /// check, required because a unified APFS volume group presents ONE
     /// `st_dev` across the system/Data pair so a firmlink mount is invisible
-    /// to (a). Identical to `DirectorySizer.swift:287` and
-    /// `ProjectTreeWalker.swift:376`; a `nil` device on either side disables
-    /// only arm (a), exactly as it does there.
+    /// to (a). The SAME rule the sizer and the project walker apply
+    /// (`DirectorySizer.swift:289`, `ProjectTreeWalker.swift:405`); a `nil`
+    /// device on either side disables only arm (a), exactly as it does there.
+    /// Arm (b)'s ARGUMENT differs by necessity — see below: the sizer walks
+    /// an already-resolved root, this probe and the walker do not.
     ///
     /// `child` is lstat-probed as a real directory by both callers before
     /// this runs, so a symlink pointing AT a volume root never reaches here
     /// (and is never followed regardless — the no-follow rule).
+    ///
+    /// ## Arm (b) gets a CANONICAL path, and ONLY arm (b) (PR #457 review r4)
+    /// `isMountPoint` compares `statfs`'s `f_mntonname` — always canonical —
+    /// against the path handed to it, and documents that requirement
+    /// (`FileSystemIdentityProvider.swift:143`); the sizer satisfies it by
+    /// passing its already-resolved URLs. This probe cannot: it keeps the
+    /// UNRESOLVED spelling on purpose, because that is the path a deletion
+    /// removes and the one a no-follow `lstat` must land on. So an aliased
+    /// spelling — an artifact dir under a dev root declared through a
+    /// symlinked ancestor (`/tmp/work`, a symlinked home), or the cleaner's
+    /// frozen delete-time target — never equalled `f_mntonname`, and arm (b)
+    /// answered `false` for a real mount.
+    ///
+    /// On its own that is a false negative behind a working arm (a). It is
+    /// NOT defense-in-depth, because the two fail TOGETHER on a
+    /// firmlink-shaped mount that shares the walk root's `st_dev` — which is
+    /// exactly the case arm (b) exists to catch. Both silent means the probe
+    /// enumerates the mounted volume and calls the result COMPLETE: a "proven
+    /// clean" verdict derived from a filesystem the user never pointed this
+    /// scanner at, on the delete-time face that has no size report to back it
+    /// up.
+    ///
+    /// The canonical spelling is therefore computed HERE, as an argument, and
+    /// discarded. It is never returned, never stored, never pushed on the
+    /// stack, never sorted, and never reaches an item — canonicalizing the
+    /// traversal would break the `resolveTargetKeepingLeaf` doctrine
+    /// (identity is the canonical PARENT chain plus the UNRESOLVED leaf) and
+    /// point the walk at paths the deletion does not touch, which is a worse
+    /// bug than the one this fixes. Safe here specifically: `canonicalize`
+    /// resolves the leaf too, which the unresolved-leaf rule forbids
+    /// elsewhere (a mere LINK to a volume root must report `false`), but both
+    /// callers run inside `case .kind(.directory)`, so no symlink leaf can
+    /// reach this call and a real directory's own name is its canonical name.
+    /// Cost is one `realpath` per DIRECTORY child, on the arm-(a)-silent path
+    /// only, inside a walk already bounded to `entryLimit` entries and beside
+    /// a `DirectorySizer` pass that enumerates the same tree unbounded.
     private static func crossesMountBoundary(
         _ child: URL,
         rootDevice: UInt64?,
@@ -688,7 +739,7 @@ enum ValuablesDetector {
             && childDevice != rootDevice {
             return true
         }
-        return provider.isMountPoint(child)
+        return provider.isMountPoint(provider.canonicalize(child))
     }
 
     /// BOUNDED directory read: at most `limit` basenames, plus whether MORE

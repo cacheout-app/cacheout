@@ -317,6 +317,41 @@ final class BuildArtifactsScannerTests: XCTestCase {
         }
     }
 
+    /// Mirrors the PRODUCTION `isMountPoint` contract instead of injecting by
+    /// inode: `statfs` compares `f_mntonname` — ALWAYS canonical — against the
+    /// path it is HANDED, so a real mount answers `true` only for its
+    /// CANONICAL spelling. The inode-keyed seam above answers correctly for
+    /// ANY spelling, which is exactly why it cannot see a caller that passes
+    /// an alias — and why every existing mount test stayed green across this
+    /// defect. Devices are deliberately left untouched, so both sides of the
+    /// boundary share one `st_dev` and the device arm is genuinely silent
+    /// too: the firmlink shape the `statfs` arm exists to catch.
+    private final class CanonicalSpellingMountProvider:
+        FileSystemIdentityProvider
+    {
+        /// CANONICAL mount-root paths, spelled exactly as `f_mntonname`
+        /// would. Compared with `==` and never normalized here — normalizing
+        /// on this side would reintroduce the spelling-blindness the inode
+        /// seam has.
+        var canonicalMountPaths: Set<String> = []
+        private(set) var probedPaths: [String] = []
+
+        override func isMountPoint(_ url: URL) -> Bool {
+            if canonicalMountPaths.contains(url.path) { return true }
+            return super.isMountPoint(url)
+        }
+
+        override func probeKind(of url: URL) -> KindProbe {
+            probedPaths.append(url.path)
+            return super.probeKind(of: url)
+        }
+
+        func touches(below directory: URL) -> [String] {
+            let prefix = directory.path + "/"
+            return probedPaths.filter { $0.hasPrefix(prefix) }
+        }
+    }
+
     /// Forces `.failed` lstat probes for exact paths — EPERM cannot be
     /// fixtured from an unentitled process.
     private final class FailingProbeProvider: FileSystemIdentityProvider {
@@ -2560,6 +2595,179 @@ final class BuildArtifactsScannerTests: XCTestCase {
         )
         XCTAssertFalse(verdict.probeComplete)
         XCTAssertEqual(verdict.valuables, [])
+    }
+
+    // MARK: R15/R17 — the mount check gets a CANONICAL path (PR #457 r4)
+
+    /// `base/aliaslink` → `base/real`, and the declared dev root
+    /// `base/aliaslink/dev`: the `/var` → `/private/var` shape, where the
+    /// LEAF is a real directory reached through a SYMLINKED ANCESTOR. Every
+    /// path the walker then builds carries the alias, because the resolution
+    /// pipeline keeps the DECLARED spelling verbatim.
+    private func makeAliasDeclaredDevRoot() throws -> URL {
+        let real = base.appendingPathComponent("real")
+        try mkdir(real)
+        let aliasParent = base.appendingPathComponent("aliaslink")
+        try fm.createSymbolicLink(at: aliasParent, withDestinationURL: real)
+        return aliasParent.appendingPathComponent("dev")
+    }
+
+    /// The canonical spelling of `url`, computed with a stock provider — the
+    /// test's own independent math, never the code under test.
+    private func canonicalPath(of url: URL) -> String {
+        FileSystemIdentityProvider().canonicalize(url).path
+    }
+
+    func testNestedMountUnderAnAliasedSpellingIsStillNotCrossed()
+        async throws
+    {
+        // BOTH boundary signals silent at once. Arm (a) — device vs the walk
+        // root — cannot fire on a firmlink-shaped mount that shares the
+        // root's `st_dev` (that is the case arm (b) exists for). Arm (b) then
+        // answered `false` too, because the walk hands `isMountPoint` its
+        // deliberately UNRESOLVED spelling and `statfs` compares against the
+        // always-canonical `f_mntonname`. Two checks with a CORRELATED blind
+        // spot, not two independent ones — so the probe enumerated the
+        // mounted tree and called the result COMPLETE.
+        let aliasRoot = try makeAliasDeclaredDevRoot()
+        let artifact = try makeProject(
+            at: aliasRoot.appendingPathComponent("rust"),
+            marker: "Cargo.toml", artifact: "target", payloadBytes: nil
+        )
+        try writeBulkFile(
+            artifact.appendingPathComponent("InTree.dmg"),
+            bytes: aboveFloorBytes
+        )
+        let mounted = artifact.appendingPathComponent("mounted-volume")
+        let beyond = try writeBulkFile(
+            mounted.appendingPathComponent("Beyond.dmg"), bytes: aboveFloorBytes
+        )
+
+        let provider = CanonicalSpellingMountProvider()
+        provider.canonicalMountPaths = [canonicalPath(of: mounted)]
+        XCTAssertFalse(
+            provider.canonicalMountPaths.contains(mounted.path),
+            "the fixture must really be aliased, or the test proves nothing"
+        )
+
+        // THE DELETE-TIME FACE — the one with no backstop at all: it is
+        // handed a bare frozen target and has no size report to consult.
+        let atDelete = BuildArtifactsScanner.preDeleteValuablesProbe(
+            at: artifact, provider: provider
+        )
+        XCTAssertEqual(
+            provider.touches(below: mounted), [],
+            "not one entry of the mounted volume is lstat'd"
+        )
+        XCTAssertFalse(atDelete.probeComplete,
+                       "an uncrossed boundary is UNPROVEN, never 'clean'")
+        XCTAssertEqual(atDelete.valuables.map(\.name), ["InTree.dmg"],
+                       "the rest of the tree is still walked whole")
+        XCTAssertTrue(fm.fileExists(atPath: beyond.path))
+
+        // …and the scan-time face reaches the SAME verdict, from the SAME
+        // aliased spelling the walker built.
+        let scanProvider = CanonicalSpellingMountProvider()
+        scanProvider.canonicalMountPaths = [canonicalPath(of: mounted)]
+        let outcome = try await runScan(
+            makeScanner(roots: [aliasRoot], provider: scanProvider)
+        )
+        let found = try XCTUnwrap(
+            item(outcome, at: artifact, provider: scanProvider)
+        )
+        XCTAssertEqual(found.valuablesDisclosure, atDelete,
+                       "scan time and delete time agree — no drift")
+        XCTAssertEqual(scanProvider.touches(below: mounted), [])
+    }
+
+    func testArtifactDirThatIsItselfAMountIsRefusedUnderAnAliasedSpelling()
+        async throws
+    {
+        // The ROOT arm, same correlated blind spot: the artifact dir IS the
+        // mount, so arm (a)'s device-vs-PARENT comparison is silent on a
+        // firmlink-shaped mount, and arm (b) never matched the alias. Against
+        // the unfixed source the probe opened a foreign volume and disclosed
+        // a valuable from it, reporting COMPLETE — a "proven" verdict derived
+        // entirely from a filesystem the user never pointed this scanner at.
+        let aliasRoot = try makeAliasDeclaredDevRoot()
+        let artifact = try makeProject(
+            at: aliasRoot.appendingPathComponent("rust"),
+            marker: "Cargo.toml", artifact: "target", payloadBytes: nil
+        )
+        try writeBulkFile(
+            artifact.appendingPathComponent("Shipped.dmg"),
+            bytes: aboveFloorBytes
+        )
+
+        let provider = CanonicalSpellingMountProvider()
+        provider.canonicalMountPaths = [canonicalPath(of: artifact)]
+        XCTAssertFalse(provider.canonicalMountPaths.contains(artifact.path))
+
+        let atDelete = BuildArtifactsScanner.preDeleteValuablesProbe(
+            at: artifact, provider: provider
+        )
+        XCTAssertEqual(atDelete, .incomplete,
+                       "nothing is disclosed from a volume we refused to read")
+        XCTAssertEqual(
+            provider.touches(below: artifact), [],
+            "the probe returns before opening the directory at all"
+        )
+    }
+
+    func testCanonicalizationReachesTheMountCheckAndNothingElse()
+        async throws
+    {
+        // THE SEPARATION, asserted rather than trusted. The canonical
+        // spelling is an ARGUMENT and nothing more: canonicalizing the
+        // traversal instead would break the `resolveTargetKeepingLeaf`
+        // doctrine and aim the walk at paths the deletion does not touch —
+        // a worse bug than the one being fixed. Aliased tree, NO mount
+        // anywhere, so the probe runs whole and every lstat it makes is
+        // visible.
+        let aliasRoot = try makeAliasDeclaredDevRoot()
+        let artifact = try makeProject(
+            at: aliasRoot.appendingPathComponent("rust"),
+            marker: "Cargo.toml", artifact: "target", payloadBytes: nil
+        )
+        let dmg = try writeBulkFile(
+            artifact.appendingPathComponent("nested/Shipped.dmg"),
+            bytes: aboveFloorBytes
+        )
+        try makeBundle(
+            at: artifact.appendingPathComponent("Shipped.app"),
+            contentBytes: aboveFloorBytes
+        )
+
+        let provider = CanonicalSpellingMountProvider()
+        let disclosure = BuildArtifactsScanner.preDeleteValuablesProbe(
+            at: artifact, provider: provider
+        )
+
+        XCTAssertTrue(disclosure.probeComplete,
+                      "no boundary anywhere: the probe is not made incomplete "
+                        + "by the canonicalization it now performs")
+        XCTAssertEqual(disclosure.valuables.map(\.name),
+                       ["Shipped.app", "Shipped.dmg"])
+
+        let canonicalPrefix = canonicalPath(of: artifact) + "/"
+        XCTAssertFalse(
+            provider.probedPaths.contains { $0.hasPrefix(canonicalPrefix) },
+            "no lstat ever lands on the CANONICAL spelling — the walk keeps "
+                + "the aliased one it was given: "
+                + "\(provider.probedPaths.filter { $0.hasPrefix(canonicalPrefix) })"
+        )
+        XCTAssertTrue(
+            provider.probedPaths.allSatisfy {
+                $0 == artifact.path || $0.hasPrefix(artifact.path + "/")
+            },
+            "every probed path is the aliased spelling or beneath it"
+        )
+        XCTAssertEqual(
+            disclosure.valuables.first { $0.name == "Shipped.dmg" }?
+                .displayURL.path,
+            dmg.path,
+            "the discovered spelling reaches the item UNRESOLVED, as always"
+        )
     }
 
     // MARK: R13 — additive model fields + the value-domain family

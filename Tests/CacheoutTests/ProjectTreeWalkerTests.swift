@@ -440,6 +440,77 @@ final class ProjectTreeWalkerTests: XCTestCase {
         XCTAssertNotNil(event(events, at: root.appendingPathComponent("normal")))
     }
 
+    /// Mirrors the PRODUCTION `isMountPoint` contract instead of injecting by
+    /// inode: `statfs` compares `f_mntonname` — ALWAYS canonical — against the
+    /// path it is HANDED, so a real mount answers `true` only for its
+    /// CANONICAL spelling. The inode seam above answers correctly for ANY
+    /// spelling, which is why it cannot see a caller that passes an alias.
+    /// Devices are left untouched, so the walk root and the mount share one
+    /// `st_dev` and the device arm is genuinely silent too — the firmlink
+    /// shape the `statfs` arm exists for.
+    private final class CanonicalSpellingMountProvider:
+        FileSystemIdentityProvider
+    {
+        var canonicalMountPaths: Set<String> = []
+
+        override func isMountPoint(_ url: URL) -> Bool {
+            if canonicalMountPaths.contains(url.path) { return true }
+            return super.isMountPoint(url)
+        }
+    }
+
+    func testMountBoundaryUnderAnAliasDeclaredRootIsStillNotCrossed() throws {
+        // PR #457 review r4. The walker canonicalizes ONLY to compare against
+        // the TCC-protected roots (`:152`) and then descends from the ORIGINAL
+        // root spelling, so every child inherits whatever aliasing the
+        // configured dev root has — a root like `/tmp/work`, or any home
+        // reached through a symlink. Arm (a) is blind by construction on a
+        // mount that shares the root's device; arm (b) was blind because the
+        // aliased spelling never equalled `f_mntonname`. Both silent means
+        // the walk descends into the mounted volume.
+        let realParent = base.appendingPathComponent("realparent")
+        try mkdir(realParent.appendingPathComponent("dev"))
+        let alias = base.appendingPathComponent("alias")
+        try fm.createSymbolicLink(at: alias, withDestinationURL: realParent)
+        let root = alias.appendingPathComponent("dev")
+        let mounted = root.appendingPathComponent("mounted-volume")
+        try mkdir(mounted.appendingPathComponent("beyond"))
+        try mkdir(root.appendingPathComponent("normal"))
+
+        let provider = CanonicalSpellingMountProvider()
+        provider.canonicalMountPaths = [
+            FileSystemIdentityProvider().canonicalize(mounted).path
+        ]
+        XCTAssertFalse(
+            provider.canonicalMountPaths.contains(mounted.path),
+            "the fixture must really be aliased, or the test proves nothing"
+        )
+
+        let (events, issues) = recordedWalk(roots: [root], provider: provider)
+
+        XCTAssertTrue(issues.isEmpty,
+                      "a boundary is a non-crossing, not a scan problem here")
+        let rootEvent = try XCTUnwrap(event(events, at: root))
+        XCTAssertEqual(rootEvent.entries.map(\.name),
+                       ["mounted-volume", "normal"],
+                       "the boundary child is still LISTED")
+        XCTAssertNil(event(events, at: mounted),
+                     "…and never descended, alias spelling or not")
+        XCTAssertNil(event(events, at: mounted.appendingPathComponent("beyond")))
+        XCTAssertNotNil(event(events, at: root.appendingPathComponent("normal")),
+                        "the boundary stops one branch, not the walk")
+
+        // THE SEPARATION: canonicalization is an ARGUMENT to the mount check
+        // and nothing more — the traversal keeps the spelling it was given.
+        for walked in events {
+            XCTAssertTrue(
+                walked.directory.pathComponents.starts(with: root.pathComponents),
+                "traversal still carries the alias: \(walked.directory.path)"
+            )
+            XCTAssertEqual(walked.originRoot.path, root.path)
+        }
+    }
+
     // MARK: - R9: maxDepth budget
 
     func testMaxDepthDefaultEightMeasuredFromRootAndConfigurable() throws {

@@ -170,20 +170,25 @@ below are both part of that coordination, and the latter BLOCKS this release.
   reads dirty or unassessable and is never a candidate; an orphaned admin
   directory is offered by the prune tier).
 
-  **RELEASE-BLOCKING cross-repo gate — OPEN.** Status: **NOT SATISFIED. Do
-  not cut this release until it is.** The consumer change lives in a
-  DIFFERENT repository and is not part of this branch; this entry is the gate
-  that keeps the two in step.
+  **RELEASE-BLOCKING cross-repo gate.**
+  Status: **NOT SATISFIED** — no release may be cut until this closes.
+
+  **To close (ONE edit, one meaning):** run the verification below, then
+  replace that status line's `**NOT SATISFIED**` with
+  `**SATISFIED at <commit-hash>**`. Nothing else needs editing: the release
+  script keys on the `Status:` LINE alone, so this paragraph — and any future
+  entry quoting the phrase — never blocks a build.
 
   **Deferred to the release path, deliberately — and ENFORCED there.**
   Merging this work with the gate open is intentional: the scanner ships to
   users only at release, and `[Unreleased]` is exactly where an unshipped
   precondition belongs. It is not left to memory —
-  `scripts/bundle.sh --release` runs `check_release_gates` BEFORE it builds,
-  signs or notarizes anything, and aborts while this section still carries a
-  `RELEASE-BLOCKING` gate whose status reads `NOT SATISFIED` (an unreadable
-  CHANGELOG aborts too — fail-closed). Closing the gate is what unblocks the
-  pipeline.
+  `scripts/bundle.sh` runs `check_release_gates` FIRST in EVERY
+  distribution-producing mode (`--release`/`--notarize` and `--direct`, which
+  also produces a signed DMG), before it builds, signs, packages or
+  notarizes anything. A missing or unreadable CHANGELOG aborts too: an
+  unverifiable gate is never a passed one. The default no-flag mode builds an
+  unsigned .app for local testing and ships nothing, so it is not gated.
 
   - **Consumer:** `cacheout-mcp` (org `acebytes`), branch
     `fn-1.3-memory-stats-mcp-tool`, PR #1.
@@ -212,8 +217,8 @@ below are both part of that coordination, and the latter BLOCKS this release.
 
   Zero in (2) is reachable and stable: the runner must DERIVE its timeout per
   invocation (`None` for composite-capable cleans) instead of hardcoding one
-  for every command. **Replace "OPEN" above with the adopting commit hash
-  when it lands** — that hash closing this gate is the release precondition.
+  for every command. The adopting commit hash going into the status line is
+  what closes this gate — and what lets any distribution build run.
 
 ## [2.2.0] - 2026-08-06
 

@@ -633,40 +633,144 @@ final class DocumentedContractTests: XCTestCase {
         XCTAssertTrue(section.contains("NO client-side timeout"), section)
     }
 
-    /// The gate is DEFERRED to the release path — so the release path has to
-    /// enforce it. A recorded promise nobody executes is how a coordinated
-    /// consumer ships out of step; this asserts the enforcement exists, runs
-    /// BEFORE anything is built or notarized, and reads the same two markers
-    /// the CHANGELOG gate publishes.
-    func testTheReleasePathEnforcesOpenCrossRepoGates() throws {
+    /// The gate is DEFERRED to the release path — so EVERY mode that produces
+    /// a distributable artifact has to enforce it. `--direct` builds and signs
+    /// a DMG just as `--release` does (it only skips notarization), so a gate
+    /// wired into the release arm alone would be bypassable by the shorter
+    /// command (review r3).
+    func testEveryDistributionModeRunsTheReleaseGateFirst() throws {
         let script = try document("scripts/bundle.sh")
-
         XCTAssertTrue(script.contains("check_release_gates() {"),
                       "bundle.sh must define the release-gate check")
-        // Wired into the RELEASE arm, not merely defined.
-        let releaseArm = try XCTUnwrap(
-            script.range(of: "--notarize|--release)"),
-            "bundle.sh must have a release arm"
-        )
-        let armBody = String(script[releaseArm.lowerBound...].prefix(900))
-        XCTAssertTrue(armBody.contains("check_release_gates"),
-                      "the release arm must RUN the check: \(armBody)")
-        // …and run it before the destructive/expensive steps.
-        for later in ["build_release", "create_dmg", "notarize_dmg"] {
-            guard let gate = armBody.range(of: "check_release_gates"),
-                  let step = armBody.range(of: later) else {
-                return XCTFail("release arm missing '\(later)'")
+
+        for (arm, steps) in [
+            ("--direct)", ["build_release", "create_bundle", "create_dmg"]),
+            ("--notarize|--release)",
+             ["build_release", "create_bundle", "create_dmg", "notarize_dmg"]),
+        ] {
+            let start = try XCTUnwrap(script.range(of: arm),
+                                      "bundle.sh must have the \(arm) arm")
+            let body = String(script[start.lowerBound...].prefix(1_200))
+            let gate = try XCTUnwrap(
+                body.range(of: "check_release_gates"),
+                "the \(arm) arm must RUN the gate: \(body)"
+            )
+            for step in steps {
+                let stepRange = try XCTUnwrap(
+                    body.range(of: step), "\(arm) arm missing '\(step)'"
+                )
+                XCTAssertLessThan(gate.lowerBound, stepRange.lowerBound,
+                                  "the gate must precede \(step) in \(arm)")
             }
-            XCTAssertLessThan(gate.lowerBound, step.lowerBound,
-                              "the gate must precede \(later)")
         }
-        // The markers it keys on are the ones the CHANGELOG actually uses.
-        XCTAssertTrue(script.contains("RELEASE-BLOCKING"), script)
-        XCTAssertTrue(script.contains("NOT SATISFIED"), script)
-        // Fail-closed when the CHANGELOG cannot be read at all.
+    }
+
+    /// The gate, EXECUTED — string presence proves wiring, not behavior.
+    /// Three states over fixture CHANGELOGs, plus the one that matters most:
+    /// applying the CHANGELOG's own documented close instruction really does
+    /// unblock the build. A close instruction that does not match what the
+    /// script keys on would leave the release permanently blocked (review r3).
+    func testTheReleaseGateOpensAndClosesExactlyAsDocumented() throws {
+        let script = try document("scripts/bundle.sh")
+        let changelog = try document("CHANGELOG.md")
+
+        // The DOCUMENTED transition, quoted from the CHANGELOG itself.
+        let openMarker = "Status: **NOT SATISFIED**"
+        let closedMarker = "Status: **SATISFIED at 63edbfc**"
+        XCTAssertTrue(changelog.contains(openMarker),
+                      "the gate's status line must be the documented one")
         XCTAssertTrue(
-            script.contains("CHANGELOG.md not found — release gates cannot be verified"),
-            "an unreadable CHANGELOG must abort, never pass"
+            changelog.contains("`**SATISFIED at <commit-hash>**`"),
+            "the CHANGELOG must publish the exact closing edit"
+        )
+
+        // Extract the function so the REAL shell runs, not a paraphrase.
+        let start = try XCTUnwrap(script.range(of: "check_release_gates() {"))
+        let end = try XCTUnwrap(
+            script.range(of: "\n}\n", range: start.upperBound..<script.endIndex)
+        )
+        let function = String(script[start.lowerBound..<end.upperBound])
+
+        let sandbox = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ReleaseGate-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(
+            at: sandbox, withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+        let functionFile = sandbox.appendingPathComponent("gate.sh")
+        try function.write(to: functionFile, atomically: true, encoding: .utf8)
+
+        /// Runs the extracted gate against a fixture project directory.
+        func runGate(projectDir: URL) throws -> Int32 {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/bin/bash")
+            process.arguments = [
+                "-c",
+                "source \"$1\"; PROJECT_DIR=\"$2\"; check_release_gates",
+                "bash", functionFile.path, projectDir.path,
+            ]
+            process.standardOutput = FileHandle.nullDevice
+            process.standardError = FileHandle.nullDevice
+            try process.run()
+            XCTAssertTrue(process.waitForExit(within: 30), "the gate hung")
+            return process.terminationStatus
+        }
+
+        func fixture(_ name: String, changelog contents: String?) throws -> URL {
+            let dir = sandbox.appendingPathComponent(name)
+            try FileManager.default.createDirectory(
+                at: dir, withIntermediateDirectories: true
+            )
+            if let contents {
+                try contents.write(
+                    to: dir.appendingPathComponent("CHANGELOG.md"),
+                    atomically: true, encoding: .utf8
+                )
+            }
+            return dir
+        }
+
+        // (1) OPEN — the CHANGELOG exactly as it ships today.
+        XCTAssertNotEqual(
+            try runGate(projectDir: fixture("open", changelog: changelog)), 0,
+            "an open gate must stop the build"
+        )
+
+        // (2) CLOSED — the documented edit, applied verbatim. THE assertion:
+        // following the instruction actually unblocks the pipeline.
+        let closed = changelog.replacingOccurrences(
+            of: openMarker, with: closedMarker
+        )
+        XCTAssertNotEqual(closed, changelog, "the documented edit must apply")
+        XCTAssertEqual(
+            try runGate(projectDir: fixture("closed", changelog: closed)), 0,
+            "the documented close must actually open the release path — "
+                + "prose still MENTIONING the phrase must not keep it shut"
+        )
+
+        // (3) MISSING — fail-closed: an unverifiable gate is not a passed one.
+        XCTAssertNotEqual(
+            try runGate(projectDir: fixture("missing", changelog: nil)), 0,
+            "a missing CHANGELOG must abort"
+        )
+
+        // (4) A CLOSED gate in a SHIPPED section is history, never a blocker.
+        let historical = """
+        # Changelog
+
+        ## [Unreleased]
+
+        - nothing pending
+
+        ## [2.2.0] - 2026-08-06
+
+          **RELEASE-BLOCKING cross-repo gate.**
+          Status: **NOT SATISFIED** — this shipped long ago.
+        """
+        XCTAssertEqual(
+            try runGate(projectDir: fixture("historical", changelog: historical)),
+            0,
+            "only [Unreleased] gates block"
         )
     }
 

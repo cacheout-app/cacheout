@@ -324,13 +324,22 @@ notarize_dmg() {
 # consumer that must adopt a contract before this build ships. Nothing in
 # this repo's own test suite can observe that, so the gate is RECORDED in
 # CHANGELOG.md's [Unreleased] section (named consumer, owner, verification,
-# and a status line) and enforced HERE, on the release path only. Merging
-# with an open gate is fine and deliberate; SHIPPING with one is not.
+# and ONE status line) and enforced HERE, on every DISTRIBUTION-producing
+# mode. Merging with an open gate is fine and deliberate; shipping an
+# artifact with one is not — and `--direct` produces a signed, distributable
+# DMG just as `--release` does, so both arms run this. The default no-flag
+# mode builds an unsigned .app for local testing and produces no
+# distributable artifact, so it deliberately does not.
 #
-# Fail-closed by construction: an unreadable CHANGELOG, or an [Unreleased]
-# section that still carries a RELEASE-BLOCKING gate whose status reads
-# NOT SATISFIED, stops the release. Closing a gate means replacing that
-# status with the adopting commit hash.
+# THE GATE KEYS ON THE STATUS LINE ALONE — a line whose first non-blank
+# content is `Status: **NOT SATISFIED`. Keying on any occurrence of the
+# phrase would mean the paragraph EXPLAINING the mechanism (or a future
+# entry quoting it) could never be written without blocking every release.
+# Closing a gate is therefore one edit with one meaning: replace that
+# line's `**NOT SATISFIED**` with `**SATISFIED at <commit-hash>**`.
+#
+# Fail-closed by construction: an unreadable or missing CHANGELOG stops the
+# build too — an unverifiable gate is never a passed one.
 check_release_gates() {
     changelog="$PROJECT_DIR/CHANGELOG.md"
     if [ ! -f "$changelog" ]; then
@@ -340,12 +349,11 @@ check_release_gates() {
     # The [Unreleased] section only: closed gates in shipped sections are
     # history, not preconditions.
     unreleased=$(awk '/^## \[Unreleased\]/{inside=1; next} /^## \[/{inside=0} inside' "$changelog")
-    if printf '%s\n' "$unreleased" | grep -q "RELEASE-BLOCKING" &&
-       printf '%s\n' "$unreleased" | grep -q "NOT SATISFIED"; then
-        echo "❌ A RELEASE-BLOCKING gate in CHANGELOG.md [Unreleased] is still NOT SATISFIED."
-        echo "   Close it — run its recorded verification, then replace the status"
-        echo "   line with the adopting commit hash — before releasing:"
-        printf '%s\n' "$unreleased" | grep -n -m 3 -A 3 "RELEASE-BLOCKING"
+    if printf '%s\n' "$unreleased" | grep -qE '^[[:space:]]*Status: \*\*NOT SATISFIED'; then
+        echo "❌ A RELEASE-BLOCKING gate in CHANGELOG.md [Unreleased] is still open:"
+        printf '%s\n' "$unreleased" | grep -nE '^[[:space:]]*Status: \*\*NOT SATISFIED'
+        echo "   Run the gate's recorded verification, then replace that line's"
+        echo "   **NOT SATISFIED** with **SATISFIED at <commit-hash>**."
         return 1
     fi
     echo "✅ No open release-blocking gates in CHANGELOG.md [Unreleased]"
@@ -354,6 +362,9 @@ check_release_gates() {
 # Main
 case "${1:-}" in
     --direct)
+        # A signed, distributable DMG — the same shipping artifact the
+        # release arm produces, minus notarization. Gated identically.
+        check_release_gates
         if [ -z "$DEVID_CERT" ]; then
             echo "❌ Developer ID Application certificate required!"
             echo "   Found in Keychain? Check: security find-identity -v -p codesigning"

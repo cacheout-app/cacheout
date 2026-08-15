@@ -191,6 +191,23 @@ final class GitWorktreeInventoryTests: XCTestCase {
         )
     }
 
+    func testUnterminatedFinalFieldFailsClosed() {
+        // A stream cut mid-path: half a path is exactly the wrong deletion
+        // target the `-z` grammar exists to prevent.
+        var data = Data()
+        data.append(Data("worktree /repos/r".utf8)); data.append(0)
+        data.append(Data("branch refs/heads/ma".utf8)) // no terminating NUL
+        XCTAssertNil(GitWorktreePorcelainParser.parse(data))
+    }
+
+    func testRecordMissingItsClosingNulFailsClosed() {
+        var data = Data()
+        data.append(Data("worktree /repos/r".utf8)); data.append(0)
+        data.append(Data("branch refs/heads/main".utf8)); data.append(0)
+        // Every field terminated, but the record's own closing NUL is gone.
+        XCTAssertNil(GitWorktreePorcelainParser.parse(data))
+    }
+
     func testNonUTF8BytesFailClosedRatherThanDecodingLossily() {
         var data = Data("worktree /repos/".utf8)
         data.append(contentsOf: [0xFF, 0xFE])

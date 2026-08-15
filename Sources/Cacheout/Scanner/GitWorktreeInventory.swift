@@ -127,9 +127,10 @@ struct GitWorktreeInventory: Equatable, Sendable {
     var parentRepoWorkingDir: URL? { mainRecord?.path }
 
     /// Parse raw `--porcelain -z` bytes. `nil` means the stream could not be
-    /// read faithfully (non-UTF-8 bytes, or a record with no `worktree`
-    /// attribute) — fail CLOSED rather than hand a guessed path downstream.
-    /// Unknown attribute lines are ignored, never fatal.
+    /// read faithfully — non-UTF-8 bytes, a record with no `worktree`
+    /// attribute, or TRUNCATION (an unterminated final field or a record
+    /// missing its closing NUL) — fail CLOSED rather than hand a guessed
+    /// path downstream. Unknown attribute lines are ignored, never fatal.
     static func parse(_ data: Data) -> GitWorktreeInventory? {
         guard let entries = GitWorktreePorcelainParser.parse(data) else { return nil }
         return GitWorktreeInventory(entries: entries)
@@ -174,12 +175,13 @@ enum GitWorktreePorcelainParser {
                 index = data.index(after: index)
             }
         }
-        // A trailing unterminated field (git always terminates, but a
-        // truncated stream must not silently vanish).
-        if start < data.endIndex {
-            guard flushField(start..<data.endIndex) else { return nil }
-        }
-        if !current.isEmpty { records.append(current) }
+        // TRUNCATION IS MALFORMED, not "best effort". Every field is
+        // NUL-TERMINATED and every record is closed by an empty field, so a
+        // trailing unterminated field or a record that never received its
+        // terminator means the stream was not read faithfully — and half a
+        // path is exactly the wrong deletion target the `-z` grammar exists
+        // to prevent (D8). Fail CLOSED for the whole listing.
+        guard start == data.endIndex, current.isEmpty else { return nil }
 
         var entries: [GitWorktreeEntry] = []
         entries.reserveCapacity(records.count)

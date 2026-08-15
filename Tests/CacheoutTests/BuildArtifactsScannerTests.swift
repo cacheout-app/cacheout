@@ -288,6 +288,35 @@ final class BuildArtifactsScannerTests: XCTestCase {
         }
     }
 
+    /// Marks chosen inodes as mount points AND records every path anything
+    /// lstat-probes. "The probe did not cross the boundary" is then provable
+    /// by the ABSENCE of any touch beyond it — a stronger claim than an empty
+    /// result, which an unrelated bug could also produce.
+    private final class BoundaryTouchRecordingProvider:
+        FileSystemIdentityProvider
+    {
+        var mountPointInodes: Set<UInt64> = []
+        private(set) var probedPaths: [String] = []
+
+        override func isMountPoint(_ url: URL) -> Bool {
+            if let id = identity(of: url), mountPointInodes.contains(id.inode) {
+                return true
+            }
+            return super.isMountPoint(url)
+        }
+
+        override func probeKind(of url: URL) -> KindProbe {
+            probedPaths.append(url.path)
+            return super.probeKind(of: url)
+        }
+
+        /// Every recorded touch STRICTLY beneath `directory`.
+        func touches(below directory: URL) -> [String] {
+            let prefix = directory.path + "/"
+            return probedPaths.filter { $0.hasPrefix(prefix) }
+        }
+    }
+
     /// Forces `.failed` lstat probes for exact paths — EPERM cannot be
     /// fixtured from an unentitled process.
     private final class FailingProbeProvider: FileSystemIdentityProvider {
@@ -2315,6 +2344,175 @@ final class BuildArtifactsScannerTests: XCTestCase {
         )
         XCTAssertNotNil(disclosure.acknowledgementToken(for: found.key),
                        "a COMPLETE probe of a real hit IS acknowledgeable")
+    }
+
+    // MARK: R15/R17 — the probe never crosses a mount boundary
+
+    func testProbeStopsAtANestedMountAndStillWalksTheRestOfTheTree()
+        async throws
+    {
+        // PR #457 review (P2). Removing the depth cap left the 20,000-entry
+        // budget as the only bound, so a volume mounted inside a matched
+        // artifact dir could absorb the WHOLE budget — up to 20,000 reads
+        // outside the configured dev root, on network/removable/FUSE storage,
+        // for an item the boundary already made uncleanable.
+        let artifact = try makeProject(
+            at: dev.appendingPathComponent("proj"),
+            marker: "Cargo.toml", artifact: "target", payloadBytes: nil
+        )
+        // A real valuable INSIDE the tree, buried deeper than the retired
+        // depth cap: the walk must still reach it (no dd9faec regression).
+        try writeBulkFile(
+            artifact.appendingPathComponent("\(deepChain(14))/InTree.dmg"),
+            bytes: aboveFloorBytes
+        )
+        // The mounted volume, holding a valuable that must NEVER be read.
+        let mounted = artifact.appendingPathComponent("mounted-volume")
+        let beyond = try writeBulkFile(
+            mounted.appendingPathComponent("Beyond.dmg"), bytes: aboveFloorBytes
+        )
+
+        let provider = BoundaryTouchRecordingProvider()
+        provider.mountPointInodes.insert(
+            try XCTUnwrap(provider.identity(of: mounted)?.inode)
+        )
+
+        let outcome = try await runScan(makeScanner(provider: provider))
+        let found = try XCTUnwrap(item(outcome, at: artifact, provider: provider))
+        let disclosure = try XCTUnwrap(found.valuablesDisclosure)
+
+        // THE CLAIM: not one entry of the mounted volume was read.
+        XCTAssertEqual(
+            provider.touches(below: mounted), [],
+            "nothing beneath the mount is ever lstat'd — no network round "
+                + "trip, no privacy-sensitive read outside the dev root"
+        )
+        XCTAssertFalse(
+            disclosure.valuables.contains { $0.name == "Beyond.dmg" },
+            "a valuable past the boundary is not disclosed because it was "
+                + "never looked at"
+        )
+        XCTAssertTrue(fm.fileExists(atPath: beyond.path))
+
+        // Honest, and fail-closed: we did not look there.
+        XCTAssertFalse(disclosure.probeComplete,
+                       "an uncrossed boundary is UNPROVEN, never 'clean'")
+        // And the rest of the tree was still walked whole — the boundary
+        // stops one branch, not the probe.
+        XCTAssertEqual(disclosure.valuables.map(\.name), ["InTree.dmg"],
+                       "the in-tree valuable, deeper than the retired cap, "
+                        + "is still found")
+
+        // Nothing NEW is stranded: the boundary already denied this item.
+        XCTAssertEqual(found.state, .denied)
+        XCTAssertEqual(CLIHandler.cleanPlanAction(for: found), "refuse",
+                       "uncleanable before the probe ran, uncleanable after")
+    }
+
+    func testDeleteTimeProbeAlsoStopsAtAMountAndAgreesWithScanTime()
+        async throws
+    {
+        // WHY THE CHECK LIVES IN THE PROBE, not at the scan-time call site:
+        // the reviewer's cheaper option — gate on the size report's already
+        // known `hasBoundary` — fixes ONLY the face that has a report. The
+        // delete-time face is handed a bare URL (a volume can be mounted into
+        // a build dir between scan and clean), so gating there would leave it
+        // walking through the mount: exactly the scan/delete drift the "one
+        // core, two call sites" rule exists to prevent.
+        let artifact = try makeProject(
+            at: dev.appendingPathComponent("proj"),
+            marker: "Cargo.toml", artifact: "target", payloadBytes: nil
+        )
+        let mounted = artifact.appendingPathComponent("mounted-volume")
+        try writeBulkFile(
+            mounted.appendingPathComponent("Beyond.dmg"), bytes: aboveFloorBytes
+        )
+
+        let scanProvider = BoundaryTouchRecordingProvider()
+        scanProvider.mountPointInodes.insert(
+            try XCTUnwrap(scanProvider.identity(of: mounted)?.inode)
+        )
+        let outcome = try await runScan(makeScanner(provider: scanProvider))
+        let scanned = try XCTUnwrap(
+            item(outcome, at: artifact, provider: scanProvider)?
+                .valuablesDisclosure
+        )
+
+        // The DELETE-TIME face, on its own fresh recorder.
+        let deleteProvider = BoundaryTouchRecordingProvider()
+        deleteProvider.mountPointInodes.insert(
+            try XCTUnwrap(deleteProvider.identity(of: mounted)?.inode)
+        )
+        let atDelete = BuildArtifactsScanner.preDeleteValuablesProbe(
+            at: artifact, provider: deleteProvider
+        )
+
+        XCTAssertEqual(
+            deleteProvider.touches(below: mounted), [],
+            "the delete-time probe does not cross either — the check is in "
+                + "the shared core, so both faces inherit it"
+        )
+        XCTAssertFalse(atDelete.probeComplete)
+        XCTAssertEqual(atDelete.valuables, [])
+        XCTAssertEqual(scanned, atDelete,
+                       "scan time and delete time reach the SAME verdict — "
+                        + "no drift")
+        XCTAssertNil(
+            ValuablesDisclosure.acknowledgementToken(
+                scannerID: BuildArtifactsScanner.registeredID,
+                itemID: "any", valuables: atDelete.valuables,
+                probeComplete: atDelete.probeComplete
+            ),
+            "an unfinished inspection is tokenless, as always"
+        )
+    }
+
+    func testArtifactDirThatIsItselfAMountIsNeverOpenedByTheProbe()
+        async throws
+    {
+        // The ROOT cell. The sizer declines to enumerate its own root when
+        // that root is a mount (`DirectorySizer.swift:202`); the probe must
+        // decline identically, or it reads a whole foreign volume that the
+        // caller has already denied.
+        let artifact = try makeProject(
+            at: dev.appendingPathComponent("proj"),
+            marker: "Cargo.toml", artifact: "target", payloadBytes: nil
+        )
+        try writeBulkFile(
+            artifact.appendingPathComponent("Shipped.dmg"),
+            bytes: aboveFloorBytes
+        )
+
+        let provider = BoundaryTouchRecordingProvider()
+        provider.mountPointInodes.insert(
+            try XCTUnwrap(provider.identity(of: artifact)?.inode)
+        )
+
+        let outcome = try await runScan(makeScanner(provider: provider))
+        let found = try XCTUnwrap(item(outcome, at: artifact, provider: provider))
+
+        XCTAssertEqual(
+            provider.touches(below: artifact), [],
+            "not one entry of the mounted volume is read — the probe returns "
+                + "before opening the directory at all"
+        )
+        XCTAssertEqual(found.valuablesDisclosure, .incomplete,
+                       "unproven, and nothing disclosed from a volume we "
+                        + "refused to read")
+        XCTAssertEqual(found.state, .denied)
+
+        // The delete-time face agrees, on the same root shape.
+        let deleteProvider = BoundaryTouchRecordingProvider()
+        deleteProvider.mountPointInodes.insert(
+            try XCTUnwrap(deleteProvider.identity(of: artifact)?.inode)
+        )
+        XCTAssertEqual(
+            BuildArtifactsScanner.preDeleteValuablesProbe(
+                at: artifact, provider: deleteProvider
+            ),
+            .incomplete
+        )
+        XCTAssertEqual(deleteProvider.touches(below: artifact), [])
     }
 
     func testPreDeleteProbeKindGatingFailsClosedOnlyWhereItMust() throws {

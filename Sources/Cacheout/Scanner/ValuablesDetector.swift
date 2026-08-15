@@ -18,12 +18,45 @@
 ///
 /// ## Fail closed, always
 /// A probe that could not finish (entry budget exhausted, unreadable branch,
-/// unreadable metadata, an undecodable basename, a bundle whose bounded
-/// subtree sizing truncated) is INCOMPLETE.
+/// a mount boundary left uncrossed, unreadable metadata, an undecodable
+/// basename, a bundle whose bounded subtree sizing truncated) is INCOMPLETE.
 /// An incomplete probe has the SAME consequence as a hit: risk forced off
 /// safe, selection forced false, "couldn't fully inspect" evidence — and,
 /// uniformly across every surface, NO acknowledgement token exists. Absence of
 /// valuables is only meaningful when the inspection actually finished.
+///
+/// ## Mount boundaries are NEVER crossed (PR #457 review, R15)
+/// The probe stops at every mount boundary, using the SAME two signals the
+/// sizer (`DirectorySizer.swift:202,287`) and the project walker
+/// (`ProjectTreeWalker.swift:376`) already use — device-id change against the
+/// walk root, plus the `statfs` mount-root check that catches same-`st_dev`
+/// firmlink mounts. There is exactly ONE notion of "mount boundary" in this
+/// codebase and this is it; nothing here re-derives a second one.
+///
+/// Why the probe needs its own check rather than trusting the caller's size
+/// report: this walk has TWO faces and only one of them has a report. At scan
+/// time `BuildArtifactsScanner` already knows the tree holds a boundary and
+/// has already denied the item — but at DELETE time
+/// `preDeleteValuablesProbe` is handed a bare URL, with no report to consult,
+/// and a volume can be mounted into a build directory between the scan and
+/// the clean. Gating on the scan-time `hasBoundary` alone would fix the face
+/// that was already safe and leave the other one walking through the mount:
+/// exactly the scan/delete drift the one-core rule above exists to prevent.
+///
+/// What it costs to cross one: a mounted volume beneath a matched artifact
+/// dir is network, removable, or FUSE storage. Descending it spends the entry
+/// budget — up to 20,000 entries — on reads OUTSIDE the configured dev root,
+/// which means network round trips, spin-up, and privacy-sensitive access to
+/// a filesystem the user never pointed this scanner at. And it buys nothing:
+/// an artifact dir containing a boundary is `.denied` at scan time and
+/// refused whole by the cleaner (`CacheCleaner.swift:875,970`), so no
+/// valuable found past the mount could ever change an outcome.
+///
+/// UNCROSSED ⇒ INCOMPLETE, never "clean": the honest report is "we did not
+/// look there", and that is fail-closed. It strands nothing, because the
+/// boundary that stops the probe is the same fact that already makes the item
+/// unclean-able, and it is CLEARABLE in the way a depth cap never was —
+/// unmount the volume and the next scan probes the tree whole.
 ///
 /// ## ONE budget, and NO depth cap (PR #457 review)
 /// The shared ENTRY budget is the probe's only bound, and it alone guarantees
@@ -313,6 +346,14 @@ enum ValuablesDetector {
     /// they are sized as ONE subject; a valuable nested inside a flagged
     /// bundle is already covered by the bundle itself.
     ///
+    /// NO-CROSS rule (safety — the same two signals as the sizer and the
+    /// project walker): mount boundaries are never crossed, at the root or
+    /// anywhere beneath it, and an uncrossed boundary makes the probe
+    /// INCOMPLETE. A boundary-bearing artifact dir is denied and refused
+    /// whole anyway, so nothing past a mount could change an outcome — and
+    /// reading it would spend the entry budget on a network/removable/FUSE
+    /// volume outside the configured dev root (see the file header).
+    ///
     /// Determinism: within every directory the budget could read WHOLE,
     /// siblings are visited in byte-wise basename order — files as they come,
     /// directories descended in that same ascending order (the stack is
@@ -329,6 +370,24 @@ enum ValuablesDetector {
         // The GLOBAL entry budget, shared with every bundle subtree walk —
         // and the ONE bound on this walk (see the file header).
         var visited = 0
+
+        // MOUNT BOUNDARY AT THE ROOT. The sizer applies exactly this pair of
+        // signals to its OWN root (`DirectorySizer.swift:202`) and declines to
+        // enumerate; the probe must decline identically, or the delete-time
+        // face — which has no size report to consult — would read a whole
+        // mounted volume. Nothing is opened: not one entry of a foreign
+        // filesystem is read, and the verdict is INCOMPLETE because we did
+        // not look.
+        let rootDevice = provider.deviceID(of: directory)
+        let parentDevice = provider.deviceID(
+            of: directory.deletingLastPathComponent()
+        )
+        if (rootDevice != nil && parentDevice != nil
+                && rootDevice != parentDevice)
+            || provider.isMountPoint(directory) {
+            return .incomplete
+        }
+
         var stack: [URL] = [directory]
 
         walk: while let dir = stack.popLast() {
@@ -386,6 +445,19 @@ enum ValuablesDetector {
                     ))
 
                 case .kind(.directory):
+                    // MOUNT BOUNDARY: never crossed, whatever is on the far
+                    // side. Checked BEFORE the bundle split on purpose — a
+                    // mounted `.app` must not be subtree-sized either, and
+                    // sizing it would spend the same budget on the same
+                    // foreign volume.
+                    guard !crossesMountBoundary(
+                        child, rootDevice: rootDevice, provider: provider
+                    ) else {
+                        // We did not look past it: unproven, exactly like an
+                        // unreadable branch.
+                        complete = false
+                        break
+                    }
                     guard bundleExtensions.contains(ext) else {
                         // ALWAYS descended: discovering this directory
                         // already cost an entry, and the budget bounds what
@@ -399,6 +471,7 @@ enum ValuablesDetector {
                     // walk deliberately does not descend it.
                     let sized = boundedSubtreeAllocation(
                         at: child, provider: provider,
+                        rootDevice: rootDevice,
                         entryLimit: entryLimit, visited: &visited
                     )
                     if !sized.complete {
@@ -482,17 +555,20 @@ enum ValuablesDetector {
     /// Counts REGULAR FILES' allocated bytes only (directory inodes are not
     /// counted — the same stance as the shared `DirectorySizer`), never
     /// follows symlinks, and shares the caller's GLOBAL entry budget — the
-    /// one bound here too, so the whole probe stays bounded. `complete ==
-    /// false` on an unreadable branch, unreadable file metadata, the entry
-    /// cap, or an allocation sum that would overflow `Int64` — every one of
-    /// which makes the returned figure a FLOOR, never a truth, so no token
-    /// may derive from it. A deep bundle (`Contents/Frameworks/…
+    /// one bound here too, so the whole probe stays bounded. Mount boundaries
+    /// are not crossed here either — a bundle can hold a mounted subtree just
+    /// as an artifact dir can. `complete == false` on an unreadable branch, an
+    /// uncrossed mount boundary, unreadable file metadata, the entry cap, or
+    /// an allocation sum that would overflow `Int64` — every one of which
+    /// makes the returned figure a FLOOR, never a truth, so no token may
+    /// derive from it. A deep bundle (`Contents/Frameworks/…
     /// /Versions/A/Resources/…` runs long) is sized WHOLE while the budget
     /// lasts: an under-counted bundle would fall below the floor and vanish
     /// from the disclosure entirely.
     private static func boundedSubtreeAllocation(
         at bundleRoot: URL,
         provider: FileSystemIdentityProvider,
+        rootDevice: UInt64?,
         entryLimit: Int,
         visited: inout Int
     ) -> (allocatedBytes: Int64, complete: Bool) {
@@ -540,6 +616,16 @@ enum ValuablesDetector {
                     }
                     total = sum
                 case .kind(.directory):
+                    // The SAME uncrossable boundary, against the SAME walk
+                    // root as the outer probe (the bundle was reached from
+                    // it, so it shares its device). An uncrossed branch makes
+                    // the size a FLOOR, so the sizing is incomplete.
+                    guard !crossesMountBoundary(
+                        child, rootDevice: rootDevice, provider: provider
+                    ) else {
+                        complete = false
+                        break
+                    }
                     pendingDirectories.append(child)
                 case .kind:
                     // Symlink / special: 0 bytes, never followed.
@@ -553,6 +639,33 @@ enum ValuablesDetector {
             stack.append(contentsOf: pendingDirectories.reversed())
         }
         return (total, complete)
+    }
+
+    /// Does descending into `child` cross a mount boundary?
+    ///
+    /// The house rule VERBATIM — both signals, no third notion invented here:
+    /// (a) device-id change against the WALK ROOT, which catches foreign
+    /// volumes and injected test devices, and (b) the `statfs` mount-root
+    /// check, required because a unified APFS volume group presents ONE
+    /// `st_dev` across the system/Data pair so a firmlink mount is invisible
+    /// to (a). Identical to `DirectorySizer.swift:287` and
+    /// `ProjectTreeWalker.swift:376`; a `nil` device on either side disables
+    /// only arm (a), exactly as it does there.
+    ///
+    /// `child` is lstat-probed as a real directory by both callers before
+    /// this runs, so a symlink pointing AT a volume root never reaches here
+    /// (and is never followed regardless — the no-follow rule).
+    private static func crossesMountBoundary(
+        _ child: URL,
+        rootDevice: UInt64?,
+        provider: FileSystemIdentityProvider
+    ) -> Bool {
+        let childDevice = provider.deviceID(of: child)
+        if rootDevice != nil && childDevice != nil
+            && childDevice != rootDevice {
+            return true
+        }
+        return provider.isMountPoint(child)
     }
 
     /// BOUNDED directory read: at most `limit` basenames, plus whether MORE

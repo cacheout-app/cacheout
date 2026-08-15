@@ -47,6 +47,7 @@ final class SpaceScannerIntegrationTests: XCTestCase {
     /// fixture home"), so the gate matches these EXACT registered slugs.
     private static let fixtureSlugs = [
         "fixture_e2e_tree", "fixture_e2e_refusals", "fixture_e2e_cache",
+        "fixture_e2e_alias", "fixture_e2e_aliased",
     ]
 
     /// The RETIRED per-item scanner slug (fn-4.5 unregistered it atomically
@@ -761,6 +762,130 @@ final class SpaceScannerIntegrationTests: XCTestCase {
             deps.runtime.scanners.contains { $0.id == retiredNodeModulesSlug },
             "the CLI composition is the swapped one too"
         )
+    }
+
+    // MARK: - Cross-scanner alias shadowing (review P2, fn-4.5)
+
+    /// The SHARPER half of the alias-shadowing defect a00d657 fixed inside
+    /// the dev-root list: the root a symlink dev root aliases need not be a
+    /// DEV root at all. `~/Library/Caches` enters the runtime union from
+    /// `orphaned_caches`, and the production registry puts `build_artifacts`
+    /// FIRST — so an alias dev root sat ahead of the sweep's own root, and
+    /// `matchConfiguredRoot`'s first-match returned the alias for every
+    /// orphaned-cache origin claim, which `admitContainer`'s no-follow gate
+    /// then refused: every sweep cleanup failed `containerUnavailable`.
+    ///
+    /// Driven through the REAL production composition, in the REAL
+    /// registration order, all the way to a deletion.
+    func testAliasDevRootNeverShadowsAnotherScannersRealRoot() async throws {
+        let provider = FileSystemIdentityProvider()
+        let caches = fixtureHome.appendingPathComponent("Library/Caches")
+        let stale = caches.appendingPathComponent("com.example.gone")
+        try makePayloadTree(at: stale)
+        // A symlink-LEAF dev root whose target is the sweep's root — legal
+        // to configure (the container-root policy admits `~/Library/Caches`)
+        // and never itself walkable.
+        let alias = base.appendingPathComponent("dev-alias")
+        try fm.createSymbolicLink(at: alias, withDestinationURL: caches)
+        XCTAssertEqual(provider.canonicalize(alias).path,
+                       provider.canonicalize(caches).path,
+                       "fixture precondition: the alias resolves onto the "
+                       + "sweep's caches root")
+
+        let runtime = productionRuntime(devRoots: [alias])
+        // The order this defect needs is the PRODUCTION one — asserted, not
+        // assumed, so a future registry reshuffle cannot silently turn this
+        // test into a tautology.
+        let registrationOrder = runtime.scanners.map(\.id)
+        let artifactsIndex = try XCTUnwrap(
+            registrationOrder.firstIndex(of: BuildArtifactsScanner.registeredID)
+        )
+        let sweepIndex = try XCTUnwrap(
+            registrationOrder.firstIndex(of: OrphanedCachesScanner.registeredID)
+        )
+        XCTAssertLessThan(artifactsIndex, sweepIndex,
+                          "the dev-root scanner registers FIRST, so its alias "
+                          + "is what first-match root matching would find")
+        // The union carries at most ONE spelling per canonical location, and
+        // when any spelling is a real directory that is the one kept — an
+        // unusable alias may never sit ahead of the root it shadows.
+        XCTAssertEqual(
+            runtime.trustedContainerRoots.map(\.path),
+            [caches.path],
+            "the unusable alias is suppressed from the runtime union"
+        )
+
+        // The sweep's own origin claim must still admit — and clean.
+        let key = ItemKey(
+            scannerID: OrphanedCachesScanner.registeredID, itemID: "stale-fixture"
+        )
+        let snapshot = ContainerSnapshot.capture(
+            roots: runtime.trustedContainerRoots, provider: provider
+        )
+        let report = await runtime.makeCleaner(snapshot: snapshot).clean(
+            items: [Self.removeItemFixture(
+                scanner: OrphanedCachesScanner.registeredID, key: key,
+                name: "gone", origin: caches, target: stale
+            )],
+            moveToTrash: false
+        )
+        XCTAssertEqual(report.errors.map(\.message), [],
+                       "an aliased dev root must not make every "
+                       + "orphaned-cache cleanup fail container-unavailable")
+        XCTAssertEqual(report.entries.map(\.key), [key])
+        XCTAssertFalse(fm.fileExists(atPath: stale.path))
+    }
+
+    /// …and the suppression is ORDER-INDEPENDENT: the alias is dropped
+    /// whether its scanner registers before or after the scanner declaring
+    /// the real directory. Fixture scanners, so the proof is about the union
+    /// itself and not about any one production registry order.
+    func testUnionAliasSuppressionHoldsInBothRegistrationOrders() throws {
+        let provider = FileSystemIdentityProvider()
+        let real = base.appendingPathComponent("real-root")
+        let item = real.appendingPathComponent("victim")
+        try makePayloadTree(at: item)
+        let alias = base.appendingPathComponent("alias-root")
+        try fm.createSymbolicLink(at: alias, withDestinationURL: real)
+
+        let aliasScanner = OutcomeFixtureScanner(
+            id: "fixture_e2e_alias", trustedContainerRoots: [alias],
+            provide: { ScanOutcome(items: [], errors: []) }
+        )
+        let realScanner = OutcomeFixtureScanner(
+            id: "fixture_e2e_aliased", trustedContainerRoots: [real],
+            provide: { ScanOutcome(items: [], errors: []) }
+        )
+
+        for scanners in [[aliasScanner, realScanner], [realScanner, aliasScanner]] {
+            let runtime = try SpaceScannerRuntime(
+                scanners: scanners, categories: [],
+                home: fixtureHome, provider: provider
+            )
+            XCTAssertEqual(runtime.trustedContainerRoots.map(\.path),
+                           [real.path],
+                           "declaration order must not decide whether the "
+                           + "real root is admissible")
+            let pathGuard = PathGuard(
+                home: fixtureHome,
+                containerRoots: runtime.trustedContainerRoots,
+                provider: provider
+            )
+            let snapshot = ContainerSnapshot.capture(
+                roots: runtime.trustedContainerRoots, provider: provider
+            )
+            let container = try pathGuard.admitContainer(real, snapshot: snapshot)
+            XCTAssertNoThrow(
+                try pathGuard.validateRemovableItem(item, inside: container)
+            )
+            // The alias itself grants NOTHING extra: it never widened
+            // admission (its canonical location is the real root's), and it
+            // is no longer a spelling the guard can return.
+            XCTAssertThrowsError(
+                try pathGuard.admitContainer(alias, snapshot: snapshot),
+                "the alias spelling is not a usable container in its own right"
+            )
+        }
     }
 
     /// R17/R6 ordering, proven at the product boundary: a valuable-bearing

@@ -278,6 +278,14 @@ struct DevRootsStore {
     ///    real-directory root is DROPPED with a classified issue instead of
     ///    passing through (see below) — the one case where "set aside"
     ///    would break the root it aliases rather than merely itself.
+    ///    THIS LIST ONLY, by construction: dev roots resolve before any
+    ///    runtime exists, so a dev root aliasing ANOTHER SCANNER's root
+    ///    (`~/Library/Caches`, registered by the orphaned-caches sweep) is
+    ///    invisible here. `SpaceScannerRuntime.suppressingAliasShadows`
+    ///    re-runs exactly this rule over the FINAL registration union, which
+    ///    is the first place every root is known; the two are the same
+    ///    doctrine at the two scopes, and neither weakens the walk-time or
+    ///    delete-time gates.
     private func resolve(
         declaredRoots: [URL], home: URL, parseIssues: [ScanIssue]
     ) -> DevRootsResolution {

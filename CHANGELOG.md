@@ -170,14 +170,27 @@ below are both part of that coordination, and the latter BLOCKS this release.
   reads dirty or unassessable and is never a candidate; an orphaned admin
   directory is offered by the prune tier).
 
-  **RELEASE-BLOCKING cross-repo gate.** `cacheout-mcp` (org `acebytes`,
-  branch `fn-1.3-memory-stats-mcp-tool`, PR #1) still wraps EVERY CLI
-  invocation in a blanket client-side timeout
-  (`AppEngine._run`, `src/cacheout_mcp/engine.py`), so a confirmed
-  `git_worktrees` clean would be killed mid-removal today. That consumer must
-  adopt the rule above BEFORE or WITH this release. Owner: the fn-5.6
-  implementer. Verification, both parts source-scoped (`-I` and
-  `--exclude-dir=__pycache__` keep a stale `.pyc` from deciding the verdict):
+  **RELEASE-BLOCKING cross-repo gate — OPEN.** Status: **NOT SATISFIED. Do
+  not cut this release until it is.** The consumer change lives in a
+  DIFFERENT repository and is not part of this branch; this entry is the gate
+  that keeps the two in step.
+
+  - **Consumer:** `cacheout-mcp` (org `acebytes`), branch
+    `fn-1.3-memory-stats-mcp-tool`, PR #1.
+  - **Baseline verified at `63edbfc`:** `AppEngine._run`
+    (`src/cacheout_mcp/engine.py:465`) wraps EVERY CLI invocation in
+    `asyncio.wait_for(proc.communicate(), timeout=120)` (line 475) and raises
+    at line 480. A confirmed `git_worktrees` clean therefore gets SIGKILLed
+    at 120 s today — mid-`git worktree remove` on any tree that takes longer.
+  - **Required change:** derive the timeout per invocation and pass `None`
+    when the D18 trigger fires (target token `git_worktrees`, a
+    `git_worktrees:` prefix, a preflight row whose `action` is
+    `git_worktree_reclaim`, or a scanner-ambiguous target); every other
+    command keeps its existing bound.
+  - **Owner:** the fn-5.6 implementer, at release time.
+  - **Verification**, both parts source-scoped (`-I` and
+    `--exclude-dir=__pycache__` keep a stale `.pyc` from deciding the
+    verdict), run in the `cacheout-mcp` checkout:
 
   ```
   # (1) the trigger rule is implemented AND tested — must be NON-ZERO:
@@ -189,7 +202,8 @@ below are both part of that coordination, and the latter BLOCKS this release.
 
   Zero in (2) is reachable and stable: the runner must DERIVE its timeout per
   invocation (`None` for composite-capable cleans) instead of hardcoding one
-  for every command. Record the adopting commit hash here when it lands.
+  for every command. **Replace "OPEN" above with the adopting commit hash
+  when it lands** — that hash closing this gate is the release precondition.
 
 ## [2.2.0] - 2026-08-06
 

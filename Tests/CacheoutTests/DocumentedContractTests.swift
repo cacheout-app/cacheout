@@ -610,8 +610,11 @@ final class DocumentedContractTests: XCTestCase {
 
         for fragment in [
             "RELEASE-BLOCKING",           // it blocks, it is not advisory
+            "NOT SATISFIED",              // …and its CURRENT state is stated
             "cacheout-mcp",               // the named consumer
             "Owner:",                     // a person, not "someone"
+            "Baseline verified at",        // the defect was observed, not assumed
+            "Required change:",           // what closing it actually means
             "git_worktrees",              // the trigger the consumer implements
             "-I",                         // binaries never decide the verdict
             "--exclude-dir=__pycache__",  // build artifacts never do either

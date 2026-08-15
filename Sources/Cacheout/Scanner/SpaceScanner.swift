@@ -993,6 +993,19 @@ struct SpaceScannerRuntime {
     private let home: URL
     private let provider: FileSystemIdentityProvider
 
+    /// The SHARED git runner (fn-5.1), held at the composition layer and
+    /// handed to every cleaner this runtime builds (fn-5.4). ONE instance per
+    /// runtime by design: fn-5.1 made the `git --version` availability cache
+    /// INSTANCE-scoped, so a second runner built elsewhere would probe (and
+    /// cache) independently — and detection and execution must agree about
+    /// whether git exists at all. `nil` stays the fail-closed default for
+    /// runtimes composed without one (every test runtime today), which makes
+    /// their cleaners refuse composite items per item.
+    ///
+    /// fn-5.5's `GitWorktreeScanner` must be constructed with THIS SAME
+    /// instance when fn-5.6 registers it — never with a fresh one.
+    let gitRunner: (any GitCommandRunning)?
+
     /// Registration + FOLDED validation as one check (epic rounds 6-7):
     /// scanner-id slug syntax, scanner-id uniqueness, and the combined
     /// category-slug/scanner-slug namespace collision check. Injectable for
@@ -1002,11 +1015,16 @@ struct SpaceScannerRuntime {
     /// - Parameter categories: the category registry the `CategoryScanner`
     ///   adapter scans — registered HERE so scan-time validation has an
     ///   authoritative source to check category provenance against.
+    /// - Parameter gitRunner: the SHARED fn-5.1 runner (see the stored
+    ///   property). TRAILING and DEFAULTED so every existing composition
+    ///   compiles unchanged; the default `nil` keeps those runtimes'
+    ///   cleaners fail-closed for composite items.
     init(
         scanners: [any SpaceScanner],
         categories: [CacheCategory],
         home: URL,
-        provider: FileSystemIdentityProvider
+        provider: FileSystemIdentityProvider,
+        gitRunner: (any GitCommandRunning)? = nil
     ) throws {
         var namespace = Set<String>()
         for scanner in scanners {
@@ -1056,6 +1074,7 @@ struct SpaceScannerRuntime {
         self.preDeleteRevalidators = revalidators
         self.home = home
         self.provider = provider
+        self.gitRunner = gitRunner
     }
 
     /// The production registry — the single place scanners are registered.
@@ -1134,7 +1153,20 @@ struct SpaceScannerRuntime {
             ],
             categories: categories,
             home: home,
-            provider: provider
+            provider: provider,
+            // The SHARED git runner (fn-5.1/fn-5.4): built ONCE here so the
+            // cleaner this runtime makes can execute `git_worktree_reclaim`
+            // instead of refusing it fail-closed. Inert until an item exists
+            // — nothing constructs a subprocess and nothing probes for git
+            // until a composite item is actually cleaned, and no registered
+            // scanner emits one until fn-5.5.
+            //
+            // fn-5.6 registers `GitWorktreeScanner` with THIS instance (hold
+            // it in a local above and pass it to both) — a second runner
+            // would fork fn-5.1's deliberately instance-scoped availability
+            // cache, letting the scan and the clean disagree about whether
+            // git exists.
+            gitRunner: GitCommandRunner(home: home)
         )
     }
 
@@ -1153,20 +1185,12 @@ struct SpaceScannerRuntime {
     /// honour a `requiresPreDeleteRevalidation` marker, and a cleaner built
     /// without one fails closed on marked items.
     ///
-    /// **NO `gitRunner` IS THREADED HERE YET, and that is deliberate** (fn-5.3
-    /// designed the seam, fn-5.4 built the performer behind it, fn-5.6 wires
-    /// it): the runner argument stays at its fail-closed `nil` default, so a
-    /// composite `git_worktree_reclaim` item reaching a runtime-built cleaner
-    /// is REFUSED per item rather than executed. Nothing regresses in the
-    /// meantime — no registered scanner emits a composite item until fn-5.5
-    /// lands `GitWorktreeScanner`, so the refusal is unreachable in practice
-    /// and is pinned by
-    /// `GitWorktreeReclaimActionTests.testTheRunnerSeamIsTrailingAndDefaulted`.
-    /// fn-5.6 owns this line together with the `production(devRoots:)`
-    /// registration it must land beside (the runner instance is SHARED with
-    /// the scanner — constructing a second one here would fork the
-    /// instance-scoped availability cache fn-5.1 deliberately made
-    /// per-instance).
+    /// The runtime's SHARED git runner rides along the same way (fn-5.4): a
+    /// cleaner built THROUGH a runtime that holds one can EXECUTE
+    /// `git_worktree_reclaim`, and a cleaner built through a runtime without
+    /// one (or constructed directly) refuses those items per item —
+    /// fail-closed, never a silent no-op. `production(...)` always supplies
+    /// it, so the GUI and CLI paths are wired end to end.
     func makeCleaner(
         snapshot: ContainerSnapshot? = nil,
         trashHandler: CacheCleaner.TrashHandler? = nil
@@ -1177,7 +1201,8 @@ struct SpaceScannerRuntime {
             containerSnapshot: snapshot,
             preDeleteRevalidators: preDeleteRevalidators,
             provider: provider,
-            trashHandler: trashHandler
+            trashHandler: trashHandler,
+            gitRunner: gitRunner
         )
     }
 

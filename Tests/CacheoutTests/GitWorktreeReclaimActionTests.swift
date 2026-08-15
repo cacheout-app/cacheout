@@ -905,19 +905,10 @@ final class GitWorktreeReclaimActionTests: XCTestCase {
         XCTAssertTrue(runner.invocations.isEmpty)
     }
 
-    func testTheRunnerSeamIsTrailingAndDefaulted() async throws {
+    func testTheRunnerSeamIsTrailingAndDefaultedAndRuntimeThreaded() async throws {
         // Zero call-site churn is the contract: every pre-existing
-        // construction — including the runtime's own factory — still
-        // compiles, and the default is the fail-closed nil.
-        //
-        // THE SEQUENCING THIS PINS (fn-5.3 designed the seam, fn-5.4 built
-        // the performer behind it, fn-5.6 threads the SHARED runner through
-        // `makeCleaner` beside the scanner's registration): until fn-5.6, a
-        // runtime-built cleaner REFUSES composite items per item instead of
-        // executing them. That is unreachable in practice — no registered
-        // scanner emits a composite item until fn-5.5 — and it is the
-        // fail-closed direction, never a silent no-op. When fn-5.6 threads
-        // the runner, THIS cell is the one that must be updated.
+        // construction — including a runtime composed without a runner —
+        // still compiles, and the default is the fail-closed nil.
         let runtime = try makeRuntime()
         let fromFactory = runtime.makeCleaner()
         let report = await fromFactory.clean(
@@ -929,7 +920,45 @@ final class GitWorktreeReclaimActionTests: XCTestCase {
             "refused: no git runner is available to this cleaner — a "
                 + "git_worktree_reclaim item can only be cleaned through a "
                 + "cleaner built with one",
-            "makeCleaner threads no runner yet (fn-5.6) — so it fails closed"
+            "a runner-less runtime's cleaner fails CLOSED, never silently"
+        )
+
+        // fn-5.4: a runtime that DOES hold the shared runner threads it
+        // through `makeCleaner`, so composite items reach the performer
+        // instead of the composition refusal. (This one still refuses — it
+        // has no session snapshot — but the message proves which gate it
+        // reached.)
+        let wired = try SpaceScannerRuntime(
+            scanners: [FixtureScanner(
+                id: scannerID, trustedContainerRoots: [container]
+            )],
+            categories: [], home: home, provider: FileSystemIdentityProvider(),
+            gitRunner: RecordingRunner()
+        )
+        let wiredReport = await wired.makeCleaner().clean(
+            items: [item(plan(.pruneOrphanedAdmin), id: "wired")],
+            moveToTrash: false
+        )
+        XCTAssertTrue(
+            wiredReport.errors.first?.message.contains(
+                "no scan-session container snapshot"
+            ) ?? false,
+            "expected the performer's own gate, got: "
+                + "\(wiredReport.errors.first?.message ?? "<none>")"
+        )
+    }
+
+    func testTheProductionRuntimeCarriesTheSharedGitRunner() {
+        // The composition assertion the execution path depends on: without a
+        // runner on the production runtime, every GUI and CLI clean of a
+        // composite item would refuse before reaching the performer.
+        let runtime = SpaceScannerRuntime.production(
+            home: home, provider: FileSystemIdentityProvider(),
+            devRoots: DevRootsResolution(keptRoots: [], issues: [])
+        )
+        XCTAssertNotNil(
+            runtime.gitRunner,
+            "production() must supply the shared runner to its cleaners"
         )
     }
 

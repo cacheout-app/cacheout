@@ -340,6 +340,23 @@ final class GitWorktreeEndToEndTests: XCTestCase {
                 + "\(runner.argvs)"
         )
 
+        // ---- The CLI row for the SAME item, from the generic builder ------
+        // Registration alone makes these rows appear; the builder needed no
+        // per-scanner branch. The plan payload is NOT on the wire (the
+        // `.commands` non-exposure rule, extended to the composite).
+        let row = CLIHandler.scannerItemRowJSON(for: stale)
+        XCTAssertEqual(row["scanner_id"] as? String,
+                       GitWorktreeScanner.registeredID)
+        XCTAssertEqual(row["item_id"] as? String, stale.id)
+        XCTAssertEqual(row["action"] as? String, "git_worktree_reclaim")
+        XCTAssertEqual(
+            Set(row.keys),
+            ["scanner_id", "item_id", "path", "name", "state", "exact_bytes",
+             "estimated_up_to_bytes", "size_bytes", "item_count",
+             "risk_level", "evidence", "action"],
+            "the documented base row shape — no plan paths, no extra keys"
+        )
+
         // ---- Quick Clean picks up NOTHING --------------------------------
         viewModel.selectAllSafe()
         XCTAssertTrue(viewModel.selectedItemKeys.isEmpty,

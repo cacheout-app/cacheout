@@ -409,35 +409,38 @@ check_release_gates() {
     fi
 
     # (b) SPELLING — every paired status is one of the two admissible forms.
+    #
+    # COUNTED, not iterated. A `while read` fed by a heredoc needs a writable
+    # temporary file, and a shell that cannot create one SKIPS the loop
+    # silently — the body never runs, no status is ever rejected, and the
+    # function falls through to "satisfied". A gate that passes because the
+    # filesystem was full is the fail-open this whole check exists to
+    # prevent, so the validation uses only pipes and arithmetic: any grep
+    # that cannot run yields a count of 0, which fails the equality below and
+    # blocks.
     status_lines=$(printf '%s\n' "$unreleased" | grep -E '^[[:space:]]*Status:' || true)
+    open_count=$(printf '%s\n' "$status_lines" |
+        grep -cE '^[[:space:]]*Status: \*\*NOT SATISFIED\*\*' || true)
+    satisfied_count=$(printf '%s\n' "$status_lines" |
+        grep -cE '^[[:space:]]*Status: \*\*SATISFIED at [0-9a-f]{7,40}\*\*' || true)
 
-    # Enumerate the admissible states; anything else is refused by name.
-    while IFS= read -r line; do
-        case "$line" in
-            *[![:space:]]*) ;;
-            *) continue ;;
-        esac
-        case "$line" in
-            *"Status: **NOT SATISFIED**"*)
-                echo "❌ An open release-blocking gate in CHANGELOG.md [Unreleased]:"
-                echo "  $line"
-                echo "   Run the gate's recorded verification, then replace that line's"
-                echo "   **NOT SATISFIED** with **SATISFIED at <commit-hash>**."
-                return 1
-                ;;
-        esac
-        if ! printf '%s\n' "$line" |
-             grep -qE '^[[:space:]]*Status: \*\*SATISFIED at [0-9a-f]{7,40}\*\*'; then
-            echo "❌ Malformed release-gate status in CHANGELOG.md [Unreleased]:"
-            echo "  $line"
-            echo "   Admissible: 'Status: **NOT SATISFIED**' or"
-            echo "   'Status: **SATISFIED at <commit-hash>**' (7-40 hex characters)."
-            echo "   Anything else is unverifiable and therefore blocks."
-            return 1
-        fi
-    done <<STATUS_LINES
-$status_lines
-STATUS_LINES
+    if [ "$open_count" -gt 0 ]; then
+        echo "❌ An open release-blocking gate in CHANGELOG.md [Unreleased]:"
+        printf '%s\n' "$status_lines" | grep -E '^[[:space:]]*Status: \*\*NOT SATISFIED\*\*'
+        echo "   Run the gate's recorded verification, then replace that line's"
+        echo "   **NOT SATISFIED** with **SATISFIED at <commit-hash>**."
+        return 1
+    fi
+    if [ "$satisfied_count" -ne "$gate_count" ]; then
+        echo "❌ Malformed release-gate status in CHANGELOG.md [Unreleased]"
+        echo "   ($gate_count gate(s), $satisfied_count well-formed status line(s)):"
+        printf '%s\n' "$status_lines" |
+            grep -vE '^[[:space:]]*Status: \*\*SATISFIED at [0-9a-f]{7,40}\*\*' || true
+        echo "   Admissible: 'Status: **NOT SATISFIED**' or"
+        echo "   'Status: **SATISFIED at <commit-hash>**' (7-40 hex characters)."
+        echo "   Anything else is unverifiable and therefore blocks."
+        return 1
+    fi
 
     echo "✅ Every release-blocking gate in CHANGELOG.md [Unreleased] is satisfied"
 }

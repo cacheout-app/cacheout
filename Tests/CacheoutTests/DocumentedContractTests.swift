@@ -700,8 +700,19 @@ final class DocumentedContractTests: XCTestCase {
         let functionFile = sandbox.appendingPathComponent("gate.sh")
         try function.write(to: functionFile, atomically: true, encoding: .utf8)
 
+        // NO HEREDOC in the gate (review r7): a `while read` fed by a
+        // heredoc needs a writable temp file, and a shell that cannot create
+        // one SKIPS the loop silently — every status would go unchecked and
+        // the function would fall through to "satisfied". The behavioural
+        // half of this is the unwritable-TMPDIR run below; this is the
+        // structural guard that keeps the construct from coming back.
+        XCTAssertFalse(function.contains("<<"),
+                       "the gate must not depend on temporary files: \(function)")
+
         /// Runs the extracted gate against a fixture project directory.
-        func runGate(projectDir: URL) throws -> Int32 {
+        /// `temporaryDirectory` is injected so the caller can prove the gate
+        /// behaves identically when the shell cannot create temp files.
+        func runGate(projectDir: URL, temporaryDirectory: String? = nil) throws -> Int32 {
             let process = Process()
             process.executableURL = URL(fileURLWithPath: "/bin/bash")
             process.arguments = [
@@ -709,6 +720,11 @@ final class DocumentedContractTests: XCTestCase {
                 "source \"$1\"; PROJECT_DIR=\"$2\"; check_release_gates",
                 "bash", functionFile.path, projectDir.path,
             ]
+            if let temporaryDirectory {
+                var environment = ProcessInfo.processInfo.environment
+                environment["TMPDIR"] = temporaryDirectory
+                process.environment = environment
+            }
             process.standardOutput = FileHandle.nullDevice
             process.standardError = FileHandle.nullDevice
             try process.run()
@@ -888,17 +904,29 @@ final class DocumentedContractTests: XCTestCase {
              """, true),
         ]
 
+        // Every class, run TWICE: once normally, once with TMPDIR pointing
+        // nowhere writable. The verdicts must be identical — a gate whose
+        // answer depends on whether the shell could open a temp file is a
+        // gate that passes when the disk is full (review r7).
         for testCase in cases {
-            let status = try runGate(
-                projectDir: fixture(testCase.name, changelog: testCase.changelog)
+            let directory = try fixture(
+                testCase.name, changelog: testCase.changelog
             )
-            if testCase.passes {
-                XCTAssertEqual(status, 0,
-                               "'\(testCase.name)' must let the build proceed")
-            } else {
-                XCTAssertNotEqual(status, 0,
-                                  "'\(testCase.name)' must STOP the build — an "
-                                      + "unverifiable gate is never a passed one")
+            for temporaryDirectory in [nil, "/nonexistent-tmpdir"] as [String?] {
+                let status = try runGate(
+                    projectDir: directory, temporaryDirectory: temporaryDirectory
+                )
+                let context = temporaryDirectory == nil
+                    ? "'\(testCase.name)'"
+                    : "'\(testCase.name)' with no usable TMPDIR"
+                if testCase.passes {
+                    XCTAssertEqual(status, 0,
+                                   "\(context) must let the build proceed")
+                } else {
+                    XCTAssertNotEqual(status, 0,
+                                      "\(context) must STOP the build — an "
+                                          + "unverifiable gate is never a passed one")
+                }
             }
         }
     }

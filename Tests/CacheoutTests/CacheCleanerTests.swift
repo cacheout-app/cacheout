@@ -3236,9 +3236,20 @@ final class CacheCleanerTests: XCTestCase {
         // legitimately permission-flavored, unlike a bare scan-time errno.
         try XCTSkipIf(geteuid() == 0, "chmod-based failure requires non-root")
         let world = try makeEphemeralWorld("ephemeral-undeletable")
-        defer { try? FileManager.default.removeItem(at: world.base) }
+        let locked = world.root.appendingPathComponent("locked-scratch")
+        // ONE teardown path, ordered: the 0555 directory is restored to 0755
+        // FIRST, because the recursive fixture removal cannot unlink a payload
+        // inside it and would otherwise leak the whole temp tree. Registered
+        // before the fixture is staged so an early throw still cleans up (both
+        // calls are harmless no-ops against a path that never existed).
+        defer {
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o755], ofItemAtPath: locked.path
+            )
+            try? FileManager.default.removeItem(at: world.base)
+        }
         let keepA = try stageStaleTempEntry("aaa-scratch", under: world.root)
-        let locked = try stageStaleTempEntry("locked-scratch", under: world.root)
+        try stageStaleTempEntry("locked-scratch", under: world.root)
         let keepB = try stageStaleTempEntry("zzz-scratch", under: world.root)
 
         // r-xr-xr-x AFTER backdating (chmod moves ctime, never mtime): the
@@ -3247,17 +3258,35 @@ final class CacheCleanerTests: XCTestCase {
         try FileManager.default.setAttributes(
             [.posixPermissions: 0o555], ofItemAtPath: locked.path
         )
-        addTeardownBlock {
-            try? FileManager.default.setAttributes(
-                [.posixPermissions: 0o755], ofItemAtPath: locked.path
-            )
-        }
-        // Characterize the fixture rather than trusting it: the same operation
-        // the cleaner will attempt fails EACCES for THIS user right now.
+        // Characterize the fixture rather than trusting it: the raw operation
+        // underneath the cleaner's deletion fails EACCES for THIS user right
+        // now, so the stand-in cannot silently degrade into a no-op.
         let lockedPayload = locked.appendingPathComponent("payload.bin")
         let probe = lockedPayload.path.withCString { unlink($0) }
         XCTAssertEqual(probe, -1, "the fixture must be undeletable")
         XCTAssertEqual(errno, EACCES, "the stand-in is the EACCES class")
+
+        // CLASSIFY the failure independently, through the SAME operation the
+        // cleaner performs, so the assertion below is locale-independent: the
+        // deletion fails as Cocoa `NSFileWriteNoPermissionError` wrapping the
+        // POSIX EACCES the probe just observed. This is what makes the item
+        // error "classified" rather than merely non-empty.
+        var independentFailure: NSError?
+        do {
+            try FileManager.default.removeItem(at: locked)
+            XCTFail("the locked entry must not be removable")
+        } catch {
+            independentFailure = error as NSError
+        }
+        let classified = try XCTUnwrap(independentFailure)
+        XCTAssertEqual(classified.domain, NSCocoaErrorDomain)
+        XCTAssertEqual(classified.code, NSFileWriteNoPermissionError,
+                       "the deletion failure is permission-classified")
+        XCTAssertEqual(
+            (classified.userInfo[NSUnderlyingErrorKey] as? NSError)?.code,
+            Int(EACCES),
+            "the Cocoa error carries the POSIX EACCES provenance"
+        )
 
         let scanner = makeEphemeralTempScanner(root: world.root, home: world.home)
         let items = await scannedTempItems(scanner)
@@ -3276,8 +3305,14 @@ final class CacheCleanerTests: XCTestCase {
         XCTAssertEqual(report.errors.count, 1,
                        "exactly one error for the undeletable entry: \(report.errors)")
         XCTAssertEqual(report.errors.first?.key, lockedItem.key)
-        XCTAssertFalse(report.errors.first?.message.isEmpty ?? true,
-                       "the error carries the classified failure text")
+        // The item error carries the PERMISSION-CLASSIFIED failure verbatim —
+        // byte-identical to the independently classified NSError above, which
+        // pins domain/code/underlying-errno without depending on the locale
+        // any localized description is rendered in. A generic deletion error
+        // (or an admission refusal) would not match.
+        XCTAssertEqual(report.errors.first?.message,
+                       classified.localizedDescription,
+                       "the error text is the permission-classified deletion failure")
         XCTAssertEqual(report.entries.count, 2, "N−1 entries still deleted")
         for entry in report.entries {
             XCTAssertEqual(entry.disposal, .permanent)

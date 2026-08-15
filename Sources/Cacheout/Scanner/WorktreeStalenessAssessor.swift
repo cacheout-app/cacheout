@@ -31,11 +31,12 @@
 ///   `git -C <wt> merge-base --is-ancestor HEAD <default>` decides. Exit 0
 ///   is the only pass; exit 1 is git's ANSWER "not an ancestor" and exit 128
 ///   is "could not answer" — they are never conflated, and neither passes.
-///   The same discipline governs the ladder itself: only exit 1 ("this ref
-///   is not there") moves to the next rung, while a FATAL rung fails the
-///   gate closed rather than silently promoting a lower rung to default
-///   branch. No network anywhere (the Boundaries forbid `fetch`/`remote
-///   prune`).
+///   The same discipline governs the ladder itself: only a SILENT exit 1
+///   ("this ref is not there") moves to the next rung, while a rung that
+///   FAILED — including git's talkative exit 1 for an unreadable ref —
+///   fails the gate closed rather than silently promoting a lower rung to
+///   default branch. No network anywhere (the Boundaries forbid
+///   `fetch`/`remote prune`).
 /// - **G4 not locked** — porcelain `locked`. A locked worktree is NEVER a
 ///   candidate; this epic has no lock handling at all (`--force`, including
 ///   the "twice for locked" trick, is a Boundaries violation).
@@ -299,9 +300,28 @@ struct WorktreeStalenessAssessor: Sendable {
     static let originHeadRef = "refs/remotes/origin/HEAD"
     /// The exit code BOTH ladder commands use for "this ref is not there"
     /// (`symbolic-ref -q`: unset, deleted, or not symbolic;
-    /// `rev-parse --verify --quiet`: absent). It is the ONLY nonzero exit
-    /// that continues the ladder — see `resolveDefaultBranch`.
+    /// `rev-parse --verify --quiet`: absent). Necessary but NOT sufficient
+    /// to continue the ladder — see `isRefMissing`.
     static let refMissingExitCode: Int32 = 1
+
+    /// Whether a nonzero ladder result really means "this ref is not there".
+    ///
+    /// Exit 1 alone is not enough. Git also answers 1 for a ref that EXISTS
+    /// and cannot be read — `warning: ignoring broken ref refs/heads/main`,
+    /// verified on git 2.50.1 against a corrupted loose ref — and that is a
+    /// completely different fact from "there is no such ref". Continuing on
+    /// it would let a repository whose `main` is unreadable be judged
+    /// against `master`, so a worktree unmerged into the real default branch
+    /// could pass G3.
+    ///
+    /// The discriminator is stderr: a genuine miss is SILENT (both commands
+    /// print nothing for an absent/unset ref — verified), while every
+    /// diagnostic answer says something. Erring on the strict side costs at
+    /// most a missed reclaim; erring the other way costs human work.
+    static func isRefMissing(exitCode: Int32, stderr: String) -> Bool {
+        exitCode == refMissingExitCode
+            && stderr.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
     /// Step (b) and (c). A `develop`/`trunk` repository without
     /// `origin/HEAD` resolves to nothing and is never a candidate — accepted
     /// (repairing it would need `fetch`, which the no-network boundary
@@ -492,28 +512,32 @@ struct WorktreeStalenessAssessor: Sendable {
     /// → fail closed.
     ///
     /// EVERY failure class is enumerated, and exactly ONE of them continues
-    /// the ladder: **exit 1**, which is each command's "this rung is not
-    /// there" answer. Everything else stops it.
+    /// the ladder: a SILENT exit 1, which is each command's "this rung is
+    /// not there" answer. Everything else stops it.
     ///
-    /// - `symbolic-ref -q <ref>` exits **1** when the ref is unset, deleted,
-    ///   or present-but-not-symbolic (the common shape on fetched,
+    /// - `symbolic-ref -q <ref>` exits **1** SILENTLY when the ref is unset,
+    ///   deleted, or present-but-not-symbolic (the common shape on fetched,
     ///   non-cloned repos) and **128** when git could not look at all — not
-    ///   a repository, or an unreadable/garbage ref file. Verified on git
-    ///   2.50.1; the `-q` is what SPLITS those two, because without it the
-    ///   ordinary unset case also dies with 128 and becomes indistinguishable
-    ///   from a broken repository.
-    /// - `rev-parse --verify --quiet <ref>` exits **1** for an absent (or
-    ///   git-ignorable broken) ref and **128** for a fatal condition.
+    ///   a repository, or an unreadable ref file. Verified on git 2.50.1;
+    ///   the `-q` is what SPLITS those two, because without it the ordinary
+    ///   unset case also dies with 128 and becomes indistinguishable from a
+    ///   broken repository.
+    /// - `rev-parse --verify --quiet <ref>` exits **1** SILENTLY for an
+    ///   absent ref, **1 with a `warning: ignoring broken ref …`** for a ref
+    ///   that exists and cannot be read, and **128** for a fatal condition.
     ///
-    /// Treating a FATAL rung as a miss would be a real fail-open, not a
-    /// conservative refusal: a repository whose `refs/heads/main` cannot be
-    /// read but whose `refs/heads/master` still resolves would silently be
-    /// judged against `master`, and a worktree unmerged into the actual
-    /// default branch could pass G3. So a fatal rung fails the gate CLOSED
-    /// with the rung and the exit NAMED. A TIMEOUT or a gitUnavailable stops
-    /// the ladder for the same reason plus one more: firing two further
-    /// subprocesses at a wedged or absent git would only relabel a real
-    /// failure as "default branch unresolvable".
+    /// Hence the miss test is `isRefMissing` — exit 1 AND a silent stderr —
+    /// not the exit code alone.
+    ///
+    /// Treating a FAILED rung as a missing one would be a real fail-open,
+    /// not a conservative refusal: a repository whose `refs/heads/main`
+    /// cannot be read but whose `refs/heads/master` still resolves would
+    /// silently be judged against `master`, and a worktree unmerged into the
+    /// actual default branch could pass G3. So a failed rung fails the gate
+    /// CLOSED with the rung and the failure NAMED. A TIMEOUT or a
+    /// gitUnavailable stops the ladder for the same reason plus one more:
+    /// firing two further subprocesses at a wedged or absent git would only
+    /// relabel a real failure as "default branch unresolvable".
     private func resolveDefaultBranch(
         parentRepoWorkingDir: URL
     ) async -> DefaultBranchResolution {
@@ -534,7 +558,7 @@ struct WorktreeStalenessAssessor: Sendable {
             }
             return .resolved(ref: ref)
         case .failure(let exitCode, let stderr):
-            guard exitCode == Self.refMissingExitCode else {
+            guard Self.isRefMissing(exitCode: exitCode, stderr: stderr) else {
                 let summary = GitCommandFailureSummary.describe(
                     exitCode: exitCode, stderr: stderr
                 )
@@ -555,10 +579,10 @@ struct WorktreeStalenessAssessor: Sendable {
             case .success:
                 return .resolved(ref: ref)
             case .failure(let exitCode, let stderr):
-                guard exitCode == Self.refMissingExitCode else {
-                    // A FATAL rung is not a miss: falling through to the next
-                    // ref would judge the worktree against a branch that is
-                    // not this repository's default.
+                guard Self.isRefMissing(exitCode: exitCode, stderr: stderr) else {
+                    // A FAILED rung is not a MISSING one: falling through to
+                    // the next ref would judge the worktree against a branch
+                    // that is not this repository's default.
                     let summary = GitCommandFailureSummary.describe(
                         exitCode: exitCode, stderr: stderr
                     )

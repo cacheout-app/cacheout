@@ -586,6 +586,36 @@ final class WorktreeStalenessAssessorTests: XCTestCase {
         }
     }
 
+    /// The same shape on REAL git: a corrupted `refs/heads/main` beside a
+    /// healthy `master`. Git answers the main rung with exit 1 AND a
+    /// `warning: ignoring broken ref` — the exit code alone is
+    /// indistinguishable from an absent ref, so only the stderr check keeps
+    /// this worktree from being judged against `master` and deleted.
+    func testCorruptedDefaultBranchRefFailsG3ClosedOnRealGit() async throws {
+        let repository = try makeRepository(named: "repo")
+        XCTAssertEqual(
+            try GitFixture.git(["-C", repository.path, "branch", "master"], home: home).status, 0
+        )
+        try addWorktree(named: "wt", in: repository, arguments: ["-b", "feature"])
+        // Corrupt the loose ref AFTER the worktree exists: the linked
+        // worktree stays healthy, so only the ladder is affected.
+        try "garbage\n".write(
+            to: repository.appendingPathComponent(".git/refs/heads/main"),
+            atomically: true, encoding: .utf8
+        )
+
+        let assessment = try await assessLinked(of: repository)
+        XCTAssertFalse(
+            assessment.isCandidate,
+            "an unreadable default branch must never be silently replaced by master"
+        )
+        let mergedReason = try reason(assessment, .merged)
+        XCTAssertTrue(
+            mergedReason.hasPrefix("refs/heads/main lookup failed (git exit 1"),
+            "got: \(mergedReason)"
+        )
+    }
+
     func testRepositoryWithNeitherMainNorMasterFailsG3Closed() async throws {
         let repository = try makeRepository(named: "repo", defaultBranch: "trunk")
         try addWorktree(named: "wt", in: repository, arguments: ["-b", "feature"])
@@ -700,14 +730,28 @@ final class WorktreeStalenessAssessorTests: XCTestCase {
         XCTAssertTrue(runner.requests(containing: "merge-base").isEmpty)
     }
 
-    /// A FATAL rung is NOT a miss. The dangerous shape this pins: `main`
-    /// cannot be read but `master` still resolves — promoting `master` to
-    /// "the default branch" would judge the worktree against a branch that
-    /// is not this repository's default, and a worktree unmerged into `main`
-    /// could pass G3.
-    func testFatalLadderRungFailsClosedInsteadOfPromotingTheNextRung() async throws {
+    /// A FAILED rung is NOT a missing one. The dangerous shape this pins:
+    /// `main` cannot be read but `master` still resolves — promoting
+    /// `master` to "the default branch" would judge the worktree against a
+    /// branch that is not this repository's default, and a worktree unmerged
+    /// into `main` could pass G3.
+    ///
+    /// Both failure spellings are covered: the fatal 128, AND git's
+    /// TALKATIVE exit 1 (`warning: ignoring broken ref …`), which carries the
+    /// same exit code as a genuine miss and is separated from it only by
+    /// stderr.
+    func testFailedLadderRungFailsClosedInsteadOfPromotingTheNextRung() async throws {
         let fatal = GitCommandOutcome.failure(
             exitCode: 128, stderr: "fatal: not a git repository\n"
+        )
+        let brokenMain = GitCommandOutcome.failure(
+            exitCode: 1, stderr: "warning: ignoring broken ref refs/heads/main\n"
+        )
+        let brokenOriginHead = GitCommandOutcome.failure(
+            exitCode: 1, stderr: "warning: ignoring broken ref refs/remotes/origin/HEAD\n"
+        )
+        let resolvedMaster = GitCommandOutcome.success(
+            stdout: Data("221c2f088de2c34c76347bde00820accad4f529c\n".utf8)
         )
         let cases: [(name: String, script: GitScript, reason: String, forbidden: String)] = [
             (
@@ -740,6 +784,29 @@ final class WorktreeStalenessAssessorTests: XCTestCase {
                 }(),
                 "refs/heads/master lookup failed (git exit 128: fatal: not a git repository)",
                 "merge-base"
+            ),
+            (
+                "BROKEN main (talkative exit 1) while master resolves",
+                {
+                    var script = GitScript()
+                    script.revParseMain = brokenMain
+                    script.revParseMaster = resolvedMaster
+                    return script
+                }(),
+                "refs/heads/main lookup failed "
+                    + "(git exit 1: warning: ignoring broken ref refs/heads/main)",
+                "refs/heads/master"
+            ),
+            (
+                "BROKEN origin/HEAD (talkative exit 1)",
+                {
+                    var script = GitScript()
+                    script.symbolicRef = brokenOriginHead
+                    return script
+                }(),
+                "refs/remotes/origin/HEAD lookup failed "
+                    + "(git exit 1: warning: ignoring broken ref refs/remotes/origin/HEAD)",
+                "rev-parse"
             )
         ]
 

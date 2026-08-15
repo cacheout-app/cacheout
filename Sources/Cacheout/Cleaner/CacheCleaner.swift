@@ -243,6 +243,15 @@ actor CacheCleaner {
     /// `requiresPreDeleteRevalidation` (fail-closed), because it cannot
     /// perform the re-inspection the item structurally demands.
     private let preDeleteRevalidators: [String: PreDeleteRevalidator]
+    /// The SHARED git runner (fn-5.1), injected for the composite
+    /// `git_worktree_reclaim` action and used by nothing else. `nil` is
+    /// FAIL-CLOSED and is the DEFAULT: a cleaner built without a runner
+    /// refuses every composite item rather than reaching for a runner of its
+    /// own — the `containerSnapshot` doctrine, one dependency later. The
+    /// protocol type (not the concrete runner) is what fn-5.1 froze as the
+    /// injection seam, so tests inject doubles and production injects the one
+    /// instance the scanner already shares.
+    private let gitRunner: (any GitCommandRunning)?
     private nonisolated let trashHandler: TrashHandler
 
     /// - Parameters:
@@ -271,13 +280,21 @@ actor CacheCleaner {
     ///   - provider: identity provider shared with `PathGuard` and the sizer
     ///     (tests may subclass to inject devices/kinds).
     ///   - trashHandler: Trash seam; `nil` uses `FileManager.trashItem`.
+    ///   - gitRunner: the shared fn-5.1 runner for the composite
+    ///     `git_worktree_reclaim` action. TRAILING and DEFAULTED so every
+    ///     existing construction site — including
+    ///     `SpaceScannerRuntime.makeCleaner(snapshot:trashHandler:)` —
+    ///     compiles unchanged; the default `nil` refuses every composite
+    ///     item (fail-closed, the `containerSnapshot` precedent). fn-5.6
+    ///     threads the production instance through `makeCleaner`.
     init(
         home: URL = FileManager.default.homeDirectoryForCurrentUser,
         containerRoots: [URL],
         containerSnapshot: ContainerSnapshot? = nil,
         preDeleteRevalidators: [String: PreDeleteRevalidator] = [:],
         provider: FileSystemIdentityProvider = FileSystemIdentityProvider(),
-        trashHandler: TrashHandler? = nil
+        trashHandler: TrashHandler? = nil,
+        gitRunner: (any GitCommandRunning)? = nil
     ) {
         self.home = home
         self.provider = provider
@@ -287,6 +304,7 @@ actor CacheCleaner {
         )
         self.containerSnapshot = containerSnapshot
         self.preDeleteRevalidators = preDeleteRevalidators
+        self.gitRunner = gitRunner
         self.trashHandler = trashHandler ?? { url in
             try FileManager.default.trashItem(at: url, resultingItemURL: nil)
         }
@@ -370,8 +388,16 @@ actor CacheCleaner {
             // records can only be a construction bug — never vacuously
             // admissible (rounds 11-12). Exhaustive over the action so a
             // future case is a compile-time decision.
+            //
+            // SITE 1 of 8 (fn-5.3): the composite JOINS this refusal in BOTH
+            // modes. Stale mode's worktree and prune mode's admin container
+            // are each captured as a root record by the scan, so an empty
+            // record set is the same construction bug it is for an aggregate
+            // — and the composite's structural rules demand a `.measured`
+            // record binding the target in every deletable state, which zero
+            // records could never satisfy.
             switch item.action {
-            case .removeContents, .commands:
+            case .removeContents, .commands, .gitWorktreeReclaim:
                 if item.rootRecords.isEmpty {
                     let reason = "refused: no root records — nothing was captured for this item to admit"
                     errors.append(Self.itemError(item, reason))
@@ -411,6 +437,16 @@ actor CacheCleaner {
             case .commands, .removeContents:
                 if item.allocatedBytes == 0 { continue }
             case .removeItem:
+                break
+            // SITE 2 of 8 (fn-5.3): the composite is EXCLUDED from the
+            // zero-byte skip, deliberately. A prune-only item frees roughly
+            // nothing (git metadata) yet MUST still run — the registry is
+            // what it cleans — and this skip runs BEFORE dispatch, so
+            // including it here would turn every zero-byte prune item into a
+            // silent no-op that reported success. (fn-5.5 emits prune items
+            // `.measured`, never `.empty`, for the same reason: the `.empty`
+            // no-op above also precedes dispatch.)
+            case .gitWorktreeReclaim:
                 break
             }
             // `.partiallyDenied` reaches here only through explicit
@@ -459,6 +495,36 @@ actor CacheCleaner {
                 )
                 if let entry = outcome.entry { entries.append(entry) }
                 errors.append(contentsOf: outcome.errors)
+
+            // SITE 3 of 8 (fn-5.3): the FAIL-CLOSED PLACEHOLDER. fn-5.4
+            // replaces this arm with the real performer; until then a
+            // composite item that reaches dispatch produces a per-item
+            // ERROR and nothing else — never a silent `continue`. A
+            // registered-but-unwired action that skipped quietly would be
+            // reported as a successful clean that freed nothing, which is
+            // exactly the lie this project's reporting exists to prevent.
+            //
+            // The two causes are kept APART on purpose: a cleaner built
+            // without the runner seam is a COMPOSITION fault (the runtime
+            // did not thread it through), while a cleaner that has the
+            // runner is blocked by this unimplemented arm. Collapsing them
+            // into one message would hide a wiring regression behind a
+            // "not implemented yet" that fn-5.4 is about to delete.
+            case .gitWorktreeReclaim:
+                let reason: String
+                let tag: String
+                if gitRunner == nil {
+                    reason = "refused: no git runner is available to this "
+                        + "cleaner — a git_worktree_reclaim item can only be "
+                        + "cleaned through a cleaner built with one"
+                    tag = "git-runner-unavailable"
+                } else {
+                    reason = "refused: git_worktree_reclaim execution is not "
+                        + "wired up in this build — nothing was reclaimed"
+                    tag = "action-not-implemented"
+                }
+                errors.append(Self.itemError(item, reason))
+                logRefusal(label: item.displayName, tag: tag, detail: reason)
             }
         }
 
@@ -490,10 +556,22 @@ actor CacheCleaner {
         // seam") must hold for EVERY action, not just the one that has a
         // seam. No production scanner emits this shape; a forged or
         // regressed item cannot use it to slip past revalidation.
+        //
+        // SITE 8 of 8 (fn-5.3) — the site the epic census MISSED: fn-4.8
+        // added this second exhaustive switch INSIDE `structuralRefusal`,
+        // so the function holds two, not one. The composite decides FALSE:
+        // this build has no composite performer at all (dispatch is the
+        // fail-closed placeholder below), so a marked composite item could
+        // not be re-inspected immediately before its reclaim even in
+        // principle, and the marker's guarantee — "nothing marked is ever
+        // deleted without passing the seam" — is only kept by refusing it.
+        // fn-5.4 revisits this line deliberately if its performer routes the
+        // stale target through the seam.
         let revalidatableAction: Bool
         switch item.action {
         case .removeItem: revalidatableAction = true
-        case .removeContents, .commands: revalidatableAction = false
+        case .removeContents, .commands, .gitWorktreeReclaim:
+            revalidatableAction = false
         }
         if item.requiresPreDeleteRevalidation, !revalidatableAction {
             return "refused: requiresPreDeleteRevalidation is a per-target "
@@ -539,6 +617,18 @@ actor CacheCleaner {
             case .containerItem:
                 return "refused: a \(item.action.wireString) item must carry category admission provenance"
             }
+        // SITE 4 of 8 (fn-5.3). The plan riding the action is a CLAIM
+        // exactly like a `.commands` payload, so it is checked against the
+        // admission descriptor here — independently of the runtime
+        // validator, which this chokepoint never assumes ran (fn-2.7's
+        // headless path reaches it directly). ONE rule set, two enforcers:
+        // the validator's own arm calls the same helper, so the two can
+        // never disagree about a well-formed composite item.
+        case .gitWorktreeReclaim(let plan):
+            guard let violation = GitWorktreeReclaimPlan.violation(
+                for: item, plan: plan
+            ) else { return nil }
+            return "refused: \(violation)"
         }
     }
 

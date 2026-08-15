@@ -25,10 +25,13 @@
 /// ## Frozen wire values (epic contract — fn-2.6 asserts, fn-3..fn-6 inherit)
 ///
 /// - CategoryScanner's scanner id: `categories`.
-/// - `ReclaimAction`: `remove_contents` | `remove_item` | `commands` —
-///   `.commands` serializes ONLY its kind; argv arrays never reach any wire.
+/// - `ReclaimAction`: `remove_contents` | `remove_item` | `commands` |
+///   `git_worktree_reclaim` — `.commands` and `.gitWorktreeReclaim`
+///   serialize ONLY their kind; argv arrays and plan paths never reach any
+///   wire.
 /// - `ScanIssue.Kind`: `container_refused` | `symlink_root` | `tcc_denied` |
-///   `permission_denied` | `unreadable` | `malformed_outcome`.
+///   `permission_denied` | `unreadable` | `config_invalid` |
+///   `tool_unavailable` | `malformed_outcome`.
 /// - Item ids: full 64-char lowercase-hex SHA-256 over the UTF-8 bytes of
 ///   `scannerID + "\0" + canonicalPath` (`ReclaimableItem.stableID`).
 
@@ -123,12 +126,337 @@ struct ItemKey: Hashable, Sendable {
     }
 }
 
+// MARK: - Git worktree reclaim plan (fn-5.3, D1/D13/D14)
+
+/// The PLAN the composite `ReclaimAction` carries: what git is to be pointed
+/// at, expressed as structured paths and a mode — never as argv.
+///
+/// ARGV PROVENANCE (the whole reason this is a plan and not a
+/// `.commands([[String]])` payload): command argv is trusted registry code,
+/// never item input (fn-2.3). The cleaner assembles
+/// `["git", "-C", <parentRepoWorkingDir>, "worktree", "remove", <path>]` /
+/// `["git", "-C", <parentRepoWorkingDir>, "worktree", "prune", "--expire=now"]`
+/// from these fields plus its own constants at execution time (fn-5.4), so a
+/// forged item can only mis-POINT a fixed command — and every path it could
+/// point at is bound to the item's own admitted container by
+/// `GitWorktreeReclaimPlan.violation(...)`. `.commands` is not an option at
+/// all here: validator checks (f)/(g) require every `.commands` item to carry
+/// a REGISTERED `CacheCategory` whose `cleanCommands` equal the argv, and
+/// fn-5 has no category — one such item would malform the whole outcome.
+///
+/// WHY THE MODE-SPECIFIC FIELDS ARE OPTIONAL rather than associated values on
+/// `Mode`: the shapes this type must REFUSE (a stale plan carrying a
+/// disclosed set, a prune plan carrying a worktree path) have to be
+/// REPRESENTABLE for the two independent checkers — the cleaner's
+/// `structuralRefusal` and the runtime validator — to refuse them. A
+/// mode-parameterized enum would make the forgeries unrepresentable in Swift
+/// and thereby unTESTABLE, which is the wrong trade for a payload whose
+/// entire job is to survive a hostile item: the cleaner explicitly never
+/// assumes the validator ran (fn-2.7's headless path reaches it directly).
+struct GitWorktreeReclaimPlan: Equatable, Sendable {
+
+    /// The two reclaim shapes. They are NOT interchangeable: stale removal
+    /// deletes ONE worktree tree, prune removes EVERY prunable admin
+    /// directory of the repository (a repo-wide side effect — D14).
+    enum Mode: Equatable, Sendable {
+        /// `git -C <parent> worktree remove <worktreePath>`, with fn-5.4's
+        /// guarded rm + gated prune fallback.
+        case removeStaleWorktree
+        /// `git -C <parent> worktree prune --expire=now` — repository-level,
+        /// one item per repo, disclosing the COMPLETE set it will remove.
+        case pruneOrphanedAdmin
+    }
+
+    let mode: Mode
+
+    /// STALE MODE ONLY (nil in prune mode): the linked worktree to remove,
+    /// verbatim as the scan spelled it. Must equal the admission
+    /// descriptor's `requestedTargetURL`.
+    let worktreePath: URL?
+
+    /// STALE MODE ONLY (nil in prune mode): that worktree's own admin
+    /// directory, `<parentAdminContainer>/<id>`, as the fn-5.1 resolver
+    /// derived it. fn-5.4's post-fallback prune gate compares the RECOMPUTED
+    /// prunable set against exactly this entry and prunes only when they are
+    /// the same one directory (epic round 8) — without the carried entry the
+    /// gate could not name what it is allowed to sweep.
+    let worktreeAdminEntry: URL?
+
+    /// BOTH MODES: git's `-C` target — the porcelain FIRST record's path
+    /// (`WorktreeMembership.parentRepoWorkingDir`), which is the main working
+    /// tree or the bare repository directory. NEVER derived from the git
+    /// directory's parent: under `--separate-git-dir` that is not the working
+    /// tree (fn-5.1's authority split).
+    let parentRepoWorkingDir: URL
+
+    /// BOTH MODES: the RESOLVER-carried `<parentGitDir>/worktrees`
+    /// (`WorktreeMembership.parentAdminContainer`) — the admin data every
+    /// mode mutates. NEVER reconstructed as `<parentRepoWorkingDir>/.git/
+    /// worktrees`: a bare parent's git directory does not live at
+    /// `<wd>/.git`, and a linked worktree of a bare main is not itself
+    /// `bare`, so no gate would catch the mis-pathing (D13 revised).
+    let parentAdminContainer: URL
+
+    /// PRUNE MODE ONLY (empty in stale mode): the PROVABLY-COMPLETE set of
+    /// admin directories the repository-level prune will remove, as
+    /// disclosed to the user at scan time. fn-5.4 recomputes the set at
+    /// delete time and refuses fail-closed on anything outside this
+    /// disclosure (D14).
+    let disclosedAdminDirectories: [URL]
+
+    /// Stale-removal plan. The disclosed set is empty BY CONSTRUCTION here —
+    /// a stale item discloses no repo-wide prune set.
+    static func removeStaleWorktree(
+        worktreePath: URL,
+        worktreeAdminEntry: URL,
+        parentRepoWorkingDir: URL,
+        adminContainer: URL
+    ) -> GitWorktreeReclaimPlan {
+        GitWorktreeReclaimPlan(
+            mode: .removeStaleWorktree,
+            worktreePath: worktreePath,
+            worktreeAdminEntry: worktreeAdminEntry,
+            parentRepoWorkingDir: parentRepoWorkingDir,
+            parentAdminContainer: adminContainer,
+            disclosedAdminDirectories: []
+        )
+    }
+
+    /// Repository-level prune plan. No worktree path and no admin entry by
+    /// construction — the operation is not about one worktree.
+    static func pruneOrphanedAdmin(
+        parentRepoWorkingDir: URL,
+        adminContainer: URL,
+        disclosedAdminDirectories: [URL]
+    ) -> GitWorktreeReclaimPlan {
+        GitWorktreeReclaimPlan(
+            mode: .pruneOrphanedAdmin,
+            worktreePath: nil,
+            worktreeAdminEntry: nil,
+            parentRepoWorkingDir: parentRepoWorkingDir,
+            parentAdminContainer: adminContainer,
+            disclosedAdminDirectories: disclosedAdminDirectories
+        )
+    }
+
+    // MARK: Structural rules (ONE rule set, two enforcing sites)
+
+    /// Every path the plan can point git at, each with the name the refusal
+    /// wording uses. The `..` screen below walks THIS list, so a field added
+    /// later is screened by construction rather than by remembering to.
+    private var labelledPaths: [(label: String, url: URL)] {
+        var paths: [(String, URL)] = [
+            ("parentRepoWorkingDir", parentRepoWorkingDir),
+            ("parentAdminContainer", parentAdminContainer),
+        ]
+        if let worktreePath { paths.append(("worktreePath", worktreePath)) }
+        if let worktreeAdminEntry {
+            paths.append(("worktreeAdminEntry", worktreeAdminEntry))
+        }
+        paths += disclosedAdminDirectories.map { ("disclosed admin directory", $0) }
+        return paths
+    }
+
+    /// The ONE structural rule set for a composite item — shared VERBATIM by
+    /// `CacheCleaner.structuralRefusal` and
+    /// `SpaceScannerRuntime.structuralViolation` (the
+    /// `missingRevalidatorRefusal` precedent: one helper, two call sites, so
+    /// the two enforcers can never diverge in wording OR in condition).
+    /// Returns the bare reason; the cleaner prefixes it with `refused: `.
+    ///
+    /// What it defends: this plan is a CLAIM riding an item, and the item is
+    /// the only thing `clean(items:)` receives. Every field is therefore
+    /// bound to the item's OWN admitted container so a forged or regressed
+    /// plan cannot point `git -C` at another repository on disk (D13).
+    ///
+    /// NOT its job: filesystem truth. Every check here is lexical, on the
+    /// VERBATIM spellings — the root-capture doctrine forbids a second
+    /// resolution at validation time (it would race the filesystem), and the
+    /// delete-time subprocess-traversal guard (fn-5.4, D13) is what proves a
+    /// leaf is a real directory canonically inside the container.
+    static func violation(
+        for item: ReclaimableItem, plan: GitWorktreeReclaimPlan
+    ) -> String? {
+        // The composite mutates ONE container's worth of git data, so it
+        // needs the per-item container admission — a category descriptor
+        // would admit by policy roots that have nothing to do with it.
+        guard case .containerItem(let originContainer, let requestedTargetURL)
+                = item.admission else {
+            return "a git_worktree_reclaim item must carry the "
+                + "container-item admission descriptor"
+        }
+
+        // (1) `..` SCREEN — FIRST, before any standardization (epic round
+        // 9). Standardization ERASES `..` (`/a/../b` becomes `/b`), so a
+        // containment check run on standardized spellings would accept a
+        // traversal spelling as if it had been written plainly — and the
+        // path that reaches git at execution time is the VERBATIM one.
+        // Order here is the whole defense: screen raw components, then
+        // standardize only for the containment comparison below.
+        for (label, url) in plan.labelledPaths
+        where url.pathComponents.contains("..") {
+            return "the plan's \(label) '\(url.path)' contains a '..' "
+                + "component — a traversal spelling is malformed, never "
+                + "standardized away"
+        }
+
+        // (2) MODE SHAPE. Each mode's fields are exactly the ones its git
+        // invocation consumes; carrying the OTHER mode's fields is a forged
+        // or regressed plan, never a harmless extra.
+        switch plan.mode {
+        case .removeStaleWorktree:
+            guard let worktreePath = plan.worktreePath else {
+                return "a stale-removal plan must carry the worktree path it "
+                    + "removes"
+            }
+            guard let adminEntry = plan.worktreeAdminEntry else {
+                return "a stale-removal plan must carry the worktree's admin "
+                    + "entry — the post-fallback prune gate identifies the "
+                    + "one entry it may sweep by that path"
+            }
+            if !plan.disclosedAdminDirectories.isEmpty {
+                return "a stale-removal plan must disclose no prune set — a "
+                    + "repository-wide prune set belongs to the prune-only "
+                    + "mode, and undisclosed sweeping is what D14 forbids"
+            }
+            // The deletion target is the descriptor's, never the plan's: if
+            // they disagree, the item was admitted for one path and would
+            // execute against another.
+            if worktreePath.path != requestedTargetURL.path {
+                return "the plan's worktree path '\(worktreePath.path)' is "
+                    + "not the admitted requestedTargetURL "
+                    + "'\(requestedTargetURL.path)' — the path admitted and "
+                    + "the path removed must be the same one"
+            }
+            if !isStrictDescendant(adminEntry, of: plan.parentAdminContainer) {
+                return "the worktree's admin entry '\(adminEntry.path)' is "
+                    + "not inside the carried admin container "
+                    + "'\(plan.parentAdminContainer.path)'"
+            }
+        case .pruneOrphanedAdmin:
+            if let worktreePath = plan.worktreePath {
+                return "a prune-only plan must carry no worktree path "
+                    + "(carried '\(worktreePath.path)') — the operation is "
+                    + "repository-level and removes no checkout"
+            }
+            if let adminEntry = plan.worktreeAdminEntry {
+                return "a prune-only plan must carry no worktree admin entry "
+                    + "(carried '\(adminEntry.path)') — its removal set is "
+                    + "the disclosed set, not one worktree's entry"
+            }
+            if plan.disclosedAdminDirectories.isEmpty {
+                return "a prune-only plan must disclose the non-empty set of "
+                    + "admin directories the repository-level prune removes"
+            }
+            // The item's admitted target IS the container being mutated —
+            // compared against the CARRIED field, never against a
+            // `<wd>/.git/worktrees` reconstruction (D13: a bare parent's git
+            // directory does not live there).
+            if requestedTargetURL.path != plan.parentAdminContainer.path {
+                return "the prune-only plan's admitted requestedTargetURL "
+                    + "'\(requestedTargetURL.path)' is not the carried admin "
+                    + "container '\(plan.parentAdminContainer.path)'"
+            }
+            for directory in plan.disclosedAdminDirectories
+            where !isStrictDescendant(directory, of: plan.parentAdminContainer) {
+                return "disclosed admin directory '\(directory.path)' is not "
+                    + "inside the carried admin container "
+                    + "'\(plan.parentAdminContainer.path)'"
+            }
+        }
+
+        // (3) MUTATION SCOPE, both modes (D13). The admin container holds
+        // the data git rewrites, so it must sit STRICTLY inside the item's
+        // own admitted container — a plan whose admin container IS the
+        // container would put every sibling of the repository in scope.
+        if !isStrictDescendant(plan.parentAdminContainer, of: originContainer) {
+            return "the plan's admin container "
+                + "'\(plan.parentAdminContainer.path)' is not strictly "
+                + "inside the admitted originContainer "
+                + "'\(originContainer.path)' — a plan may only mutate git "
+                + "data inside its own admitted container"
+        }
+        // The `-C` target may EQUAL the container: a dev root that IS a
+        // repository is a legal, common shape (epic round 4) — only its
+        // strictly-contained admin data is mutated. Anything OUTSIDE is a
+        // forged mutation scope.
+        if !isDescendantOrEqual(plan.parentRepoWorkingDir, of: originContainer) {
+            return "the plan's parent repository "
+                + "'\(plan.parentRepoWorkingDir.path)' is outside the "
+                + "admitted originContainer '\(originContainer.path)' — git "
+                + "would be pointed at a repository this item never admitted"
+        }
+
+        // (4) MEASURED-RECORD / DISPLAY BINDING, mirrored from the
+        // `.removeItem` arm. In the states the cleaner dispatches, the
+        // admitted target must be one of the scan's OWN `.measured`
+        // captures, and the item's display identity must be that same
+        // record's resolution — otherwise a forged item could measure and
+        // show one capture while executing against another admitted path.
+        // Exhaustive over `ScanState` so a future state decides at compile
+        // time; the non-deletable states never reach execution.
+        switch item.state {
+        case .measured, .partiallyDenied:
+            let bound = item.rootRecords.filter { record in
+                record.status == .measured
+                    && record.requestedURL.path == requestedTargetURL.path
+            }
+            if bound.isEmpty {
+                return "a deletable git_worktree_reclaim item must carry a "
+                    + "measured root record capturing its "
+                    + "requestedTargetURL — the measured path and the "
+                    + "reclaim target must be the same capture"
+            }
+            let displayBound = bound.contains { record in
+                record.resolvedURL?.path == item.url?.path
+            }
+            if !displayBound {
+                return "a deletable git_worktree_reclaim item's display url "
+                    + "must be the resolved identity of the record binding "
+                    + "its target — the path shown and the path reclaimed "
+                    + "must be the same capture"
+            }
+        case .missing, .empty, .denied:
+            break
+        }
+
+        return nil
+    }
+
+    /// STRICT lexical containment on STANDARDIZED spellings, compared as
+    /// `pathComponents` arrays — never `hasPrefix` (`/a/bc` is not inside
+    /// `/a/b`), the PathGuard doctrine (PathGuard.swift:45). Standardization
+    /// runs only AFTER the `..` screen above; it collapses `.`, `//` and
+    /// trailing slashes so two spellings of one path compare equal, and it
+    /// resolves NO symlinks (that is delete-time's job).
+    private static func isStrictDescendant(_ candidate: URL, of ancestor: URL) -> Bool {
+        let candidateComponents = candidate.standardizedFileURL.pathComponents
+        let ancestorComponents = ancestor.standardizedFileURL.pathComponents
+        guard candidateComponents.count > ancestorComponents.count else {
+            return false
+        }
+        return Array(candidateComponents.prefix(ancestorComponents.count))
+            == ancestorComponents
+    }
+
+    /// Descendant OR EQUAL — used for `parentRepoWorkingDir` alone.
+    private static func isDescendantOrEqual(_ candidate: URL, of ancestor: URL) -> Bool {
+        let candidateComponents = candidate.standardizedFileURL.pathComponents
+        let ancestorComponents = ancestor.standardizedFileURL.pathComponents
+        guard candidateComponents.count >= ancestorComponents.count else {
+            return false
+        }
+        return Array(candidateComponents.prefix(ancestorComponents.count))
+            == ancestorComponents
+    }
+}
+
 // MARK: - Reclaim action
 
 /// How an item's bytes are reclaimed. Dispatch with EXHAUSTIVE switches (no
 /// `default:`) — fn-5 adds a composite case (git worktree remove → fallback
 /// removeItem + prune) and that addition must be a compile-time-visible
-/// change. Do not encode "there are exactly three actions" anywhere.
+/// change. Do not encode "there are exactly four actions" anywhere.
 enum ReclaimAction: Equatable, Sendable {
     /// Delete the children of every `.measured` root record, keeping the
     /// root directory itself (today's category clean).
@@ -139,16 +467,27 @@ enum ReclaimAction: Equatable, Sendable {
     /// At delete time EVERY root record's `requestedURL` is re-admitted and
     /// ANY refusal blocks the ENTIRE command set (fn-1.3 R17 parity).
     case commands([[String]])
+    /// The fn-5 COMPOSITE reclaim: a git-mediated worktree removal, or a
+    /// repository-level prune of orphaned worktree admin directories. The
+    /// payload is a PLAN of structured paths — never argv. The cleaner
+    /// builds the argv from the plan's fields plus registry-controlled
+    /// constants, so command argv stays trusted registry code exactly as it
+    /// is for `.commands` (fn-2.3's argv-provenance rule).
+    case gitWorktreeReclaim(GitWorktreeReclaimPlan)
 
     /// FROZEN wire strings (epic contract; `ScanError.Kind.wireString`
-    /// precedent). `.commands` serializes ONLY its kind — the argv arrays
-    /// are NEVER exposed on any wire surface (deliberate non-exposure: the
-    /// CLI JSON is a reporting surface, not an execution contract).
+    /// precedent). `.commands` and `.gitWorktreeReclaim` serialize ONLY
+    /// their kind — argv arrays and plan paths are NEVER exposed on any wire
+    /// surface (deliberate non-exposure: the CLI JSON is a reporting
+    /// surface, not an execution contract).
     var wireString: String {
         switch self {
         case .removeContents: return "remove_contents"
         case .removeItem: return "remove_item"
         case .commands: return "commands"
+        // SITE 5 of 8 (fn-5.3): FROZEN at merge, snake_case like its three
+        // siblings and the PROTOCOL.md action rows.
+        case .gitWorktreeReclaim: return "git_worktree_reclaim"
         }
     }
 }
@@ -388,6 +727,17 @@ struct ScanIssue: Equatable, Sendable {
         /// configured roots are NOT this kind — they carry their offending
         /// path honestly under the frozen `.containerRefused`.)
         case configInvalid
+        /// An EXTERNAL TOOL a scanner depends on is unavailable (fn-5, D12
+        /// revised — e.g. `git` missing from the runner's fixed PATH, or its
+        /// availability probe failing). The affected scan produced no
+        /// results BECAUSE the tool could not run, and that must be VISIBLE:
+        /// a tool-less scan reporting zero findings is indistinguishable
+        /// from a clean machine. Another NON-filesystem kind: the problem is
+        /// the toolchain, not a path, so `url` is nil and a fake path is
+        /// never invented (the round-3 rejection of reusing `.unreadable`
+        /// with a nil url — `url` is required BY CONTRACT for the
+        /// filesystem kinds). `detail` names the tool and the context.
+        case toolUnavailable
         /// Synthesized ONLY by `SpaceScannerRuntime.validatedOutcome` when a
         /// scanner's outcome fails ownership/structural validation — never
         /// produced by scanners themselves. RESERVED and enforced (check
@@ -407,14 +757,16 @@ struct ScanIssue: Equatable, Sendable {
             case .permissionDenied: return "permission_denied"
             case .unreadable: return "unreadable"
             case .configInvalid: return "config_invalid"
+            case .toolUnavailable: return "tool_unavailable"
             case .malformedOutcome: return "malformed_outcome"
             }
         }
     }
 
     /// Required BY CONVENTION for the filesystem kinds; nil for the
-    /// NON-filesystem kinds (`.malformedOutcome`, `.configInvalid`) — no
-    /// filesystem location exists, and a fake path must never be invented.
+    /// NON-filesystem kinds (`.malformedOutcome`, `.configInvalid`,
+    /// `.toolUnavailable`) — no filesystem location exists, and a fake path
+    /// must never be invented.
     /// The wire `path` key is conditional on the same rule.
     let url: URL?
     let kind: Kind
@@ -1418,6 +1770,46 @@ struct SpaceScannerRuntime {
                 return "a .removeItem item must carry the .containerItem "
                     + "admission descriptor"
             }
+        // SITE 6 of 8 (fn-5.3). The composite gets its OWN top-level arm:
+        // a forged plan/admission divergence must malform the outcome at
+        // VALIDATION time, not only at the cleaner — the two enforcers are
+        // deliberately independent, and only this one holds the registration
+        // facts (declared roots, the producing scanner id).
+        case .gitWorktreeReclaim(let plan):
+            // CONVERSE ownership, mirrored from `.removeItem`: the aggregate
+            // adapter constructs only category-backed items, so a composite
+            // item bearing its id is a mapping regression, and downstream
+            // treats every `categories` item as an aggregate.
+            if scannerID == CategoryScanner.registeredID {
+                return "the aggregate category adapter may emit only "
+                    + "category-backed actions — git_worktree_reclaim is "
+                    + "reserved for per-item scanners"
+            }
+            switch item.admission {
+            case .containerItem(let originContainer, _):
+                // ORIGIN BINDING (round 6 doctrine, same reason as
+                // `.removeItem`): delete-time admission checks the
+                // runtime-wide UNION, so an undeclared origin could ride
+                // another scanner's registration. Path equality against the
+                // declaration — never a second resolution.
+                if !declaredContainerRoots.contains(where: {
+                    $0.path == originContainer.path
+                }) {
+                    return "originContainer '\(originContainer.path)' is "
+                        + "not one of the producing scanner's declared "
+                        + "trustedContainerRoots — delete-time admission "
+                        + "checks the runtime-wide union, so an undeclared "
+                        + "origin could ride another scanner's registration"
+                }
+            case .category:
+                // Refused by the shared rule set below, in its ONE wording.
+                break
+            }
+            // The plan/admission rules themselves: ONE implementation, also
+            // called by `CacheCleaner.structuralRefusal`, so validation and
+            // the chokepoint can never disagree about what a well-formed
+            // composite item is.
+            return GitWorktreeReclaimPlan.violation(for: item, plan: plan)
         case .removeContents, .commands:
             switch item.admission {
             case .category(let carried):
@@ -1495,6 +1887,15 @@ struct SpaceScannerRuntime {
                             + "commands action, never remove_contents"
                     }
                 case .removeItem:
+                    break // unreachable — the outer switch splits it out
+                // SITE 7 of 8 (fn-5.3). This nested switch is exhaustive
+                // over `ReclaimAction` in its OWN right, so the composite
+                // case must decide here even though the outer switch splits
+                // it out too — the `.removeItem` precedent immediately
+                // above. Nothing to check: the composite carries no argv and
+                // no category, and its coherence rules live in its own
+                // outer-switch arm.
+                case .gitWorktreeReclaim:
                     break // unreachable — the outer switch splits it out
                 }
             case .containerItem:

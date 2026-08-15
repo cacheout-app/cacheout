@@ -1234,8 +1234,10 @@ struct CLIHandler {
 
     /// One `scanner_errors` row. `path` is CONDITIONAL (round 7): present
     /// for the filesystem kinds, ABSENT for the non-filesystem kinds
-    /// (`malformed_outcome`, `config_invalid`) — a fake path must never be
-    /// invented. `grant_hint` is CONDITIONAL: present
+    /// (`malformed_outcome`, `config_invalid`, `tool_unavailable`) — a fake
+    /// path must never be invented. The rule is written over the KIND CLASS,
+    /// so this builder needs no per-kind branch. `grant_hint` is CONDITIONAL:
+    /// present
     /// only for `tcc_denied` — the same remedy category and per-item rows
     /// carry, since macOS denies CLI processes silently (no consent prompt).
     static func scannerErrorRowJSON(

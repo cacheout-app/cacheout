@@ -698,6 +698,13 @@ final class CategoryScannerTests: XCTestCase {
         // compile-time-visible change everywhere, never a silent fallthrough.
         let actions: [ReclaimAction] = [
             .removeContents, .removeItem, .commands([["true"]]),
+            .gitWorktreeReclaim(GitWorktreeReclaimPlan.pruneOrphanedAdmin(
+                parentRepoWorkingDir: URL(fileURLWithPath: "/dev/repo"),
+                adminContainer: URL(fileURLWithPath: "/dev/repo/.git/worktrees"),
+                disclosedAdminDirectories: [
+                    URL(fileURLWithPath: "/dev/repo/.git/worktrees/gone"),
+                ]
+            )),
         ]
         for action in actions {
             switch action {
@@ -707,6 +714,10 @@ final class CategoryScannerTests: XCTestCase {
                 XCTAssertEqual(action.wireString, "remove_item")
             case .commands:
                 XCTAssertEqual(action.wireString, "commands")
+            // fn-5.3 landed the composite case: this arm IS the
+            // compile-time-visible change the comment above predicted.
+            case .gitWorktreeReclaim:
+                XCTAssertEqual(action.wireString, "git_worktree_reclaim")
             }
         }
     }
@@ -728,6 +739,7 @@ final class CategoryScannerTests: XCTestCase {
         XCTAssertEqual(ScanIssue.Kind.permissionDenied.wireString, "permission_denied")
         XCTAssertEqual(ScanIssue.Kind.unreadable.wireString, "unreadable")
         XCTAssertEqual(ScanIssue.Kind.configInvalid.wireString, "config_invalid")
+        XCTAssertEqual(ScanIssue.Kind.toolUnavailable.wireString, "tool_unavailable")
         XCTAssertEqual(ScanIssue.Kind.malformedOutcome.wireString, "malformed_outcome")
     }
 

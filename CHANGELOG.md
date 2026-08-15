@@ -171,7 +171,7 @@ below are both part of that coordination, and the latter BLOCKS this release.
   directory is offered by the prune tier).
 
   **RELEASE-BLOCKING cross-repo gate.**
-  Status: **SATISFIED at a854996** — cacheout-mcp adopted the rule.
+  Status: **SATISFIED at 0b50b62** — cacheout-mcp adopted the rule.
 
   **To close (ONE edit, one meaning):** run the verification below, then
   replace that status line's `**NOT SATISFIED**` with

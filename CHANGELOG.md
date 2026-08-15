@@ -7,14 +7,56 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 Scanner unification (`SpaceScanner` protocol) plus the project
-build-artifacts scanner. Breaking CLI release for JSON consumers:
-`schema_version` is now 4 and `--cli scan` emits an envelope instead of a
-top-level array. Coordinate MCP updates with `cacheout-mcp` (see PROTOCOL.md
-and docs/v1/CLI-REFERENCE.md) — the pre-release `node_modules` →
-`build_artifacts` slug rename below is part of that coordination.
+build-artifacts and stale-git-worktree scanners. Breaking CLI release for
+JSON consumers: `schema_version` is now 4 and `--cli scan` emits an envelope
+instead of a top-level array. Coordinate MCP updates with `cacheout-mcp` (see
+PROTOCOL.md and docs/v1/CLI-REFERENCE.md) — the pre-release `node_modules` →
+`build_artifacts` slug rename and the `git_worktrees` no-client-timeout rule
+below are both part of that coordination, and the latter BLOCKS this release.
 
 ### Added
 
+- **Stale git worktrees in the GUI and the CLI.** A `git_worktrees` per-item
+  scanner walks your configured dev roots for LINKED git worktrees whose work
+  is finished — the field case being 23 GB of merged worktrees under a hidden
+  `.claude/worktrees/` directory. A worktree is offered only when all four
+  gates pass: linked (not the main checkout, not bare), clean (`git status`
+  with submodules and untracked files forced on, so a repository cannot
+  configure its way to a false "clean"), merged into the repository's default
+  branch by local ancestry, and not locked. Every gate fails CLOSED — a
+  command that fails, times out or cannot be answered never passes — and each
+  row carries all four clauses as evidence, with the merge clause hedged
+  because `--is-ancestor` structurally misses squash and rebase merges. A
+  worktree that fails a gate is omitted rather than listed as an undeletable
+  row. Separately, each repository whose registered checkouts no longer exist
+  on disk gets ONE item for its orphaned worktree registry, disclosing exactly
+  what a prune would remove. `--cli scan` reports both as `scanner_items` rows
+  and `--cli clean` accepts `git_worktrees` or `git_worktrees:<item-id>` —
+  destructive runs still require `--confirm`. Nothing here is ever
+  auto-selected, Quick-Cleaned, or reached by `smart-clean`. The macOS
+  privacy prompts for Documents and Desktop now name worktree discovery
+  alongside build artifacts, in all three build paths — the prompt describes
+  every scanner that actually walks those roots.
+- **Worktree removal runs through git, and says so.** Removal is
+  `git worktree remove` — never `--force`, because git's own refusal of a
+  dirty tree is a check worth keeping. If git refuses, the tree is re-checked
+  for cleanliness and only then deleted directly, followed by a narrowly
+  gated `git worktree prune --expire=now` limited to that worktree's own
+  admin entry; the repository-level item prunes exactly the disclosed set.
+  **No branch is ever deleted and repository objects are never touched.**
+  Because git unlinks rather than trashes, the confirmation sheet discloses
+  per selected item that Move to Trash does not apply — stale removals and
+  repository prunes worded separately — and the cleanup report records what
+  actually happened. A removal that succeeded but left admin data behind
+  reports a `warning` on its row (the bytes were still freed) and the next
+  scan offers the leftovers.
+- **`tool_unavailable` scan errors.** When a scanner cannot run an external
+  tool it depends on — today `git` for `git_worktrees` — the scan publishes a
+  `tool_unavailable` row in `scanner_errors` and withdraws every item that
+  scan had built, instead of reporting an empty result that would be
+  indistinguishable from a machine with nothing to clean. Like
+  `malformed_outcome` and `config_invalid` it carries no `path`: the problem
+  is the toolchain, not a location.
 - **Project build artifacts in the GUI and the CLI.** A `build_artifacts`
   per-item scanner walks your configured dev roots for build output PROVEN by
   an ecosystem marker — `target/` beside `Cargo.toml`, `node_modules/` beside
@@ -110,6 +152,44 @@ and docs/v1/CLI-REFERENCE.md) — the pre-release `node_modules` →
   reachable. `-I` and `--exclude-dir` keep it scoped to source: a stale or
   freshly written `__pycache__/*.pyc` would otherwise let the gate report on
   build artifacts instead of on the code.
+- **BREAKING for MCP callers: NO client-side timeout on a confirmed
+  `git_worktrees` clean.** PROTOCOL.md's blanket 30-second subprocess timeout
+  now carries one exception, documented in full under "Subprocess Timeout".
+  Cleaning a worktree runs `git worktree remove` on a tree that may be
+  gigabytes, with an unbounded guarded fallback behind it, so ANY finite
+  client-side guess can kill a valid clean mid-removal and leave both
+  Cacheout and its git child in partial state. Callers apply NO timeout when
+  a clean target token equals `git_worktrees`, starts with `git_worktrees:`,
+  or names an item whose preflight `scan` row carries
+  `"action": "git_worktree_reclaim"` — and, conservatively, when the target
+  is scanner-ambiguous (over-waiting is safe; a premature kill is not).
+  Everything else keeps 30 seconds. The CLI bounds itself: 300 s per git
+  invocation at delete time plus its own SIGTERM → SIGKILL escalation. If the
+  CLI is killed from outside anyway, an orphaned git child and a partially
+  removed tree are possible — the next scan recovers both (a partial tree
+  reads dirty or unassessable and is never a candidate; an orphaned admin
+  directory is offered by the prune tier).
+
+  **RELEASE-BLOCKING cross-repo gate.** `cacheout-mcp` (org `acebytes`,
+  branch `fn-1.3-memory-stats-mcp-tool`, PR #1) still wraps EVERY CLI
+  invocation in a blanket client-side timeout
+  (`AppEngine._run`, `src/cacheout_mcp/engine.py`), so a confirmed
+  `git_worktrees` clean would be killed mid-removal today. That consumer must
+  adopt the rule above BEFORE or WITH this release. Owner: the fn-5.6
+  implementer. Verification, both parts source-scoped (`-I` and
+  `--exclude-dir=__pycache__` keep a stale `.pyc` from deciding the verdict):
+
+  ```
+  # (1) the trigger rule is implemented AND tested — must be NON-ZERO:
+  grep -rnI --exclude-dir=__pycache__ -E '"git_worktrees"|git_worktrees:' src tests
+
+  # (2) the blanket CLI timeout is gone — must be ZERO:
+  grep -rnI --exclude-dir=__pycache__ -E 'proc\.communicate\(\), timeout=120' src
+  ```
+
+  Zero in (2) is reachable and stable: the runner must DERIVE its timeout per
+  invocation (`None` for composite-capable cleans) instead of hardcoding one
+  for every command. Record the adopting commit hash here when it lands.
 
 ## [2.2.0] - 2026-08-06
 

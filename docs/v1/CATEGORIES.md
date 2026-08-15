@@ -16,9 +16,9 @@ per-item scanners — implements one `SpaceScanner` protocol and registers with 
   id `categories`) wraps the data-driven registry and emits one aggregate item per
   category. Category behavior is unchanged, and adding a category is still a
   one-line `CacheCategory` entry — no scanner code involved.
-- **`build_artifacts` and `orphaned_caches` are the per-item scanners**,
-  emitting one item per discovered directory or entry. Follow-on scanners
-  (git worktrees, temp dirs) drop into the same registry.
+- **`build_artifacts`, `orphaned_caches` and `git_worktrees` are the per-item
+  scanners**, emitting one item per discovered directory, entry or worktree.
+  Follow-on scanners (temp dirs) drop into the same registry.
 - The CLI addresses categories by slug and per-item scanners by
   `<scanner-slug>` or `<scanner-slug>:<item-id>` — see
   [CLI-REFERENCE.md](CLI-REFERENCE.md) and the address grammar in PROTOCOL.md.
@@ -413,6 +413,63 @@ Photos-library copy, invisible to every category).
 inside their app containers (`~/Library/Containers/<bundle-id>/Data/Library/
 Caches`); the sweep deliberately does not enter them. `/Library/Caches`
 (the system domain) is likewise out of scope.
+
+---
+
+## Stale Git Worktrees
+
+The `git_worktrees` scanner walks the same DEV ROOTS as `build_artifacts`
+and finds linked git worktrees whose work is finished — the field case being
+23 GB of merged worktrees under a hidden `.claude/worktrees/` directory, each
+carrying its own multi-gigabyte build tree. Nothing is name-matched: every
+worktree is attributed to its parent repository through git's own registry
+and a bidirectional `gitdir` back-link check, and every removal runs through
+git.
+
+- **Gates (all four must pass; each fails CLOSED).** A worktree is offered
+  only when it is (1) a LINKED worktree, not the main checkout and not bare;
+  (2) CLEAN — `git status` with submodules and untracked files forced ON, so
+  a repository cannot configure its way to a false "clean"; (3) MERGED — its
+  HEAD is a local ancestor of the repository's default branch; (4) NOT
+  LOCKED. A command that fails, times out, or cannot be answered fails its
+  gate — it never passes silently. Every worktree's evidence names all four
+  clauses, and the merge clause is hedged: `--is-ancestor` structurally
+  misses squash and rebase merges, so the evidence never claims "not merged"
+  as fact. There is no network access anywhere — no `fetch`, no
+  `remote prune`.
+- **Tiers.** Stale candidates are one item each (Review). Separately, each
+  repository with registered checkouts that no longer exist on disk gets ONE
+  repository-level item for its orphaned worktree registry (Safe — it removes
+  metadata only). A worktree that is assessed and fails a gate is OMITTED
+  from the results entirely rather than listed as an un-deletable row.
+- **Selection.** Nothing here is ever auto-selected or eligible for Quick
+  Clean, whatever the risk says — a git subprocess must never run without an
+  explicit choice. CLI `smart-clean` never runs this scanner.
+- **Deletion sequence.** A stale worktree is removed with
+  `git worktree remove` — never `--force`, because git's own refusal of a
+  dirty tree is a safety check worth keeping. If git refuses, the tree is
+  re-checked for cleanliness and only then deleted directly, followed by a
+  narrowly-gated `git worktree prune --expire=now` that may remove nothing
+  but that worktree's own admin entry. The repository-level item runs
+  `git worktree prune --expire=now` over exactly the set the scan disclosed.
+  **Branch refs and repository objects are never touched** — no branch is
+  ever deleted.
+- **Move to Trash does not apply.** git unlinks and prunes; it does not
+  trash. The confirmation sheet says so per selected item, and the cleanup
+  report records what actually happened. If a removal succeeded but left
+  admin data behind, the entry carries a warning and the next scan offers the
+  leftovers.
+- **Timeouts.** A worktree removal is unbounded work. The CLI bounds each git
+  invocation itself; MCP callers must apply NO client-side timeout to a
+  confirmed clean of `git_worktrees` targets (PROTOCOL.md, "Subprocess
+  Timeout").
+
+**Out of scope:** submodules (attributed to nothing and never offered),
+locked worktrees, bare repositories as removal targets, anything outside the
+configured dev roots, and any worktree whose parent repository, admin data or
+tree do not all sit inside ONE declared dev root — git mutates the parent's
+admin data, so the whole mutation scope must share a root or nothing is
+offered.
 
 ---
 

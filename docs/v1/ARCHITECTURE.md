@@ -21,6 +21,7 @@ business logic (scanning/cleaning), state management, and presentation.
 │  SpaceScannerRuntime (registry + validated scan stream)     │
 │    CategoryScanner ──► CacheScanner (actor)                 │
 │    BuildArtifactsScanner │ OrphanedCachesScanner            │
+│    GitWorktreeScanner ──► GitCommandRunner (one per runtime) │
 │    CacheCleaner (actor)                                     │
 ├─────────────────────────────────────────────────────────────┤
 │                     Data Models                             │
@@ -56,9 +57,14 @@ Sources/Cacheout/
 │   ├── BuildArtifactsScanner.swift     # Project build-artifact scanner (SpaceScanner)
 │   ├── ValuablesDetector.swift         # Release-artifact probe + acknowledgement tokens
 │   ├── OrphanedCachesScanner.swift     # First-level ~/Library/Caches sweep (SpaceScanner)
+│   ├── GitCommandRunner.swift          # The ONE git subprocess seam (read-only/mutation profiles)
+│   ├── GitWorktreeInventory.swift      # worktree list --porcelain -z parse, gitdir resolver, admin mapper
+│   ├── WorktreeStalenessAssessor.swift # The four fail-closed staleness gates + evidence
+│   ├── GitWorktreeScanner.swift        # Stale git-worktree scanner (SpaceScanner)
 │   └── SpaceScanner.swift              # SpaceScanner protocol, ReclaimableItem model, SpaceScannerRuntime
 ├── Cleaner/
 │   ├── CacheCleaner.swift              # Guarded deletion/trash + InodeAccountingRegistry (actors)
+│   ├── WorktreeReclaimPerformer.swift  # git-mediated worktree removal / repo-level prune
 │   ├── FileSystemIdentityProvider.swift # realpath/lstat identity: (st_dev, st_ino), st_nlink, mounts
 │   └── PathGuard.swift                 # Deletion/container admission chokepoint (D4)
 ├── ViewModels/

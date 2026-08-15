@@ -378,10 +378,12 @@ final class DocumentedContractTests: XCTestCase {
 
     /// The macOS privacy prompts are PRODUCT copy, generated from three
     /// synchronized sources (the bundle.sh heredoc, Info.plist, and
-    /// project.yml). They must describe the scanner that actually walks the
+    /// project.yml). They must describe the scanners that actually walk the
     /// protected roots — after fn-4.7 that is `build_artifacts`, not the
-    /// retired node_modules scanner — and the three copies must agree, since
-    /// a drifting one ships silently in whichever build path used it.
+    /// retired node_modules scanner, and after fn-5.6's registration
+    /// `git_worktrees` walks the SAME dev roots through the same gate — and
+    /// the three copies must agree, since a drifting one ships silently in
+    /// whichever build path used it.
     func testShippedTCCUsageStringsDescribeTheLiveScannerAndStayInSync()
         throws
     {
@@ -391,11 +393,13 @@ final class DocumentedContractTests: XCTestCase {
             "scripts/bundle.sh",
         ]
         let documents = "Cacheout looks for developer build-artifact folders "
-            + "(target/, node_modules/, .venv/ and similar) in Documents "
+            + "(target/, node_modules/, .venv/ and similar) and stale git "
+            + "worktrees in Documents "
             + "during scans you start. Nothing is deleted without your "
             + "confirmation."
         let desktop = "Cacheout looks for developer build-artifact folders "
-            + "(target/, node_modules/, .venv/ and similar) on your Desktop "
+            + "(target/, node_modules/, .venv/ and similar) and stale git "
+            + "worktrees on your Desktop "
             + "during scans you start. Nothing is deleted without your "
             + "confirmation."
 
@@ -433,7 +437,7 @@ final class DocumentedContractTests: XCTestCase {
         let text = try protocolDoc()
         let allKinds: [ScanIssue.Kind] = [
             .containerRefused, .symlinkRoot, .tccDenied, .permissionDenied,
-            .unreadable, .configInvalid, .malformedOutcome,
+            .unreadable, .configInvalid, .toolUnavailable, .malformedOutcome,
         ]
         for kind in allKinds {
             XCTAssertTrue(text.contains("`\"\(kind.wireString)\"`"),
@@ -451,7 +455,8 @@ final class DocumentedContractTests: XCTestCase {
         )
         XCTAssertTrue(pathRow.contains("NON-FILESYSTEM"),
                       "the rule is stated over a KIND CLASS: \(pathRow)")
-        for kind in ["malformed_outcome", "config_invalid"] {
+        // fn-5.6 EXTENDS the named set rather than restating the rule.
+        for kind in ["malformed_outcome", "config_invalid", "tool_unavailable"] {
             XCTAssertTrue(pathRow.contains(kind),
                           "the rule must name `\(kind)`: \(pathRow)")
         }
@@ -463,6 +468,158 @@ final class DocumentedContractTests: XCTestCase {
         )
         XCTAssertNil(issue.url)
         XCTAssertEqual(issue.kind.wireString, "config_invalid")
+
+        // …and so does the one the scanner actually publishes: the shipped
+        // issue is path-less and its detail carries the pinned prefix the
+        // documentation quotes.
+        XCTAssertNil(GitWorktreeScanner.toolUnavailableIssue.url)
+        XCTAssertEqual(
+            GitWorktreeScanner.toolUnavailableIssue.kind.wireString,
+            "tool_unavailable"
+        )
+        XCTAssertTrue(
+            GitWorktreeScanner.toolUnavailableIssue.detail
+                .hasPrefix("git unavailable")
+        )
+        XCTAssertTrue(text.contains("the detail begins `git unavailable`"),
+                      "PROTOCOL.md must quote the pinned detail prefix")
+    }
+
+    // MARK: - The documented reclaim actions (fn-5.6, R11)
+
+    /// The `action` row must cover EVERY wire string the enum can produce —
+    /// a consumer branching on `action` is branching on this list — and must
+    /// keep the non-exposure rule for the two payload-carrying cases.
+    func testDocumentedActionWireStringsCoverTheEnum() throws {
+        let text = try protocolDoc()
+        let actionRow = try XCTUnwrap(
+            text.split(separator: "\n").first {
+                $0.hasPrefix("| `action` |") && $0.contains("wire string")
+            },
+            "PROTOCOL.md must carry the `action` row"
+        )
+        // Built from the ENUM, so a new case fails here until documented.
+        let allActions: [ReclaimAction] = [
+            .removeContents, .removeItem, .commands([["true"]]),
+            .gitWorktreeReclaim(.pruneOrphanedAdmin(
+                parentRepoWorkingDir: URL(fileURLWithPath: "/dev/repo"),
+                adminContainer: URL(fileURLWithPath: "/dev/repo/admin"),
+                disclosedAdminDirectories: []
+            )),
+        ]
+        for action in allActions {
+            XCTAssertTrue(
+                actionRow.contains("`\"\(action.wireString)\"`"),
+                "the row must list `\(action.wireString)`: \(actionRow)"
+            )
+        }
+        XCTAssertTrue(actionRow.contains("NEVER exposed"),
+                      "the payload non-exposure rule survives: \(actionRow)")
+        XCTAssertEqual(
+            ReclaimAction.gitWorktreeReclaim(.removeStaleWorktree(
+                worktreePath: URL(fileURLWithPath: "/dev/wt"),
+                worktreeAdminEntry: URL(fileURLWithPath: "/dev/repo/admin/wt"),
+                parentRepoWorkingDir: URL(fileURLWithPath: "/dev/repo"),
+                adminContainer: URL(fileURLWithPath: "/dev/repo/admin")
+            )).wireString,
+            "git_worktree_reclaim",
+            "the FROZEN wire string, both modes"
+        )
+    }
+
+    // MARK: - The D18 external timeout contract (fn-5.6, R11)
+
+    /// The rule MCP callers implement, and the reason there is nothing
+    /// numeric to keep in sync: a worktree removal is unbounded work, so any
+    /// published client-side formula could kill a valid clean. This test
+    /// therefore pins the RULE and its TRIGGER, and asserts that no numeric
+    /// client-side formula crept back in.
+    func testDocumentedNoClientTimeoutRuleAndItsTriggerAreComplete() throws {
+        let text = try protocolDoc()
+        let start = try XCTUnwrap(
+            text.range(of: "#### Exception: NO client-side timeout"),
+            "PROTOCOL.md must carry the composite-clean timeout exception"
+        )
+        let end = try XCTUnwrap(text.range(of: "## Alert Schema"))
+        let section = String(text[start.lowerBound..<end.lowerBound])
+
+        // THE RULE.
+        XCTAssertTrue(section.contains("NO client-side timeout"), section)
+        XCTAssertTrue(section.contains("`git_worktree_reclaim`"), section)
+        XCTAssertTrue(section.contains("Not a longer timeout — none."), section)
+        // THE TRIGGER, all four clauses — a caller must be able to decide
+        // BEFORE running anything.
+        for clause in [
+            "equals the scanner slug `git_worktrees`",
+            "starts with `git_worktrees:`",
+            "`\"action\": \"git_worktree_reclaim\"`",
+            "scanner-ambiguous",
+            "Treat it as composite",
+            "Over-waiting is safe",
+        ] {
+            XCTAssertTrue(section.contains(clause),
+                          "the trigger rule must state '\(clause)'")
+        }
+        // Everything else is unchanged.
+        XCTAssertTrue(section.contains("keeps the 30-second rule"), section)
+        // THE HONEST CAVEAT — the outer kill is possible and is named.
+        XCTAssertTrue(section.contains("ORPHANED mid-removal"), section)
+        XCTAssertTrue(section.contains("Partial\ntree state is possible"), section)
+        XCTAssertTrue(section.contains("next scan handles"), section)
+
+        // NO client-side FORMULA — the round-8 shape is gone for good. The
+        // only numbers here are the CLI's OWN budget and the unchanged
+        // 30-second default.
+        for formula in [
+            "per GB", "per gigabyte", "×", "timeout =", "base timeout",
+            "scaled", "multiplied",
+        ] {
+            XCTAssertFalse(
+                section.contains(formula),
+                "a client-side timeout formula reappeared ('\(formula)') — "
+                    + "any finite guess can kill a valid clean"
+            )
+        }
+        // …and the budget the doc DOES quote is the real one.
+        XCTAssertTrue(
+            section.contains("300 s"),
+            "the CLI's own per-invocation budget is what actually bounds this"
+        )
+        XCTAssertEqual(WorktreeReclaimPerformer.deleteTimeGitTimeout, 300,
+                       "the documented budget is the shipped constant")
+    }
+
+    /// The release-blocking consumer gate, recorded where a release engineer
+    /// will see it. Same discipline as the slug-retirement gate above: a
+    /// named owner, and a verification whose passing state is stated and
+    /// reachable. The sibling checkout is not assumed to exist, so this
+    /// checks the PROMISE's shape.
+    func testRecordedTimeoutGateIsBlockingNamedAndVerifiable() throws {
+        let changelog = try document("CHANGELOG.md")
+        guard let unreleased = changelog.range(of: "## [Unreleased]"),
+              let released = changelog.range(of: "## [2.2.0]") else {
+            return XCTFail("CHANGELOG must carry an [Unreleased] section")
+        }
+        let section = String(changelog[unreleased.lowerBound..<released.lowerBound])
+
+        for fragment in [
+            "RELEASE-BLOCKING",           // it blocks, it is not advisory
+            "cacheout-mcp",               // the named consumer
+            "Owner:",                     // a person, not "someone"
+            "git_worktrees",              // the trigger the consumer implements
+            "-I",                         // binaries never decide the verdict
+            "--exclude-dir=__pycache__",  // build artifacts never do either
+            "src tests",                  // the consumer's source roots
+            "NON-ZERO",                   // the adoption half's passing state
+            "must be ZERO",               // the defect half's passing state
+        ] {
+            XCTAssertTrue(section.contains(fragment),
+                          "the recorded gate must contain '\(fragment)'")
+        }
+        // The rule the consumer has to adopt is stated here too, not just
+        // referenced — a release engineer reading the CHANGELOG alone must be
+        // able to tell whether the gate is met.
+        XCTAssertTrue(section.contains("NO client-side timeout"), section)
     }
 
     /// PROTOCOL.md's `risk_level` note must no longer claim a per-SCANNER

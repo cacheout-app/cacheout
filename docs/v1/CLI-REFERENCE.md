@@ -64,7 +64,8 @@ Cacheout --cli disk-info
 ### `scan`
 
 Run every registered scanner (the built-in cache categories plus the
-per-item scanners `build_artifacts` and `orphaned_caches`) and report the
+per-item scanners `build_artifacts`, `orphaned_caches` and `git_worktrees`)
+and report the
 schema-4 envelope. The
 registry in `Sources/Cacheout/Scanner/Categories.swift` is the source of
 truth for which categories exist — see [CATEGORIES.md](CATEGORIES.md) for
@@ -164,9 +165,11 @@ command.
 carries root/scanner-level problems (`scanner_id`, `kind`, `detail`, and
 `path` for the FILESYSTEM kinds; the NON-filesystem kinds carry no `path`
 because none honestly exists — `malformed_outcome` means that scanner's
-items were excluded fail-closed, and `config_invalid` means a persisted
+items were excluded fail-closed, `config_invalid` means a persisted
 config value could not be parsed, so the defaults are in effect and the
-stored value was left untouched).
+stored value was left untouched, and `tool_unavailable` means an external
+tool the scan needs could not run — today `git` for `git_worktrees` — so
+that scanner produced no results and withdrew any it had already built).
 
 A `build_artifacts` row may additionally carry two ADDITIVE keys:
 `logical_bytes` (apparent size, present only when it materially exceeds
@@ -682,6 +685,7 @@ Per-item scanner slugs (usable bare or as `<slug>:<item-id>`):
 |------|---------|
 | `build_artifacts` | Project build-artifact directories under your dev roots — `target/`, `node_modules/`, `.venv/`, `build/`, … each proven by an ecosystem marker file (item ids from `scan`'s `scanner_items`; see [CATEGORIES.md](CATEGORIES.md)) |
 | `orphaned_caches` | First-level `~/Library/Caches` sweep — leaked, orphaned, and stale cache entries (item ids from `scan`'s `scanner_items`; see [CATEGORIES.md](CATEGORIES.md)) |
+| `git_worktrees` | Stale git worktrees under your dev roots, plus one repository-level orphaned-worktree-registry item per repository (item ids from `scan`'s `scanner_items`; see [CATEGORIES.md](CATEGORIES.md)). Its rows carry `"action": "git_worktree_reclaim"` — cleaning one runs git, not a file delete, so **MCP callers must apply no client-side timeout to a confirmed clean of these targets** (PROTOCOL.md, "Subprocess Timeout") |
 
 The `node_modules` slug that shipped in unreleased schema-4 work is
 **retired**: `build_artifacts` covers every directory it found (and more).

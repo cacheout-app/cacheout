@@ -70,8 +70,8 @@ The MCP server discovers CacheOut capabilities before invoking commands. This en
 - `scan` output changes from a top-level array to the **scan envelope**
   (`{schema_version, categories, scanner_items, scanner_errors}`). The
   `categories` rows are field-for-field the schema-3 rows; the other keys
-  are additive (per-item scanners — `build_artifacts` and
-  `orphaned_caches` today — become visible for the first time).
+  are additive (per-item scanners — `build_artifacts`, `orphaned_caches`
+  and `git_worktrees` today — become visible for the first time).
 - `clean` accepts the **target address grammar** (`<category-slug>` |
   `<scanner-slug>` | `<scanner-slug>:<item-id>`) — bare category slugs work
   exactly as in schema 3.
@@ -241,7 +241,7 @@ compatibility sum.
 |-------|------|----------|-------------|
 | `schema_version` | integer | yes | Always present — every schema-4 payload self-describes |
 | `categories` | object[] | yes | Schema 3's category rows, field-for-field (table below). NO `scanner_id`/`item_id` here — identity fields live on `scanner_items` and the clean/smart-clean rows only |
-| `scanner_items` | object[] | yes | One row per PER-ITEM scanner item (`build_artifacts` and `orphaned_caches` today; git worktrees and temp dirs to follow). Empty array when no per-item scanner found anything |
+| `scanner_items` | object[] | yes | One row per PER-ITEM scanner item (`build_artifacts`, `orphaned_caches` and `git_worktrees` today; temp dirs to follow). Empty array when no per-item scanner found anything |
 | `scanner_errors` | object[] | yes | Root/scanner-level problems that produced NO item (refused search roots, traversal failures, malformed outcomes). Empty array when clean |
 
 **`scanner_items` rows:**
@@ -259,7 +259,7 @@ compatibility sum.
 | `logical_bytes` | integer | no | ADDITIVE. Apparent (non-allocated) size, present ONLY when it materially exceeds `size_bytes` — the sparse-file case where deletion frees LESS than the apparent size (a 57.1 GB-logical Rust `target/` occupying 31 GB). Absent for ordinary trees, where block rounding makes logical *smaller* than allocated and the divergence is noise. NEVER a reclaimable figure: budget against `exact_bytes` |
 | `valuables` | object[] | no | ADDITIVE. Release artifacts detected INSIDE this item, in the ONE canonical order (byte-wise ascending `path`). Omitted entirely when none were disclosed. Element shape is pinned below and is shared byte-for-byte with clean plan rows and refusal rows |
 | `evidence` | string | yes | Human-readable provenance rendered in confirmation UIs |
-| `action` | string | yes | Reclaim action wire string: `"remove_contents"`, `"remove_item"`, or `"commands"`. For `"commands"` ONLY the kind is serialized — **the argv arrays are NEVER exposed anywhere in CLI output** (the JSON is a reporting surface, not an execution contract) |
+| `action` | string | yes | Reclaim action wire string: `"remove_contents"`, `"remove_item"`, `"commands"`, or `"git_worktree_reclaim"`. For `"commands"` and `"git_worktree_reclaim"` ONLY the kind is serialized — **the argv arrays and the reclaim plan's paths are NEVER exposed anywhere in CLI output** (the JSON is a reporting surface, not an execution contract). `"git_worktree_reclaim"` is the `git_worktrees` scanner's composite action: a git-mediated worktree removal, or a repository-level prune of orphaned worktree admin data. It is the trigger for the no-client-timeout rule — see [Subprocess Timeout](#subprocess-timeout) |
 | `scan_error` | object | no | Same conditional shape as category rows |
 | `grant_hint` | string | no | Same conditional TCC remedy as category rows |
 
@@ -268,9 +268,9 @@ compatibility sum.
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `scanner_id` | string | yes | Which scanner reported (or failed validation) |
-| `kind` | string | yes | One of: `"container_refused"`, `"symlink_root"`, `"tcc_denied"`, `"permission_denied"`, `"unreadable"`, `"config_invalid"`, `"malformed_outcome"`. The list is EXTENSIBLE — consumers must tolerate unknown kinds |
+| `kind` | string | yes | One of: `"container_refused"`, `"symlink_root"`, `"tcc_denied"`, `"permission_denied"`, `"unreadable"`, `"config_invalid"`, `"tool_unavailable"`, `"malformed_outcome"`. The list is EXTENSIBLE — consumers must tolerate unknown kinds |
 | `detail` | string | yes | Human-readable description |
-| `path` | string | conditional | Present for the FILESYSTEM kinds; ABSENT for the NON-FILESYSTEM kinds — `"malformed_outcome"` and `"config_invalid"` — where no filesystem location exists and a fake path is therefore never invented |
+| `path` | string | conditional | Present for the FILESYSTEM kinds; ABSENT for the NON-FILESYSTEM kinds — `"malformed_outcome"`, `"config_invalid"` and `"tool_unavailable"` — where no filesystem location exists and a fake path is therefore never invented |
 | `grant_hint` | string | no | Present only when `kind == "tcc_denied"` — the same user-side remedy (Full Disk Access) as category and `scanner_items` rows, since macOS denies CLI processes silently |
 
 A `malformed_outcome` row means that scanner's ENTIRE outcome failed
@@ -286,6 +286,14 @@ silent. It carries no `path` because a config parse failure has no honest
 filesystem location. A configured root that was REJECTED by policy (the
 filesystem root, a volume root/mount point, `$HOME`) is a different thing
 and reports honestly under `container_refused` WITH its offending path.
+
+A `tool_unavailable` row means the scan could not run an external tool it
+depends on, so it produced NO results — today: `git_worktrees` could not
+execute `git` (the detail begins `git unavailable`). Every item that scan
+had already built is WITHDRAWN, because a tool-less scan reporting zero
+findings is indistinguishable from a machine with no stale worktrees. It
+carries no `path` for the same reason `config_invalid` does not: the problem
+is the toolchain, not a location.
 
 **Per-item valuables element (pinned, shared by three surfaces):** the same
 six-field object appears in `scanner_items[].valuables`, in clean plan rows
@@ -535,7 +543,7 @@ process-level success.
 | `results[].scanner_id` | string | yes | Owning scanner id — `"categories"` on aggregate rows (schema 4) |
 | `results[].item_id` | string | yes | Scanner-scoped item id — the category slug on aggregate rows, the full-hash id on per-item rows (schema 4) |
 | `results[].error` | string | no | Error message(s), `"; "`-joined, when `success` is false |
-| `results[].warning` | string | no | Present when the category scanned `partiallyDenied` — only measured bytes were cleaned/reported |
+| `results[].warning` | string | no | TWO SOURCES, and they COMPOSE (joined with `"; "` when both apply — a row never drops one because the other was there). (1) SCAN-TIME: the target scanned `partiallyDenied`, so only measured bytes were cleaned/reported. (2) DELETE-TIME: the entry's own non-fatal warning — today only `git_worktree_reclaim` stale removals that SUCCEEDED but left repository admin data behind (the post-removal prune failed, or was conservatively SKIPPED because the prunable set was not exactly the removed worktree's own entry). The bytes were freed and `success` stays `true`; the leftover metadata is offered by the next scan's prune tier. A prune-only item's failure is an ERROR, never a warning |
 | `results[].valuables` | object[] | no | ADDITIVE. Present only on a VALUABLES REFUSAL row: the release artifacts the DELETE-TIME inspection found, pinned element shape, canonical order. Omitted when the refusal disclosed none (the vanished-set case) |
 | `results[].acknowledgement_token` | string | no | ADDITIVE. Present only on a valuables refusal whose delete-time inspection COMPLETED and found a non-empty set — the exact token to pass back in `--acknowledge-valuables`. Vanished-set and incomplete-inspection refusals are deliberately TOKENLESS |
 | `scanner_rollups` | object[] | yes | Additive per-scanner sums over the report entries (`scanner_id`, `exact_bytes`, `estimated_up_to_bytes`, `bytes_freed`, `entry_count`), first-appearance order |
@@ -1304,6 +1312,46 @@ All CLI commands follow a consistent error reporting contract.
 ### Subprocess Timeout
 
 MCP server callers should enforce a **30-second subprocess timeout** when invoking any CLI command. If the process does not exit within 30 seconds, send SIGTERM, wait 2 seconds, then SIGKILL.
+
+#### Exception: NO client-side timeout for `git_worktree_reclaim` cleans
+
+**Callers MUST apply NO client-side timeout to any confirmed `clean` whose
+targets can execute `git_worktree_reclaim`.** Not a longer timeout — none.
+A `git worktree remove` on a multi-gigabyte tree is unbounded work, the
+guarded filesystem fallback behind it is unbounded too, and an outer kill
+lands mid-removal: it defeats the CLI's own budget and can leave Cacheout AND
+its git child in partial state. Any finite client-side guess can therefore
+kill a valid clean, which is why no formula is published here.
+
+**The trigger rule is decidable by the caller, before it runs anything.**
+Apply the no-timeout rule when ANY of these holds:
+
+- a clean target token equals the scanner slug `git_worktrees`; or
+- a clean target token starts with `git_worktrees:` (the
+  `<scanner-slug>:<item-id>` address form); or
+- a preflight `scan` row for an addressed item carries
+  `"action": "git_worktree_reclaim"`; or
+- the target is scanner-ambiguous — an unknown or uncached item id under a
+  scanner the caller cannot resolve. **Treat it as composite.**
+  Over-waiting is safe; a premature kill is not.
+
+Every other command — including `scan`, `smart-clean`, and cleans that name
+only category slugs or other scanners — keeps the 30-second rule.
+
+**The CLI's own budgets are the only bounds.** A confirmed composite clean
+bounds itself per git invocation (300 s at delete time) and terminates a
+hung child through its own SIGTERM → SIGKILL protocol. Those budgets, not
+the caller, are what stop a wedged git.
+
+**Honest caveat — an outer kill is still possible, and this is what it
+does.** If the Cacheout process itself is SIGTERM/SIGKILLed mid-clean (a
+caller that ignores this rule, a shell `Ctrl-C`, a logout), Cacheout's own
+escalation never runs and the git child may be ORPHANED mid-removal. Partial
+tree state is possible; it is not pretended away. It is also exactly what the
+next scan handles: a partially removed tree reads dirty or unassessable, so
+it is never a removal candidate, and an admin directory whose checkout is
+gone is offered by the repository-level prune tier. Nothing silently
+disappears and nothing is silently deleted — the recovery is a rescan.
 
 ---
 

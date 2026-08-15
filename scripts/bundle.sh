@@ -362,23 +362,46 @@ check_release_gates() {
     # not preconditions.
     unreleased=$(awk '/^## \[Unreleased\]/{inside=1; next} /^## \[/{inside=0} inside' "$changelog")
 
-    gate_count=$(printf '%s\n' "$unreleased" | grep -cE '\*\*RELEASE-BLOCKING' || true)
-    status_lines=$(printf '%s\n' "$unreleased" | grep -E '^[[:space:]]*Status: \*\*' || true)
-    status_count=$(printf '%s\n' "$status_lines" | grep -c '[^[:space:]]' || true)
+    # (a) STRUCTURE — each gate marker is followed by exactly one status line
+    # before the next marker. Counting markers against statuses is NOT
+    # equivalent: two gates where one carries two statuses and the other none
+    # would balance out, leaving an unverified gate. Positional pairing is
+    # what the recorded form actually claims, so that is what is checked.
+    pairing=$(printf '%s\n' "$unreleased" | awk '
+        /\*\*RELEASE-BLOCKING/ {
+            if (awaiting) { print "MISSING_STATUS"; exit }
+            awaiting = 1; gates++; next
+        }
+        /^[ \t]*Status: \*\*/ {
+            if (!awaiting) { print "ORPHAN_STATUS\t" $0; exit }
+            awaiting = 0; next
+        }
+        END { if (awaiting) print "MISSING_STATUS"; else print "OK\t" gates+0 }
+    ')
+    case "$pairing" in
+        MISSING_STATUS*)
+            echo "❌ CHANGELOG.md [Unreleased]: a RELEASE-BLOCKING gate has no status line."
+            echo "   Every gate carries EXACTLY ONE 'Status: **…**' line beneath it."
+            echo "   An unverifiable gate never passes."
+            return 1
+            ;;
+        ORPHAN_STATUS*)
+            echo "❌ CHANGELOG.md [Unreleased]: a gate status line belongs to no gate:"
+            echo "  ${pairing#ORPHAN_STATUS	}"
+            echo "   A duplicate or stray status means the record is broken, so the"
+            echo "   gate it claims to describe cannot be verified."
+            return 1
+            ;;
+    esac
 
-    if [ "$gate_count" -ne "$status_count" ]; then
-        echo "❌ CHANGELOG.md [Unreleased]: $gate_count release-blocking gate(s) but $status_count status line(s)."
-        echo "   Every gate carries EXACTLY ONE status line, either"
-        echo "   'Status: **NOT SATISFIED**' or 'Status: **SATISFIED at <commit-hash>**'."
-        echo "   A missing, extra or renamed status is an UNVERIFIABLE gate, and an"
-        echo "   unverifiable gate never passes."
-        return 1
-    fi
-
-    if [ "$gate_count" -eq 0 ]; then
+    gate_count=${pairing#OK	}
+    if [ "$gate_count" = "0" ]; then
         echo "✅ No release-blocking gates recorded in CHANGELOG.md [Unreleased]"
         return 0
     fi
+
+    # (b) SPELLING — every paired status is one of the two admissible forms.
+    status_lines=$(printf '%s\n' "$unreleased" | grep -E '^[[:space:]]*Status: \*\*' || true)
 
     # Enumerate the admissible states; anything else is refused by name.
     while IFS= read -r line; do

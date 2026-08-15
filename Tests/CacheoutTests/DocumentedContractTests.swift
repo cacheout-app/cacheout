@@ -771,6 +771,73 @@ final class DocumentedContractTests: XCTestCase {
 
              ## [2.2.0] - 2026-08-06
              """, false),
+            // MULTI-GATE PAIRING (review r5). Counting markers against
+            // statuses is NOT equivalent to pairing them: this layout
+            // balances (two of each, both spellings valid) while gate B has
+            // no status at all — a fail-open the count check waved through.
+            ("two-gates-one-carrying-both-statuses", """
+             # Changelog
+
+             ## [Unreleased]
+
+               **RELEASE-BLOCKING gate A**
+               Status: **SATISFIED at 63edbfc**
+               Status: **SATISFIED at abcdef1**
+
+               **RELEASE-BLOCKING gate B**
+
+             ## [2.2.0] - 2026-08-06
+             """, false),
+            ("two-gates-the-first-unstated", """
+             # Changelog
+
+             ## [Unreleased]
+
+               **RELEASE-BLOCKING gate A**
+
+               **RELEASE-BLOCKING gate B**
+               Status: **SATISFIED at abcdef1**
+
+             ## [2.2.0] - 2026-08-06
+             """, false),
+            ("two-gates-the-last-unstated", """
+             # Changelog
+
+             ## [Unreleased]
+
+               **RELEASE-BLOCKING gate A**
+               Status: **SATISFIED at 63edbfc**
+
+               **RELEASE-BLOCKING gate B**
+
+             ## [2.2.0] - 2026-08-06
+             """, false),
+            ("two-gates-one-still-open", """
+             # Changelog
+
+             ## [Unreleased]
+
+               **RELEASE-BLOCKING gate A**
+               Status: **SATISFIED at 63edbfc**
+
+               **RELEASE-BLOCKING gate B**
+               Status: **NOT SATISFIED** — still waiting
+
+             ## [2.2.0] - 2026-08-06
+             """, false),
+            ("two-gates-both-satisfied", """
+             # Changelog
+
+             ## [Unreleased]
+
+               **RELEASE-BLOCKING gate A**
+               Status: **SATISFIED at 63edbfc**
+
+               **RELEASE-BLOCKING gate B**
+               Status: **SATISFIED at abcdef1**
+
+             ## [2.2.0] - 2026-08-06
+             """, true),
             // Nothing recorded at all is the ordinary, releasable state.
             ("no-gates-recorded", """
              # Changelog

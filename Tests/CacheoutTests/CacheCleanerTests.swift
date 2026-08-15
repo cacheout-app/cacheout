@@ -2031,19 +2031,30 @@ final class CacheCleanerTests: XCTestCase {
     }
 
     func testAutoEligibleSweepItemProbeIncompleteAtDeleteTimeIsRefused() async throws {
+        try XCTSkipIf(geteuid() == 0, "root ignores permission bits")
         let (home, caches, entry, snapshot) = try makeSweepFixture()
         defer { try? FileManager.default.removeItem(at: home) }
 
-        // Recreate the entry with a directory sitting AT the probe's depth
-        // boundary (entry/a/b/c — c is a directory at depth 3, left
-        // unexpanded): the pre-delete probe cannot prove the absence of
-        // user data, and an inspection that could not finish is treated
-        // like a change (fail closed).
+        // Recreate the entry around a branch the probe cannot READ. Depth
+        // no longer truncates anything (the entry budget is the one bound,
+        // and it is deterministic — a bound-shaped refusal no retry could
+        // ever clear is exactly what was removed), so the remaining
+        // fail-closed causes are genuine obstructions like this one: the
+        // pre-delete probe cannot prove the absence of user data, and an
+        // inspection that could not finish is treated like a change.
         try FileManager.default.removeItem(at: entry)
-        let deep = entry.appendingPathComponent("a/b/c")
-        try FileManager.default.createDirectory(at: deep, withIntermediateDirectories: true)
-        let survivor = deep.appendingPathComponent("hidden.bin")
+        let locked = entry.appendingPathComponent("locked-sub")
+        try FileManager.default.createDirectory(at: locked, withIntermediateDirectories: true)
+        let survivor = locked.appendingPathComponent("hidden.bin")
         try writeFile(survivor, bytes: 1024)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o000], ofItemAtPath: locked.path
+        )
+        defer {
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o755], ofItemAtPath: locked.path
+            )
+        }
 
         let item = makeRemoveItem(
             scannerID: OrphanedCachesScanner.registeredID,
@@ -2058,9 +2069,17 @@ final class CacheCleanerTests: XCTestCase {
         XCTAssertTrue(report.entries.isEmpty)
         XCTAssertEqual(report.errors.count, 1)
         let message = try XCTUnwrap(report.errors.first?.message)
-        XCTAssertTrue(message.contains("couldn't fully re-inspect"), message)
+        XCTAssertTrue(message.contains("couldn't fully inspect"), message)
+        XCTAssertFalse(
+            message.contains("re-scan required"),
+            "the probe is deterministic — prescribing a re-scan that "
+                + "reproduces the same verdict is misleading: \(message)"
+        )
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755], ofItemAtPath: locked.path
+        )
         XCTAssertTrue(FileManager.default.fileExists(atPath: survivor.path),
-                      "content behind the uninspectable boundary survives")
+                      "content behind the uninspectable branch survives")
         XCTAssertTrue(logContents(home: home).contains("REFUSED [content-drift]"))
     }
 

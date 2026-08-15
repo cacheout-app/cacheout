@@ -77,8 +77,9 @@ final class OrphanedCachesSweepTests: XCTestCase {
     private func makeScanner(
         categories: [CacheCategory] = [],
         provider: FileSystemIdentityProvider = FileSystemIdentityProvider(),
-        probeDepthLimit: Int = 3,
-        probeEntryLimit: Int = 512,
+        // The PRODUCTION bound by default — the shared constant, never a
+        // hardcoded copy, so these tests cannot drift from what ships.
+        probeEntryLimit: Int = OrphanedCachesScanner.defaultProbeEntryLimit,
         toolAvailability: (@Sendable (String) -> Bool)? = nil,
         probeResolver: (@Sendable (String) -> String?)? = nil
     ) -> OrphanedCachesScanner {
@@ -86,7 +87,6 @@ final class OrphanedCachesSweepTests: XCTestCase {
             home: home,
             categories: categories,
             provider: provider,
-            probeDepthLimit: probeDepthLimit,
             probeEntryLimit: probeEntryLimit,
             toolAvailability: toolAvailability,
             probeResolver: probeResolver
@@ -805,23 +805,43 @@ final class OrphanedCachesSweepTests: XCTestCase {
                       "absence of matches is meaningful — the probe completed")
     }
 
-    func testProbeFailsClosedOnMatchJustBeyondDepthBoundary() throws {
-        // depth 1: a, depth 2: b, depth 3: c (directory at the boundary —
-        // left unexpanded), depth 4: the match the probe never sees.
+    func testProbeFailsClosedOnMatchJustBeyondBudgetBoundary() throws {
+        // The budget is the ONE bound, and it fails closed exactly where
+        // the retired depth cap did: a, b, c cost one entry each, so a
+        // budget of 3 is spent before `c`'s children can be read and the
+        // match inside it is never seen.
         let entry = cachesRoot.appendingPathComponent("deep-cache")
         try mkdir(entry.appendingPathComponent(
             "a/b/c/Photos Library.photoslibrary"
         ))
 
-        let facts = factsByName(makeScanner(probeDepthLimit: 3))
+        let facts = factsByName(makeScanner(probeEntryLimit: 3))
         let deep = try XCTUnwrap(facts["deep-cache"])
 
         XCTAssertTrue(deep.userDataShapeMatches.isEmpty,
                       "the match beyond the boundary is not recorded")
         XCTAssertFalse(deep.userDataProbeComplete,
-                       "an unexpanded directory at the boundary fails closed — "
-                       + "a knownLeak must never stay bulk-eligible on a "
-                       + "truncated inspection")
+                       "a budget spent before the tree was exhausted fails "
+                       + "closed — a knownLeak must never stay bulk-eligible "
+                       + "on a truncated inspection")
+    }
+
+    func testDepthAloneNeverTruncatesUnderTheProductionBudget() throws {
+        // The same fixture under the SHIPPING bound: depth costs entries,
+        // not a separate veto, so a tree the budget can afford is PROVEN —
+        // and the buried match is actually found rather than silently
+        // replaced by "couldn't inspect".
+        let entry = cachesRoot.appendingPathComponent("deep-cache")
+        try mkdir(entry.appendingPathComponent(
+            "a/b/c/d/e/f/g/h/Photos Library.photoslibrary"
+        ))
+
+        let deep = try XCTUnwrap(factsByName(makeScanner())["deep-cache"])
+
+        XCTAssertEqual(deep.userDataShapeMatches, ["photos-library"])
+        XCTAssertTrue(deep.userDataProbeComplete,
+                      "nothing obstructed this walk — depth alone must not "
+                      + "manufacture an inescapable INCOMPLETE verdict")
     }
 
     func testProbeEntryCapHitBeforeExhaustionFailsClosed() throws {

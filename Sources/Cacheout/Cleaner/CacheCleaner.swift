@@ -951,10 +951,25 @@ actor CacheCleaner {
                 return (nil, [Self.itemError(item, detail)])
             }
             if !probe.complete {
-                let detail = "\(target.path): couldn't fully re-inspect "
+                // Remediation guidance deliberately does NOT say "re-scan"
+                // (PR #456 follow-up): every remaining cause of an
+                // incomplete probe — an unreadable branch, a child whose
+                // kind cannot be established, an exhausted entry budget —
+                // is a property of the TREE, not of the scan, so a re-scan
+                // reproduces it exactly. What a re-scan does do is
+                // re-describe the item at review risk carrying the same
+                // reason, after which it is removable only by explicit
+                // per-item confirmation. Say that, instead of prescribing
+                // a remedy that provably cannot work.
+                let detail = "\(target.path): couldn't fully inspect "
                     + "contents at delete time — refused (an inspection that "
-                    + "could not finish is treated like a change since scan); "
-                    + "re-scan required"
+                    + "could not finish is treated like a change since "
+                    + "scan). Re-scanning will not clear this — the "
+                    + "inspection is bounded and deterministic, so it "
+                    + "reports the same thing every time. Grant access to "
+                    + "any unreadable subfolder, or remove this item by "
+                    + "explicit per-item confirmation once a re-scan lists "
+                    + "it at review risk."
                 logRefusal(label: item.displayName, tag: "content-drift",
                            detail: detail)
                 return (nil, [Self.itemError(item, detail)])

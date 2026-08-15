@@ -1246,16 +1246,31 @@ final class OrphanedCachesScannerTests: XCTestCase {
         XCTAssertTrue(result.matches.isEmpty)
         XCTAssertTrue(result.complete)
 
-        // (e) A directory at the depth boundary is left unexpanded → the
-        // probe is INCOMPLETE (fail closed): entry/a/b/c, c at depth 3.
+        // (e) DEPTH alone never truncates: the entry budget is the one
+        // bound, so a tree it can afford is walked whole and PROVEN.
         let deep = cachesRoot.appendingPathComponent("deep-entry")
-        try mkdir(deep.appendingPathComponent("a/b/c"))
+        try mkdir(deep.appendingPathComponent("a/b/c/d/e/f/g/h/i/j"))
         result = OrphanedCachesScanner.preDeleteUserDataProbe(
             at: deep, provider: provider
         )
         XCTAssertTrue(result.matches.isEmpty)
+        XCTAssertTrue(result.complete,
+                      "nothing obstructed this walk — a deterministic depth "
+                          + "verdict here could never be cleared by any retry")
+
+        // (f) A GENUINELY obstructed branch is still fail-closed.
+        try XCTSkipIf(geteuid() == 0, "root ignores permission bits")
+        let blocked = cachesRoot.appendingPathComponent("blocked-entry")
+        let locked = blocked.appendingPathComponent("locked-sub")
+        try mkdir(locked)
+        try chmod000(locked)
+        defer { restorePerms(locked) }
+        result = OrphanedCachesScanner.preDeleteUserDataProbe(
+            at: blocked, provider: provider
+        )
+        XCTAssertTrue(result.matches.isEmpty)
         XCTAssertFalse(result.complete,
-                       "a boundary directory left unexpanded is fail-closed")
+                       "an unreadable branch means absence of matches is unproven")
     }
 
     func testPreDeleteProbeMatchesCaseVariants() throws {
@@ -1371,6 +1386,146 @@ final class OrphanedCachesScannerTests: XCTestCase {
         XCTAssertTrue(message.contains("contents changed since scan"), message)
         XCTAssertTrue(fm.fileExists(atPath: victim.path),
                       "the case-variant recreated content is byte-untouched")
+    }
+
+    // MARK: - One budget, no depth cap (PR #456 follow-up)
+
+    /// A directory chain far deeper than the retired three-level cap — the
+    /// shape ordinary caches reach constantly (this machine's own
+    /// `~/Library/Caches` nests fourteen levels in `com.microsoft.VSCode.ShipIt`).
+    private func deepChain(_ levels: Int) -> String {
+        (1...levels).map { "d\($0)" }.joined(separator: "/")
+    }
+
+    /// A realistically deep AND large orphaned cache holding nothing
+    /// user-data-shaped. Under the retired bounds (depth 3 / 512 entries)
+    /// this probed INCOMPLETE — deterministically, so every re-scan and
+    /// every delete-time re-probe reproduced it — which forced a clean
+    /// known leak off `.safe`, out of `defaultSelected`, and out of every
+    /// automatic path FOREVER, over evidence claiming the contents could
+    /// not be inspected when nothing had actually obstructed the walk.
+    func testDeepLargeCleanLeakIsProvenCleanAndStaysAutoEligible() async throws {
+        let entry = cachesRoot.appendingPathComponent("com.apple.SwiftUI.Drag-DEEP")
+        let leaf = entry.appendingPathComponent(deepChain(12))
+        try mkdir(leaf)
+        try writeFile(leaf.appendingPathComponent("payload.bin"))
+        // …and wider than the retired 512-entry budget.
+        let wide = entry.appendingPathComponent("blobs")
+        try mkdir(wide)
+        for index in 0..<600 {
+            try writeFile(wide.appendingPathComponent("b\(index).bin"), bytes: 8)
+        }
+
+        let scanner = makeScanner()
+        let (byName, outcome) = await scanItems(scanner)
+        try assertValidates(outcome, scanner: scanner)
+
+        let item = try XCTUnwrap(byName["com.apple.SwiftUI.Drag-DEEP"])
+        XCTAssertFalse(
+            item.evidence.contains("couldn't fully inspect"),
+            "nothing obstructed this walk — the probe must not manufacture "
+                + "uncertainty it can afford to resolve: \(item.evidence)"
+        )
+        XCTAssertEqual(item.risk, .safe)
+        XCTAssertTrue(item.defaultSelected)
+        XCTAssertTrue(item.automaticCleanEligible,
+                      "a deterministic bound made this permanently ineligible "
+                          + "for Quick Clean and CLI smart-clean")
+    }
+
+    /// The safety half, and the reason removing the depth cap is not merely
+    /// an optimism change: user data sitting BELOW the retired boundary was
+    /// never seen at all. The old probe reported "no matches, incomplete";
+    /// it must now report the match itself, on BOTH faces.
+    func testUserDataBelowTheRetiredDepthBoundaryIsFoundOnBothFaces() async throws {
+        let entry = cachesRoot.appendingPathComponent("com.apple.SwiftUI.Drag-BURIED")
+        try mkdir(entry)
+        try writeFile(entry.appendingPathComponent("payload.bin"))
+        let buried = entry.appendingPathComponent(
+            "\(deepChain(6))/Pictures/Photos Library.photoslibrary"
+        )
+        try mkdir(buried)
+
+        // Scan-time face.
+        let scanner = makeScanner()
+        let (byName, outcome) = await scanItems(scanner)
+        try assertValidates(outcome, scanner: scanner)
+        let item = try XCTUnwrap(byName["com.apple.SwiftUI.Drag-BURIED"])
+        XCTAssertEqual(item.risk, .review, "the buried match forces it off safe")
+        XCTAssertFalse(item.automaticCleanEligible)
+        XCTAssertTrue(item.evidence.contains(
+            "user-data-shaped content (photos-library, pictures-directory)"
+        ), item.evidence)
+
+        // Delete-time face — the SAME core, the SAME bound.
+        let probe = OrphanedCachesScanner.preDeleteUserDataProbe(
+            at: entry, provider: FileSystemIdentityProvider()
+        )
+        XCTAssertEqual(probe.matches, ["photos-library", "pictures-directory"])
+        XCTAssertTrue(probe.complete)
+    }
+
+    /// Scan time and delete time must agree on the same static tree — they
+    /// read ONE constant, so a tree either surface can afford is proven by
+    /// both.
+    func testScanTimeAndDeleteTimeProbesAgreeOnADeepTree() async throws {
+        let entry = cachesRoot.appendingPathComponent("com.apple.SwiftUI.Drag-AGREE")
+        try mkdir(entry.appendingPathComponent(deepChain(20)))
+        try writeFile(entry.appendingPathComponent("payload.bin"))
+
+        guard case .entries(let facts) = makeScanner().enumerateFacts() else {
+            return XCTFail("expected facts")
+        }
+        let fact = try XCTUnwrap(facts.first { $0.name == entry.lastPathComponent })
+        let probe = OrphanedCachesScanner.preDeleteUserDataProbe(
+            at: entry, provider: FileSystemIdentityProvider()
+        )
+
+        XCTAssertTrue(fact.userDataProbeComplete)
+        XCTAssertEqual(fact.userDataProbeComplete, probe.complete)
+        XCTAssertEqual(fact.userDataShapeMatches, probe.matches)
+    }
+
+    /// Fail-closed is untouched: a GENUINELY obstructed probe — a branch
+    /// the walk cannot read — still refuses at delete time, and the refusal
+    /// no longer prescribes a re-scan it knows cannot help.
+    func testObstructedDeleteTimeProbeStillRefusesWithHonestGuidance() async throws {
+        try XCTSkipIf(geteuid() == 0, "root ignores permission bits")
+        let entry = cachesRoot.appendingPathComponent("com.apple.SwiftUI.Drag-BLOCKED")
+        try mkdir(entry)
+        try writeFile(entry.appendingPathComponent("payload.bin"))
+
+        let runtime = try makeRuntime([makeScanner()])
+        let (items, snapshot) = await scanSession(runtime)
+        let leak = try XCTUnwrap(items.first)
+        XCTAssertTrue(leak.automaticCleanEligible,
+                      "the fixture entry scans as a clean known leak")
+
+        // The entry is recreated with an unreadable branch between scan and
+        // clean — the walk cannot prove what is inside it.
+        try fm.removeItem(at: entry)
+        let locked = entry.appendingPathComponent("locked-sub")
+        try mkdir(locked)
+        let victim = try writeFile(locked.appendingPathComponent("data.bin"))
+        try chmod000(locked)
+        defer { restorePerms(locked) }
+
+        let cleaner = runtime.makeCleaner(snapshot: snapshot)
+        let report = await cleaner.clean(items: [leak], moveToTrash: false)
+
+        XCTAssertTrue(report.entries.isEmpty, "nothing deleted")
+        XCTAssertEqual(report.errors.count, 1)
+        let message = try XCTUnwrap(report.errors.first?.message)
+        XCTAssertTrue(message.contains("couldn't fully inspect"), message)
+        XCTAssertFalse(
+            message.contains("re-scan required"),
+            "the probe is deterministic — a re-scan reproduces the same "
+                + "incompleteness, so prescribing one is misleading: \(message)"
+        )
+        restorePerms(locked)
+        XCTAssertTrue(fm.fileExists(atPath: victim.path),
+                      "the uninspectable content is byte-untouched")
+        try assertCleanupLogContains(tag: "content-drift")
     }
 
     func testUninstalledToolStaleFallbackSurfacesThroughProtocolScan() async throws {

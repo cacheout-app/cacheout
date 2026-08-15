@@ -114,11 +114,14 @@ struct SweptCacheEntry: Equatable {
     /// caution evidence).
     let userDataShapeMatches: [String]
     /// FAIL-CLOSED completeness (epic rule): absence of matches is only
-    /// meaningful when the probe COMPLETED. False when the entry cap was
-    /// hit before exhausting, when any directory at the depth boundary was
-    /// left unexpanded, or when any branch was unreadable — fn-3.2 treats
-    /// an incomplete probe like a caution (review risk, no default or
-    /// automatic selection).
+    /// meaningful when the probe COMPLETED. False when the entry budget was
+    /// exhausted before the tree was, when any branch was unreadable, or
+    /// when a child's kind could not be established — fn-3.2 treats an
+    /// incomplete probe like a caution (review risk, no default or
+    /// automatic selection). Deliberately NOT false for a tree that is
+    /// merely deep: the budget is the one bound, and manufacturing doubt
+    /// the walk could have resolved is what stranded ordinary caches
+    /// permanently (see `boundedUserDataShapeWalk`).
     let userDataProbeComplete: Bool
 
     /// The two split components summed — COMPUTED, never stored (byte-model
@@ -188,12 +191,36 @@ struct OrphanedCachesScanner: @unchecked Sendable {
         UserDataShapePattern(name: "pictures-directory", glob: "Pictures"),
     ]
 
-    /// PRODUCTION probe caps — one definition shared by the init defaults
+    /// The PRODUCTION probe cap — ONE definition shared by the init default
     /// and the delete-time revalidation entry point
     /// (`preDeleteUserDataProbe`), so scan-time and delete-time inspection
     /// bounds can never drift apart.
-    static let defaultProbeDepthLimit = 3
-    static let defaultProbeEntryLimit = 512
+    ///
+    /// This is the walk's ONLY bound and the sole guarantee that it
+    /// terminates (see `boundedUserDataShapeWalk`'s doc for the argument and
+    /// for why a second, depth-shaped bound was removed).
+    ///
+    /// **Why 20,000, measured.** Driven through this very probe over the
+    /// field machine's real `~/Library/Caches` (179 first-level
+    /// directories), the retired depth-3/512-entry pair reported 53
+    /// (29.6%) INCOMPLETE — 44 of them with nothing whatsoever obstructing
+    /// the walk. The entry budget ALONE reports 21 at 512, 11 at 20,000,
+    /// 10 at 50,000; the irreducible 9 are genuinely unreadable (TCC), so
+    /// 20,000 leaves exactly 2 bound-truncated (1.1%). 512 was far too
+    /// small for real caches, and it is just as deterministic as the depth
+    /// cap was, so it stranded too.
+    ///
+    /// Cost is not the binding constraint: `DirectorySizer.measure`
+    /// already performs an UNBOUNDED full enumeration of the very same
+    /// entry at scan time, so this probe can never cost more than work
+    /// being done unconditionally anyway (measured over those 179 trees:
+    /// 158,597 entries for the sizing walk against 72,549 for a
+    /// 20,000-budget probe) — and at DELETE time it runs for ONE item, not
+    /// the whole sweep. 20,000 is also `ValuablesDetector`'s budget in the
+    /// sibling scanner: one number, one doctrine. The two trees that still
+    /// exceed it here (26,248 and 99,800 entries) stay honestly unproven —
+    /// genuine "we could not afford to look", not manufactured doubt.
+    static let defaultProbeEntryLimit = 20_000
 
     /// The sweep root this instance enumerates (injectable for tests; no
     /// test touches the real `$HOME` or the real `~/Library/Caches`).
@@ -209,10 +236,11 @@ struct OrphanedCachesScanner: @unchecked Sendable {
     private let provider: FileSystemIdentityProvider
     private let sizer: DirectorySizer
     private let fileManager = FileManager.default
-    /// User-data probe caps — the probe is BOUNDED (only the sizing walk is
-    /// complete). Injectable so tests can prove the fail-closed cap
-    /// behavior without thousand-file fixtures.
-    private let probeDepthLimit: Int
+    /// The user-data probe's cap — the probe is BOUNDED (only the sizing
+    /// walk is complete). Injectable so tests can prove the fail-closed cap
+    /// behavior without thousand-file fixtures; the DEFAULT is the shared
+    /// production constant the delete-time entry point uses, so scan-time
+    /// and delete-time bounds cannot drift.
     private let probeEntryLimit: Int
 
     /// Classification thresholds (R8) — scanner-CONSTRUCTION state by
@@ -252,7 +280,6 @@ struct OrphanedCachesScanner: @unchecked Sendable {
         cachesRoot: URL? = nil,
         categories: [CacheCategory] = CacheCategory.allCategories,
         provider: FileSystemIdentityProvider = FileSystemIdentityProvider(),
-        probeDepthLimit: Int = OrphanedCachesScanner.defaultProbeDepthLimit,
         probeEntryLimit: Int = OrphanedCachesScanner.defaultProbeEntryLimit,
         thresholds: OrphanedCacheClassifier.Thresholds =
             OrphanedCachesSweepConfig.defaultThresholds,
@@ -268,7 +295,6 @@ struct OrphanedCachesScanner: @unchecked Sendable {
         self.categories = categories
         self.provider = provider
         self.sizer = DirectorySizer(provider: provider)
-        self.probeDepthLimit = probeDepthLimit
         self.probeEntryLimit = probeEntryLimit
         self.thresholds = thresholds
         self.installedAppStatus = installedAppStatus
@@ -540,13 +566,12 @@ struct OrphanedCachesScanner: @unchecked Sendable {
 
     // MARK: - User-data-shape probe (R4 input)
 
-    /// Bounded shallow walk of one REAL-DIRECTORY entry — the instance
-    /// (scan-time) face of the shared static core below, using the
-    /// injectable per-instance caps.
+    /// Bounded walk of one REAL-DIRECTORY entry — the instance (scan-time)
+    /// face of the shared static core below, using the injectable
+    /// per-instance cap.
     private func probeUserDataShapes(at entryURL: URL) -> (matches: [String], complete: Bool) {
         Self.boundedUserDataShapeWalk(
-            at: entryURL, provider: provider,
-            depthLimit: probeDepthLimit, entryLimit: probeEntryLimit
+            at: entryURL, provider: provider, entryLimit: probeEntryLimit
         )
     }
 
@@ -561,7 +586,7 @@ struct OrphanedCachesScanner: @unchecked Sendable {
     /// same fail-closed doctrine as scan time.
     ///
     /// Kind gating mirrors the scan path exactly:
-    /// - real directory → the bounded no-follow walk (PRODUCTION caps);
+    /// - real directory → the bounded no-follow walk (the PRODUCTION cap);
     /// - symlink / regular file / special → no contents of their own —
     ///   clean and complete by construction (deletion removes the leaf
     ///   as-is, never a target's tree);
@@ -575,7 +600,6 @@ struct OrphanedCachesScanner: @unchecked Sendable {
         case .kind(.directory):
             return boundedUserDataShapeWalk(
                 at: target, provider: provider,
-                depthLimit: defaultProbeDepthLimit,
                 entryLimit: defaultProbeEntryLimit
             )
         case .kind:
@@ -601,21 +625,50 @@ struct OrphanedCachesScanner: @unchecked Sendable {
     /// mode bought. An unexpanded symlink does NOT mark the probe
     /// incomplete: deleting the entry removes the link, never its target,
     /// so no deletable content went uninspected.
+    ///
+    /// ## ONE budget, and NO depth cap (PR #456 follow-up)
+    /// The ENTRY budget is this walk's only bound, and it alone guarantees
+    /// termination: a directory is pushed ONLY from inside the child loop,
+    /// immediately after `visited += 1` — every descent cost one entry to
+    /// DISCOVER — so at most `entryLimit` directories are ever pushed and
+    /// at most `entryLimit + 1` are ever popped. That holds however deep
+    /// the tree runs, and even of a hypothetical directory cycle (a symlink
+    /// is `lstat`-classified and never descended, so no cycle can form
+    /// through one anyway).
+    ///
+    /// A fixed depth cap therefore bounded NOTHING the budget did not.
+    /// What it did do was manufacture INCOMPLETE verdicts on ordinary cache
+    /// trees, and those verdicts were inescapable: a depth boundary is
+    /// DETERMINISTIC, so every re-scan and every delete-time re-probe
+    /// reproduced it. Downstream that is permanent — the classifier forces
+    /// such an entry off `.safe` and sets `automaticCleanEligible = false`,
+    /// which removes it from Quick Clean, `selectAllSafe` and CLI
+    /// smart-clean FOREVER, over evidence claiming the contents could not
+    /// be inspected when nothing had obstructed the walk. Worse for safety
+    /// than for reclaim: user data BELOW the boundary was never looked at,
+    /// so a buried `Photos Library.photoslibrary` produced "no matches"
+    /// rather than a match. Real caches cross three levels constantly (the
+    /// field machine's own `~/Library/Caches` nests fourteen deep, and 42
+    /// of its 179 entries pass depth 3) — including, on that machine, a
+    /// live `com.apple.SwiftUI.Drag-<UUID>` leak of just 52 entries whose
+    /// only sin was reaching depth 4: the exact class this scanner exists
+    /// to reclaim, held off the automatic path forever by a bound that
+    /// bought nothing. Depth is now spent FROM the one budget: a tree the
+    /// budget can afford is PROVEN, and only a tree it genuinely cannot
+    /// afford stays unproven.
     private static func boundedUserDataShapeWalk(
         at entryURL: URL,
         provider: FileSystemIdentityProvider,
-        depthLimit: Int,
         entryLimit: Int
     ) -> (matches: [String], complete: Bool) {
         let fileManager = FileManager.default
         var matched = Set<String>()
         var complete = true
         var visited = 0
-        // Depth-first with sorted children — deterministic order; the entry
-        // itself sits at depth 0, its children at depth 1.
-        var stack: [(url: URL, depth: Int)] = [(entryURL, 0)]
+        // Depth-first with sorted children — deterministic order.
+        var stack: [URL] = [entryURL]
 
-        walk: while let (dir, depth) = stack.popLast() {
+        walk: while let dir = stack.popLast() {
             let children: [URL]
             do {
                 // Hidden entries included, same stance as the enumeration.
@@ -652,14 +705,11 @@ struct OrphanedCachesScanner: @unchecked Sendable {
 
                 switch provider.probeKind(of: child) {
                 case .kind(.directory):
-                    let childDepth = depth + 1
-                    if childDepth < depthLimit {
-                        stack.append((child, childDepth))
-                    } else {
-                        // A directory at the depth boundary left unexpanded:
-                        // a match could hide just past it (fail closed).
-                        complete = false
-                    }
+                    // ALWAYS descended: discovering this directory already
+                    // cost an entry, and the budget bounds everything that
+                    // follows. Refusing to look past some fixed level is
+                    // what stranded ordinary caches (see the doc above).
+                    stack.append(child)
                 case .kind:
                     // Symlink / regular file / special: matched by name
                     // above, never descended (see the no-follow rule).

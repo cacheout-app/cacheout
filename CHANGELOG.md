@@ -175,6 +175,16 @@ below are both part of that coordination, and the latter BLOCKS this release.
   DIFFERENT repository and is not part of this branch; this entry is the gate
   that keeps the two in step.
 
+  **Deferred to the release path, deliberately — and ENFORCED there.**
+  Merging this work with the gate open is intentional: the scanner ships to
+  users only at release, and `[Unreleased]` is exactly where an unshipped
+  precondition belongs. It is not left to memory —
+  `scripts/bundle.sh --release` runs `check_release_gates` BEFORE it builds,
+  signs or notarizes anything, and aborts while this section still carries a
+  `RELEASE-BLOCKING` gate whose status reads `NOT SATISFIED` (an unreadable
+  CHANGELOG aborts too — fail-closed). Closing the gate is what unblocks the
+  pipeline.
+
   - **Consumer:** `cacheout-mcp` (org `acebytes`), branch
     `fn-1.3-memory-stats-mcp-tool`, PR #1.
   - **Baseline verified at `63edbfc`:** `AppEngine._run`

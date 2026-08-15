@@ -149,10 +149,13 @@ final class CacheoutViewModelTests: XCTestCase {
     }
 
     /// The production scanner ids a rebuilt runtime must NEVER acquire.
+    /// Every id `SpaceScannerRuntime.production` registers belongs here — a
+    /// missing one silently weakens the guard rather than failing it.
     private static let productionScannerIDs = [
         CategoryScanner.registeredID,
         BuildArtifactsScanner.registeredID,
         OrphanedCachesScanner.registeredID,
+        GitWorktreeScanner.registeredID,
     ]
 
     /// A `FixtureScanner` DECLARING the origin container `perItem(scanner:

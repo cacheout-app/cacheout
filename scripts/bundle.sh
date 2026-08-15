@@ -318,6 +318,39 @@ notarize_dmg() {
     echo "✅ Notarization complete! DMG is ready for distribution."
 }
 
+# RELEASE-BLOCKING cross-repo gates (fn-5.6)
+#
+# Some release preconditions live in ANOTHER repository — a coordinated
+# consumer that must adopt a contract before this build ships. Nothing in
+# this repo's own test suite can observe that, so the gate is RECORDED in
+# CHANGELOG.md's [Unreleased] section (named consumer, owner, verification,
+# and a status line) and enforced HERE, on the release path only. Merging
+# with an open gate is fine and deliberate; SHIPPING with one is not.
+#
+# Fail-closed by construction: an unreadable CHANGELOG, or an [Unreleased]
+# section that still carries a RELEASE-BLOCKING gate whose status reads
+# NOT SATISFIED, stops the release. Closing a gate means replacing that
+# status with the adopting commit hash.
+check_release_gates() {
+    changelog="$PROJECT_DIR/CHANGELOG.md"
+    if [ ! -f "$changelog" ]; then
+        echo "❌ CHANGELOG.md not found — release gates cannot be verified"
+        return 1
+    fi
+    # The [Unreleased] section only: closed gates in shipped sections are
+    # history, not preconditions.
+    unreleased=$(awk '/^## \[Unreleased\]/{inside=1; next} /^## \[/{inside=0} inside' "$changelog")
+    if printf '%s\n' "$unreleased" | grep -q "RELEASE-BLOCKING" &&
+       printf '%s\n' "$unreleased" | grep -q "NOT SATISFIED"; then
+        echo "❌ A RELEASE-BLOCKING gate in CHANGELOG.md [Unreleased] is still NOT SATISFIED."
+        echo "   Close it — run its recorded verification, then replace the status"
+        echo "   line with the adopting commit hash — before releasing:"
+        printf '%s\n' "$unreleased" | grep -n -m 3 -A 3 "RELEASE-BLOCKING"
+        return 1
+    fi
+    echo "✅ No open release-blocking gates in CHANGELOG.md [Unreleased]"
+}
+
 # Main
 case "${1:-}" in
     --direct)
@@ -339,6 +372,10 @@ case "${1:-}" in
     --notarize|--release)
         # --notarize now performs the full pipeline (build + sign + DMG + notarize).
         # --release is kept as an alias for the same operation.
+        #
+        # Release gates FIRST: an open cross-repo gate must stop the pipeline
+        # before it builds, signs, or submits anything for notarization.
+        check_release_gates
         if [ -z "$DEVID_CERT" ]; then
             echo "❌ Developer ID Application certificate required!"
             echo "   Found in Keychain? Check: security find-identity -v -p codesigning"

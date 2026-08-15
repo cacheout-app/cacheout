@@ -527,6 +527,12 @@ final class GitWorktreeEndToEndTests: XCTestCase {
     /// allowed to spell it). A code line that carries a trailing comment
     /// containing a needle is reported — the conservative direction: a false
     /// positive costs a comment edit, a false negative ships `--force`.
+    ///
+    /// KNOWN LIMIT, stated rather than hidden: a line INSIDE a multi-line
+    /// string literal that itself begins with `//` would be admitted as a
+    /// comment. No production source has one, and such a line is string
+    /// content rather than argv — but a future heredoc-style literal would
+    /// need this gate taught about it.
     func testProductionSourcesHonourTheGitBoundaries() throws {
         let sources = try productionSwiftFiles()
         XCTAssertGreaterThan(sources.count, 20,
@@ -601,8 +607,11 @@ final class GitWorktreeEndToEndTests: XCTestCase {
                              "the reconstruction needle found nothing")
         XCTAssertGreaterThan(executableSeen, 0,
                              "the git executable needle found nothing")
-        XCTAssertEqual(pruneArgvSeen, 1,
-                       "exactly one production prune argv builder exists")
+        // The rule is "EVERY prune argv carries --expire=now" (enforced per
+        // line above); this only proves the needle matched something, so a
+        // future second builder is checked rather than assumed away.
+        XCTAssertGreaterThan(pruneArgvSeen, 0,
+                             "the prune argv needle found nothing")
     }
 
     /// ONE oracle→admin mapping implementation, with BOTH call sites present:

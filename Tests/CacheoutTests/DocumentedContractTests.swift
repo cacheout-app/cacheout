@@ -570,7 +570,9 @@ final class DocumentedContractTests: XCTestCase {
         XCTAssertTrue(section.contains("keeps the 30-second rule"), section)
         // THE HONEST CAVEAT — the outer kill is possible and is named.
         XCTAssertTrue(section.contains("ORPHANED mid-removal"), section)
-        XCTAssertTrue(section.contains("Partial\ntree state is possible"), section)
+        // Substrings that never span a line break: the caveat must survive a
+        // prose reflow, since what is pinned is the CLAIM, not the wrapping.
+        XCTAssertTrue(section.contains("tree state is possible"), section)
         XCTAssertTrue(section.contains("next scan handles"), section)
 
         // NO client-side FORMULA — the round-8 shape is gone for good. The
@@ -629,6 +631,43 @@ final class DocumentedContractTests: XCTestCase {
         // referenced — a release engineer reading the CHANGELOG alone must be
         // able to tell whether the gate is met.
         XCTAssertTrue(section.contains("NO client-side timeout"), section)
+    }
+
+    /// The gate is DEFERRED to the release path — so the release path has to
+    /// enforce it. A recorded promise nobody executes is how a coordinated
+    /// consumer ships out of step; this asserts the enforcement exists, runs
+    /// BEFORE anything is built or notarized, and reads the same two markers
+    /// the CHANGELOG gate publishes.
+    func testTheReleasePathEnforcesOpenCrossRepoGates() throws {
+        let script = try document("scripts/bundle.sh")
+
+        XCTAssertTrue(script.contains("check_release_gates() {"),
+                      "bundle.sh must define the release-gate check")
+        // Wired into the RELEASE arm, not merely defined.
+        let releaseArm = try XCTUnwrap(
+            script.range(of: "--notarize|--release)"),
+            "bundle.sh must have a release arm"
+        )
+        let armBody = String(script[releaseArm.lowerBound...].prefix(900))
+        XCTAssertTrue(armBody.contains("check_release_gates"),
+                      "the release arm must RUN the check: \(armBody)")
+        // …and run it before the destructive/expensive steps.
+        for later in ["build_release", "create_dmg", "notarize_dmg"] {
+            guard let gate = armBody.range(of: "check_release_gates"),
+                  let step = armBody.range(of: later) else {
+                return XCTFail("release arm missing '\(later)'")
+            }
+            XCTAssertLessThan(gate.lowerBound, step.lowerBound,
+                              "the gate must precede \(later)")
+        }
+        // The markers it keys on are the ones the CHANGELOG actually uses.
+        XCTAssertTrue(script.contains("RELEASE-BLOCKING"), script)
+        XCTAssertTrue(script.contains("NOT SATISFIED"), script)
+        // Fail-closed when the CHANGELOG cannot be read at all.
+        XCTAssertTrue(
+            script.contains("CHANGELOG.md not found — release gates cannot be verified"),
+            "an unreadable CHANGELOG must abort, never pass"
+        )
     }
 
     /// PROTOCOL.md's `risk_level` note must no longer claim a per-SCANNER

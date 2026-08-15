@@ -948,6 +948,74 @@ class CacheoutViewModel: ObservableObject {
             + "commands — Move to Trash does not apply to them"
     }
 
+    /// The `git_worktree_reclaim` Move-to-Trash disclosures (fn-5.6, R11/F7).
+    ///
+    /// WHY THIS EXISTS AT ALL: the `.commands` disclosure above matches only
+    /// `.commands`, so a selected composite item would fall through to the
+    /// sheet's generic wording — which reflects the Move-to-Trash toggle and
+    /// would therefore imply the worktree is recoverable. It is not:
+    /// `git worktree remove` UNLINKS the tree, and `git worktree prune`
+    /// removes admin data; neither puts anything in the Trash, whatever the
+    /// toggle says (D16, and the `.commands` precedent it follows).
+    ///
+    /// TWO MODES, TWO DIFFERENT TRUTHS — never one laundered sentence:
+    ///
+    /// - **stale removal** — permanent git removal. The ONE narrow exception
+    ///   is named rather than hidden: when git itself REFUSES the removal,
+    ///   fn-5.4 falls back to a guarded filesystem delete, and only THAT path
+    ///   honours the toggle. Which path actually ran is reported per entry in
+    ///   the cleanup report (`disposal`), so the sheet promises the
+    ///   conservative truth and the report tells the specific one.
+    /// - **prune-only** — repository ADMIN DATA (the orphaned worktree
+    ///   registry). Branch refs and repository objects survive, and there is
+    ///   no fallback path at all, so it is permanent unconditionally.
+    ///
+    /// Ordered stale-then-prune and returned as separate strings so a
+    /// selection containing both never merges two different promises. Empty
+    /// when no composite item is selected.
+    var gitWorktreeTrashDisclosures: [String] {
+        Self.gitWorktreeTrashDisclosures(selectedItems: selectedItems)
+    }
+
+    /// Pure derivation behind `gitWorktreeTrashDisclosures` — static so XCTest
+    /// asserts on it without a runtime.
+    nonisolated static func gitWorktreeTrashDisclosures(
+        selectedItems: [ReclaimableItem]
+    ) -> [String] {
+        var stale: [String] = []
+        var prune: [String] = []
+        for item in selectedItems {
+            // EXHAUSTIVE over the mode — a third reclaim shape must be a
+            // compile-time decision here, not a silent fall-through to
+            // wording that describes neither.
+            guard case .gitWorktreeReclaim(let plan) = item.action else { continue }
+            switch plan.mode {
+            case .removeStaleWorktree: stale.append(item.displayName)
+            case .pruneOrphanedAdmin: prune.append(item.displayName)
+            }
+        }
+        var disclosures: [String] = []
+        if !stale.isEmpty {
+            let verb = stale.count == 1 ? "is" : "are"
+            disclosures.append(
+                "\(stale.joined(separator: ", ")) \(verb) removed by git — "
+                    + "Move to Trash does not apply: the worktree is unlinked "
+                    + "permanently. Only a fallback delete, used when git "
+                    + "itself refuses the removal, honours the toggle; the "
+                    + "cleanup report says which ran."
+            )
+        }
+        if !prune.isEmpty {
+            let verb = prune.count == 1 ? "removes" : "remove"
+            disclosures.append(
+                "\(prune.joined(separator: ", ")) \(verb) repository admin "
+                    + "data permanently — Move to Trash does not apply. "
+                    + "Branch refs and repository objects are untouched."
+            )
+        }
+        return disclosures
+    }
+
     /// True when the current selection includes a caution-risk item (the
     /// confirmation sheet's warning banner).
     var hasCautionSelection: Bool {

@@ -840,6 +840,9 @@ final class CategoryScannerTests: XCTestCase {
                 CategoryScanner.registeredID,
                 BuildArtifactsScanner.registeredID,
                 OrphanedCachesScanner.registeredID,
+                // fn-5.6: registered LAST, sharing the dev roots (and the one
+                // git runner) the composition already resolved.
+                GitWorktreeScanner.registeredID,
             ]
         )
         XCTAssertFalse(
@@ -855,7 +858,8 @@ final class CategoryScannerTests: XCTestCase {
             "the union is the per-item scanners' declared sets in "
                 + "registration order (the kept dev roots, then the "
                 + "orphaned-caches sweep root) — CategoryScanner contributes "
-                + "no container roots"
+                + "no container roots, and git_worktrees declares the SAME "
+                + "dev roots, which the union deduplicates by path"
         )
         // The factory reaching here at all asserts the production
         // category-slug/scanner-slug namespace is collision-free (a

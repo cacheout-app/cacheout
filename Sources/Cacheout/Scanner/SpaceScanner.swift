@@ -1002,8 +1002,9 @@ struct SpaceScannerRuntime {
     /// runtimes composed without one (every test runtime today), which makes
     /// their cleaners refuse composite items per item.
     ///
-    /// fn-5.5's `GitWorktreeScanner` must be constructed with THIS SAME
-    /// instance when fn-5.6 registers it — never with a fresh one.
+    /// `production(...)` builds ONE instance and hands it to BOTH the
+    /// registered `GitWorktreeScanner` and this property (fn-5.6) — never a
+    /// fresh one per consumer.
     let gitRunner: (any GitCommandRunning)?
 
     /// Registration + FOLDED validation as one check (epic rounds 6-7):
@@ -1117,23 +1118,39 @@ struct SpaceScannerRuntime {
     ///   persisted. `keptRoots` become the scanner's declared container
     ///   roots (and the walker's roots); `issues` ride EVERY scan outcome,
     ///   so a policy-rejected persisted root stays visible while never
-    ///   registering or walking (R16).
+    ///   registering or walking (R16). Resolved ONCE here and handed to BOTH
+    ///   dev-root scanners (`build_artifacts`, `git_worktrees`): resolving
+    ///   twice would read the store twice and could hand the two scanners
+    ///   different roots.
+    /// - Parameter gitRunner: the SHARED fn-5.1 runner. `nil` — the GUI and
+    ///   CLI composition — builds exactly ONE `GitCommandRunner`; tests
+    ///   inject a hermetic instance (`GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM`
+    ///   pinned) so no scan or clean can read the developer's real git
+    ///   config. EITHER WAY the composition holds ONE runner and hands the
+    ///   SAME instance to the scanner and to every cleaner it makes — fn-5.1's
+    ///   `git --version` availability cache is INSTANCE-scoped, so a second
+    ///   runner would probe independently and let detection and execution
+    ///   disagree about whether git exists at all.
     static func production(
         home: URL = FileManager.default.homeDirectoryForCurrentUser,
         provider: FileSystemIdentityProvider = FileSystemIdentityProvider(),
         orphanedCachesThresholds: OrphanedCacheClassifier.Thresholds? = nil,
-        devRoots: DevRootsResolution? = nil
+        devRoots: DevRootsResolution? = nil,
+        gitRunner: (any GitCommandRunning)? = nil
     ) -> SpaceScannerRuntime {
         let categories = CacheCategory.allCategories
         let categoryScanner = CategoryScanner(
             categories: categories,
             scanner: CacheScanner(home: home, provider: provider)
         )
+        // ONE resolution, TWO consumers (fn-5.6): the build-artifacts scanner
+        // and the git-worktree scanner walk the SAME effective roots, and both
+        // republish the SAME classified config issues on every outcome.
+        let resolvedDevRoots = devRoots
+            ?? DevRootsStore(provider: provider).effectiveRoots(home: home)
         let buildArtifactsScanner = BuildArtifactsScanner(
             home: home,
-            devRoots: devRoots
-                ?? DevRootsStore(provider: provider)
-                    .effectiveRoots(home: home),
+            devRoots: resolvedDevRoots,
             provider: provider
         )
         // fn-3.3's production resolver, wired in as the classifier's
@@ -1147,26 +1164,37 @@ struct SpaceScannerRuntime {
                 ?? OrphanedCachesSweepConfig.resolvedThresholds(),
             installedAppStatus: { installedAppResolver.status(ofBundleID: $0) }
         )
+        // The SHARED git runner (fn-5.1/fn-5.4/fn-5.6): built ONCE here, in a
+        // local, and handed to BOTH the scanner that DETECTS composite items
+        // and the runtime whose cleaners EXECUTE them. Inert until work
+        // exists — nothing constructs a subprocess and nothing probes for git
+        // until a repository is actually discovered or a composite item is
+        // actually cleaned.
+        //
+        // A second runner anywhere would fork fn-5.1's deliberately
+        // instance-scoped availability cache, letting the scan and the clean
+        // disagree about whether git exists at all.
+        let sharedGitRunner: any GitCommandRunning =
+            gitRunner ?? GitCommandRunner(home: home)
+        // fn-5.6: registration is the ONLY step. It puts the scanner's
+        // declared roots (the same effective dev roots) into the runtime's
+        // container-root union, which is what extends DELETE-TIME admission
+        // for `git_worktree_reclaim` items — items never widen it themselves.
+        let gitWorktreeScanner = GitWorktreeScanner(
+            home: home,
+            devRoots: resolvedDevRoots,
+            runner: sharedGitRunner,
+            provider: provider
+        )
         return try! SpaceScannerRuntime(
             scanners: [
                 categoryScanner, buildArtifactsScanner, orphanedCachesScanner,
+                gitWorktreeScanner,
             ],
             categories: categories,
             home: home,
             provider: provider,
-            // The SHARED git runner (fn-5.1/fn-5.4): built ONCE here so the
-            // cleaner this runtime makes can execute `git_worktree_reclaim`
-            // instead of refusing it fail-closed. Inert until an item exists
-            // — nothing constructs a subprocess and nothing probes for git
-            // until a composite item is actually cleaned, and no registered
-            // scanner emits one until fn-5.5.
-            //
-            // fn-5.6 registers `GitWorktreeScanner` with THIS instance (hold
-            // it in a local above and pass it to both) — a second runner
-            // would fork fn-5.1's deliberately instance-scoped availability
-            // cache, letting the scan and the clean disagree about whether
-            // git exists.
-            gitRunner: GitCommandRunner(home: home)
+            gitRunner: sharedGitRunner
         )
     }
 

@@ -551,6 +551,9 @@ final class SpaceScannerIntegrationTests: XCTestCase {
             CategoryScanner.registeredID,
             BuildArtifactsScanner.registeredID,
             OrphanedCachesScanner.registeredID,
+            // fn-5.6 registered the worktree scanner in the same registry; the
+            // swap this test pins is unaffected by later arrivals.
+            GitWorktreeScanner.registeredID,
         ])
         XCTAssertFalse(
             runtime.scanners.contains { $0.id == retiredNodeModulesSlug },
@@ -732,7 +735,11 @@ final class SpaceScannerIntegrationTests: XCTestCase {
         // composition, not a different one.
         XCTAssertEqual(
             viewModel.perItemSections.map(\.scannerID),
-            [BuildArtifactsScanner.registeredID, OrphanedCachesScanner.registeredID]
+            [
+                BuildArtifactsScanner.registeredID,
+                OrphanedCachesScanner.registeredID,
+                GitWorktreeScanner.registeredID,
+            ]
         )
     }
 

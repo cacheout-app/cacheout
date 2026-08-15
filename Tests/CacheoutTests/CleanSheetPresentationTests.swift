@@ -14,6 +14,11 @@ import XCTest
 /// - `CacheoutViewModel.commandsTrashDisclosure(selectedItems:)` — nil
 ///   without command-backed selection; otherwise names ONLY the
 ///   command-backed items (their argv runs regardless of the Trash toggle).
+/// - `CacheoutViewModel.gitWorktreeTrashDisclosures(selectedItems:)` (fn-5.6,
+///   R11/F7) — the same honesty for `git_worktree_reclaim`: git UNLINKS a
+///   worktree and PRUNES admin data, so a Trash-mode confirmation must not
+///   imply recoverability. Stale removals and repository prunes disclose
+///   SEPARATELY; the two derivations are disjoint by construction.
 /// - `CleanupReport.scannerSections` — per-scanner rollup grouping in
 ///   first-appearance order, pure sums.
 /// - `CleanupReport.errorLines` — failed items render from SELF-CONTAINED
@@ -481,6 +486,148 @@ final class CleanSheetPresentationTests: XCTestCase {
         )
         XCTAssertNil(
             CacheoutViewModel.commandsTrashDisclosure(selectedItems: []),
+            "empty selection → no disclosure"
+        )
+    }
+
+    // MARK: - git_worktree_reclaim Move-to-Trash disclosure (fn-5.6, R11/F7)
+
+    /// A composite plan of the given mode. Only `mode` and the structural
+    /// fields the derivation reads matter here; the plan's paths are inert.
+    private func reclaimAction(
+        _ mode: GitWorktreeReclaimPlan.Mode
+    ) -> ReclaimAction {
+        let parent = base.appendingPathComponent("repo")
+        let admin = parent.appendingPathComponent("admin")
+        switch mode {
+        case .removeStaleWorktree:
+            return .gitWorktreeReclaim(.removeStaleWorktree(
+                worktreePath: base.appendingPathComponent("wt"),
+                worktreeAdminEntry: admin.appendingPathComponent("wt"),
+                parentRepoWorkingDir: parent,
+                adminContainer: admin
+            ))
+        case .pruneOrphanedAdmin:
+            return .gitWorktreeReclaim(.pruneOrphanedAdmin(
+                parentRepoWorkingDir: parent,
+                adminContainer: admin,
+                disclosedAdminDirectories: [admin.appendingPathComponent("gone")]
+            ))
+        }
+    }
+
+    /// THE trash-honesty case: the toggle is ON, and the sheet must still say
+    /// the worktree is unlinked permanently. Before fn-5.6 a composite item
+    /// matched NO disclosure branch and fell to generic wording that reflects
+    /// the toggle — a false promise of recoverability.
+    func testStaleReclaimDisclosesPermanentGitRemovalRegardlessOfTheToggle()
+        throws
+    {
+        let stale = perItem(
+            scanner: GitWorktreeScanner.registeredID, id: "wt-1",
+            name: "feature-branch", action: reclaimAction(.removeStaleWorktree)
+        )
+        let deletionItem = perItem(id: "abc", name: "projectA")
+
+        let disclosures = CacheoutViewModel.gitWorktreeTrashDisclosures(
+            selectedItems: [deletionItem, stale, aggregate(name: "npm-cache")]
+        )
+
+        XCTAssertEqual(disclosures.count, 1, "\(disclosures)")
+        let text = try XCTUnwrap(disclosures.first)
+        XCTAssertTrue(text.contains("feature-branch"), text)
+        XCTAssertTrue(text.contains("Move to Trash does not apply"), text)
+        XCTAssertTrue(text.contains("unlinked permanently"), text)
+        // The ONE narrow exception is NAMED rather than hidden (D16: only the
+        // guarded fallback honours the toggle, and the report says which ran).
+        XCTAssertTrue(text.contains("fallback"), text)
+        XCTAssertFalse(text.contains("projectA"),
+                       "deletion-cleaned neighbors are NEVER named")
+        XCTAssertFalse(text.contains("npm-cache"),
+                       "aggregate deletion items are NEVER named")
+    }
+
+    func testPruneReclaimDisclosesAdminDataRemovalAndSurvivingRefs() throws {
+        let prune = perItem(
+            scanner: GitWorktreeScanner.registeredID, id: "prune-1",
+            name: "repo — orphaned worktree registry",
+            action: reclaimAction(.pruneOrphanedAdmin)
+        )
+
+        let disclosures = CacheoutViewModel.gitWorktreeTrashDisclosures(
+            selectedItems: [prune]
+        )
+
+        XCTAssertEqual(disclosures.count, 1, "\(disclosures)")
+        let text = try XCTUnwrap(disclosures.first)
+        XCTAssertTrue(text.contains("orphaned worktree registry"), text)
+        XCTAssertTrue(text.contains("repository admin data permanently"), text)
+        XCTAssertTrue(text.contains("Move to Trash does not apply"), text)
+        XCTAssertTrue(text.contains("Branch refs"), text)
+        XCTAssertFalse(text.contains("unlinked permanently"),
+                       "prune is NOT a worktree removal — one mode, one promise")
+    }
+
+    /// Both modes selected → TWO disclosures, stale first. Merging them into
+    /// one sentence would state a promise that is true of neither.
+    func testBothModesDiscloseSeparatelyAndInOrder() {
+        let stale = perItem(
+            scanner: GitWorktreeScanner.registeredID, id: "wt-1",
+            name: "feature-branch", action: reclaimAction(.removeStaleWorktree)
+        )
+        let prune = perItem(
+            scanner: GitWorktreeScanner.registeredID, id: "prune-1",
+            name: "repo — orphaned worktree registry",
+            action: reclaimAction(.pruneOrphanedAdmin)
+        )
+
+        let disclosures = CacheoutViewModel.gitWorktreeTrashDisclosures(
+            selectedItems: [prune, stale]
+        )
+
+        XCTAssertEqual(disclosures.count, 2, "\(disclosures)")
+        XCTAssertTrue(disclosures[0].contains("feature-branch"))
+        XCTAssertTrue(disclosures[1].contains("orphaned worktree registry"))
+    }
+
+    /// The two disclosures are DISJOINT: the `.commands` derivation never
+    /// names a worktree item, and the worktree derivation never names a
+    /// command-backed one. Overlap would print the same item twice under two
+    /// different promises.
+    func testTheTwoTrashDisclosuresNeverNameEachOthersItems() {
+        let commandItem = perItem(
+            scanner: "sims", id: "sim-devices", name: "Simulator Devices",
+            action: .commands([["true"]])
+        )
+        let stale = perItem(
+            scanner: GitWorktreeScanner.registeredID, id: "wt-1",
+            name: "feature-branch", action: reclaimAction(.removeStaleWorktree)
+        )
+        let selection = [commandItem, stale]
+
+        let commands = CacheoutViewModel.commandsTrashDisclosure(
+            selectedItems: selection
+        )
+        XCTAssertEqual(commands?.contains("feature-branch"), false, "\(commands ?? "")")
+        let worktrees = CacheoutViewModel.gitWorktreeTrashDisclosures(
+            selectedItems: selection
+        )
+        XCTAssertEqual(worktrees.count, 1)
+        XCTAssertFalse(worktrees[0].contains("Simulator Devices"), worktrees[0])
+    }
+
+    func testNoWorktreeDisclosureWithoutACompositeSelection() {
+        XCTAssertTrue(
+            CacheoutViewModel.gitWorktreeTrashDisclosures(selectedItems: [
+                aggregate(name: "npm-cache"),
+                perItem(id: "abc", name: "projectA"),
+                perItem(scanner: "sims", id: "s", name: "Simulator Devices",
+                        action: .commands([["true"]])),
+            ]).isEmpty,
+            "no composite item selected → no disclosure"
+        )
+        XCTAssertTrue(
+            CacheoutViewModel.gitWorktreeTrashDisclosures(selectedItems: []).isEmpty,
             "empty selection → no disclosure"
         )
     }

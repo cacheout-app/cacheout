@@ -16,6 +16,11 @@
 ///   selected, `viewModel.commandsTrashDisclosure` names EXACTLY those
 ///   items — their cleanup commands run regardless of the toggle and place
 ///   nothing in the Trash
+/// - The `git_worktree_reclaim` disclosures (fn-5.6/R11):
+///   `viewModel.gitWorktreeTrashDisclosures` names the selected worktree
+///   items, stale removals apart from repository prunes. git UNLINKS and
+///   PRUNES — neither trashes, whatever the toggle says — so without this
+///   the generic wording would falsely promise recoverability
 /// - Warning banner when a `.partiallyDenied` category is selected (R18):
 ///   unreadable contents — measured bytes only
 /// - Per-row DISCLOSED release artifacts (fn-4.6, R3): each valuable's
@@ -152,6 +157,20 @@ struct CleanConfirmationSheet: View {
             // banner, and it informs the toggle decision either way. The
             // toggle itself stays.
             if let disclosure = viewModel.commandsTrashDisclosure {
+                Label(disclosure, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
+
+            // fn-5.6 (R11/F7): the SAME honesty for the composite reclaim.
+            // Without this branch a selected worktree item would fall to the
+            // sheet's generic wording, which reflects the toggle and would
+            // falsely promise recoverability — git unlinks, it does not
+            // trash. Stale removals and repo-level prunes are disclosed
+            // SEPARATELY (they are different promises), so the enumeration is
+            // over the derived strings, not one merged sentence.
+            ForEach(Array(viewModel.gitWorktreeTrashDisclosures.enumerated()),
+                    id: \.offset) { _, disclosure in
                 Label(disclosure, systemImage: "exclamationmark.triangle.fill")
                     .font(.caption)
                     .foregroundStyle(.orange)

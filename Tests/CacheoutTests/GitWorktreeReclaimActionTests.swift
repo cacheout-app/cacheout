@@ -909,6 +909,15 @@ final class GitWorktreeReclaimActionTests: XCTestCase {
         // Zero call-site churn is the contract: every pre-existing
         // construction — including the runtime's own factory — still
         // compiles, and the default is the fail-closed nil.
+        //
+        // THE SEQUENCING THIS PINS (fn-5.3 designed the seam, fn-5.4 built
+        // the performer behind it, fn-5.6 threads the SHARED runner through
+        // `makeCleaner` beside the scanner's registration): until fn-5.6, a
+        // runtime-built cleaner REFUSES composite items per item instead of
+        // executing them. That is unreachable in practice — no registered
+        // scanner emits a composite item until fn-5.5 — and it is the
+        // fail-closed direction, never a silent no-op. When fn-5.6 threads
+        // the runner, THIS cell is the one that must be updated.
         let runtime = try makeRuntime()
         let fromFactory = runtime.makeCleaner()
         let report = await fromFactory.clean(

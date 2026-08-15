@@ -1152,6 +1152,21 @@ struct SpaceScannerRuntime {
     /// snapshot (fn-4.8): a cleaner built THROUGH the runtime can always
     /// honour a `requiresPreDeleteRevalidation` marker, and a cleaner built
     /// without one fails closed on marked items.
+    ///
+    /// **NO `gitRunner` IS THREADED HERE YET, and that is deliberate** (fn-5.3
+    /// designed the seam, fn-5.4 built the performer behind it, fn-5.6 wires
+    /// it): the runner argument stays at its fail-closed `nil` default, so a
+    /// composite `git_worktree_reclaim` item reaching a runtime-built cleaner
+    /// is REFUSED per item rather than executed. Nothing regresses in the
+    /// meantime — no registered scanner emits a composite item until fn-5.5
+    /// lands `GitWorktreeScanner`, so the refusal is unreachable in practice
+    /// and is pinned by
+    /// `GitWorktreeReclaimActionTests.testTheRunnerSeamIsTrailingAndDefaulted`.
+    /// fn-5.6 owns this line together with the `production(devRoots:)`
+    /// registration it must land beside (the runner instance is SHARED with
+    /// the scanner — constructing a second one here would fork the
+    /// instance-scoped availability cache fn-5.1 deliberately made
+    /// per-instance).
     func makeCleaner(
         snapshot: ContainerSnapshot? = nil,
         trashHandler: CacheCleaner.TrashHandler? = nil

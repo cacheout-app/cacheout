@@ -49,6 +49,10 @@ final class GitWorktreeInventoryTests: XCTestCase {
     private var home: URL!
     private let fm = FileManager.default
 
+    /// chmod-000 fixtures registered for teardown restore (house rule:
+    /// restore 0755 before removal).
+    private var permsToRestore: [URL] = []
+
     override func setUpWithError() throws {
         base = fm.temporaryDirectory
             .appendingPathComponent("GitWorktreeInventoryTests-\(UUID().uuidString)")
@@ -57,6 +61,10 @@ final class GitWorktreeInventoryTests: XCTestCase {
     }
 
     override func tearDownWithError() throws {
+        for url in permsToRestore {
+            try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+        }
+        permsToRestore = []
         if let base { try? fm.removeItem(at: base) }
     }
 
@@ -742,10 +750,48 @@ final class GitWorktreeInventoryTests: XCTestCase {
     }
 
     func testNoPrunableRecordsAndNoContainerIsStillComplete() throws {
+        // The ONLY benign container failure: a repository that never had a
+        // linked worktree.
         let container = base.appendingPathComponent("never-created/worktrees")
         let verdict = GitWorktreeAdminMapper()
             .map(prunableRecordsIn: [], adminContainer: container)
         XCTAssertEqual(verdict, .complete(adminDirectories: []))
+    }
+
+    func testAbsentContainerWithPrunableRecordsIsIncomplete() throws {
+        let container = base.appendingPathComponent("never-created/worktrees")
+        let record = GitWorktreeEntry(
+            path: base.appendingPathComponent("ghost"), headSHA: "a", branchRef: nil,
+            isDetached: true, isBare: false, isLocked: false, lockReason: nil,
+            isPrunable: true, prunableReason: "gone", isMain: false
+        )
+        guard case .incomplete(let reason) = GitWorktreeAdminMapper()
+            .map(prunableRecordsIn: [record], adminContainer: container)
+        else { return XCTFail("an absent container cannot account for a prunable record") }
+        XCTAssertTrue(reason.contains("is absent"), reason)
+    }
+
+    func testContainerThatIsNotADirectoryIsIncompleteEvenWithNothingPrunable() throws {
+        // A permission denial, an I/O error, or a container that is a FILE
+        // must never read as "nothing to prune" — a repo-wide prune would
+        // still traverse it.
+        let container = base.appendingPathComponent("file-container")
+        try "not a directory".write(to: container, atomically: true, encoding: .utf8)
+        guard case .incomplete(let reason) = GitWorktreeAdminMapper()
+            .map(prunableRecordsIn: [], adminContainer: container)
+        else { return XCTFail("a non-directory container must suppress") }
+        XCTAssertTrue(reason.contains("is not a directory"), reason)
+    }
+
+    func testUnreadableContainerIsIncompleteEvenWithNothingPrunable() throws {
+        let container = base.appendingPathComponent("locked-container")
+        try fm.createDirectory(at: container, withIntermediateDirectories: true)
+        try fm.setAttributes([.posixPermissions: 0o000], ofItemAtPath: container.path)
+        permsToRestore.append(container)
+        guard case .incomplete(let reason) = GitWorktreeAdminMapper()
+            .map(prunableRecordsIn: [], adminContainer: container)
+        else { return XCTFail("an unenumerable container must suppress") }
+        XCTAssertTrue(reason.contains("could not be read"), reason)
     }
 
     func testUnmappablePrunableRecordYieldsIncompleteNamingTheEntry() async throws {

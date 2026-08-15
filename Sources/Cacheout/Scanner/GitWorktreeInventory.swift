@@ -479,13 +479,36 @@ struct GitWorktreeAdminMapper {
     ) -> GitAdminMappingVerdict {
         let targets = entries.filter { $0.isPrunable && !$0.isLocked }
 
+        // ABSENCE is the ONLY benign container failure, and only when
+        // nothing is prunable — a repository that never had a linked
+        // worktree has no container at all. Everything else (a permission
+        // denial, an I/O error, a container that is a file or a symlink) is
+        // a container this mapper cannot account for, and a repo-wide prune
+        // would still traverse it.
+        switch identity.probeKind(of: adminContainer) {
+        case .absent:
+            if targets.isEmpty { return .complete(adminDirectories: []) }
+            return .incomplete(
+                reason: "admin container \(adminContainer.path) is absent while "
+                    + "\(targets.count) prunable record(s) remain"
+            )
+        case .kind(.directory):
+            break
+        case .kind(let kind):
+            return .incomplete(
+                reason: "admin container \(adminContainer.path) is not a directory (\(kind))"
+            )
+        case .failed(let code):
+            return .incomplete(
+                reason: "admin container \(adminContainer.path) could not be inspected "
+                    + "(errno \(code))"
+            )
+        }
+
         let names: [String]
         do {
             names = try fileManager.contentsOfDirectory(atPath: adminContainer.path).sorted()
         } catch {
-            // No container at all is only benign when nothing is prunable —
-            // a repo that never had a linked worktree.
-            if targets.isEmpty { return .complete(adminDirectories: []) }
             return .incomplete(
                 reason: "admin container \(adminContainer.path) could not be read"
             )

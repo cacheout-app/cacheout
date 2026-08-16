@@ -127,6 +127,20 @@ struct SizeReport {
     var logicalBytes: Int64 = 0
     /// Regular-file directory entries encountered (links, not inodes).
     var itemCount: Int = 0
+    /// EVERY directory entry this walk enumerated — files, directories,
+    /// symlinks, specials, and entries that raced away mid-walk — excluding
+    /// the root itself. `itemCount` counts regular files ONLY, so it is not
+    /// a census; this is.
+    ///
+    /// It exists because it is the ONE exhaustive count of the same subject
+    /// the bounded valuables probe walks, taken by the same pass: the probe's
+    /// entry budget is derived from it (`ValuablesProbeBudget`), which is
+    /// what stops a fixed constant from deterministically stranding the
+    /// largest real artifact trees. A FLOOR, not a guarantee: a walk that hit
+    /// denials or a mount boundary counted nothing past them, and a probe
+    /// budget derived from such a census can still run out — honestly, and
+    /// alongside the denial that explains it.
+    var enumeratedEntries: Int = 0
     var denials: [SizeDenial] = []
     /// Directories recorded as mount boundaries; their subtrees are uncounted.
     var mountBoundaries: [URL] = []
@@ -282,6 +296,10 @@ struct DirectorySizer {
 
         while let next = enumerator.nextObject() {
             guard let itemURL = next as? URL else { continue }
+            // The CENSUS, counted before any classification: every entry the
+            // enumerator yielded, whatever it turns out to be and whether or
+            // not it survives to contribute bytes.
+            report.enumeratedEntries += 1
             let kind: FileSystemIdentityProvider.FileKind
             switch provider.probeKind(of: itemURL) {
             case .kind(let probed):

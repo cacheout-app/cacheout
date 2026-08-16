@@ -77,6 +77,15 @@ final class BuildArtifactsScannerTests: XCTestCase {
         permsToRestore.append(url)
     }
 
+    /// SEARCHABLE but UNREADABLE (`--x--x--x`): paths THROUGH the directory
+    /// still resolve — a dev root configured beneath it opens and walks — while
+    /// the directory's own entries cannot be enumerated. Restored in teardown
+    /// by the same registry `chmod000` uses.
+    private func chmod111(_ url: URL) throws {
+        try fm.setAttributes([.posixPermissions: 0o111], ofItemAtPath: url.path)
+        permsToRestore.append(url)
+    }
+
     /// Independent fixture math (raw `lstat`), never the code under test.
     private func allocated(_ urls: URL...) -> Int64 {
         var total: Int64 = 0
@@ -179,15 +188,16 @@ final class BuildArtifactsScannerTests: XCTestCase {
     private func makeScanner(
         roots: [URL]? = nil,
         provider: FileSystemIdentityProvider = FileSystemIdentityProvider(),
-        valuablesProbeEntryLimit: Int =
-            ValuablesDetector.defaultProbeEntryLimit,
+        valuablesProbeBudget: ValuablesProbeBudget = .censusProportionate(
+            floor: ValuablesDetector.defaultProbeEntryLimit
+        ),
         now: @escaping @Sendable () -> Date = { Date() }
     ) -> BuildArtifactsScanner {
         BuildArtifactsScanner(
             home: fixtureHome,
             devRoots: resolution(roots ?? [dev], provider: provider),
             provider: provider,
-            valuablesProbeEntryLimit: valuablesProbeEntryLimit,
+            valuablesProbeBudget: valuablesProbeBudget,
             now: now
         )
     }
@@ -1617,7 +1627,7 @@ final class BuildArtifactsScannerTests: XCTestCase {
         // child directory is the bundle itself, so the incompleteness can
         // ONLY come from the truncated bundle sizing.
         let outcome = try await runScan(
-            makeScanner(valuablesProbeEntryLimit: 3)
+            makeScanner(valuablesProbeBudget: .fixed(3))
         )
         let found = try XCTUnwrap(item(outcome, at: target))
         let disclosure = try XCTUnwrap(found.valuablesDisclosure)
@@ -1634,8 +1644,11 @@ final class BuildArtifactsScannerTests: XCTestCase {
                      "no token EVER derives from a partial size")
         XCTAssertEqual(found.risk, .review)
         XCTAssertFalse(found.defaultSelected)
+        XCTAssertEqual(disclosure.incompleteness, .entryBudget,
+                       "the bundle's subtree ran past the pinned bound")
         XCTAssertTrue(
-            found.evidence.contains("couldn't fully inspect"), found.evidence
+            found.evidence.contains("more entries than the inspection budget"),
+            found.evidence
         )
     }
 
@@ -1758,7 +1771,7 @@ final class BuildArtifactsScannerTests: XCTestCase {
             capped.appendingPathComponent("a/b.bin"), bytes: subFloorBytes
         )
         let cappedOutcome = try await runScan(
-            makeScanner(roots: [dev], valuablesProbeEntryLimit: 1)
+            makeScanner(roots: [dev], valuablesProbeBudget: .fixed(1))
         )
         let cappedItem = try XCTUnwrap(item(cappedOutcome, at: capped))
         let cappedDisclosure = try XCTUnwrap(cappedItem.valuablesDisclosure)
@@ -1766,9 +1779,15 @@ final class BuildArtifactsScannerTests: XCTestCase {
         XCTAssertEqual(cappedItem.risk, .review, "fail-closed forcing")
         XCTAssertFalse(cappedItem.defaultSelected)
         XCTAssertEqual(
+            cappedDisclosure.incompleteness, .entryBudget,
+            "a pinned bound that ran out is the BUDGET cause, and it is "
+                + "reported as itself — the two causes clear differently"
+        )
+        XCTAssertEqual(
             cappedItem.evidence,
             "target/ beside Cargo.toml; last build today — WARNING: couldn't "
-                + "fully inspect this directory for release artifacts — "
+                + "finish inspecting this directory for release artifacts — "
+                + "it holds more entries than the inspection budget — "
                 + "verify before deleting"
         )
         XCTAssertNil(cappedDisclosure.acknowledgementToken(for: cappedItem.key),
@@ -1791,6 +1810,11 @@ final class BuildArtifactsScannerTests: XCTestCase {
         let disclosure = try XCTUnwrap(found.valuablesDisclosure)
         XCTAssertFalse(disclosure.probeComplete,
                        "an unreadable branch leaves absence UNPROVEN")
+        XCTAssertEqual(
+            disclosure.incompleteness, .obstruction,
+            "an unreadable branch is an OBSTRUCTION, never a budget: no "
+                + "bigger budget can read it, so it must not advertise one"
+        )
         XCTAssertEqual(found.risk, .review)
         XCTAssertTrue(found.evidence.contains("couldn't fully inspect"),
                       found.evidence)
@@ -1851,7 +1875,7 @@ final class BuildArtifactsScannerTests: XCTestCase {
         }
 
         let atCap = try await runScan(
-            makeScanner(valuablesProbeEntryLimit: 4)
+            makeScanner(valuablesProbeBudget: .fixed(4))
         )
         XCTAssertTrue(
             try XCTUnwrap(item(atCap, at: target)?.valuablesDisclosure)
@@ -1860,7 +1884,7 @@ final class BuildArtifactsScannerTests: XCTestCase {
         )
 
         let underCap = try await runScan(
-            makeScanner(valuablesProbeEntryLimit: 3)
+            makeScanner(valuablesProbeBudget: .fixed(3))
         )
         XCTAssertFalse(
             try XCTUnwrap(item(underCap, at: target)?.valuablesDisclosure)
@@ -1951,7 +1975,7 @@ final class BuildArtifactsScannerTests: XCTestCase {
         )
 
         let outcome = try await runScan(
-            makeScanner(valuablesProbeEntryLimit: 3)
+            makeScanner(valuablesProbeBudget: .fixed(3))
         )
         let disclosure = try XCTUnwrap(
             item(outcome, at: target)?.valuablesDisclosure
@@ -2337,6 +2361,230 @@ final class BuildArtifactsScannerTests: XCTestCase {
                        "a valuable is found however deep it is buried")
         XCTAssertEqual(scanned, atDelete,
                        "scan time and delete time see the SAME thing")
+    }
+
+    // MARK: - The entry budget is PROPORTIONATE, not a constant (review r7)
+
+    /// An artifact tree of at least `entries` directory entries under one
+    /// project, returning the artifact dir. Flat and cheap on purpose: what
+    /// matters is the COUNT the census sees, not the shape.
+    @discardableResult
+    private func makeWideProject(at dir: URL, entries: Int) throws -> URL {
+        let artifact = try makeProject(
+            at: dir, marker: "Cargo.toml", artifact: "target",
+            payloadBytes: nil
+        )
+        for index in 0..<entries {
+            try writeFile(
+                artifact.appendingPathComponent("deps/pkg\(index).js"),
+                bytes: 64
+            )
+        }
+        return artifact
+    }
+
+    /// THE STRANDING DEFECT, in the bound that outlived the depth cap. A FIXED
+    /// entry budget is deterministic, so an artifact tree bigger than it
+    /// probed incomplete on EVERY scan and EVERY delete-time revalidation: the
+    /// GUI filtered the row out of the confirmation clean set, the CLI could
+    /// never obtain the token the identical bounded revalidation demands, and
+    /// re-scanning an unchanged tree exhausted in exactly the same place —
+    /// permanently unauthorizable, for the ordinary large `node_modules` and
+    /// `.build` trees this scanner exists to reclaim (measured on this
+    /// machine: 44,468 and 53,924 entries against a 20,000-entry cap).
+    ///
+    /// The budget is now derived from the subject's OWN exhaustive census, so
+    /// a tree this pass can enumerate at all is a tree the probe can prove.
+    /// The floor is pinned small here so the fixture is a handful of files
+    /// rather than a hundred thousand; nothing else about the policy differs.
+    func testTreeLargerThanTheBudgetFloorIsProvenAndActuallyDeletes()
+        async throws
+    {
+        let artifact = try makeWideProject(
+            at: dev.appendingPathComponent("proj"), entries: 40
+        )
+
+        let (items, snapshot, runtime) = try await scanSession(
+            makeScanner(valuablesProbeBudget: .censusProportionate(floor: 3))
+        )
+        let found = try XCTUnwrap(item(from: items, at: artifact))
+        let disclosure = try XCTUnwrap(found.valuablesDisclosure)
+
+        XCTAssertEqual(
+            disclosure, .clean,
+            "a tree far past the FLOOR is still PROVEN clean — the budget is "
+                + "the subject's own census, not a constant"
+        )
+        XCTAssertEqual(found.risk, .safe, "the gate never fired")
+        XCTAssertNil(CacheoutViewModel.blockedReason(for: found),
+                     "…so the GUI never filters it out of the clean set")
+
+        // THE CLAIM THAT MATTERS: it actually deletes. The delete-time face
+        // has no census in hand and must earn one, at the SAME policy, or the
+        // two faces drift and this item is refused forever.
+        let cleaner = runtime.makeCleaner(snapshot: snapshot)
+        let report = await cleaner.clean(items: [found], moveToTrash: false)
+        XCTAssertTrue(report.errors.isEmpty,
+                      report.errors.map(\.message).joined(separator: "; "))
+        XCTAssertFalse(fm.fileExists(atPath: artifact.path))
+    }
+
+    /// The delete-time face on its own, at the same policy: it starts at the
+    /// floor, finds the budget (and ONLY the budget) is what stopped it,
+    /// censuses the same subject, and finishes — disclosing exactly what the
+    /// scan-time face disclosed, which is what makes the acknowledgement token
+    /// reproducible instead of stranding a valuable-bearing tree.
+    func testDeleteTimeFaceEscalatesToTheSameCensusAndAgreesWithScanTime()
+        async throws
+    {
+        let artifact = try makeWideProject(
+            at: dev.appendingPathComponent("proj"), entries: 40
+        )
+        let dmg = try writeBulkFile(
+            artifact.appendingPathComponent("bundle/dmg/Murmur.dmg"),
+            bytes: aboveFloorBytes
+        )
+        let budget = ValuablesProbeBudget.censusProportionate(floor: 3)
+
+        let outcome = try await runScan(
+            makeScanner(valuablesProbeBudget: budget)
+        )
+        let found = try XCTUnwrap(item(outcome, at: artifact))
+        let scanned = try XCTUnwrap(found.valuablesDisclosure)
+        XCTAssertTrue(scanned.probeComplete)
+        XCTAssertEqual(scanned.valuables.map(\.name), ["Murmur.dmg"])
+        let token = try XCTUnwrap(
+            scanned.acknowledgementToken(for: found.key),
+            "a COMPLETE probe over a non-empty set has a token"
+        )
+
+        // Unescalated, the delete-time first pass cannot finish …
+        let atFloor = ValuablesDetector.probe(
+            at: artifact, provider: FileSystemIdentityProvider(), entryLimit: 3
+        )
+        XCTAssertEqual(atFloor.incompleteness, .entryBudget,
+                       "fixture precondition: the floor is genuinely too small")
+
+        // … and the face escalates past it to the identical answer.
+        let atDelete = BuildArtifactsScanner.preDeleteValuablesProbe(
+            at: artifact, provider: FileSystemIdentityProvider(), budget: budget
+        )
+        XCTAssertEqual(scanned, atDelete,
+                       "scan time and delete time see the SAME thing")
+        XCTAssertEqual(
+            ValuablesDisclosure.acknowledgementToken(
+                scannerID: found.scannerID, itemID: found.id,
+                valuables: atDelete.valuables, probeComplete: true
+            ),
+            token,
+            "the delete-time token reproduces the acknowledged one"
+        )
+        XCTAssertTrue(fm.fileExists(atPath: dmg.path))
+    }
+
+    /// The escalation is NARROW: it buys a bigger budget and nothing else. An
+    /// unreadable branch is an OBSTRUCTION — no budget can read it — so the
+    /// probe stays incomplete and tokenless, and the printed remedy stays the
+    /// one that can actually work.
+    func testCensusEscalationNeverRescuesAnObstruction() async throws {
+        try XCTSkipIf(geteuid() == 0, "root ignores permission bits")
+        let artifact = try makeWideProject(
+            at: dev.appendingPathComponent("proj"), entries: 40
+        )
+        let locked = artifact.appendingPathComponent("locked-branch")
+        try mkdir(locked)
+        try chmod000(locked)
+
+        let outcome = try await runScan(
+            makeScanner(valuablesProbeBudget: .censusProportionate(floor: 3))
+        )
+        let found = try XCTUnwrap(item(outcome, at: artifact))
+        let disclosure = try XCTUnwrap(found.valuablesDisclosure)
+
+        XCTAssertFalse(disclosure.probeComplete)
+        XCTAssertEqual(disclosure.incompleteness, .obstruction,
+                       "an obstruction is reported as itself even when the "
+                        + "budget was also spent — the causes clear "
+                        + "differently and must not be flattened")
+        XCTAssertNil(disclosure.acknowledgementToken(for: found.key))
+        XCTAssertEqual(found.risk, .review)
+        XCTAssertTrue(found.evidence.contains("couldn't fully inspect"),
+                      found.evidence)
+        XCTAssertFalse(
+            found.evidence.contains("more entries than the inspection budget"),
+            "the printed remedy must be the one that can work: "
+                + found.evidence
+        )
+    }
+
+    /// BOTH causes at once, deterministically — and the walk reports the one
+    /// a bigger budget cannot clear.
+    ///
+    /// The bound is pinned at exactly the artifact dir's two entries, so its
+    /// own read finishes whole (no truncation, no unspecified membership) and
+    /// the budget is spent to the last entry. Descending the byte-wise first
+    /// child hits EACCES (an OBSTRUCTION); descending the second finds the
+    /// budget gone (ENTRY BUDGET). Reporting the budget here would send the
+    /// delete-time face into a second pass that must fail identically, and
+    /// would print "retry" for a directory whose real remedy is `chmod`.
+    func testObstructionOutRanksTheBudgetWhenBothStopTheSameWalk() async throws
+    {
+        try XCTSkipIf(geteuid() == 0, "root ignores permission bits")
+        let artifact = try makeProject(
+            at: dev.appendingPathComponent("proj"),
+            marker: "Cargo.toml", artifact: "target", payloadBytes: nil
+        )
+        let locked = artifact.appendingPathComponent("a-locked")
+        try mkdir(locked)
+        try chmod000(locked)
+        try writeFile(
+            artifact.appendingPathComponent("b-sub/chunk.js"), bytes: 64
+        )
+
+        let outcome = try await runScan(
+            makeScanner(valuablesProbeBudget: .fixed(2))
+        )
+        let found = try XCTUnwrap(item(outcome, at: artifact))
+        let disclosure = try XCTUnwrap(found.valuablesDisclosure)
+
+        XCTAssertFalse(disclosure.probeComplete)
+        XCTAssertEqual(
+            disclosure.incompleteness, .obstruction,
+            "both causes fired; the reported one must be the cause no bigger "
+                + "budget can clear"
+        )
+        XCTAssertTrue(found.evidence.contains("couldn't fully inspect"),
+                      found.evidence)
+        XCTAssertEqual(
+            BuildArtifactsScanner.incompleteProbeRefusal(
+                disclosure.incompleteness
+            ).contains("re-scan required"),
+            true,
+            "…and the delete-time remedy is the obstruction's, not a retry"
+        )
+    }
+
+    /// The policy arithmetic itself: the floor is a floor, the census raises
+    /// it, a pinned bound is honored verbatim and never escalates, and a
+    /// filesystem-supplied census can never trap the multiplication.
+    func testProbeBudgetPolicyArithmeticIsPinnedAndSaturating() {
+        let production = ValuablesProbeBudget.censusProportionate(floor: 100)
+        XCTAssertEqual(production.firstPass, 100)
+        XCTAssertEqual(production.limit(census: 0), 100, "the floor holds")
+        XCTAssertEqual(production.limit(census: 10), 100)
+        XCTAssertEqual(production.limit(census: 60), 120,
+                       "twice the subject's own exhaustive census")
+        XCTAssertNil(production.escalation(census: 10),
+                     "no second pass that could not read one entry more")
+        XCTAssertEqual(production.escalation(census: 60), 120)
+        XCTAssertEqual(production.limit(census: Int.max), Int.max,
+                       "a filesystem-supplied census saturates, never traps")
+
+        let pinned = ValuablesProbeBudget.fixed(7)
+        XCTAssertEqual(pinned.firstPass, 7)
+        XCTAssertEqual(pinned.limit(census: 10_000), 7,
+                       "an explicitly pinned bound is honored verbatim")
+        XCTAssertNil(pinned.escalation(census: 10_000), "…and never escalates")
     }
 
     func testDeepArtifactTreeWithoutValuablesIsProvenCleanAndStaysCleanable()
@@ -5331,6 +5579,294 @@ final class BuildArtifactsScannerTests: XCTestCase {
         XCTAssertFalse(found.defaultSelected)
     }
 
+    /// Fires a REAL `rename(2)` + `symlink(2)` in the ONE window the ANCHORED
+    /// probe entry point exists to cover: AFTER the containment descent has
+    /// obtained a live descriptor for the artifact dir, and BEFORE the probe
+    /// reads a single entry through it.
+    ///
+    /// Every other swap fixture in this file fires in phase 2 (from
+    /// `resolveTargetKeepingLeaf`), which is strictly EARLIER than
+    /// `anchoredArtifactDirectory` — so the descent itself refuses, the probe
+    /// is never entered, and the anchored entry point is never exercised under
+    /// attack. Overriding the child open and firing on the descent's LAST step
+    /// (`super` has already returned the fd) is what lands inside the window
+    /// instead of before it. Deterministic by construction: no sleeps, no
+    /// threads, no timing.
+    private final class PostDescentSwappingProvider: FileSystemIdentityProvider
+    {
+        var trigger = ""
+        var swap: (() -> Void)?
+        private(set) var swapped = false
+
+        override func openChildDirectory(
+            inDirectory parent: Int32, named name: String, logical url: URL
+        ) -> Int32 {
+            let fd = super.openChildDirectory(
+                inDirectory: parent, named: name, logical: url
+            )
+            if fd >= 0, !swapped, url.path == trigger {
+                swapped = true
+                swap?()
+            }
+            return fd
+        }
+    }
+
+    /// THE ANCHORED PROBE ENTRY POINT, under the only attack that reaches it.
+    ///
+    /// Containment is re-proven and the artifact dir's descriptor is HELD —
+    /// and only then does the ancestor become a symlink out of the dev root.
+    /// A descriptor is inode-pinned, so a probe entered with that descriptor
+    /// reads the real artifact dir and discloses nothing. A probe that
+    /// re-opens `candidate.artifactDirectory` BY PATH instead (the
+    /// `probe(at:provider:)` face) resolves through the fresh symlink,
+    /// discloses `…/outside-the-dev-root/decoy/target/Foreign.dmg`, and mints
+    /// an acknowledgement token over it — the value that AUTHORIZES A
+    /// DELETION, derived entirely from a tree the artifact dir does not
+    /// contain.
+    func testAnchoredProbeReadsTheHeldDescriptorNotTheSwappedPath()
+        async throws
+    {
+        let outside = base.appendingPathComponent("outside-the-dev-root")
+        let decoy = outside.appendingPathComponent("decoy")
+        try writeFile(decoy.appendingPathComponent("Cargo.toml"), bytes: 32)
+        let foreign = try writeBulkFile(
+            decoy.appendingPathComponent("target/Foreign.dmg"),
+            bytes: aboveFloorBytes
+        )
+
+        let project = dev.appendingPathComponent("proj")
+        let artifact = try makeProject(
+            at: project, marker: "Cargo.toml", artifact: "target",
+            payloadBytes: 8_192
+        )
+        let relocated = dev.appendingPathComponent("proj.real")
+
+        let provider = PostDescentSwappingProvider()
+        // The descent's LAST step: the artifact dir's own descriptor is open.
+        provider.trigger = artifact.path
+        let manager = fm
+        provider.swap = {
+            try? manager.moveItem(at: project, to: relocated)
+            try? manager.createSymbolicLink(
+                at: project, withDestinationURL: decoy
+            )
+        }
+
+        let outcome = await makeScanner(provider: provider)
+            .scan(context: ScanContext(trigger: .userInitiated))
+
+        XCTAssertTrue(
+            provider.swapped,
+            "fixture precondition: the swap ran, and it ran AFTER the "
+                + "containment descent held the artifact dir open"
+        )
+        XCTAssertEqual(
+            try fm.destinationOfSymbolicLink(atPath: project.path), decoy.path,
+            "fixture precondition: the ANCESTOR is a symlink out of the tree"
+        )
+
+        let disclosed = outcome.items
+            .flatMap { $0.valuablesDisclosure?.valuables ?? [] }
+        XCTAssertTrue(
+            disclosed.isEmpty,
+            "the probe read a tree reached through a swapped ancestor: "
+                + disclosed.map(\.canonicalIdentityPath).description
+        )
+        for found in outcome.items {
+            XCTAssertNil(
+                found.valuablesDisclosure?.acknowledgementToken(for: found.key),
+                "a token was minted over a foreign tree — that value "
+                    + "AUTHORIZES A DELETION"
+            )
+        }
+        XCTAssertTrue(fm.fileExists(atPath: foreign.path),
+                      "the foreign tree is byte-untouched")
+        XCTAssertTrue(
+            fm.fileExists(
+                atPath: relocated.appendingPathComponent("target/payload.bin")
+                    .path
+            ),
+            "and the real artifact dir — the one the held descriptor names — "
+                + "is what was inspected"
+        )
+    }
+
+    // MARK: - The containment descent's own refusals, driven directly
+
+    /// One open, vetted anchor per declared root — the shape `scan` hands
+    /// `anchoredArtifactDirectory`, built here so the descent's refusals can
+    /// be driven without a whole scan.
+    private func anchors(
+        _ roots: [URL], provider: FileSystemIdentityProvider
+    ) throws -> [String: SecureDirectory] {
+        var anchors: [String: SecureDirectory] = [:]
+        for root in roots {
+            anchors[root.path] = try XCTUnwrap(SecureDirectory(
+                fd: provider.openDirectoryNoFollow(at: root),
+                provider: provider
+            ))
+        }
+        return anchors
+    }
+
+    private func candidate(
+        artifact: URL, originRoot: URL
+    ) -> BuildArtifactCandidate {
+        BuildArtifactCandidate(
+            artifactDirectory: artifact, originRoot: originRoot,
+            rule: BuildArtifactRules.v1[0], marker: "Cargo.toml"
+        )
+    }
+
+    /// A provider whose child open does NOT re-check the component — the
+    /// contract weakened exactly one layer down, which is the only thing that
+    /// makes the DESCENT's own `isSafeComponent` observable.
+    ///
+    /// Deliberately LESS capable than production, never more: it is the
+    /// question "does this descent delegate its component safety, or hold it
+    /// itself?" and no production behavior is being simulated away — the
+    /// production provider's own check is pinned by
+    /// `testMultiComponentNamesAreRejectedBeforeAnySyscall`.
+    private final class UncheckedChildOpenProvider: FileSystemIdentityProvider
+    {
+        override func openChildDirectory(
+            inDirectory parent: Int32, named name: String, logical url: URL
+        ) -> Int32 {
+            openat(parent, name, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
+        }
+    }
+
+    /// `..` IS a legal `openat` name, and it climbs. The descent's own
+    /// component check is what refuses it before any syscall — not the
+    /// provider's, which is a different layer and may be overridden,
+    /// re-implemented, or (as here) weakened. Without the caller-side check
+    /// the descent walks OUT of the dev root and anchors the directory ABOVE
+    /// it, which is then probed and sized as if it were build output.
+    func testContainmentDescentHoldsItsOwnComponentSafety() throws {
+        let provider = UncheckedChildOpenProvider()
+        let root = dev.appendingPathComponent("root")
+        try mkdir(root)
+        let sibling = try makeProject(
+            at: dev.appendingPathComponent("sibling"),
+            marker: "Cargo.toml", artifact: "target"
+        )
+        let held = try anchors([root], provider: provider)
+        let above = try XCTUnwrap(provider.identity(of: dev))
+
+        var escaping = root
+        escaping.appendPathComponent("..")
+        escaping.appendPathComponent("sibling")
+        escaping.appendPathComponent("target")
+        XCTAssertTrue(escaping.pathComponents.contains(".."),
+                      "fixture precondition: the candidate spells a climb")
+
+        switch BuildArtifactsScanner.anchoredArtifactDirectory(
+            candidate(artifact: escaping, originRoot: root),
+            rootAnchors: held, provider: provider
+        ) {
+        case .obstructed(let report):
+            XCTAssertTrue(
+                report.denials.contains {
+                    $0.detail.contains("single safe path component")
+                },
+                "refused, and classified as what it is: "
+                    + report.denials.map(\.detail).description
+            )
+        case .anchored(let anchor):
+            XCTAssertNotEqual(
+                anchor.identity, above,
+                "the descent climbed OUT of the dev root through '..'"
+            )
+            XCTFail("a '..' component must never anchor anything")
+        case .vanished:
+            XCTFail("a '..' component is not a vanished subject")
+        }
+        XCTAssertTrue(fm.fileExists(atPath: sibling.path))
+    }
+
+    /// The component-wise containment check on the SPELLING, driven directly
+    /// because no walk produces a candidate that violates it — which is
+    /// exactly why it must be proven rather than assumed. Its absence is not
+    /// a cosmetic difference: `dropFirst(rootComponents.count)` over a
+    /// candidate that does not extend its root yields the WRONG suffix, and
+    /// the descent then anchors — and the probe then reads, and the token
+    /// then covers — a directory the item does not name.
+    func testCandidateNotSpelledInsideItsOriginRootIsRefused() throws {
+        let provider = FileSystemIdentityProvider()
+        let rootA = dev.appendingPathComponent("a")
+        let decoyTarget = try makeProject(
+            at: rootA, marker: "Cargo.toml", artifact: "target"
+        )
+        let rootB = dev.appendingPathComponent("b")
+        let claimed = try makeProject(
+            at: rootB, marker: "Cargo.toml", artifact: "target"
+        )
+        let held = try anchors([rootA, dev], provider: provider)
+        let decoyIdentity = try XCTUnwrap(provider.identity(of: decoyTarget))
+        let devIdentity = try XCTUnwrap(provider.identity(of: dev))
+
+        // (a) A SIBLING spelling: same component COUNT past the root, so the
+        // suffix looks plausible and lands on the wrong directory.
+        switch BuildArtifactsScanner.anchoredArtifactDirectory(
+            candidate(artifact: claimed, originRoot: rootA),
+            rootAnchors: held, provider: provider
+        ) {
+        case .obstructed(let report):
+            XCTAssertTrue(
+                report.denials.contains {
+                    $0.detail.contains("not spelled inside the")
+                },
+                report.denials.map(\.detail).description
+            )
+        case .anchored(let anchor):
+            XCTAssertNotEqual(
+                anchor.identity, decoyIdentity,
+                "the descent anchored a DIFFERENT directory than the "
+                    + "candidate names — everything downstream (probe, token, "
+                    + "sizing) would describe the wrong tree"
+            )
+            XCTFail("a candidate outside its origin root must not anchor")
+        case .vanished:
+            XCTFail("the subject exists; this is not a vanish")
+        }
+
+        // (b) SHORTER than the root: the suffix is EMPTY, so an unguarded
+        // descent takes no step at all and hands back the ROOT itself.
+        switch BuildArtifactsScanner.anchoredArtifactDirectory(
+            candidate(artifact: dev, originRoot: rootA),
+            rootAnchors: held, provider: provider
+        ) {
+        case .obstructed:
+            break
+        case .anchored(let anchor):
+            XCTAssertNotEqual(
+                anchor.identity, devIdentity,
+                "an empty suffix anchored the dev ROOT as the artifact dir"
+            )
+            XCTFail("a candidate above its origin root must not anchor")
+        case .vanished:
+            XCTFail("the subject exists; this is not a vanish")
+        }
+
+        // (c) …and a candidate whose root was never anchored is refused too,
+        // never assumed.
+        switch BuildArtifactsScanner.anchoredArtifactDirectory(
+            candidate(artifact: claimed, originRoot: rootB),
+            rootAnchors: held, provider: provider
+        ) {
+        case .obstructed(let report):
+            XCTAssertTrue(
+                report.denials.contains {
+                    $0.detail.contains("no longer open for this scan")
+                },
+                report.denials.map(\.detail).description
+            )
+        case .anchored, .vanished:
+            XCTFail("an unanchored origin root is an obstruction")
+        }
+    }
+
     /// Retaining root anchors and descending to each candidate adds
     /// descriptors to a pass that had none, so its exit paths get the same
     /// treatment the probe's did: a WHOLE SCAN — success, replacement,
@@ -5425,6 +5961,81 @@ final class BuildArtifactsScannerTests: XCTestCase {
         )
         XCTAssertEqual(innerItem.state, .measured)
         XCTAssertGreaterThan(innerItem.allocatedBytes, 0)
+    }
+
+    /// THREAD C, the second reason an ancestor cannot reach its descendant.
+    /// The outer matched artifact dir is SEARCHABLE but UNREADABLE (mode
+    /// `0111`), so a separately configured root beneath it walks perfectly
+    /// well and finds an artifact of its own — while the outer's own sizing
+    /// can enumerate nothing and its removal can delete nothing past the
+    /// barrier. No mount separates them, so the boundary arm never fires, and
+    /// the lexical drop took the CLEANABLE inner candidate with it, leaving
+    /// only the undeletable outer row.
+    func testDescendantUnderAnUnreadableAncestorSurvivesTheAncestorDrop()
+        async throws
+    {
+        try XCTSkipIf(geteuid() == 0, "root ignores permission bits")
+
+        let outer = try makeProject(
+            at: dev.appendingPathComponent("proj"),
+            marker: "Cargo.toml", artifact: "target", payloadBytes: 8_192
+        )
+        let innerRoot = outer.appendingPathComponent("nested-root")
+        let inner = try makeProject(
+            at: innerRoot.appendingPathComponent("proj2"),
+            marker: "Cargo.toml", artifact: "target", payloadBytes: 16_384
+        )
+        // Searchable, unreadable: the ancestor's walk stops dead here while
+        // the inner root — reached by PATH, which needs only search — does not.
+        try chmod111(outer)
+
+        let outcome = try await runScan(
+            makeScanner(roots: [dev, innerRoot])
+        )
+
+        let outerItem = try XCTUnwrap(
+            item(outcome, at: outer),
+            "the unreadable outer artifact stays visible and classified"
+        )
+        XCTAssertEqual(outerItem.state, .denied,
+                       "an artifact dir that cannot be read is denied")
+        XCTAssertEqual(outerItem.allocatedBytes, 0,
+                       "…and therefore counted none of the inner bytes")
+
+        let innerItem = try XCTUnwrap(
+            item(outcome, at: inner),
+            "the inner artifact — under its OWN configured root, past a "
+                + "barrier the outer walk cannot cross — is cleanable and "
+                + "must survive the ancestor drop: \(itemPaths(outcome))"
+        )
+        XCTAssertEqual(innerItem.state, .measured)
+        XCTAssertGreaterThan(innerItem.allocatedBytes, 0)
+        XCTAssertEqual(innerItem.valuablesDisclosure?.probeComplete, true,
+                       "the inner tree is readable and proven clean")
+    }
+
+    /// The other half of the same rule: an ancestor that CAN reach its
+    /// descendant still drops it. Without this cell, "void the drop whenever
+    /// anything looks odd" would pass — the drop's double-count and
+    /// nested-deletion job has to survive intact for the ordinary readable
+    /// tree, which is the shape every real overlapping-root setup has.
+    func testReadableAncestorStillDropsItsDescendantCandidate() async throws {
+        let outer = try makeProject(
+            at: dev.appendingPathComponent("proj"),
+            marker: "Cargo.toml", artifact: "target", payloadBytes: 8_192
+        )
+        let innerRoot = outer.appendingPathComponent("nested-root")
+        let inner = try makeProject(
+            at: innerRoot.appendingPathComponent("proj2"),
+            marker: "Cargo.toml", artifact: "target", payloadBytes: 16_384
+        )
+
+        let outcome = try await runScan(makeScanner(roots: [dev, innerRoot]))
+
+        XCTAssertEqual(itemPaths(outcome), [identityPath(of: outer)],
+                       "the readable ancestor reaches — and would both count "
+                        + "and delete — the descendant, so the drop stands")
+        XCTAssertNil(item(outcome, at: inner))
     }
 
     // MARK: - fn-4.5 fixtures

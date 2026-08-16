@@ -1109,7 +1109,7 @@ final class SpaceScannerIntegrationTests: XCTestCase {
         let provider = FileSystemIdentityProvider()
         let truncated = BuildArtifactsScanner(
             home: fixtureHome, devRoots: devRoots([dev]), provider: provider,
-            valuablesProbeEntryLimit: 1
+            valuablesProbeBudget: .fixed(1)
         )
         let runtime = try SpaceScannerRuntime(
             scanners: [

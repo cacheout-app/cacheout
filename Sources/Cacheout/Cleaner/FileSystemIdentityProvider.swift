@@ -202,6 +202,27 @@ class FileSystemIdentityProvider {
         return mountedOn == url.path
     }
 
+    /// Can this directory's ENTRIES be read — i.e. would a walk that reached
+    /// it be able to enumerate what is inside?
+    ///
+    /// Asked by ATTEMPTING THE OPEN, never by `access(2)`: `access` consults
+    /// the mode bits and misses ACLs, and the question here is exactly "would
+    /// the enumeration succeed", not "do the permission bits suggest it
+    /// would". A directory with mode `0111` is SEARCHABLE (paths through it
+    /// resolve, so a root configured beneath it opens fine) while its own
+    /// entries are unreadable — the split this exists to see.
+    ///
+    /// This is a DISPLAY-LAYER question only (the candidate dedupe's
+    /// ancestor drop). It never authorizes anything: every candidate that
+    /// survives the drop is still re-proven by the containment descent, the
+    /// sizer, the valuables probe, and the delete-time revalidator.
+    func canEnumerateDirectory(_ url: URL) -> Bool {
+        let fd = open(url.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+        guard fd >= 0 else { return false }
+        close(fd)
+        return true
+    }
+
     /// Errno-aware kind probe result: distinguishes "nothing there" (the
     /// callers' silent-skip case) from a real metadata failure that must be
     /// recorded, never swallowed (D6).

@@ -1638,11 +1638,33 @@ struct CLIHandler {
                     row["acknowledgement_token"] = token
                 }
             } else {
-                row["acknowledgement_note"] = incompleteProbePlanNote
+                row["acknowledgement_note"] = incompleteProbeNote(
+                    for: disclosure.incompleteness
+                )
             }
         }
         return row
     }
+
+    /// The plan/dry-run note for THIS item's incompleteness CAUSE. The two
+    /// causes end differently, so they may not print one remedy: an
+    /// obstruction is cleared by fixing it and re-scanning, while an entry
+    /// budget derived from the tree's own exhaustive census is only reached
+    /// by a tree that is still changing — and "re-scan" is the advice that
+    /// cannot work for it.
+    static func incompleteProbeNote(
+        for cause: ValuablesDisclosure.ProbeIncompleteness?
+    ) -> String {
+        cause == .entryBudget ? growingTreePlanNote : incompleteProbePlanNote
+    }
+
+    /// The note for a tree that outgrew its own census mid-inspection.
+    static let growingTreePlanNote =
+        "the release-artifact inspection ran out of its entry budget at scan "
+        + "time — this directory is changing faster than it can be read — so "
+        + "no acknowledgement token exists for this item; a confirmed run "
+        + "re-inspects it immediately before deletion and refuses until an "
+        + "inspection completes; retry when it settles"
 
     /// The plan/dry-run note for an item whose scan-time valuables probe
     /// could not finish: no token exists for it on ANY surface, and a

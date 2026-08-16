@@ -17,7 +17,7 @@
 /// CANNOT drift, because there is only one bound.
 ///
 /// ## Fail closed, always
-/// A probe that could not finish (entry budget exhausted, unreadable branch,
+/// A probe that could not finish (entry budget spent, unreadable branch,
 /// a mount boundary left uncrossed, unreadable metadata, an undecodable
 /// basename, a bundle whose bounded subtree sizing truncated) is INCOMPLETE.
 /// An incomplete probe has the SAME consequence as a hit: risk forced off
@@ -118,22 +118,28 @@
 /// unclean-able, and it is CLEARABLE in the way a depth cap never was —
 /// unmount the volume and the next scan probes the tree whole.
 ///
-/// ## ONE budget, and NO depth cap (PR #457 review)
+/// ## ONE budget, PROPORTIONATE, and no depth cap (PR #457 review r7)
 /// The shared ENTRY budget is the probe's only bound, and it alone guarantees
 /// termination: every directory the walk descends into cost one entry to
 /// discover, so at most `entryLimit` directories are ever popped — true even
 /// of a hypothetical directory cycle. A fixed depth cap therefore bounded
-/// nothing the budget did not already bound. What it DID do was manufacture
-/// INCOMPLETE verdicts on ordinary artifact trees, and those verdicts were
-/// unescapable: a depth boundary is DETERMINISTIC, so every re-scan and every
-/// delete-time re-probe reproduced it, while an incomplete probe is tokenless
-/// — the GUI filtered the item out and the revalidator refused it forever,
-/// and the "re-scan and retry" guidance every surface prints could not
-/// possibly help. Real trees crossed eight levels constantly (this repo's own
-/// `.build` nests thirteen deep, well inside the entry budget), so the cap
-/// stranded exactly the build directories this scanner exists to reclaim.
-/// Depth is now spent FROM the one budget: a tree the budget can afford is
-/// PROVEN, and only a tree it genuinely cannot afford stays unproven.
+/// nothing the budget did not already bound, while manufacturing INCOMPLETE
+/// verdicts on ordinary artifact trees that no re-scan could clear.
+///
+/// The FIXED budget that outlived it had the same shape and the same effect,
+/// one size larger: measured on this machine it fired on `node_modules` up to
+/// 44,468 entries and `.build` up to 53,924, against a 20,000-entry cap. So
+/// the bound is now PROPORTIONATE to its subject — see `ValuablesProbeBudget`
+/// — and a tree this pass can enumerate at all is a tree the probe can prove.
+/// Budget exhaustion survives only as what it should always have been: the
+/// non-deterministic, retry-clearable case of a tree that is still growing.
+///
+/// The probe is INCOMPLETE for two separately reported REASONS
+/// (`ValuablesDisclosure.ProbeIncompleteness`), because they clear
+/// differently: an ENTRY BUDGET is cleared by a bigger one (which the policy
+/// grants automatically from the subject's own census), an OBSTRUCTION only
+/// by removing the impediment. When both stop one walk the OBSTRUCTION is
+/// reported — it is the one no escalation can help.
 ///
 /// ## Determinism contract (deliberately NARROW under truncation)
 /// For a COMPLETE probe the output is fully deterministic: every directory
@@ -272,6 +278,44 @@ struct ValuablesDisclosure: Equatable, Sendable {
     /// False when the bounded inspection could not finish — see the file
     /// header's fail-closed rule.
     let probeComplete: Bool
+    /// WHY it could not finish — nil exactly when it did.
+    ///
+    /// Two causes with two different remedies, and flattening them into one
+    /// message (or one class) is what made "re-scan and retry" the printed
+    /// advice for a condition no retry could ever change. See
+    /// `ProbeIncompleteness`.
+    let incompleteness: ProbeIncompleteness?
+
+    /// Why a bounded inspection stopped short. The question that separates
+    /// them is the house one: *can a retry, unaided, change this?*
+    enum ProbeIncompleteness: Equatable, Sendable {
+        /// The ENTRY BUDGET ran out, and nothing else went wrong. The tree is
+        /// bigger than the bound it was granted, so a bigger bound — which
+        /// the census-proportionate policy grants automatically from the
+        /// subject's own exhaustive count — is exactly what changes it.
+        case entryBudget
+        /// Something the probe could not read, characterise, decode, or
+        /// cross: an unreadable branch, a mount boundary, an undecodable
+        /// basename, a descriptor that could not be re-anchored, metadata
+        /// outside the pinned value domains. A bigger budget cannot help;
+        /// fixing the impediment can.
+        case obstruction
+    }
+
+    /// The memberwise init, made TOTAL: an unfinished probe ALWAYS names a
+    /// cause, and the default is the conservative one (an obstruction never
+    /// escalates a budget), so no caller can construct a disclosure that is
+    /// incomplete for no stated reason.
+    init(
+        valuables: [DetectedValuable],
+        probeComplete: Bool,
+        incompleteness: ProbeIncompleteness? = nil
+    ) {
+        self.valuables = valuables
+        self.probeComplete = probeComplete
+        self.incompleteness = probeComplete
+            ? nil : (incompleteness ?? .obstruction)
+    }
 
     /// The probe result that forces nothing: nothing found, inspection
     /// finished.
@@ -279,8 +323,10 @@ struct ValuablesDisclosure: Equatable, Sendable {
 
     /// The fail-closed result of an inspection that could not even begin:
     /// nothing disclosed, and nothing PROVEN — unauthorizable and tokenless.
+    /// An OBSTRUCTION by construction: an inspection that never started did
+    /// not run out of budget.
     static let incomplete = ValuablesDisclosure(
-        valuables: [], probeComplete: false
+        valuables: [], probeComplete: false, incompleteness: .obstruction
     )
 
     /// Does this disclosure force the item off safe, force selection false,
@@ -349,6 +395,84 @@ struct ValuablesDisclosure: Equatable, Sendable {
     }
 }
 
+// MARK: - ValuablesProbeBudget
+
+/// The probe's ENTRY BOUND POLICY — ONE value per scanner, consumed by BOTH
+/// of its faces, so the scan-time and delete-time bounds cannot drift.
+///
+/// ## Why a policy and not a constant (PR #457 review r7)
+/// A FIXED entry cap is deterministic, and a deterministic bound that makes a
+/// probe incomplete strands its item FOREVER: an incomplete probe is tokenless
+/// on every surface, the GUI filters it out of the confirmation clean set, the
+/// CLI can never obtain the token the identical bounded revalidation demands,
+/// and re-scanning an unchanged tree exhausts in exactly the same place. That
+/// is the defect the retired depth cap had; the 20,000-entry cap that survived
+/// it had the same shape, and MEASURED ON THIS MACHINE it fired on exactly the
+/// trees this scanner exists to reclaim — `node_modules` up to 44,468 entries,
+/// `.build` up to 53,924, a `venv` at 33,552, with five of twenty-five sampled
+/// `node_modules` and three of thirteen `.build` trees over the cap.
+///
+/// So the bound stops being a constant and becomes PROPORTIONATE to its
+/// subject: the probe is granted twice the entries an EXHAUSTIVE enumeration
+/// of that very tree just cost (`SizeReport.enumeratedEntries`). For a static
+/// tree the budget therefore cannot run out — budget exhaustion stops being an
+/// event at all, which is the honest end state for a bound nothing could
+/// clear. What CAN still exhaust it is a tree that grew between the census and
+/// the probe, and that is the clearable case by construction: it is not
+/// deterministic, and a retry over a tree that stopped growing completes.
+///
+/// The bound still exists, and still guarantees termination: the probe's total
+/// work is capped at twice what an enumeration of the same subject already
+/// cost in the same pass. Raising it costs nothing that pass was not already
+/// paying — `DirectorySizer.measure` walks the identical tree with
+/// `FileManager.enumerator` and NO cap (and at strictly higher cost per entry),
+/// and the deletion that follows unlinks every entry — so the probe was never
+/// the pass's cost driver at any cap.
+enum ValuablesProbeBudget: Equatable, Sendable {
+    /// PRODUCTION. At least `floor` entries, raised to `slackFactor ×` the
+    /// subject's own exhaustive census whenever that is larger.
+    case censusProportionate(floor: Int)
+    /// A FIXED bound, never escalated. The delete-time first pass runs at the
+    /// floor this way, and the fail-closed truncation cells are proven with
+    /// it — an explicitly pinned bound is honored verbatim.
+    case fixed(Int)
+
+    /// Twice the census. The census is exact for a static tree, so the factor
+    /// is pure slack: it covers entries created between the two walks and the
+    /// small census differences two enumerators can have at a boundary.
+    static let slackFactor = 2
+
+    /// The bound to spend when no census is available yet (the delete-time
+    /// first pass).
+    var firstPass: Int {
+        switch self {
+        case .censusProportionate(let floor): return floor
+        case .fixed(let limit): return limit
+        }
+    }
+
+    /// The bound to spend for a subject whose exhaustive census is `census`.
+    /// Never below `firstPass`; SATURATING rather than trapping, because the
+    /// census is filesystem-supplied.
+    func limit(census: Int) -> Int {
+        switch self {
+        case .fixed(let limit):
+            return limit
+        case .censusProportionate(let floor):
+            let (scaled, overflow) = census
+                .multipliedReportingOverflow(by: Self.slackFactor)
+            return max(floor, overflow ? Int.max : scaled)
+        }
+    }
+
+    /// The bound a SECOND pass should spend, or nil when a second pass could
+    /// not read one entry more than the first already did.
+    func escalation(census: Int) -> Int? {
+        let escalated = limit(census: census)
+        return escalated > firstPass ? escalated : nil
+    }
+}
+
 // MARK: - ValuablesDetector
 
 /// The detection rules and the ONE bounded probe core.
@@ -381,17 +505,25 @@ enum ValuablesDetector {
 
     // MARK: The pinned cap (shared by scan time AND delete time)
 
-    /// The PRODUCTION probe cap — ONE definition, consumed by the scanner's
+    /// The PRODUCTION probe FLOOR — ONE definition, consumed by the scanner's
     /// init default AND by the delete-time entry point
     /// (`BuildArtifactsScanner.preDeleteValuablesProbe`), so the two
     /// inspections' bounds can never drift apart (the
     /// `OrphanedCachesScanner.swift:193` doctrine).
     ///
-    /// This is the GLOBAL bound on the probe's total work AND the sole
-    /// guarantee that it terminates — it is shared across the outer walk and
-    /// every bundle's subtree sizing, so the whole probe visits at most this
-    /// many directory entries however deep the tree runs (see the file
-    /// header on why there is no second, depth-shaped bound).
+    /// A FLOOR, not a cap (review r7): the production policy raises it to
+    /// twice the subject's own exhaustive census whenever that is larger, so
+    /// this value only decides how much work a probe may do BEFORE anyone has
+    /// counted the tree. It is sized to cover an ordinary artifact dir
+    /// outright — measured on this machine, 20 of 25 sampled `node_modules`
+    /// and 10 of 13 `.build` trees finish inside it — so the escalation is
+    /// the exception, not the path.
+    ///
+    /// Whatever bound is in force is GLOBAL to one probe and is the sole
+    /// guarantee that it terminates: it is shared across the outer walk and
+    /// every bundle's subtree sizing, so the whole probe visits at most that
+    /// many directory entries however deep the tree runs (see the file header
+    /// on why there is no second, depth-shaped bound).
     static let defaultProbeEntryLimit = 20_000
 
     // MARK: The ONE bounded probe core
@@ -554,7 +686,8 @@ enum ValuablesDetector {
                 $0.canonicalIdentityPath.utf8
                     .lexicographicallyPrecedes($1.canonicalIdentityPath.utf8)
             },
-            probeComplete: walk.complete
+            probeComplete: walk.complete,
+            incompleteness: walk.incompleteness
         )
     }
 
@@ -725,6 +858,34 @@ enum ValuablesDetector {
         var found: [DetectedValuable] = []
         var sizing: BundleSizing?
         var aborted = false
+        /// Did the ENTRY BUDGET stop this walk anywhere?
+        var budgetExhausted = false
+        /// Did anything OTHER than the budget stop it anywhere?
+        var obstructed = false
+
+        /// The ONE incompleteness verdict, or nil for a finished walk.
+        ///
+        /// An obstruction WINS over budget exhaustion whenever both happened:
+        /// the causes differ in what clears them, and a bigger budget cannot
+        /// clear an unreadable branch. Reporting the escalatable cause while
+        /// an unescalatable one is also present would send a caller (and the
+        /// user) chasing a second pass that must fail identically.
+        var incompleteness: ValuablesDisclosure.ProbeIncompleteness? {
+            if complete { return nil }
+            if obstructed { return .obstruction }
+            return budgetExhausted ? .entryBudget : .obstruction
+        }
+
+        /// Record an incompleteness with its CAUSE. Every `complete = false`
+        /// in this walk goes through here, so no arm can add a cause-less
+        /// refusal.
+        mutating func fail(_ cause: ValuablesDisclosure.ProbeIncompleteness) {
+            complete = false
+            switch cause {
+            case .entryBudget: budgetExhausted = true
+            case .obstruction: obstructed = true
+            }
+        }
 
         init(
             provider: FileSystemIdentityProvider,
@@ -767,7 +928,7 @@ enum ValuablesDetector {
                     if i >= 1, frames[i - 1].dir == nil {
                         guard reacquire(index: i - 1, from: frames[i].dir!)
                         else {
-                            complete = false
+                            fail(.obstruction)
                             aborted = true
                             break walk
                         }
@@ -798,22 +959,26 @@ enum ValuablesDetector {
         mutating func enumerate(index: Int) {
             let remaining = entryLimit - visited
             guard remaining > 0 else {
-                complete = false
+                fail(.entryBudget)
                 aborted = true
                 return
             }
             guard let dir = frames[index].dir else {
-                complete = false
+                fail(.obstruction)
                 return
             }
             guard let read = ValuablesDetector.boundedChildNames(
                 parentFD: dir.fd, limit: remaining, provider: provider
             ) else {
                 // Unreadable branch: absence of valuables is UNPROVEN.
-                complete = false
+                fail(.obstruction)
                 return
             }
-            if read.truncated { complete = false }
+            // The two ways ONE directory read can come up short, kept apart:
+            // entries left unread because the budget ended, versus a read that
+            // FAILED or produced a name that could not be decoded.
+            if read.budgetTruncated { fail(.entryBudget) }
+            if read.obstructed { fail(.obstruction) }
             // Sorting a slice bounded by the REMAINING budget, never a whole
             // million-entry build directory.
             let names = read.names
@@ -824,7 +989,7 @@ enum ValuablesDetector {
 
             for name in names {
                 guard visited < entryLimit else {
-                    complete = false
+                    fail(.entryBudget)
                     aborted = true
                     return
                 }
@@ -833,7 +998,7 @@ enum ValuablesDetector {
                 // entirely (measured). `readdir` cannot produce one; this
                 // makes a future refactor a refusal instead of a hole.
                 guard FileSystemIdentityProvider.isSafeComponent(name) else {
-                    complete = false
+                    fail(.obstruction)
                     continue
                 }
                 let logical = frames[index].logicalURL
@@ -860,7 +1025,7 @@ enum ValuablesDetector {
                     // Vanished mid-probe — the ordinary benign race.
                     break
                 case .failed:
-                    complete = false
+                    fail(.obstruction)
                 }
             }
             ValuablesDetector.testHook?(
@@ -894,7 +1059,7 @@ enum ValuablesDetector {
             guard let metadata else {
                 // Metadata we cannot describe is a valuable we cannot
                 // describe — fail closed rather than skip silently.
-                complete = false
+                fail(.obstruction)
                 return
             }
             guard metadata.allocatedBytes >= minimumAllocatedBytes else {
@@ -920,7 +1085,7 @@ enum ValuablesDetector {
             guard let metadata else {
                 // A bundle we cannot describe is never disclosed and never
                 // sized: its size would enter a token preimage.
-                complete = false
+                fail(.obstruction)
                 frames[index].pending.removeLast()
                 return
             }
@@ -931,7 +1096,7 @@ enum ValuablesDetector {
 
         mutating func descend(name: String, from index: Int) {
             guard let parent = frames[index].dir else {
-                complete = false
+                fail(.obstruction)
                 aborted = true
                 return
             }
@@ -951,12 +1116,12 @@ enum ValuablesDetector {
                 // live build directory incomplete. Everything else — ENOTDIR
                 // (the name is no longer a directory: swapped for a symlink,
                 // swapped for a file, or raced), EACCES, EMFILE — is unproven.
-                if code != ENOENT { complete = false }
+                if code != ENOENT { fail(.obstruction) }
                 return
             }
             guard let child = SecureDirectory(fd: fd, provider: provider)
             else {
-                complete = false
+                fail(.obstruction)
                 return
             }
             // The corroborator. Sound now in a way it never was before: the
@@ -967,13 +1132,13 @@ enum ValuablesDetector {
             guard let vetted = frames[index].vetted[name],
                   child.identity == vetted
             else {
-                complete = false
+                fail(.obstruction)
                 return
             }
             guard !crossesMountBoundary(child: child, logical: logical) else {
                 // We did not look past it: unproven, exactly like an
                 // unreadable branch.
-                complete = false
+                fail(.obstruction)
                 return
             }
 
@@ -1001,7 +1166,11 @@ enum ValuablesDetector {
         private mutating func finishBundle() {
             guard let bundle = sizing else { return }
             sizing = nil
-            if !bundle.complete { complete = false }
+            // A bundle sizing that failed on METADATA (or an
+            // unrepresentable sum) is an obstruction; a bundle the BUDGET cut
+            // short never sets this flag — that arm already recorded the
+            // budget as the cause where it happened.
+            if !bundle.complete { fail(.obstruction) }
             guard bundle.total >= minimumAllocatedBytes else { return }
             found.append(ValuablesDetector.valuable(
                 name: bundle.name, at: bundle.logicalURL, provider: provider,
@@ -1105,9 +1274,13 @@ enum ValuablesDetector {
     /// directory URL. `.` and `..` are skipped; hidden entries are INCLUDED
     /// (a `.dmg` in a dot-directory is still a release artifact).
     ///
-    /// `truncated` means the enumeration is NOT PROVEN EXHAUSTED — more
-    /// entries remained, a `readdir` failed, or an entry's name could not be
-    /// decoded. Every one of those makes the probe incomplete.
+    /// The enumeration is NOT PROVEN EXHAUSTED in two SEPARATELY REPORTED
+    /// ways, because they have different remedies (the caller maps them to
+    /// `ProbeIncompleteness` verbatim): `budgetTruncated` means entries
+    /// remained that the granted budget could not read — a bigger budget
+    /// reads them — while `obstructed` means a `readdir` FAILED or an entry's
+    /// name could not be decoded, which no budget can fix. Either one makes
+    /// the probe incomplete.
     ///
     /// UNDECODABLE NAMES FAIL CLOSED: `String(validatingCString:)`, never
     /// `String(cString:)`. A repairing decode would substitute U+FFFD, and
@@ -1128,7 +1301,7 @@ enum ValuablesDetector {
     /// `closedir` closes only this handle; the caller's anchor survives.
     private static func boundedChildNames(
         parentFD: Int32, limit: Int, provider: FileSystemIdentityProvider
-    ) -> (names: [String], truncated: Bool)? {
+    ) -> (names: [String], budgetTruncated: Bool, obstructed: Bool)? {
         let enumerationFD = provider.openSelfForEnumeration(parentFD)
         guard enumerationFD >= 0 else { return nil }
         guard let handle = fdopendir(enumerationFD) else {
@@ -1139,13 +1312,14 @@ enum ValuablesDetector {
         // `parentFD` is a DIFFERENT description and is untouched.
         defer { closedir(handle) }
         var names: [String] = []
-        var truncated = false
+        var budgetTruncated = false
+        var obstructed = false
         while true {
             // `readdir` returns nil for BOTH end-of-stream and error; errno
             // is the only discriminator, so it is cleared before each call.
             errno = 0
             guard let entry = readdir(handle) else {
-                if errno != 0 { truncated = true }
+                if errno != 0 { obstructed = true }
                 break
             }
             let decoded = withUnsafeBytes(of: entry.pointee.d_name) {
@@ -1155,17 +1329,17 @@ enum ValuablesDetector {
                 return decodedBasename(fromCString: base)
             }
             guard let name = decoded, !name.isEmpty else {
-                truncated = true
+                obstructed = true
                 break
             }
             if name == "." || name == ".." { continue }
             guard names.count < limit else {
-                truncated = true
+                budgetTruncated = true
                 break
             }
             names.append(name)
         }
-        return (names, truncated)
+        return (names, budgetTruncated, obstructed)
     }
 
     /// The VALIDATING basename decode, factored out so the fail-closed policy

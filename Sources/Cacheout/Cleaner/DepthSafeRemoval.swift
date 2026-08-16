@@ -347,6 +347,20 @@ enum DepthSafeRemoval {
                 path: displayPath, cause: .mountBoundary, depth: 0
             )
         }
+        // LAYER TWO, AND STATED RATHER THAN IMPLIED (PR #458 review — the
+        // guard census). This arm alone is UNEVIDENCED: replacing the
+        // refusal with any fallback leaves the suite green, because the
+        // proof it feeds asks about the SAME inode one syscall later —
+        // `proveContainment` opens `current/..`, which IS the parent, and
+        // refuses `.unprovableLocation` on the identical unreadable answer.
+        // What IS evidenced is the pair: deleting this arm together with the
+        // proof it guards fails
+        // `testRefusesWhenAnIdentityCannotBeRead` (case 1), and so does
+        // breaking `proveContainment`'s own arm (case 3). It stays because
+        // reading the parent's identity BEFORE opening `..` says what is
+        // wrong at the level it is wrong at, and because a value the next
+        // line needs should not be produced by an optional the next line
+        // silently reinterprets.
         guard let parentIdentity = provider.identity(ofDescriptor: parentFd)
         else {
             throw Failure(
@@ -473,6 +487,20 @@ enum DepthSafeRemoval {
             let up = openat(current, "..", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
             close(current)
             current = up
+            // LAYER TWO, AND STATED (PR #458 review — the guard census).
+            // Deleting this arm leaves the suite green: `up` is then `-1`,
+            // `identity(ofDescriptor: -1)` fails, and the comparison below
+            // refuses `.relocated`. So the SAFETY is carried by that
+            // comparison (evidenced by the three relocation tests) and this
+            // arm buys the honest sentence — an ascent that could not open
+            // `..` at all reports ITS errno instead of accusing the user's
+            // filesystem of a rename that did not happen. Unlike its twin in
+            // `proveContainment`, which
+            // `testAContainmentProofThatCannotOpenDotDotKeepsItsErrno`
+            // reaches with a real `chmod(2)`, this one has no seam: between
+            // the proof on the way down and this open on the way up the
+            // traversal asks the provider nothing, so no injectable fixture
+            // can make the same directory readable then and unreadable now.
             guard up >= 0 else {
                 throw Failure(
                     path: displayPath, cause: .posix(errno), depth: depth
@@ -610,6 +638,17 @@ enum DepthSafeRemoval {
             case UInt8(DT_UNKNOWN):
                 // Not every filesystem fills `d_type` in (a userland one need
                 // not), so ask — no-follow, against THIS held descriptor.
+                //
+                // UNEVIDENCED, AND THAT IS DISCLOSED RATHER THAN IMPLIED
+                // (PR #458 review — the guard census): no filesystem the
+                // tests can create returns `DT_UNKNOWN`, so deleting this
+                // arm leaves the suite green — measured. Its absence is not
+                // a safety hole in the destructive direction: a directory
+                // classified as a leaf is handed to `unlinkat` WITHOUT
+                // `AT_REMOVEDIR`, which cannot remove a directory (measured:
+                // `EPERM`), so the removal would REFUSE rather than delete
+                // anything unintended. What it costs is the ability to
+                // delete at all on such a filesystem.
                 var st = stat()
                 guard fstatat(fd, name, &st, AT_SYMLINK_NOFOLLOW) == 0 else {
                     if errno == ENOENT { continue }

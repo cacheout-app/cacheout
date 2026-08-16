@@ -791,6 +791,51 @@ final class DepthSafeRemovalTests: XCTestCase {
         XCTAssertTrue(exists(precious), "and never through it")
     }
 
+    /// Only `ENOTDIR` means "this is a leaf". Every other open failure keeps
+    /// its own errno instead of being re-answered by a syscall that was
+    /// never asked the question.
+    ///
+    /// The kind gate being the open means the open's errno is now the KIND
+    /// ANSWER, and exactly one code says "not a directory". Letting the rest
+    /// fall through to the leaf `unlinkat` would report an unreadable
+    /// directory as `EPERM` ("Operation not permitted", which is what
+    /// `unlink` says about any directory) instead of `EACCES` ("Permission
+    /// denied") — a remedy the user cannot act on, for a condition that is
+    /// cleared by a `chmod`. Nothing is destroyed either way; the guard buys
+    /// the honest sentence.
+    func testAnOpenFailureThatIsNotENOTDIRKeepsItsOwnErrno() throws {
+        let target = base.appendingPathComponent("unreadable-directory")
+        try mkdir(target)
+        try fm.setAttributes([.posixPermissions: 0o000],
+                             ofItemAtPath: target.path)
+        defer {
+            try? fm.setAttributes([.posixPermissions: 0o755],
+                                  ofItemAtPath: target.path)
+        }
+        let probe = target.withUnsafeFileSystemRepresentation { path -> Int32 in
+            guard let path else { return -1 }
+            return open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+        }
+        if probe >= 0 {
+            close(probe)
+            throw XCTSkip("this process can open a 000 directory (root?)")
+        }
+
+        XCTAssertThrowsError(
+            try DepthSafeRemoval.remove(
+                at: target, expecting: nil,
+                provider: FileSystemIdentityProvider()
+            )
+        ) { error in
+            XCTAssertEqual(
+                (error as? DepthSafeRemoval.Failure)?.cause, .posix(EACCES),
+                "an unreadable directory is a permission problem, not "
+                    + "'Operation not permitted': "
+                    + error.localizedDescription
+            )
+        }
+    }
+
     // MARK: - Unprovable location
 
     /// Blinds `mountIdentity(ofDescriptor:)` for ONE chosen inode — the
@@ -810,8 +855,75 @@ final class DepthSafeRemovalTests: XCTestCase {
         }
     }
 
+    /// Blinds `identity(ofDescriptor:)` for ONE chosen inode, after letting
+    /// `answerFirst` questions about it through.
+    ///
+    /// The delay is what makes the LAST arm reachable: the traversal asks
+    /// about the same inode twice per descent — once as the directory it is
+    /// standing in, once as the `..` a containment proof lands on — and an
+    /// `fstat` that worked a moment ago and fails now is exactly what an I/O
+    /// error looks like.
+    private final class UnprovableIdentityProvider: FileSystemIdentityProvider {
+        var blindInode: UInt64?
+        var answerFirst = 0
+        private var seen = 0
+
+        override func identity(ofDescriptor descriptor: Int32) -> Identity? {
+            let real = super.identity(ofDescriptor: descriptor)
+            guard let blindInode, real?.inode == blindInode else { return real }
+            seen += 1
+            return seen > answerFirst ? nil : real
+        }
+    }
+
+    /// AN IDENTITY THAT CANNOT BE READ IS NOT A MATCH, at every place the
+    /// traversal asks for one.
+    ///
+    /// Each of these arms guards a different question — the held parent's
+    /// own identity, the identity a descent is about to be proven against,
+    /// and the identity `..` landed on — and each of them decides whether a
+    /// destructive pass runs. Answering "unreadable" with anything other
+    /// than a refusal means unlinking by name inside a directory nobody can
+    /// place. `fstat` failing on a held descriptor is rare, which is
+    /// precisely why it needs a test rather than an assumption.
+    func testRefusesWhenAnIdentityCannotBeRead() throws {
+        // `answerFirst` selects WHICH arm fires; the fixture asserts the
+        // content that arm is standing in front of.
+        let cases: [(name: String, blind: String, answerFirst: Int, depth: Int)] = [
+            ("the held parent's identity", "parent", 0, 0),
+            ("the directory a descent is proven against", "target", 0, 0),
+            ("the identity `..` landed on", "target", 1, 1),
+        ]
+        for (label, blind, answerFirst, depth) in cases {
+            let target = base.appendingPathComponent("unreadable-\(label.hashValue)")
+            let child = target.appendingPathComponent("child")
+            try mkdir(child)
+            let precious = child.appendingPathComponent("keep.bin")
+            try write(precious, bytes: 2048)
+
+            let provider = UnprovableIdentityProvider()
+            provider.blindInode = try inode(of: blind == "parent" ? base : target)
+            provider.answerFirst = answerFirst
+
+            XCTAssertThrowsError(
+                try DepthSafeRemoval.remove(
+                    at: target, expecting: nil, provider: provider
+                ), label
+            ) { error in
+                let failure = error as? DepthSafeRemoval.Failure
+                XCTAssertEqual(failure?.cause, .unprovableLocation, label)
+                XCTAssertEqual(failure?.depth, depth, label)
+            }
+            XCTAssertTrue(
+                exists(precious),
+                "\(label): a subtree whose location cannot be proven must "
+                    + "not be emptied"
+            )
+        }
+    }
+
     /// A mount question that cannot be answered REFUSES — on both sides of
-    /// the root's comparison.
+    /// the root's comparison, and again at every child.
     ///
     /// The root's boundary proof is `parent == root`, and an unreadable
     /// answer on EITHER side leaves it unproven. Falling through to the
@@ -820,16 +932,19 @@ final class DepthSafeRemovalTests: XCTestCase {
     /// question about it errored is the worst possible reading of the R15
     /// doctrine. Unprovable ⇒ refused, nothing destroyed.
     func testRefusesWhenAMountIdentityCannotBeRead() throws {
-        for blinded in ["parent", "root"] {
+        for blinded in ["parent", "root", "child"] {
             let target = base.appendingPathComponent("unprovable-\(blinded)")
-            try mkdir(target.appendingPathComponent("nested"))
-            let precious = target.appendingPathComponent("nested/keep.bin")
+            let nested = target.appendingPathComponent("nested")
+            try mkdir(nested)
+            let precious = nested.appendingPathComponent("keep.bin")
             try write(precious, bytes: 2048)
 
             let provider = UnprovableMountProvider()
-            provider.blindInode = try inode(
-                of: blinded == "parent" ? base : target
-            )
+            switch blinded {
+            case "parent": provider.blindInode = try inode(of: base)
+            case "root": provider.blindInode = try inode(of: target)
+            default: provider.blindInode = try inode(of: nested)
+            }
 
             XCTAssertThrowsError(
                 try DepthSafeRemoval.remove(
@@ -850,6 +965,51 @@ final class DepthSafeRemovalTests: XCTestCase {
                           "nothing may be unlinked on an unproven volume "
                               + "(\(blinded))")
         }
+    }
+
+    /// A containment proof whose `..` cannot be OPENED is a posix failure
+    /// with its own code — not "unprovable", and not containment.
+    ///
+    /// The two are different remedies: `EACCES` here is cleared by a
+    /// `chmod`, while `.unprovableLocation` tells the user nothing they can
+    /// act on. Driven with a REAL `chmod(2)` on the held parent, fired at
+    /// the instant the child is open and about to be proven — which is the
+    /// only way this arm is reachable, since the same permission that stops
+    /// `..` opening now would have stopped it a moment earlier.
+    func testAContainmentProofThatCannotOpenDotDotKeepsItsErrno() throws {
+        let target = base.appendingPathComponent("unopenable-parent")
+        let child = target.appendingPathComponent("child")
+        try mkdir(child)
+        try write(child.appendingPathComponent("keep.bin"))
+        let restore = { [fm] in
+            try? fm.setAttributes([.posixPermissions: 0o755],
+                                  ofItemAtPath: target.path)
+        }
+        defer { restore() }
+
+        let provider = FirstDescentHook()
+        provider.watched = [try inode(of: child)]
+        provider.onFirstDescent = { [fm] _ in
+            try? fm.setAttributes([.posixPermissions: 0o000],
+                                  ofItemAtPath: target.path)
+        }
+
+        XCTAssertThrowsError(
+            try DepthSafeRemoval.remove(
+                at: target, expecting: nil, provider: provider
+            )
+        ) { error in
+            let failure = error as? DepthSafeRemoval.Failure
+            if failure?.cause == .posix(EPERM) || failure?.cause == nil {
+                return XCTFail("unexpected: \(error)")
+            }
+            XCTAssertEqual(failure?.cause, .posix(EACCES),
+                           error.localizedDescription)
+        }
+        XCTAssertNotNil(provider.firedFor, "the fixture never fired")
+        restore()
+        XCTAssertTrue(exists(child.appendingPathComponent("keep.bin")),
+                      "an unproven child must not be emptied")
     }
 
     // MARK: - Residual #1, MEASURED

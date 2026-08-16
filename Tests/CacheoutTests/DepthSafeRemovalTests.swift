@@ -792,6 +792,52 @@ final class DepthSafeRemovalTests: XCTestCase {
         XCTAssertTrue(exists(precious), "and never through it")
     }
 
+    /// THIS TEST PINS A RESIDUAL, NOT A GUARANTEE — the one the verdict TYPE
+    /// cannot express (PR #458 review — the non-directory half).
+    ///
+    /// `.noDirectoryTree` says "there was no directory tree of ours at that
+    /// name". It says NOTHING about which non-directory was there, or whether
+    /// anything was there at all, so a probe that saw an ABSENCE and a
+    /// deletion that finds a stranger's file both satisfy it — the kernel's
+    /// `unlinkat`-without-`AT_REMOVEDIR` refuses only a DIRECTORY appearing
+    /// there (`testRefusesADirectoryStandingWhereNoTreeWasInspected` above),
+    /// which is a kind check, not an identity one. Measured here: the probe
+    /// saw nothing, a file appeared, and it is unlinked with success
+    /// reported.
+    ///
+    /// WHAT CLOSES IT is a shape this file cannot introduce alone, because
+    /// the type is `PreDeleteInspectedObject` in `SpaceScanner.swift` and its
+    /// producer is `OrphanedCachesScanner.swift:1421`: split the case into an
+    /// ABSENCE (`case absent`) and an OBSERVED leaf carrying its identity
+    /// (`case nonDirectoryLeaf(FileSystemIdentityProvider.Identity)`, from
+    /// the `fstatat` the probe already has at hand), then both disposals bind
+    /// to the actual probe result — this one with `fstatat(parentFd, leaf,
+    /// AT_SYMLINK_NOFOLLOW)` before the `unlinkat`, and `TrashDisposal.prove`
+    /// with the sighting it already takes. Until then this is the honest
+    /// scope, and this test goes RED when the shape lands.
+    func testANonDirectoryVerdictCannotTellAbsenceFromAReplacement() throws {
+        let target = base.appendingPathComponent("was-absent")
+        XCTAssertFalse(exists(target), "fixture: the probe saw an absence")
+
+        // The window: something else appears at that name before the
+        // deletion runs. Nobody inspected THIS object.
+        try write(target, bytes: 4096)
+
+        XCTAssertNoThrow(
+            try DepthSafeRemoval.remove(
+                at: target, expecting: .noDirectoryTree,
+                provider: FileSystemIdentityProvider()
+            ),
+            "residual: a kind-only verdict admits any non-directory"
+        )
+        XCTAssertFalse(
+            exists(target),
+            "residual overstated: the replacement survived, so the verdict "
+                + "now carries an identity — re-measure and rewrite this "
+                + "test as the refusal it has become"
+        )
+    }
+
     /// Only `ENOTDIR` means "this is a leaf". Every other open failure keeps
     /// its own errno instead of being re-answered by a syscall that was
     /// never asked the question.

@@ -116,9 +116,19 @@
 //     is written to go RED — deliberately — the moment a call site starts
 //     passing the identity it already admits.
 //
+//  4. A NON-DIRECTORY leaf. `.noDirectoryTree` carries no identity and does
+//     not separate "nothing was there" from "something that is not a
+//     directory was there", so any non-directory at the name satisfies it —
+//     the kernel refuses only a DIRECTORY appearing there, which is a kind
+//     check and not an identity one. Measured and pinned by
+//     `testANonDirectoryVerdictCannotTellAbsenceFromAReplacement`. What
+//     closes it is a shape change to `PreDeleteInspectedObject` and its
+//     producer, not anything this file can do alone.
+//
 //  POSIX offers no primitive that closes 1 or 2: there is no way to pin a
 //  directory to its parent for the duration of a read, and no way to remove
-//  a directory by descriptor. 3 is one argument at each of two call sites.
+//  a directory by descriptor. 3 is one argument at each of two call sites;
+//  4 is two cases on a shared type.
 
 import Foundation
 
@@ -371,13 +381,29 @@ enum DepthSafeRemoval {
             // Symlink, regular file, fifo, socket, device: one unlink, and
             // never a resolution through it.
             //
-            // THE BINDING FOR THIS ARM IS THE SYSCALL. A verdict of
+            // THE ONLY BINDING THIS ARM HAS IS A KIND CHECK, AND THAT IS A
+            // RESIDUAL, NOT A PROOF (PR #458 review — say what the code
+            // does, not what one would like it to do). A verdict of
             // `.noDirectoryTree` is about the ABSENCE of a tree at this
             // name, and `unlinkat` WITHOUT `AT_REMOVEDIR` cannot remove a
-            // directory — measured on this platform: `EPERM`. So a directory
-            // created here between the failed open and the unlink is refused
-            // by the kernel, not by a re-check that would have its own
-            // window.
+            // directory — measured on this platform: `EPERM` — so a
+            // DIRECTORY created here between the failed open and the unlink
+            // is refused by the kernel rather than by a re-check that would
+            // have its own window.
+            //
+            // What the kernel cannot refuse is a different NON-directory:
+            // the verdict carries neither the leaf's identity nor whether
+            // anything was there at all, so an absence the probe saw and a
+            // stranger's file the deletion finds are the same value.
+            // Measured and pinned by
+            // `testANonDirectoryVerdictCannotTellAbsenceFromAReplacement`.
+            // Closing it is a change to `PreDeleteInspectedObject`
+            // (`SpaceScanner.swift`) and its producer
+            // (`OrphanedCachesScanner.swift`) — an `absent` case and a
+            // `nonDirectoryLeaf(Identity)` case — after which this arm
+            // `fstatat`s the leaf against that identity and the Trash arm
+            // binds the same way. It is not something this file can assert
+            // its way out of.
             if let inspected {
                 guard case .noDirectoryTree = inspected else {
                     throw Failure(

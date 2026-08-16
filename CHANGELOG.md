@@ -217,6 +217,33 @@ and docs/v1/CLI-REFERENCE.md) — the pre-release `node_modules` →
   the item stays in the Trash and the error names its path so it can be
   restored in one drag; and a Trash that will not say where it put an item
   is refused rather than counted, leaving that item in the Trash too.
+- **Deletes now check the FOLDER THAT HOLDS the item, not only the item.**
+  Every check above the deletion is about the item itself or about the
+  container root you configured; the folder in between — `proj` in
+  `~/Projects/proj/node_modules`, or the cache folder a category's contents
+  are cleaned out of — was checked by nothing. Deletion runs on a background
+  queue and the folder's path is resolved on the far side of that hop, so a
+  folder renamed away and replaced in that window (an app reinstalling its
+  cache directory does exactly this) sent the whole deletion into the
+  replacement: a same-named folder inside it was deleted and the app reported
+  success with the replacement's byte count. Cacheout now reads the holding
+  folder's identity from an open handle BEFORE handing the deletion a path,
+  and the deletion refuses unless the folder it opens is that same one —
+  "the folder that holds this item is no longer the one the safety check
+  admitted", clearable by re-scanning. This covers both permanent deletes and
+  category contents cleans. REMAINING: a swap that happens BEFORE that
+  reading is invisible, because both sides then see the replacement and agree
+  about it.
+- **"Move to Trash" undo: a put-back will not restore into a folder it cannot
+  prove.** When the Trash turns out to have taken the wrong folder, Cacheout
+  puts it back. That undo held its destination folder open but never checked
+  WHICH folder it was, and the check it ran afterwards went through the same
+  unchecked handle — so it confirmed itself. A folder swap in that window
+  moved your tree out of the Trash and into a stranger's folder while the app
+  reported the item had been PUT BACK. The destination is now checked against
+  the identity taken before the disposal, and when it disagrees nothing is
+  moved at all: the item stays in the Trash, and the error names both the
+  Trash path it is at and the fact that the destination folder changed.
 - **Orphaned-caches probe: deep folders no longer burn CPU quadratically.**
   The walk re-scanned its whole open-folder stack on every level it
   descended, so a deeply nested cache close to the inspection budget could

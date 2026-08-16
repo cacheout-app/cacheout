@@ -1417,6 +1417,41 @@ final class DepthSafeRemovalTests: XCTestCase {
         )
     }
 
+    /// A CONTAINER WHOSE IDENTITY CANNOT BE READ IS NOT A BINDING, AND IT IS
+    /// NOT `.unbound` EITHER.
+    ///
+    /// The one dangerous way to write the capture is to answer an unreadable
+    /// identity with "then bind nothing" — the caller would compile, state a
+    /// binding, and get a deletion that proves no container at all, which is
+    /// the silent-permissive shape this whole parameter exists to prevent.
+    /// Unprovable ⇒ refused, and it costs nothing: `remove` performs the
+    /// identical open a moment later.
+    func testACaptureThatCannotReadTheContainerRefusesRatherThanUnbinding()
+        throws {
+        let container = base.appendingPathComponent("blind-container")
+        let target = container.appendingPathComponent("cache")
+        try mkdir(target)
+        try write(target.appendingPathComponent("ours.bin"))
+
+        let provider = UnprovableIdentityProvider()
+        provider.blindInode = try inode(of: container)
+
+        XCTAssertThrowsError(
+            try DepthSafeRemoval.admittedParent(
+                directory: target.deletingLastPathComponent(),
+                displayPath: target.path, provider: provider
+            )
+        ) { error in
+            XCTAssertEqual(
+                (error as? DepthSafeRemoval.Failure)?.cause,
+                .unprovableLocation,
+                "an unreadable container must refuse, never degrade to "
+                    + ".unbound"
+            )
+        }
+        XCTAssertTrue(exists(target), "nothing may be destroyed by a capture")
+    }
+
     /// THE CAPTURE API IS THE BINDING, AND IT CLOSES THE CASE THE UNBOUND
     /// CALLER COULD NOT SEE.
     ///

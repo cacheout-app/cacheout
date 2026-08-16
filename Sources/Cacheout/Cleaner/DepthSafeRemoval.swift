@@ -478,6 +478,21 @@ enum DepthSafeRemoval {
     /// nothing; what it gains is that the failure is named where the caller
     /// can attribute it.
     ///
+    /// THE TWO ARMS ARE NOT EQUALLY EVIDENCED, AND THAT IS DISCLOSED RATHER
+    /// THAN IMPLIED (PR #458 review — the guard census). The IDENTITY arm is
+    /// load-bearing: replace its throw with `return .unbound` and
+    /// `testACaptureThatCannotReadTheContainerRefusesRatherThanUnbinding`
+    /// fails, because "I could not read it" would otherwise become "there is
+    /// nothing to bind", which is the silently-permissive shape this whole
+    /// parameter exists to prevent. The OPEN arm is SUBSUMED — measured, by
+    /// replacing its throw with `return .unbound`: the full suite stays
+    /// GREEN, because a container this call cannot open is a container
+    /// `remove` cannot open either, and the removal then refuses with the
+    /// identical `Failure(path:cause:.posix(errno))`. It stays because a
+    /// capture that quietly hands back "unbound" for a failure is a lie about
+    /// what happened, and because the two arms must not have to be read as
+    /// one to be understood.
+    ///
     /// `displayPath` is the caller's own spelling of what it is about to
     /// destroy, so the refusal names the ITEM rather than its folder — the
     /// same locator every other `Failure` in this file carries.

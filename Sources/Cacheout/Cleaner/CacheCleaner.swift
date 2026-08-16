@@ -226,7 +226,13 @@ actor CacheCleaner {
     /// Injectable Trash seam. Production moves the URL to the Trash via
     /// Finder; tests record or redirect so nothing outside a fixture root is
     /// ever trashed. `@MainActor` because `trashItem` talks to Finder.
-    typealias TrashHandler = @Sendable @MainActor (URL) throws -> Void
+    ///
+    /// IT RETURNS WHERE THE ITEM LANDED, and that is not bookkeeping: the
+    /// disposal takes a URL and resolves it itself, so the ONLY way to ask
+    /// what it actually took is to look at what it produced (see
+    /// `TrashDisposal`). `nil` means the disposal would not say — which is
+    /// treated as unprovable, never as success.
+    typealias TrashHandler = @Sendable @MainActor (URL) throws -> URL?
 
     private let fileManager = FileManager.default
     private let home: URL
@@ -274,7 +280,9 @@ actor CacheCleaner {
         )
         self.containerSnapshot = containerSnapshot
         self.trashHandler = trashHandler ?? { url in
-            try FileManager.default.trashItem(at: url, resultingItemURL: nil)
+            var landed: NSURL?
+            try FileManager.default.trashItem(at: url, resultingItemURL: &landed)
+            return landed as URL?
         }
     }
 
@@ -834,6 +842,12 @@ actor CacheCleaner {
             if moveToTrash {
                 // A trash failure is a child error — it never falls through
                 // to a permanent delete (R11).
+                //
+                // NO INSPECTION VERDICT TO BIND TO, the same absence the
+                // permanent arm below states: contents mode runs no user-data
+                // probe, so there is no inspected object for `TrashDisposal`
+                // to prove this disposal against. The guards here are the
+                // containment chain and the mount doctrine above.
                 try await trash(child)
             } else {
                 // NO INSPECTION VERDICT TO BIND TO, and the call site says
@@ -1018,8 +1032,16 @@ actor CacheCleaner {
         // chokepoint) — generalize into a per-scanner revalidator seam when
         // fn-4/fn-5 scanners need one.
         // WHAT THE PRE-DELETE PROBE'S VERDICT IS ABOUT, carried to the
-        // deletion itself (PR #458 review r7). `nil` when no probe ran.
-        var probedObject: UserDataProbeResult.InspectedRoot?
+        // disposal itself (PR #458 review r7).
+        //
+        // `let`, WITH BOTH ARMS WRITTEN OUT (PR #458 review — the doc claim
+        // that was false). `remove(at:expecting:)` documents `nil` as
+        // something a call site STATES; contents mode states it with a literal
+        // and a paragraph, while this call site used to let an implicitly-nil
+        // `var` fall through the `if` and reach the deletion having said
+        // nothing at all. A default is exactly what the parameter must not
+        // have, so item mode says its `nil` too, below.
+        let probedObject: UserDataProbeResult.InspectedRoot?
         if item.scannerID == OrphanedCachesScanner.registeredID,
            item.automaticCleanEligible {
             let probe = OrphanedCachesScanner.preDeleteUserDataProbe(
@@ -1061,6 +1083,19 @@ actor CacheCleaner {
                            detail: detail)
                 return (nil, [Self.itemError(item, detail)])
             }
+        } else {
+            // NO INSPECTION RAN, AND THIS CALL SITE SAYS SO. Two disjoint
+            // populations arrive here: items from any OTHER scanner (fn-2's
+            // node_modules, and the fn-4/fn-5 scanners to come), which carry
+            // no clean promise and never had a user-data probe; and sweep
+            // items whose promise the classifier declined to make, which reach
+            // a deletion at all ONLY through conscious per-item confirmation
+            // against DISPLAYED caution evidence. Neither has an inspection
+            // verdict to bind a disposal to, so neither gets one — the guards
+            // they rest on are the container admission, the containment chain,
+            // the deny list and the mount doctrine above. This is not a way to
+            // skip the binding; it is the absence of anything to bind to.
+            probedObject = nil
         }
 
         let token = await registry.registerObservations(report.claims)
@@ -1104,7 +1139,26 @@ actor CacheCleaner {
             if moveToTrash {
                 // A trash failure is an item error — it never falls through
                 // to a permanent delete (R11).
-                try await trash(target)
+                //
+                // AND THE VERDICT GOES HERE TOO (PR #458 review — the P1's
+                // other half). This is the GUI's DEFAULT disposal
+                // (`CacheoutViewModel.moveToTrash = true`), so it is the path
+                // most deletions actually take; before this it ran behind
+                // nothing but the `lstat` above, which is the layer the swap
+                // fixture beats by one syscall. `trashItem` cannot be handed a
+                // descriptor, so `TrashDisposal` proves the object on BOTH
+                // sides of it and undoes a disposal it cannot prove — see that
+                // file for the window that remains and its measurement.
+                if let probedObject {
+                    try await TrashDisposal.dispose(
+                        target, expecting: probedObject, provider: provider,
+                        via: { try await self.trash($0) }
+                    )
+                } else {
+                    // NOTHING TO BIND TO (the `else` above states why), so the
+                    // disposal is the seam alone.
+                    try await trash(target)
+                }
             } else {
                 // Item mode deletes the target ITSELF — never its
                 // contents-with-parent-preserved (R1/R15). The UNRESOLVED
@@ -1129,6 +1183,14 @@ actor CacheCleaner {
                 // The SAME event as the path check above — same tag, so the
                 // log does not report a swap caught one layer down as
                 // something else entirely.
+                logRefusal(
+                    label: item.displayName, tag: "content-drift",
+                    detail: "\(target.path): \(error.localizedDescription)"
+                )
+            } else if error is TrashDisposal.Failure {
+                // Same event again, one disposal over: a swap the Trash arm
+                // caught (before its move, or after it and undone) is the same
+                // thing happening to the user as one the permanent arm caught.
                 logRefusal(
                     label: item.displayName, tag: "content-drift",
                     detail: "\(target.path): \(error.localizedDescription)"
@@ -1281,10 +1343,12 @@ actor CacheCleaner {
     }
 
     /// Move one URL to the Trash via the injectable seam (production:
-    /// `FileManager.trashItem`, which requires the main actor).
-    private func trash(_ url: URL) async throws {
+    /// `FileManager.trashItem`, which requires the main actor), answering
+    /// WHERE IT LANDED — `nil` when the disposal would not say.
+    @discardableResult
+    private func trash(_ url: URL) async throws -> URL? {
         let handler = trashHandler
-        try await MainActor.run { try handler(url) }
+        return try await MainActor.run { try handler(url) }
     }
 
     // MARK: - Logging

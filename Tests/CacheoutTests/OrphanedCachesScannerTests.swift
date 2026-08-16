@@ -1265,10 +1265,10 @@ final class OrphanedCachesScannerTests: XCTestCase {
             snapshot: snapshot,
             trashHandler: { url in
                 recorder.record(url)
-                try FileManager.default.moveItem(
-                    at: url,
-                    to: trashDir.appendingPathComponent(url.lastPathComponent)
-                )
+                let landed = trashDir
+                    .appendingPathComponent(url.lastPathComponent)
+                try FileManager.default.moveItem(at: url, to: landed)
+                return landed
             }
         )
         let report = await cleaner.clean(items: [leak], moveToTrash: true)
@@ -3194,6 +3194,358 @@ final class OrphanedCachesScannerTests: XCTestCase {
         XCTAssertTrue(message.contains("no longer the one that was inspected"),
                       message)
         try assertCleanupLogContains(tag: "content-drift")
+    }
+
+    // MARK: - The same race, on the disposal the GUI actually uses
+
+    /// THE DEFAULT PATH, NOT THE ONE THE FIX LANDED ON (PR #458 review — the
+    /// P1 the descriptor binding left open).
+    ///
+    /// `CacheoutViewModel.moveToTrash` is `true` out of the box, so the
+    /// disposal most users take is `FileManager.trashItem`, not
+    /// `DepthSafeRemoval`. Identical fixture to
+    /// `testTargetReplacedAfterTheFinalPathCheckIsRefused`, identical swap,
+    /// one flag flipped — and before the fix the identical outcome the
+    /// permanent arm used to produce: the replacement's
+    /// `Photos Library.photoslibrary` moved to the Trash, `entries=1`,
+    /// `errors=[]`, the byte count of the tree that is still sitting at the
+    /// stash path.
+    ///
+    /// `recorder.urls.isEmpty` is the load-bearing assertion for the PRE-trash
+    /// proof specifically: a refusal that only arrives after the item has been
+    /// moved would leave the user's Trash disturbed and this list non-empty.
+    func testTrashDisposalOfATargetReplacedAfterTheFinalPathCheckIsRefused()
+        async throws {
+        let entry = cachesRoot
+            .appendingPathComponent("com.apple.SwiftUI.Drag-TRASHRACE")
+        try mkdir(entry)
+        try writeFile(entry.appendingPathComponent("payload.bin"))
+
+        let provider = RaceWonAtTheFinalCheckProvider()
+        provider.target = entry
+        provider.stash = base.appendingPathComponent("drag-trashrace-moved-away")
+        let library = entry.appendingPathComponent(
+            "Pictures/Photos Library.photoslibrary"
+        )
+        provider.replacement = library
+
+        let trashDir = base.appendingPathComponent("fake-trash-race")
+        try mkdir(trashDir)
+        let recorder = TrashURLRecorder()
+
+        let runtime = try makeRuntime(
+            [makeScanner(provider: provider)], provider: provider
+        )
+        let (items, snapshot) = await scanSession(runtime)
+        let leak = try XCTUnwrap(items.first)
+        XCTAssertTrue(leak.automaticCleanEligible,
+                      "the fixture entry scans as a clean known leak")
+
+        provider.arm()
+        let cleaner = runtime.makeCleaner(
+            snapshot: snapshot,
+            trashHandler: { url in
+                recorder.record(url)
+                let landed = trashDir
+                    .appendingPathComponent(url.lastPathComponent)
+                try FileManager.default.moveItem(at: url, to: landed)
+                return landed
+            }
+        )
+        let report = await cleaner.clean(items: [leak], moveToTrash: true)
+
+        XCTAssertTrue(provider.swapped, "the fixture never armed the swap")
+        XCTAssertTrue(
+            fm.fileExists(atPath: library.path),
+            "the replacement's Photos Library was moved to the TRASH — the "
+                + "disposal acted on whatever answered to the path"
+        )
+        XCTAssertTrue(fm.fileExists(atPath: provider.stash.path),
+                      "and the inspected tree is untouched too")
+        XCTAssertTrue(
+            recorder.urls.isEmpty,
+            "the disposal ran at all: the proof must refuse BEFORE anything "
+                + "reaches the Trash, got \(recorder.urls)"
+        )
+        XCTAssertTrue(
+            report.entries.isEmpty,
+            "reported SUCCESS for a tree it never inspected: \(report.entries)"
+        )
+        XCTAssertEqual(report.errors.count, 1)
+        let message = try XCTUnwrap(report.errors.first?.message)
+        XCTAssertTrue(message.contains("no longer the one that was inspected"),
+                      message)
+        try assertCleanupLogContains(tag: "content-drift")
+    }
+
+    /// Times the residual the Trash arm cannot close: from the pre-trash
+    /// proof's question about the OPENED INODE — the last thing the cleaner
+    /// asks before the disposal — to the instant the disposal seam is
+    /// entered. Production's window is WIDER: `trashItem` resolves the URL
+    /// inside itself, after the seam.
+    private final class TrashWindowClockProvider: FileSystemIdentityProvider {
+        private let lock = NSLock()
+        private var lastDescriptorQuestion: DispatchTime?
+        /// The pair FROZEN at seam entry — the post-disposal proof asks the
+        /// same question again, and an unfrozen "last" would then be later
+        /// than the seam and measure nothing.
+        private var window: (proof: DispatchTime, seam: DispatchTime)?
+
+        override func identity(ofDescriptor descriptor: Int32) -> Identity? {
+            lock.lock()
+            lastDescriptorQuestion = .now()
+            lock.unlock()
+            return super.identity(ofDescriptor: descriptor)
+        }
+
+        func enteredTheSeam() {
+            lock.lock()
+            if window == nil, let proof = lastDescriptorQuestion {
+                window = (proof, .now())
+            }
+            lock.unlock()
+        }
+
+        var windowNanoseconds: UInt64? {
+            lock.lock(); defer { lock.unlock() }
+            guard let window,
+                  window.seam.uptimeNanoseconds
+                      >= window.proof.uptimeNanoseconds
+            else { return nil }
+            return window.seam.uptimeNanoseconds
+                - window.proof.uptimeNanoseconds
+        }
+    }
+
+    /// THE WINDOW THE PRE-TRASH PROOF CANNOT CLOSE — and what closes the
+    /// OUTCOME instead.
+    ///
+    /// `trashItem(at:)` takes a URL and resolves it inside itself, so no
+    /// proof taken before the call can be carried into it: the binding stops
+    /// at the API boundary. This fixture is that residual, exercised — the
+    /// swap is performed INSIDE the disposal seam, which is exactly where
+    /// production's own resolution happens, and the disposal then takes the
+    /// object that is standing at the name.
+    ///
+    /// The Trash is the one disposal that is REVERSIBLE by construction, so
+    /// the answer is not a narrower window: it is proving the object AFTER
+    /// the move and putting back what should never have been taken. Nothing
+    /// is destroyed, nothing is reported freed, and the user's own tree ends
+    /// up exactly where it started.
+    func testATrashDisposalThatTookTheWrongObjectPutsItBackAndRefuses()
+        async throws {
+        let entry = cachesRoot
+            .appendingPathComponent("com.apple.SwiftUI.Drag-PUTBACK")
+        try mkdir(entry)
+        try writeFile(entry.appendingPathComponent("payload.bin"))
+        let stash = base.appendingPathComponent("drag-putback-moved-away")
+        let library = entry.appendingPathComponent(
+            "Pictures/Photos Library.photoslibrary"
+        )
+        let trashDir = base.appendingPathComponent("fake-trash-putback")
+        try mkdir(trashDir)
+        let landed = trashDir.appendingPathComponent(entry.lastPathComponent)
+        let recorder = TrashURLRecorder()
+        let clock = TrashWindowClockProvider()
+
+        let runtime = try makeRuntime(
+            [makeScanner(provider: clock)], provider: clock
+        )
+        let (items, snapshot) = await scanSession(runtime)
+        let leak = try XCTUnwrap(items.first)
+        XCTAssertTrue(leak.automaticCleanEligible,
+                      "the fixture entry scans as a clean known leak")
+
+        let cleaner = runtime.makeCleaner(
+            snapshot: snapshot,
+            trashHandler: { url in
+                clock.enteredTheSeam()
+                // Real syscalls, at the one instant no pre-call proof can
+                // reach: after the proof, inside the disposal.
+                try FileManager.default.moveItem(at: entry, to: stash)
+                try FileManager.default.createDirectory(
+                    at: library, withIntermediateDirectories: true
+                )
+                recorder.record(url)
+                try FileManager.default.moveItem(at: url, to: landed)
+                return landed
+            }
+        )
+        let report = await cleaner.clean(items: [leak], moveToTrash: true)
+
+        XCTAssertEqual(recorder.urls.count, 1,
+                       "the fixture never reached the disposal")
+        // The residual, MEASURED rather than argued: pre-proof `fstat` →
+        // disposal seam entered. Under-estimates production, where
+        // `trashItem` resolves the URL later still, inside itself.
+        if let window = clock.windowNanoseconds {
+            print("MEASURED-TRASH-WINDOW-NS \(window)")
+        }
+        XCTAssertTrue(
+            report.entries.isEmpty,
+            "reported SUCCESS for a tree it never inspected: \(report.entries)"
+        )
+        XCTAssertEqual(report.errors.count, 1)
+        let message = try XCTUnwrap(report.errors.first?.message)
+        XCTAssertTrue(message.contains("PUT BACK"), message)
+        XCTAssertTrue(message.contains("nothing was freed"), message)
+        XCTAssertTrue(
+            fm.fileExists(atPath: library.path),
+            "the wrongly-taken tree was left in the Trash — a disposal that "
+                + "cannot be proved must be UNDONE, not merely reported"
+        )
+        XCTAssertFalse(
+            fm.fileExists(atPath: landed.path),
+            "and nothing of it may remain in the Trash"
+        )
+        XCTAssertTrue(fm.fileExists(atPath: stash.path),
+                      "the inspected tree is untouched")
+        try assertCleanupLogContains(tag: "content-drift")
+    }
+
+    /// A DISPOSAL THAT WILL NOT SAY WHAT IT TOOK HAS NOT BEEN PROVED.
+    ///
+    /// The whole after-the-fact proof rests on `trashItem` reporting where it
+    /// put the item. When it does not, there is no object to compare and no
+    /// path to put anything back from — so the honest outcome is a refusal
+    /// that names the situation, never an entry: an item reported as freed on
+    /// the strength of "the call did not throw" is the byte-count lie this
+    /// codebase exists to avoid.
+    func testATrashDisposalThatWillNotSayWhereItPutTheItemIsRefused()
+        async throws {
+        let entry = cachesRoot
+            .appendingPathComponent("com.apple.SwiftUI.Drag-SILENT")
+        try mkdir(entry)
+        try writeFile(entry.appendingPathComponent("payload.bin"))
+        let trashDir = base.appendingPathComponent("fake-trash-silent")
+        try mkdir(trashDir)
+        let landed = trashDir.appendingPathComponent(entry.lastPathComponent)
+
+        let runtime = try makeRuntime([makeScanner()])
+        let (items, snapshot) = await scanSession(runtime)
+        let leak = try XCTUnwrap(items.first)
+
+        let cleaner = runtime.makeCleaner(
+            snapshot: snapshot,
+            trashHandler: { url in
+                try FileManager.default.moveItem(at: url, to: landed)
+                return nil
+            }
+        )
+        let report = await cleaner.clean(items: [leak], moveToTrash: true)
+
+        XCTAssertTrue(
+            report.entries.isEmpty,
+            "reported freed bytes for a disposal it could not check: "
+                + "\(report.entries)"
+        )
+        XCTAssertEqual(report.errors.count, 1)
+        let message = try XCTUnwrap(report.errors.first?.message)
+        XCTAssertTrue(message.contains("did not report where"), message)
+        XCTAssertTrue(
+            fm.fileExists(atPath: landed.path),
+            "the item really was disposed of — the refusal is about what "
+                + "cannot be PROVED, not about what did not happen"
+        )
+        try assertCleanupLogContains(tag: "content-drift")
+    }
+
+    /// WHEN THE UNDO ITSELF CANNOT LAND, SAY WHERE THE ITEM IS.
+    ///
+    /// The put-back is `renamex_np(RENAME_EXCL)`, so it refuses to overwrite
+    /// whatever now stands at the original name — undoing one mistake by
+    /// destroying somebody else's directory is not an undo. The disclosed
+    /// residual of that choice is an item left in the Trash, and the only
+    /// acceptable form of it is an error that names the path so the user can
+    /// finish the job in one drag.
+    func testATrashDisposalThatCannotBePutBackNamesWhereTheItemIs()
+        async throws {
+        let entry = cachesRoot
+            .appendingPathComponent("com.apple.SwiftUI.Drag-STRANDED")
+        try mkdir(entry)
+        try writeFile(entry.appendingPathComponent("payload.bin"))
+        let stash = base.appendingPathComponent("drag-stranded-moved-away")
+        let library = entry.appendingPathComponent(
+            "Pictures/Photos Library.photoslibrary"
+        )
+        let occupantMarker = entry.appendingPathComponent("occupant.bin")
+        let trashDir = base.appendingPathComponent("fake-trash-stranded")
+        try mkdir(trashDir)
+        let landed = trashDir.appendingPathComponent(entry.lastPathComponent)
+
+        let runtime = try makeRuntime([makeScanner()])
+        let (items, snapshot) = await scanSession(runtime)
+        let leak = try XCTUnwrap(items.first)
+
+        let cleaner = runtime.makeCleaner(
+            snapshot: snapshot,
+            trashHandler: { url in
+                try FileManager.default.moveItem(at: entry, to: stash)
+                try FileManager.default.createDirectory(
+                    at: library, withIntermediateDirectories: true
+                )
+                try FileManager.default.moveItem(at: url, to: landed)
+                // …and the name is taken again before the undo can use it.
+                try FileManager.default.createDirectory(
+                    at: entry, withIntermediateDirectories: true
+                )
+                FileManager.default.createFile(
+                    atPath: occupantMarker.path, contents: Data("x".utf8)
+                )
+                return landed
+            }
+        )
+        let report = await cleaner.clean(items: [leak], moveToTrash: true)
+
+        XCTAssertTrue(report.entries.isEmpty, "nothing may be reported freed")
+        XCTAssertEqual(report.errors.count, 1)
+        let message = try XCTUnwrap(report.errors.first?.message)
+        XCTAssertTrue(message.contains(landed.path),
+                      "the error must name where the item actually is: "
+                          + message)
+        XCTAssertTrue(
+            fm.fileExists(atPath: occupantMarker.path),
+            "the undo overwrote the directory standing at the name — an undo "
+                + "that destroys is not an undo"
+        )
+        XCTAssertTrue(
+            fm.fileExists(
+                atPath: landed.appendingPathComponent(
+                    "Pictures/Photos Library.photoslibrary"
+                ).path
+            ),
+            "the wrongly-taken tree is still in the Trash, whole"
+        )
+        XCTAssertTrue(fm.fileExists(atPath: stash.path),
+                      "the inspected tree is untouched")
+        try assertCleanupLogContains(tag: "content-drift")
+    }
+
+    /// AN ABSENCE PROVES A `.noDirectoryTree` VERDICT ON THE WAY IN, AND
+    /// NOTHING AT ALL ON THE WAY OUT — the two positions are not the same
+    /// question and the code does not pretend they are.
+    ///
+    /// Before the disposal, "nothing is there" is exactly what that verdict
+    /// says, and the disposal's own ENOENT is the frozen ghost-target
+    /// behaviour. After it, the disposal has CLAIMED to put an item at a URL:
+    /// if nothing is there, what it took cannot be established, and
+    /// unestablished is refused.
+    func testAnAbsenceProvesTheVerdictBeforeTheDisposalOnly() throws {
+        let ghost = cachesRoot.appendingPathComponent("com.example.Ghost-TRASH")
+        let provider = FileSystemIdentityProvider()
+
+        XCTAssertNoThrow(
+            try TrashDisposal.proveStanding(
+                .noDirectoryTree, at: ghost, provider: provider
+            ),
+            "an absent target still satisfies a verdict about an ABSENCE"
+        )
+        XCTAssertThrowsError(
+            try TrashDisposal.proveTaken(
+                .noDirectoryTree, at: ghost, provider: provider
+            ),
+            "a disposal that put an item nowhere provable must not pass"
+        )
     }
 
     /// The verdict SHAPE this arm binds to: an absent path proves the

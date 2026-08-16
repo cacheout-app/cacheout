@@ -154,6 +154,23 @@ now 3 and destructive commands require `--confirm`. Coordinate MCP updates with
   re-checks its own root before accepting a result, and reports WHICH object
   its verdict is about so the deletion refuses unless that object is still
   the one at the path. Refusals are clearable by re-scanning.
+- **Orphaned-caches "Move to Trash": the same replaced folder is no longer
+  trashed either.** Move to Trash is ON by default, and it did not go
+  through the deletion that was hardened above — it handed the folder's path
+  to the system Trash, behind nothing but a check that a swap timed one
+  syscall earlier defeats. A folder replaced in that instant was moved to
+  the Trash whole, and the app reported success with the byte count of the
+  folder it had actually inspected. The system Trash takes a path and
+  resolves it itself, so the check cannot be handed the open folder the way
+  the permanent deletion now can; what makes this safe instead is that
+  moving to the Trash destroys nothing. The app now checks the folder it
+  holds open before the move, checks WHAT THE TRASH ACTUALLY TOOK
+  afterwards, and PUTS BACK anything that turns out not to be the inspected
+  folder — reporting zero bytes freed either way. REMAINING: if the put-back
+  cannot be performed because something else has taken the original name,
+  the item stays in the Trash and the error names its path so it can be
+  restored in one drag; and a Trash that will not say where it put an item
+  is refused rather than counted, leaving that item in the Trash too.
 - **Orphaned-caches probe: deep folders no longer burn CPU quadratically.**
   The walk re-scanned its whole open-folder stack on every level it
   descended, so a deeply nested cache close to the inspection budget could

@@ -140,12 +140,11 @@ final class CacheCleanerTests: XCTestCase {
                 ])
             }
             recorder.record(url)
-            try FileManager.default.moveItem(
-                at: url,
-                to: trashDir.appendingPathComponent(
-                    "\(UUID().uuidString)-\(url.lastPathComponent)"
-                )
+            let landed = trashDir.appendingPathComponent(
+                "\(UUID().uuidString)-\(url.lastPathComponent)"
             )
+            try FileManager.default.moveItem(at: url, to: landed)
+            return landed
         }
     }
 

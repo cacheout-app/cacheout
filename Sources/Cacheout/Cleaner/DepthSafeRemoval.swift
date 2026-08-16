@@ -173,9 +173,19 @@ enum DepthSafeRemoval {
     ///
     /// `inspected` is WHAT THE CALLER'S PRE-DELETE INSPECTION WAS ABOUT, and
     /// it is proved against the descriptor this call opens, before anything
-    /// is destroyed. `nil` says — explicitly, at the call site, because there
-    /// is no default — that no inspection ran and there is nothing to bind
-    /// to; it is not a way to skip the check.
+    /// is destroyed. `nil` says that no inspection ran and there is nothing to
+    /// bind to; it is not a way to skip the check.
+    ///
+    /// THE PARAMETER HAS NO DEFAULT, AND BOTH CALL SITES STATE THEIR `nil`
+    /// (PR #458 review — this sentence used to be true of only one of them).
+    /// `CacheCleaner.deleteGuardedChild` passes a literal `nil` under a
+    /// paragraph saying contents mode runs no probe;
+    /// `CacheCleaner.removeGuardedItem` used to let an implicitly-nil `var`
+    /// fall past its `if` and arrive here having said nothing, and now writes
+    /// the `else` arm out with the two populations it covers. A comment that
+    /// claims a property the code lacks is worse than no comment, so if a
+    /// third call site appears, either it states its `nil` or this paragraph
+    /// stops being true and must change with it.
     ///
     /// `provider` answers the mount question, and it is the same object the
     /// scanner's walk asks, so the two cannot classify a boundary

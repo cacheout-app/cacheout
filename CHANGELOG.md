@@ -6,20 +6,49 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-Scanner unification (`SpaceScanner` protocol). Breaking CLI release for JSON
-consumers: `schema_version` is now 4 and `--cli scan` emits an envelope
-instead of a top-level array. Coordinate MCP updates with `cacheout-mcp`
-(see PROTOCOL.md and docs/v1/CLI-REFERENCE.md).
+Scanner unification (`SpaceScanner` protocol) plus the project
+build-artifacts scanner. Breaking CLI release for JSON consumers:
+`schema_version` is now 4 and `--cli scan` emits an envelope instead of a
+top-level array. Coordinate MCP updates with `cacheout-mcp` (see PROTOCOL.md
+and docs/v1/CLI-REFERENCE.md) — the pre-release `node_modules` →
+`build_artifacts` slug rename below is part of that coordination.
 
 ### Added
 
-- **node_modules in the CLI.** `--cli scan` now reports discovered
-  `node_modules` directories as `scanner_items` rows, and `--cli clean`
-  accepts `node_modules` (every discovered directory) or
-  `node_modules:<item-id>` (one directory) as targets — destructive runs
-  still require `--confirm`. Item ids are opaque, stable across rescans,
-  and echoed back exactly as scan printed them. node_modules is
-  `review`-risk and never part of smart-clean or any automatic clean path.
+- **Project build artifacts in the GUI and the CLI.** A `build_artifacts`
+  per-item scanner walks your configured dev roots for build output PROVEN by
+  an ecosystem marker — `target/` beside `Cargo.toml`, `node_modules/` beside
+  `package.json`, any directory containing `pyvenv.cfg`, and the rest of the
+  rule table in `docs/v1/CATEGORIES.md`. Sizes are allocated and
+  sparse-aware, with the apparent size reported separately
+  (`logical_bytes`) when it materially exceeds what deletion would free.
+  `--cli scan` reports each find as a `scanner_items` row and `--cli clean`
+  accepts `build_artifacts` (every find) or `build_artifacts:<item-id>` (one)
+  as targets — destructive runs still require `--confirm`. Item ids are
+  opaque, stable across rescans, and echoed back exactly as scan printed
+  them. No per-item row is ever part of smart-clean or any automatic clean
+  path.
+- **Release artifacts are protected from build-artifact cleans.** Before
+  deleting an artifact directory, Cacheout inspects it for `.dmg`, `.pkg`,
+  `.ipa` files and `.app` / `.xcarchive` / `.dSYM` bundles above 5 MB. Any
+  hit is disclosed on the scan row, forces the item off "safe" and out of
+  default selection, and blocks deletion until it is acknowledged — in the
+  GUI by confirming a sheet that lists exactly what is there, in the CLI with
+  the repeatable, item-bound
+  `--acknowledge-valuables <scanner-slug>:<item-id>:<token>`. The inspection
+  runs AGAIN immediately before deletion, so an artifact produced after the
+  scan still stops the delete, and any change to the set rotates the token.
+  An inspection that could not finish is treated exactly like a change:
+  refused, tokenless, re-scan required. Full contract in PROTOCOL.md and
+  `docs/v1/CLI-REFERENCE.md`.
+- **Configurable dev roots.** Settings gains a dev-roots editor and the CLI a
+  repeatable `--dev-root PATH` (invocation-scoped, never persisted). The
+  filesystem root, any volume root or mount point, and `$HOME` itself are
+  refused as dev roots in canonical and symlink-alias spellings alike;
+  protected children such as `~/Documents` remain legal. A persisted value
+  that cannot be parsed falls back to the seeds WITHOUT rewriting the stored
+  value and surfaces a `config_invalid` row in `scanner_errors` on every scan
+  — the fallback is never silent.
 - **Per-item evidence in the confirmation sheet.** Every row of the clean
   confirmation states what the item is and where it lives, and
   command-cleaned categories are named in a disclosure: their bytes are
@@ -31,7 +60,66 @@ instead of a top-level array. Coordinate MCP updates with `cacheout-mcp`
   longer exists still renders an honest error line.
 - **Stable selection across rescans.** Selection is keyed by scanner-scoped
   stable item ids: a rescan preserves both selections and explicit
-  deselections. node_modules selection previously reset on every rescan.
+  deselections. Per-item selection previously reset on every rescan.
+
+### Security
+
+- **The build-artifacts walks are descriptor-anchored: no path resolution
+  below a scan root.** The valuables probe and the project-tree walker used
+  to re-resolve every child by absolute path — a kind `lstat`, a metadata
+  `lstat`, then an open. Any of those could be redirected by a concurrent
+  writer replacing an ANCESTOR directory with a symlink, and neither
+  `O_NOFOLLOW` (which guards only the last component) nor an inode re-proof
+  (whose "vetted" value was itself read through the swapped ancestor) could
+  see it. Both walks now open their root once and derive every child from the
+  descriptor they already hold — `fstatat`/`openat` by single-component
+  basename — so a child's safety is established by containment in a held,
+  vetted parent inode. This matters most on the valuables probe, whose output
+  feeds the acknowledgement token that authorizes a deletion. Live
+  descriptors are bounded (the probe holds at most `clamp((RLIMIT_NOFILE −
+  64)/4, 4, 64)` anchors plus two transients; the tree walker holds at most
+  its depth budget), and exceeding that bound is never a refusal — anchors
+  are released and restored with an identity-verified `..` step, so no tree
+  depth can strand an item the way the retired depth cap did.
+- **The post-walk pass re-proves CONTAINMENT instead of re-resolving a
+  path.** Anchoring the walks was not enough on its own: the scanner threw the
+  walker's vetted descriptor away and kept a bare URL, then re-resolved that
+  absolute path after the whole walk had finished — for the kind gate, the
+  sizing, the valuables probe and the delete-time re-probe. A writer inside
+  the user's own dev root (a `build.rs`, an npm postinstall) that replaced an
+  intermediate directory with a symlink in that window sent all of them
+  somewhere else, and because the valuables probe's output is the
+  acknowledgement token's only preimage, the result was a valid-looking token
+  minted over a tree the artifact directory does not contain. The scan now
+  RETAINS each admitted dev root's descriptor and re-reaches every candidate
+  by single-component `openat` from it, so the artifact directory is proven
+  reachable by containment before one byte of it is read. A component swapped
+  for a symlink, a file, or nothing at all is simply not offered (the same
+  answer a re-scan gives); anything else — permissions, a mount that appeared
+  over the path — becomes a classified, denied, tokenless row rather than a
+  silent drop or a silent trust. Cost: one descriptor per configured dev root,
+  held for the duration of a scan.
+- **Mount boundaries are now discriminated by `f_fsid`.** Every path on an
+  APFS volume group reports the same `st_dev` (measured: `/` and
+  `/System/Volumes/Data` both report 16777230), so the device comparison was
+  blind to exactly the firmlink split it was meant to catch. The descriptor's
+  own `f_fsid` is now the primary signal; the previous path-based signals are
+  kept as an additional, refusal-only backstop.
+- **Known consequence.** The probe is now free of `PATH_MAX`: it can inspect
+  and certify a tree whose absolute paths exceed the limit, while
+  `FileManager.removeItem` — which the cleaner still uses — cannot address
+  one. Such a deletion fails with its own error rather than being silently
+  skipped; giving the deleter the same descriptor-relative treatment is
+  tracked separately.
+- **Known residual.** `DirectorySizer` is still a path-based
+  `FileManager.enumerator` walk, so an ancestor swap landing after the
+  containment descent above can still redirect the SIZING of a build-artifact
+  item. What that yields is bytes, dates and denial classifications — figures
+  an item displays. It cannot mint an acknowledgement token (that comes solely
+  from the descriptor-anchored valuables probe), cannot authorize a deletion,
+  and cannot move the deletion target, which stays the unresolved spelling the
+  cleaner re-admits and the revalidator re-proves. Converting the sizer is
+  tracked separately.
 
 ### Changed
 
@@ -44,15 +132,43 @@ instead of a top-level array. Coordinate MCP updates with `cacheout-mcp`
   clean target). Every payload — scan, clean, smart-clean, and both
   dry-runs — self-describes with a top-level `schema_version`.
 - **Unified scanner architecture (internal).** The category registry and
-  the node_modules scanner now sit behind one `SpaceScanner` protocol with
+  every per-item scanner now sit behind one `SpaceScanner` protocol with
   a validated registry runtime: scan outcomes are ownership- and
   structure-validated fail-closed before any surface can address them, and
   delete-time container admission derives from scanner registration, never
-  from scanned items. Category content and behavior are unchanged.
+  from scanned items. Category content and behavior are unchanged. An item
+  may additionally declare that it MUST be re-inspected immediately before
+  deletion; a cleaner that cannot perform that re-inspection refuses it
+  rather than deleting it.
 - **Category-count claims removed from docs.** README and docs/v1 no longer
   state a hardcoded number of cache categories — prose counts rot; the
   registry in `Sources/Cacheout/Scanner/Categories.swift` is the source of
   truth.
+- **PRE-RELEASE RENAME: the `node_modules` scanner slug is now
+  `build_artifacts`.** The `node_modules` per-item scanner landed in this same
+  unreleased schema-4 work and never shipped in a release (the last release is
+  v2.1.9), so this is a rename with NO alias and no compatibility shim: the
+  `build_artifacts` rule table's `node_modules/` row finds everything the old
+  scanner found, and registering both would double-list the same directories.
+  `--cli clean node_modules` is now an unknown target (`INVALID_ARGUMENTS`),
+  no `scanner_items` row carries `scanner_id: "node_modules"`, and the scanner
+  plus its GUI-only item model have been deleted. Persisted node_modules
+  selections do not survive the rename — selection is session-scoped anyway.
+  The `cacheout-mcp` consumer was updated in the same change window (branch
+  `fn-1.3-memory-stats-mcp-tool`, commit `c4efd9b`). Its slug sites are
+  verifiable with the SOURCE-ONLY semantic gate, which returns zero matches:
+
+  ```
+  grep -rnI --exclude-dir=__pycache__ \
+    -E '"node_modules"|`node_modules`|node_modules:' src tests
+  ```
+
+  The pattern targets slug SITES only — `scanner_id` values, address
+  prefixes, backtick slug mentions — so artifact-NAME references that
+  legitimately persist under `build_artifacts` do not match and zero is
+  reachable. `-I` and `--exclude-dir` keep it scoped to source: a stale or
+  freshly written `__pycache__/*.pyc` would otherwise let the gate report on
+  build artifacts instead of on the code.
 
 ## [2.2.0] - 2026-08-06
 

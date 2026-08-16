@@ -432,6 +432,10 @@ final class PathGuardTests: XCTestCase {
         let library = fixtureHome.appendingPathComponent("Library")
         try mkdir(documents)
         try mkdir(library)
+        // `fixtureHome` is deliberately still CONFIGURED here (fn-4.5): the
+        // protected-child arm below pins that the R16 container-root policy
+        // now refuses it at ADMISSION — one layer before the deny-list
+        // re-check this test used to reach through it.
         let pathGuard = makeGuard(containers: [documents, fixtureHome])
         let sessionSnapshot = snapshot(of: [documents, fixtureHome])
         let docsContainer = try pathGuard.admitContainer(
@@ -465,18 +469,25 @@ final class PathGuardTests: XCTestCase {
             }
         }
 
-        // Deny-list re-check: a protected first-level child is refused even
-        // as a strict descendant of an admitted (home) container.
-        let homeContainer = try pathGuard.admitContainer(
-            fixtureHome, snapshot: sessionSnapshot
-        )
+        // MIGRATED (fn-4.5, R16): this arm used to admit `$HOME` as a
+        // container and then rely on the deny-list re-check to refuse
+        // `~/Library` as a target. The container-root policy now refuses the
+        // `$HOME` container OUTRIGHT, so the protected child below it is
+        // unreachable a layer earlier — the same protection, one step
+        // sooner. (`validateRemovableItem`'s deny-list re-check stays in
+        // place as defense in depth; its volume-root/cross-device arms are
+        // covered by the device tests below.)
         XCTAssertThrowsError(
-            try pathGuard.validateRemovableItem(library, inside: homeContainer)
+            try pathGuard.admitContainer(fixtureHome, snapshot: sessionSnapshot)
         ) {
-            guard case .deniedProtectedChild? = $0 as? PathGuardError else {
-                return XCTFail("expected deniedProtectedChild, got \($0)")
+            guard case .deniedHomeDirectory? = $0 as? PathGuardError else {
+                return XCTFail("expected deniedHomeDirectory, got \($0)")
             }
         }
+        XCTAssertTrue(
+            fm.fileExists(atPath: library.path),
+            "nothing under the refused container was touched"
+        )
     }
 
     // MARK: - Device rules (injected provider, R15)
@@ -626,6 +637,339 @@ final class PathGuardTests: XCTestCase {
             guard case .deniedVolumeRoot? = $0 as? PathGuardError else {
                 return XCTFail("expected deniedVolumeRoot, got \($0)")
             }
+        }
+    }
+
+    // MARK: - Container-root admission policy (fn-4.1, R16)
+
+    /// The shared policy component, tested DIRECTLY (its store call site is
+    /// covered in DevRootsStoreTests; CLI and PathGuard-admission call
+    /// sites arrive in fn-4.6 / fn-4.5). It is `denyCheck` MINUS the
+    /// protected-children clause: `/`, volume roots, and `$HOME` are
+    /// refused in canonical AND alias spellings; `~/Documents` is legal.
+
+    func testContainerRootPolicyRejectsFilesystemRoot() {
+        XCTAssertThrowsError(
+            try PathGuard.validateContainerRoot(
+                URL(fileURLWithPath: "/"), home: fixtureHome,
+                provider: FileSystemIdentityProvider()
+            )
+        ) { error in
+            XCTAssertEqual(error as? PathGuardError,
+                           .deniedFilesystemRoot(path: "/"))
+        }
+    }
+
+    func testContainerRootPolicyRejectsSymlinkAliasOfFilesystemRoot() throws {
+        // Canonicalize-then-check, proven: the alias spelling is nowhere
+        // near "/" lexically, yet resolves to it.
+        let alias = base.appendingPathComponent("rootlink")
+        try fm.createSymbolicLink(
+            at: alias, withDestinationURL: URL(fileURLWithPath: "/")
+        )
+        XCTAssertThrowsError(
+            try PathGuard.validateContainerRoot(
+                alias, home: fixtureHome,
+                provider: FileSystemIdentityProvider()
+            )
+        ) { error in
+            XCTAssertEqual(error as? PathGuardError,
+                           .deniedFilesystemRoot(path: "/"))
+        }
+    }
+
+    func testContainerRootPolicyRejectsVolumeRootBothSignals() throws {
+        // Signal (a): device-id change against the parent.
+        let deviceVolume = base.appendingPathComponent("DeviceVol")
+        try mkdir(deviceVolume)
+        let deviceProvider = DeviceInjectingProvider()
+        deviceProvider.overrides = [
+            (deviceProvider.canonicalize(deviceVolume).path, 0xD15C)
+        ]
+        XCTAssertThrowsError(
+            try PathGuard.validateContainerRoot(
+                deviceVolume, home: fixtureHome, provider: deviceProvider
+            ),
+            "device-change signal must refuse a volume root"
+        ) {
+            guard case .deniedVolumeRoot? = $0 as? PathGuardError else {
+                return XCTFail("expected deniedVolumeRoot, got \($0)")
+            }
+        }
+
+        // Signal (b): statfs mount-root detection (injected mount probe) —
+        // the firmlink case where st_dev never changes.
+        let mountVolume = base.appendingPathComponent("MountVol")
+        try mkdir(mountVolume)
+        let mountProvider = MountPointInjectingProvider()
+        mountProvider.mountPointPaths = [
+            mountProvider.canonicalize(mountVolume).path
+        ]
+        XCTAssertThrowsError(
+            try PathGuard.validateContainerRoot(
+                mountVolume, home: fixtureHome, provider: mountProvider
+            ),
+            "mount-root signal must refuse even with an unchanged device id"
+        ) {
+            guard case .deniedVolumeRoot? = $0 as? PathGuardError else {
+                return XCTFail("expected deniedVolumeRoot, got \($0)")
+            }
+        }
+    }
+
+    func testContainerRootPolicyRejectsInjectedHomeDirectAndAlias() throws {
+        let provider = FileSystemIdentityProvider()
+        // Direct spelling of the injected home.
+        XCTAssertThrowsError(
+            try PathGuard.validateContainerRoot(
+                fixtureHome, home: fixtureHome, provider: provider
+            )
+        ) {
+            guard case .deniedHomeDirectory? = $0 as? PathGuardError else {
+                return XCTFail("expected deniedHomeDirectory, got \($0)")
+            }
+        }
+
+        // Symlink alias — inode identity collapses the spellings.
+        let alias = base.appendingPathComponent("homelink")
+        try fm.createSymbolicLink(at: alias, withDestinationURL: fixtureHome)
+        XCTAssertThrowsError(
+            try PathGuard.validateContainerRoot(
+                alias, home: fixtureHome, provider: provider
+            )
+        ) {
+            guard case .deniedHomeDirectory? = $0 as? PathGuardError else {
+                return XCTFail("expected deniedHomeDirectory, got \($0)")
+            }
+        }
+    }
+
+    func testContainerRootPolicyAcceptsProtectedChildren() throws {
+        // The protected-children clause is deliberately EXCLUDED: intended
+        // dev roots like ~/Documents and ~/Documents/dev must be legal
+        // containers (the seed list depends on this) even though both stay
+        // refused as DELETION targets.
+        let documents = fixtureHome.appendingPathComponent("Documents")
+        let dev = documents.appendingPathComponent("dev")
+        try mkdir(dev)
+        let provider = FileSystemIdentityProvider()
+
+        XCTAssertNoThrow(try PathGuard.validateContainerRoot(
+            documents, home: fixtureHome, provider: provider
+        ))
+        XCTAssertNoThrow(try PathGuard.validateContainerRoot(
+            dev, home: fixtureHome, provider: provider
+        ))
+
+        // …and the SAME URL is still refused as a deletion target — the
+        // split is the point.
+        assertRefused(documents, policy: emptyPolicy, guard: makeGuard(),
+                      message: "(deletion-target admission keeps the clause)")
+    }
+
+    // MARK: - Container-root policy INSIDE admission (fn-4.5, R16 layer c)
+    //
+    // The store (fn-4.1) and the CLI (fn-4.6) apply the same policy at
+    // RESOLUTION, but resolution is configuration — this layer is the one
+    // that holds when configuration is bypassed entirely. Every cell below
+    // constructs a guard whose configured container root IS the dangerous
+    // path (the shape a hand-edited plist, a future config path, or a
+    // resolution bug produces) and asserts BOTH admission modes refuse it
+    // with a CLASSIFIED error. The snapshot always contains the root, so a
+    // refusal can never be the snapshot-missing fail-close by accident.
+
+    /// One attack cell: (label, the configured root, the expected refusal
+    /// predicate, the provider that makes the fixture behave like the
+    /// dangerous thing).
+    private func assertBothAdmissionModesRefuse(
+        configuredRoot: URL,
+        requestedAs requested: URL? = nil,
+        provider: FileSystemIdentityProvider = FileSystemIdentityProvider(),
+        label: String,
+        expected: (PathGuardError) -> Bool,
+        file: StaticString = #filePath, line: UInt = #line
+    ) {
+        let pathGuard = makeGuard(containers: [configuredRoot], provider: provider)
+        let sessionSnapshot = snapshot(of: [configuredRoot], provider: provider)
+        let url = requested ?? configuredRoot
+
+        for (mode, run) in [
+            ("admitSearchRoot", { try pathGuard.admitSearchRoot(url) as Any }),
+            ("admitContainer", {
+                try pathGuard.admitContainer(url, snapshot: sessionSnapshot) as Any
+            }),
+        ] as [(String, () throws -> Any)] {
+            XCTAssertThrowsError(
+                try run(), "\(label): \(mode) must refuse",
+                file: file, line: line
+            ) { error in
+                guard let guardError = error as? PathGuardError,
+                      expected(guardError) else {
+                    return XCTFail(
+                        "\(label): \(mode) refused with the WRONG error: \(error)",
+                        file: file, line: line
+                    )
+                }
+            }
+        }
+    }
+
+    func testAdmissionRefusesConfiguredFilesystemRootAndItsAlias() throws {
+        assertBothAdmissionModesRefuse(
+            configuredRoot: URL(fileURLWithPath: "/"),
+            label: "configured filesystem root",
+            expected: { if case .deniedFilesystemRoot = $0 { return true }; return false }
+        )
+
+        // The SYMLINK ALIAS of `/` — nowhere near "/" lexically. Both the
+        // alias spelling and the canonical spelling must refuse, because the
+        // policy runs on the CANONICALIZED matched root.
+        let alias = base.appendingPathComponent("rootlink")
+        try fm.createSymbolicLink(
+            at: alias, withDestinationURL: URL(fileURLWithPath: "/")
+        )
+        assertBothAdmissionModesRefuse(
+            configuredRoot: alias,
+            label: "configured symlink alias of /",
+            expected: { if case .deniedFilesystemRoot = $0 { return true }; return false }
+        )
+        assertBothAdmissionModesRefuse(
+            configuredRoot: alias, requestedAs: URL(fileURLWithPath: "/"),
+            label: "alias-configured root requested by its canonical spelling",
+            expected: { if case .deniedFilesystemRoot = $0 { return true }; return false }
+        )
+    }
+
+    func testAdmissionRefusesConfiguredHomeDirectlyAndViaAlias() throws {
+        assertBothAdmissionModesRefuse(
+            configuredRoot: fixtureHome,
+            label: "configured $HOME",
+            expected: { if case .deniedHomeDirectory = $0 { return true }; return false }
+        )
+
+        let alias = base.appendingPathComponent("homelink-admission")
+        try fm.createSymbolicLink(at: alias, withDestinationURL: fixtureHome)
+        assertBothAdmissionModesRefuse(
+            configuredRoot: alias,
+            label: "configured symlink alias of $HOME",
+            expected: { if case .deniedHomeDirectory = $0 { return true }; return false }
+        )
+    }
+
+    func testAdmissionRefusesConfiguredVolumeRootBothSignals() throws {
+        // Signal (a): device-id change against the parent.
+        let deviceVolume = base.appendingPathComponent("AdmitDeviceVol")
+        try mkdir(deviceVolume)
+        let deviceProvider = DeviceInjectingProvider()
+        deviceProvider.overrides = [
+            (deviceProvider.canonicalize(deviceVolume).path, 0xD15C)
+        ]
+        assertBothAdmissionModesRefuse(
+            configuredRoot: deviceVolume, provider: deviceProvider,
+            label: "configured volume root (device signal)",
+            expected: { if case .deniedVolumeRoot = $0 { return true }; return false }
+        )
+
+        // Signal (b): statfs mount-root detection — the firmlink case where
+        // st_dev never changes.
+        let mountVolume = base.appendingPathComponent("AdmitMountVol")
+        try mkdir(mountVolume)
+        let mountProvider = MountPointInjectingProvider()
+        mountProvider.mountPointPaths = [
+            mountProvider.canonicalize(mountVolume).path
+        ]
+        assertBothAdmissionModesRefuse(
+            configuredRoot: mountVolume, provider: mountProvider,
+            label: "configured mount root (statfs signal)",
+            expected: { if case .deniedVolumeRoot = $0 { return true }; return false }
+        )
+    }
+
+    func testAdmissionAdmitsLegalProtectedChildContainerRoots() throws {
+        // The LEGAL cell (the seeds depend on it): protected first-level
+        // children and their descendants stay admissible as CONTAINERS in
+        // both modes, and a symlinked-ANCESTOR spelling of such a root
+        // canonicalizes to its legal target and admits too.
+        let documents = fixtureHome.appendingPathComponent("Documents")
+        let dev = documents.appendingPathComponent("dev")
+        try mkdir(dev)
+        let aliasParent = base.appendingPathComponent("docslink")
+        try fm.createSymbolicLink(at: aliasParent, withDestinationURL: documents)
+        let aliasDev = aliasParent.appendingPathComponent("dev")
+
+        let roots = [documents, dev, aliasDev]
+        let pathGuard = makeGuard(containers: roots)
+        let sessionSnapshot = snapshot(of: roots)
+        for root in roots {
+            XCTAssertNoThrow(try pathGuard.admitSearchRoot(root),
+                             "\(root.path) must admit as a search root")
+            XCTAssertNoThrow(
+                try pathGuard.admitContainer(root, snapshot: sessionSnapshot),
+                "\(root.path) must admit as a delete-time container"
+            )
+        }
+
+        // And a target inside the admitted protected-child container still
+        // validates — the policy narrowed nothing legal.
+        let target = dev.appendingPathComponent("proj/target")
+        try mkdir(target)
+        let container = try pathGuard.admitContainer(dev, snapshot: sessionSnapshot)
+        XCTAssertNoThrow(try pathGuard.validateRemovableItem(target, inside: container))
+    }
+
+    func testEveryProductionRegisteredContainerRootStillAdmits() throws {
+        // THE NO-REGRESSION CELL: the policy runs on every configured root
+        // of every registered scanner, so the production union itself has to
+        // pass it — seeded dev roots (several of them protected first-level
+        // children) plus the orphaned-caches sweep root.
+        let suiteName = "PathGuardTests-\(UUID().uuidString)"
+        let suite = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { suite.removePersistentDomain(forName: suiteName) }
+        let provider = FileSystemIdentityProvider()
+        let devRoots = DevRootsStore(defaults: suite, provider: provider)
+            .effectiveRoots(home: fixtureHome)
+        let runtime = SpaceScannerRuntime.production(
+            home: fixtureHome, provider: provider, devRoots: devRoots
+        )
+        let roots = runtime.trustedContainerRoots
+        // Non-vacuity: the union must actually carry the seeded roots AND a
+        // protected first-level child (the case the policy must NOT reject).
+        XCTAssertEqual(roots.count, DevRootsStore.seedRootNames.count + 1)
+        XCTAssertTrue(
+            roots.contains { $0.path == fixtureHome.appendingPathComponent("Documents").path },
+            "~/Documents is a seeded dev root — the legal protected child"
+        )
+
+        let pathGuard = PathGuard(
+            home: fixtureHome, containerRoots: roots, provider: provider
+        )
+        let sessionSnapshot = ContainerSnapshot.capture(
+            roots: roots, provider: provider
+        )
+        for root in roots {
+            XCTAssertNoThrow(try pathGuard.admitSearchRoot(root),
+                             "registered root refused by the policy: \(root.path)")
+            // Delete-time admission additionally needs the root to EXIST
+            // (snapshot identity) — assert the policy verdict only for the
+            // roots this fixture home actually has.
+            if fm.fileExists(atPath: root.path) {
+                XCTAssertNoThrow(
+                    try pathGuard.admitContainer(root, snapshot: sessionSnapshot),
+                    "registered root refused at delete time: \(root.path)"
+                )
+            }
+        }
+    }
+
+    /// Injects statfs mount-root answers for canonical paths — hermetic
+    /// stand-in for a firmlink/APFS-group mount (device id unchanged).
+    private final class MountPointInjectingProvider:
+        FileSystemIdentityProvider
+    {
+        var mountPointPaths: Set<String> = []
+        override func isMountPoint(_ url: URL) -> Bool {
+            if mountPointPaths.contains(url.path) { return true }
+            return super.isMountPoint(url)
         }
     }
 

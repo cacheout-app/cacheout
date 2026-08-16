@@ -727,6 +727,7 @@ final class CategoryScannerTests: XCTestCase {
         XCTAssertEqual(ScanIssue.Kind.tccDenied.wireString, "tcc_denied")
         XCTAssertEqual(ScanIssue.Kind.permissionDenied.wireString, "permission_denied")
         XCTAssertEqual(ScanIssue.Kind.unreadable.wireString, "unreadable")
+        XCTAssertEqual(ScanIssue.Kind.configInvalid.wireString, "config_invalid")
         XCTAssertEqual(ScanIssue.Kind.malformedOutcome.wireString, "malformed_outcome")
     }
 
@@ -806,23 +807,41 @@ final class CategoryScannerTests: XCTestCase {
         }
     }
 
+    /// MIGRATED for the fn-4.5 atomic swap: `node_modules` → `build_artifacts`
+    /// in the SAME registration slot, with the same assertions (composition
+    /// order + the union being exactly the per-item scanners' declared sets).
+    /// The dev roots are INJECTED so the union is deterministic — the
+    /// standard-suite read the nil default would do is a machine-dependent
+    /// input, not a property of the composition.
     func testProductionFactoryRegistersCategoryScannerCollisionFree() throws {
         let home = try makeTempDir("home")
-        let runtime = SpaceScannerRuntime.production(home: home)
+        let suiteName = "CategoryScannerTests-\(UUID().uuidString)"
+        let suite = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { suite.removePersistentDomain(forName: suiteName) }
+        let devRoots = DevRootsStore(defaults: suite).effectiveRoots(home: home)
+        let runtime = SpaceScannerRuntime.production(
+            home: home, devRoots: devRoots
+        )
         XCTAssertEqual(
             runtime.scanners.map(\.id),
             [
                 CategoryScanner.registeredID,
-                NodeModulesScanner.registeredID,
+                BuildArtifactsScanner.registeredID,
                 OrphanedCachesScanner.registeredID,
             ]
         )
+        XCTAssertFalse(
+            runtime.scanners.contains { $0.id == "node_modules" },
+            "the atomic swap unregistered node_modules in the same change — "
+                + "the RETIRED slug is a bare string here because fn-4.7 "
+                + "deleted the scanner that used to declare it"
+        )
         XCTAssertEqual(
             runtime.trustedContainerRoots.map(\.path),
-            NodeModulesScanner.defaultSearchRoots(home: home).map(\.path)
+            devRoots.keptRoots.map(\.path)
                 + [home.appendingPathComponent("Library/Caches").path],
             "the union is the per-item scanners' declared sets in "
-                + "registration order (node_modules search roots, then the "
+                + "registration order (the kept dev roots, then the "
                 + "orphaned-caches sweep root) — CategoryScanner contributes "
                 + "no container roots"
         )
@@ -1040,8 +1059,8 @@ final class CategoryScannerTests: XCTestCase {
         // The production truth table's NON-deletable emissions still pass:
         // `.denied` carries its honest `.deniedUnmeasured` record (the
         // cleaner refuses it; demanding a measured record would break
-        // NodeModulesScanner's denied emission), and `.missing` carries
-        // zero records.
+        // the retired node_modules scanner's denied emission), and
+        // `.missing` carries zero records.
         let denied = makeContainerItem(
             id: "bound1", scannerID: "fixture", state: .denied,
             rootRecords: [RootScanRecord(
@@ -1077,8 +1096,8 @@ final class CategoryScannerTests: XCTestCase {
         // item origin to the PRODUCING scanner's own declared roots: a
         // mapping bug in scanner A can no longer pair its target with
         // scanner B's registered container and ride B's registration
-        // through union admission. (Production: NodeModulesScanner's
-        // `originContainer` is always the exact search root the walk
+        // through union admission. (Production: the retired node_modules
+        // scanner's `originContainer` was always the exact search root the walk
         // started from — an exact member of its declared set.)
         let home = try makeTempDir("home")
         let rootA = fixtureContainer
@@ -1457,7 +1476,7 @@ final class CategoryScannerTests: XCTestCase {
             ("missing aggregate (no records, zero components)",
              makeAggregateItem(category: category, state: .missing),
              adapterID, true),
-            ("denied per-item (NodeModulesScanner's denied emission)",
+            ("denied per-item (the retired node_modules denied emission)",
              makeContainerItem(id: "c1", scannerID: "fixture",
                                state: .denied),
              "fixture", true),

@@ -550,7 +550,8 @@ struct OrphanedCachesScanner: @unchecked Sendable {
         )
     }
 
-    /// DELETE-TIME REVALIDATION entry point (cleaner seam, PR #456 review):
+    /// DELETE-TIME REVALIDATION entry point (cleaner seam, PR #456 review;
+    /// reached through fn-4.8's generalized `preDeleteRevalidator` below):
     /// a sweep entry removed and RECREATED at the same name between scan
     /// and confirmation passes the cleaner's container-snapshot check (the
     /// snapshot binds the `~/Library/Caches` root's identity, not the
@@ -790,6 +791,80 @@ extension OrphanedCachesScanner: SpaceScanner {
     /// PathGuard's delete-time admission (nothing item-side can widen it).
     var trustedContainerRoots: [URL] { [cachesRoot] }
 
+    /// The sweep's DELETE-TIME revalidator — the seam's first client
+    /// (fn-4.8). Declared here, captured by the runtime at registration,
+    /// and run by the cleaner at the one chokepoint; it replaces, with no
+    /// behavioural change, the scanner-keyed gate the cleaner used to
+    /// hard-code.
+    var preDeleteRevalidator: PreDeleteRevalidator? {
+        Self.preDeleteRevalidator(provider: provider)
+    }
+
+    /// The revalidator VALUE, constructible without a scanner instance so a
+    /// cleaner built directly (tests, headless paths) can register exactly
+    /// what production registers.
+    ///
+    /// APPLICABILITY (the pure predicate — no filesystem access, no state):
+    /// exactly the items that carry the CLEAN PROMISE. `automaticCleanEligible`
+    /// is set by the classifier ONLY when the scan-time user-data probe
+    /// found nothing AND completed, so re-establishing that promise at
+    /// delete time is precisely what must be re-proven. Non-eligible sweep
+    /// items reach deletion only through conscious per-item confirmation
+    /// against DISPLAYED caution evidence (the verified-Photos-library field
+    /// case); re-refusing them on the same disclosed state would make them
+    /// permanently undeletable, so they keep the epic's accepted
+    /// conscious-confirmation TOCTOU residual — and the emission marks
+    /// exactly this same set, so scan-time validation and delete-time
+    /// dispatch agree item for item.
+    ///
+    /// VERDICT: the promise re-establishes (no matches AND complete) →
+    /// `.allow`; anything else → a fail-closed refusal. The sweep has no
+    /// valuables model, so its refusals carry an EMPTY payload and NO token
+    /// (the uniform R17 rule: there is nothing here to acknowledge, and the
+    /// `authorization` entry is deliberately unread — a sweep refusal is
+    /// resolved by re-scanning, never by acknowledging).
+    static func preDeleteRevalidator(
+        provider: FileSystemIdentityProvider
+    ) -> PreDeleteRevalidator {
+        PreDeleteRevalidator(
+            requiresRevalidation: { $0.automaticCleanEligible },
+            revalidate: { item, _ in
+                guard case .containerItem(_, let target) = item.admission else {
+                    // Structurally unreachable (the validator and the
+                    // cleaner both refuse a `.removeItem` item without the
+                    // container descriptor) — fail closed rather than
+                    // assume a target.
+                    return .refuse(
+                        reason: "refused: a sweep item without a "
+                            + "container-item target cannot be re-inspected "
+                            + "before deletion",
+                        valuables: [], acknowledgementToken: nil
+                    )
+                }
+                let probe = preDeleteUserDataProbe(at: target, provider: provider)
+                if !probe.matches.isEmpty {
+                    let names = probe.matches.joined(separator: ", ")
+                    return .refuse(
+                        reason: "\(target.path): contents changed since scan "
+                            + "— user-data-shaped content (\(names)) present "
+                            + "at delete time; refused, re-scan required",
+                        valuables: [], acknowledgementToken: nil
+                    )
+                }
+                if !probe.complete {
+                    return .refuse(
+                        reason: "\(target.path): couldn't fully re-inspect "
+                            + "contents at delete time — refused (an "
+                            + "inspection that could not finish is treated "
+                            + "like a change since scan); re-scan required",
+                        valuables: [], acknowledgementToken: nil
+                    )
+                }
+                return .allow
+            }
+        )
+    }
+
     /// Protocol scan. The sweep ignores `categoryFilter` (category-scanner
     /// only) and runs on BOTH triggers — `~/Library/Caches` is not a
     /// TCC-gated search root; per-entry TCC denials are still classified by
@@ -944,7 +1019,16 @@ extension OrphanedCachesScanner: SpaceScanner {
             ),
             defaultSelected: selectable,
             automaticCleanEligible: selectable,
-            isStale: isStale
+            isStale: isStale,
+            // The sweep runs no valuables probe — nothing to disclose.
+            valuablesDisclosure: nil,
+            // The scanner-agnostic revalidation marker (fn-4.8, R17/D8),
+            // emitted for EXACTLY the set the registered revalidator's
+            // predicate deems applicable (`automaticCleanEligible`) — the
+            // runtime's marker invariant malforms the outcome if these two
+            // ever disagree. Non-eligible sweep items stay unmarked: their
+            // accepted conscious-confirmation residual is preserved exactly.
+            requiresPreDeleteRevalidation: selectable
         )
     }
 

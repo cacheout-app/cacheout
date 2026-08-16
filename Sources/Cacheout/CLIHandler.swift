@@ -37,9 +37,33 @@
 ///   REJECTS them with `INVALID_ARGUMENTS` before dispatch. Overrides the
 ///   persisted `cacheout.orphanedCaches.*` value for this invocation;
 ///   never persisted
+/// - `--dev-root <path>`: REPEATABLE, invocation-scoped REPLACEMENT of the
+///   dev roots the build-artifacts scanner walks. Accepted by `scan` and
+///   `clean` ONLY (every other command REJECTS it with `INVALID_ARGUMENTS`
+///   before dispatch). PRECEDENCE: when present, the flag's values are the
+///   ENTIRE effective root set for this invocation — the persisted
+///   `cacheout.buildArtifacts.devRoots` list is not consulted and is never
+///   written. PATH FORMS: an ABSOLUTE path and a `~`-expanded path are
+///   accepted; any other relative path is `INVALID_ARGUMENTS` naming the
+///   value (a cwd-relative dev root would silently depend on the invocation
+///   directory). Values run the same container-root admission policy as the
+///   persisted list — a dangerous root (`/`, a volume root, `$HOME`, or a
+///   symlink alias of one) is `INVALID_ARGUMENTS` naming it; exact-canonical
+///   duplicates collapse (declared spellings preserved) and NESTED roots
+///   stay independent walks
+/// - `--acknowledge-valuables <scanner-slug>:<item-id>:<token>`: REPEATABLE,
+///   item-bound acknowledgement of the release artifacts a `clean` refusal
+///   (or plan row) disclosed for that item — one entry per item, accepted by
+///   `clean` ONLY (every other command REJECTS it with `INVALID_ARGUMENTS`
+///   before dispatch). The token is the full lowercase-hex SHA-256 the
+///   refusal printed; deletion proceeds only when the delete-time
+///   re-inspection recomputes exactly that token
+/// - Positional arguments come BEFORE flags. A positional token appearing
+///   after the first flag is `INVALID_ARGUMENTS` naming it (every documented
+///   invocation shape is already targets-first)
 /// - Clean targets are positional arguments after the command. A target is
 ///   one of `<category-slug>` (a category aggregate), `<scanner-slug>` (ALL
-///   items of a per-item scanner, e.g. `node_modules`), or
+///   items of a per-item scanner, e.g. `build_artifacts`), or
 ///   `<scanner-slug>:<item-id>` (one item — the opaque id echoed from
 ///   `scan`'s `scanner_items`). The frozen aggregate scanner id
 ///   `categories` is NOT a valid target; address aggregates by their
@@ -65,8 +89,8 @@
 /// ```bash
 /// Cacheout --cli scan
 /// Cacheout --cli clean xcode_derived_data npm_cache --confirm
-/// Cacheout --cli clean node_modules --confirm
-/// Cacheout --cli clean node_modules:3f0c…e1 --confirm
+/// Cacheout --cli clean build_artifacts --confirm
+/// Cacheout --cli clean build_artifacts:3f0c…e1 --confirm
 /// Cacheout --cli clean xcode_derived_data --dry-run
 /// Cacheout --cli smart-clean 10.0 --confirm
 /// Cacheout --cli smart-clean 10.0 --dry-run
@@ -129,15 +153,30 @@ struct CLIHandler {
             exitWithError(code: "UNKNOWN_COMMAND", message: "Unknown command: \(commandStr)")
         }
 
+        // The NORMALIZED parse (fn-4.9, F3): positional targets, valued
+        // flags, and the pinned TARGETS-BEFORE-FLAGS ordering rule — a
+        // positional after the first flag is a loud INVALID_ARGUMENTS naming
+        // it, where the as-built parser dropped it silently. Runs before
+        // dispatch so every command shares one grammar.
+        let invocation: NormalizedInvocation
+        switch normalizedInvocation(
+            command: command, arguments: Array(args[(cliIndex + 2)...])
+        ) {
+        case .failure(let error):
+            exitWithError(code: "INVALID_ARGUMENTS", message: error.message)
+        case .success(let parsed):
+            invocation = parsed
+        }
+
         // Pre-dispatch gate: the sweep's config flags (R8) are accepted by
         // the commands that actually run the sweep scanner — scan and clean
-        // ONLY. Every other command rejects them up front; silently
-        // ignoring a threshold the caller passed would hide the flag
+        // ONLY — and `--acknowledge-valuables` (R17) by clean only. Every
+        // other command rejects them up front; silently ignoring a threshold
+        // (or an ACKNOWLEDGEMENT) the caller passed would hide the flag
         // landing on the wrong command.
-        if let flag = rejectedSweepFlag(for: command, in: args) {
+        if let rejection = rejectedFlag(for: command, in: args) {
             exitWithError(
-                code: "INVALID_ARGUMENTS",
-                message: sweepFlagRejectionMessage(flag: flag, command: command)
+                code: "INVALID_ARGUMENTS", message: rejection.message
             )
         }
 
@@ -150,18 +189,27 @@ struct CLIHandler {
 
         case .scan:
             // The sweep's config flags (R8) are accepted by the commands
-            // that actually run the sweep scanner — scan and clean.
+            // that actually run the sweep scanner — scan and clean. The same
+            // holds for `--dev-root` (fn-4.6): the roots are threaded into
+            // `.production()` BEFORE the dependency bundle is built, because
+            // `trustedContainerRoots` freeze at registration (D1).
             let sweepThresholds = resolveSweepThresholds(from: args)
+            let devRoots = resolveDevRoots(invocation, in: args)
             await handleScan(deps: .production(
-                orphanedCachesThresholds: sweepThresholds
+                orphanedCachesThresholds: sweepThresholds, devRoots: devRoots
             ))
 
         case .clean:
-            let slugs = extractSlugs(from: args, after: cliIndex + 1)
             let sweepThresholds = resolveSweepThresholds(from: args)
+            let devRoots = resolveDevRoots(invocation, in: args)
             await handleClean(
-                slugs: slugs, dryRun: isDryRun, confirmed: isConfirmed,
-                deps: .production(orphanedCachesThresholds: sweepThresholds)
+                slugs: invocation.targets,
+                acknowledgements: resolveAcknowledgements(invocation, in: args),
+                dryRun: isDryRun, confirmed: isConfirmed,
+                deps: .production(
+                    orphanedCachesThresholds: sweepThresholds,
+                    devRoots: devRoots
+                )
             )
 
         case .smartClean:
@@ -175,7 +223,7 @@ struct CLIHandler {
             // `smart-clean garbage --confirm` delete 5 GB the caller never
             // asked for. (Range/finiteness is validated in the handler.)
             let targetGB: Double
-            if let raw = extractPositionalArg(from: args, after: cliIndex + 1) {
+            if let raw = invocation.targets.first {
                 guard let parsed = Double(raw) else {
                     exitWithError(code: "INVALID_ARGUMENTS",
                                   message: "smart-clean target must be a number of GB, got: \(raw)")
@@ -214,7 +262,7 @@ struct CLIHandler {
             handleUninstallHelper()
 
         case .intervene:
-            let interventionName = extractPositionalArg(from: args, after: cliIndex + 1)
+            let interventionName = invocation.targets.first
             let targetPID: pid_t?
             if let flagIdx = args.firstIndex(of: "--target-pid") {
                 // Flag present — validate the value strictly.
@@ -349,12 +397,22 @@ struct CLIHandler {
         ///   thresholds (R8) — nil resolves defaults → UserDefaults inside
         ///   the runtime factory; the CLI passes the flag-layered value.
         ///   Never persisted.
+        /// - Parameter devRoots: invocation-scoped dev-roots REPLACEMENT
+        ///   (fn-4, R8/D1) — nil resolves the persisted `DevRootsStore`
+        ///   inside the runtime factory. The roots are threaded into
+        ///   `.production()` BEFORE this bundle is constructed, because
+        ///   `trustedContainerRoots` freeze at registration: a runtime is
+        ///   the only thing that can carry them, and one CLI invocation is
+        ///   one runtime. `--dev-root` parsing is fn-4.6's; nothing here is
+        ///   ever persisted.
         static func production(
-            orphanedCachesThresholds: OrphanedCacheClassifier.Thresholds? = nil
+            orphanedCachesThresholds: OrphanedCacheClassifier.Thresholds? = nil,
+            devRoots: DevRootsResolution? = nil
         ) -> CLIRuntimeDependencies {
             CLIRuntimeDependencies(
                 runtime: .production(
-                    orphanedCachesThresholds: orphanedCachesThresholds
+                    orphanedCachesThresholds: orphanedCachesThresholds,
+                    devRoots: devRoots
                 ),
                 categorySlugs: Set(CacheCategory.allCategories.map(\.slug))
             )
@@ -500,6 +558,477 @@ struct CLIHandler {
     /// `rejectedSweepFlag(for:in:)`.
     static func smartCleanRejectedSweepFlag(in args: [String]) -> String? {
         rejectedSweepFlag(for: .smartClean, in: args)
+    }
+
+    // MARK: - Acknowledgement flag + normalized parse (fn-4.9, R17/F3)
+
+    /// The REPEATABLE, ITEM-BOUND valuables acknowledgement (R17):
+    /// `--acknowledge-valuables <scanner-slug>:<item-id>:<token>`, one entry
+    /// per item. Slug, item id, and token are colon-free by construction
+    /// (`[a-z0-9_]+`, the CLI-safe opaque id contract, and 64 lowercase hex),
+    /// so the colon-joined form parses unambiguously and covers multi-target
+    /// and bare-scanner cleans alike. Accepted by `clean` ONLY — it is the
+    /// only command that deletes items a valuables gate can guard.
+    static let acknowledgeValuablesFlag = "--acknowledge-valuables"
+
+    // MARK: - Dev roots (fn-4.6, R8/R16)
+
+    /// The REPEATABLE, invocation-scoped dev-roots REPLACEMENT:
+    /// `--dev-root <path>`, accepted by `scan` and `clean` ONLY (the two
+    /// commands that walk the configured roots; every other command rejects
+    /// it up front). Every occurrence's value joins the effective set, which
+    /// REPLACES the persisted `DevRootsStore` list for this invocation and is
+    /// NEVER persisted.
+    ///
+    /// PATH FORMS (pinned): an ABSOLUTE path (`/Volumes/Work/code`) and a
+    /// `~`-EXPANDED path (`~/dev`) are accepted; ANY other relative spelling
+    /// (`projects/x`) is `INVALID_ARGUMENTS` naming the value — a
+    /// cwd-relative dev root would silently depend on the invocation
+    /// directory, and the store's home-relative SEED resolution is a
+    /// store-internal matter, never a CLI input form.
+    static let devRootFlag = "--dev-root"
+
+    /// Flags whose NEXT argv token is their VALUE. The normalized parse
+    /// consumes those value tokens so they are never mistaken for positional
+    /// targets — the ordering rule below would otherwise reject perfectly
+    /// valid as-built invocations.
+    ///
+    /// `--format` is in the table deliberately: the handler ignores it
+    /// (output is always JSON), but the MCP consumer appends `--format json`
+    /// to EVERY invocation, so its value token must be recognized as a value.
+    /// `--dev-root` (fn-4.6) is ONE table entry — the repeatable flag
+    /// consumes fn-4.9's grammar and adds no second parser.
+    static let valuedFlags: Set<String> = [
+        "--target-pid", "--target-name", "--top", "--format",
+        orphanSizeFloorFlag, orphanStaleDaysFlag, acknowledgeValuablesFlag,
+        devRootFlag,
+    ]
+
+    /// One invocation, normalized (F3): the command, its POSITIONAL targets,
+    /// and every valued flag's values in argv order. Repeatable flags
+    /// (`--acknowledge-valuables`, and fn-4.6's `--dev-root`) collect all of
+    /// their values here; single-value flags keep their as-built extraction
+    /// semantics and read argv themselves.
+    struct NormalizedInvocation: Equatable {
+        let command: Command
+        /// Positional tokens, in order, ALL of them before the first flag
+        /// (the ordering rule guarantees it).
+        let targets: [String]
+        let flagValues: [String: [String]]
+
+        /// Every value passed for `flag`, in argv order (empty when absent).
+        func values(of flag: String) -> [String] { flagValues[flag] ?? [] }
+    }
+
+    /// The normalized parse with the PINNED ordering rule: **TARGETS BEFORE
+    /// FLAGS** — a positional token appearing AFTER the first `--`-prefixed
+    /// token is `INVALID_ARGUMENTS` naming the token.
+    ///
+    /// Why this rule and not flags-anywhere: the as-built hand parser already
+    /// stopped target extraction at the first `--` while detecting flags by
+    /// whole-argv scans, so a trailing positional was silently DROPPED. The
+    /// ordering rule keeps every currently-valid invocation meaning exactly
+    /// what it meant (every documented shape — `clean <targets…> --confirm`,
+    /// `smart-clean <gb> --dry-run`, `intervene <name> --confirm --target-pid
+    /// N`, `top-processes --top N`, and the MCP's trailing `--format json` —
+    /// is targets-first) and converts the silent drop into a loud error.
+    /// Flags-anywhere would instead RE-INTERPRET existing argv shapes.
+    ///
+    /// UNKNOWN flags are tolerated (the MCP passes `--include-caution`, and
+    /// the as-built handler ignores what it does not parse); only the
+    /// ordering rule rejects here. A valued flag with no following token is
+    /// left to that flag's OWN validation, whose message is more specific.
+    ///
+    /// - Parameter arguments: the argv tokens AFTER the command token.
+    static func normalizedInvocation(
+        command: Command, arguments: [String]
+    ) -> Result<NormalizedInvocation, CLIAddressError> {
+        var targets: [String] = []
+        var flagValues: [String: [String]] = [:]
+        var sawFlag = false
+        var index = arguments.startIndex
+
+        while index < arguments.endIndex {
+            let token = arguments[index]
+            guard !token.hasPrefix("--") else {
+                sawFlag = true
+                if valuedFlags.contains(token), index + 1 < arguments.endIndex {
+                    flagValues[token, default: []].append(arguments[index + 1])
+                    index += 2
+                    continue
+                }
+                index += 1
+                continue
+            }
+            guard !sawFlag else {
+                return .failure(CLIAddressError(message:
+                    "Unexpected argument '\(token)' after flags: "
+                    + "\(command.rawValue) takes its targets BEFORE any flag "
+                    + "(Cacheout --cli \(command.rawValue) <targets...> "
+                    + "[flags]). Move '\(token)' ahead of the flags."
+                ))
+            }
+            targets.append(token)
+            index += 1
+        }
+        return .success(NormalizedInvocation(
+            command: command, targets: targets, flagValues: flagValues
+        ))
+    }
+
+    /// The CENTRALIZED pre-dispatch flag gate: the first flag present in an
+    /// invocation of a command that does not accept it, with its refusal
+    /// message. Sweep flags (`scan`/`clean`) are checked first, preserving
+    /// fn-3.4's exact behavior and wording; `--acknowledge-valuables` is
+    /// clean-ONLY. Silently ignoring a flag the caller passed would hide it
+    /// landing on the wrong command — and for an acknowledgement, that is a
+    /// destructive-authorization input going nowhere.
+    static func rejectedFlag(
+        for command: Command, in args: [String]
+    ) -> (flag: String, message: String)? {
+        if let flag = rejectedSweepFlag(for: command, in: args) {
+            return (flag, sweepFlagRejectionMessage(flag: flag, command: command))
+        }
+        if command != .clean, args.contains(acknowledgeValuablesFlag) {
+            return (
+                acknowledgeValuablesFlag,
+                acknowledgeFlagRejectionMessage(command: command)
+            )
+        }
+        if command != .scan, command != .clean, args.contains(devRootFlag) {
+            return (devRootFlag, devRootFlagRejectionMessage(command: command))
+        }
+        return nil
+    }
+
+    /// The INVALID_ARGUMENTS message for `--dev-root` on a command that
+    /// never walks the configured dev roots — same actionable shape as the
+    /// sweep-flag refusal (names the flag, the refusing command, and the
+    /// commands that accept it).
+    static func devRootFlagRejectionMessage(command: Command) -> String {
+        "\(devRootFlag) is not accepted by \(command.rawValue) — only scan "
+            + "and clean walk the configured dev roots; use the flag with "
+            + "scan or clean"
+    }
+
+    /// The INVALID_ARGUMENTS message for `--acknowledge-valuables` on a
+    /// command that never deletes an item behind a valuables gate — same
+    /// actionable shape as the sweep-flag refusal (names the flag, the
+    /// refusing command, and the command that accepts it).
+    static func acknowledgeFlagRejectionMessage(command: Command) -> String {
+        "\(acknowledgeValuablesFlag) is not accepted by \(command.rawValue) "
+            + "— only clean deletes items that can require a valuables "
+            + "acknowledgement; use the flag with clean"
+    }
+
+    /// One parsed `--acknowledge-valuables` entry: the ITEM it binds to and
+    /// the token the delete-time revalidation must recompute exactly.
+    struct ParsedAcknowledgement: Equatable {
+        let key: ItemKey
+        let token: String
+    }
+
+    /// FORM validation of every `--acknowledge-valuables` entry — run on
+    /// EVERY path (`--dry-run`, unconfirmed, confirmed) so malformed
+    /// destructive-authorization input fails fast everywhere. This is a
+    /// pure parse: it performs NO token-vs-set matching (that can only
+    /// happen at delete time, against the CURRENT probe).
+    ///
+    /// FROZEN rules — this is an authorization input, never incidental
+    /// dictionary construction:
+    /// - exactly two colons (`<scanner-slug>:<item-id>:<token>`);
+    /// - slug matches the address grammar `[a-z0-9_]+`;
+    /// - item id is the documented CLI-safe opaque string;
+    /// - token is EXACTLY 64 lowercase hex characters (the full SHA-256 the
+    ///   refusal printed — never a prefix, never uppercase);
+    /// - a DUPLICATE ItemKey is refused outright, including a byte-identical
+    ///   repeat: first-wins would ignore a contradicting second entry and
+    ///   last-wins would ignore the first, and either silently drops half of
+    ///   what the caller authorized.
+    static func parseAcknowledgements(
+        _ entries: [String]
+    ) -> Result<[ParsedAcknowledgement], CLIAddressError> {
+        var parsed: [ParsedAcknowledgement] = []
+        var seen = Set<ItemKey>()
+
+        for entry in entries {
+            let fields = entry.split(
+                separator: ":", omittingEmptySubsequences: false
+            ).map(String.init)
+            guard fields.count == 3 else {
+                return .failure(malformedAcknowledgement(entry))
+            }
+            let (slug, itemID, token) = (fields[0], fields[1], fields[2])
+            guard SpaceScannerRuntime.isValidSlug(slug),
+                  SpaceScannerRuntime.isCLISafeItemID(itemID) else {
+                return .failure(malformedAcknowledgement(entry))
+            }
+            guard isAcknowledgementToken(token) else {
+                return .failure(CLIAddressError(message:
+                    "\(acknowledgeValuablesFlag) token must be exactly 64 "
+                    + "lowercase hex characters (the token the refusal "
+                    + "printed), got: '\(token)'"
+                ))
+            }
+            let key = ItemKey(scannerID: slug, itemID: itemID)
+            guard seen.insert(key).inserted else {
+                return .failure(CLIAddressError(message:
+                    "\(acknowledgeValuablesFlag) names \(slug):\(itemID) more "
+                    + "than once — pass exactly one acknowledgement per item"
+                ))
+            }
+            parsed.append(ParsedAcknowledgement(key: key, token: token))
+        }
+        return .success(parsed)
+    }
+
+    /// The OCCURRENCE-COUNT guard for the repeatable acknowledgement flag,
+    /// mirroring `--dev-root`'s (review r1). The normalized grammar leaves a
+    /// valued flag with NO following token to that flag's own validation, and
+    /// silence is the dangerous direction here too: a trailing
+    /// `--acknowledge-valuables` collects no value, so the invocation would
+    /// look exactly like an UNACKNOWLEDGED clean and proceed — the caller
+    /// believing they authorized something. An acknowledgement is destructive
+    /// authorization input; a mismatch is `INVALID_ARGUMENTS`, pre-flight,
+    /// nothing deleted (the documented fail-fast rule).
+    ///
+    /// - Parameter occurrences: how many times the flag appears in argv.
+    static func acknowledgementValues(
+        from values: [String], occurrences: Int
+    ) -> Result<[String], CLIAddressError> {
+        guard occurrences <= values.count else {
+            return .failure(CLIAddressError(message:
+                "\(acknowledgeValuablesFlag) requires an entry — one "
+                + "occurrence has no value. Pass "
+                + "<scanner-slug>:<item-id>:<token> (the address and token "
+                + "the refusal printed). Nothing was cleaned."
+            ))
+        }
+        return .success(values)
+    }
+
+    /// The process-facing resolution: the acknowledgement entry list, exiting
+    /// via the invalid-arguments convention on a MISSING value. The raw argv
+    /// is read for the OCCURRENCE count only (the `--dev-root` convention) —
+    /// the values themselves always come from the one normalized grammar.
+    private static func resolveAcknowledgements(
+        _ invocation: NormalizedInvocation, in args: [String]
+    ) -> [String] {
+        switch acknowledgementValues(
+            from: invocation.values(of: acknowledgeValuablesFlag),
+            occurrences: args.filter { $0 == acknowledgeValuablesFlag }.count
+        ) {
+        case .failure(let error):
+            exitWithError(code: "INVALID_ARGUMENTS", message: error.message)
+        case .success(let values):
+            return values
+        }
+    }
+
+    private static func malformedAcknowledgement(
+        _ entry: String
+    ) -> CLIAddressError {
+        CLIAddressError(message:
+            "\(acknowledgeValuablesFlag) expects "
+            + "<scanner-slug>:<item-id>:<token> (the address and token the "
+            + "refusal printed), got: '\(entry)'"
+        )
+    }
+
+    /// The token's exact form: 64 LOWERCASE hex characters — the full
+    /// lowercase-hex SHA-256 the refusal and the plan rows emit. Uppercase
+    /// is rejected rather than folded: the token is compared byte-for-byte
+    /// against a freshly derived one, so accepting a spelling that can never
+    /// match would only defer the failure to delete time.
+    static func isAcknowledgementToken(_ token: String) -> Bool {
+        token.count == 64 && token.utf8.allSatisfy { byte in
+            (byte >= UInt8(ascii: "0") && byte <= UInt8(ascii: "9"))
+                || (byte >= UInt8(ascii: "a") && byte <= UInt8(ascii: "f"))
+        }
+    }
+
+    /// PRE-FLIGHT validation of parsed entries against the RESOLVED clean
+    /// selection — after target resolution, before ANY deletion, on every
+    /// path. Still no token matching: these rules are about what the entry
+    /// BINDS to, which the scan already knows.
+    ///
+    /// - an entry naming an item that is not in this clean's selection
+    ///   (unknown id, or a real item this invocation does not clean) is
+    ///   refused: an acknowledgement that authorizes nothing this run touches
+    ///   is caller confusion, and accepting it would let a stale script
+    ///   believe it acknowledged something;
+    /// - an entry for a PROVEN valuables-free item is refused for the same
+    ///   reason (no token exists for an empty set anywhere). "Proven" is
+    ///   load-bearing: an item whose scan-time probe did NOT finish is not
+    ///   proven free — its delete-time probe may find valuables and issue a
+    ///   token — so an INCOMPLETE probe with an empty disclosed set is
+    ///   accepted here and decided at delete time, where the uniform R17 rule
+    ///   refuses it anyway if the inspection still cannot finish.
+    static func validateAcknowledgements(
+        _ entries: [ParsedAcknowledgement], against items: [ReclaimableItem]
+    ) -> CLIAddressError? {
+        let itemsByKey = Dictionary(
+            items.map { ($0.key, $0) }, uniquingKeysWith: { first, _ in first }
+        )
+        for entry in entries {
+            let address = "\(entry.key.scannerID):\(entry.key.itemID)"
+            guard let item = itemsByKey[entry.key] else {
+                return CLIAddressError(message:
+                    "\(acknowledgeValuablesFlag) names \(address), which is "
+                    + "not part of this clean's selection — acknowledge only "
+                    + "items this invocation would clean (item ids are "
+                    + "echoed from 'scan'). Nothing was cleaned."
+                )
+            }
+            let provenFree: Bool
+            if let disclosure = item.valuablesDisclosure {
+                provenFree = disclosure.probeComplete
+                    && disclosure.valuables.isEmpty
+            } else {
+                // No valuables model at all (every scanner but
+                // build_artifacts today) — nothing this entry could bind to.
+                provenFree = true
+            }
+            guard !provenFree else {
+                return CLIAddressError(message:
+                    "\(acknowledgeValuablesFlag) names \(address), which "
+                    + "discloses no release artifacts — there is nothing to "
+                    + "acknowledge; re-run without the entry. Nothing was "
+                    + "cleaned."
+                )
+            }
+        }
+        return nil
+    }
+
+    /// The per-clean `[ItemKey: acknowledgement]` AUTHORIZATION CONTEXT the
+    /// cleaner hands to each item's revalidator (fn-4.8's surface). Built
+    /// ONLY from validated entries — duplicates are impossible by then, so
+    /// this construction can never silently collapse two acknowledgements.
+    static func authorizationContext(
+        from entries: [ParsedAcknowledgement]
+    ) -> PreDeleteAuthorizationContext {
+        var context: PreDeleteAuthorizationContext = [:]
+        for entry in entries { context[entry.key] = entry.token }
+        return context
+    }
+
+    /// The PURE `--dev-root` resolution (in-process testable; the process
+    /// shell below turns a failure into the INVALID_ARGUMENTS exit).
+    ///
+    /// `nil` success = the flag was absent, so the persisted `DevRootsStore`
+    /// resolves inside the production factory exactly as it does for the
+    /// GUI. Otherwise the flag values REPLACE the effective set for this
+    /// invocation:
+    ///
+    /// 1. PATH FORM per value — absolute or `~`-expanded only (see
+    ///    `devRootFlag`); anything else is refused NAMING the value;
+    /// 2. the SHARED resolution pipeline — `DevRootsStore`'s replacement
+    ///    path, so the same container-root admission policy (R16), the same
+    ///    exact-canonical-duplicate dedupe, and the same declared-spelling
+    ///    preservation apply as for persisted roots; NESTED flag roots stay
+    ///    independent walks (D7);
+    /// 3. a POLICY-rejected value becomes an INVALID_ARGUMENTS error NAMING
+    ///    the offending root — invocation-scoped input has an immediate
+    ///    error channel, so it never degrades into a silent config issue the
+    ///    way a persisted root does.
+    ///
+    /// Nothing here reads or writes the defaults suite: the replacement path
+    /// consults no persisted value, and `--dev-root` is never persisted.
+    ///
+    /// - Parameter occurrences: how many times the flag appears in argv.
+    ///   The normalized grammar leaves a valued flag with NO following token
+    ///   to the flag's own validation, and for THIS flag silence would be
+    ///   the dangerous direction: a trailing `--dev-root` would look exactly
+    ///   like an absent flag and quietly scan the PERSISTED roots the caller
+    ///   meant to replace. A mismatch is therefore INVALID_ARGUMENTS.
+    static func devRootsOverride(
+        from values: [String],
+        occurrences: Int,
+        home: URL,
+        provider: FileSystemIdentityProvider = FileSystemIdentityProvider()
+    ) -> Result<DevRootsResolution?, CLIAddressError> {
+        guard occurrences <= values.count else {
+            return .failure(CLIAddressError(message:
+                "\(devRootFlag) requires a folder path — one occurrence has "
+                + "no value. Pass an absolute path (/Volumes/Work/code) or a "
+                + "~/ path (~/dev). Nothing was scanned."
+            ))
+        }
+        guard !values.isEmpty else { return .success(nil) }
+
+        var declaredRoots: [URL] = []
+        for value in values {
+            switch declaredDevRoot(value, home: home) {
+            case .failure(let error):
+                return .failure(error)
+            case .success(let url):
+                declaredRoots.append(url)
+            }
+        }
+
+        let resolution = DevRootsStore(provider: provider)
+            .effectiveRoots(replacing: declaredRoots, home: home)
+        // The policy's own verdict, surfaced as a usage error (the CLI
+        // attack case: `--dev-root /`). `.configInvalid` cannot occur on the
+        // replacement path — nothing was parsed out of the defaults suite.
+        if let refused = resolution.issues.first(
+            where: { $0.kind == .containerRefused }
+        ) {
+            return .failure(CLIAddressError(message:
+                "\(devRootFlag) \(refused.url?.path ?? "") is not a usable "
+                + "dev root: \(refused.detail). Nothing was scanned."
+            ))
+        }
+        return .success(resolution)
+    }
+
+    /// ONE `--dev-root` value → its declared URL, enforcing the pinned path
+    /// forms. `~` expands against the INJECTED home (never `getpwuid`), so
+    /// the flag means the same thing in tests and in production.
+    private static func declaredDevRoot(
+        _ value: String, home: URL
+    ) -> Result<URL, CLIAddressError> {
+        func refuse(_ reason: String) -> Result<URL, CLIAddressError> {
+            .failure(CLIAddressError(message:
+                "\(devRootFlag) \(reason), got: '\(value)'. Pass an absolute "
+                + "path (/Volumes/Work/code) or a ~/ path (~/dev) — a "
+                + "relative path would depend on the current directory."
+            ))
+        }
+        guard !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else { return refuse("requires a folder path") }
+        if value == "~" { return .success(home) }
+        if value.hasPrefix("~/") {
+            return .success(
+                home.appendingPathComponent(String(value.dropFirst(2)))
+            )
+        }
+        guard value.hasPrefix("/") else {
+            return refuse("requires an ABSOLUTE or ~-expanded path")
+        }
+        return .success(URL(fileURLWithPath: value))
+    }
+
+    /// The process-facing resolution: `--dev-root` values → the
+    /// invocation-scoped replacement, exiting via the invalid-arguments
+    /// convention on a MISSING value, a bad path form, or a policy-refused
+    /// root. The raw argv is read for the OCCURRENCE count only (the gate's
+    /// own convention) — the values themselves always come from the one
+    /// normalized grammar.
+    private static func resolveDevRoots(
+        _ invocation: NormalizedInvocation, in args: [String]
+    ) -> DevRootsResolution? {
+        switch devRootsOverride(
+            from: invocation.values(of: devRootFlag),
+            occurrences: args.filter { $0 == devRootFlag }.count,
+            home: FileManager.default.homeDirectoryForCurrentUser
+        ) {
+        case .failure(let error):
+            exitWithError(code: "INVALID_ARGUMENTS", message: error.message)
+        case .success(let resolution):
+            return resolution
+        }
     }
 
     /// The INVALID_ARGUMENTS message for a rejected sweep flag: names the
@@ -653,12 +1182,60 @@ struct CLIHandler {
                 row["grant_hint"] = tccGrantHint
             }
         }
+        // ADDITIVE, fn-4.4 (no schema bump). Both keys are OMITTED — never
+        // null — when they do not apply: `logical_bytes` only when the model
+        // carries a materially diverging figure (the sparse `target/` field
+        // case), `valuables` only when the probe actually disclosed some.
+        if let logicalBytes = item.logicalBytes {
+            row["logical_bytes"] = logicalBytes
+        }
+        if let disclosure = item.valuablesDisclosure,
+           !disclosure.valuables.isEmpty {
+            // Array order IS the model's stored canonical order — no re-sort.
+            row["valuables"] = disclosure.valuables.map(valuableRowJSON(for:))
+        }
+        return row
+    }
+
+    /// The ONE pinned valuables ELEMENT shape (fn-4.4, R3/R17), six fields:
+    ///
+    ///     {"name": …, "path": …, "allocated_bytes": …,
+    ///      "device": …, "inode": …, "modified_at_ns": …}
+    ///
+    /// `path` is the CANONICAL IDENTITY PATH (`resolveTargetKeepingLeaf`) —
+    /// the same string the token preimage consumes; the unresolved display
+    /// spelling NEVER reaches the wire. `device`/`inode` serialize as
+    /// UNSIGNED decimal integers (the `FileSystemIdentityProvider.Identity`
+    /// convention). `modified_at_ns` is DERIVED as `modifiedSeconds * 1e9 +
+    /// modifiedNanoseconds` from the same integers the sheet renders its date
+    /// from — one source, no precision drift.
+    ///
+    /// Plan rows and clean-result refusal rows (fn-4.9) REUSE this builder
+    /// verbatim so scan, plan, and refusal surfaces can never drift.
+    ///
+    /// The `modified_at_ns` key is unconditional for anything real: the value
+    /// is absent only for an identity outside the pinned value domains, which
+    /// no production probe can produce (`leafMetadata` rejects it at the
+    /// `lstat`) and no validated outcome can carry (the value-domain family
+    /// malforms it first). The row omits rather than inventing a number.
+    static func valuableRowJSON(for valuable: DetectedValuable) -> [String: Any] {
+        var row: [String: Any] = [
+            "name": valuable.name,
+            "path": valuable.canonicalIdentityPath,
+            "allocated_bytes": valuable.identity.allocatedBytes,
+            "device": valuable.identity.device,
+            "inode": valuable.identity.inode,
+        ]
+        if let modifiedAtNS = valuable.identity.modifiedAtNanoseconds {
+            row["modified_at_ns"] = modifiedAtNS
+        }
         return row
     }
 
     /// One `scanner_errors` row. `path` is CONDITIONAL (round 7): present
-    /// for the filesystem kinds, ABSENT for `malformed_outcome` — a fake
-    /// path must never be invented. `grant_hint` is CONDITIONAL: present
+    /// for the filesystem kinds, ABSENT for the non-filesystem kinds
+    /// (`malformed_outcome`, `config_invalid`) — a fake path must never be
+    /// invented. `grant_hint` is CONDITIONAL: present
     /// only for `tcc_denied` — the same remedy category and per-item rows
     /// carry, since macOS denies CLI processes silently (no consent prompt).
     static func scannerErrorRowJSON(
@@ -880,7 +1457,7 @@ struct CLIHandler {
     /// construction — any target referencing one fails with the same
     /// unknown/invalid-target message, and nothing is selected, addressed,
     /// or deleted. Items dedupe by `ItemKey` in first-appearance order
-    /// (`clean node_modules node_modules:<id>` names the item once).
+    /// (`clean build_artifacts build_artifacts:<id>` names the item once).
     static func resolveCleanTargets(
         _ targets: [CleanTarget],
         outcomes: [String: ScanOutcome],
@@ -1009,6 +1586,25 @@ struct CLIHandler {
     /// One plan entry (scan-time split components — never a re-walk, R16).
     /// Schema-3 fields retained verbatim; `scanner_id`/`item_id` identity
     /// fields are additive on every row (schema 4).
+    ///
+    /// ADDITIVE (fn-4.9, R17) — the acknowledgement the confirmed run WOULD
+    /// require, so the caller learns it from the plan instead of from a
+    /// refusal (both the `CONFIRMATION_REQUIRED` details and `--dry-run`
+    /// render these rows, so the two surfaces cannot drift):
+    /// - `valuables` — the DISCLOSED set in fn-4.4's pinned six-field element
+    ///   shape and stored canonical order, omitted when the probe disclosed
+    ///   none;
+    /// - `acknowledgement_token` — emitted ONLY when the SCAN-TIME probe was
+    ///   COMPLETE and the disclosed set NON-EMPTY (the uniform R17 rule: a
+    ///   token over an incomplete set could not safely authorize the current
+    ///   one, and no empty-set token exists anywhere). The confirmed run
+    ///   always recomputes from the DELETE-TIME probe — a scan-derived plan
+    ///   token that no longer matches simply yields the standard fresh
+    ///   refusal;
+    /// - `acknowledgement_note` — present exactly when the scan-time probe
+    ///   did NOT finish, saying so and pointing at the confirmed run's
+    ///   revalidation, so an ABSENT token is never read as "nothing to
+    ///   acknowledge".
     static func cleanPlanItemJSON(for item: ReclaimableItem) -> [String: Any] {
         var row: [String: Any] = [
             "slug": addressValue(for: item),
@@ -1029,8 +1625,55 @@ struct CLIHandler {
                 "message": scanError.message,
             ] as [String: Any]
         }
+        if let disclosure = item.valuablesDisclosure {
+            if !disclosure.valuables.isEmpty {
+                // Stored canonical order — never re-sorted here.
+                row["valuables"] = disclosure.valuables.map(valuableRowJSON(for:))
+            }
+            if disclosure.probeComplete {
+                // Derived from the SCAN-TIME identities through the shared
+                // preimage; nil for an empty set by that derivation's own
+                // precondition, so no empty-set token can ever be emitted.
+                if let token = disclosure.acknowledgementToken(for: item.key) {
+                    row["acknowledgement_token"] = token
+                }
+            } else {
+                row["acknowledgement_note"] = incompleteProbeNote(
+                    for: disclosure.incompleteness
+                )
+            }
+        }
         return row
     }
+
+    /// The plan/dry-run note for THIS item's incompleteness CAUSE. The two
+    /// causes end differently, so they may not print one remedy: an
+    /// obstruction is cleared by fixing it and re-scanning, while an entry
+    /// budget that starts at the tree's own census and DOUBLES until the
+    /// inspection finishes is only reached by a tree that is still changing —
+    /// and "re-scan" is the advice that cannot work for it.
+    static func incompleteProbeNote(
+        for cause: ValuablesDisclosure.ProbeIncompleteness?
+    ) -> String {
+        cause == .entryBudget ? growingTreePlanNote : incompleteProbePlanNote
+    }
+
+    /// The note for a tree that outgrew its own census mid-inspection.
+    static let growingTreePlanNote =
+        "the release-artifact inspection ran out of its entry budget at scan "
+        + "time — this directory is changing faster than it can be read — so "
+        + "no acknowledgement token exists for this item; a confirmed run "
+        + "re-inspects it immediately before deletion and refuses until an "
+        + "inspection completes; retry when it settles"
+
+    /// The plan/dry-run note for an item whose scan-time valuables probe
+    /// could not finish: no token exists for it on ANY surface, and a
+    /// confirmed run re-inspects before deleting anything.
+    static let incompleteProbePlanNote =
+        "the release-artifact inspection did not finish at scan time, so no "
+        + "acknowledgement token exists for this item — a confirmed run "
+        + "re-inspects it immediately before deletion and refuses until an "
+        + "inspection completes; re-scan and retry"
 
     /// Exact-only totals over the entries the plan would actually clean.
     /// SATURATING (round 8): a multi-target plan can span scanners, and
@@ -1121,11 +1764,13 @@ struct CLIHandler {
     }
 
     private static func handleClean(
-        slugs: [String], dryRun: Bool, confirmed: Bool,
+        slugs: [String], acknowledgements: [String],
+        dryRun: Bool, confirmed: Bool,
         deps: CLIRuntimeDependencies
     ) async {
         render(await cleanCLIOutcome(
-            targets: slugs, dryRun: dryRun, confirmed: confirmed,
+            targets: slugs, acknowledgements: acknowledgements,
+            dryRun: dryRun, confirmed: confirmed,
             euid: geteuid(), deps: deps
         ))
     }
@@ -1135,8 +1780,19 @@ struct CLIHandler {
     /// gating, schema shape, AND the confirmed fixture deletion). Check
     /// order preserved from schema 3: usage → target validation → gate →
     /// read-only scan → branch.
+    ///
+    /// - Parameter acknowledgements: the raw repeatable
+    ///   `--acknowledge-valuables <scanner-slug>:<item-id>:<token>` entries
+    ///   (R17). Their FORM is validated here on EVERY path — before the scan,
+    ///   so malformed destructive-authorization input fails fast on
+    ///   `--dry-run`, unconfirmed, and confirmed alike — and their BINDING
+    ///   (selection membership, disclosed valuables) immediately after target
+    ///   resolution, before any deletion. Token-vs-current-set MATCHING never
+    ///   happens here: it belongs to the delete-time revalidator, which the
+    ///   confirmed path alone reaches.
     static func cleanCLIOutcome(
         targets rawTargets: [String],
+        acknowledgements: [String] = [],
         dryRun: Bool, confirmed: Bool, euid: uid_t,
         deps: CLIRuntimeDependencies
     ) async -> CLIOutcome {
@@ -1150,6 +1806,18 @@ struct CLIHandler {
                     + "<scanner-slug>:<item-id>. Use 'scan' to list them.",
                 details: nil
             )
+        }
+
+        // FORM first, on every path and before anything is scanned or
+        // resolved: an acknowledgement is a destructive-authorization input.
+        let parsedAcknowledgements: [ParsedAcknowledgement]
+        switch parseAcknowledgements(acknowledgements) {
+        case .failure(let error):
+            return .failure(
+                code: "INVALID_ARGUMENTS", message: error.message, details: nil
+            )
+        case .success(let entries):
+            parsedAcknowledgements = entries
         }
 
         let perItemScannerIDs = Set(deps.runtime.scanners.map(\.id))
@@ -1211,6 +1879,21 @@ struct CLIHandler {
             selection = resolved
         }
         let items = selection.items
+
+        // PRE-FLIGHT acknowledgement binding (R17): after target resolution,
+        // before ANY deletion, on EVERY path — an entry that names nothing
+        // this invocation cleans, or an item with nothing to acknowledge, is
+        // caller confusion and refuses the whole invocation. Still no token
+        // matching: that is the delete-time revalidator's, on the confirmed
+        // path only.
+        if let error = validateAcknowledgements(
+            parsedAcknowledgements, against: items
+        ) {
+            return .failure(
+                code: "INVALID_ARGUMENTS", message: error.message, details: nil
+            )
+        }
+
         // Bare-scanner-target scan impediments as `scan`'s frozen
         // `scanner_errors` rows — surfaced on EVERY branch below (plan,
         // dry-run, confirmed) so a denied or partially-denied scanner-wide
@@ -1244,7 +1927,14 @@ struct CLIHandler {
             // One invocation, one session (R9): the cleaner holds the
             // snapshot of the very scan that resolved these items.
             let cleaner = deps.makeCleaner(collected.snapshot)
-            let report = await cleaner.clean(items: items, moveToTrash: false)
+            // The per-clean AUTHORIZATION CONTEXT (R17), built HERE from the
+            // validated entries and handed down the deletion path so each
+            // item's revalidator receives ITS OWN entry (nil when absent).
+            // The items' structural disclosures are never read as consent.
+            let report = await cleaner.clean(
+                items: items, moveToTrash: false,
+                authorization: authorizationContext(from: parsedAcknowledgements)
+            )
             return confirmedCleanPayload(
                 items: items, report: report, scannerErrors: scannerErrorRows
             )
@@ -1284,7 +1974,13 @@ struct CLIHandler {
                 continue
             }
             let entry = entriesByKey[item.key]
-            let errs = (errorsByKey[item.key] ?? []).map(\.message)
+            let itemErrors = errorsByKey[item.key] ?? []
+            let errs = itemErrors.map(\.message)
+            // The TYPED refusal payload (fn-4.9, R17), transported through
+            // `CleanupReport.ItemError` — the row NEVER parses message prose.
+            // At most one revalidation refusal exists per item (the seam
+            // returns immediately), so the first payload IS the payload.
+            let refusal = itemErrors.compactMap(\.refusal).first
             let exact = entry?.exactBytes ?? 0
             let estimated = entry?.estimatedUpToBytes ?? 0
             var row: [String: Any] = [
@@ -1305,6 +2001,21 @@ struct CLIHandler {
             }
             if item.state == .partiallyDenied {
                 row["warning"] = partiallyDeniedCleanWarning
+            }
+            // ADDITIVE refusal fields (R17), from the typed payload only —
+            // ABSENT on every ordinary error row and on every success row, so
+            // pre-existing row shapes are unchanged. `valuables` is omitted
+            // when the refusal disclosed none (a VANISHED set), and
+            // `acknowledgement_token` unless the refusal carries a non-empty
+            // current set from a COMPLETE delete-time probe (vanished-set and
+            // incomplete-probe refusals are tokenless — the uniform R17 rule).
+            if let refusal {
+                if !refusal.valuables.isEmpty {
+                    row["valuables"] = refusal.valuables.map(valuableRowJSON(for:))
+                }
+                if let token = refusal.acknowledgementToken {
+                    row["acknowledgement_token"] = token
+                }
             }
             rows.append(row)
         }
@@ -1355,7 +2066,8 @@ struct CLIHandler {
     /// items are excluded entirely. Safe before review, larger first
     /// within a tier. Exactly ONE addition (epic contract):
     /// `automaticCleanEligible == false` items are excluded — in practice
-    /// only node_modules, which becoming CLI-visible must not silently
+    /// every per-item scanner row (no `build_artifacts` row is ever
+    /// auto-eligible), which becoming CLI-visible must not silently
     /// enroll in any automatic destructive path. (Vacuously true today:
     /// smart-clean scans the `categories` scanner only, whose aggregates
     /// are all eligible — the filter is the model-encoded guarantee, not a
@@ -1436,7 +2148,7 @@ struct CLIHandler {
     /// The whole `smart-clean` decision pipeline, injected and exit-free
     /// (test seam parity with `cleanCLIOutcome`). Scope is policy (c)'s:
     /// the aggregate `categories` scanner ONLY — no per-item scanner is
-    /// ever invoked (round 10), so node_modules can never enter the
+    /// ever invoked (round 10), so per-item scanners can never enter the
     /// automatic path. Decision logic byte-identical to schema 3; target
     /// math untouched.
     static func smartCleanCLIOutcome(
@@ -2230,24 +2942,12 @@ struct CLIHandler {
 
     // MARK: - Helpers
 
-    private static func extractPositionalArg(from args: [String], after index: Int) -> String? {
-        let nextIndex = index + 1
-        guard nextIndex < args.count else { return nil }
-        let arg = args[nextIndex]
-        return arg.hasPrefix("--") ? nil : arg
-    }
-
-    private static func extractSlugs(from args: [String], after index: Int) -> [String] {
-        var slugs: [String] = []
-        var i = index + 1
-        while i < args.count {
-            let arg = args[i]
-            if arg.hasPrefix("--") { break }
-            slugs.append(arg)
-            i += 1
-        }
-        return slugs
-    }
+    // The positional extractors that used to live here (`extractSlugs`,
+    // `extractPositionalArg`) are SUBSUMED by the normalized parse
+    // (`normalizedInvocation`): one grammar, one positional list, and the
+    // trailing positional they dropped silently is now a loud
+    // INVALID_ARGUMENTS. `--top` keeps its own as-built extraction (a
+    // single-value flag with its own message).
 
     /// Parse `--top N` flag from args after the command position.
     /// Returns `nil` if `--top` is absent. Calls `exitWithError` if `--top`

@@ -1,3 +1,4 @@
+import Combine
 import XCTest
 @testable import Cacheout
 
@@ -25,13 +26,19 @@ import XCTest
 ///   Quick Clean/selectAllSafe, Select Stale/All, the Clean gate) excludes
 ///   them until a valid outcome lifts the block
 /// - `clean()` driving fn-2.3's unified entry with exactly the selection
+/// - fn-4.10 (R8): the runtime-RECONSTRUCTION seam — injected composition
+///   preserved across a Settings-triggered rebuild, deferred latest-value-
+///   wins replacement, and the destructive-freshness invalidation that
+///   keeps a new runtime's cleaner away from an old runtime's snapshot
 ///
-/// Everything runs hermetically against fixture homes and fixture scanners —
-/// zero reads of the real `$HOME`.
+/// Everything runs hermetically against fixture homes, fixture scanners and
+/// an ephemeral UserDefaults suite — zero reads of the real `$HOME`.
 final class CacheoutViewModelTests: XCTestCase {
 
     private var base: URL!
     private var fixtureHome: URL!
+    private var devRootsDefaults: UserDefaults!
+    private var suiteName: String!
     private let fm = FileManager.default
 
     override func setUpWithError() throws {
@@ -39,9 +46,16 @@ final class CacheoutViewModelTests: XCTestCase {
             .appendingPathComponent("CacheoutViewModelTests-\(UUID().uuidString)")
         fixtureHome = base.appendingPathComponent("home")
         try fm.createDirectory(at: fixtureHome, withIntermediateDirectories: true)
+        // The dev-roots config the fn-4.10 seam resolves — an EPHEMERAL
+        // suite, never the standard one (house rule).
+        suiteName = "CacheoutViewModelTests-\(UUID().uuidString)"
+        devRootsDefaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
     }
 
     override func tearDownWithError() throws {
+        if let suiteName {
+            devRootsDefaults?.removePersistentDomain(forName: suiteName)
+        }
         if let base {
             try? fm.removeItem(at: base)
         }
@@ -51,15 +65,95 @@ final class CacheoutViewModelTests: XCTestCase {
 
     private func makeRuntime(
         _ scanners: [any SpaceScanner],
-        categories: [CacheCategory] = []
+        categories: [CacheCategory] = [],
+        provider: FileSystemIdentityProvider = FileSystemIdentityProvider()
     ) throws -> SpaceScannerRuntime {
         try SpaceScannerRuntime(
             scanners: scanners,
             categories: categories,
             home: fixtureHome,
-            provider: FileSystemIdentityProvider()
+            provider: provider
         )
     }
+
+    /// The root names `makeReconstruction`'s factory knows how to compose a
+    /// fixture runtime for.
+    private static let reconstructionRootNames = [
+        "alpha", "beta", "gamma", "delta",
+    ]
+
+    /// Persists the declared dev roots the NEXT `devRootsDidChange()` will
+    /// resolve — through the store's OWN key, so resolution runs the same
+    /// parse/policy/dedupe pipeline production runs.
+    private func persistDevRoots(_ names: [String]) {
+        devRootsDefaults.set(names, forKey: DevRootsStore.devRootsKey)
+    }
+
+    private func makeDevRootsStore() -> DevRootsStore {
+        DevRootsStore(
+            defaults: devRootsDefaults, provider: FileSystemIdentityProvider()
+        )
+    }
+
+    /// The fn-4.10 reconstruction seam over FIXTURE compositions: the
+    /// injected factory maps a resolution to a runtime holding ONE fixture
+    /// scanner named after the LAST kept root (`~/beta` → `root_beta`), and
+    /// records every resolution it was handed. No production scanner could
+    /// ever answer those ids, so "the rebuild silently swapped the injected
+    /// composition for production defaults" is a single assertion away.
+    private func makeReconstruction()
+        -> (CacheoutViewModel.RuntimeReconstruction, ResolutionLog)
+    {
+        let base = self.base!
+        let home = self.fixtureHome!
+        // `let` on purpose: the factory below is `@Sendable`, and a captured
+        // `var` is a Swift 6 error.
+        let outcomes = Dictionary(
+            uniqueKeysWithValues: Self.reconstructionRootNames.map { name in
+                (
+                    "root_\(name)",
+                    ScanOutcome(
+                        items: [
+                            perItem(scanner: "root_\(name)", id: "\(name)_item")
+                        ],
+                        errors: []
+                    )
+                )
+            }
+        )
+        let log = ResolutionLog()
+        let seam = CacheoutViewModel.RuntimeReconstruction(
+            devRootsStore: makeDevRootsStore(),
+            home: home
+        ) { resolution in
+            log.record(resolution)
+            let scannerID =
+                "root_\(resolution.keptRoots.last?.lastPathComponent ?? "none")"
+            let outcome = outcomes[scannerID]
+                ?? ScanOutcome(items: [], errors: [])
+            let scanner = FixtureScanner(
+                id: scannerID,
+                trustedContainerRoots: [base.appendingPathComponent(scannerID)],
+                provide: { outcome }
+            )
+            // try!: a fixture composition with one valid slug and no
+            // categories cannot fail registration validation.
+            return try! SpaceScannerRuntime(
+                scanners: [scanner],
+                categories: [],
+                home: home,
+                provider: FileSystemIdentityProvider()
+            )
+        }
+        return (seam, log)
+    }
+
+    /// The production scanner ids a rebuilt runtime must NEVER acquire.
+    private static let productionScannerIDs = [
+        CategoryScanner.registeredID,
+        BuildArtifactsScanner.registeredID,
+        OrphanedCachesScanner.registeredID,
+    ]
 
     /// A `FixtureScanner` DECLARING the origin container `perItem(scanner:
     /// id)` claims (`base/<id>`) — the runtime validator's origin binding
@@ -1263,6 +1357,359 @@ final class CacheoutViewModelTests: XCTestCase {
                        ["junk_b"])
         XCTAssertTrue(viewModel.selectedItemKeys.isEmpty)
     }
+
+    // MARK: - Runtime reconstruction (fn-4.10, R8)
+
+    /// The seam is OPT-IN: a view model handed a finished runtime and no
+    /// reconstruction seam never rebuilds — and, crucially, never falls back
+    /// to production defaults — so a dev-roots change cannot perturb it or
+    /// gate its destructive paths. This is the state every pre-fn-4.5 call
+    /// site is in.
+    @MainActor
+    func testDevRootsChangeIsANoOpWithoutTheReconstructionSeam() async throws {
+        let outcome = ScanOutcome(
+            items: [perItem(scanner: "old_alpha", id: "a1")], errors: []
+        )
+        let runtime = try makeRuntime([
+            fixtureScanner("old_alpha") { outcome },
+        ])
+        let viewModel = CacheoutViewModel(runtime: runtime)
+
+        await viewModel.scan(trigger: .userInitiated)
+        viewModel.toggleSelection(for: key("old_alpha", "a1"))
+        XCTAssertTrue(viewModel.hasCleanableSelection)
+
+        viewModel.devRootsDidChange()
+
+        XCTAssertEqual(viewModel.perItemSections.map(\.scannerID),
+                       ["old_alpha"],
+                       "an unwired seam must never rebuild the composition")
+        XCTAssertTrue(viewModel.hasCleanableSelection,
+                      "no rebuild happened — destructive freshness is untouched")
+    }
+
+    /// INJECTED-COMPOSITION PRESERVATION (the reason the factory exists): a
+    /// Settings-triggered rebuild goes through the injected factory, so a
+    /// fixture-composed runtime is rebuilt as a FIXTURE-composed runtime.
+    /// Rebuilding by re-deriving `production(...)` — the only alternative,
+    /// since the view model holds a finished runtime it cannot decompose —
+    /// would silently swap the hermetic composition for the production
+    /// registry here.
+    @MainActor
+    func testSettingsRebuildPreservesInjectedFixtureComposition() async throws {
+        let outcome = ScanOutcome(
+            items: [perItem(scanner: "old_alpha", id: "a1")], errors: []
+        )
+        let runtime = try makeRuntime([
+            fixtureScanner("old_alpha") { outcome },
+        ])
+        let (seam, log) = makeReconstruction()
+        let viewModel = CacheoutViewModel(
+            runtime: runtime, reconstruction: seam
+        )
+
+        await viewModel.scan(trigger: .userInitiated)
+        XCTAssertEqual(viewModel.perItemSections.map(\.scannerID),
+                       ["old_alpha"])
+
+        persistDevRoots(["beta"])
+        viewModel.devRootsDidChange()
+
+        // ONE factory call, with what the STORE resolved (not what the
+        // caller guessed) — and the composition in force is its answer.
+        XCTAssertEqual(log.recorded.count, 1)
+        XCTAssertEqual(log.recorded.last?.keptRoots.map(\.lastPathComponent),
+                       ["beta"])
+        XCTAssertEqual(viewModel.perItemSections.map(\.scannerID),
+                       ["root_beta"],
+                       "the rebuilt composition is the INJECTED factory's")
+
+        await viewModel.scan(trigger: .userInitiated)
+        XCTAssertEqual(viewModel.items(forScanner: "root_beta").map(\.id),
+                       ["beta_item"],
+                       "the new composition's scanners are what ran")
+        for productionID in Self.productionScannerIDs {
+            XCTAssertNil(
+                viewModel.outcomesByScannerID[productionID],
+                "a rebuild must never swap an injected composition for the "
+                    + "production registry (\(productionID) ran)"
+            )
+        }
+    }
+
+    /// MATRIX (a) — replacement requested during the INITIAL DiskInfo await,
+    /// before the session captured its container snapshot (the spy provider
+    /// proves the window). The as-built `scan()` read `runtime` again AFTER
+    /// that await; the session capture closes it, so the request is deferred
+    /// and the session runs, completes and adopts on the runtime it started
+    /// with.
+    @MainActor
+    func testReplacementDuringInitialDiskInfoAwaitDefersToSessionEnd() async throws {
+        let spy = SnapshotCaptureSpy()
+        let outcome = ScanOutcome(
+            items: [perItem(scanner: "old_alpha", id: "a1")], errors: []
+        )
+        let runtime = try makeRuntime(
+            [fixtureScanner("old_alpha") { outcome }], provider: spy
+        )
+        let (seam, log) = makeReconstruction()
+        let viewModel = CacheoutViewModel(
+            runtime: runtime, reconstruction: seam
+        )
+        persistDevRoots(["beta"])
+
+        let scanTask = Task { await viewModel.scan(trigger: .automatic) }
+        // The scan task's synchronous prologue runs before this
+        // continuation (MainActor FIFO), and the ONLY suspension it can
+        // have reached is the initial DiskInfo await — nothing else
+        // suspends before `scanValidatedSession`, whose FIRST act is the
+        // snapshot capture the spy counts. No sleeps: the loop yields.
+        var yields = 0
+        while !viewModel.isAnyScanInProgress && yields < 100 {
+            await Task.yield()
+            yields += 1
+        }
+        XCTAssertTrue(viewModel.isAnyScanInProgress,
+                      "the scan session never raised its guard")
+        XCTAssertEqual(spy.captures, 0,
+                       "the request must land in the INITIAL DiskInfo await "
+                           + "— before this session captured its snapshot")
+
+        viewModel.devRootsDidChange()
+
+        XCTAssertTrue(log.recorded.isEmpty,
+                      "a replacement during an active session is DEFERRED — "
+                          + "no composition is built mid-session")
+        XCTAssertEqual(viewModel.perItemSections.map(\.scannerID),
+                       ["old_alpha"],
+                       "the in-flight session keeps its captured composition")
+
+        await scanTask.value
+
+        XCTAssertGreaterThan(spy.captures, 0,
+                             "the session captured a snapshot from its OWN runtime")
+        XCTAssertEqual(viewModel.items(forScanner: "old_alpha").map(\.id),
+                       ["a1"],
+                       "the session ran the scanners it captured, start to end")
+        XCTAssertEqual(log.recorded.count, 1,
+                       "the deferred replacement applies ONCE, at session end")
+        XCTAssertEqual(viewModel.perItemSections.map(\.scannerID),
+                       ["root_beta"])
+
+        // Destructive freshness is INVALIDATED: the session that just
+        // adopted belongs to the previous composition.
+        viewModel.toggleSelection(for: key("old_alpha", "a1"))
+        XCTAssertTrue(viewModel.selectedItemKeys.contains(key("old_alpha", "a1")),
+                      "display state is never lost — only destructive paths gate")
+        XCTAssertTrue(viewModel.selectedItems.isEmpty)
+        XCTAssertFalse(viewModel.hasCleanableSelection)
+
+        // ...and returns only when a scan from the NEW runtime adopts.
+        await viewModel.scan(trigger: .userInitiated)
+        viewModel.toggleSelection(for: key("root_beta", "beta_item"))
+        XCTAssertEqual(viewModel.selectedItems.map(\.key),
+                       [key("root_beta", "beta_item")],
+                       "the new composition's own session lifts the gate")
+        XCTAssertTrue(viewModel.hasCleanableSelection)
+    }
+
+    /// MATRIX (b) — replacement requested while a scanner is EXECUTING (the
+    /// gate proves the window): deferred, the session finishes on its
+    /// captured runtime, the rebuild lands at session end, and destructive
+    /// paths stay gated until a new-runtime scan adopts.
+    @MainActor
+    func testReplacementDuringScannerExecutionDefersToSessionEnd() async throws {
+        let entered = ScanGate()
+        let release = ScanGate()
+        let outcome = ScanOutcome(
+            items: [perItem(scanner: "old_alpha", id: "a1")], errors: []
+        )
+        let runtime = try makeRuntime([
+            fixtureScanner("old_alpha") {
+                await entered.open()
+                await release.wait()
+                return outcome
+            },
+        ])
+        let (seam, log) = makeReconstruction()
+        let viewModel = CacheoutViewModel(
+            runtime: runtime, reconstruction: seam
+        )
+        persistDevRoots(["gamma"])
+
+        let scanTask = Task { await viewModel.scan(trigger: .automatic) }
+        await entered.wait()  // provably INSIDE scanner execution
+
+        viewModel.devRootsDidChange()
+        XCTAssertTrue(log.recorded.isEmpty,
+                      "no composition is built while a scanner is running")
+        XCTAssertEqual(viewModel.perItemSections.map(\.scannerID),
+                       ["old_alpha"])
+
+        await release.open()
+        await scanTask.value
+
+        XCTAssertEqual(viewModel.items(forScanner: "old_alpha").map(\.id),
+                       ["a1"],
+                       "the in-flight session completed on its captured runtime")
+        XCTAssertEqual(log.recorded.count, 1)
+        XCTAssertEqual(log.recorded.last?.keptRoots.map(\.lastPathComponent),
+                       ["gamma"])
+        XCTAssertEqual(viewModel.perItemSections.map(\.scannerID),
+                       ["root_gamma"])
+
+        viewModel.toggleSelection(for: key("old_alpha", "a1"))
+        XCTAssertTrue(viewModel.selectedItems.isEmpty,
+                      "the adopted session's items belong to the OLD runtime")
+        XCTAssertFalse(viewModel.hasCleanableSelection)
+
+        await viewModel.scan(trigger: .userInitiated)
+        XCTAssertEqual(viewModel.items(forScanner: "root_gamma").map(\.id),
+                       ["gamma_item"])
+        viewModel.toggleSelection(for: key("root_gamma", "gamma_item"))
+        XCTAssertEqual(viewModel.selectedItems.map(\.key),
+                       [key("root_gamma", "gamma_item")])
+    }
+
+    /// MATRIX (c) — replacement requested AFTER a completed scan and before
+    /// the next: nothing is in flight, so it applies immediately, and the
+    /// destructive proof is on-disk. `clean()` builds its cleaner from the
+    /// CURRENT runtime and the PREVIOUSLY adopted snapshot; the runtime
+    /// generation gate empties the selection wholesale, so a real file
+    /// selected under the old composition survives a confirmed clean.
+    @MainActor
+    func testReplacementAfterCompletedScanGatesCleanUntilNewRuntimeAdopts() async throws {
+        let container = base.appendingPathComponent("projects")
+        let junkA = container.appendingPathComponent("junk_a")
+        try fm.createDirectory(at: junkA, withIntermediateDirectories: true)
+        try Data(repeating: 0xAB, count: 4096)
+            .write(to: junkA.appendingPathComponent("payload.bin"))
+
+        let runtime = try makeRuntime([
+            DirectoryFixtureScanner(id: "fixture_items", container: container),
+        ])
+        let (seam, log) = makeReconstruction()
+        let viewModel = CacheoutViewModel(
+            runtime: runtime, reconstruction: seam
+        )
+        viewModel.moveToTrash = false  // permanent delete, fixture-contained
+
+        await viewModel.scan(trigger: .userInitiated)
+        viewModel.toggleSelection(for: key("fixture_items", "junk_a"))
+        XCTAssertTrue(viewModel.hasCleanableSelection,
+                      "the adopted session's items start cleanable")
+
+        persistDevRoots(["delta"])
+        viewModel.devRootsDidChange()
+        XCTAssertEqual(log.recorded.count, 1,
+                       "no session in flight — the rebuild is immediate")
+        XCTAssertFalse(viewModel.hasCleanableSelection,
+                       "a runtime change invalidates destructive freshness")
+
+        await viewModel.clean()
+
+        let report = try XCTUnwrap(viewModel.lastReport)
+        XCTAssertTrue(report.entries.isEmpty,
+                      "a new runtime's cleaner must never act on the old "
+                          + "runtime's adopted snapshot: \(report.entries)")
+        XCTAssertTrue(report.errors.isEmpty, "\(report.errors)")
+        XCTAssertTrue(fm.fileExists(atPath: junkA.path),
+                      "nothing may be deleted while the model is gated")
+
+        // clean()'s trailing rescan runs on the NEW runtime and adopts,
+        // lifting the gate for ITS items only.
+        XCTAssertEqual(viewModel.items(forScanner: "root_delta").map(\.id),
+                       ["delta_item"])
+        viewModel.toggleSelection(for: key("root_delta", "delta_item"))
+        XCTAssertEqual(viewModel.selectedItems.map(\.key),
+                       [key("root_delta", "delta_item")])
+        XCTAssertFalse(viewModel.selectedItems.contains {
+            $0.scannerID == "fixture_items"
+        }, "the old composition's retained rows never return to a "
+            + "destructive path")
+    }
+
+    /// A rebuild changes PRIVATE state that published derivations read
+    /// (`perItemSections`, `hasCleanableSelection`, the clean totals), so it
+    /// must co-publish — otherwise SwiftUI keeps rendering the old
+    /// composition's sections and a live Clean control until some unrelated
+    /// `@Published` write happens to fire. `installRuntime` is the ONE
+    /// replacement site, so this covers the deferred path too.
+    @MainActor
+    func testRuntimeRebuildPublishesAnObservableChange() async throws {
+        let outcome = ScanOutcome(
+            items: [perItem(scanner: "old_alpha", id: "a1")], errors: []
+        )
+        let runtime = try makeRuntime([
+            fixtureScanner("old_alpha") { outcome },
+        ])
+        let (seam, _) = makeReconstruction()
+        let viewModel = CacheoutViewModel(
+            runtime: runtime, reconstruction: seam
+        )
+        await viewModel.scan(trigger: .userInitiated)
+
+        let recorder = ChangeRecorder()
+        let subscription = viewModel.objectWillChange.sink { _ in
+            recorder.record()
+        }
+        defer { subscription.cancel() }
+        XCTAssertEqual(recorder.count, 0)
+
+        persistDevRoots(["beta"])
+        viewModel.devRootsDidChange()
+
+        XCTAssertGreaterThan(recorder.count, 0,
+                             "a runtime rebuild must notify observers — its "
+                                 + "derived state is published, its storage "
+                                 + "is not")
+        XCTAssertEqual(viewModel.perItemSections.map(\.scannerID),
+                       ["root_beta"])
+    }
+
+    /// LATEST-VALUE-WINS: three Settings edits during one session collapse
+    /// to exactly ONE rebuild, from the NEWEST resolution — no intermediate
+    /// composition is ever built, and the session is never disturbed.
+    @MainActor
+    func testReplacementsDuringOneSessionCollapseToTheNewestResolution() async throws {
+        let entered = ScanGate()
+        let release = ScanGate()
+        let outcome = ScanOutcome(
+            items: [perItem(scanner: "old_alpha", id: "a1")], errors: []
+        )
+        let runtime = try makeRuntime([
+            fixtureScanner("old_alpha") {
+                await entered.open()
+                await release.wait()
+                return outcome
+            },
+        ])
+        let (seam, log) = makeReconstruction()
+        let viewModel = CacheoutViewModel(
+            runtime: runtime, reconstruction: seam
+        )
+
+        let scanTask = Task { await viewModel.scan(trigger: .automatic) }
+        await entered.wait()
+
+        persistDevRoots(["beta"])
+        viewModel.devRootsDidChange()
+        persistDevRoots(["gamma"])
+        viewModel.devRootsDidChange()
+        persistDevRoots(["delta"])
+        viewModel.devRootsDidChange()
+        XCTAssertTrue(log.recorded.isEmpty)
+
+        await release.open()
+        await scanTask.value
+
+        XCTAssertEqual(log.recorded.count, 1,
+                       "three requests collapse to ONE rebuild")
+        XCTAssertEqual(log.recorded.last?.keptRoots.map(\.lastPathComponent),
+                       ["delta"], "the NEWEST resolution wins")
+        XCTAssertEqual(viewModel.perItemSections.map(\.scannerID),
+                       ["root_delta"])
+    }
 }
 
 // MARK: - Fixture scanner machinery
@@ -1361,6 +1808,59 @@ private actor ScanGate {
     func wait() async {
         if opened { return }
         await withCheckedContinuation { waiters.append($0) }
+    }
+}
+
+/// What the INJECTED runtime factory was handed, and how often (fn-4.10) —
+/// the deferral and latest-value-wins proofs read this. Lock-guarded because
+/// the factory type is `@Sendable`; every call in these tests is in fact on
+/// the MainActor.
+private final class ResolutionLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [DevRootsResolution] = []
+
+    func record(_ resolution: DevRootsResolution) {
+        lock.lock()
+        defer { lock.unlock() }
+        values.append(resolution)
+    }
+
+    var recorded: [DevRootsResolution] {
+        lock.lock()
+        defer { lock.unlock() }
+        return values
+    }
+}
+
+/// Counts `objectWillChange` emissions — SwiftUI's ONLY signal that a
+/// published derivation may have changed.
+private final class ChangeRecorder {
+    private(set) var count = 0
+    func record() { count += 1 }
+}
+
+/// Counts `identity(of:)` calls — the SYNCHRONOUS signal that a session
+/// reached `scanValidatedSession`, whose first act is the `ContainerSnapshot`
+/// capture over the registered roots. Zero captures while a scan is in
+/// progress therefore proves the session is still at its FIRST suspension:
+/// the initial DiskInfo await (fn-4.10 matrix case (a)). Subclassing is the
+/// sanctioned test seam on this type.
+private final class SnapshotCaptureSpy: FileSystemIdentityProvider,
+                                        @unchecked Sendable {
+    private let lock = NSLock()
+    private var calls = 0
+
+    override func identity(of url: URL) -> Identity? {
+        lock.lock()
+        calls += 1
+        lock.unlock()
+        return super.identity(of: url)
+    }
+
+    var captures: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return calls
     }
 }
 

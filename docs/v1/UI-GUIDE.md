@@ -46,7 +46,7 @@ Cacheout has three scenes managed by `CacheoutApp`:
 │                                              │
 │  ──────────────────────────────────────────  │
 │                                              │
-│  ▼ 📁 Project node_modules (12 found) 4.2GB │
+│  ▼ 📁 Project Build Artifacts (12)   4.2GB │
 │    [Select Stale] [Select All] [Deselect]    │
 │                                              │
 │    ◉ 📦 my-project          ~/Documents/...  │
@@ -67,7 +67,7 @@ Cacheout has three scenes managed by `CacheoutApp`:
 | Header | `headerSection` | Title, subtitle, scan progress indicator |
 | Disk Bar | `DiskUsageBar` | Visual disk usage with percentage |
 | Category List | `CategoryRow` (×N) | Selectable cache categories |
-| Node Modules | `NodeModulesSection` | Collapsible project list |
+| Per-item scanners | `ScannerItemSection` | Collapsible per-scanner list |
 | Bottom Bar | `bottomBar` | Selection menu, scan button, clean button |
 
 ### Interactions

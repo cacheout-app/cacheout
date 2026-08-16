@@ -177,25 +177,32 @@ final class CLIGateTests: XCTestCase {
         )
     }
 
-    /// A real node_modules fixture: `<container>/<project>/node_modules`
-    /// (optionally with content) plus a scanner over that container.
-    private func makeNodeModulesFixture(
+    /// A real per-item fixture on the REGISTERED per-item slug (fn-4.7 —
+    /// these cases used the retired `node_modules` scanner until its source
+    /// was deleted): `<dev>/<project>/{package.json, node_modules/}` — the
+    /// build-artifact rule row's marker-sibling shape — plus a
+    /// `BuildArtifactsScanner` over that dev root. `withContent: false`
+    /// yields the `.empty` artifact-dir cell.
+    private func makeArtifactFixture(
         project: String = "projA", withContent: Bool = true
-    ) throws -> (container: URL, nodeModules: URL, scanner: NodeModulesScanner) {
-        let container = base.appendingPathComponent("container-\(UUID().uuidString)")
-        let nodeModules = container
-            .appendingPathComponent(project)
-            .appendingPathComponent("node_modules")
-        try fm.createDirectory(at: nodeModules, withIntermediateDirectories: true)
+    ) throws -> (dev: URL, artifact: URL, scanner: BuildArtifactsScanner) {
+        let dev = base.appendingPathComponent("dev-\(UUID().uuidString)")
+        let projectDir = dev.appendingPathComponent(project)
+        let artifact = projectDir.appendingPathComponent("node_modules")
+        try fm.createDirectory(at: artifact, withIntermediateDirectories: true)
+        try Data(repeating: 0xC3, count: 64).write(
+            to: projectDir.appendingPathComponent("package.json")
+        )
         if withContent {
             try Data(repeating: 0xAB, count: 8192).write(
-                to: nodeModules.appendingPathComponent("dep.bin")
+                to: artifact.appendingPathComponent("dep.bin")
             )
         }
-        let scanner = NodeModulesScanner(
-            home: fixtureHome, searchRoots: [container]
+        let scanner = BuildArtifactsScanner(
+            home: fixtureHome,
+            devRoots: DevRootsResolution(keptRoots: [dev], issues: [])
         )
-        return (container, nodeModules, scanner)
+        return (dev, artifact, scanner)
     }
 
     private func successPayload(
@@ -710,9 +717,43 @@ final class CLIGateTests: XCTestCase {
         XCTAssertNotNil(rows[0]["scan_error"])
     }
 
-    func testScanEnvelopeListsNodeModulesItems() async throws {
-        let fixture = try makeNodeModulesFixture()
-        let deps = try makeDeps(categories: [], extraScanners: [fixture.scanner])
+    /// fn-4.5 (R6/R7/R12): the SAME envelope assertions as the node_modules
+    /// twin above, on the slug that replaced it — plus the two properties
+    /// the swap adds: no `node_modules` rows can exist (the scanner is
+    /// unregistered), and the scanner's config/per-root issues ride
+    /// `scanner_errors` rather than vanishing into a silent zero.
+    ///
+    /// The registry here is fixture-composed (the CategoryScanner over an
+    /// EMPTY category list) for the usual reason: production categories run
+    /// `.probed` tool subprocesses. The production COMPOSITION itself — that
+    /// `build_artifacts` is registered and `node_modules` is not — is
+    /// asserted against the real `production(...)` factory in
+    /// `SpaceScannerIntegrationTests` and `CategoryScannerTests`.
+    func testScanEnvelopeListsBuildArtifactsItemsAndNeverNodeModulesRows()
+        async throws
+    {
+        let dev = base.appendingPathComponent("dev-\(UUID().uuidString)")
+        let project = dev.appendingPathComponent("projA")
+        let nodeModules = project.appendingPathComponent("node_modules")
+        try fm.createDirectory(at: nodeModules, withIntermediateDirectories: true)
+        try Data(repeating: 0xC3, count: 64).write(
+            to: project.appendingPathComponent("package.json")
+        )
+        try Data(repeating: 0xAB, count: 8192).write(
+            to: nodeModules.appendingPathComponent("dep.bin")
+        )
+        // A policy-rejected persisted root beside the good one: its config
+        // issue must reach `scanner_errors` on every scan (R16).
+        let suiteName = "CLIGateTests-\(UUID().uuidString)"
+        let suite = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { suite.removePersistentDomain(forName: suiteName) }
+        suite.set(["/", dev.path], forKey: DevRootsStore.devRootsKey)
+        let scanner = BuildArtifactsScanner(
+            home: fixtureHome,
+            devRoots: DevRootsStore(defaults: suite)
+                .effectiveRoots(home: fixtureHome)
+        )
+        let deps = try makeDeps(categories: [], extraScanners: [scanner])
 
         let envelope = await CLIHandler.scanEnvelope(deps: deps)
 
@@ -720,32 +761,96 @@ final class CLIGateTests: XCTestCase {
         let items = try XCTUnwrap(envelope["scanner_items"] as? [[String: Any]])
         XCTAssertEqual(items.count, 1)
         let row = items[0]
-        XCTAssertEqual(row["scanner_id"] as? String, "node_modules")
+        XCTAssertEqual(row["scanner_id"] as? String, "build_artifacts")
+        XCTAssertFalse(
+            items.contains { $0["scanner_id"] as? String == "node_modules" },
+            "the retired slug can never author a row — it is unregistered"
+        )
 
         let itemID = try XCTUnwrap(row["item_id"] as? String)
         XCTAssertEqual(itemID.count, 64, "full-hash opaque id — never truncated")
         XCTAssertEqual(itemID, itemID.lowercased())
-        XCTAssertTrue(itemID.allSatisfy { $0.isHexDigit },
-                      "64 lowercase-hex chars, always beside its scanner_id sibling")
-        let resolved = FileSystemIdentityProvider().canonicalize(fixture.nodeModules)
+        XCTAssertTrue(itemID.allSatisfy { $0.isHexDigit })
+        let resolved = FileSystemIdentityProvider()
+            .resolveTargetKeepingLeaf(nodeModules)
         XCTAssertEqual(
             itemID,
-            ReclaimableItem.stableID(scannerID: "node_modules", canonicalPath: resolved.path),
+            ReclaimableItem.stableID(
+                scannerID: "build_artifacts", canonicalPath: resolved.path
+            ),
             "the id IS the frozen preimage derivation — stable across rescans"
         )
 
         XCTAssertEqual(row["path"] as? String, resolved.path)
-        XCTAssertEqual(row["name"] as? String, "projA")
+        XCTAssertEqual(row["name"] as? String, "node_modules")
         XCTAssertEqual(row["state"] as? String, "measured")
         XCTAssertEqual(row["action"] as? String, "remove_item")
         XCTAssertEqual(row["risk_level"] as? String, "review",
-                       "the frozen node_modules risk mapping (round 11)")
-        XCTAssertTrue(((row["evidence"] as? String) ?? "").contains("projA"))
+                       "the node_modules rule row preserves the as-built risk")
+        XCTAssertTrue(((row["evidence"] as? String) ?? "")
+            .contains("beside package.json"))
         let exact = try XCTUnwrap(row["exact_bytes"] as? Int64)
         XCTAssertGreaterThan(exact, 0)
         XCTAssertEqual(row["size_bytes"] as? Int64,
                        exact + (row["estimated_up_to_bytes"] as? Int64 ?? 0),
                        "size_bytes stays the compatibility component sum")
+
+        // R12/R16: the classified config issue is VISIBLE on the wire.
+        let errors = try XCTUnwrap(envelope["scanner_errors"] as? [[String: Any]])
+        let refusals = errors.filter {
+            $0["scanner_id"] as? String == "build_artifacts"
+                && $0["kind"] as? String == "container_refused"
+        }
+        XCTAssertEqual(refusals.count, 1, "\(errors)")
+        XCTAssertEqual(refusals[0]["path"] as? String, "/")
+    }
+
+    /// R12: a DENIED dev root is a classified, visible error on the wire —
+    /// never a silent zero. The healthy root's items still ride the same
+    /// envelope, so a partial failure is honestly partial.
+    func testScanEnvelopeSurfacesDeniedDevRootBesideHealthyItems() async throws {
+        try XCTSkipIf(geteuid() == 0, "root ignores permission bits")
+        let dev = base.appendingPathComponent("dev-\(UUID().uuidString)")
+        let denied = base.appendingPathComponent("denied-dev-\(UUID().uuidString)")
+        let project = dev.appendingPathComponent("rust")
+        let artifact = project.appendingPathComponent("target")
+        try fm.createDirectory(at: artifact, withIntermediateDirectories: true)
+        try Data(repeating: 0xC3, count: 64).write(
+            to: project.appendingPathComponent("Cargo.toml")
+        )
+        try Data(repeating: 0xAB, count: 4096).write(
+            to: artifact.appendingPathComponent("out.o")
+        )
+        try fm.createDirectory(at: denied, withIntermediateDirectories: true)
+        try fm.setAttributes([.posixPermissions: 0o000], ofItemAtPath: denied.path)
+        addTeardownBlock { [fm] in
+            try? fm.setAttributes(
+                [.posixPermissions: 0o755], ofItemAtPath: denied.path
+            )
+        }
+
+        let suiteName = "CLIGateTests-\(UUID().uuidString)"
+        let suite = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { suite.removePersistentDomain(forName: suiteName) }
+        let scanner = BuildArtifactsScanner(
+            home: fixtureHome,
+            devRoots: DevRootsStore(defaults: suite)
+                .effectiveRoots(replacing: [dev, denied], home: fixtureHome)
+        )
+        let deps = try makeDeps(categories: [], extraScanners: [scanner])
+
+        let envelope = await CLIHandler.scanEnvelope(deps: deps)
+
+        let errors = try XCTUnwrap(envelope["scanner_errors"] as? [[String: Any]])
+        let denials = errors.filter { $0["path"] as? String == denied.path }
+        XCTAssertEqual(denials.count, 1, "\(errors)")
+        XCTAssertEqual(denials[0]["scanner_id"] as? String, "build_artifacts")
+        XCTAssertEqual(denials[0]["kind"] as? String, "permission_denied")
+        XCTAssertFalse((denials[0]["detail"] as? String ?? "").isEmpty)
+
+        let items = try XCTUnwrap(envelope["scanner_items"] as? [[String: Any]])
+        XCTAssertEqual(items.map { $0["name"] as? String }, ["target"],
+                       "the readable root's items are unaffected")
     }
 
     func testScanEnvelopeScannerErrorsBothForms() async throws {
@@ -876,11 +981,12 @@ final class CLIGateTests: XCTestCase {
                            "argv arrays never appear in any row")
         }
 
-        // ALL SIX ScanIssue.Kind wire strings through the scanner_errors row
-        // builder — exact rows: the five filesystem kinds carry their real
-        // `path`; `malformed_outcome` has NO path key at all; `tcc_denied`
-        // ALONE additionally carries `grant_hint` (macOS denies CLI
-        // processes silently — the row must say what to do about it).
+        // ALL SEVEN ScanIssue.Kind wire strings through the scanner_errors
+        // row builder — exact rows: the five filesystem kinds carry their
+        // real `path`; the non-filesystem kinds (`malformed_outcome`,
+        // `config_invalid`) have NO path key at all; `tcc_denied` ALONE
+        // additionally carries `grant_hint` (macOS denies CLI processes
+        // silently — the row must say what to do about it).
         let url = URL(fileURLWithPath: "/tmp/wire-fixture-root")
         let filesystemKinds: [(ScanIssue.Kind, String)] = [
             (.containerRefused, "container_refused"),
@@ -920,6 +1026,17 @@ final class CLIGateTests: XCTestCase {
             "kind": "malformed_outcome",
             "detail": "fixture detail",
         ] as NSDictionary, "malformed_outcome is path-less by contract")
+        let configInvalidRow = CLIHandler.scannerErrorRowJSON(
+            scannerID: "wire_scanner",
+            issue: ScanIssue(url: nil, kind: .configInvalid,
+                             detail: "fixture detail")
+        )
+        XCTAssertEqual(configInvalidRow as NSDictionary, [
+            "scanner_id": "wire_scanner",
+            "kind": "config_invalid",
+            "detail": "fixture detail",
+        ] as NSDictionary, "config_invalid is path-less by contract (fn-4 — "
+            + "a config parse failure has no honest filesystem path)")
 
         // The frozen aggregate scanner id on clean-side identity fields —
         // the literal string, not just the constant (a renamed constant
@@ -928,6 +1045,44 @@ final class CLIGateTests: XCTestCase {
             for: makeItem(state: .measured, exact: 4096, items: 1)
         )
         XCTAssertEqual(aggregateRow["scanner_id"] as? String, "categories")
+    }
+
+    /// fn-4.4: the two ADDITIVE `scanner_items` fields, at the shared row
+    /// builder every scanner's items flow through. Absence is the DEFAULT —
+    /// an item that carries neither must emit neither key (never `null`), so
+    /// no existing scanner's envelope changes shape.
+    func testAdditiveLogicalBytesAndValuablesRowFieldsAreOmittedByDefault()
+        throws
+    {
+        let plain = makeStandaloneItem(id: "plain")
+        let plainRow = CLIHandler.scannerItemRowJSON(for: plain)
+        XCTAssertNil(plain.logicalBytes)
+        XCTAssertNil(plain.valuablesDisclosure)
+        XCTAssertFalse(plainRow.keys.contains("logical_bytes"))
+        XCTAssertFalse(plainRow.keys.contains("valuables"))
+
+        // The ONE pinned SIX-FIELD element shape, asserted as an EXACT row —
+        // plan rows and refusal rows (fn-4.9) REUSE this builder, so this is
+        // the one place the shape is pinned.
+        let valuable = DetectedValuable(
+            name: "Murmur_0.1.7_aarch64.dmg",
+            displayURL: URL(fileURLWithPath: "/alias/target/dmg/Murmur.dmg"),
+            canonicalIdentityPath: "/canonical/target/dmg/Murmur.dmg",
+            identity: ValuableIdentity(
+                allocatedBytes: 44_040_192, device: 16_777_232,
+                inode: 12_345_678, modifiedSeconds: 1_755_057_600,
+                modifiedNanoseconds: 123_456_789
+            )
+        )
+        XCTAssertEqual(CLIHandler.valuableRowJSON(for: valuable) as NSDictionary, [
+            "name": "Murmur_0.1.7_aarch64.dmg",
+            "path": "/canonical/target/dmg/Murmur.dmg",
+            "allocated_bytes": Int64(44_040_192),
+            "device": UInt64(16_777_232),
+            "inode": UInt64(12_345_678),
+            "modified_at_ns": Int64(1_755_057_600_123_456_789),
+        ] as NSDictionary, "the pinned valuables element — the display "
+            + "spelling never reaches the wire")
     }
 
     // MARK: - Address grammar (R7)
@@ -939,7 +1094,7 @@ final class CLIGateTests: XCTestCase {
             to: catRoot.appendingPathComponent("f.bin")
         )
         let category = makeCategory(name: "cat_a", path: catRoot.path)
-        let fixture = try makeNodeModulesFixture()
+        let fixture = try makeArtifactFixture()
         let deps = try makeDeps(categories: [category], extraScanners: [fixture.scanner])
 
         // Echo-back: the item id comes from scan output, never derived.
@@ -957,15 +1112,15 @@ final class CLIGateTests: XCTestCase {
 
         // Form 2: bare per-item scanner slug — ALL its items.
         let byScanner = try successPayload(await CLIHandler.cleanCLIOutcome(
-            targets: ["node_modules"], dryRun: true, confirmed: false, euid: 501, deps: deps
+            targets: ["build_artifacts"], dryRun: true, confirmed: false, euid: 501, deps: deps
         ))
         let scannerRows = try XCTUnwrap(byScanner["results"] as? [[String: Any]])
         XCTAssertEqual(scannerRows.map { $0["slug"] as? String },
-                       ["node_modules:\(itemID)"])
+                       ["build_artifacts:\(itemID)"])
 
         // Form 3: `<scanner-slug>:<item-id>` — one item, id echoed back.
         let byAddress = try successPayload(await CLIHandler.cleanCLIOutcome(
-            targets: ["node_modules:\(itemID)"], dryRun: true, confirmed: false,
+            targets: ["build_artifacts:\(itemID)"], dryRun: true, confirmed: false,
             euid: 501, deps: deps
         ))
         let addressRows = try XCTUnwrap(byAddress["results"] as? [[String: Any]])
@@ -974,26 +1129,29 @@ final class CLIGateTests: XCTestCase {
 
         // Mixed forms in one invocation resolve together, deduped by item.
         let mixed = try successPayload(await CLIHandler.cleanCLIOutcome(
-            targets: ["cat_a", "node_modules", "node_modules:\(itemID)"],
+            targets: ["cat_a", "build_artifacts", "build_artifacts:\(itemID)"],
             dryRun: true, confirmed: false, euid: 501, deps: deps
         ))
         let mixedRows = try XCTUnwrap(mixed["results"] as? [[String: Any]])
         XCTAssertEqual(
             mixedRows.map { $0["slug"] as? String },
-            ["cat_a", "node_modules:\(itemID)"],
+            ["cat_a", "build_artifacts:\(itemID)"],
             "an item named twice (scanner-wide + addressed) appears once, argument order kept"
         )
     }
 
     func testCleanUnknownTargetsAreInvalidArguments() async throws {
-        let fixture = try makeNodeModulesFixture()
+        let fixture = try makeArtifactFixture()
         let deps = try makeDeps(
             categories: [makeCategory(name: "cat_a")],
             extraScanners: [fixture.scanner]
         )
 
-        for target in ["nope", "node_modules:" + String(repeating: "0", count: 64),
-                       "node_modules:", "cat_a:whatever", "nope:abc"] {
+        // The RETIRED `node_modules` slug is in the matrix on purpose
+        // (fn-4.5/fn-4.7): it must be refused like any other unknown token.
+        for target in ["nope", "node_modules", "node_modules:abc",
+                       "build_artifacts:" + String(repeating: "0", count: 64),
+                       "build_artifacts:", "cat_a:whatever", "nope:abc"] {
             let failure = try failureOutcome(await CLIHandler.cleanCLIOutcome(
                 targets: [target], dryRun: true, confirmed: false, euid: 501, deps: deps
             ))
@@ -1120,10 +1278,10 @@ final class CLIGateTests: XCTestCase {
                       "the unrequested category's content is untouched")
     }
 
-    // MARK: - node_modules clean behind --confirm (R2, the acceptance headline)
+    // MARK: - Per-item clean behind --confirm (R2, the acceptance headline)
 
-    func testNodeModulesCleanWithoutConfirmIsRefusedWithPlan() async throws {
-        let fixture = try makeNodeModulesFixture()
+    func testPerItemCleanWithoutConfirmIsRefusedWithPlan() async throws {
+        let fixture = try makeArtifactFixture()
         let deps = try makeDeps(categories: [], extraScanners: [fixture.scanner])
         let envelope = await CLIHandler.scanEnvelope(deps: deps)
         let itemID = try XCTUnwrap(
@@ -1131,7 +1289,7 @@ final class CLIGateTests: XCTestCase {
         )
 
         let failure = try failureOutcome(await CLIHandler.cleanCLIOutcome(
-            targets: ["node_modules:\(itemID)"], dryRun: false, confirmed: false,
+            targets: ["build_artifacts:\(itemID)"], dryRun: false, confirmed: false,
             euid: 501, deps: deps
         ))
 
@@ -1139,31 +1297,31 @@ final class CLIGateTests: XCTestCase {
         let details = try XCTUnwrap(failure.details)
         let plan = try XCTUnwrap(details["plan"] as? [[String: Any]])
         XCTAssertEqual(plan.count, 1)
-        XCTAssertEqual(plan[0]["slug"] as? String, "node_modules:\(itemID)")
+        XCTAssertEqual(plan[0]["slug"] as? String, "build_artifacts:\(itemID)")
         XCTAssertEqual(plan[0]["action"] as? String, "clean")
-        XCTAssertTrue(fm.fileExists(atPath: fixture.nodeModules.path),
+        XCTAssertTrue(fm.fileExists(atPath: fixture.artifact.path),
                       "an unconfirmed clean deletes NOTHING")
     }
 
-    func testNodeModulesConfirmedCleanDeletesAndReportsExactRow() async throws {
-        let fixture = try makeNodeModulesFixture()
+    func testPerItemConfirmedCleanDeletesAndReportsExactRow() async throws {
+        let fixture = try makeArtifactFixture()
         let deps = try makeDeps(categories: [], extraScanners: [fixture.scanner])
         let envelope = await CLIHandler.scanEnvelope(deps: deps)
         let itemID = try XCTUnwrap(
             (envelope["scanner_items"] as? [[String: Any]])?.first?["item_id"] as? String
         )
-        let address = "node_modules:\(itemID)"
+        let address = "build_artifacts:\(itemID)"
 
         let payload = try successPayload(await CLIHandler.cleanCLIOutcome(
             targets: [address], dryRun: false, confirmed: true, euid: 501, deps: deps
         ))
 
         // The confirmed deletion, exercised IN-PROCESS through the injected
-        // bundle: the node_modules tree is gone, its project dir survives.
-        XCTAssertFalse(fm.fileExists(atPath: fixture.nodeModules.path),
-                       "the addressed node_modules tree is deleted")
+        // bundle: the artifact tree is gone, its project dir survives.
+        XCTAssertFalse(fm.fileExists(atPath: fixture.artifact.path),
+                       "the addressed artifact tree is deleted")
         XCTAssertTrue(
-            fm.fileExists(atPath: fixture.nodeModules.deletingLastPathComponent().path),
+            fm.fileExists(atPath: fixture.artifact.deletingLastPathComponent().path),
             "the project directory itself survives"
         )
 
@@ -1175,14 +1333,15 @@ final class CLIGateTests: XCTestCase {
         // composite address, with separate sibling identity fields whose
         // concatenation matches it.
         XCTAssertEqual(row["category"] as? String, address)
-        XCTAssertEqual(row["scanner_id"] as? String, "node_modules")
+        XCTAssertEqual(row["scanner_id"] as? String, "build_artifacts")
         XCTAssertEqual(row["item_id"] as? String, itemID)
         XCTAssertEqual(
             "\(row["scanner_id"] as? String ?? ""):\(row["item_id"] as? String ?? "")",
             row["category"] as? String,
             "consumers never parse the composite — the siblings reproduce it"
         )
-        XCTAssertEqual(row["name"] as? String, "projA")
+        XCTAssertEqual(row["name"] as? String, "node_modules",
+                       "the per-item display name is the ARTIFACT dir")
         XCTAssertEqual(row["success"] as? Bool, true)
         let freed = try XCTUnwrap(row["bytes_freed"] as? Int64)
         XCTAssertGreaterThan(freed, 0)
@@ -1191,7 +1350,7 @@ final class CLIGateTests: XCTestCase {
         // Per-scanner rollup rides additively (fn-2.3's report on the wire).
         let rollups = try XCTUnwrap(payload["scanner_rollups"] as? [[String: Any]])
         XCTAssertEqual(rollups.count, 1)
-        XCTAssertEqual(rollups[0]["scanner_id"] as? String, "node_modules")
+        XCTAssertEqual(rollups[0]["scanner_id"] as? String, "build_artifacts")
         XCTAssertEqual(rollups[0]["entry_count"] as? Int, 1)
         XCTAssertEqual(rollups[0]["exact_bytes"] as? Int64, freed)
     }
@@ -1200,7 +1359,7 @@ final class CLIGateTests: XCTestCase {
         // An EMPTY node_modules dir: recognized, emitted as `.empty` —
         // explicitly addressing it with --confirm deletes nothing, yields
         // NO result row, and stays a process-level success (round 9).
-        let fixture = try makeNodeModulesFixture(project: "emptyProj", withContent: false)
+        let fixture = try makeArtifactFixture(project: "emptyProj", withContent: false)
         let deps = try makeDeps(categories: [], extraScanners: [fixture.scanner])
         let envelope = await CLIHandler.scanEnvelope(deps: deps)
         let items = try XCTUnwrap(envelope["scanner_items"] as? [[String: Any]])
@@ -1209,11 +1368,11 @@ final class CLIGateTests: XCTestCase {
         let itemID = try XCTUnwrap(items.first?["item_id"] as? String)
 
         let payload = try successPayload(await CLIHandler.cleanCLIOutcome(
-            targets: ["node_modules:\(itemID)"], dryRun: false, confirmed: true,
+            targets: ["build_artifacts:\(itemID)"], dryRun: false, confirmed: true,
             euid: 501, deps: deps
         ))
 
-        XCTAssertTrue(fm.fileExists(atPath: fixture.nodeModules.path),
+        XCTAssertTrue(fm.fileExists(atPath: fixture.artifact.path),
                       "nothing is deleted for an .empty candidate")
         XCTAssertEqual((payload["results"] as? [[String: Any]])?.count, 0,
                        "no result entry — the cleaner's silent pre-admission skip surfaces as absence")
@@ -1353,6 +1512,33 @@ final class CLIGateTests: XCTestCase {
             "detail": "fixture EACCES",
             "path": otherRoot.path,
         ] as NSDictionary)
+    }
+
+    /// fn-4.9: an ORDINARY (non-valuables) item error serializes EXACTLY as
+    /// it did before the refusal payload existed — the additive fields are
+    /// absent and no other key moved. Pinned as a full key-set fixture: the
+    /// item's container is removed after the fixture is built (the fixture
+    /// scanner emits its items statically), so the confirmed clean fails at
+    /// admission — a plain, payload-free error path.
+    func testOrdinaryItemErrorRowsSerializeExactlyAsBefore() async throws {
+        let fixture = try makeImpededScannerFixture(id: "ord_scanner", errors: [])
+        try fm.removeItem(at: fixture.itemDir.deletingLastPathComponent())
+        let deps = try makeDeps(categories: [], extraScanners: [fixture.scanner])
+
+        let failure = try failureOutcome(await CLIHandler.cleanCLIOutcome(
+            targets: [fixture.address], dryRun: false, confirmed: true,
+            euid: 501, deps: deps
+        ))
+
+        XCTAssertEqual(failure.code, "CLEAN_FAILED")
+        let rows = try XCTUnwrap(failure.details?["results"] as? [[String: Any]])
+        XCTAssertEqual(rows.count, 1)
+        XCTAssertEqual(rows[0]["success"] as? Bool, false)
+        XCTAssertEqual(Set(rows[0].keys), [
+            "category", "name", "bytes_freed", "exact_bytes",
+            "estimated_up_to_bytes", "freed_human", "success", "scanner_id",
+            "item_id", "error",
+        ], "an ordinary error row gains NO keys from the refusal payload")
     }
 
     func testExplicitItemAddressCarriesNoScannerErrors() async throws {
@@ -1720,6 +1906,451 @@ final class CLIGateTests: XCTestCase {
             }
         }
     }
+
+    // MARK: - Normalized parse: targets before flags (fn-4.9, F3)
+
+    /// Every currently-valid invocation shape keeps its EXACT meaning under
+    /// the normalized parse: the same positionals the as-built extractors
+    /// produced, with valued-flag values never mistaken for targets. The
+    /// MCP consumer's trailing `--format json` is in the table on purpose —
+    /// it appends that pair to EVERY invocation.
+    func testNormalizedParsePreservesEveryCurrentlyValidInvocation() throws {
+        let cases: [(CLIHandler.Command, [String], [String])] = [
+            (.version, [], []),
+            (.version, ["--format", "json"], []),
+            (.scan, ["--format", "json"], []),
+            (.scan, ["--orphan-size-floor-mb", "100", "--orphan-stale-days", "30"], []),
+            (.clean, ["npm_cache", "--confirm"], ["npm_cache"]),
+            (.clean, ["a", "b", "c", "--dry-run", "--format", "json"], ["a", "b", "c"]),
+            (.clean, ["build_artifacts:abc", "--confirm",
+                      "--orphan-size-floor-mb", "100"], ["build_artifacts:abc"]),
+            (.smartClean, ["10.0", "--confirm"], ["10.0"]),
+            (.smartClean, ["--confirm"], []),
+            (.smartClean, ["10.0", "--confirm", "--include-caution",
+                           "--format", "json"], ["10.0"]),
+            (.topProcesses, ["--top", "10"], []),
+            (.intervene, ["sigterm-cascade", "--confirm", "--target-pid", "123",
+                          "--target-name", "Safari"], ["sigterm-cascade"]),
+        ]
+        for (command, arguments, expected) in cases {
+            switch CLIHandler.normalizedInvocation(
+                command: command, arguments: arguments
+            ) {
+            case .failure(let error):
+                XCTFail("\(command.rawValue) \(arguments) must parse: \(error.message)")
+            case .success(let invocation):
+                XCTAssertEqual(invocation.command, command)
+                XCTAssertEqual(invocation.targets, expected,
+                               "\(command.rawValue) \(arguments)")
+            }
+        }
+
+        // Repeatable valued flags collect EVERY value, in argv order.
+        guard case .success(let repeated) = CLIHandler.normalizedInvocation(
+            command: .clean, arguments: [
+                "build_artifacts", "--confirm",
+                CLIHandler.acknowledgeValuablesFlag, "s:a:1",
+                CLIHandler.acknowledgeValuablesFlag, "s:b:2",
+            ]
+        ) else { return XCTFail("repeatable flag must parse") }
+        XCTAssertEqual(repeated.targets, ["build_artifacts"])
+        XCTAssertEqual(
+            repeated.values(of: CLIHandler.acknowledgeValuablesFlag),
+            ["s:a:1", "s:b:2"]
+        )
+        XCTAssertEqual(repeated.values(of: "--dev-root"), [],
+                       "an unused flag reads as no values, never nil-crashes")
+    }
+
+    /// The pinned ordering rule: a positional AFTER the first flag token is
+    /// INVALID_ARGUMENTS naming it — where the as-built parser dropped it
+    /// silently. Interleaved orderings included.
+    func testPositionalAfterFlagsIsRejectedNamingTheToken() throws {
+        let cases: [(CLIHandler.Command, [String], String)] = [
+            (.clean, ["npm_cache", "--confirm", "stray_target"], "stray_target"),
+            (.clean, ["--confirm", "npm_cache"], "npm_cache"),
+            (.clean, ["a", "--dry-run", "b", "--confirm"], "b"),
+            (.smartClean, ["--confirm", "10.0"], "10.0"),
+            (.intervene, ["--dry-run", "pressure-trigger"], "pressure-trigger"),
+            (.topProcesses, ["--top", "10", "extra"], "extra"),
+            (.clean, ["x", CLIHandler.acknowledgeValuablesFlag, "s:a:1", "y"], "y"),
+        ]
+        for (command, arguments, offender) in cases {
+            switch CLIHandler.normalizedInvocation(
+                command: command, arguments: arguments
+            ) {
+            case .success(let invocation):
+                XCTFail("\(arguments) must be refused, parsed \(invocation.targets)")
+            case .failure(let error):
+                XCTAssertTrue(error.message.contains("'\(offender)'"),
+                              "names the offending token: \(error.message)")
+                XCTAssertTrue(error.message.contains(command.rawValue),
+                              "names the command: \(error.message)")
+            }
+        }
+    }
+
+    /// `--acknowledge-valuables` joins the CENTRALIZED pre-dispatch gate:
+    /// clean accepts it, EVERY other command refuses it up front with the
+    /// flag named — and the sweep flags' own gate is unchanged.
+    func testAcknowledgeFlagPreDispatchGateMatrixAcrossAllCommands() {
+        let entry = [CLIHandler.acknowledgeValuablesFlag, "build_artifacts:a:b"]
+        for command in CLIHandler.Command.allCases {
+            let rejection = CLIHandler.rejectedFlag(for: command, in: entry)
+            if command == .clean {
+                XCTAssertNil(rejection, "clean accepts the acknowledgement flag")
+                continue
+            }
+            let message = rejection?.message ?? ""
+            XCTAssertEqual(rejection?.flag, CLIHandler.acknowledgeValuablesFlag,
+                           "\(command.rawValue) must refuse the flag")
+            XCTAssertTrue(
+                message.contains(CLIHandler.acknowledgeValuablesFlag)
+                    && message.contains(command.rawValue)
+                    && message.contains("clean"),
+                "actionable refusal: \(message)"
+            )
+        }
+
+        // The sweep gate keeps its own wording and its own accepted set.
+        let sweep = CLIHandler.rejectedFlag(
+            for: .smartClean, in: [CLIHandler.orphanStaleDaysFlag, "30"]
+        )
+        XCTAssertEqual(sweep?.flag, CLIHandler.orphanStaleDaysFlag)
+        XCTAssertEqual(sweep?.message, CLIHandler.sweepFlagRejectionMessage(
+            flag: CLIHandler.orphanStaleDaysFlag, command: .smartClean
+        ))
+        XCTAssertNil(CLIHandler.rejectedFlag(
+            for: .scan, in: [CLIHandler.orphanStaleDaysFlag, "30"]
+        ), "scan still accepts the sweep flags")
+    }
+
+    // MARK: - `--dev-root` (fn-4.6, R8/R16)
+
+    /// The repeatable dev-roots flag joins the CENTRALIZED pre-dispatch
+    /// gate: `scan` and `clean` — the two commands that walk the configured
+    /// roots — accept it; EVERY other command refuses it up front with the
+    /// flag named. Silently ignoring it would let a caller believe they
+    /// scoped an invocation they did not.
+    func testDevRootFlagPreDispatchGateMatrixAcrossAllCommands() {
+        let args = [CLIHandler.devRootFlag, "/tmp/dev"]
+        for command in CLIHandler.Command.allCases {
+            let rejection = CLIHandler.rejectedFlag(for: command, in: args)
+            if command == .scan || command == .clean {
+                XCTAssertNil(
+                    rejection,
+                    "\(command.rawValue) walks the dev roots and accepts the flag"
+                )
+                continue
+            }
+            let message = rejection?.message ?? ""
+            XCTAssertEqual(rejection?.flag, CLIHandler.devRootFlag,
+                           "\(command.rawValue) must refuse the flag")
+            XCTAssertTrue(
+                message.contains(CLIHandler.devRootFlag)
+                    && message.contains(command.rawValue)
+                    && message.contains("scan or clean"),
+                "actionable refusal: \(message)"
+            )
+            // Without the flag the gate stays silent — it never turns an
+            // ordinary invocation into a usage error.
+            XCTAssertNil(CLIHandler.rejectedFlag(
+                for: command, in: ["Cacheout", "--cli", command.rawValue]
+            ))
+        }
+    }
+
+    /// PATH-FORM MATRIX (pinned): absolute accepted, `~`-prefixed accepted
+    /// and EXPANDED against the injected home, any other relative spelling
+    /// refused with the value named.
+    func testDevRootPathFormMatrix() throws {
+        let absolute = base.appendingPathComponent("abs-dev")
+        let tilde = fixtureHome.appendingPathComponent("tilde-dev")
+        for dir in [absolute, tilde] {
+            try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        }
+
+        // (a) ABSOLUTE — accepted verbatim, declared spelling preserved.
+        switch CLIHandler.devRootsOverride(
+            from: [absolute.path], occurrences: 1, home: fixtureHome
+        ) {
+        case .failure(let error):
+            XCTFail("an absolute --dev-root must be accepted: \(error.message)")
+        case .success(let resolution):
+            XCTAssertEqual(resolution?.keptRoots.map(\.path), [absolute.path])
+            XCTAssertEqual(resolution?.issues.count, 0)
+        }
+
+        // (b) `~`-EXPANDED — expanded against the INJECTED home, never
+        // `getpwuid` (the flag means the same thing in tests and in
+        // production).
+        switch CLIHandler.devRootsOverride(
+            from: ["~/tilde-dev"], occurrences: 1, home: fixtureHome
+        ) {
+        case .failure(let error):
+            XCTFail("a ~ --dev-root must be accepted: \(error.message)")
+        case .success(let resolution):
+            XCTAssertEqual(resolution?.keptRoots.map(\.path), [tilde.path],
+                           "the tilde expands against the injected home")
+        }
+
+        // (c) BARE RELATIVE — refused, NAMING the value. A cwd-relative dev
+        // root would silently depend on the invocation directory.
+        for relative in ["projects/x", "dev", "./dev", "../dev"] {
+            switch CLIHandler.devRootsOverride(
+                from: [relative], occurrences: 1, home: fixtureHome
+            ) {
+            case .success(let resolution):
+                XCTFail("'\(relative)' must be refused, got \(String(describing: resolution))")
+            case .failure(let error):
+                XCTAssertTrue(error.message.contains("'\(relative)'"),
+                              "names the offending value: \(error.message)")
+                XCTAssertTrue(error.message.contains(CLIHandler.devRootFlag),
+                              "names the flag: \(error.message)")
+            }
+        }
+
+        // Absent flag = no replacement at all: the persisted store resolves
+        // inside the production factory exactly as it does for the app.
+        switch CLIHandler.devRootsOverride(
+            from: [], occurrences: 0, home: fixtureHome
+        ) {
+        case .failure(let error):
+            XCTFail("no flag must resolve to nil: \(error.message)")
+        case .success(let resolution):
+            XCTAssertNil(resolution)
+        }
+
+        // (d) A trailing `--dev-root` with NO value: the grammar collects
+        // nothing for that occurrence, and silence here would look exactly
+        // like an ABSENT flag — quietly scanning the PERSISTED roots the
+        // caller meant to replace. Refused, on the empty and partial shapes
+        // alike.
+        for (values, occurrences) in [([], 1), ([absolute.path], 2)]
+            as [([String], Int)] {
+            switch CLIHandler.devRootsOverride(
+                from: values, occurrences: occurrences, home: fixtureHome
+            ) {
+            case .success(let resolution):
+                XCTFail("a valueless occurrence must be refused, got "
+                        + "\(String(describing: resolution))")
+            case .failure(let error):
+                XCTAssertTrue(error.message.contains(CLIHandler.devRootFlag),
+                              "names the flag: \(error.message)")
+                XCTAssertTrue(error.message.contains("requires a folder path"),
+                              error.message)
+                XCTAssertTrue(error.message.contains("Nothing was scanned"),
+                              error.message)
+            }
+        }
+    }
+
+    /// The CLI ATTACK CASE (R16): a policy-rejected value is an immediate
+    /// INVALID_ARGUMENTS naming the offending root — never a silent config
+    /// issue (that path exists only for PERSISTED roots) and never a scan.
+    /// The policy is the SHARED one, so its alias spellings are caught too.
+    func testDevRootPolicyRefusalNamesTheOffendingRoot() throws {
+        let aliasOfRoot = base.appendingPathComponent("slash-alias")
+        try fm.createSymbolicLink(
+            at: aliasOfRoot, withDestinationURL: URL(fileURLWithPath: "/")
+        )
+
+        let dangerous = ["/", fixtureHome.path, aliasOfRoot.path]
+        for root in dangerous {
+            switch CLIHandler.devRootsOverride(
+                from: [root], occurrences: 1, home: fixtureHome
+            ) {
+            case .success(let resolution):
+                XCTFail("'\(root)' must be refused, got \(String(describing: resolution))")
+            case .failure(let error):
+                XCTAssertTrue(error.message.contains(CLIHandler.devRootFlag),
+                              "names the flag: \(error.message)")
+                XCTAssertTrue(error.message.contains(root),
+                              "names the offending root: \(error.message)")
+                XCTAssertTrue(error.message.contains("Nothing was scanned"),
+                              "says nothing happened: \(error.message)")
+            }
+        }
+
+        // The LEGAL protected child admits — the seeds depend on it.
+        let documents = fixtureHome.appendingPathComponent("Documents")
+        try fm.createDirectory(at: documents, withIntermediateDirectories: true)
+        switch CLIHandler.devRootsOverride(
+            from: [documents.path], occurrences: 1, home: fixtureHome
+        ) {
+        case .failure(let error):
+            XCTFail("~/Documents is a legal dev root: \(error.message)")
+        case .success(let resolution):
+            XCTAssertEqual(resolution?.keptRoots.map(\.path), [documents.path])
+        }
+    }
+
+    /// REPLACEMENT semantics (R8): the flag's values are the WHOLE effective
+    /// set — the persisted list and its seeds are not consulted, nothing is
+    /// written — with exact-canonical-duplicate dedupe (declared spellings
+    /// preserved) and NESTED roots kept as INDEPENDENT walks (D7).
+    func testDevRootReplacesTheStoredSetWithoutPersistingAnything() throws {
+        let suiteName = "CLIGateTests-devroots-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        defaults.set(["Documents", "Code"], forKey: DevRootsStore.devRootsKey)
+
+        let outer = fixtureHome.appendingPathComponent("dev")
+        let nested = outer.appendingPathComponent("deep/inner")
+        try fm.createDirectory(at: nested, withIntermediateDirectories: true)
+        // A second SPELLING of `outer` via a symlinked ANCESTOR — legal
+        // (only the LEAF must lstat as a real directory), and an exact
+        // canonical duplicate of the first.
+        let aliasParent = base.appendingPathComponent("alias-home")
+        try fm.createSymbolicLink(at: aliasParent, withDestinationURL: fixtureHome)
+        let aliasSpelling = aliasParent.appendingPathComponent("dev")
+
+        let resolution: DevRootsResolution
+        switch CLIHandler.devRootsOverride(
+            from: [outer.path, aliasSpelling.path, nested.path],
+            occurrences: 3, home: fixtureHome
+        ) {
+        case .failure(let error):
+            return XCTFail("must resolve: \(error.message)")
+        case .success(let resolved):
+            resolution = try XCTUnwrap(resolved)
+        }
+
+        XCTAssertEqual(
+            resolution.keptRoots.map(\.path), [outer.path, nested.path],
+            "exact canonical duplicate collapsed; the NESTED root is KEPT "
+                + "as its own independent walk (D7)"
+        )
+        XCTAssertTrue(resolution.issues.isEmpty, "\(resolution.issues)")
+
+        // The persisted list is neither consulted nor rewritten.
+        XCTAssertFalse(
+            resolution.keptRoots.contains {
+                $0.lastPathComponent == "Documents" || $0.lastPathComponent == "Code"
+            },
+            "the flag REPLACES the stored set — seeds/persisted roots are "
+                + "not consulted"
+        )
+        XCTAssertEqual(
+            defaults.stringArray(forKey: DevRootsStore.devRootsKey),
+            ["Documents", "Code"],
+            "an invocation-scoped flag never persists anything"
+        )
+    }
+
+    /// The flag rides fn-4.9's NORMALIZED grammar and NOTHING else: one
+    /// `valuedFlags` entry, values collected in argv order, the
+    /// targets-before-flags rule applying to it exactly as to every other
+    /// flag — and, grep-asserted, no second parser exists to drift from.
+    func testDevRootParsesThroughTheOneNormalizedGrammar() throws {
+        XCTAssertTrue(CLIHandler.valuedFlags.contains(CLIHandler.devRootFlag),
+                      "ONE table entry is the whole registration")
+
+        guard case .success(let invocation) = CLIHandler.normalizedInvocation(
+            command: .clean, arguments: [
+                "build_artifacts", "--confirm",
+                CLIHandler.devRootFlag, "~/dev",
+                CLIHandler.devRootFlag, "/Volumes/Work/code",
+            ]
+        ) else { return XCTFail("repeatable --dev-root must parse") }
+        XCTAssertEqual(invocation.targets, ["build_artifacts"])
+        XCTAssertEqual(invocation.values(of: CLIHandler.devRootFlag),
+                       ["~/dev", "/Volumes/Work/code"],
+                       "every value, in argv order")
+
+        // Interleaved positional-after-flag: INVALID_ARGUMENTS naming the
+        // token — the value token itself is never mistaken for a target.
+        switch CLIHandler.normalizedInvocation(
+            command: .clean,
+            arguments: ["a", CLIHandler.devRootFlag, "~/dev", "stray"]
+        ) {
+        case .success(let parsed):
+            XCTFail("must be refused, parsed \(parsed.targets)")
+        case .failure(let error):
+            XCTAssertTrue(error.message.contains("'stray'"), error.message)
+        }
+
+        // GREP-ASSERTED: exactly ONE positional/flag grammar exists in the
+        // sources — a second `normalizedInvocation` (or a second copy of its
+        // ordering rule) is what "no duplicate grammar implementation" bans.
+        let sources = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()   // CacheoutTests
+            .deletingLastPathComponent()   // Tests
+            .deletingLastPathComponent()   // repo root
+            .appendingPathComponent("Sources/Cacheout/CLIHandler.swift")
+        let code = try String(contentsOf: sources, encoding: .utf8)
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .filter { !$0.trimmingCharacters(in: .whitespaces).hasPrefix("//") }
+            .joined(separator: "\n")
+        XCTAssertGreaterThan(code.count, 10_000, "the gate read real code")
+        XCTAssertEqual(
+            code.components(separatedBy: "func normalizedInvocation(").count - 1,
+            1, "exactly one normalized parse implementation"
+        )
+        XCTAssertEqual(
+            code.components(
+                separatedBy: "takes its targets BEFORE any flag"
+            ).count - 1,
+            1, "exactly one ordering-rule implementation"
+        )
+    }
+
+    // MARK: - Acknowledgement FORM parsing (fn-4.9, R17 — frozen rules)
+
+    func testAcknowledgementFormRulesAreFrozen() throws {
+        let id = String(repeating: "e", count: 64)
+        let token = String(repeating: "a", count: 64)
+
+        guard case .success(let parsed) = CLIHandler.parseAcknowledgements(
+            ["build_artifacts:\(id):\(token)"]
+        ) else { return XCTFail("a well-formed entry must parse") }
+        XCTAssertEqual(parsed, [CLIHandler.ParsedAcknowledgement(
+            key: ItemKey(scannerID: "build_artifacts", itemID: id), token: token
+        )])
+
+        let malformed: [String] = [
+            "build_artifacts:\(id)",                       // one colon
+            "build_artifacts:\(id):\(token):extra",        // three colons
+            ":\(id):\(token)",                             // empty slug
+            "Build_Artifacts:\(id):\(token)",              // not [a-z0-9_]+
+            "build artifacts:\(id):\(token)",              // whitespace in slug
+            "build_artifacts::\(token)",                   // empty item id
+            "build_artifacts:bad id:\(token)",             // whitespace in id
+            "build_artifacts:\(id):\(String(repeating: "a", count: 63))",
+            "build_artifacts:\(id):\(String(repeating: "A", count: 64))",
+            "build_artifacts:\(id):\(String(repeating: "z", count: 64))",
+            "build_artifacts:\(id):",                      // empty token
+        ]
+        for entry in malformed {
+            guard case .failure(let error) = CLIHandler.parseAcknowledgements([entry])
+            else { return XCTFail("'\(entry)' must be refused") }
+            XCTAssertTrue(
+                error.message.contains(CLIHandler.acknowledgeValuablesFlag),
+                "the refusal names the flag: \(error.message)"
+            )
+        }
+
+        // DUPLICATE ItemKey — never first- or last-wins, even byte-identical.
+        for second in [token, String(repeating: "b", count: 64)] {
+            guard case .failure(let error) = CLIHandler.parseAcknowledgements([
+                "build_artifacts:\(id):\(token)",
+                "build_artifacts:\(id):\(second)",
+            ]) else { return XCTFail("a duplicate ItemKey must be refused") }
+            XCTAssertTrue(error.message.contains("more than once"),
+                          error.message)
+        }
+
+        // The SAME item id under a DIFFERENT scanner is a different ItemKey.
+        guard case .success(let twoScanners) = CLIHandler.parseAcknowledgements([
+            "build_artifacts:\(id):\(token)",
+            "orphaned_caches:\(id):\(token)",
+        ]) else { return XCTFail("two distinct ItemKeys must parse") }
+        XCTAssertEqual(twoScanners.count, 2)
+        XCTAssertEqual(
+            CLIHandler.authorizationContext(from: twoScanners).count, 2,
+            "the authorization context keys on the FULL ItemKey"
+        )
+    }
 }
 
 /// fn-1.5 subprocess INTEGRATION tests (R5) — read-only, framing ONLY.
@@ -1982,5 +2613,792 @@ final class CLIGateFramingTests: XCTestCase {
         let error = try XCTUnwrap(envelope["error"] as? [String: Any])
         XCTAssertEqual(error["code"] as? String, "CONFIRMATION_REQUIRED",
                        "the sweep flag is accepted — the refusal is the confirm gate, not the flag gate")
+    }
+
+    // MARK: - Normalized grammar at the process boundary (fn-4.9, F3)
+
+    func testTrailingFormatJSONStillParsesFraming() throws {
+        // The MCP consumer appends `--format json` to EVERY invocation
+        // (cacheout-mcp engine.py `_run`). The ordering rule must not turn
+        // that value token into a stray positional — read-only command.
+        let run = try runCLI(["--cli", "version", "--format", "json"])
+        XCTAssertEqual(run.exitCode, 0, "stderr: \(run.stderr)")
+        let data = try XCTUnwrap(run.stdout.data(using: .utf8))
+        XCTAssertNotNil(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+    }
+
+    func testPositionalAfterFlagsIsRefusedFraming() throws {
+        // The silent DROP becomes a loud error: refused before dispatch, so
+        // no scan and no deletion can follow (`--confirm` present on purpose).
+        let run = try runCLI([
+            "--cli", "clean", "npm_cache", "--confirm", "stray_target",
+        ])
+        XCTAssertEqual(run.exitCode, 1)
+        XCTAssertEqual(run.stdout, "", "stdout stays EMPTY when refused")
+        let envelope = try parseErrorEnvelope(run.stderr)
+        let error = try XCTUnwrap(envelope["error"] as? [String: Any])
+        XCTAssertEqual(error["code"] as? String, "INVALID_ARGUMENTS")
+        XCTAssertTrue(((error["message"] as? String) ?? "")
+            .contains("'stray_target'"), "names the offending token")
+    }
+
+    func testAcknowledgeValuablesRejectedOnNonCleanCommandsFraming() throws {
+        let entry = "build_artifacts:\(String(repeating: "e", count: 64)):"
+            + String(repeating: "a", count: 64)
+        for command in ["version", "disk-info", "memory-stats"] {
+            let run = try runCLI([
+                "--cli", command, CLIHandler.acknowledgeValuablesFlag, entry,
+            ])
+            XCTAssertEqual(run.exitCode, 1, "\(command) must refuse the flag")
+            XCTAssertEqual(run.stdout, "")
+            let envelope = try parseErrorEnvelope(run.stderr)
+            let error = try XCTUnwrap(envelope["error"] as? [String: Any])
+            XCTAssertEqual(error["code"] as? String, "INVALID_ARGUMENTS")
+            let message = (error["message"] as? String) ?? ""
+            XCTAssertTrue(message.contains(CLIHandler.acknowledgeValuablesFlag),
+                          "names the flag: \(message)")
+            XCTAssertTrue(message.contains(command), "names the command: \(message)")
+            XCTAssertTrue(message.contains("clean"),
+                          "points at the command that accepts it: \(message)")
+        }
+    }
+
+    func testDevRootRejectedOnNonScanCleanCommandsFraming() throws {
+        // Read-only commands only, so even a gate regression stays
+        // side-effect-free (the in-process matrix covers every command).
+        for command in ["version", "disk-info", "memory-stats"] {
+            let run = try runCLI([
+                "--cli", command, CLIHandler.devRootFlag, "/tmp/dev",
+            ])
+            XCTAssertEqual(run.exitCode, 1, "\(command) must refuse the flag")
+            XCTAssertEqual(run.stdout, "",
+                           "stdout stays EMPTY when refused: \(command)")
+            let envelope = try parseErrorEnvelope(run.stderr)
+            let error = try XCTUnwrap(envelope["error"] as? [String: Any])
+            XCTAssertEqual(error["code"] as? String, "INVALID_ARGUMENTS")
+            let message = (error["message"] as? String) ?? ""
+            XCTAssertTrue(message.contains(CLIHandler.devRootFlag),
+                          "names the flag: \(message)")
+            XCTAssertTrue(message.contains(command), "names the command: \(message)")
+            XCTAssertTrue(message.contains("scan or clean"),
+                          "points at the commands that accept it: \(message)")
+        }
+    }
+
+    func testBareDevRootFlagIsRefusedInsteadOfSilentlyUnscopedFraming() throws {
+        // A trailing `--dev-root` collects no value. Treating that like an
+        // absent flag would scan the PERSISTED roots the caller meant to
+        // replace — an UNSCOPED scan/clean dressed as a scoped one. Both
+        // accepting commands must refuse it BEFORE dispatch (read-only:
+        // nothing is scanned, `--confirm` deletes nothing).
+        for arguments in [
+            ["--cli", "scan", CLIHandler.devRootFlag],
+            ["--cli", "clean", "npm_cache", "--confirm", CLIHandler.devRootFlag],
+        ] {
+            let run = try runCLI(arguments)
+            XCTAssertEqual(run.exitCode, 1, "\(arguments) must be refused")
+            XCTAssertEqual(run.stdout, "",
+                           "stdout stays EMPTY — no scan envelope, no plan")
+            let envelope = try parseErrorEnvelope(run.stderr)
+            let error = try XCTUnwrap(envelope["error"] as? [String: Any])
+            XCTAssertEqual(error["code"] as? String, "INVALID_ARGUMENTS")
+            let message = (error["message"] as? String) ?? ""
+            XCTAssertTrue(message.contains(CLIHandler.devRootFlag), message)
+            XCTAssertTrue(message.contains("requires a folder path"), message)
+        }
+    }
+
+    func testDevRootValueIsResolvedBeforeAnyScanFraming() throws {
+        // The PROCESS wiring, not just the pure resolver: a bad path form
+        // and a policy-refused root both fail BEFORE the clean pipeline runs
+        // (`--confirm` present on purpose — nothing is scanned or deleted,
+        // and the refusal is the dev-root one, not the confirmation gate).
+        let cases: [(String, String)] = [
+            ("projects/x", "projects/x"),   // relative → path-form refusal
+            ("/", "/"),                     // dangerous → policy refusal
+        ]
+        for (value, named) in cases {
+            let run = try runCLI([
+                "--cli", "clean", "npm_cache", "--confirm",
+                CLIHandler.devRootFlag, value,
+            ])
+            XCTAssertEqual(run.exitCode, 1, "'\(value)' must be refused")
+            XCTAssertEqual(run.stdout, "")
+            let envelope = try parseErrorEnvelope(run.stderr)
+            let error = try XCTUnwrap(envelope["error"] as? [String: Any])
+            XCTAssertEqual(error["code"] as? String, "INVALID_ARGUMENTS",
+                           "'\(value)' is a usage error, never a silent scan")
+            let message = (error["message"] as? String) ?? ""
+            XCTAssertTrue(message.contains(CLIHandler.devRootFlag),
+                          "names the flag: \(message)")
+            XCTAssertTrue(message.contains(named),
+                          "names the offending value: \(message)")
+        }
+    }
+
+    func testMalformedAcknowledgementOnCleanFailsFastFraming() throws {
+        // Read-only by construction: a malformed acknowledgement is refused
+        // before the gate decision, so even `--confirm` deletes nothing.
+        let run = try runCLI([
+            "--cli", "clean", "npm_cache", "--confirm",
+            CLIHandler.acknowledgeValuablesFlag, "not-an-entry",
+        ])
+        XCTAssertEqual(run.exitCode, 1)
+        XCTAssertEqual(run.stdout, "")
+        let envelope = try parseErrorEnvelope(run.stderr)
+        let error = try XCTUnwrap(envelope["error"] as? [String: Any])
+        XCTAssertEqual(error["code"] as? String, "INVALID_ARGUMENTS")
+        XCTAssertTrue(((error["message"] as? String) ?? "")
+            .contains("not-an-entry"))
+    }
+}
+
+/// fn-4.9 (R17): the CLI acknowledgement authorization flow END TO END —
+/// plan-row disclosure and tokens, the item-bound refusal wire on BOTH
+/// clean-result arms, the frozen `--acknowledge-valuables` pre-flight rules,
+/// validation timing, token rotation, and the vanished-set flow.
+///
+/// Hermetic and in-process: a real `BuildArtifactsScanner` over a fixture dev
+/// root inside the test's temp tree, driven through the injected
+/// `CLIRuntimeDependencies` seam. Zero real-`$HOME` reads; every deletion is
+/// fixture-contained.
+final class CLIAcknowledgementTests: XCTestCase {
+
+    private var base: URL!
+    private var fixtureHome: URL!
+    private var suiteName: String!
+    private var defaults: UserDefaults!
+    private let fm = FileManager.default
+    private let scannerID = BuildArtifactsScanner.registeredID
+
+    override func setUpWithError() throws {
+        base = fm.temporaryDirectory
+            .appendingPathComponent("CLIAckTests-\(UUID().uuidString)")
+        fixtureHome = base.appendingPathComponent("home")
+        try fm.createDirectory(at: fixtureHome, withIntermediateDirectories: true)
+        suiteName = "CLIAckTests-\(UUID().uuidString)"
+        defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+    }
+
+    override func tearDownWithError() throws {
+        if let suiteName { defaults?.removePersistentDomain(forName: suiteName) }
+        if let base { try? fm.removeItem(at: base) }
+    }
+
+    // MARK: - Fixtures
+
+    /// `<dev>/<name>/Cargo.toml` beside `<dev>/<name>/target/` (the rule row's
+    /// marker-sibling shape), with an optional release artifact inside the
+    /// build directory. Returns the artifact directory.
+    @discardableResult
+    private func makeRustProject(
+        _ name: String, in dev: URL, valuables: [String] = []
+    ) throws -> URL {
+        let project = dev.appendingPathComponent(name)
+        try fm.createDirectory(at: project, withIntermediateDirectories: true)
+        try Data(repeating: 0xC3, count: 32)
+            .write(to: project.appendingPathComponent("Cargo.toml"))
+        let artifact = project.appendingPathComponent("target")
+        try fm.createDirectory(at: artifact, withIntermediateDirectories: true)
+        try Data(repeating: 0xAB, count: 8192)
+            .write(to: artifact.appendingPathComponent("payload.bin"))
+        for valuable in valuables {
+            try writeValuable(
+                at: artifact.appendingPathComponent("release/bundle/\(valuable)")
+            )
+        }
+        return artifact
+    }
+
+    /// A release artifact comfortably above the shared allocated floor.
+    private func writeValuable(at url: URL, fill: UInt8 = 0xAB) throws {
+        try fm.createDirectory(
+            at: url.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        try Data(
+            repeating: fill,
+            count: Int(ValuablesDetector.minimumAllocatedBytes) + 100_000
+        ).write(to: url)
+    }
+
+    private func makeRuntime(
+        devRoots roots: [URL],
+        probeBudget: ValuablesProbeBudget = .censusProportionate(
+            floor: ValuablesDetector.defaultProbeEntryLimit
+        )
+    ) throws -> SpaceScannerRuntime {
+        let scanner = BuildArtifactsScanner(
+            home: fixtureHome,
+            devRoots: DevRootsStore(defaults: defaults)
+                .effectiveRoots(replacing: roots, home: fixtureHome),
+            valuablesProbeBudget: probeBudget
+        )
+        return try SpaceScannerRuntime(
+            scanners: [scanner], categories: [], home: fixtureHome,
+            provider: FileSystemIdentityProvider()
+        )
+    }
+
+    private func makeDeps(
+        _ runtime: SpaceScannerRuntime,
+        makeCleaner: ((ContainerSnapshot?) -> CacheCleaner)? = nil
+    ) -> CLIHandler.CLIRuntimeDependencies {
+        CLIHandler.CLIRuntimeDependencies(
+            runtime: runtime, categorySlugs: [], makeCleaner: makeCleaner
+        )
+    }
+
+    /// The frozen id derivation — the SAME preimage the scanner publishes.
+    private func itemID(for artifact: URL) -> String {
+        ReclaimableItem.stableID(
+            scannerID: scannerID,
+            canonicalPath: FileSystemIdentityProvider()
+                .resolveTargetKeepingLeaf(artifact).path
+        )
+    }
+
+    private func address(for artifact: URL) -> String {
+        "\(scannerID):\(itemID(for: artifact))"
+    }
+
+    private func entry(for artifact: URL, token: String) -> String {
+        "\(address(for: artifact)):\(token)"
+    }
+
+    /// The token an INDEPENDENT probe of this artifact dir derives — the
+    /// production preimage, recomputed in the test from the same integers.
+    private func independentToken(for artifact: URL) throws -> String {
+        let disclosure = ValuablesDetector.probe(
+            at: artifact, provider: FileSystemIdentityProvider()
+        )
+        XCTAssertTrue(disclosure.probeComplete)
+        return try XCTUnwrap(ValuablesDisclosure.acknowledgementToken(
+            scannerID: scannerID, itemID: itemID(for: artifact),
+            valuables: disclosure.valuables,
+            probeComplete: disclosure.probeComplete
+        ))
+    }
+
+    // MARK: - Outcome helpers
+
+    private func successPayload(
+        _ outcome: CLIHandler.CLIOutcome,
+        file: StaticString = #filePath, line: UInt = #line
+    ) throws -> [String: Any] {
+        guard case .success(let payload) = outcome else {
+            XCTFail("expected success, got \(outcome)", file: file, line: line)
+            throw XCTSkip("not a success outcome")
+        }
+        return payload
+    }
+
+    private func failureOutcome(
+        _ outcome: CLIHandler.CLIOutcome,
+        file: StaticString = #filePath, line: UInt = #line
+    ) throws -> (code: String, message: String, details: [String: Any]?) {
+        guard case .failure(let code, let message, let details) = outcome else {
+            XCTFail("expected failure, got \(outcome)", file: file, line: line)
+            throw XCTSkip("not a failure outcome")
+        }
+        return (code, message, details)
+    }
+
+    private func clean(
+        _ deps: CLIHandler.CLIRuntimeDependencies,
+        targets: [String], acknowledgements: [String] = [],
+        dryRun: Bool = false, confirmed: Bool = true
+    ) async -> CLIHandler.CLIOutcome {
+        await CLIHandler.cleanCLIOutcome(
+            targets: targets, acknowledgements: acknowledgements,
+            dryRun: dryRun, confirmed: confirmed, euid: 501, deps: deps
+        )
+    }
+
+    private func rows(
+        _ payload: [String: Any], file: StaticString = #filePath, line: UInt = #line
+    ) throws -> [[String: Any]] {
+        try XCTUnwrap(payload["results"] as? [[String: Any]], file: file, line: line)
+    }
+
+    private func row(
+        forItem artifact: URL, in rows: [[String: Any]],
+        file: StaticString = #filePath, line: UInt = #line
+    ) throws -> [String: Any] {
+        let id = itemID(for: artifact)
+        return try XCTUnwrap(
+            rows.first { $0["item_id"] as? String == id },
+            "no row for \(artifact.path)", file: file, line: line
+        )
+    }
+
+    // MARK: - Plan rows carry the disclosure + the token (R17)
+
+    func testPlanAndDryRunRowsCarryValuablesAndTheAcknowledgementToken()
+        async throws
+    {
+        let dev = base.appendingPathComponent("dev")
+        let valuable = try makeRustProject(
+            "rust-a", in: dev, valuables: ["App.dmg"]
+        )
+        let plain = try makeRustProject("rust-b", in: dev)
+        let deps = makeDeps(try makeRuntime(devRoots: [dev]))
+        let expectedToken = try independentToken(for: valuable)
+
+        // (a) --dry-run rows.
+        let dryRun = try successPayload(await clean(
+            deps, targets: [scannerID], dryRun: true, confirmed: false
+        ))
+        let dryRows = try rows(dryRun)
+        let valuableRow = try row(forItem: valuable, in: dryRows)
+        let valuables = try XCTUnwrap(valuableRow["valuables"] as? [[String: Any]])
+        XCTAssertEqual(valuables.count, 1)
+        XCTAssertEqual(Set(valuables[0].keys), [
+            "name", "path", "allocated_bytes", "device", "inode",
+            "modified_at_ns",
+        ], "the pinned SIX-FIELD element, reused verbatim")
+        XCTAssertEqual(valuables[0]["name"] as? String, "App.dmg")
+        XCTAssertEqual(
+            valuables[0]["path"] as? String,
+            FileSystemIdentityProvider().resolveTargetKeepingLeaf(
+                valuable.appendingPathComponent("release/bundle/App.dmg")
+            ).path,
+            "the CANONICAL identity path — never a display spelling"
+        )
+        XCTAssertEqual(valuableRow["acknowledgement_token"] as? String,
+                       expectedToken,
+                       "the plan token IS the shared preimage's output")
+        XCTAssertNil(valuableRow["acknowledgement_note"],
+                     "a COMPLETE probe needs no revalidation note")
+
+        // (b) the plain item: no disclosure, no token, no note.
+        let plainRow = try row(forItem: plain, in: dryRows)
+        XCTAssertFalse(plainRow.keys.contains("valuables"))
+        XCTAssertFalse(plainRow.keys.contains("acknowledgement_token"),
+                       "no empty-set token exists anywhere")
+        XCTAssertFalse(plainRow.keys.contains("acknowledgement_note"))
+
+        // (c) the CONFIRMATION_REQUIRED plan carries the SAME rows.
+        let refused = try failureOutcome(await clean(
+            deps, targets: [scannerID], confirmed: false
+        ))
+        XCTAssertEqual(refused.code, "CONFIRMATION_REQUIRED")
+        let plan = try XCTUnwrap(refused.details?["plan"] as? [[String: Any]])
+        let plannedValuable = try row(forItem: valuable, in: plan)
+        XCTAssertEqual(plannedValuable["acknowledgement_token"] as? String,
+                       expectedToken)
+        XCTAssertEqual(
+            (plannedValuable["valuables"] as? [[String: Any]])?.count, 1
+        )
+
+        XCTAssertTrue(fm.fileExists(atPath: valuable.path),
+                      "planning deletes nothing")
+        XCTAssertTrue(fm.fileExists(atPath: plain.path))
+    }
+
+    func testIncompleteScanProbeOmitsThePlanTokenAndNotesRevalidation()
+        async throws
+    {
+        // A one-entry probe budget cannot finish this artifact dir: the
+        // uniform R17 rule makes it UNAUTHORIZABLE and TOKENLESS, and the row
+        // says so rather than reading as "nothing to acknowledge".
+        let dev = base.appendingPathComponent("dev")
+        let valuable = try makeRustProject(
+            "rust-a", in: dev, valuables: ["App.dmg"]
+        )
+        let deps = makeDeps(
+            try makeRuntime(devRoots: [dev], probeBudget: .fixed(1))
+        )
+
+        let dryRun = try successPayload(await clean(
+            deps, targets: [scannerID], dryRun: true, confirmed: false
+        ))
+        let planned = try row(forItem: valuable, in: try rows(dryRun))
+
+        XCTAssertFalse(planned.keys.contains("acknowledgement_token"),
+                       "an incomplete probe is tokenless on EVERY surface")
+        // …and the note names THIS cause's remedy. A pinned bound that ran
+        // out is the budget cause, whose remedy is a retry once the tree
+        // settles — never the obstruction's "re-scan", which cannot move a
+        // bound. The two notes are separate strings on purpose.
+        XCTAssertEqual(planned["acknowledgement_note"] as? String,
+                       CLIHandler.growingTreePlanNote)
+        XCTAssertEqual(CLIHandler.incompleteProbeNote(for: .obstruction),
+                       CLIHandler.incompleteProbePlanNote)
+        XCTAssertNotEqual(CLIHandler.growingTreePlanNote,
+                          CLIHandler.incompleteProbePlanNote)
+        XCTAssertTrue(fm.fileExists(atPath: valuable.path))
+    }
+
+    // MARK: - Refuse → acknowledge → delete (R17, the headline)
+
+    func testUnacknowledgedConfirmRefusesWithTokenThenTheTokenDeletes()
+        async throws
+    {
+        let dev = base.appendingPathComponent("dev")
+        let valuable = try makeRustProject(
+            "rust-a", in: dev, valuables: ["App.dmg"]
+        )
+        let deps = makeDeps(try makeRuntime(devRoots: [dev]))
+        let expectedToken = try independentToken(for: valuable)
+
+        // (a) a plain --confirm REFUSES — the CLEAN_FAILED arm carries the
+        // refusal wire fields on its rows.
+        let refusal = try failureOutcome(await clean(
+            deps, targets: [address(for: valuable)]
+        ))
+        XCTAssertEqual(refusal.code, "CLEAN_FAILED")
+        let refusedRows = try XCTUnwrap(
+            refusal.details?["results"] as? [[String: Any]]
+        )
+        let refused = try row(forItem: valuable, in: refusedRows)
+        XCTAssertEqual(refused["success"] as? Bool, false)
+        XCTAssertEqual(refused["acknowledgement_token"] as? String, expectedToken)
+        let disclosed = try XCTUnwrap(refused["valuables"] as? [[String: Any]])
+        XCTAssertEqual(disclosed.map { $0["name"] as? String }, ["App.dmg"])
+        XCTAssertTrue(((refused["error"] as? String) ?? "").contains("App.dmg"),
+                      "the prose names the valuable, but the ROW came from "
+                      + "the typed payload")
+        XCTAssertTrue(fm.fileExists(atPath: valuable.path),
+                      "an unacknowledged confirm deletes nothing")
+
+        // (b) the SAME token, item-bound, deletes on the re-run.
+        let payload = try successPayload(await clean(
+            deps, targets: [address(for: valuable)],
+            acknowledgements: [entry(for: valuable, token: expectedToken)]
+        ))
+        let deleted = try row(forItem: valuable, in: try rows(payload))
+        XCTAssertEqual(deleted["success"] as? Bool, true)
+        XCTAssertGreaterThan(try XCTUnwrap(deleted["bytes_freed"] as? Int64), 0)
+        XCTAssertFalse(deleted.keys.contains("valuables"),
+                       "a non-refusal row carries neither additive field")
+        XCTAssertFalse(deleted.keys.contains("acknowledgement_token"))
+        XCTAssertFalse(fm.fileExists(atPath: valuable.path))
+        XCTAssertTrue(
+            fm.fileExists(atPath: dev.appendingPathComponent("rust-a/Cargo.toml").path),
+            "only the artifact directory went"
+        )
+    }
+
+    func testMixedMultiItemCleanAuthorizesEachItemOnItsOwnEntry() async throws {
+        // ONE invocation, three items: an AUTHORIZED valuable-bearing item
+        // deletes, an UNAUTHORIZED one refuses with ITS OWN token, and a
+        // plain item deletes. The partial-success arm carries the refusal
+        // wire fields on the refused row only.
+        let dev = base.appendingPathComponent("dev")
+        let authorized = try makeRustProject(
+            "rust-a", in: dev, valuables: ["App.dmg"]
+        )
+        let unauthorized = try makeRustProject(
+            "rust-b", in: dev, valuables: ["Other.pkg"]
+        )
+        let plain = try makeRustProject("rust-c", in: dev)
+        let deps = makeDeps(try makeRuntime(devRoots: [dev]))
+        let authorizedToken = try independentToken(for: authorized)
+        let unauthorizedToken = try independentToken(for: unauthorized)
+
+        // Bare `build_artifacts` — the scanner-wide clean, same per-item rule.
+        let payload = try successPayload(await clean(
+            deps, targets: [scannerID],
+            acknowledgements: [entry(for: authorized, token: authorizedToken)]
+        ))
+        let resultRows = try rows(payload)
+
+        let authorizedRow = try row(forItem: authorized, in: resultRows)
+        XCTAssertEqual(authorizedRow["success"] as? Bool, true)
+        XCTAssertFalse(fm.fileExists(atPath: authorized.path))
+
+        let refusedRow = try row(forItem: unauthorized, in: resultRows)
+        XCTAssertEqual(refusedRow["success"] as? Bool, false)
+        XCTAssertEqual(refusedRow["acknowledgement_token"] as? String,
+                       unauthorizedToken,
+                       "each item refuses with ITS OWN fresh token")
+        XCTAssertNotEqual(refusedRow["acknowledgement_token"] as? String,
+                          authorizedToken)
+        XCTAssertEqual(
+            (refusedRow["valuables"] as? [[String: Any]])?
+                .map { $0["name"] as? String },
+            ["Other.pkg"]
+        )
+        XCTAssertTrue(fm.fileExists(atPath: unauthorized.path))
+
+        let plainRow = try row(forItem: plain, in: resultRows)
+        XCTAssertEqual(plainRow["success"] as? Bool, true)
+        XCTAssertFalse(plainRow.keys.contains("acknowledgement_token"))
+        XCTAssertFalse(fm.fileExists(atPath: plain.path))
+    }
+
+    func testATokenAppliedToTheWrongItemCanNeverMatch() async throws {
+        // The preimage begins with the FULL ItemKey, so another item's token
+        // is simply a mismatch — refused with the target item's own fresh one.
+        let dev = base.appendingPathComponent("dev")
+        let itemA = try makeRustProject("rust-a", in: dev, valuables: ["A.dmg"])
+        let itemB = try makeRustProject("rust-b", in: dev, valuables: ["B.dmg"])
+        let deps = makeDeps(try makeRuntime(devRoots: [dev]))
+        let tokenA = try independentToken(for: itemA)
+        let tokenB = try independentToken(for: itemB)
+        XCTAssertNotEqual(tokenA, tokenB)
+
+        let refusal = try failureOutcome(await clean(
+            deps, targets: [address(for: itemB)],
+            acknowledgements: [entry(for: itemB, token: tokenA)]
+        ))
+
+        XCTAssertEqual(refusal.code, "CLEAN_FAILED")
+        let refusedRows = try XCTUnwrap(
+            refusal.details?["results"] as? [[String: Any]]
+        )
+        let refused = try row(forItem: itemB, in: refusedRows)
+        XCTAssertEqual(refused["acknowledgement_token"] as? String, tokenB)
+        XCTAssertTrue(fm.fileExists(atPath: itemB.path))
+        XCTAssertTrue(fm.fileExists(atPath: itemA.path))
+    }
+
+    func testInPlaceReplacementRotatesTheTokenAndRefusesTheStaleOne()
+        async throws
+    {
+        // Same path, same size, NEW inode and mtime: the honest invalidation
+        // contract rotates the token, so a held acknowledgement is refused.
+        let dev = base.appendingPathComponent("dev")
+        let artifact = try makeRustProject(
+            "rust-a", in: dev, valuables: ["App.dmg"]
+        )
+        let dmg = artifact.appendingPathComponent("release/bundle/App.dmg")
+        let deps = makeDeps(try makeRuntime(devRoots: [dev]))
+        let staleToken = try independentToken(for: artifact)
+
+        try fm.removeItem(at: dmg)
+        try writeValuable(at: dmg, fill: 0xCD)   // same path, same size
+        let freshToken = try independentToken(for: artifact)
+        XCTAssertNotEqual(freshToken, staleToken,
+                          "an in-place replacement must rotate the token")
+
+        let refusal = try failureOutcome(await clean(
+            deps, targets: [address(for: artifact)],
+            acknowledgements: [entry(for: artifact, token: staleToken)]
+        ))
+        XCTAssertEqual(refusal.code, "CLEAN_FAILED")
+        let refused = try row(
+            forItem: artifact,
+            in: try XCTUnwrap(refusal.details?["results"] as? [[String: Any]])
+        )
+        XCTAssertEqual(refused["acknowledgement_token"] as? String, freshToken,
+                       "the refusal hands back a FRESH token")
+        XCTAssertTrue(fm.fileExists(atPath: artifact.path))
+
+        // The fresh token deletes.
+        let payload = try successPayload(await clean(
+            deps, targets: [address(for: artifact)],
+            acknowledgements: [entry(for: artifact, token: freshToken)]
+        ))
+        XCTAssertEqual(
+            try row(forItem: artifact, in: try rows(payload))["success"] as? Bool,
+            true
+        )
+        XCTAssertFalse(fm.fileExists(atPath: artifact.path))
+    }
+
+    // MARK: - Vanished set (R17)
+
+    func testVanishedValuableSetRefusesOnceWithoutATokenThenDeletesOnRetry()
+        async throws
+    {
+        let dev = base.appendingPathComponent("dev")
+        let artifact = try makeRustProject(
+            "rust-a", in: dev, valuables: ["App.dmg"]
+        )
+        let dmg = artifact.appendingPathComponent("release/bundle/App.dmg")
+        let runtime = try makeRuntime(devRoots: [dev])
+        let token = try independentToken(for: artifact)
+
+        // The valuable disappears BETWEEN the scan and the deletion — the
+        // cleaner factory runs at exactly that point in the pipeline.
+        let vanishing = makeDeps(runtime, makeCleaner: { snapshot in
+            try? self.fm.removeItem(at: dmg)
+            return runtime.makeCleaner(snapshot: snapshot)
+        })
+        let refusal = try failureOutcome(await clean(
+            vanishing, targets: [address(for: artifact)],
+            acknowledgements: [entry(for: artifact, token: token)]
+        ))
+
+        XCTAssertEqual(refusal.code, "CLEAN_FAILED")
+        let refused = try row(
+            forItem: artifact,
+            in: try XCTUnwrap(refusal.details?["results"] as? [[String: Any]])
+        )
+        XCTAssertTrue(((refused["error"] as? String) ?? "")
+            .contains("no longer there"),
+            "the vanished-set reason: \(refused["error"] ?? "nil")")
+        XCTAssertFalse(refused.keys.contains("acknowledgement_token"),
+                       "there is nothing left to acknowledge — no token")
+        XCTAssertFalse(refused.keys.contains("valuables"),
+                       "an empty current set discloses nothing")
+        XCTAssertTrue(fm.fileExists(atPath: artifact.path),
+                      "the refusal deleted nothing")
+
+        // RE-SCAN and retry WITHOUT acknowledgement: the item is now
+        // valuables-free and needs none.
+        let payload = try successPayload(await clean(
+            makeDeps(runtime), targets: [address(for: artifact)]
+        ))
+        XCTAssertEqual(
+            try row(forItem: artifact, in: try rows(payload))["success"] as? Bool,
+            true
+        )
+        XCTAssertFalse(fm.fileExists(atPath: artifact.path))
+    }
+
+    func testDeleteTimeIncompleteProbeRefusesWithoutAToken() async throws {
+        // The artifact dir becomes unreadable between scan and delete: the
+        // delete-time inspection cannot finish, so the refusal is TOKENLESS —
+        // an unfinished inspection can never authorize.
+        try XCTSkipIf(geteuid() == 0, "root ignores permission bits")
+        let dev = base.appendingPathComponent("dev")
+        let artifact = try makeRustProject(
+            "rust-a", in: dev, valuables: ["App.dmg"]
+        )
+        let runtime = try makeRuntime(devRoots: [dev])
+        let deps = makeDeps(runtime, makeCleaner: { snapshot in
+            try? self.fm.setAttributes(
+                [.posixPermissions: 0o000], ofItemAtPath: artifact.path
+            )
+            return runtime.makeCleaner(snapshot: snapshot)
+        })
+        defer {
+            try? fm.setAttributes(
+                [.posixPermissions: 0o755], ofItemAtPath: artifact.path
+            )
+        }
+
+        let refusal = try failureOutcome(await clean(
+            deps, targets: [address(for: artifact)]
+        ))
+
+        XCTAssertEqual(refusal.code, "CLEAN_FAILED")
+        let refused = try row(
+            forItem: artifact,
+            in: try XCTUnwrap(refusal.details?["results"] as? [[String: Any]])
+        )
+        XCTAssertTrue(((refused["error"] as? String) ?? "")
+            .contains("couldn't fully re-inspect"),
+            "the incomplete-probe reason: \(refused["error"] ?? "nil")")
+        XCTAssertFalse(refused.keys.contains("acknowledgement_token"),
+                       "an incomplete delete-time probe is tokenless")
+    }
+
+    // MARK: - Frozen pre-flight parsing rules (R17)
+
+    /// Every rule refuses with INVALID_ARGUMENTS, PRE-FLIGHT, with nothing
+    /// deleted — one invocation per rule.
+    func testAcknowledgementPreFlightRulesRefuseBeforeAnyDeletion() async throws {
+        let dev = base.appendingPathComponent("dev")
+        let valuable = try makeRustProject(
+            "rust-a", in: dev, valuables: ["App.dmg"]
+        )
+        let other = try makeRustProject(
+            "rust-b", in: dev, valuables: ["Other.dmg"]
+        )
+        let plain = try makeRustProject("rust-c", in: dev)
+        let deps = makeDeps(try makeRuntime(devRoots: [dev]))
+        let token = try independentToken(for: valuable)
+        let unknownID = String(repeating: "0", count: 64)
+
+        let cases: [(name: String, targets: [String], entries: [String])] = [
+            ("duplicate ItemKey", [scannerID], [
+                entry(for: valuable, token: token),
+                entry(for: valuable, token: String(repeating: "b", count: 64)),
+            ]),
+            ("malformed entry", [scannerID], ["build_artifacts:missing-token"]),
+            ("malformed token", [scannerID], [
+                entry(for: valuable, token: "not-64-lowercase-hex"),
+            ]),
+            ("unknown item", [scannerID], [
+                "\(scannerID):\(unknownID):\(token)",
+            ]),
+            ("item outside the resolved selection",
+             [address(for: valuable)], [entry(for: other, token: token)]),
+            ("valuables-free item", [scannerID], [
+                entry(for: plain, token: token),
+            ]),
+        ]
+
+        for testCase in cases {
+            let failure = try failureOutcome(await clean(
+                deps, targets: testCase.targets,
+                acknowledgements: testCase.entries
+            ))
+            XCTAssertEqual(failure.code, "INVALID_ARGUMENTS", testCase.name)
+            XCTAssertTrue(
+                failure.message.contains(CLIHandler.acknowledgeValuablesFlag),
+                "\(testCase.name): \(failure.message)"
+            )
+            XCTAssertNil(failure.details,
+                         "\(testCase.name): a usage refusal carries no plan")
+            for artifact in [valuable, other, plain] {
+                XCTAssertTrue(fm.fileExists(atPath: artifact.path),
+                              "\(testCase.name) deleted \(artifact.path)")
+            }
+        }
+    }
+
+    // MARK: - Validation TIMING (R17)
+
+    func testFormFailsFastOnEveryPathAndMatchingRunsOnlyWhenConfirmed()
+        async throws
+    {
+        let dev = base.appendingPathComponent("dev")
+        let artifact = try makeRustProject(
+            "rust-a", in: dev, valuables: ["App.dmg"]
+        )
+        let deps = makeDeps(try makeRuntime(devRoots: [dev]))
+        let realToken = try independentToken(for: artifact)
+        let wrongToken = String(repeating: "f", count: 64)
+        XCTAssertNotEqual(realToken, wrongToken)
+
+        // (a) FORM: malformed input fails fast on ALL THREE paths.
+        let paths: [(name: String, dryRun: Bool, confirmed: Bool)] = [
+            ("dry-run", true, false),
+            ("unconfirmed", false, false),
+            ("confirmed", false, true),
+        ]
+        for path in paths {
+            let failure = try failureOutcome(await clean(
+                deps, targets: [scannerID],
+                acknowledgements: ["build_artifacts:nope"],
+                dryRun: path.dryRun, confirmed: path.confirmed
+            ))
+            XCTAssertEqual(failure.code, "INVALID_ARGUMENTS", path.name)
+            XCTAssertTrue(fm.fileExists(atPath: artifact.path), path.name)
+        }
+
+        // (b) a WELL-FORMED but WRONG token performs NO matching on the
+        // non-destructive paths — they report what WOULD be required.
+        let dryRun = try successPayload(await clean(
+            deps, targets: [scannerID],
+            acknowledgements: [entry(for: artifact, token: wrongToken)],
+            dryRun: true, confirmed: false
+        ))
+        XCTAssertEqual(
+            try row(forItem: artifact, in: try rows(dryRun))["acknowledgement_token"]
+                as? String,
+            realToken,
+            "the plan reports the token the confirmed run would require"
+        )
+        let unconfirmed = try failureOutcome(await clean(
+            deps, targets: [scannerID],
+            acknowledgements: [entry(for: artifact, token: wrongToken)],
+            confirmed: false
+        ))
+        XCTAssertEqual(unconfirmed.code, "CONFIRMATION_REQUIRED",
+                       "a wrong token is not matched before the gate")
+        XCTAssertTrue(fm.fileExists(atPath: artifact.path))
+
+        // (c) …and matching happens on the confirmed path, where it refuses.
+        let refusal = try failureOutcome(await clean(
+            deps, targets: [scannerID],
+            acknowledgements: [entry(for: artifact, token: wrongToken)]
+        ))
+        XCTAssertEqual(refusal.code, "CLEAN_FAILED")
+        XCTAssertTrue(fm.fileExists(atPath: artifact.path))
     }
 }

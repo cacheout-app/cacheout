@@ -154,21 +154,25 @@ struct ScannerItemSection: View {
 
 struct ScanIssuesBlock: View {
     let issues: [ScanIssue]
+    /// Injectable for tests only (zero real-`$HOME` reads); production
+    /// collapses against the account home exactly as before.
+    var home: URL = FileManager.default.homeDirectoryForCurrentUser
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             ForEach(Array(issues.enumerated()), id: \.offset) { _, issue in
+                let row = ScanIssueRowPresentation(issue: issue, home: home)
                 HStack(spacing: 6) {
                     Image(systemName: "exclamationmark.triangle.fill")
                         .font(.caption)
                         .foregroundStyle(.orange)
-                    Text("\(Self.location(of: issue)) — \(Self.label(for: issue.kind))")
+                    Text(row.text)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                         .truncationMode(.middle)
                         .help(issue.detail)
-                    if issue.kind == .tccDenied {
+                    if row.showsSettingsLink {
                         Link("Grant access…",
                              destination: ScanError.fullDiskAccessSettingsURL)
                             .font(.caption)
@@ -184,14 +188,40 @@ struct ScanIssuesBlock: View {
         .padding(.horizontal, 10)
         .padding(.bottom, 4)
     }
+}
 
-    /// `ScanIssue.url` is nil for `.malformedOutcome` — no filesystem
-    /// location exists, and a fake path must never be invented.
-    private static func location(of issue: ScanIssue) -> String {
+/// The testable derivation behind ONE issue row (fn-4.6, R12/R16) — SwiftUI
+/// bodies are assertion-dead, so the wording, the location, and the
+/// remedy-link decision live here (the `ScannerItemRowPresentation`
+/// precedent). A denied dev root, a policy-refused configured root, and a
+/// whole-value config parse failure all render through this one shape —
+/// never as a zero-byte item row, never as an empty section.
+struct ScanIssueRowPresentation: Equatable {
+    /// The rendered line: location — classified reason.
+    let text: String
+    /// Where the problem is, home-collapsed. `ScanIssue.url` is nil for the
+    /// non-filesystem kinds (`.malformedOutcome`, `.configInvalid`) — no
+    /// filesystem location exists, and a fake path is never invented.
+    let location: String
+    let label: String
+    /// TCC denials have a user-side remedy (System Settings deep link);
+    /// BSD-permission denials, admission refusals, and config parse
+    /// failures do not — no link that cannot help.
+    let showsSettingsLink: Bool
+
+    init(
+        issue: ScanIssue,
+        home: URL = FileManager.default.homeDirectoryForCurrentUser
+    ) {
+        location = Self.location(of: issue, home: home)
+        label = Self.label(for: issue.kind)
+        text = "\(location) — \(label)"
+        showsSettingsLink = issue.kind == .tccDenied
+    }
+
+    private static func location(of issue: ScanIssue, home: URL) -> String {
         guard let url = issue.url else { return "Scanner output" }
-        return url.path.replacingOccurrences(
-            of: FileManager.default.homeDirectoryForCurrentUser.path, with: "~"
-        )
+        return url.path.replacingOccurrences(of: home.path, with: "~")
     }
 
     private static func label(for kind: ScanIssue.Kind) -> String {
@@ -201,6 +231,7 @@ struct ScanIssuesBlock: View {
         case .tccDenied: return "access denied by macOS privacy settings"
         case .permissionDenied: return "permission denied"
         case .unreadable: return "unreadable"
+        case .configInvalid: return "invalid saved configuration — defaults in effect"
         case .malformedOutcome: return "rejected — malformed scanner output; previous results kept"
         }
     }

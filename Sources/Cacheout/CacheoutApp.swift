@@ -51,7 +51,11 @@ import os
 
 
 struct CacheoutApp: App {
-    @StateObject private var viewModel = CacheoutViewModel()
+    /// The PRODUCTION composition (fn-4.5): the runtime plus fn-4.10's
+    /// runtime-reconstruction seam, both from one factory — so a dev-roots
+    /// change in Settings rebuilds exactly this composition with the new
+    /// roots instead of silently re-deriving defaults.
+    @StateObject private var viewModel = CacheoutViewModel.production()
 
     /// Tracks whether onboarding sheet should be shown.
     /// Suppressed when the helper is already enabled (e.g. CLI installed before

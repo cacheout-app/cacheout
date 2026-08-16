@@ -2,7 +2,7 @@
 
 **Version:** 1.2.0
 **Schema Version:** 4
-**Last Updated:** 2026-08-07
+**Last Updated:** 2026-08-14
 
 This document defines the interface contract between the CacheOut macOS application (`cacheout`) and the MCP server (`cacheout-mcp`). Both repositories reference this protocol. Changes must be coordinated across both repos.
 
@@ -70,8 +70,8 @@ The MCP server discovers CacheOut capabilities before invoking commands. This en
 - `scan` output changes from a top-level array to the **scan envelope**
   (`{schema_version, categories, scanner_items, scanner_errors}`). The
   `categories` rows are field-for-field the schema-3 rows; the other keys
-  are additive (per-item scanners such as `node_modules` become visible for
-  the first time).
+  are additive (per-item scanners — `build_artifacts` and
+  `orphaned_caches` today — become visible for the first time).
 - `clean` accepts the **target address grammar** (`<category-slug>` |
   `<scanner-slug>` | `<scanner-slug>:<item-id>`) — bare category slugs work
   exactly as in schema 3.
@@ -81,8 +81,10 @@ The MCP server discovers CacheOut capabilities before invoking commands. This en
   `schema_version` — consumers can branch on one field regardless of which
   command produced the payload.
 - The `--confirm` gate is unchanged and covers the new per-item targets:
-  deleting a `node_modules` item requires `--confirm` exactly like a
-  category clean.
+  deleting a `build_artifacts` item requires `--confirm` exactly like a
+  category clean. A `build_artifacts` item that discloses RELEASE ARTIFACTS
+  additionally requires an item-bound `--acknowledge-valuables` entry — see
+  [the acknowledgement contract](#valuables-acknowledgement-contract-schema-4).
 
 ---
 
@@ -101,7 +103,7 @@ Cacheout --cli <command> [arguments] [flags]
 | `version` | Application version and capabilities | Existing | No |
 | `disk-info` | Boot volume disk space | Existing | No |
 | `scan` | Run every registered scanner; emit the schema-4 envelope (categories + per-item scanner items + scanner errors) | Existing | No |
-| `clean <targets...> [--confirm\|--dry-run]` | Delete addressed targets — category slugs, per-item scanner slugs, or `<scanner-slug>:<item-id>` addresses (destructive — requires `--confirm` since schema 3) | Existing | No |
+| `clean <targets...> [--confirm\|--dry-run]` | Delete addressed targets — category slugs, per-item scanner slugs, or `<scanner-slug>:<item-id>` addresses (destructive — requires `--confirm` since schema 3; items disclosing release artifacts additionally require `--acknowledge-valuables`) | Existing | No |
 | `smart-clean <gb> [--confirm\|--dry-run]` | Auto-clean safe categories to free target GB (destructive — requires `--confirm` since schema 3) | Existing | No |
 | `spotlight` | Tag cache directories with Spotlight metadata | Existing | No |
 | `memory-stats` | System memory statistics | Existing | No |
@@ -178,26 +180,56 @@ compatibility sum.
   ],
   "scanner_items": [
     {
-      "scanner_id": "node_modules",
+      "scanner_id": "build_artifacts",
       "item_id": "0d3a9ab9a662fb335a6803cccf0e8a73dd5f1f2a36965334d7f3f5742caeec0e",
       "path": "/Users/dev/project/node_modules",
-      "name": "project",
+      "name": "node_modules",
       "state": "measured",
       "exact_bytes": 1200000000,
       "estimated_up_to_bytes": 0,
       "size_bytes": 1200000000,
       "item_count": 40231,
       "risk_level": "review",
-      "evidence": "node_modules of project — ~/project; last touched 3 months ago",
+      "evidence": "node_modules/ beside package.json; last build 94 days ago",
       "action": "remove_item"
+    },
+    {
+      "scanner_id": "build_artifacts",
+      "item_id": "8f14e45fceea167a5a36dedd4bea2543f5eec9d6a0f4c2fca3b2e0c2a4c33ab1",
+      "path": "/Users/dev/rustapp/target",
+      "name": "target",
+      "state": "measured",
+      "exact_bytes": 33285996544,
+      "estimated_up_to_bytes": 0,
+      "size_bytes": 33285996544,
+      "logical_bytes": 61312450560,
+      "item_count": 128442,
+      "risk_level": "review",
+      "evidence": "target/ beside Cargo.toml; last build 12 days ago; contains release artifacts",
+      "action": "remove_item",
+      "valuables": [
+        {
+          "name": "Murmur_0.1.7_aarch64.dmg",
+          "path": "/Users/dev/rustapp/target/release/bundle/dmg/Murmur_0.1.7_aarch64.dmg",
+          "allocated_bytes": 44040192,
+          "device": 16777232,
+          "inode": 12345678,
+          "modified_at_ns": 1755057600123456789
+        }
+      ]
     }
   ],
   "scanner_errors": [
     {
-      "scanner_id": "node_modules",
+      "scanner_id": "build_artifacts",
       "kind": "container_refused",
-      "detail": "search root is not a configured container",
-      "path": "/Users/dev/Elsewhere"
+      "detail": "dev root is not a usable container: the filesystem root",
+      "path": "/"
+    },
+    {
+      "scanner_id": "build_artifacts",
+      "kind": "config_invalid",
+      "detail": "cacheout.buildArtifacts.devRoots is not an array of strings — the seed roots are in effect and the stored value was left untouched"
     }
   ]
 }
@@ -209,7 +241,7 @@ compatibility sum.
 |-------|------|----------|-------------|
 | `schema_version` | integer | yes | Always present — every schema-4 payload self-describes |
 | `categories` | object[] | yes | Schema 3's category rows, field-for-field (table below). NO `scanner_id`/`item_id` here — identity fields live on `scanner_items` and the clean/smart-clean rows only |
-| `scanner_items` | object[] | yes | One row per PER-ITEM scanner item (node_modules and orphaned_caches today; build artifacts, git worktrees, temp dirs to follow). Empty array when no per-item scanner found anything |
+| `scanner_items` | object[] | yes | One row per PER-ITEM scanner item (`build_artifacts` and `orphaned_caches` today; git worktrees and temp dirs to follow). Empty array when no per-item scanner found anything |
 | `scanner_errors` | object[] | yes | Root/scanner-level problems that produced NO item (refused search roots, traversal failures, malformed outcomes). Empty array when clean |
 
 **`scanner_items` rows:**
@@ -219,11 +251,13 @@ compatibility sum.
 | `scanner_id` | string | yes | Owning scanner's registered slug (`[a-z0-9_]+`) |
 | `item_id` | string | yes | OPAQUE stable item id — the full 64-char lowercase-hex SHA-256 over the UTF-8 bytes of `scannerID + "\0" + canonicalPath` (NUL separator; no truncation, ever). Consumers NEVER parse or derive ids — echo back exactly what scan printed. Always adjacent to its `scanner_id` sibling: a bare item id row without `scanner_id` is malformed by definition |
 | `path` | string | yes | The item's resolved location (the declared spelling when unresolved — never a fake resolution) |
-| `name` | string | yes | Display name (node_modules: the project name) |
+| `name` | string | yes | Display name (`build_artifacts`: the artifact directory's own name — `target`, `node_modules`, `.venv`) |
 | `state` | string | yes | Same state machine as category rows |
 | `exact_bytes` / `estimated_up_to_bytes` / `size_bytes` | integer | yes | Split components + compatibility sum (same semantics as category rows) |
 | `item_count` | integer | yes | Files/items inside |
-| `risk_level` | string | yes | `node_modules` rows are always `"review"` (frozen mapping — never auto-cleaned) |
+| `risk_level` | string | yes | One of `"safe"`, `"review"`, `"caution"`. There is no per-SCANNER constant: `build_artifacts` rows carry the risk of the RULE ROW that matched (a `target/` proven by `Cargo.toml` is `safe`; `node_modules/` stays `review`), and the valuables gate NARROWS a `safe` row to `review` when the artifact directory contains — or could not be fully inspected for — release artifacts. Risk is evidence confidence, NOT clean eligibility: no per-item row is auto-cleaned today (see `automatic_clean_eligible` in the model; smart-clean is category-only) |
+| `logical_bytes` | integer | no | ADDITIVE. Apparent (non-allocated) size, present ONLY when it materially exceeds `size_bytes` — the sparse-file case where deletion frees LESS than the apparent size (a 57.1 GB-logical Rust `target/` occupying 31 GB). Absent for ordinary trees, where block rounding makes logical *smaller* than allocated and the divergence is noise. NEVER a reclaimable figure: budget against `exact_bytes` |
+| `valuables` | object[] | no | ADDITIVE. Release artifacts detected INSIDE this item, in the ONE canonical order (byte-wise ascending `path`). Omitted entirely when none were disclosed. Element shape is pinned below and is shared byte-for-byte with clean plan rows and refusal rows |
 | `evidence` | string | yes | Human-readable provenance rendered in confirmation UIs |
 | `action` | string | yes | Reclaim action wire string: `"remove_contents"`, `"remove_item"`, or `"commands"`. For `"commands"` ONLY the kind is serialized — **the argv arrays are NEVER exposed anywhere in CLI output** (the JSON is a reporting surface, not an execution contract) |
 | `scan_error` | object | no | Same conditional shape as category rows |
@@ -234,14 +268,38 @@ compatibility sum.
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `scanner_id` | string | yes | Which scanner reported (or failed validation) |
-| `kind` | string | yes | One of: `"container_refused"`, `"symlink_root"`, `"tcc_denied"`, `"permission_denied"`, `"unreadable"`, `"malformed_outcome"`. The list is EXTENSIBLE — consumers must tolerate unknown kinds |
+| `kind` | string | yes | One of: `"container_refused"`, `"symlink_root"`, `"tcc_denied"`, `"permission_denied"`, `"unreadable"`, `"config_invalid"`, `"malformed_outcome"`. The list is EXTENSIBLE — consumers must tolerate unknown kinds |
 | `detail` | string | yes | Human-readable description |
-| `path` | string | conditional | Present for the filesystem kinds; ABSENT for `"malformed_outcome"` (no filesystem location exists — a fake path is never invented) |
+| `path` | string | conditional | Present for the FILESYSTEM kinds; ABSENT for the NON-FILESYSTEM kinds — `"malformed_outcome"` and `"config_invalid"` — where no filesystem location exists and a fake path is therefore never invented |
 | `grant_hint` | string | no | Present only when `kind == "tcc_denied"` — the same user-side remedy (Full Disk Access) as category and `scanner_items` rows, since macOS denies CLI processes silently |
 
 A `malformed_outcome` row means that scanner's ENTIRE outcome failed
 fail-closed validation: its items are excluded from `scanner_items` AND from
 clean addressability, and the remaining valid scanners' rows are unaffected.
+
+A `config_invalid` row means a PERSISTED configuration value could not be
+parsed by this build (today: `cacheout.buildArtifacts.devRoots` holding
+anything other than an array of strings). The scanner fell back to its
+defaults **without rewriting the stored value**, and the row rides EVERY
+scan outcome while the corrupt value persists — the fallback is never
+silent. It carries no `path` because a config parse failure has no honest
+filesystem location. A configured root that was REJECTED by policy (the
+filesystem root, a volume root/mount point, `$HOME`) is a different thing
+and reports honestly under `container_refused` WITH its offending path.
+
+**Per-item valuables element (pinned, shared by three surfaces):** the same
+six-field object appears in `scanner_items[].valuables`, in clean plan rows
+(`details.plan[].valuables`), and in clean refusal rows
+(`results[].valuables`) — one builder, so the surfaces cannot drift.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `name` | string | yes | Basename as discovered (`Murmur_0.1.7_aarch64.dmg`) |
+| `path` | string | yes | The artifact's CANONICAL IDENTITY path (canonical parent chain, leaf never resolved). This exact string is what the acknowledgement-token preimage consumes; display spellings never serialize |
+| `allocated_bytes` | integer | yes | Leaf allocation for a regular file; BOUNDED SUBTREE allocation for a directory bundle (`.app`, `.xcarchive`, `.dSYM`) |
+| `device` | integer | yes | `st_dev` of the artifact's root, as an UNSIGNED decimal integer |
+| `inode` | integer | yes | `st_ino` of the artifact's root, as an UNSIGNED decimal integer |
+| `modified_at_ns` | integer | yes | Modification time in nanoseconds since the epoch — `modifiedSeconds * 1_000_000_000 + modifiedNanoseconds`, derived with checked arithmetic from the same two integers everything else uses |
 
 **Category row fields (unchanged from schema 3):**
 
@@ -294,7 +352,7 @@ A positional target token is ONE of:
 | Form | Meaning |
 |------|---------|
 | `<category-slug>` | One category aggregate — unchanged from schema 3 (e.g. `npm_cache`) |
-| `<scanner-slug>` | ALL items of that per-item scanner (e.g. `node_modules`) |
+| `<scanner-slug>` | ALL items of that per-item scanner (e.g. `build_artifacts`) |
 | `<scanner-slug>:<item-id>` | One item of that scanner, by the opaque id echoed from `scan`'s `scanner_items` |
 
 - Category slugs and scanner slugs match `[a-z0-9_]+` — no colon — so the
@@ -317,9 +375,24 @@ A positional target token is ONE of:
 **Arguments:**
 - `<targets...>` -- One or more targets per the grammar above
 - `--confirm` -- Actually delete. Without it the command refuses (below).
-  Required for per-item targets too: node_modules deletion honors the same
-  gate as category cleans
+  Required for per-item targets too: `build_artifacts` deletion honors the
+  same gate as category cleans
 - `--dry-run` -- Preview without deleting (needs no `--confirm`; wins even beside it)
+- `--acknowledge-valuables <scanner-slug>:<item-id>:<token>` -- REPEATABLE,
+  one entry per item. Authorizes deletion of an item that discloses release
+  artifacts. Accepted by `clean` ONLY — see
+  [the acknowledgement contract](#valuables-acknowledgement-contract-schema-4)
+
+**Argument ordering (schema 4 — frozen):** every command takes its
+POSITIONAL targets BEFORE any flag. A positional token appearing after the
+first `--`-prefixed token is `INVALID_ARGUMENTS` naming the token, rather
+than being silently dropped as it was before schema 4. Flags whose next argv
+token is their VALUE (`--acknowledge-valuables`, `--dev-root`,
+`--orphan-size-floor-mb`, `--orphan-stale-days`, `--format`, `--top`,
+`--target-pid`, `--target-name`) consume that token, so it is never mistaken
+for a positional; every documented shape — including a trailing
+`--format json` — is already targets-first and keeps its exact meaning.
+Unknown flags are tolerated and ignored.
 
 Tokens that match no known category slug, scanner slug, or scanned item id
 cause an `INVALID_ARGUMENTS` error naming the invalid token(s); no cleaning
@@ -375,6 +448,9 @@ under `details`:
 | `plan[].scanner_id` / `plan[].item_id` | string | Identity siblings on EVERY row (schema 4) — consumers never parse the composite `slug` value |
 | `plan[].warning` | string | Present for `partiallyDenied` entries |
 | `plan[].scan_error` | object | Present when the scan was impeded (same shape as `scan`) |
+| `plan[].valuables` | object[] | ADDITIVE. The release artifacts this item disclosed, in the pinned element shape and canonical order. OMITTED when the item disclosed none |
+| `plan[].acknowledgement_token` | string | ADDITIVE. The 64-char lowercase-hex token a confirmed run would require for this item, so the caller learns it from the PLAN instead of from a refusal. Emitted ONLY when the scan-time inspection was COMPLETE and the disclosed set NON-EMPTY |
+| `plan[].acknowledgement_note` | string | ADDITIVE. Present exactly when the scan-time inspection did NOT finish: it says so and points at the confirmed run's re-inspection, so an absent token is never read as "nothing to acknowledge" |
 | `total_exact_bytes` | integer | Sum of exact bytes over entries that would clean |
 | `total_estimated_up_to_bytes` | integer | Sum of estimated bytes over entries that would clean |
 | `scanner_errors` | object[] | Additive, optional: present only when a bare `<scanner-slug>` target's scan reported root/scanner-level issues (same row shape as `scan`'s `scanner_errors`) — the scanner-wide selection was impeded and may be incomplete |
@@ -411,14 +487,14 @@ process-level success.
       "item_id": "xcode_derived_data"
     },
     {
-      "category": "node_modules:0d3a9ab9a662fb335a6803cccf0e8a73dd5f1f2a36965334d7f3f5742caeec0e",
-      "name": "project",
+      "category": "build_artifacts:0d3a9ab9a662fb335a6803cccf0e8a73dd5f1f2a36965334d7f3f5742caeec0e",
+      "name": "node_modules",
       "bytes_freed": 1200000000,
       "exact_bytes": 1200000000,
       "estimated_up_to_bytes": 0,
       "freed_human": "1.2 GB",
       "success": true,
-      "scanner_id": "node_modules",
+      "scanner_id": "build_artifacts",
       "item_id": "0d3a9ab9a662fb335a6803cccf0e8a73dd5f1f2a36965334d7f3f5742caeec0e"
     }
   ],
@@ -431,7 +507,7 @@ process-level success.
       "entry_count": 1
     },
     {
-      "scanner_id": "node_modules",
+      "scanner_id": "build_artifacts",
       "exact_bytes": 1200000000,
       "estimated_up_to_bytes": 0,
       "bytes_freed": 1200000000,
@@ -460,6 +536,8 @@ process-level success.
 | `results[].item_id` | string | yes | Scanner-scoped item id — the category slug on aggregate rows, the full-hash id on per-item rows (schema 4) |
 | `results[].error` | string | no | Error message(s), `"; "`-joined, when `success` is false |
 | `results[].warning` | string | no | Present when the category scanned `partiallyDenied` — only measured bytes were cleaned/reported |
+| `results[].valuables` | object[] | no | ADDITIVE. Present only on a VALUABLES REFUSAL row: the release artifacts the DELETE-TIME inspection found, pinned element shape, canonical order. Omitted when the refusal disclosed none (the vanished-set case) |
+| `results[].acknowledgement_token` | string | no | ADDITIVE. Present only on a valuables refusal whose delete-time inspection COMPLETED and found a non-empty set — the exact token to pass back in `--acknowledge-valuables`. Vanished-set and incomplete-inspection refusals are deliberately TOKENLESS |
 | `scanner_rollups` | object[] | yes | Additive per-scanner sums over the report entries (`scanner_id`, `exact_bytes`, `estimated_up_to_bytes`, `bytes_freed`, `entry_count`), first-appearance order |
 | `scanner_errors` | object[] | no | Additive: present only when a bare `<scanner-slug>` target's scan reported root/scanner-level issues — same row shape as `scan`'s `scanner_errors`. Also present on the `CLEAN_FAILED` details when applicable |
 
@@ -529,6 +607,200 @@ when non-empty — see "Impeded scanner-wide targets" above):
 }
 ```
 
+#### Valuables acknowledgement contract (schema 4)
+
+Some deletable items are dangerous *because of what is inside them*. A Rust
+`target/` is rebuild-able noise — until a release build left
+`target/release/bundle/dmg/App_1.2.3.dmg` in it. The `build_artifacts`
+scanner therefore runs a bounded, no-follow inspection INSIDE every matched
+artifact directory for release artifacts (`.dmg`, `.pkg`, `.ipa` regular
+files and `.app` / `.xcarchive` / `.dSYM` directory bundles above 5 MB) and
+**refuses to delete a disclosing item unless the caller acknowledges it by
+token**.
+
+Acknowledgement means *the user saw it*. Discovery is never acknowledgement:
+the `valuables` array on a scan row is DISCLOSURE, and an unacknowledged
+`clean --confirm` of that same scanned item is refused exactly as if it had
+never been scanned.
+
+**The flag.**
+
+```
+--acknowledge-valuables <scanner-slug>:<item-id>:<token>
+```
+
+- **REPEATABLE** — one entry per item; a multi-item clean passes one flag
+  occurrence per acknowledged item.
+- **ITEM-BOUND** — the address half is the same `<scanner-slug>:<item-id>`
+  pair `scan` printed. Slug (`[a-z0-9_]+`), item id (opaque CLI-safe id) and
+  token (64 lowercase hex) are colon-free by construction, so the
+  colon-joined form parses unambiguously.
+- **`clean` ONLY.** Every other command refuses it PRE-DISPATCH with
+  `INVALID_ARGUMENTS` naming the flag — the same centralized gate that
+  refuses `--orphan-size-floor-mb` / `--orphan-stale-days` outside
+  `scan`/`clean` and `--dev-root` outside `scan`/`clean`. A destructive
+  authorization silently landing on a command that ignores it would be worse
+  than a usage error.
+- It is a FLAG, so like every flag it comes AFTER the positional targets
+  (see "Argument ordering" above).
+
+**Learning the token from the plan.** Both plan surfaces — the
+`CONFIRMATION_REQUIRED` `details.plan` rows and the `--dry-run` result rows —
+carry the additive `valuables`, `acknowledgement_token` and
+`acknowledgement_note` keys documented in the plan table above, so a caller
+can prepare the acknowledgement without first provoking a refusal:
+
+| Scan-time inspection | Disclosed set | `valuables` | `acknowledgement_token` | `acknowledgement_note` |
+|---|---|---|---|---|
+| complete | non-empty | present | present | absent |
+| complete | empty | absent | absent | absent |
+| INCOMPLETE | any | present if anything was seen | **absent** | present |
+
+The confirmed run ALWAYS recomputes the token from its own delete-time
+inspection; a plan token that no longer matches simply yields the standard
+fresh refusal below.
+
+**The token.** Full lowercase-hex SHA-256 (64 chars, never truncated) over
+the UTF-8 bytes of
+
+```
+scannerID NUL itemID NUL
+  ( path NUL allocated_bytes NUL device NUL inode NUL
+    modified_seconds NUL modified_nanoseconds NUL )*
+```
+
+with the valuables in the canonical order the wire prints them, every
+numeric written as its decimal integer (`device`/`inode` unsigned), and `NUL`
+the single byte `0x00`. `path` is the element's canonical identity path — the
+exact string the `valuables` wire field carries; display spellings never
+enter the preimage. `modified_seconds`/`modified_nanoseconds` are the two
+integers from which the wire's `modified_at_ns` is derived (`seconds *
+1_000_000_000 + nanoseconds`, checked arithmetic), so JSON, token and
+re-computation consume ONE set of integers and cannot drift on precision.
+
+The leading `scannerID NUL itemID NUL` pair is the canonical `ItemKey`
+serialization — the same convention the opaque item id itself uses. Item ids
+are scanner-scoped, so only the FULL ItemKey makes a token item-bound: a
+token applied to a different item, even one carrying the same item id under
+another scanner, can never match.
+
+**A token exists ONLY for a non-empty set from a complete inspection.** There
+is no empty-set token and no partial-inspection token on any surface.
+
+**Honest invalidation contract.** The token rotates whenever set membership,
+a path, an allocated size, a no-follow identity (device/inode) or an mtime
+changes — so an in-place replacement (same path, same size, new inode or new
+mtime) invalidates a held token, and any touch or rebuild of a release
+artifact does too. That is deliberate and fail-safe. It does **NOT** guard
+against content mutation that preserves all of those; that residual is
+accepted and stated here rather than papered over.
+
+**Refusal shape.** A `clean --confirm` that reaches an unacknowledged (or
+wrongly-acknowledged) valuable-bearing item deletes NOTHING for that item and
+reports it as a per-item error. The refusal fields ride the ONE result-row
+shape, so they appear identically on BOTH arms:
+
+- the partial-success payload's `results[]` (exit 0 — other targets still
+  cleaned), and
+- `CLEAN_FAILED`'s `details.results[]` (exit 1 — nothing could be cleaned).
+
+MCP and other JSON consumers read the token from the same envelope either
+way; nothing is parsed out of prose.
+
+```json
+{
+  "category": "build_artifacts:8f14e45fceea167a5a36dedd4bea2543f5eec9d6a0f4c2fca3b2e0c2a4c33ab1",
+  "name": "target",
+  "bytes_freed": 0,
+  "exact_bytes": 0,
+  "estimated_up_to_bytes": 0,
+  "freed_human": "0 bytes",
+  "success": false,
+  "scanner_id": "build_artifacts",
+  "item_id": "8f14e45fceea167a5a36dedd4bea2543f5eec9d6a0f4c2fca3b2e0c2a4c33ab1",
+  "error": "/Users/dev/rustapp/target: release artifacts (Murmur_0.1.7_aarch64.dmg) are inside this directory at delete time and are not covered by an acknowledgement — refused, nothing deleted",
+  "valuables": [
+    {
+      "name": "Murmur_0.1.7_aarch64.dmg",
+      "path": "/Users/dev/rustapp/target/release/bundle/dmg/Murmur_0.1.7_aarch64.dmg",
+      "allocated_bytes": 44040192,
+      "device": 16777232,
+      "inode": 12345678,
+      "modified_at_ns": 1755057600123456789
+    }
+  ],
+  "acknowledgement_token": "3b1f0a9d2c4e6b8a0d1f3e5c7a9b1d3f5e7c9a1b3d5f7e9c1a3b5d7f9e1c3a5b"
+}
+```
+
+**Absence rules on refusal rows.** `valuables` is omitted when the refusal
+disclosed none. `acknowledgement_token` is omitted unless the delete-time
+inspection COMPLETED and found a non-empty set — the uniform rule that both
+of these are TOKENLESS:
+
+- **Incomplete inspection** (caps hit, unreadable subtree, undecodable name):
+  refused with a "couldn't fully re-inspect … re-scan required" reason, the
+  partial sighting carried as a floor, and **no token**. An inspection that
+  could not finish cannot authorize anything; re-scan and retry once it can.
+- **Vanished set**: the item disclosed artifacts at scan time and the
+  delete-time inspection finds NONE. Refused **once**, with no token —
+  there is nothing left to acknowledge. Re-scan and clean again *without*
+  any acknowledgement: the item is now artifact-free and needs none.
+
+**Multi-item behavior.** Authorization is per item. One invocation can mix
+authorized valuable-bearing deletes, unauthorized valuable-bearing refusals
+and ordinary deletes; each item is decided on its own entry, the refusals
+appear as their own error rows, and the run stays exit 0 as long as anything
+succeeded.
+
+**Frozen parsing / rejection rules** (all `INVALID_ARGUMENTS`, pre-flight,
+nothing deleted):
+
+| Input | Refused because |
+|---|---|
+| a bare `--acknowledge-valuables` with no following token | a valueless occurrence would look exactly like an ABSENT flag and run an UNACKNOWLEDGED clean while the caller believes they authorized one |
+| not exactly two colons (`slug:id`, `slug:id:tok:extra`) | the entry shape is frozen |
+| slug not `[a-z0-9_]+`, or an empty/ill-formed item id | it cannot address an item |
+| token not exactly 64 LOWERCASE hex characters | it is compared byte-for-byte; a spelling that can never match is rejected now, not at delete time |
+| the same `<scanner-slug>:<item-id>` named twice | first-wins would ignore a contradicting second entry and last-wins the first — either silently drops half of what the caller authorized |
+| an item that is NOT part of this clean's resolved selection | an acknowledgement that authorizes nothing this run touches is caller confusion |
+| an item PROVEN to disclose nothing (complete inspection, empty set) | there is nothing to acknowledge, and no token exists for it |
+
+An item whose scan-time inspection did NOT finish is *not* proven
+artifact-free, so an entry for it is accepted pre-flight and decided at
+delete time (where the tokenless rule refuses it if the inspection still
+cannot finish).
+
+**Validation timing.** Entry FORM and the pre-flight rules above run on every
+path — `--dry-run`, unconfirmed, and confirmed alike — so malformed
+authorization input fails fast everywhere. Token MATCHING happens only on the
+confirmed path, against the delete-time inspection; `--dry-run` reports what
+*would* be required and deletes nothing.
+
+**Worked retry.**
+
+```bash
+# 1. Confirmed clean of a disclosing item: refused, nothing deleted.
+Cacheout --cli clean build_artifacts:8f14e45f… --confirm
+# → exit 1, stderr CLEAN_FAILED; details.results[0] carries
+#   "valuables": [...] and
+#   "acknowledgement_token": "3b1f0a9d…"
+
+# 2. Read the token out of the SAME envelope (never parsed from prose),
+#    show the user what it covers, then re-run with the entry.
+Cacheout --cli clean build_artifacts:8f14e45f… --confirm \
+  --acknowledge-valuables build_artifacts:8f14e45f…:3b1f0a9d…
+# → exit 0; the artifact directory (release artifacts included) is deleted
+#   and reported in results[] with success: true.
+```
+
+If anything about the disclosed set changed between steps 1 and 2 — a
+rebuild, a touch, an added or removed artifact — step 2 refuses again with a
+FRESH token and the current `valuables`. Repeat with the new token; the
+contract never silently deletes on stale authorization.
+
+---
+
 ---
 
 ### `--cli smart-clean <gb> [--confirm|--dry-run]`
@@ -556,7 +828,7 @@ floor measurement), as are caution-risk categories. Safe risk sorts before
 review; larger first within a tier. Since schema 4 the candidate set is
 EXPLICITLY category-aggregates-only: smart-clean scans the aggregate
 category scanner exclusively and items that are not eligible for automatic
-cleaning (node_modules — every per-item scanner item today) are excluded by
+cleaning (every per-item scanner item today) are excluded by
 model policy. Per-item scanners becoming CLI-visible does NOT widen
 automatic destruction — that is a deliberate non-goal; per-item deletions
 happen only through explicitly addressed `clean` targets.

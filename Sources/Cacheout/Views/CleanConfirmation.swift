@@ -18,7 +18,20 @@
 ///   nothing in the Trash
 /// - Warning banner when a `.partiallyDenied` category is selected (R18):
 ///   unreadable contents — measured bytes only
-/// - Cancel and Confirm buttons (confirm triggers cleanup and dismisses)
+/// - Per-row DISCLOSED release artifacts (fn-4.6, R3): each valuable's
+///   name + size + modified date, consumed from fn-4.4's structured field
+///   in its STORED canonical order (never re-probed, never re-sorted here)
+///   with a reveal-in-Finder affordance over the UNRESOLVED display
+///   spelling — a vanished valuable no-ops the reveal
+/// - A row whose release-artifact inspection did NOT finish stays VISIBLE
+///   and SELECTED in a blocked/warning state with rescan guidance (R17):
+///   `confirmationRows` derives live from the selection, so deselecting
+///   would hide the very warning — the confirm ACTION filters its key out
+///   of both the authorization context and the clean set instead
+/// - Cancel and Confirm buttons — confirm runs `confirmClean()`, which
+///   builds the per-clean `[ItemKey: acknowledgement]` AUTHORIZATION
+///   CONTEXT from exactly the displayed sets and passes it down the clean
+///   path into the cleaner (R17), then dismisses
 ///
 /// The item list scrolls inside a 200px cap to prevent overflow on machines
 /// with many selected items.
@@ -54,10 +67,11 @@ struct CleanConfirmationSheet: View {
             Text("Clean Selected Caches?")
                 .font(.title2.bold())
 
-            // CLEANABLE totals, not bare selection totals: the headline must
-            // quote exactly what clean() will act on — retained selections
-            // under a malformed rescan are excluded from destructive paths.
-            Text("This will remove \(viewModel.formattedTotalCleanableSelectedSize) from \(viewModel.cleanableSelectedCount) items.")
+            // CONFIRMABLE totals, not bare selection totals: the headline
+            // must quote exactly what the confirm action will act on —
+            // retained selections under a malformed rescan AND blocked
+            // (incomplete-probed) rows are excluded from it.
+            Text("This will remove \(viewModel.formattedConfirmableSelectedSize) from \(viewModel.confirmableSelectedCount) items.")
                 .font(.body)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
@@ -90,6 +104,26 @@ struct CleanConfirmationSheet: View {
                                 .font(.caption2)
                                 .foregroundStyle(.tertiary)
                                 .padding(.leading, 24)
+
+                            // R3: the item's DISCLOSED release artifacts, in
+                            // their stored canonical order — name, size,
+                            // modified date, warning treatment, and reveal
+                            // in Finder (the sheet's only filesystem touch).
+                            ForEach(row.valuables) { valuable in
+                                ValuableDisclosureRow(valuable: valuable)
+                            }
+
+                            // R17: an INCOMPLETE-probed row stays VISIBLE and
+                            // SELECTED in a blocked state with rescan
+                            // guidance; the confirm action filters its key
+                            // from both the authorization context and the
+                            // clean set.
+                            if let blocked = row.blockedReason {
+                                Label(blocked, systemImage: "exclamationmark.octagon.fill")
+                                    .font(.caption2)
+                                    .foregroundStyle(.orange)
+                                    .padding(.leading, 24)
+                            }
                         }
                         .font(.caption)
                         .accessibilityElement(children: .combine)
@@ -135,17 +169,71 @@ struct CleanConfirmationSheet: View {
                 Button("Cancel") { dismiss() }
                     .keyboardShortcut(.cancelAction)
 
-                Button("Clean \(viewModel.formattedTotalCleanableSelectedSize)") {
+                // The AUTHORIZED confirm path (fn-4.6, R17): populates the
+                // per-clean authorization context from exactly the displayed
+                // sets, filters blocked rows out of the clean set, and
+                // passes the context down to the cleaner.
+                Button("Clean \(viewModel.formattedConfirmableSelectedSize)") {
                     dismiss()
-                    Task { await viewModel.clean() }
+                    Task { await viewModel.confirmClean() }
                 }
                 .keyboardShortcut(.defaultAction)
                 .buttonStyle(.borderedProminent)
                 .tint(.red)
+                .disabled(viewModel.confirmableSelectedCount == 0)
             }
         }
         .padding(24)
         .frame(width: 420)
+    }
+}
+
+// MARK: - Valuables disclosure (fn-4.6, R3)
+
+/// ONE disclosed release artifact under its item's confirmation row: name,
+/// size, modified date (all derived from fn-4.4's stored integers — nothing
+/// is re-probed at sheet time), warning treatment, and a reveal-in-Finder
+/// affordance over the UNRESOLVED display spelling.
+struct ValuableDisclosureRow: View {
+    let valuable: ConfirmationValuableRowModel
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+            Text(valuable.name)
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Text("\(valuable.formattedSize) · \(valuable.formattedModified)")
+                .foregroundStyle(.secondary)
+            Button("Reveal") { ValuableReveal.reveal(valuable.revealURL) }
+                .buttonStyle(.link)
+            Spacer(minLength: 0)
+        }
+        .font(.caption2)
+        .padding(.leading, 24)
+        .accessibilityElement(children: .combine)
+    }
+}
+
+/// Reveal-in-Finder for a disclosed valuable — the sheet's ONLY filesystem
+/// touch, and the one place the self-contained-row doctrine bends: a
+/// valuable that VANISHED between scan and click is a NO-OP, never a Finder
+/// error and never a re-resolution of the row.
+enum ValuableReveal {
+    /// - Returns: whether the reveal was attempted (false = the path is gone
+    ///   and nothing happened).
+    @discardableResult
+    static func reveal(
+        _ url: URL,
+        exists: (URL) -> Bool = { FileManager.default.fileExists(atPath: $0.path) },
+        revealer: (URL) -> Void = {
+            NSWorkspace.shared.selectFile($0.path, inFileViewerRootedAtPath: "")
+        }
+    ) -> Bool {
+        guard exists(url) else { return false }
+        revealer(url)
+        return true
     }
 }
 

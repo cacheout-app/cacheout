@@ -188,6 +188,13 @@ enum UserDataProbeObstruction: CaseIterable, Comparable, Sendable {
     /// next walk spends the same budget on the same entries and stops in the
     /// same place. Nothing but a policy change or an explicit per-item
     /// confirmation clears it.
+    ///
+    /// RECORDED ONLY ONCE A REAL ENTRY BEYOND THE BUDGET HAS BEEN SEEN (PR
+    /// #458 review r9). It is the single IRREDUCIBLE class, so claiming it
+    /// on a spent budget alone — without ever meeting the entry that would
+    /// prove it — permanently excluded trees that actually fit. A spent
+    /// budget is a capacity of zero: the walk still reads at that capacity,
+    /// which admits no entry and yet tells EOF from an over-budget sentinel.
     case budgetExhausted
     /// A basename that is not valid UTF-8, so the walk cannot address the
     /// entry safely (a repairing decode would name a DIFFERENT path). A
@@ -914,9 +921,17 @@ struct OrphanedCachesScanner: @unchecked Sendable {
     /// directory with millions of entries could spike memory and stall the
     /// scan even though only `entryLimit` entries were ever inspected — the
     /// budget was a bound on ATTENTION, not on WORK. The retired depth cap
-    /// had been hiding that for anything below its boundary. A directory is
-    /// also no longer opened at all once the budget is spent (`remaining >
-    /// 0` is checked before the read, not after it).
+    /// had been hiding that for anything below its boundary.
+    ///
+    /// A SPENT BUDGET IS A CAPACITY OF ZERO, NOT A REFUSAL TO LOOK (PR #458
+    /// review r9). A directory discovered by a read has already been PAID
+    /// FOR; what the budget cannot afford is its CHILDREN, and a `limit: 0`
+    /// read admits none of them while still distinguishing the two answers
+    /// that matter — immediate EOF (nothing beyond the budget exists, so the
+    /// walk is COMPLETE) from one real entry (`.budgetExhausted`, proven).
+    /// The gate that refused the descent outright bought no budget and threw
+    /// away that distinction, manufacturing the one irreducible obstruction
+    /// for trees that fit.
     ///
     /// Under truncation, WHICH entries were read is deliberately
     /// UNSPECIFIED: a directory bigger than the remaining budget is read in
@@ -1676,7 +1691,18 @@ struct OrphanedCachesScanner: @unchecked Sendable {
         /// record its pending subdirectories. `false` ⇒ stop the walk.
         func enumerate(_ index: Int) -> Bool {
             let remaining = entryLimit - visited
-            guard remaining > 0 else {
+            // ZERO IS A LEGAL CAPACITY, NOT A REFUSAL (PR #458 review r9,
+            // thread `PRRT_kwDORmg6_86ZlKD0`). A spent budget is not proof
+            // that anything exists beyond it, and `boundedChildNames` at
+            // `limit: 0` tells the two apart in ONE `readdir`: immediate EOF
+            // ⇒ this directory is empty and the walk is COMPLETE; any real
+            // entry ⇒ `.budgetExhausted`, exactly as before. Refusing to look
+            // manufactured the irreducible class for trees that fit.
+            //
+            // A negative remainder is an invariant violation (`visited` only
+            // ever advances while it is strictly below `entryLimit`) — the
+            // budget really would be overspent, so say so and stop.
+            guard remaining >= 0 else {
                 obstructions.insert(.budgetExhausted)
                 return false
             }
@@ -1729,6 +1755,16 @@ struct OrphanedCachesScanner: @unchecked Sendable {
                 guard visited < entryLimit else {
                     // Defense in depth: the read above is already bounded by
                     // the REMAINING budget, so this cannot fire today.
+                    //
+                    // UNEVIDENCED ON ITS OWN, AND THAT IS STATED RATHER THAN
+                    // IMPLIED (PR #458 review r9): deleting this guard alone
+                    // leaves the whole suite green — measured. It is LAYER
+                    // TWO. Breaking the read's own capacity check alone is
+                    // caught by
+                    // `testAZeroCapacityReadStillTellsEOFFromAnOverBudgetEntry`;
+                    // only breaking BOTH lets a name past a spent budget
+                    // reach the matcher, which
+                    // `testTheExactBudgetReadAdmitsNoNames` then catches.
                     obstructions.insert(.budgetExhausted)
                     continues = false
                     break
@@ -1869,15 +1905,38 @@ struct OrphanedCachesScanner: @unchecked Sendable {
             // cursor advanced.
             noteWorkChanged(at: depth)
 
-            // The budget is checked BEFORE the child is opened, exactly as
-            // the retired shape checked it before a popped directory was
-            // opened: a directory the budget cannot afford must not be
-            // touched at all, so nothing may be attributed to having
-            // touched it.
-            guard visited < entryLimit else {
-                obstructions.insert(.budgetExhausted)
-                break walk
-            }
+            // NO BUDGET GATE HERE, AND THAT IS THE NARROWING (PR #458 review
+            // r9, thread `PRRT_kwDORmg6_86ZlKD0`).
+            //
+            // This gate refused to open a child once `visited == entryLimit`,
+            // on the rule that "a directory the budget cannot afford must not
+            // be touched at all". THE PREMISE IS FALSE FOR THIS DIRECTORY:
+            // it was ALREADY PAID FOR — one entry was spent on it when its
+            // parent's read discovered it — and what is unaffordable is its
+            // CHILDREN, of which the descent below now admits exactly zero
+            // (`enumerate` reads at `remaining == 0`). So the gate bought no
+            // budget; it only threw away the one fact still missing, namely
+            // whether any child exists at all. When none does, the tree fits
+            // and the walk is complete; the gate called that `.budgetExhausted`
+            // — the single IRREDUCIBLE class — and so excluded an unchanged,
+            // budget-sized tree from automatic cleaning permanently, on
+            // nothing but the KIND of its last budgeted entry.
+            //
+            // WHAT THE GATE ACTUALLY PROTECTED IS UNCHANGED: no name is
+            // admitted past a spent budget (the read's own capacity check
+            // yields none at `limit: 0`, pinned by
+            // `testAZeroCapacityReadStillTellsEOFFromAnOverBudgetEntry`, and
+            // the per-name guard is the second layer behind it), and nothing
+            // is attributed to a directory that was never read — an open
+            // that FAILS at zero budget records ITS OWN errno now, which is
+            // the honest cause and a better remedy than a budget claim the
+            // walk never proved.
+            //
+            // TERMINATION IS UNAFFECTED. Every pending entry was counted when
+            // it was discovered, so at most `entryLimit` zero-capacity
+            // descents can follow, each costing a constant number of
+            // syscalls and producing no new pending work (a zero-capacity
+            // read returns no names).
             guard frames[depth].dir != nil else {
                 obstructions.insert(.transientFailure)
                 break walk
@@ -2008,8 +2067,43 @@ struct OrphanedCachesScanner: @unchecked Sendable {
         // rename is retryable, so it is `.transientFailure`: a re-scan finds
         // whatever is really there now and completes. The comparison runs
         // unconditionally so there is still exactly ONE exit.
-        if provider.identity(of: entryURL) != root.identity {
-            obstructions.insert(.transientFailure)
+        //
+        // AND IT KEEPS ITS ERRNO (PR #458 review r9, thread
+        // `PRRT_kwDORmg6_86ZlKDx`). `identity(of:)` collapses EVERY failure
+        // onto `nil` — that is precisely the flattening `obstruction(forErrno:)`
+        // exists to retire, and the first version of this check walked
+        // straight past the classifier and called all of them
+        // `.transientFailure`. An ancestor that has become unsearchable
+        // (`EACCES`/`EPERM`) or been replaced by a symlink CYCLE (`ELOOP`)
+        // both fail this `lstat`, and neither is cleared by the "re-scan and
+        // try again" that class prescribes: one needs a GRANT, the other a
+        // restructured path. Measured on this platform with a real
+        // `chmod(2)`/`symlink(2)` fired inside the walk: errno 13 and errno
+        // 62 respectively, both previously reported as merely transient.
+        //
+        // THE SECOND CALL IS ON THE FAILURE PATH ONLY, and its window costs
+        // nothing. `probeKind` is asked only once `identity(of:)` has
+        // already failed, so the common path is still exactly one `lstat`;
+        // and every arm below inserts SOME obstruction, so the verdict is
+        // INCOMPLETE however the second look answers. A second resolution
+        // can therefore refine the REMEDY and can never widen admission —
+        // the reason this is acceptable here and is not below the root,
+        // where a two-`lstat` kind+identity pair really could admit a
+        // swapped object (`probeChild` exists for exactly that).
+        if let current = provider.identity(of: entryURL) {
+            if current != root.identity { obstructions.insert(.transientFailure) }
+        } else {
+            switch provider.probeKind(of: entryURL) {
+            case .failed(let code):
+                obstructions.insert(obstruction(forErrno: code))
+            case .absent:
+                // Renamed or unlinked away: retryable, exactly as before.
+                obstructions.insert(.transientFailure)
+            case .kind:
+                // Unreadable a moment ago and readable now: the name changed
+                // under the walk, which is the retryable class by definition.
+                obstructions.insert(.transientFailure)
+            }
         }
 
         // Teardown: dropping `frames` releases every descriptor on EVERY
@@ -2138,6 +2232,13 @@ struct OrphanedCachesScanner: @unchecked Sendable {
     /// `whileReading` is called ONCE, with the enumeration handle open, so a
     /// descriptor census can be taken at the instant this read is holding
     /// its extra descriptor rather than after it has given it back.
+    ///
+    /// `limit: 0` IS A SUPPORTED CAPACITY and carries the walk's
+    /// exact-budget proof (PR #458 review r9): no name is admitted, and the
+    /// two outcomes are still distinguished — an empty directory reaches EOF
+    /// and reports NOTHING truncated, while the first real entry reports
+    /// `.budgetExhausted`. That is the whole difference between "this tree
+    /// fits" and "this tree is bigger than we can afford".
     static func boundedChildNames(
         inDirectory parentDescriptor: Int32,
         limit: Int,

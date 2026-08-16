@@ -3235,6 +3235,88 @@ final class OrphanedCachesScannerTests: XCTestCase {
         try assertCleanupLogContains(tag: "content-drift")
     }
 
+    // MARK: - The root re-bind keeps its errno (PR #458 review r9,
+    //         thread PRRT_kwDORmg6_86ZlKDx)
+
+    /// The closing root re-bind is an `lstat`, and `identity(of:)` collapses
+    /// EVERY failure onto `nil`. Recording `.transientFailure` for all of
+    /// them is the errno flattening this branch built `obstruction(forErrno:)`
+    /// to retire — reintroduced by the check that closed the swap dual.
+    ///
+    /// Here the target's parent becomes UNSEARCHABLE mid-walk, for real
+    /// (`chmod 000` fired from inside a walk event, single-threaded, no
+    /// sleeps). The closing `lstat` returns `EACCES`, and the honest remedy
+    /// is a GRANT — not "re-scan and try again", which reproduces exactly.
+    func testUnsearchableParentAtTheRootReBindIsAnAccessDenial() throws {
+        try XCTSkipIf(geteuid() == 0, "root ignores permission bits")
+        let entry = cachesRoot.appendingPathComponent("com.example.RootEACCES")
+        try mkdir(entry.appendingPathComponent("sub"))
+        defer { restorePerms(cachesRoot) }
+
+        var blinded = false
+        let probe = OrphanedCachesScanner.boundedUserDataShapeWalk(
+            at: entry, provider: FileSystemIdentityProvider(),
+            entryLimit: OrphanedCachesScanner.defaultProbeEntryLimit
+        ) { event in
+            guard case .willDescend(let name, _) = event,
+                  name == "sub", !blinded else { return }
+            blinded = true
+            try? self.chmod000(self.cachesRoot)
+        }
+
+        XCTAssertTrue(blinded, "the fixture never armed the denial")
+        XCTAssertEqual(
+            probe.obstructions, [.accessDenied],
+            "the closing re-bind could not read the target's own name, and "
+                + "the reason was a PERMISSION — a bare re-scan reproduces it"
+        )
+        XCTAssertEqual(
+            OrphanedCachesScanner.remediationGuidance(for: probe.obstructions)
+                .contains("granting access"),
+            true,
+            OrphanedCachesScanner.remediationGuidance(for: probe.obstructions)
+        )
+    }
+
+    /// The same site, the other permanent class: an ancestor replaced by a
+    /// REAL self-referential symlink mid-walk, so the closing `lstat` returns
+    /// `ELOOP`. Nothing about a re-scan changes a symlink cycle; only
+    /// restructuring the path does, and `.unaddressablePath` is the class
+    /// that says so.
+    func testSymlinkCycleAtTheRootReBindIsAnUnaddressablePath() throws {
+        let anchor = base.appendingPathComponent("loop-anchor")
+        let mid = anchor.appendingPathComponent("mid")
+        let entry = mid.appendingPathComponent("entry")
+        try mkdir(entry.appendingPathComponent("sub"))
+        let stash = anchor.appendingPathComponent("mid-gone")
+
+        var looped = false
+        let probe = OrphanedCachesScanner.boundedUserDataShapeWalk(
+            at: entry, provider: FileSystemIdentityProvider(),
+            entryLimit: OrphanedCachesScanner.defaultProbeEntryLimit
+        ) { event in
+            guard case .willDescend(let name, _) = event,
+                  name == "sub", !looped else { return }
+            looped = true
+            XCTAssertEqual(rename(mid.path, stash.path), 0,
+                           "fixture rename failed: \(errno)")
+            // A REAL cycle: `mid` -> `mid`, resolved relative to `anchor`.
+            XCTAssertEqual(symlink("mid", mid.path), 0,
+                           "fixture symlink failed: \(errno)")
+        }
+
+        XCTAssertTrue(looped, "the fixture never armed the cycle")
+        var probeStat = stat()
+        XCTAssertEqual(lstat(entry.path, &probeStat), -1)
+        XCTAssertEqual(errno, ELOOP,
+                       "the fixture must really produce ELOOP on this platform")
+        XCTAssertEqual(
+            probe.obstructions, [.unaddressablePath],
+            "a symlink cycle in the path is STRUCTURAL — a re-scan of an "
+                + "unchanged tree reproduces it exactly"
+        )
+    }
+
     // MARK: - The climb's per-level `..` re-proof (PR #458 review r7)
 
     /// A two-step climb whose FIRST landing cannot be proven and whose
@@ -3928,6 +4010,41 @@ final class OrphanedCachesScannerTests: XCTestCase {
         )
     }
 
+    /// THE PRIMITIVE THE EXACT-BUDGET PROOF RESTS ON: at a capacity of ZERO
+    /// the read still separates "this directory is empty" from "this
+    /// directory holds something we cannot afford", and admits no name
+    /// either way. Without that separation the walk has nothing to descend
+    /// with, and a spent budget has to be guessed at (which is what
+    /// manufactured a permanent `.budgetExhausted` for trees that fit).
+    func testAZeroCapacityReadStillTellsEOFFromAnOverBudgetEntry() throws {
+        let empty = cachesRoot.appendingPathComponent("zero-empty")
+        try mkdir(empty)
+        let emptyFD = try openDirectory(empty)
+        defer { close(emptyFD) }
+        XCTAssertEqual(
+            OrphanedCachesScanner.boundedChildNames(
+                inDirectory: emptyFD, limit: 0
+            ),
+            .read([], truncatedBy: []),
+            "immediate EOF PROVES exhaustion: nothing is beyond the budget"
+        )
+
+        // `.` and `..` are still skipped rather than counted as entries —
+        // otherwise every directory on the system would read as over budget.
+        let occupied = cachesRoot.appendingPathComponent("zero-occupied")
+        try mkdir(occupied)
+        try writeFile(occupied.appendingPathComponent("only.bin"), bytes: 1)
+        let occupiedFD = try openDirectory(occupied)
+        defer { close(occupiedFD) }
+        XCTAssertEqual(
+            OrphanedCachesScanner.boundedChildNames(
+                inDirectory: occupiedFD, limit: 0
+            ),
+            .read([], truncatedBy: [.budgetExhausted]),
+            "one real entry beyond the budget, and NO name materialised"
+        )
+    }
+
     /// The SENTINEL read — the one extra `readdir` whose only job is to
     /// prove the directory holds more than the budget allows — must not
     /// lose that proof to the decode guard sitting in front of the capacity
@@ -4044,11 +4161,28 @@ final class OrphanedCachesScannerTests: XCTestCase {
                        [.budgetExhausted, .transientFailure])
     }
 
-    /// A directory the budget cannot afford is never OPENED — the visible
-    /// half of the same fix. `a` is unreadable, so had the walk popped and
-    /// read it (as it did while the read came before the guard) the verdict
-    /// would carry an access obstruction too.
-    func testABudgetSpentMeansTheNextDirectoryIsNeverOpened() throws {
+    /// A SPENT BUDGET IS NOT A CAUSE UNTIL SOMETHING BEYOND IT IS PROVEN
+    /// (PR #458 review r9, thread `PRRT_kwDORmg6_86ZlKD0`).
+    ///
+    /// This test used to assert the opposite — that `a` is never opened once
+    /// the budget is spent, and that the verdict is therefore
+    /// `.budgetExhausted`. That reading confused the ATTENTION the budget
+    /// bounds with the FACT the walk is missing: `a` was already paid for
+    /// when the root's read discovered it, and its children are what the
+    /// budget cannot afford — of which the zero-capacity descent admits
+    /// exactly none (`testTheExactBudgetReadAdmitsNoNames` pins that, and it
+    /// is what the original "the read came before the guard" regression
+    /// really cost). What the refusal threw away was the only outstanding
+    /// question, and answering it wrongly by default manufactured the sole
+    /// IRREDUCIBLE class for trees that had proven nothing of the sort.
+    ///
+    /// Here the answer genuinely cannot be obtained: `a` is chmod-000, so
+    /// the descent's `openat` fails `EACCES`. The verdict must name THAT —
+    /// a grant lets the next scan get further, whereas the budget claim
+    /// steered the user to per-item confirmation over a permission bit, and
+    /// no budget increase could ever have read this directory.
+    func testAnUnreadableExactBudgetDirectoryBlamesTheDenialNotTheBudget()
+        throws {
         try XCTSkipIf(geteuid() == 0, "root ignores permission bits")
         let entry = cachesRoot.appendingPathComponent("com.example.SpentBudget")
         let unreadable = entry.appendingPathComponent("a")
@@ -4060,11 +4194,124 @@ final class OrphanedCachesScannerTests: XCTestCase {
             at: entry, provider: FileSystemIdentityProvider(), entryLimit: 1
         )
 
-        XCTAssertEqual(probe.obstructions, [.budgetExhausted],
-                       "discovering `a` spent the budget; it must not then "
-                           + "be opened, so nothing may be attributed to "
-                           + "having read it")
+        XCTAssertEqual(probe.obstructions, [.accessDenied],
+                       "nothing beyond the budget was ever proven to exist; "
+                           + "what actually stopped the walk was a permission")
         XCTAssertFalse(probe.complete)
+        XCTAssertEqual(
+            probe.obstructions.map(\.remedy), [.userActionThenRetry],
+            "and the remedy offered is the one that can actually work"
+        )
+    }
+
+    // MARK: - An exact-budget directory may PROVE exhaustion (PR #458
+    //         review r9, thread PRRT_kwDORmg6_86ZlKD0)
+
+    /// A tree of exactly `entryLimit` entries whose last one is an EMPTY
+    /// directory is COMPLETE, and the old guard called it truncated.
+    ///
+    /// Nothing beyond the budget was ever proven to exist: the directory
+    /// itself was discovered and PAID FOR, and one zero-capacity read reaches
+    /// EOF and settles the question. Refusing to look manufactured a
+    /// `.budgetExhausted` — the one irreducible class — for a tree that fits,
+    /// which excluded it from automatic cleaning FOREVER on nothing but the
+    /// kind of its last entry.
+    func testExactBudgetEmptyDirectoryProvesTheWalkComplete() throws {
+        let entry = cachesRoot.appendingPathComponent("com.example.ExactFit")
+        try mkdir(entry.appendingPathComponent("sub"))
+
+        let probe = OrphanedCachesScanner.boundedUserDataShapeWalk(
+            at: entry, provider: FileSystemIdentityProvider(), entryLimit: 1
+        )
+
+        XCTAssertEqual(probe.obstructions, [],
+                       "one entry, a budget of one, and nothing beyond it")
+        XCTAssertTrue(probe.complete)
+
+        // AND WITH THE WHOLE TAIL AT ZERO CAPACITY. Once the budget is
+        // spent, EVERY remaining pending entry is descended at capacity
+        // zero; each was already counted when it was discovered, so the
+        // extra descents are bounded by the budget and the walk still
+        // terminates with a proven verdict rather than a manufactured one.
+        let wide = cachesRoot.appendingPathComponent("com.example.WideFit")
+        for index in 0..<8 {
+            try mkdir(wide.appendingPathComponent("d\(index)"))
+        }
+        let widely = OrphanedCachesScanner.boundedUserDataShapeWalk(
+            at: wide, provider: FileSystemIdentityProvider(), entryLimit: 8
+        )
+        XCTAssertEqual(widely.obstructions, [])
+        XCTAssertTrue(widely.complete)
+    }
+
+    /// The proof runs both ways: the same shape with ONE entry inside the
+    /// exact-budget directory is still `.budgetExhausted`, because the
+    /// zero-capacity read really did meet an entry the budget cannot afford.
+    /// The guard is narrowed, not deleted.
+    func testExactBudgetNonEmptyDirectoryStillReportsExhaustion() throws {
+        let entry = cachesRoot.appendingPathComponent("com.example.ExactOver")
+        try mkdir(entry.appendingPathComponent("sub/child"))
+
+        let probe = OrphanedCachesScanner.boundedUserDataShapeWalk(
+            at: entry, provider: FileSystemIdentityProvider(), entryLimit: 1
+        )
+
+        XCTAssertEqual(probe.obstructions, [.budgetExhausted])
+        XCTAssertFalse(probe.complete)
+    }
+
+    /// THE ZERO-CAPACITY DESCENT SPENDS NOTHING, evidenced independently of
+    /// any counter the walk keeps about itself: a `Documents` directory
+    /// sitting inside the exact-budget directory must NOT appear in
+    /// `matches`, and the verdict must still be the one that was PROVEN.
+    ///
+    /// WHICH LAYER THIS PINS, MEASURED RATHER THAN ASSERTED. Two guards
+    /// stand between a spent budget and a matched name: the read's own
+    /// capacity check, and the walk's per-name `visited < entryLimit`.
+    /// Breaking the read alone (`names.count <= limit`) leaves this test
+    /// GREEN — the per-name guard drops the extra name before matching — and
+    /// fails `testAZeroCapacityReadStillTellsEOFFromAnOverBudgetEntry`
+    /// instead. Breaking BOTH lets `Documents` reach `matches` and fails
+    /// THIS one. So the primitive test evidences layer one and this test
+    /// evidences layer two; neither claim rides on the other.
+    func testTheExactBudgetReadAdmitsNoNames() throws {
+        let entry = cachesRoot.appendingPathComponent("com.example.ExactLeak")
+        try mkdir(entry.appendingPathComponent("sub/Documents"))
+
+        let probe = OrphanedCachesScanner.boundedUserDataShapeWalk(
+            at: entry, provider: FileSystemIdentityProvider(), entryLimit: 1
+        )
+
+        XCTAssertEqual(probe.matches, [],
+                       "a name was admitted past a spent budget")
+        XCTAssertEqual(probe.obstructions, [.budgetExhausted])
+    }
+
+    /// The harm, end to end through the production classifier: an unchanged
+    /// tree that fits its budget exactly must be automatically cleanable.
+    /// Before the narrowing it carried a `.budgetExhausted` — the irreducible
+    /// remedy — so it fell to review risk and stayed there on every future
+    /// scan of the same bytes.
+    func testExactBudgetLeakIsAutomaticallyCleanable() async throws {
+        let entry = cachesRoot.appendingPathComponent(
+            "com.apple.SwiftUI.Drag-EXACTFIT"
+        )
+        try mkdir(entry.appendingPathComponent("sub"))
+        try writeFile(entry.appendingPathComponent("payload.bin"))
+
+        // Budget 2 = `payload.bin` + `sub`, and `sub` is empty.
+        let scanner = OrphanedCachesScanner(
+            home: home, categories: [], probeEntryLimit: 2
+        )
+        let (items, _) = await scanItems(scanner)
+        let leak = try XCTUnwrap(items[entry.lastPathComponent])
+
+        XCTAssertEqual(leak.risk, .safe)
+        XCTAssertTrue(
+            leak.automaticCleanEligible,
+            "a tree that fits its budget exactly was held off the automatic "
+                + "path forever because its last entry was a directory"
+        )
     }
 
     // MARK: - Obstructions are distinguished, not flattened (PR #458 review)

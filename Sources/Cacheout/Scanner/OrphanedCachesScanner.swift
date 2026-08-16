@@ -2641,10 +2641,12 @@ extension OrphanedCachesScanner: SpaceScanner {
 
     /// One sweep entry's classification → one `ReclaimableItem`.
     ///
-    /// State mapping (mount-boundary doctrine per the as-merged
-    /// `NodeModulesScanner.reclaimableItem` — delete refuses a
+    /// State mapping (mount-boundary doctrine per
+    /// `BuildArtifactsScanner.reclaimableItem` — delete refuses a
     /// boundary-bearing target ENTIRELY, so `.partiallyDenied` is reserved
-    /// for walk-denial impediments, where deletion partially succeeds):
+    /// for walk-denial impediments, where deletion partially succeeds).
+    /// The rule was written for `NodeModulesScanner`, which PR #457
+    /// replaced; only its home moved, not the rule:
     ///
     /// - ANY mount boundary (root or nested, measured content or not) →
     ///   `.denied`, ZERO components (components mean "deletion frees
@@ -2788,8 +2790,9 @@ extension OrphanedCachesScanner: SpaceScanner {
         return mountBoundaryScanError(for: entry)
     }
 
-    /// The boundary-naming error, mirroring the as-merged
-    /// `NodeModulesScanner` doctrine: `.other` (a boundary is neither TCC
+    /// The boundary-naming error, mirroring the `BuildArtifactsScanner`
+    /// doctrine (written for `NodeModulesScanner`, which PR #457 replaced —
+    /// the rule is unchanged): `.other` (a boundary is neither TCC
     /// nor BSD permissions, and no grant would lift it), the message naming
     /// the boundary — and carrying the measured floor when the walk
     /// measured readable content beside it, because the item's byte

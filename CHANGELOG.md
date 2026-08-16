@@ -170,6 +170,75 @@ and docs/v1/CLI-REFERENCE.md) — the pre-release `node_modules` →
   freshly written `__pycache__/*.pyc` would otherwise let the gate report on
   build artifacts instead of on the code.
 
+### Fixed
+
+- **Deleting a folder nested deeper than the system path limit now works.**
+  Inspection had been made descriptor-relative and could read such trees;
+  permanent deletion still went through `FileManager.removeItem`, which
+  builds an absolute path per entry and cannot. The result was a cache
+  folder reported as inspected and clean that no route in the app could ever
+  remove: it failed instantly, every time, with "the file name is invalid" —
+  a message naming a cause that did not exist, since the names were fine and
+  the DEPTH was the problem. `rm -rf` removed the identical folder in under a
+  second, so the refusal was the app's own. Permanent deletion now traverses
+  by open directory handle the same way, with the same no-follow and
+  mount-boundary rules as the inspection, and a constant number of open
+  handles at any depth. Moving to the Trash was never affected (it is a
+  rename). REMAINING, and now said honestly instead of being blamed on a
+  file name: the SIZE of such a folder still cannot be measured, so it is
+  listed at review risk with "couldn't measure its size: part of it sits
+  deeper than an absolute path can address — deleting it still works", and
+  the bytes it frees are under-reported.
+- **Orphaned-caches delete: a folder replaced after it was inspected is no
+  longer deleted.** The pre-delete safety inspection holds the folder open,
+  which is what stops it following a swap — and also what pins it to the
+  folder it opened. If that folder was renamed away and a NEW one created
+  under the same name, the inspection reported "clean" about the folder it
+  held while the deletion, which works by path, removed the replacement.
+  Every other check in the path (container admission, containment, deny
+  list, mount boundary) is satisfied by the replacement. The inspection now
+  re-checks its own root before accepting a result, and reports WHICH object
+  its verdict is about so the deletion refuses unless that object is still
+  the one at the path. Refusals are clearable by re-scanning.
+- **Orphaned-caches "Move to Trash": the same replaced folder is no longer
+  trashed either.** Move to Trash is ON by default, and it did not go
+  through the deletion that was hardened above — it handed the folder's path
+  to the system Trash, behind nothing but a check that a swap timed one
+  syscall earlier defeats. A folder replaced in that instant was moved to
+  the Trash whole, and the app reported success with the byte count of the
+  folder it had actually inspected. The system Trash takes a path and
+  resolves it itself, so the check cannot be handed the open folder the way
+  the permanent deletion now can; what makes this safe instead is that
+  moving to the Trash destroys nothing. The app now checks the folder it
+  holds open before the move, checks WHAT THE TRASH ACTUALLY TOOK
+  afterwards, and PUTS BACK anything that turns out not to be the inspected
+  folder — reporting zero bytes freed either way. REMAINING: if the put-back
+  cannot be performed because something else has taken the original name,
+  the item stays in the Trash and the error names its path so it can be
+  restored in one drag; and a Trash that will not say where it put an item
+  is refused rather than counted, leaving that item in the Trash too.
+- **Orphaned-caches probe: deep folders no longer burn CPU quadratically.**
+  The walk re-scanned its whole open-folder stack on every level it
+  descended, so a deeply nested cache close to the inspection budget could
+  stall for a long time even though the number of entries inspected was
+  capped. The accounting is now incremental and bounded by the number of
+  folders held open, never by depth.
+- **Orphaned-caches probe: ancestor-swap disclosure.** The bounded
+  user-data probe resolved each child by absolute path, so a directory
+  replaced by a symlink after its parent had been read (but before the
+  child was vetted) redirected the walk outside `~/Library/Caches` — up to
+  the full 20,000-entry budget — and attributed what it found there to the
+  cache entry. `O_NOFOLLOW` guards only the final component, and the
+  identity re-proof could not help because the identity it compared was
+  already the foreign object's. The probe now holds each parent open and
+  discovers, stats and descends every child relative to that descriptor by
+  single-component basename, at a bounded number of live descriptors. Two
+  side effects are user-visible: trees whose absolute paths exceed
+  `PATH_MAX` are now inspected instead of being refused forever, and mount
+  boundaries are detected by filesystem id rather than by path spelling, so
+  an aliased path can no longer hide one.
+
+
 ## [2.2.0] - 2026-08-06
 
 Disk-path safety hardening (D1–D8). Breaking CLI release: `schema_version` is
@@ -242,71 +311,6 @@ now 3 and destructive commands require `--confirm`. Coordinate MCP updates with
 
 ### Fixed
 
-- **Deleting a folder nested deeper than the system path limit now works.**
-  Inspection had been made descriptor-relative and could read such trees;
-  permanent deletion still went through `FileManager.removeItem`, which
-  builds an absolute path per entry and cannot. The result was a cache
-  folder reported as inspected and clean that no route in the app could ever
-  remove: it failed instantly, every time, with "the file name is invalid" —
-  a message naming a cause that did not exist, since the names were fine and
-  the DEPTH was the problem. `rm -rf` removed the identical folder in under a
-  second, so the refusal was the app's own. Permanent deletion now traverses
-  by open directory handle the same way, with the same no-follow and
-  mount-boundary rules as the inspection, and a constant number of open
-  handles at any depth. Moving to the Trash was never affected (it is a
-  rename). REMAINING, and now said honestly instead of being blamed on a
-  file name: the SIZE of such a folder still cannot be measured, so it is
-  listed at review risk with "couldn't measure its size: part of it sits
-  deeper than an absolute path can address — deleting it still works", and
-  the bytes it frees are under-reported.
-- **Orphaned-caches delete: a folder replaced after it was inspected is no
-  longer deleted.** The pre-delete safety inspection holds the folder open,
-  which is what stops it following a swap — and also what pins it to the
-  folder it opened. If that folder was renamed away and a NEW one created
-  under the same name, the inspection reported "clean" about the folder it
-  held while the deletion, which works by path, removed the replacement.
-  Every other check in the path (container admission, containment, deny
-  list, mount boundary) is satisfied by the replacement. The inspection now
-  re-checks its own root before accepting a result, and reports WHICH object
-  its verdict is about so the deletion refuses unless that object is still
-  the one at the path. Refusals are clearable by re-scanning.
-- **Orphaned-caches "Move to Trash": the same replaced folder is no longer
-  trashed either.** Move to Trash is ON by default, and it did not go
-  through the deletion that was hardened above — it handed the folder's path
-  to the system Trash, behind nothing but a check that a swap timed one
-  syscall earlier defeats. A folder replaced in that instant was moved to
-  the Trash whole, and the app reported success with the byte count of the
-  folder it had actually inspected. The system Trash takes a path and
-  resolves it itself, so the check cannot be handed the open folder the way
-  the permanent deletion now can; what makes this safe instead is that
-  moving to the Trash destroys nothing. The app now checks the folder it
-  holds open before the move, checks WHAT THE TRASH ACTUALLY TOOK
-  afterwards, and PUTS BACK anything that turns out not to be the inspected
-  folder — reporting zero bytes freed either way. REMAINING: if the put-back
-  cannot be performed because something else has taken the original name,
-  the item stays in the Trash and the error names its path so it can be
-  restored in one drag; and a Trash that will not say where it put an item
-  is refused rather than counted, leaving that item in the Trash too.
-- **Orphaned-caches probe: deep folders no longer burn CPU quadratically.**
-  The walk re-scanned its whole open-folder stack on every level it
-  descended, so a deeply nested cache close to the inspection budget could
-  stall for a long time even though the number of entries inspected was
-  capped. The accounting is now incremental and bounded by the number of
-  folders held open, never by depth.
-- **Orphaned-caches probe: ancestor-swap disclosure.** The bounded
-  user-data probe resolved each child by absolute path, so a directory
-  replaced by a symlink after its parent had been read (but before the
-  child was vetted) redirected the walk outside `~/Library/Caches` — up to
-  the full 20,000-entry budget — and attributed what it found there to the
-  cache entry. `O_NOFOLLOW` guards only the final component, and the
-  identity re-proof could not help because the identity it compared was
-  already the foreign object's. The probe now holds each parent open and
-  discovers, stats and descends every child relative to that descriptor by
-  single-component basename, at a bounded number of live descriptors. Two
-  side effects are user-visible: trees whose absolute paths exceed
-  `PATH_MAX` are now inspected instead of being refused forever, and mount
-  boundaries are detected by filesystem id rather than by path spelling, so
-  an aliased path can no longer hide one.
 - **Freed-bytes over-report (D1).** Freed bytes were assumed from pre-scan
   totals even when deletion partially failed. Every deletion target is now
   measured immediately before deletion and settled through claim-based

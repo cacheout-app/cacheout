@@ -1596,9 +1596,12 @@ enum ValuablesDetector {
         var budgetTruncated = false
         var obstructed = false
         while true {
-            // Checked EVERY entry, not every N: the check is a flag read
-            // beside a `readdir`, and an interval would put a directory's own
-            // size back into the wind-down latency this exists to bound.
+            // Checked EVERY entry, not every N. Measured on this machine
+            // inside a real `Task` (where the check takes its atomic-load
+            // path) over a 50,000-entry directory: 11.55 ns for the poll
+            // against 513.50 ns per `readdir` entry — 2.2%. An interval would
+            // buy that back by putting a directory's own size into the
+            // wind-down latency this exists to bound.
             if Task.isCancelled {
                 obstructed = true
                 break

@@ -89,12 +89,33 @@
 /// The ROOT is the one thing the caller supplies, and there are now TWO ways
 /// to supply it. `probe(at:root:…)` takes a root the caller has ALREADY OPENED
 /// and reached by containment — that is what the scan-time face does, from the
-/// dev-root descriptor it has held since admission — so the artifact dir's own
-/// ancestors are never resolved at all. `probe(at:provider:…)` opens the root
-/// by path, and there the RESIDUAL stands, accepted and documented: that open
-/// resolves the root's ancestors, so an attacker who already owns the probed
-/// directory's PARENT can redirect the walk. `O_NOFOLLOW_ANY` would close it
-/// and would also break the legitimate aliased roots this codebase supports
+/// dev-root descriptor it has held since admission — so the walk never RE-opens
+/// or re-resolves an ancestor once it holds a descriptor for it.
+///
+/// It does NOT follow that the contained face resolves no ancestors (this
+/// header said exactly that, and PR #457 review r11 measured it false). Exactly
+/// ONE path resolution survives, and it is authorization-bearing: the identity
+/// anchor, `provider.canonicalize(directory)` in `probeCore`, whose output is
+/// the base of every disclosed `canonicalIdentityPath` and therefore of the
+/// acknowledgement-token preimage. Swap the artifact dir's PARENT between the
+/// caller's open and the probe and that anchor resolves through the swap, so a
+/// file genuinely inside the held inode is published under a foreign path and
+/// its token rotates — reproduced with a real `rename(2)`+`symlink(2)` against
+/// a held `SecureDirectory`.
+///
+/// What the anchoring change actually bought, stated exactly: it cut the
+/// hostile-resolvable resolutions from (1 root + N valuables) to (1 root), and
+/// the surviving one is measured byte-identical in exposure to the derivation
+/// it replaced — strictly fewer, never more. It is fail-closed downstream: the
+/// rotated token does not match at delete time, so the clean is REFUSED rather
+/// than performed against the wrong tree (`testAdvScanTimeTokenAuthorizesThe`
+/// `ProductionRevalidator` pins the honest round trip; a rotated token refuses).
+/// Closing it entirely needs `F_GETPATH` on the held anchor, which would change
+/// the identity doctrine for every scanner — deliberately out of scope here.
+///
+/// `probe(at:provider:…)` opens the root by path, so it carries the same
+/// residual plus the root's own open. `O_NOFOLLOW_ANY` would close both and
+/// would also break the legitimate aliased roots this codebase supports
 /// (`/tmp` → `/private/tmp`, a symlinked `$HOME`). The DELETE-TIME face is
 /// still that shape — it is handed a bare URL and has no descriptor to
 /// descend from. Its exposure is narrower in one direction and unchanged in

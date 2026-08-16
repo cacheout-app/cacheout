@@ -297,18 +297,61 @@ enum UserDataProbeObstruction: CaseIterable, Comparable, Sendable {
 /// nothing obstructed the walk, which is the fail-closed rule the classifier
 /// (R4) and the delete-time revalidation both read.
 struct UserDataProbeResult: Equatable {
+
+    /// WHAT THIS VERDICT IS ABOUT (PR #458 review r7 — the swap DUAL).
+    ///
+    /// The walk is anchored to a HELD DESCRIPTOR, which is what stops it
+    /// FOLLOWING a swap — and, by exactly the same mechanism, PINS it to the
+    /// old inode when one happens. That is the dual of the ancestor-swap
+    /// bug this file already closed: inspect the right object and then
+    /// DELETE A DIFFERENT ONE at the same name. A probe verdict is therefore
+    /// not a fact about a PATH; it is a fact about an OBJECT, and it has to
+    /// travel with enough identity for the deletion to prove the path still
+    /// names that object (`CacheCleaner.removeGuardedItem`).
+    enum InspectedRoot: Equatable {
+        /// A real directory was opened and walked; this is the `fstat`
+        /// identity of the descriptor the whole walk was anchored to.
+        case directory(FileSystemIdentityProvider.Identity)
+        /// The root open reported `ENOENT`/`ENOTDIR`: there is no directory
+        /// TREE of ours at that name — absent, symlink, regular file,
+        /// special file — and deletion removes the leaf as-is. The clean
+        /// verdict is about the ABSENCE of a tree, so a directory appearing
+        /// at that name since voids it just as surely as a swapped inode.
+        case noDirectoryTree
+        /// Nothing was established: the probe refused before it could bind
+        /// anything. NEVER a licence to delete.
+        case unestablished
+    }
+
     /// Matched pattern NAMES in table order, deduplicated.
     let matches: [String]
     /// Deduplicated and sorted in declaration order — deterministic output
     /// for a deterministic message. Empty iff the walk finished.
     let obstructions: [UserDataProbeObstruction]
+    /// The object the verdict describes. Defaulted so every construction
+    /// site that has proven nothing says so without having to remember to.
+    let inspected: InspectedRoot
+
+    init(
+        matches: [String],
+        obstructions: [UserDataProbeObstruction],
+        inspected: InspectedRoot = .unestablished
+    ) {
+        self.matches = matches
+        self.obstructions = obstructions
+        self.inspected = inspected
+    }
 
     /// FAIL-CLOSED completeness (epic rule).
     var complete: Bool { obstructions.isEmpty }
 
     /// The clean, finished verdict.
-    static func complete(matches: [String] = []) -> UserDataProbeResult {
-        UserDataProbeResult(matches: matches, obstructions: [])
+    static func complete(
+        matches: [String] = [], inspected: InspectedRoot = .unestablished
+    ) -> UserDataProbeResult {
+        UserDataProbeResult(
+            matches: matches, obstructions: [], inspected: inspected
+        )
     }
 }
 
@@ -1109,8 +1152,9 @@ struct OrphanedCachesScanner: @unchecked Sendable {
         /// this. The spelling lives once, as one basename per level, in the
         /// walk's `pathComponents`, and is composed into a URL only when an
         /// observer asks (`logicalURL(atDepth:)`).
-        /// Subdirectory basenames, byte-wise ASCENDING.
-        var pending: [String] = []
+        /// Subdirectory basenames, byte-wise ASCENDING — as VALIDATED
+        /// components, so the descent below has nothing left to check.
+        var pending: [SafeComponent] = []
         var cursor: Int = 0
         /// The `fstatat` identity of each pending name, for the descent's
         /// cheap corroborator.
@@ -1142,16 +1186,48 @@ struct OrphanedCachesScanner: @unchecked Sendable {
         /// `live + transient` is the count an external observer of this
         /// process sees, and tests assert that equality.
         case descriptorCensus(live: Int, transient: Int, depth: Int)
+        /// How many frame/live-index inspections ONE `makeRoom` performed.
+        ///
+        /// The walk's own bookkeeping is a RESOURCE, and the entry budget
+        /// bounds ATTENTION, not resources — the distinction that has now
+        /// cost this walk three times. Wall-clock cannot pin an asymptote
+        /// deterministically; this can, so a test asserts the accounting is
+        /// bounded by the descriptor WINDOW rather than by DEPTH.
+        case frameBookkeeping(inspected: Int, depth: Int)
     }
 
-    /// A basename that may be handed to `openat`/`fstatat`.
+    /// A basename PROVEN safe to hand to `openat`/`fstatat`.
     ///
     /// MANDATORY, not belt-and-braces. `openat` accepts a MULTI-COMPONENT
     /// relative path and `O_NOFOLLOW` then guards only its LAST component —
     /// measured on this platform: `openat(base, "cache/mid/secret.bin",
-    /// O_NOFOLLOW)` opened a foreign file through a symlinked `mid`.
-    /// `readdir` cannot produce such a name today; this turns a future
-    /// refactor that could into a refusal rather than a hole.
+    /// O_NOFOLLOW)` opened a foreign file through a symlinked `mid`. APFS
+    /// and HFS+ will not create such a basename, but `d_name` is whatever
+    /// the filesystem driver puts there, and a userland one (FUSE, SMB) is
+    /// not the kernel.
+    ///
+    /// A TYPE, NOT TWO CALLS (PR #458 review r7). The predicate used to be
+    /// invoked at two sites — once before the discovery `fstatat`, once
+    /// before the descent `openat` — and DELETING EITHER LEFT THE SUITE
+    /// GREEN, because the other caught the name first. Two mutually masking
+    /// copies of one rule are one refactor from both being dropped as dead.
+    /// There is now a single construction point and no way to spell a
+    /// component that has not been through it: `Frame.pending` holds these
+    /// rather than strings, so "an unvalidated name reached a syscall" is
+    /// not a bug this walk can have.
+    struct SafeComponent {
+        let name: String
+
+        init?(_ name: String) {
+            guard OrphanedCachesScanner.isSafeComponent(name) else {
+                return nil
+            }
+            self.name = name
+        }
+    }
+
+    /// The predicate itself, kept separately addressable so its truth table
+    /// is testable without a hostile volume.
     static func isSafeComponent(_ name: String) -> Bool {
         !name.isEmpty && name != "." && name != ".."
             && !name.utf8.contains(UInt8(ascii: "/"))
@@ -1189,6 +1265,7 @@ struct OrphanedCachesScanner: @unchecked Sendable {
         provider: FileSystemIdentityProvider,
         entryLimit: Int,
         descriptorWindow: Int = OrphanedCachesScanner.defaultDescriptorWindow(),
+        decode: (UnsafePointer<CChar>) -> String? = decodedBasename(fromCString:),
         onEvent: ((WalkEvent) -> Void)? = nil
     ) -> UserDataProbeResult {
         var matched = Set<String>()
@@ -1214,7 +1291,12 @@ struct OrphanedCachesScanner: @unchecked Sendable {
         )
         guard rootDescriptor >= 0 else {
             let code = errno
-            if code == ENOENT || code == ENOTDIR { return .complete() }
+            if code == ENOENT || code == ENOTDIR {
+                // Clean AND complete — and the verdict says WHAT it is
+                // about, so the deletion can prove no directory tree has
+                // appeared at that name since.
+                return .complete(inspected: .noDirectoryTree)
+            }
             return refuse(obstruction(forErrno: code))
         }
         guard let root = SecureDirectory(fd: rootDescriptor, provider: provider)
@@ -1277,9 +1359,35 @@ struct OrphanedCachesScanner: @unchecked Sendable {
             return url
         }
 
+        /// The frame indices BELOW THE ROOT that currently hold a
+        /// descriptor. `frames[0]` is excluded because I3 never releases it,
+        /// so this list holds AT MOST `window - 1` entries — bounded by the
+        /// WINDOW, never by DEPTH.
+        ///
+        /// IT EXISTS BECAUSE THE BUDGET BOUNDS ATTENTION, NOT RESOURCES, AND
+        /// CPU IS A RESOURCE (PR #458 review r7 — the third time that
+        /// distinction has cost this walk something, after
+        /// `contentsOfDirectory` materialising a whole directory before any
+        /// cap could apply and the per-frame `URL` prefix). Every descent
+        /// used to rescan the WHOLE frame stack three times — the
+        /// eager-tail-release loop, `liveCount()`'s reduce, and the
+        /// shallowest-live search — so a single-child chain approaching the
+        /// 20,000-entry budget performed on the order of 10⁹ frame
+        /// inspections before it even began to unwind: quadratic CPU inside
+        /// a walk whose only bound is an ENTRY count, on exactly the deep
+        /// trees e9de405 rescued. Kept incrementally, all three answers cost
+        /// `O(window)`, and the walk is linear in entries at any depth.
+        var liveBelowRoot: [Int] = []
+
         /// Live descriptors held by the frame stack (transients excluded).
-        func liveCount() -> Int {
-            frames.reduce(0) { $0 + ($1.dir == nil ? 0 : 1) }
+        /// `+ 1` is the root, which is always live (I3).
+        func liveCount() -> Int { liveBelowRoot.count + 1 }
+
+        /// Drop `index` from the live list. `O(window)`.
+        func forgetLive(_ index: Int) {
+            if let slot = liveBelowRoot.firstIndex(of: index) {
+                liveBelowRoot.remove(at: slot)
+            }
         }
 
         /// INVARIANT I3: `frames[0]` is NEVER released — the continuously
@@ -1288,27 +1396,45 @@ struct OrphanedCachesScanner: @unchecked Sendable {
         /// is relative to, so at least one must be held continuously).
         /// INVARIANT I4: `liveCount() <= window` after this returns and the
         /// caller appends one frame.
-        func makeRoom() {
+        ///
+        /// `depth` is the frame the walk is descending FROM.
+        func makeRoom(after depth: Int) {
+            var inspected = 1
             // EAGER TAIL RELEASE, and it is FREE: a frame with nothing left
             // to descend into is never climbed back to, so releasing it
             // costs no `..` at all. On a pure deep chain this fires at every
             // level, which is why a 500-deep chain holds two descriptors and
             // performs ZERO re-anchors.
-            if frames.count > 1 {
-                for index in 1..<frames.count
-                where frames[index].dir != nil
-                    && frames[index].cursor == frames[index].pending.count {
-                    frames[index].dir = nil
-                }
+            //
+            // ONLY `frames[depth]` CAN HAVE NEWLY BECOME EXHAUSTED, so the
+            // old sweep over every frame was pure re-inspection: a frame's
+            // cursor advances only while it is the deepest, and this runs at
+            // the instant it stops being so; a frame left exhausted by a
+            // `continue` (a failed open, a refused corroboration) is popped
+            // on the very next iteration rather than descended past; and
+            // `climb` only ever restores frames that still have pending
+            // work, so a re-anchored frame is never exhausted.
+            if depth >= 1, frames[depth].dir != nil,
+               frames[depth].cursor == frames[depth].pending.count {
+                frames[depth].dir = nil
+                inspected += liveBelowRoot.count
+                forgetLive(depth)
             }
-            guard liveCount() >= window else { return }
-            // Window pressure: give up the SHALLOWEST live frame, the one
-            // the walk will need again last. Cost: `..` steps on the way
-            // back up — never a refusal.
-            if let shallowest = frames.indices.first(
-                where: { $0 >= 1 && frames[$0].dir != nil }
-            ) {
-                frames[shallowest].dir = nil
+            if liveCount() >= window, !liveBelowRoot.isEmpty {
+                // Window pressure: give up the SHALLOWEST live frame, the
+                // one the walk will need again last. Cost: `..` steps on the
+                // way back up — never a refusal.
+                var slot = liveBelowRoot.startIndex
+                for index in liveBelowRoot.indices
+                where liveBelowRoot[index] < liveBelowRoot[slot] {
+                    slot = index
+                }
+                inspected += liveBelowRoot.count
+                frames[liveBelowRoot[slot]].dir = nil
+                liveBelowRoot.remove(at: slot)
+            }
+            if let emit = onEvent {
+                emit(.frameBookkeeping(inspected: inspected, depth: depth))
             }
         }
 
@@ -1364,6 +1490,7 @@ struct OrphanedCachesScanner: @unchecked Sendable {
                 transient = 1
             }
             frames[target].dir = current
+            liveBelowRoot.append(target)   // `target >= 1`: I3 keeps 0 live
             onEvent?(.didReanchor(depth: target))
             return true
         }
@@ -1393,7 +1520,8 @@ struct OrphanedCachesScanner: @unchecked Sendable {
                 }
             }
             switch boundedChildNames(
-                inDirectory: dir.fd, limit: remaining, whileReading: census
+                inDirectory: dir.fd, limit: remaining, whileReading: census,
+                decode: decode
             ) {
             case .unreadable(let cause):
                 // Unreadable branch: absence of matches is unproven, and the
@@ -1416,7 +1544,7 @@ struct OrphanedCachesScanner: @unchecked Sendable {
                 ))
             }
 
-            var pending: [String] = []
+            var pending: [SafeComponent] = []
             var vetted: [String: FileSystemIdentityProvider.Identity] = [:]
             var continues = true
 
@@ -1429,7 +1557,11 @@ struct OrphanedCachesScanner: @unchecked Sendable {
                     break
                 }
                 visited += 1
-                guard isSafeComponent(name) else {
+                // THE ONE VALIDATION POINT. Everything downstream — the
+                // discovery `fstatat` here and the descent `openat` in the
+                // walk loop — takes `component.name`, which cannot exist
+                // without having passed it.
+                guard let component = SafeComponent(name) else {
                     obstructions.insert(.transientFailure)
                     continue
                 }
@@ -1438,7 +1570,7 @@ struct OrphanedCachesScanner: @unchecked Sendable {
                 // casefolding can only ADD matches, which only forces
                 // review / refuses deletion.
                 for pattern in userDataShapePatterns
-                where fnmatch(pattern.glob, name, FNM_CASEFOLD) == 0 {
+                where fnmatch(pattern.glob, component.name, FNM_CASEFOLD) == 0 {
                     matched.insert(pattern.name)
                 }
                 // ONE `fstatat` against the HELD parent: kind and identity
@@ -1449,20 +1581,22 @@ struct OrphanedCachesScanner: @unchecked Sendable {
                 // `@autoclosure`, so production, which ignores it, composes
                 // nothing at all.
                 switch provider.probeChild(
-                    inDirectory: dir.fd, named: name,
+                    inDirectory: dir.fd, named: component.name,
                     // `isDirectory: false`: this child's kind is what the
                     // probe is about to establish, so the spelling claims
                     // nothing about it (and never stats to find out).
                     logical: logicalURL(atDepth: index)
-                        .appendingPathComponent(name, isDirectory: false)
+                        .appendingPathComponent(
+                            component.name, isDirectory: false
+                        )
                 ) {
                 case .facts(let facts) where facts.kind == .directory:
                     // ALWAYS descended: discovering this directory already
                     // cost an entry, and the budget bounds everything that
                     // follows. Refusing to look past some fixed level is
                     // what stranded ordinary caches.
-                    pending.append(name)
-                    vetted[name] = facts.identity
+                    pending.append(component)
+                    vetted[component.name] = facts.identity
                 case .facts:
                     // Symlink / regular file / special: matched by NAME
                     // above, never descended (the no-follow rule).
@@ -1481,7 +1615,10 @@ struct OrphanedCachesScanner: @unchecked Sendable {
         }
 
         guard enumerate(0) else {
-            return finishedWalk(matched: matched, obstructions: obstructions)
+            return finishedWalk(
+                matched: matched, obstructions: obstructions,
+                inspected: .directory(root.identity)
+            )
         }
 
         walk: while !frames.isEmpty {
@@ -1510,12 +1647,13 @@ struct OrphanedCachesScanner: @unchecked Sendable {
                         break walk
                     }
                 }
+                if frames[depth].dir != nil { forgetLive(depth) }
                 frames.removeLast()   // `deinit` closes the descriptor
                 if !pathComponents.isEmpty { pathComponents.removeLast() }
                 continue
             }
 
-            let name = frames[depth].pending[frames[depth].cursor]
+            let name = frames[depth].pending[frames[depth].cursor].name
             frames[depth].cursor += 1
 
             // The budget is checked BEFORE the child is opened, exactly as
@@ -1535,10 +1673,12 @@ struct OrphanedCachesScanner: @unchecked Sendable {
                 emit(.willDescend(name: name, from: logicalURL(atDepth: depth)))
             }
 
-            guard isSafeComponent(name) else {
-                obstructions.insert(.transientFailure)
-                continue
-            }
+            // NO COMPONENT CHECK HERE, and that is the fix rather than an
+            // omission: `pending` holds `SafeComponent`s, so this name has
+            // already been through the one validation point there is. The
+            // second call that used to sit here was invisible to any test
+            // that deleted it — the first one caught every name first.
+
             // THE PARENT REFERENCE IS SCOPED ON PURPOSE. A `let parent =
             // frames[depth].dir` held across the rest of this iteration
             // outlives `makeRoom`'s release of that very frame and keeps its
@@ -1620,10 +1760,11 @@ struct OrphanedCachesScanner: @unchecked Sendable {
                 continue
             }
 
-            makeRoom()   // never a refusal, never a budget spend
+            makeRoom(after: depth)   // never a refusal, never a budget spend
             // The two stacks move together: one basename pushed per frame,
             // popped with it. (`pathComponents.count == frames.count - 1`.)
             frames.append(Frame(dir: child, identity: child.identity))
+            liveBelowRoot.append(frames.count - 1)
             pathComponents.append(name)
             onEvent?(.descriptorCensus(
                 live: liveCount(), transient: 0, depth: frames.count - 1
@@ -1631,19 +1772,45 @@ struct OrphanedCachesScanner: @unchecked Sendable {
             guard enumerate(frames.count - 1) else { break walk }
         }
 
+        // THE HELD ROOT, REVALIDATED AGAINST THE NAME (PR #458 review r7 —
+        // the DUAL of the ancestor swap).
+        //
+        // Holding a descriptor is what stops this walk FOLLOWING a swap; it
+        // is also what PINS it to the old inode when one happens. If the
+        // target is renamed away mid-walk and a replacement directory is
+        // created at the same name, every descriptor-relative step below
+        // stays perfectly correct — about the RELOCATED tree — and the walk
+        // would otherwise report `complete` for a path that now names
+        // something nobody has looked at. `automaticCleanEligible` reads
+        // exactly that verdict, and the deletion takes a PATH.
+        //
+        // One `lstat` of the walk root — the same single path-based access
+        // the root open already is, and the last honest place to ask. A
+        // rename is retryable, so it is `.transientFailure`: a re-scan finds
+        // whatever is really there now and completes. The comparison runs
+        // unconditionally so there is still exactly ONE exit.
+        if provider.identity(of: entryURL) != root.identity {
+            obstructions.insert(.transientFailure)
+        }
+
         // Teardown: dropping `frames` releases every descriptor on EVERY
         // exit path, including this one.
-        return finishedWalk(matched: matched, obstructions: obstructions)
+        return finishedWalk(
+            matched: matched, obstructions: obstructions,
+            inspected: .directory(root.identity)
+        )
     }
 
     /// Table order, deduplicated — deterministic output for fn-3.2, and
     /// obstructions in declaration order for a deterministic message.
     private static func finishedWalk(
-        matched: Set<String>, obstructions: Set<UserDataProbeObstruction>
+        matched: Set<String>, obstructions: Set<UserDataProbeObstruction>,
+        inspected: UserDataProbeResult.InspectedRoot
     ) -> UserDataProbeResult {
         UserDataProbeResult(
             matches: userDataShapePatterns.map(\.name).filter(matched.contains),
-            obstructions: obstructions.sorted()
+            obstructions: obstructions.sorted(),
+            inspected: inspected
         )
     }
 

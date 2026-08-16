@@ -126,6 +126,23 @@ now 3 and destructive commands require `--confirm`. Coordinate MCP updates with
 
 ### Fixed
 
+- **Orphaned-caches delete: a folder replaced after it was inspected is no
+  longer deleted.** The pre-delete safety inspection holds the folder open,
+  which is what stops it following a swap — and also what pins it to the
+  folder it opened. If that folder was renamed away and a NEW one created
+  under the same name, the inspection reported "clean" about the folder it
+  held while the deletion, which works by path, removed the replacement.
+  Every other check in the path (container admission, containment, deny
+  list, mount boundary) is satisfied by the replacement. The inspection now
+  re-checks its own root before accepting a result, and reports WHICH object
+  its verdict is about so the deletion refuses unless that object is still
+  the one at the path. Refusals are clearable by re-scanning.
+- **Orphaned-caches probe: deep folders no longer burn CPU quadratically.**
+  The walk re-scanned its whole open-folder stack on every level it
+  descended, so a deeply nested cache close to the inspection budget could
+  stall for a long time even though the number of entries inspected was
+  capped. The accounting is now incremental and bounded by the number of
+  folders held open, never by depth.
 - **Orphaned-caches probe: ancestor-swap disclosure.** The bounded
   user-data probe resolved each child by absolute path, so a directory
   replaced by a symlink after its parent had been read (but before the

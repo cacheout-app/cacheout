@@ -853,6 +853,38 @@ actor CacheCleaner {
 
     // MARK: - Item mode (.removeItem, R15)
 
+    /// Does `target` STILL name the object the pre-delete probe inspected?
+    ///
+    /// One no-follow `lstat`, asked as late as the path-based deletion API
+    /// allows. It can only REFUSE — never widen admission — and it is
+    /// deliberately asked of the UNRESOLVED target spelling, which is the
+    /// one `removeItem` will act on.
+    ///
+    /// RESIDUAL, STATED: the window between this `lstat` and the deletion
+    /// syscall is irreducible for as long as the deletion takes a path.
+    /// What it costs is unchanged from every other path check in this
+    /// method; what it buys is that the probe's whole inspection window —
+    /// the entire bounded walk, which is orders of magnitude longer — is no
+    /// longer part of the exposure.
+    private func probedObjectStillAtTarget(
+        _ inspected: UserDataProbeResult.InspectedRoot, target: URL
+    ) -> Bool {
+        switch inspected {
+        case .directory(let identity):
+            return provider.identity(of: target) == identity
+        case .noDirectoryTree:
+            // The clean verdict rested on there being no directory TREE of
+            // ours at that name (absent, symlink, regular file, special) —
+            // deletion removes the leaf as-is. A directory standing there
+            // now is a tree the probe never opened.
+            return provider.kind(of: target) != .directory
+        case .unestablished:
+            // No verdict to bind to. Unreachable — an incomplete probe has
+            // already refused above — so fail closed rather than assume.
+            return false
+        }
+    }
+
     /// One `.removeItem` deletion. `origin` is the item's CLAIMED container
     /// — validated by `admitContainer` against the CONSTRUCTOR-injected
     /// container roots (the runtime's scanner-declared union; a buggy or
@@ -936,11 +968,15 @@ actor CacheCleaner {
         // minimal (the scanner owns its probe; the cleaner owns the
         // chokepoint) — generalize into a per-scanner revalidator seam when
         // fn-4/fn-5 scanners need one.
+        // WHAT THE PRE-DELETE PROBE'S VERDICT IS ABOUT, carried to the
+        // deletion itself (PR #458 review r7). `nil` when no probe ran.
+        var probedObject: UserDataProbeResult.InspectedRoot?
         if item.scannerID == OrphanedCachesScanner.registeredID,
            item.automaticCleanEligible {
             let probe = OrphanedCachesScanner.preDeleteUserDataProbe(
                 at: target, provider: provider
             )
+            probedObject = probe.inspected
             if !probe.matches.isEmpty {
                 let names = probe.matches.joined(separator: ", ")
                 let detail = "\(target.path): contents changed since scan — "
@@ -987,6 +1023,26 @@ actor CacheCleaner {
             // containment chain re-validates.
             let recheck = try pathGuard.admitContainer(origin, snapshot: snapshot)
             try pathGuard.validateRemovableItem(target, inside: recheck)
+            // THE PROBE'S BINDING, AT THE LAST INSTANT BEFORE THE DELETE.
+            //
+            // Detecting a swap inside the probe and then deleting by path
+            // anyway would be no fix at all. The probe holds a DESCRIPTOR,
+            // so its verdict is a fact about an OBJECT; every check above —
+            // container admission, containment, deny list, mount — is a fact
+            // about a PATH, and a replacement directory created at the
+            // target's name after the probe satisfies all of them while
+            // holding content nobody inspected. This is where the path is
+            // proven to still name the object the verdict is about.
+            if let probedObject,
+               !probedObjectStillAtTarget(probedObject, target: target) {
+                let detail = "\(target.path): the folder at this path is no "
+                    + "longer the one that was inspected — it was replaced "
+                    + "between the safety check and the deletion; refused, "
+                    + "re-scan required"
+                logRefusal(label: item.displayName, tag: "content-drift",
+                           detail: detail)
+                return (nil, [Self.itemError(item, detail)])
+            }
             if moveToTrash {
                 // A trash failure is an item error — it never falls through
                 // to a permanent delete (R11).

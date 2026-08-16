@@ -25,6 +25,34 @@
 /// non-final class solely so tests (via `@testable`) can subclass and override
 /// `identity(of:)` to inject device ids for hermetic cross-device / mount-point
 /// cases.
+///
+/// ## The DESCRIPTOR-RELATIVE family (PR #457/#458 review r5)
+///
+/// > Below a walk root, no filesystem operation takes a path. Every child is
+/// > discovered and opened relative to an open, vetted parent descriptor, by
+/// > single-component basename. A child's safety is established by CONTAINMENT
+/// > in a held parent inode, not by comparing a recorded identity.
+///
+/// The path-based family above answers questions about a SPELLING and is right
+/// for roots, identity, and display. It is structurally wrong for traversal:
+/// between any two path operations an attacker can replace an ANCESTOR
+/// component with a symlink, and every subsequent absolute-path call — the
+/// kind probe, the metadata lstat, the open — silently re-resolves through it.
+/// `O_NOFOLLOW` cannot help, because it guards only the FINAL component; and an
+/// identity re-proof cannot help either, because if the ancestor was swapped
+/// BEFORE the vetting `lstat`, the identity that gets recorded as "vetted" is
+/// already the foreign object's, so the re-proof compares foreign against
+/// foreign and passes.
+///
+/// The descriptor family below closes that by construction: `openat`,
+/// `fstatat`, `fstat`, `fstatfs` are all relative to a descriptor the walk
+/// already holds open and already vetted, and a held descriptor is INODE-PINNED
+/// — no rename, no symlink, and no remount can redirect it.
+///
+/// `logical` parameters are the UNRESOLVED spelling of the same object. They
+/// are the display/identity value the walk carries anyway, and they are the
+/// key hermetic tests override on. PRODUCTION NEVER OPENS, STATS, OR RESOLVES
+/// THEM in this family — they are carried, not used.
 
 import Foundation
 
@@ -99,6 +127,14 @@ class FileSystemIdentityProvider {
     func leafMetadata(of url: URL) -> LeafMetadata? {
         var st = stat()
         guard lstat(url.path, &st) == 0 else { return nil }
+        return Self.leafMetadata(from: st)
+    }
+
+    /// The ONE domain-checked `stat` → `LeafMetadata` derivation, shared by
+    /// the path-based `leafMetadata(of:)` and the descriptor-relative
+    /// `fstatat` probe below, so the two can never disagree on the pinned
+    /// value domains.
+    static func leafMetadata(from st: stat) -> LeafMetadata? {
         let (allocated, blocksOverflow) = Int64(st.st_blocks)
             .multipliedReportingOverflow(by: 512)
         guard !blocksOverflow, allocated >= 0 else { return nil }
@@ -120,6 +156,17 @@ class FileSystemIdentityProvider {
             modifiedSeconds: seconds,
             modifiedNanoseconds: nanoseconds
         )
+    }
+
+    /// The `S_IFMT` → `FileKind` mapping, shared by the path probe and the
+    /// descriptor-relative probe.
+    static func fileKind(from st: stat) -> FileKind {
+        switch st.st_mode & S_IFMT {
+        case S_IFREG: return .regularFile
+        case S_IFDIR: return .directory
+        case S_IFLNK: return .symlink
+        default: return .other
+        }
     }
 
     /// `st_nlink` of the object at `url` (no-follow). Hardlink detection:
@@ -193,6 +240,157 @@ class FileSystemIdentityProvider {
         return nil
     }
 
+    // MARK: - Descriptor-relative traversal (the no-path family)
+
+    /// Kind AND all-integer metadata from ONE descriptor-relative no-follow
+    /// `fstatat`. Replaces the `probeKind(of:)` + `leafMetadata(of:)` PAIR:
+    /// two independent path `lstat`s of the same name are two independent
+    /// re-resolutions, and on the valuables path the identity that authorises
+    /// a deletion came from the SECOND one — so a swapped ancestor could put
+    /// a foreign file's size/inode/mtime into the acknowledgement-token
+    /// preimage while the kind check saw the real object.
+    ///
+    /// `metadata` is `nil` only when the object's metadata falls outside the
+    /// pinned value domains (`LeafMetadata`); the KIND is still reported, so
+    /// a directory with a hostile mtime is still traversable while a FILE
+    /// with one is still undescribable and fails its caller closed.
+    enum DescriptorKindProbe: Equatable {
+        case kind(FileKind, identity: Identity, metadata: LeafMetadata?)
+        /// ENOENT/ENOTDIR — the name is not there (the benign vanish race).
+        case absent
+        /// `fstatat` failed for another reason (EACCES, EPERM, EIO, …).
+        case failed(errno: Int32)
+    }
+
+    /// The mount identity of an OPEN descriptor: `f_fsid` plus `st_dev`.
+    ///
+    /// `f_fsid` is the discriminator that actually works. Measured on this
+    /// machine (Darwin 25.5), `st_dev` is `16777230` for LITERALLY EVERY path
+    /// including `/` and `/System/Volumes/Data`, so a device comparison is
+    /// blind to the APFS system/data firmlink split it was partly meant to
+    /// catch; `f_fsid` separates them (`{16777235,26}` vs `{16777230,26}`).
+    /// `st_dev` is kept because it still catches ordinary external volumes and
+    /// is the value hermetic tests inject.
+    struct MountIdentity: Equatable {
+        let fsidMajor: Int32
+        let fsidMinor: Int32
+        let device: UInt64
+    }
+
+    /// Is `name` a single, safe path COMPONENT?
+    ///
+    /// MANDATORY, not belt-and-braces: measured on this machine,
+    /// `openat(base, "cache/mid/secret.bin", O_NOFOLLOW)` SUCCEEDS through a
+    /// symlinked `mid`, because `O_NOFOLLOW` guards only the final component.
+    /// A multi-component name handed to any call in this family therefore
+    /// defeats the entire no-follow guarantee. `readdir` cannot produce one
+    /// today; this turns a future refactor into a refusal instead of a hole.
+    static func isSafeComponent(_ name: String) -> Bool {
+        !name.isEmpty && name != "." && name != ".."
+            && !name.utf8.contains(UInt8(ascii: "/"))
+    }
+
+    /// The ONE path-based open of a walk: its ROOT.
+    ///
+    /// `O_NOFOLLOW` refuses a root that IS (or became) a symlink; `O_DIRECTORY`
+    /// refuses a non-directory. RESIDUAL, documented and accepted: this still
+    /// resolves the root's ANCESTORS, so an attacker who already owns the scan
+    /// root's parent directory can redirect the whole walk. Not closable at
+    /// this layer — `O_NOFOLLOW_ANY` would close it but refuses ANY symlink
+    /// anywhere in the path, breaking the legitimate aliased roots this
+    /// codebase supports (`/tmp` → `/private/tmp`, a symlinked `$HOME`).
+    /// Returns a negative value with `errno` set on failure.
+    func openDirectoryNoFollow(at url: URL) -> Int32 {
+        open(url.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
+    }
+
+    /// `fstatat(parent, name, AT_SYMLINK_NOFOLLOW)` — kind + metadata, one
+    /// atomic call, no path resolution. `logical` is carried for tests only.
+    func probeKind(
+        inDirectory parent: Int32, named name: String, logical url: URL
+    ) -> DescriptorKindProbe {
+        guard Self.isSafeComponent(name) else { return .failed(errno: EINVAL) }
+        var st = stat()
+        guard fstatat(parent, name, &st, AT_SYMLINK_NOFOLLOW) == 0 else {
+            let code = errno
+            return (code == ENOENT || code == ENOTDIR)
+                ? .absent
+                : .failed(errno: code)
+        }
+        return .kind(
+            Self.fileKind(from: st),
+            identity: Identity(
+                device: UInt64(bitPattern: Int64(st.st_dev)),
+                inode: UInt64(st.st_ino)
+            ),
+            metadata: Self.leafMetadata(from: st)
+        )
+    }
+
+    /// `openat(parent, name, O_RDONLY|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW)`.
+    /// SINGLE COMPONENT only (see `isSafeComponent`). Negative + `errno` on
+    /// failure; note a symlink `name` fails with **ENOTDIR**, not ELOOP,
+    /// because `O_DIRECTORY` is checked first — measured on this OS and
+    /// pinned by a test.
+    func openChildDirectory(
+        inDirectory parent: Int32, named name: String, logical url: URL
+    ) -> Int32 {
+        guard Self.isSafeComponent(name) else {
+            errno = EINVAL
+            return -1
+        }
+        return openat(
+            parent, name, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW
+        )
+    }
+
+    /// A FRESH enumeration description for an already-open directory.
+    ///
+    /// `openat(fd, ".")`, never `dup` and never `fcntl(F_DUPFD_CLOEXEC)`:
+    /// measured, both of those SHARE THE FILE OFFSET with the anchor, so a
+    /// second enumeration through them returns zero entries, and plain `dup`
+    /// additionally CLEARS `FD_CLOEXEC`, leaking directory descriptors into
+    /// every `posix_spawn` (this app spawns a privileged helper). `closedir`
+    /// on the resulting handle closes only this description; the anchor `fd`
+    /// survives.
+    func openSelfForEnumeration(_ fd: Int32) -> Int32 {
+        openat(fd, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+    }
+
+    /// `openat(fd, "..")` — the RE-ANCHOR step. `..` is never a symlink, so
+    /// `O_NOFOLLOW` is unnecessary. The caller MUST verify the result's
+    /// identity against the frame it is restoring: a mismatch means the
+    /// subtree was moved out from under the walk, which is not recoverable.
+    func openParentDirectory(of fd: Int32) -> Int32 {
+        openat(fd, "..", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+    }
+
+    /// `(st_dev, st_ino)` of an OPEN descriptor. The corroborator: what we
+    /// opened must BE what the parent-relative `fstatat` vetted. Sound now in
+    /// a way the path version never was, because the vetted value came from
+    /// `fstatat` on the SAME held parent descriptor.
+    func identity(ofDescriptor fd: Int32) -> Identity? {
+        var st = stat()
+        guard fstat(fd, &st) == 0 else { return nil }
+        return Identity(
+            device: UInt64(bitPattern: Int64(st.st_dev)),
+            inode: UInt64(st.st_ino)
+        )
+    }
+
+    /// `fstatfs`/`fstat` of an OPEN descriptor → its mount identity.
+    func mountIdentity(ofDescriptor fd: Int32) -> MountIdentity? {
+        var fs = statfs()
+        guard fstatfs(fd, &fs) == 0 else { return nil }
+        var st = stat()
+        guard fstat(fd, &st) == 0 else { return nil }
+        return MountIdentity(
+            fsidMajor: fs.f_fsid.val.0,
+            fsidMinor: fs.f_fsid.val.1,
+            device: UInt64(bitPattern: Int64(st.st_dev))
+        )
+    }
+
     // MARK: - Canonicalization
 
     /// `realpath(3)` of `path`; `nil` when it fails (typically ENOENT).
@@ -250,4 +448,43 @@ class FileSystemIdentityProvider {
         }
         return canonicalize(a).pathComponents == canonicalize(b).pathComponents
     }
+}
+
+// MARK: - SecureDirectory
+
+/// An OPEN, no-follow-vetted directory that OWNS its descriptor.
+///
+/// A class, not a struct, on purpose: the number-one hazard in a
+/// descriptor-anchored walk is leaking a descriptor on an early exit — a
+/// `break walk`, a `guard … else { return }`, a thrown cancellation. ARC's
+/// `deinit` covers every exit path; review vigilance does not. NEVER store a
+/// bare `Int32` for a directory anywhere in a walk.
+///
+/// Its `identity` and `mount` are captured from the DESCRIPTOR at open time
+/// (`fstat`/`fstatfs`), never from a path — a held descriptor is inode-pinned,
+/// so these values cannot be invalidated by a later rename, symlink swap, or
+/// overmount.
+final class SecureDirectory {
+    let fd: Int32
+    let identity: FileSystemIdentityProvider.Identity
+    let mount: FileSystemIdentityProvider.MountIdentity
+
+    /// Takes OWNERSHIP of `fd`. Returns nil — after closing `fd`, so the
+    /// failure path leaks nothing either — when the descriptor cannot be
+    /// characterised, which is fail-closed: an unverifiable open is never
+    /// treated as a vetted one.
+    init?(fd: Int32, provider: FileSystemIdentityProvider) {
+        guard fd >= 0,
+              let identity = provider.identity(ofDescriptor: fd),
+              let mount = provider.mountIdentity(ofDescriptor: fd)
+        else {
+            if fd >= 0 { close(fd) }
+            return nil
+        }
+        self.fd = fd
+        self.identity = identity
+        self.mount = mount
+    }
+
+    deinit { close(fd) }
 }

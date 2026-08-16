@@ -62,6 +62,38 @@ and docs/v1/CLI-REFERENCE.md) — the pre-release `node_modules` →
   stable item ids: a rescan preserves both selections and explicit
   deselections. Per-item selection previously reset on every rescan.
 
+### Security
+
+- **The build-artifacts walks are descriptor-anchored: no path resolution
+  below a scan root.** The valuables probe and the project-tree walker used
+  to re-resolve every child by absolute path — a kind `lstat`, a metadata
+  `lstat`, then an open. Any of those could be redirected by a concurrent
+  writer replacing an ANCESTOR directory with a symlink, and neither
+  `O_NOFOLLOW` (which guards only the last component) nor an inode re-proof
+  (whose "vetted" value was itself read through the swapped ancestor) could
+  see it. Both walks now open their root once and derive every child from the
+  descriptor they already hold — `fstatat`/`openat` by single-component
+  basename — so a child's safety is established by containment in a held,
+  vetted parent inode. This matters most on the valuables probe, whose output
+  feeds the acknowledgement token that authorizes a deletion. Live
+  descriptors are bounded (the probe holds at most `clamp((RLIMIT_NOFILE −
+  64)/4, 4, 64)` anchors plus two transients; the tree walker holds at most
+  its depth budget), and exceeding that bound is never a refusal — anchors
+  are released and restored with an identity-verified `..` step, so no tree
+  depth can strand an item the way the retired depth cap did.
+- **Mount boundaries are now discriminated by `f_fsid`.** Every path on an
+  APFS volume group reports the same `st_dev` (measured: `/` and
+  `/System/Volumes/Data` both report 16777230), so the device comparison was
+  blind to exactly the firmlink split it was meant to catch. The descriptor's
+  own `f_fsid` is now the primary signal; the previous path-based signals are
+  kept as an additional, refusal-only backstop.
+- **Known consequence.** The probe is now free of `PATH_MAX`: it can inspect
+  and certify a tree whose absolute paths exceed the limit, while
+  `FileManager.removeItem` — which the cleaner still uses — cannot address
+  one. Such a deletion fails with its own error rather than being silently
+  skipped; giving the deleter the same descriptor-relative treatment is
+  tracked separately.
+
 ### Changed
 
 - **BREAKING: CLI JSON `schema_version` bumps 3 → 4.** `--cli scan` output

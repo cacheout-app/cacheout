@@ -221,6 +221,174 @@ final class ProjectTreeWalkerTests: XCTestCase {
                        "no events beneath a symlink child — ever")
     }
 
+    // MARK: - R11: the ENUMERATION itself is no-follow (PR #457 review r5)
+
+    /// Collapses the swap RACE into a lie, so no timing is involved: it
+    /// reports `.kind(.directory)` for a path that is REALLY a symlink —
+    /// precisely the state the walk is in between its descent `lstat` and
+    /// the enumeration that follows. No re-`lstat` can close that window
+    /// (every path check re-opens it); only the open can refuse.
+    private final class SwapSimulatingProvider: FileSystemIdentityProvider {
+        var reportedAsDirectory: Set<String> = []
+        private(set) var probedPaths: [String] = []
+
+        override func probeKind(of url: URL) -> KindProbe {
+            probedPaths.append(url.path)
+            if reportedAsDirectory.contains(url.path) {
+                return .kind(.directory)
+            }
+            return super.probeKind(of: url)
+        }
+
+        /// The same lie on the DESCRIPTOR seam the walk uses below its root:
+        /// a directory kind for a name that is really a symlink, with the
+        /// REAL identity kept so only the `openat` itself can refuse.
+        override func probeKind(
+            inDirectory parent: Int32, named name: String, logical url: URL
+        ) -> DescriptorKindProbe {
+            probedPaths.append(url.path)
+            let real = super.probeKind(
+                inDirectory: parent, named: name, logical: url
+            )
+            guard reportedAsDirectory.contains(url.path),
+                  case .kind(_, let identity, let metadata) = real
+            else { return real }
+            return .kind(.directory, identity: identity, metadata: metadata)
+        }
+
+        func touches(below directory: URL) -> [String] {
+            probedPaths.filter { $0.hasPrefix(directory.path + "/") }
+        }
+    }
+
+    /// Reports a bogus INODE for chosen paths, real device intact so the
+    /// mount arm stays silent: a directory replaced by a DIFFERENT
+    /// directory, which passes every path check there is.
+    private final class WrongIdentityProvider: FileSystemIdentityProvider {
+        var bogusInodeFor: Set<String> = []
+        private(set) var probedPaths: [String] = []
+
+        override func identity(of url: URL) -> Identity? {
+            guard let real = super.identity(of: url) else { return nil }
+            guard bogusInodeFor.contains(url.path) else { return real }
+            return Identity(device: real.device, inode: real.inode &+ 1)
+        }
+
+        override func probeKind(of url: URL) -> KindProbe {
+            probedPaths.append(url.path)
+            return super.probeKind(of: url)
+        }
+
+        /// The vetting stat reports an inode the real object does not have —
+        /// the hermetic stand-in for a directory re-bound to a DIFFERENT real
+        /// directory, which `O_NOFOLLOW` cannot see. Only comparing the
+        /// OPENED descriptor against what was listed catches it.
+        override func probeKind(
+            inDirectory parent: Int32, named name: String, logical url: URL
+        ) -> DescriptorKindProbe {
+            probedPaths.append(url.path)
+            let real = super.probeKind(
+                inDirectory: parent, named: name, logical: url
+            )
+            guard bogusInodeFor.contains(url.path),
+                  case .kind(let kind, let identity, let metadata) = real
+            else { return real }
+            return .kind(
+                kind,
+                identity: Identity(
+                    device: identity.device, inode: identity.inode &+ 1
+                ),
+                metadata: metadata
+            )
+        }
+
+        func touches(below directory: URL) -> [String] {
+            probedPaths.filter { $0.hasPrefix(directory.path + "/") }
+        }
+    }
+
+    func testEnumerationRefusesAChildSwappedForASymlinkAfterItsDescentGate()
+        throws
+    {
+        // Left open, the walk enumerates a tree OUTSIDE the dev root and
+        // emits its contents as events UNDER the in-tree spelling — so a
+        // consumer matches artifact dirs in someone else's files, and every
+        // item derived from them names a path the dev root does not own.
+        let root = base.appendingPathComponent("dev")
+        let outside = base.appendingPathComponent("outside-the-dev-root")
+        try mkdir(outside.appendingPathComponent("Cargo-project/target"))
+        try writeFile(outside.appendingPathComponent("secret.bin"))
+        try mkdir(root)
+        let swapped = root.appendingPathComponent("proj")
+        try fm.createSymbolicLink(at: swapped, withDestinationURL: outside)
+
+        let provider = SwapSimulatingProvider()
+        provider.reportedAsDirectory.insert(swapped.path)
+
+        let (events, issues) = recordedWalk(roots: [root], provider: provider)
+
+        XCTAssertEqual(
+            provider.touches(below: swapped), [],
+            "the walk followed the swapped link and read outside the dev "
+                + "root: \(provider.probedPaths)"
+        )
+        XCTAssertEqual(
+            eventPaths(events), [root.path],
+            "no event may describe a directory the walk could not vet"
+        )
+        // Never a silent skip: a refused enumeration is a classified,
+        // visible per-root failure (R12).
+        XCTAssertEqual(issues.map(\.kind), [.unreadable])
+        XCTAssertEqual(issues.first?.url?.path, swapped.path)
+    }
+
+    func testEnumerationRefusesADirectorySwappedForADifferentDirectory()
+        throws
+    {
+        let root = base.appendingPathComponent("dev")
+        let sub = root.appendingPathComponent("proj")
+        try mkdir(sub.appendingPathComponent("target"))
+
+        let provider = WrongIdentityProvider()
+        provider.bogusInodeFor.insert(sub.path)
+
+        let (events, issues) = recordedWalk(roots: [root], provider: provider)
+
+        XCTAssertEqual(
+            provider.touches(below: sub), [],
+            "nothing inside an unvetted directory may be enumerated: "
+                + "\(provider.probedPaths)"
+        )
+        XCTAssertEqual(eventPaths(events), [root.path])
+        XCTAssertEqual(issues.map(\.kind), [.unreadable])
+        XCTAssertEqual(issues.first?.url?.path, sub.path)
+    }
+
+    func testEnumerationRefusesAROOTSwappedForASymlinkAfterItsKindGate()
+        throws
+    {
+        // The root gate is an `lstat`; the enumeration that follows is a
+        // path open. The gate stops a root that is ALREADY a symlink and
+        // cannot stop one that BECOMES one.
+        let outside = base.appendingPathComponent("outside-via-the-root")
+        try mkdir(outside.appendingPathComponent("proj/target"))
+        let root = base.appendingPathComponent("dev")
+        try fm.createSymbolicLink(at: root, withDestinationURL: outside)
+
+        let provider = SwapSimulatingProvider()
+        provider.reportedAsDirectory.insert(root.path)
+
+        let (events, issues) = recordedWalk(roots: [root], provider: provider)
+
+        XCTAssertEqual(
+            provider.touches(below: root), [],
+            "not one path below a swapped ROOT may be read: "
+                + "\(provider.probedPaths)"
+        )
+        XCTAssertTrue(events.isEmpty)
+        XCTAssertEqual(issues.map(\.kind), [.unreadable])
+    }
+
     // MARK: - R11: root gates (symlink leaf, non-directory, absent, refused)
 
     func testSymlinkLeafRootRefusedWithClassifiedIssue() throws {
@@ -672,6 +840,17 @@ final class ProjectTreeWalkerTests: XCTestCase {
                 return .failed(errno: code)
             }
             return super.probeKind(of: url)
+        }
+
+        /// The walk probes children descriptor-relatively, so the injection
+        /// has to live on that seam too.
+        override func probeKind(
+            inDirectory parent: Int32, named name: String, logical url: URL
+        ) -> DescriptorKindProbe {
+            if let code = failingNames[name] { return .failed(errno: code) }
+            return super.probeKind(
+                inDirectory: parent, named: name, logical: url
+            )
         }
     }
 

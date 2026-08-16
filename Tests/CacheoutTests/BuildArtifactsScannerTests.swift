@@ -310,6 +310,18 @@ final class BuildArtifactsScannerTests: XCTestCase {
             return super.probeKind(of: url)
         }
 
+        /// The probe reads children DESCRIPTOR-RELATIVELY since PR #457 r5, so
+        /// recording only the path seam would make "nothing beyond the
+        /// boundary was read" vacuously true. Both seams are recorded.
+        override func probeKind(
+            inDirectory parent: Int32, named name: String, logical url: URL
+        ) -> DescriptorKindProbe {
+            probedPaths.append(url.path)
+            return super.probeKind(
+                inDirectory: parent, named: name, logical: url
+            )
+        }
+
         /// Every recorded touch STRICTLY beneath `directory`.
         func touches(below directory: URL) -> [String] {
             let prefix = directory.path + "/"
@@ -344,6 +356,16 @@ final class BuildArtifactsScannerTests: XCTestCase {
         override func probeKind(of url: URL) -> KindProbe {
             probedPaths.append(url.path)
             return super.probeKind(of: url)
+        }
+
+        /// Both seams — see `BoundaryTouchRecordingProvider`.
+        override func probeKind(
+            inDirectory parent: Int32, named name: String, logical url: URL
+        ) -> DescriptorKindProbe {
+            probedPaths.append(url.path)
+            return super.probeKind(
+                inDirectory: parent, named: name, logical: url
+            )
         }
 
         func touches(below directory: URL) -> [String] {
@@ -2767,6 +2789,813 @@ final class BuildArtifactsScannerTests: XCTestCase {
                 .displayURL.path,
             dmg.path,
             "the discovered spelling reaches the item UNRESOLVED, as always"
+        )
+    }
+
+    // MARK: R3/R17 — the OPEN itself is no-follow (PR #457 review r5)
+
+    /// Collapses the swap RACE into a lie, so no timing is involved: it
+    /// reports a DIRECTORY for a name that is REALLY a symlink — precisely
+    /// the state the walk is in between the stat that vetted a child and the
+    /// open that descends it. The window cannot be closed by re-stat'ing
+    /// (every check re-opens it); only the open itself can refuse, so the
+    /// test drives the REAL `openat` against a REAL symlink and lets the
+    /// kernel decide.
+    ///
+    /// It lies on BOTH seams: the path probe (still used for the walk ROOT's
+    /// kind gate) and the descriptor-relative probe (every child below it).
+    /// The descriptor lie deliberately keeps the REAL identity and metadata,
+    /// so the identity corroborator is satisfied and `O_NOFOLLOW` is the only
+    /// thing standing between the walk and the foreign tree.
+    private final class SwapSimulatingProvider: FileSystemIdentityProvider {
+        /// Paths this provider lies about, reporting them as directories.
+        var reportedAsDirectory: Set<String> = []
+        private(set) var probedPaths: [String] = []
+
+        override func probeKind(of url: URL) -> KindProbe {
+            probedPaths.append(url.path)
+            if reportedAsDirectory.contains(url.path) {
+                return .kind(.directory)
+            }
+            return super.probeKind(of: url)
+        }
+
+        override func probeKind(
+            inDirectory parent: Int32, named name: String, logical url: URL
+        ) -> DescriptorKindProbe {
+            probedPaths.append(url.path)
+            let real = super.probeKind(
+                inDirectory: parent, named: name, logical: url
+            )
+            guard reportedAsDirectory.contains(url.path),
+                  case .kind(_, let identity, let metadata) = real
+            else { return real }
+            return .kind(.directory, identity: identity, metadata: metadata)
+        }
+
+        func touches(atOrBelow directory: URL) -> [String] {
+            probedPaths.filter {
+                $0 == directory.path || $0.hasPrefix(directory.path + "/")
+            }
+        }
+
+        func touches(below directory: URL) -> [String] {
+            probedPaths.filter { $0.hasPrefix(directory.path + "/") }
+        }
+    }
+
+    /// Reports a bogus INODE for chosen paths, keeping the REAL device so
+    /// the mount arm stays silent: the hermetic stand-in for a directory
+    /// replaced by a DIFFERENT directory between the vetting stat and the
+    /// open — which `O_NOFOLLOW` alone cannot catch, because it passes every
+    /// no-follow check there is. Only comparing the OPENED DESCRIPTOR against
+    /// what was vetted catches it.
+    private final class WrongIdentityProvider: FileSystemIdentityProvider {
+        var bogusInodeFor: Set<String> = []
+        private(set) var probedPaths: [String] = []
+
+        override func identity(of url: URL) -> Identity? {
+            guard let real = super.identity(of: url) else { return nil }
+            guard bogusInodeFor.contains(url.path) else { return real }
+            return Identity(device: real.device, inode: real.inode &+ 1)
+        }
+
+        override func probeKind(of url: URL) -> KindProbe {
+            probedPaths.append(url.path)
+            return super.probeKind(of: url)
+        }
+
+        override func probeKind(
+            inDirectory parent: Int32, named name: String, logical url: URL
+        ) -> DescriptorKindProbe {
+            probedPaths.append(url.path)
+            let real = super.probeKind(
+                inDirectory: parent, named: name, logical: url
+            )
+            guard bogusInodeFor.contains(url.path),
+                  case .kind(let kind, let identity, let metadata) = real
+            else { return real }
+            return .kind(
+                kind,
+                identity: Identity(
+                    device: identity.device, inode: identity.inode &+ 1
+                ),
+                metadata: metadata
+            )
+        }
+
+        func touches(below directory: URL) -> [String] {
+            probedPaths.filter { $0.hasPrefix(directory.path + "/") }
+        }
+    }
+
+    /// A foreign tree OUTSIDE every dev root, stocked with an above-floor
+    /// `.dmg` and an above-floor bundle — so a probe that reads it produces
+    /// a LOUD, checkable disclosure rather than a silent one.
+    @discardableResult
+    private func makeForeignTree(named name: String) throws -> URL {
+        let outside = base.appendingPathComponent(name)
+        try writeBulkFile(
+            outside.appendingPathComponent("Foreign.dmg"),
+            bytes: aboveFloorBytes
+        )
+        try makeBundle(
+            at: outside.appendingPathComponent("Foreign.app"),
+            contentBytes: aboveFloorBytes
+        )
+        return outside
+    }
+
+    func testProbeRefusesAChildSwappedForASymlinkAfterItsKindCheck() throws {
+        // The child passed the no-follow kind check; by the time it is
+        // POPPED and opened it is a symlink into a tree the deletion never
+        // touches. A plain `opendir` follows it and spends the entry budget
+        // OUTSIDE the artifact dir — and, here, derives an acknowledgement
+        // TOKEN from someone else's files on the path that authorizes
+        // deletion.
+        let outside = try makeForeignTree(named: "outside-the-dev-root")
+        let artifact = try makeProject(
+            at: dev.appendingPathComponent("rust"),
+            marker: "Cargo.toml", artifact: "target", payloadBytes: nil
+        )
+        let swapped = artifact.appendingPathComponent("release")
+        try fm.createSymbolicLink(at: swapped, withDestinationURL: outside)
+
+        let provider = SwapSimulatingProvider()
+        provider.reportedAsDirectory.insert(swapped.path)
+
+        let disclosure = BuildArtifactsScanner.preDeleteValuablesProbe(
+            at: artifact, provider: provider
+        )
+
+        XCTAssertEqual(
+            provider.touches(below: swapped), [],
+            "the probe followed the swapped link and read outside the "
+                + "artifact dir: \(provider.probedPaths)"
+        )
+        XCTAssertEqual(
+            disclosure.valuables.map(\.name), [],
+            "valuables from OUTSIDE the tree must never be attributed to "
+                + "this item: \(disclosure.valuables.map(\.name))"
+        )
+        XCTAssertFalse(
+            disclosure.probeComplete,
+            "a refused open is 'we did not look', never 'we looked and it "
+                + "was clean'"
+        )
+        XCTAssertTrue(disclosure.forcesReview)
+        XCTAssertNil(
+            disclosure.acknowledgementToken(
+                for: ItemKey(scannerID: "build_artifacts", itemID: "x")
+            ),
+            "an incomplete probe is TOKENLESS on every surface"
+        )
+    }
+
+    func testProbeRefusesTheROOTSwappedForASymlinkAfterItsKindGate() throws {
+        // The root kind gate is an `lstat` and the open that follows is a
+        // path open: the gate is on the WRONG SIDE of the window. It stops a
+        // root that is ALREADY a symlink; it cannot stop one that BECOMES
+        // one.
+        let outside = try makeForeignTree(named: "outside-via-the-root")
+        let project = dev.appendingPathComponent("rust")
+        try mkdir(project)
+        try writeFile(project.appendingPathComponent("Cargo.toml"), bytes: 32)
+        let artifact = project.appendingPathComponent("target")
+        try fm.createSymbolicLink(at: artifact, withDestinationURL: outside)
+
+        let provider = SwapSimulatingProvider()
+        provider.reportedAsDirectory.insert(artifact.path)
+
+        let disclosure = BuildArtifactsScanner.preDeleteValuablesProbe(
+            at: artifact, provider: provider
+        )
+
+        XCTAssertEqual(
+            provider.touches(below: artifact), [],
+            "not one path below a swapped ROOT may be read: "
+                + "\(provider.probedPaths)"
+        )
+        XCTAssertEqual(disclosure.valuables.map(\.name), [])
+        XCTAssertFalse(disclosure.probeComplete)
+    }
+
+    func testProbeRefusesADirectorySwappedForADifferentDirectory() throws {
+        // The belt-and-braces half: what we OPENED must BE what we VETTED.
+        // A directory swapped for another DIRECTORY passes `O_NOFOLLOW` and
+        // every path check there is — only the descriptor's own identity
+        // catches it (and, with it, an ANCESTOR re-pointed under us).
+        let artifact = try makeProject(
+            at: dev.appendingPathComponent("rust"),
+            marker: "Cargo.toml", artifact: "target", payloadBytes: nil
+        )
+        let sub = artifact.appendingPathComponent("release")
+        try writeBulkFile(
+            sub.appendingPathComponent("Shipped.dmg"), bytes: aboveFloorBytes
+        )
+
+        let provider = WrongIdentityProvider()
+        provider.bogusInodeFor.insert(sub.path)
+
+        let disclosure = BuildArtifactsScanner.preDeleteValuablesProbe(
+            at: artifact, provider: provider
+        )
+
+        XCTAssertEqual(
+            provider.touches(below: sub), [],
+            "nothing inside an unvetted directory may be read: "
+                + "\(provider.probedPaths)"
+        )
+        XCTAssertEqual(disclosure.valuables.map(\.name), [])
+        XCTAssertFalse(disclosure.probeComplete)
+    }
+
+    func testBundleSizingRefusesASubdirectorySwappedForASymlink() throws {
+        // The bundle sizer reuses the same directory-reading primitive, so
+        // it inherits the same window: a swapped subdirectory would size the
+        // bundle from a FOREIGN subtree — and the size is a token input.
+        let outside = try makeForeignTree(named: "outside-via-the-bundle")
+        let artifact = try makeProject(
+            at: dev.appendingPathComponent("rust"),
+            marker: "Cargo.toml", artifact: "target", payloadBytes: nil
+        )
+        let bundle = try makeBundle(
+            at: artifact.appendingPathComponent("Shipped.app"),
+            contentBytes: aboveFloorBytes
+        )
+        let swapped = bundle.appendingPathComponent("Frameworks")
+        try fm.createSymbolicLink(at: swapped, withDestinationURL: outside)
+
+        let provider = SwapSimulatingProvider()
+        provider.reportedAsDirectory.insert(swapped.path)
+
+        let disclosure = BuildArtifactsScanner.preDeleteValuablesProbe(
+            at: artifact, provider: provider
+        )
+
+        XCTAssertEqual(
+            provider.touches(below: swapped), [],
+            "the bundle sizing followed the swapped link: "
+                + "\(provider.probedPaths)"
+        )
+        XCTAssertFalse(
+            disclosure.probeComplete,
+            "a bundle sized past a refused open is a FLOOR, never a truth"
+        )
+        XCTAssertNil(
+            disclosure.acknowledgementToken(
+                for: ItemKey(scannerID: "build_artifacts", itemID: "x")
+            ),
+            "no token may derive from a partial size"
+        )
+    }
+
+    // MARK: R3/R17 — the ANCESTOR-swap race (PR #457 review, thread
+    // PRRT_kwDORmg6_86ZjZf9)
+
+    /// Perform `body` exactly ONCE, synchronously, the first time the probe
+    /// reports `event` — the exact instant the race lives in, with the REAL
+    /// kernel deciding the outcome. Single-threaded: no sleeps, no threads,
+    /// no timing dependence whatsoever.
+    private func onFirstProbeEvent(
+        matching matches: @escaping (ValuablesDetector.WalkEvent) -> Bool,
+        perform body: @escaping () -> Void
+    ) {
+        ValuablesDetector.testHook = { event in
+            guard matches(event) else { return }
+            ValuablesDetector.testHook = nil
+            body()
+        }
+    }
+
+    /// Live descriptors of this process, for the fd-balance assertions.
+    private func openDescriptorCount() -> Int {
+        (try? fm.contentsOfDirectory(atPath: "/dev/fd").count) ?? -1
+    }
+
+    /// THE HEADLINE REGRESSION. A directory the walk already enumerated is
+    /// replaced by a SYMLINK to a foreign tree before the walk descends into
+    /// its children.
+    ///
+    /// This is the case an `O_NOFOLLOW` open plus an `fstat` identity re-proof
+    /// CANNOT catch, and the reason the previous fix was insufficient:
+    /// `O_NOFOLLOW` guards only the FINAL component, so a re-resolved absolute
+    /// path `…/mid/deep` walks through the swapped `mid` untouched — and the
+    /// identity the discovery `lstat` recorded as "vetted" was ALREADY the
+    /// foreign `deep`'s, so the re-proof compares foreign against foreign and
+    /// passes. The probe then enumerates outside the artifact dir, and on THIS
+    /// scanner what it reads there feeds the acknowledgement-token preimage:
+    /// a foreign read corrupts the value that AUTHORIZES DELETION.
+    ///
+    /// The correct outcome is counter-intuitive and is asserted here in full:
+    /// a held descriptor is INODE-PINNED, so the walk keeps reading the very
+    /// objects it vetted, wherever they now live. It is not merely "refused" —
+    /// it is COMPLETE over the vetted inodes, and the foreign tree is never
+    /// touched at all.
+    func testProbeNeverFollowsAnANCESTORSwappedAfterItWasEnumerated() throws {
+        let outside = base.appendingPathComponent("outside-the-dev-root")
+        let foreign = try writeBulkFile(
+            outside.appendingPathComponent("deep/Foreign.dmg"),
+            bytes: aboveFloorBytes
+        )
+        let artifact = try makeProject(
+            at: dev.appendingPathComponent("rust"),
+            marker: "Cargo.toml", artifact: "target", payloadBytes: nil
+        )
+        let mid = artifact.appendingPathComponent("mid")
+        let inTree = try writeBulkFile(
+            mid.appendingPathComponent("deep/InTree.dmg"), bytes: aboveFloorBytes
+        )
+        let realIdentity = try rawStat(inTree)
+        let relocated = artifact.appendingPathComponent("mid-relocated")
+
+        // THE RACE: `mid` is enumerated, and only then is it moved aside and
+        // replaced by a symlink pointing out of the tree.
+        onFirstProbeEvent(
+            matching: {
+                if case .didEnumerate(let logical) = $0 {
+                    return logical.path == mid.path
+                }
+                return false
+            },
+            perform: {
+                try? self.fm.moveItem(at: mid, to: relocated)
+                try? self.fm.createSymbolicLink(
+                    at: mid, withDestinationURL: outside
+                )
+            }
+        )
+        defer { ValuablesDetector.testHook = nil }
+
+        let disclosure = BuildArtifactsScanner.preDeleteValuablesProbe(
+            at: artifact, provider: FileSystemIdentityProvider()
+        )
+
+        XCTAssertTrue(
+            fm.fileExists(atPath: mid.path),
+            "fixture precondition: the swap actually happened"
+        )
+        XCTAssertEqual(
+            try? fm.destinationOfSymbolicLink(atPath: mid.path), outside.path,
+            "fixture precondition: `mid` is now a symlink out of the tree"
+        )
+
+        // THE CLAIM: not one byte of the foreign tree entered the result.
+        XCTAssertFalse(
+            disclosure.valuables.contains { $0.name == "Foreign.dmg" },
+            "a valuable from OUTSIDE the artifact dir was attributed to it: "
+                + "\(disclosure.valuables.map(\.name))"
+        )
+        XCTAssertEqual(
+            disclosure.valuables.map(\.name), ["InTree.dmg"],
+            "the walk keeps reading the inodes it vetted, wherever they moved"
+        )
+        // C8: the identity integers that enter the TOKEN preimage come from
+        // the real file, never from the foreign one.
+        let disclosed = try XCTUnwrap(disclosure.valuables.first)
+        XCTAssertEqual(disclosed.identity.inode, UInt64(realIdentity.st_ino))
+        XCTAssertEqual(
+            disclosed.identity.allocatedBytes,
+            Int64(realIdentity.st_blocks) * 512
+        )
+        XCTAssertEqual(
+            disclosed.identity.modifiedSeconds,
+            Int64(realIdentity.st_mtimespec.tv_sec)
+        )
+        XCTAssertNotEqual(
+            disclosed.identity.inode,
+            UInt64(try rawStat(foreign).st_ino),
+            "the token preimage must never be able to name the foreign file"
+        )
+        XCTAssertTrue(
+            disclosure.probeComplete,
+            "inode-pinned descriptors mean this is COMPLETE over the vetted "
+                + "objects — not a refusal, and not a strand"
+        )
+    }
+
+    /// THE EXACT INSTANT the defect lived in, isolated: the swap happens
+    /// after the directory's NAMES were read and BEFORE any of them was
+    /// vetted.
+    ///
+    /// This is what makes an ancestor swap different in kind from a leaf
+    /// swap, and why the previous fix could not cover it. The pre-fix walk
+    /// read the real `mid`'s names here, then vetted each child by ABSOLUTE
+    /// PATH — so after the swap BOTH the vetting `lstat` and the `O_NOFOLLOW`
+    /// open resolved to the foreign object, the recorded "vetted" identity
+    /// was ALREADY the foreign one, and the `fstat` re-proof compared foreign
+    /// against foreign and PASSED. Verified independently at
+    /// `scratchpad/ancestor_repro.c`, which drives the same syscall sequence
+    /// and enumerates `Foreign.dmg`.
+    ///
+    /// A descriptor-relative walk is immune because the vetting `fstatat` and
+    /// the descending `openat` are both relative to the descriptor already
+    /// held for `mid` — an inode-pinned handle no swap can redirect.
+    func testProbeVetsChildrenAgainstTheHELDParentNotTheReResolvedPath()
+        throws
+    {
+        let outside = base.appendingPathComponent("outside-vetting-window")
+        try writeBulkFile(
+            outside.appendingPathComponent("deep/Foreign.dmg"),
+            bytes: aboveFloorBytes
+        )
+        let artifact = try makeProject(
+            at: dev.appendingPathComponent("rust"),
+            marker: "Cargo.toml", artifact: "target", payloadBytes: nil
+        )
+        let mid = artifact.appendingPathComponent("mid")
+        try writeBulkFile(
+            mid.appendingPathComponent("deep/InTree.dmg"), bytes: aboveFloorBytes
+        )
+        let relocated = artifact.appendingPathComponent("mid-relocated")
+
+        onFirstProbeEvent(
+            matching: {
+                if case .didReadNames(let logical) = $0 {
+                    return logical.path == mid.path
+                }
+                return false
+            },
+            perform: {
+                try? self.fm.moveItem(at: mid, to: relocated)
+                try? self.fm.createSymbolicLink(
+                    at: mid, withDestinationURL: outside
+                )
+            }
+        )
+        defer { ValuablesDetector.testHook = nil }
+
+        let disclosure = BuildArtifactsScanner.preDeleteValuablesProbe(
+            at: artifact, provider: FileSystemIdentityProvider()
+        )
+
+        XCTAssertFalse(
+            disclosure.valuables.contains { $0.name == "Foreign.dmg" },
+            "the probe read a tree OUTSIDE the artifact dir and attributed "
+                + "it to this item — and on this scanner that corrupts the "
+                + "acknowledgement-token preimage that AUTHORIZES DELETION: "
+                + "\(disclosure.valuables.map(\.name))"
+        )
+        XCTAssertEqual(disclosure.valuables.map(\.name), ["InTree.dmg"])
+        XCTAssertTrue(disclosure.probeComplete)
+    }
+
+    /// The half `O_NOFOLLOW` is structurally blind to: the enumerated ancestor
+    /// is replaced by a DIFFERENT REAL DIRECTORY. No symlink is involved
+    /// anywhere, so every no-follow check in existence passes it. Only
+    /// CONTAINMENT in the held parent inode closes it.
+    func testProbeNeverFollowsAnANCESTORSwappedForADifferentRealDirectory()
+        throws
+    {
+        let outside = base.appendingPathComponent("outside-real-directory")
+        try writeBulkFile(
+            outside.appendingPathComponent("deep/Foreign.dmg"),
+            bytes: aboveFloorBytes
+        )
+        let artifact = try makeProject(
+            at: dev.appendingPathComponent("rust"),
+            marker: "Cargo.toml", artifact: "target", payloadBytes: nil
+        )
+        let mid = artifact.appendingPathComponent("mid")
+        try writeBulkFile(
+            mid.appendingPathComponent("deep/InTree.dmg"), bytes: aboveFloorBytes
+        )
+        let relocated = artifact.appendingPathComponent("mid-relocated")
+
+        onFirstProbeEvent(
+            matching: {
+                if case .didEnumerate(let logical) = $0 {
+                    return logical.path == mid.path
+                }
+                return false
+            },
+            perform: {
+                try? self.fm.moveItem(at: mid, to: relocated)
+                try? self.fm.moveItem(at: outside, to: mid)
+            }
+        )
+        defer { ValuablesDetector.testHook = nil }
+
+        let disclosure = BuildArtifactsScanner.preDeleteValuablesProbe(
+            at: artifact, provider: FileSystemIdentityProvider()
+        )
+
+        XCTAssertFalse(
+            disclosure.valuables.contains { $0.name == "Foreign.dmg" },
+            "a real-directory swap is invisible to O_NOFOLLOW; containment "
+                + "is what refuses it: \(disclosure.valuables.map(\.name))"
+        )
+        XCTAssertEqual(disclosure.valuables.map(\.name), ["InTree.dmg"])
+    }
+
+    /// Constraint 5: the scan-time and delete-time faces run the SAME core,
+    /// so they must agree under the race too — no drift.
+    func testBothFacesAgreeUnderTheAncestorSwap() async throws {
+        let outside = base.appendingPathComponent("outside-both-faces")
+        try writeBulkFile(
+            outside.appendingPathComponent("deep/Foreign.dmg"),
+            bytes: aboveFloorBytes
+        )
+        let artifact = try makeProject(
+            at: dev.appendingPathComponent("rust"),
+            marker: "Cargo.toml", artifact: "target", payloadBytes: nil
+        )
+        let mid = artifact.appendingPathComponent("mid")
+        try writeBulkFile(
+            mid.appendingPathComponent("deep/InTree.dmg"), bytes: aboveFloorBytes
+        )
+
+        func swapOnce(into linkTarget: URL, moving aside: URL) {
+            onFirstProbeEvent(
+                matching: {
+                    if case .didEnumerate(let logical) = $0 {
+                        return logical.path == mid.path
+                    }
+                    return false
+                },
+                perform: {
+                    try? self.fm.moveItem(at: mid, to: aside)
+                    try? self.fm.createSymbolicLink(
+                        at: mid, withDestinationURL: linkTarget
+                    )
+                }
+            )
+        }
+        defer { ValuablesDetector.testHook = nil }
+
+        swapOnce(
+            into: outside, moving: artifact.appendingPathComponent("aside-1")
+        )
+        let outcome = try await runScan(makeScanner())
+        let scanned = try XCTUnwrap(
+            item(outcome, at: artifact)?.valuablesDisclosure
+        )
+
+        // Put the tree back the way it was, then race the OTHER face.
+        try? fm.removeItem(at: mid)
+        try fm.moveItem(
+            at: artifact.appendingPathComponent("aside-1"), to: mid
+        )
+        swapOnce(
+            into: outside, moving: artifact.appendingPathComponent("aside-2")
+        )
+        let atDelete = BuildArtifactsScanner.preDeleteValuablesProbe(
+            at: artifact, provider: FileSystemIdentityProvider()
+        )
+
+        XCTAssertEqual(scanned.valuables.map(\.name), ["InTree.dmg"])
+        XCTAssertEqual(atDelete.valuables.map(\.name), ["InTree.dmg"])
+        XCTAssertEqual(scanned.probeComplete, atDelete.probeComplete)
+    }
+
+    // MARK: R3/R17 — the descriptor bound (constraint 3: no depth cap, ever)
+
+    /// THE CONSTRAINT-3 TEST. A tree far deeper than the descriptor window is
+    /// READ, not refused.
+    ///
+    /// The retired depth cap was retired because a DETERMINISTIC bound makes
+    /// its refusals permanently unclearable: every re-scan and every
+    /// delete-time re-probe reproduces them, and an incomplete probe is
+    /// tokenless forever. A descriptor limit must not resurrect that. It does
+    /// not, because exceeding the window is not an event of any kind: the
+    /// shallowest anchor below the root is released and restored later with a
+    /// single identity-verified `openat(child, "..")`.
+    func testATreeManyTimesDeeperThanTheDescriptorWindowStillCompletes()
+        throws
+    {
+        let artifact = try makeProject(
+            at: dev.appendingPathComponent("rust"),
+            marker: "Cargo.toml", artifact: "target", payloadBytes: nil
+        )
+        let buried = try writeBulkFile(
+            artifact.appendingPathComponent("\(deepChain(60))/Deep.dmg"),
+            bytes: aboveFloorBytes
+        )
+
+        let disclosure = ValuablesDetector.probe(
+            at: artifact, provider: FileSystemIdentityProvider(),
+            descriptorWindow: 3
+        )
+
+        XCTAssertTrue(
+            disclosure.probeComplete,
+            "a tree 20x deeper than the descriptor window is READ, not "
+                + "refused — the depth cap did not come back in disguise"
+        )
+        XCTAssertEqual(disclosure.valuables.map(\.name), ["Deep.dmg"])
+        XCTAssertEqual(
+            disclosure.valuables.first?.identity.allocatedBytes,
+            allocated(buried)
+        )
+    }
+
+    /// The window is a PERFORMANCE knob, never a policy: the same tree
+    /// produces byte-identical output at a window of 2 and at the production
+    /// window, on both a deep CHAIN and a wide COMB.
+    func testDescriptorWindowNeverChangesTheResult() throws {
+        let artifact = try makeProject(
+            at: dev.appendingPathComponent("rust"),
+            marker: "Cargo.toml", artifact: "target", payloadBytes: nil
+        )
+        // A chain …
+        try writeBulkFile(
+            artifact.appendingPathComponent("\(deepChain(9))/Chain.dmg"),
+            bytes: aboveFloorBytes
+        )
+        // … and a comb: siblings at every level, so anchors are re-acquired
+        // over and over rather than released once on the way down.
+        for branch in ["a", "b", "c"] {
+            try writeBulkFile(
+                artifact.appendingPathComponent(
+                    "comb/\(branch)/x/y/z/\(branch.uppercased()).pkg"
+                ),
+                bytes: aboveFloorBytes
+            )
+        }
+
+        let provider = FileSystemIdentityProvider()
+        let tight = ValuablesDetector.probe(
+            at: artifact, provider: provider, descriptorWindow: 2
+        )
+        let roomy = ValuablesDetector.probe(
+            at: artifact, provider: provider, descriptorWindow: 64
+        )
+        let production = ValuablesDetector.probe(at: artifact, provider: provider)
+
+        XCTAssertEqual(tight, roomy)
+        XCTAssertEqual(tight, production)
+        XCTAssertTrue(tight.probeComplete)
+        XCTAssertEqual(
+            tight.valuables.map(\.name).sorted(),
+            ["A.pkg", "B.pkg", "C.pkg", "Chain.dmg"]
+        )
+    }
+
+    /// Descriptors are BALANCED on every exit path — success, refusal,
+    /// budget exhaustion, mount refusal, root-open failure. This is the
+    /// number-one hazard of a descriptor-anchored walk and the reason every
+    /// directory is owned by an ARC-managed `SecureDirectory` rather than a
+    /// bare `Int32`.
+    func testEveryProbeExitPathIsDescriptorBalanced() throws {
+        let artifact = try makeProject(
+            at: dev.appendingPathComponent("rust"),
+            marker: "Cargo.toml", artifact: "target", payloadBytes: nil
+        )
+        try writeBulkFile(
+            artifact.appendingPathComponent("\(deepChain(12))/Deep.dmg"),
+            bytes: aboveFloorBytes
+        )
+        try makeBundle(
+            at: artifact.appendingPathComponent("Shipped.app"),
+            contentBytes: aboveFloorBytes
+        )
+        let swapped = artifact.appendingPathComponent("swapped")
+        try fm.createSymbolicLink(
+            at: swapped, withDestinationURL: base.appendingPathComponent("nope")
+        )
+        let lying = SwapSimulatingProvider()
+        lying.reportedAsDirectory.insert(swapped.path)
+        let mounting = MountPointInjectingProvider()
+        mounting.mountPointInodes.insert(
+            try XCTUnwrap(mounting.identity(of: artifact)?.inode)
+        )
+        let missing = dev.appendingPathComponent("not-there-at-all")
+
+        let baseline = openDescriptorCount()
+        for probe in [
+            { _ = ValuablesDetector.probe(
+                at: artifact, provider: FileSystemIdentityProvider()
+            ) },                                            // success
+            { _ = ValuablesDetector.probe(
+                at: artifact, provider: FileSystemIdentityProvider(),
+                entryLimit: 4
+            ) },                                            // budget exhausted
+            { _ = ValuablesDetector.probe(
+                at: artifact, provider: FileSystemIdentityProvider(),
+                descriptorWindow: 2
+            ) },                                            // eviction path
+            { _ = ValuablesDetector.probe(at: artifact, provider: lying) },
+            { _ = ValuablesDetector.probe(at: artifact, provider: mounting) },
+            { _ = ValuablesDetector.probe(
+                at: missing, provider: FileSystemIdentityProvider()
+            ) },                                            // root absent
+        ] {
+            probe()
+        }
+
+        XCTAssertEqual(
+            openDescriptorCount(), baseline,
+            "a descriptor leaked on some exit path of the probe"
+        )
+    }
+
+    /// The descriptor bound is ENFORCED, not asserted in prose:
+    /// `peak = min(depth + 1, window) + 2`, sampled at the deepest point of a
+    /// tree far deeper than the window.
+    func testLiveDescriptorPeakStaysInsideTheWindowPlusTransients() throws {
+        let artifact = try makeProject(
+            at: dev.appendingPathComponent("rust"),
+            marker: "Cargo.toml", artifact: "target", payloadBytes: nil
+        )
+        try writeBulkFile(
+            artifact.appendingPathComponent("\(deepChain(40))/Deep.dmg"),
+            bytes: aboveFloorBytes
+        )
+
+        let window = 6
+        let baseline = openDescriptorCount()
+        var peak = baseline
+        ValuablesDetector.testHook = { _ in
+            peak = max(peak, self.openDescriptorCount())
+        }
+        defer { ValuablesDetector.testHook = nil }
+
+        let disclosure = ValuablesDetector.probe(
+            at: artifact, provider: FileSystemIdentityProvider(),
+            descriptorWindow: window
+        )
+        ValuablesDetector.testHook = nil
+
+        XCTAssertTrue(disclosure.probeComplete)
+        XCTAssertEqual(disclosure.valuables.map(\.name), ["Deep.dmg"])
+        // +1 for the descriptor `/dev/fd` enumeration itself needs.
+        XCTAssertLessThanOrEqual(
+            peak - baseline, window + 2 + 1,
+            "the live-descriptor window is not being enforced: peak was "
+                + "\(peak - baseline) above baseline for a window of \(window)"
+        )
+        XCTAssertEqual(
+            openDescriptorCount(), baseline,
+            "and everything is handed back at the end"
+        )
+    }
+
+    // MARK: R3/R17 — the platform facts this design rests on
+
+    /// PLATFORM ERRNO PINNING. If a future macOS changes either of these, THIS
+    /// test breaks loudly instead of the taxonomy silently rerouting.
+    func testOpenErrnoContractOnThisPlatform() throws {
+        let target = dev.appendingPathComponent("real-directory")
+        try mkdir(target)
+        let link = dev.appendingPathComponent("link-to-directory")
+        try fm.createSymbolicLink(at: link, withDestinationURL: target)
+
+        // A symlink with O_DIRECTORY|O_NOFOLLOW is ENOTDIR, never ELOOP:
+        // O_DIRECTORY is checked first. Any branch keyed on ELOOP for a
+        // swapped leaf is therefore dead code.
+        let fd = open(link.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
+        let code = errno
+        if fd >= 0 { close(fd) }
+        XCTAssertLessThan(fd, 0)
+        XCTAssertEqual(code, ENOTDIR, "O_DIRECTORY|O_NOFOLLOW on a symlink")
+
+        // Without O_DIRECTORY the same open reports ELOOP — the two flags,
+        // not the filesystem, decide which errno a caller sees.
+        let bare = open(link.path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+        let bareCode = errno
+        if bare >= 0 { close(bare) }
+        XCTAssertLessThan(bare, 0)
+        XCTAssertEqual(bareCode, ELOOP, "O_NOFOLLOW alone on a symlink")
+    }
+
+    /// A multi-component name defeats `O_NOFOLLOW` entirely — measured, not
+    /// assumed — which is why every name reaching a descriptor-relative call
+    /// is validated as a single component FIRST.
+    func testMultiComponentNamesAreRejectedBeforeAnySyscall() throws {
+        XCTAssertFalse(FileSystemIdentityProvider.isSafeComponent("a/b"))
+        XCTAssertFalse(FileSystemIdentityProvider.isSafeComponent(".."))
+        XCTAssertFalse(FileSystemIdentityProvider.isSafeComponent("."))
+        XCTAssertFalse(FileSystemIdentityProvider.isSafeComponent(""))
+        XCTAssertTrue(FileSystemIdentityProvider.isSafeComponent("Shipped.app"))
+
+        // The hole the guard closes: through a symlinked INTERMEDIATE
+        // component, `openat` with O_NOFOLLOW opens a foreign file.
+        let outside = base.appendingPathComponent("outside-multi-component")
+        try writeFile(outside.appendingPathComponent("secret.bin"))
+        let holder = dev.appendingPathComponent("holder")
+        try mkdir(holder)
+        try fm.createSymbolicLink(
+            at: holder.appendingPathComponent("mid"),
+            withDestinationURL: outside
+        )
+        let holderFD = open(holder.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+        XCTAssertGreaterThanOrEqual(holderFD, 0)
+        defer { close(holderFD) }
+        let leaked = openat(holderFD, "mid/secret.bin", O_RDONLY | O_NOFOLLOW)
+        if leaked >= 0 { close(leaked) }
+        XCTAssertGreaterThanOrEqual(
+            leaked, 0,
+            "platform fact this guard exists for: O_NOFOLLOW guards only the "
+                + "FINAL component, so a multi-component name walks straight "
+                + "through a symlinked ancestor"
+        )
+        // …and the provider refuses to issue that call at all.
+        XCTAssertLessThan(
+            FileSystemIdentityProvider().openChildDirectory(
+                inDirectory: holderFD, named: "mid/secret.bin",
+                logical: holder.appendingPathComponent("mid/secret.bin")
+            ),
+            0
         )
     }
 

@@ -25,13 +25,60 @@
 /// uniformly across every surface, NO acknowledgement token exists. Absence of
 /// valuables is only meaningful when the inspection actually finished.
 ///
+/// ## BELOW THE ROOT, NOTHING TAKES A PATH (PR #457 review r5)
+///
+/// > Every child is discovered and opened relative to an open, vetted parent
+/// > descriptor, by single-component basename. A child's safety is
+/// > established by CONTAINMENT in a held parent inode, not by comparing a
+/// > recorded identity.
+///
+/// The probe used to re-resolve each child by absolute path three times over
+/// — a kind `lstat`, a metadata `lstat`, and an `opendir` — which left the
+/// ANCESTOR-swap hole: replace a directory the walk has already passed
+/// through with a symlink, and every one of those calls silently re-resolves
+/// through it. `O_NOFOLLOW` cannot help (it guards only the FINAL component)
+/// and neither can an identity re-proof: if the swap lands before the vetting
+/// stat, the identity recorded as "vetted" is ALREADY the foreign object's,
+/// so the re-proof compares foreign against foreign and passes. The probe
+/// would then enumerate up to its full 20,000-entry budget outside the
+/// artifact dir — and on THIS scanner what it reads there enters the
+/// acknowledgement-token preimage, corrupting the value that AUTHORIZES
+/// DELETION.
+///
+/// So: ONE path-based open (the root, `O_NOFOLLOW | O_DIRECTORY`), and from
+/// there a descriptor-anchored DFS — `fstatat` to vet, `openat` to descend,
+/// `openat(fd, ".")` to enumerate. A held descriptor is inode-pinned; no
+/// rename, symlink, or remount can redirect it. The `fstat` identity check
+/// survives as a cheap CORROBORATOR (it catches a directory re-bound to a
+/// different REAL directory, which no no-follow flag can see), never as the
+/// guarantee.
+///
+/// The UNRESOLVED spelling is unaffected and is now strictly safer: it is
+/// carried for display and identity ONLY (`Frame.logicalURL`), and below the
+/// root it is never opened, stat'd, or resolved. `displayURL` and
+/// `canonicalIdentityPath` are byte-identical to what they always were.
+///
+/// RESIDUAL, accepted and documented: the ROOT open still resolves the root's
+/// ancestors, so an attacker who already owns the scan root's PARENT can
+/// redirect the whole walk. `O_NOFOLLOW_ANY` would close it and would also
+/// break the legitimate aliased roots this codebase supports (`/tmp` →
+/// `/private/tmp`, a symlinked `$HOME`). Also unclosed: a vetted subtree
+/// RELOCATED mid-walk keeps being read (correctly — those are the vetted
+/// inodes) even though "inside this artifact dir" has gone stale;
+/// delete-time re-proves separately, so that is scan-time staleness, not an
+/// authorization hole.
+///
 /// ## Mount boundaries are NEVER crossed (PR #457 review, R15)
-/// The probe stops at every mount boundary, using the SAME two signals the
-/// sizer (`DirectorySizer.swift:202,287`) and the project walker
-/// (`ProjectTreeWalker.swift:376`) already use — device-id change against the
-/// walk root, plus the `statfs` mount-root check that catches same-`st_dev`
-/// firmlink mounts. There is exactly ONE notion of "mount boundary" in this
-/// codebase and this is it; nothing here re-derives a second one.
+/// The probe stops at every mount boundary. The signal that CARRIES the check
+/// is the child descriptor's own `f_fsid` against the root's: measured on
+/// this machine, `st_dev` is identical for literally every path INCLUDING
+/// `/` and `/System/Volumes/Data`, so the device comparison is blind to
+/// exactly the APFS firmlink split it was partly meant to catch. The two
+/// path-based signals the sizer (`DirectorySizer.swift:202,287`) and the
+/// project walker already use are retained beside it — they are the seam
+/// hermetic tests inject through, and they can only ever push the answer
+/// toward refusal. There is still exactly ONE notion of "mount boundary" in
+/// this codebase and this is it; nothing here re-derives a second one.
 ///
 /// Why the probe needs its own check rather than trusting the caller's size
 /// report: this walk has TWO faces and only one of them has a report. At scan
@@ -371,49 +418,61 @@ enum ValuablesDetector {
     ///
     /// Determinism: within every directory the budget could read WHOLE,
     /// siblings are visited in byte-wise basename order — files as they come,
-    /// directories descended in that same ascending order (the stack is
-    /// loaded in reverse so `popLast` yields ascending) — and the result is
+    /// directories descended in that same ascending order — and the result is
     /// sorted ONCE into the canonical order before returning. Membership
     /// under TRUNCATION is deliberately unspecified; see the file header.
+    ///
+    /// - Parameter descriptorWindow: TEST SEAM ONLY — the live-descriptor
+    ///   window (see `ValuablesProbeWalk`). Production leaves it nil and the
+    ///   window derives from `RLIMIT_NOFILE`. It is a PERFORMANCE knob, never
+    ///   a policy: the walk completes correctly at a window of 2, so there is
+    ///   no tree depth and no descriptor-pressure condition at which it
+    ///   reports something it would not report at depth 1.
     static func probe(
         at directory: URL,
         provider: FileSystemIdentityProvider,
-        entryLimit: Int = defaultProbeEntryLimit
+        entryLimit: Int = defaultProbeEntryLimit,
+        descriptorWindow: Int? = nil
     ) -> ValuablesDisclosure {
-        // THE ROOT KIND GATE, no-follow and BEFORE anything is opened (see
-        // the doc comment). One `lstat`, shared by both faces.
+        // THE ROOT KIND GATE, no-follow. Retained beside the root open below
+        // because it is the ONLY place the probe can tell "not a directory"
+        // (→ `.clean`: deleting a symlink or file leaf removes no contents of
+        // its own, so nothing went uninspected) apart from "unverifiable"
+        // (→ `.incomplete`). The open cannot draw that distinction: it
+        // reports ENOTDIR for both a symlink leaf and a leaf swapped for one.
         switch provider.probeKind(of: directory) {
         case .kind(.directory): break
         case .kind, .absent: return .clean
         case .failed: return .incomplete
         }
 
-        var found: [DetectedValuable] = []
-        var complete = true
-        // The GLOBAL entry budget, shared with every bundle subtree walk —
-        // and the ONE bound on this walk (see the file header).
-        var visited = 0
-
-        // MOUNT BOUNDARY AT THE ROOT. The sizer applies exactly this pair of
-        // signals to its OWN root (`DirectorySizer.swift:202`) and declines to
-        // enumerate; the probe must decline identically, or the delete-time
-        // face — which has no size report to consult — would read a whole
-        // mounted volume. Nothing is opened: not one entry of a foreign
-        // filesystem is read, and the verdict is INCOMPLETE because we did
-        // not look.
+        // THE ROOT OPEN — the ONE path-based open of the whole walk, and the
+        // gate that actually ENFORCES the kind decision above. The `lstat`
+        // gate and the open are two separate resolutions of the same path, so
+        // a root swapped for a symlink BETWEEN them passes the gate; only
+        // `O_NOFOLLOW | O_DIRECTORY` on the open itself refuses it, and it
+        // refuses with ENOTDIR (measured; `O_DIRECTORY` is checked before the
+        // link, so ELOOP is unreachable here).
         //
-        // CANONICAL INPUT for the `statfs` arm (PR #457 review r4): the sizer
-        // hands that arm its already-resolved root, and `isMountPoint`
-        // REQUIRES it — it compares `f_mntonname`, always canonical, against
-        // the path it is given, so an aliased spelling silently answers
-        // `false`. This probe is handed the walker's (or the cleaner's frozen
-        // target's) deliberately UNRESOLVED spelling, which is what made an
-        // artifact dir reached through a symlinked ancestor invisible to this
-        // arm. Safe HERE because the ROOT KIND GATE above already proved
-        // `directory` a REAL directory, so no symlink leaf can reach this
-        // call and a real directory's own name is its canonical name. The
-        // canonical value is an ARGUMENT and is discarded: `directory` itself
-        // is what gets walked, sorted, and turned into items.
+        // From here on NOTHING below the root is reached by path: every child
+        // is discovered by `fstatat` and opened by `openat` relative to a
+        // descriptor this walk already holds and has already vetted. That is
+        // what closes the ANCESTOR-swap race, which no amount of re-`lstat`ing
+        // or identity re-proof can: if the ancestor is replaced before the
+        // vetting stat, the "vetted" identity is ALREADY the foreign object's.
+        // Safety here is proof by CONTAINMENT in a held parent inode, and the
+        // identity comparison survives only as a cheap corroborator.
+        guard let root = SecureDirectory(
+            fd: provider.openDirectoryNoFollow(at: directory),
+            provider: provider
+        ) else { return .incomplete }
+
+        // MOUNT BOUNDARY AT THE ROOT. The sizer applies these signals to its
+        // OWN root (`DirectorySizer.swift:202`) and declines to enumerate; the
+        // probe must decline identically, or the delete-time face — which has
+        // no size report to consult — would read a whole mounted volume.
+        // Nothing beneath is opened: not one entry of a foreign filesystem is
+        // read, and the verdict is INCOMPLETE because we did not look.
         let rootDevice = provider.deviceID(of: directory)
         let parentDevice = provider.deviceID(
             of: directory.deletingLastPathComponent()
@@ -423,126 +482,23 @@ enum ValuablesDetector {
             || provider.isMountPoint(provider.canonicalize(directory)) {
             return .incomplete
         }
-
-        var stack: [URL] = [directory]
-
-        walk: while let dir = stack.popLast() {
-            let remaining = entryLimit - visited
-            guard remaining > 0 else {
-                // Budget exhausted with directories still unexplored.
-                complete = false
-                break walk
-            }
-            guard let read = boundedChildNames(of: dir, limit: remaining)
-            else {
-                // Unreadable branch: absence of valuables is UNPROVEN.
-                complete = false
-                continue
-            }
-            if read.truncated {
-                // More entries existed than the remaining budget could read.
-                complete = false
-            }
-            // Sorting a slice bounded by the REMAINING budget, never a whole
-            // million-entry build directory.
-            let names = read.names
-                .sorted { $0.utf8.lexicographicallyPrecedes($1.utf8) }
-            // Descend in ascending order: collected here, pushed reversed.
-            var pendingDirectories: [URL] = []
-
-            for name in names {
-                guard visited < entryLimit else {
-                    // The shared budget can still run out mid-directory —
-                    // a bundle's subtree sizing spends from the same pot.
-                    complete = false
-                    break walk
-                }
-                visited += 1
-
-                let child = dir.appendingPathComponent(name)
-                let ext = child.pathExtension.lowercased()
-
-                switch provider.probeKind(of: child) {
-                case .kind(.regularFile):
-                    guard fileExtensions.contains(ext) else { break }
-                    // ONE no-follow lstat: identity AND the leaf allocation.
-                    guard let metadata = provider.leafMetadata(of: child) else {
-                        // Metadata we cannot read is a valuable we cannot
-                        // describe — fail closed rather than skip silently.
-                        complete = false
-                        break
-                    }
-                    guard metadata.allocatedBytes >= minimumAllocatedBytes
-                    else { break }
-                    found.append(valuable(
-                        name: name, at: child, provider: provider,
-                        metadata: metadata,
-                        allocatedBytes: metadata.allocatedBytes
-                    ))
-
-                case .kind(.directory):
-                    // MOUNT BOUNDARY: never crossed, whatever is on the far
-                    // side. Checked BEFORE the bundle split on purpose — a
-                    // mounted `.app` must not be subtree-sized either, and
-                    // sizing it would spend the same budget on the same
-                    // foreign volume.
-                    guard !crossesMountBoundary(
-                        child, rootDevice: rootDevice, provider: provider
-                    ) else {
-                        // We did not look past it: unproven, exactly like an
-                        // unreadable branch.
-                        complete = false
-                        break
-                    }
-                    guard bundleExtensions.contains(ext) else {
-                        // ALWAYS descended: discovering this directory
-                        // already cost an entry, and the budget bounds what
-                        // follows. Refusing to look at some fixed level is
-                        // what stranded deep trees (see the file header).
-                        pendingDirectories.append(child)
-                        break
-                    }
-                    // BUNDLE. Identity from the bundle ROOT's ONE lstat;
-                    // size from the bounded subtree walk below. The outer
-                    // walk deliberately does not descend it.
-                    let sized = boundedSubtreeAllocation(
-                        at: child, provider: provider,
-                        rootDevice: rootDevice,
-                        entryLimit: entryLimit, visited: &visited
-                    )
-                    if !sized.complete {
-                        // A truncated bundle sizing makes the whole probe
-                        // INCOMPLETE: a token must never derive from a
-                        // partial size.
-                        complete = false
-                    }
-                    guard let metadata = provider.leafMetadata(of: child) else {
-                        complete = false
-                        break
-                    }
-                    guard sized.allocatedBytes >= minimumAllocatedBytes
-                    else { break }
-                    found.append(valuable(
-                        name: name, at: child, provider: provider,
-                        metadata: metadata,
-                        allocatedBytes: sized.allocatedBytes
-                    ))
-
-                case .kind:
-                    // Symlink / special file: never followed, never a
-                    // valuable (see the no-follow rule).
-                    break
-                case .absent:
-                    // Vanished mid-probe — a benign race.
-                    break
-                case .failed:
-                    // Could not establish the kind — fail closed.
-                    complete = false
-                }
-            }
-            // Reversed, so `popLast` descends siblings in ASCENDING order.
-            stack.append(contentsOf: pendingDirectories.reversed())
+        // …plus the descriptor-relative arm, which is the one that actually
+        // carries the check on modern macOS: `st_dev` is identical for EVERY
+        // path on an APFS volume group (measured: `/` and
+        // `/System/Volumes/Data` both report 16777230), so only `f_fsid`
+        // separates a firmlink mount from its host. `..` of the ROOT is the
+        // real parent directory, whatever spelling was handed in.
+        switch rootIsMountRoot(root, provider: provider) {
+        case .some(true), .none: return .incomplete
+        case .some(false): break
         }
+
+        var walk = ValuablesProbeWalk(
+            provider: provider, entryLimit: entryLimit,
+            window: max(2, descriptorWindow ?? defaultDescriptorWindow()),
+            rootURL: directory, rootDevice: rootDevice, root: root
+        )
+        walk.run()
 
         // THE ONE canonical order, applied ONCE here: byte-wise ascending by
         // the stored CANONICAL IDENTITY PATH (never a display spelling), so
@@ -550,12 +506,49 @@ enum ValuablesDetector {
         // the SAME order and nothing downstream re-sorts. Identity paths are
         // unique within one artifact dir, so this is a strict total order.
         return ValuablesDisclosure(
-            valuables: found.sorted {
+            valuables: walk.found.sorted {
                 $0.canonicalIdentityPath.utf8
                     .lexicographicallyPrecedes($1.canonicalIdentityPath.utf8)
             },
-            probeComplete: complete
+            probeComplete: walk.complete
         )
+    }
+
+    /// Is the walk root itself the root of a mounted filesystem? `nil` when
+    /// that could not be established (fail closed — the caller treats `nil`
+    /// exactly like `true`).
+    ///
+    /// `/`'s `..` is `/` itself, so the identity-equality arm comes first;
+    /// otherwise a different `f_fsid` across the `..` step means the root sits
+    /// at a mount boundary. Verified against the real firmlinks on this
+    /// machine: `/System/Volumes/Data` YES, `/Volumes` YES, `/private/tmp` no,
+    /// `~/Library/Caches` no.
+    private static func rootIsMountRoot(
+        _ root: SecureDirectory, provider: FileSystemIdentityProvider
+    ) -> Bool? {
+        guard let up = SecureDirectory(
+            fd: provider.openParentDirectory(of: root.fd), provider: provider
+        ) else { return nil }
+        if up.identity == root.identity { return true }
+        return up.mount.fsidMajor != root.mount.fsidMajor
+            || up.mount.fsidMinor != root.mount.fsidMinor
+    }
+
+    /// The live-descriptor window, derived ONCE per probe from the process's
+    /// soft descriptor limit.
+    ///
+    /// `clamp((rlim_cur - 64) / 4, 4, 64)`. The scanner NEVER calls
+    /// `setrlimit`: a library must not mutate a process-global limit it shares
+    /// with AppKit, `DirectorySizer`, and the privileged helper. Measured on
+    /// this machine, a genuinely launchd-spawned process sees a soft limit of
+    /// **256** (a dev shell sees 1048576), so the shipped `.app` gets a window
+    /// of 48 and a peak of 50 live descriptors, against 64/66 under test —
+    /// which is why the window may never become a policy decision.
+    private static func defaultDescriptorWindow() -> Int {
+        var limit = rlimit()
+        guard getrlimit(RLIMIT_NOFILE, &limit) == 0 else { return 4 }
+        let soft = Int(clamping: limit.rlim_cur)
+        return max(4, min(64, (soft - 64) / 4))
     }
 
     /// Assemble one detected valuable: the SPLIT sourcing made explicit —
@@ -586,160 +579,471 @@ enum ValuablesDetector {
         )
     }
 
-    /// Bounded, no-follow allocation of one directory bundle's subtree.
-    ///
-    /// Counts REGULAR FILES' allocated bytes only (directory inodes are not
-    /// counted — the same stance as the shared `DirectorySizer`), never
-    /// follows symlinks, and shares the caller's GLOBAL entry budget — the
-    /// one bound here too, so the whole probe stays bounded. Mount boundaries
-    /// are not crossed here either — a bundle can hold a mounted subtree just
-    /// as an artifact dir can. `complete == false` on an unreadable branch, an
-    /// uncrossed mount boundary, unreadable file metadata, the entry cap, or
-    /// an allocation sum that would overflow `Int64` — every one of which
-    /// makes the returned figure a FLOOR, never a truth, so no token may
-    /// derive from it. A deep bundle (`Contents/Frameworks/…
-    /// /Versions/A/Resources/…` runs long) is sized WHOLE while the budget
-    /// lasts: an under-counted bundle would fall below the floor and vanish
-    /// from the disclosure entirely.
-    private static func boundedSubtreeAllocation(
-        at bundleRoot: URL,
-        provider: FileSystemIdentityProvider,
-        rootDevice: UInt64?,
-        entryLimit: Int,
-        visited: inout Int
-    ) -> (allocatedBytes: Int64, complete: Bool) {
-        var total: Int64 = 0
-        var complete = true
-        var stack: [URL] = [bundleRoot]
+    // MARK: The descriptor-anchored DFS
 
-        walk: while let dir = stack.popLast() {
+    /// TEST-ONLY synchronous observation points, so a test can perform a REAL
+    /// `rename`/`symlink` at the EXACT instant the race lives in and let the
+    /// real kernel decide the outcome. Single-threaded, no sleeps, no threads,
+    /// zero timing dependence. Never set in production.
+    enum WalkEvent: Equatable {
+        /// A directory's basenames have been READ but NOT yet vetted. This
+        /// is the precise instant the ancestor-swap defect lived in: the
+        /// pre-fix walk read the real directory's names here and then vetted
+        /// each of them by ABSOLUTE PATH, so a swap performed now made both
+        /// the vetting stat and the open resolve to the foreign object —
+        /// which is why the identity re-proof passed.
+        case didReadNames(logical: URL)
+        /// A directory's children have been read and vetted; the walk is
+        /// about to start descending them.
+        case didEnumerate(logical: URL)
+        /// A named child is about to be `openat`-ed from its parent.
+        case willDescend(name: String, logical: URL)
+        /// The frame at `depth` is about to be popped.
+        case willPop(depth: Int)
+    }
+
+    /// Not concurrency-safe and not meant to be: tests set it, run one probe
+    /// synchronously, and clear it.
+    nonisolated(unsafe) static var testHook: ((WalkEvent) -> Void)?
+
+    /// The DFS state machine. One frame per level of the CURRENT PATH — never
+    /// one per pending sibling, which is the misreading that made
+    /// descriptor-relative traversal look like it needed `entryLimit` live
+    /// descriptors. Both the outer walk and every bundle's subtree sizing run
+    /// on this ONE frame stack and spend from this ONE entry budget, so the
+    /// two can neither drift nor compose their bounds.
+    ///
+    /// ## Invariants (asserted in debug)
+    /// - **I1** the DEEPEST frame always holds a live descriptor.
+    /// - **I2** live frames are `{0} ∪ [k, count)` — frame 0 plus a
+    ///   contiguous suffix. That is what makes restoring a released frame
+    ///   exactly one `..` step from the frame below it.
+    /// - **I3** `frames[0]` is NEVER released. It is the continuously held
+    ///   anchor the whole walk's containment argument rests on, and the frame
+    ///   the `..` climb terminates at.
+    /// - **I4** `liveCount <= window`.
+    ///
+    /// ## The descriptor bound
+    /// `peak = min(depth + 1, window) + 2`. The `+2` covers the mutually
+    /// exclusive transients: the `openat(fd, ".")` handed to `fdopendir`, the
+    /// child descriptor between `openat` and `append`, and the `..`
+    /// descriptor during a re-anchor.
+    ///
+    /// ## Why exceeding the window is NOT an event
+    /// When the window is full, the SHALLOWEST live frame below the root is
+    /// released; when the walk pops back to it, one `openat(child, "..")`
+    /// restores it, identity-verified. Exceeding the window costs syscalls and
+    /// nothing else — no obstruction, no budget spend, no incompleteness. A
+    /// descriptor limit must never resurrect the deterministic, permanently
+    /// unclearable refusals the retired depth cap produced.
+    private struct ValuablesProbeWalk {
+        struct Frame {
+            /// `nil` ⇒ released; re-acquirable in one `..` step.
+            var dir: SecureDirectory?
+            /// Proven when this frame's descriptor was FIRST opened; the
+            /// value a re-anchor must reproduce.
+            let identity: FileSystemIdentityProvider.Identity
+            /// The UNRESOLVED spelling. Display and identity ONLY — it is
+            /// never opened, stat'd, or resolved below the root.
+            let logicalURL: URL
+            var pending: [String] = []
+            var cursor = 0
+            /// `fstatat` identity of each pending name, for the corroborator.
+            var vetted: [String: FileSystemIdentityProvider.Identity] = [:]
+            /// Pending names that are matched BUNDLES (outer mode only).
+            var bundles: [String: FileSystemIdentityProvider.LeafMetadata] = [:]
+        }
+
+        /// The one in-flight bundle sizing. Bundles never nest — the bundle
+        /// rule applies in outer mode only, so a `.app` inside a `.app` is
+        /// just another directory being summed — which is why one optional
+        /// suffices and no second stack (and no second bound) exists.
+        struct BundleSizing {
+            let frameIndex: Int
+            let name: String
+            let logicalURL: URL
+            let metadata: FileSystemIdentityProvider.LeafMetadata
+            var total: Int64 = 0
+            var complete = true
+        }
+
+        let provider: FileSystemIdentityProvider
+        let entryLimit: Int
+        let window: Int
+        let rootURL: URL
+        let rootDevice: UInt64?
+        let rootMount: FileSystemIdentityProvider.MountIdentity
+
+        var frames: [Frame] = []
+        var liveCount = 0
+        var visited = 0
+        var complete = true
+        var found: [DetectedValuable] = []
+        var sizing: BundleSizing?
+        var aborted = false
+
+        init(
+            provider: FileSystemIdentityProvider,
+            entryLimit: Int,
+            window: Int,
+            rootURL: URL,
+            rootDevice: UInt64?,
+            root: SecureDirectory
+        ) {
+            self.provider = provider
+            self.entryLimit = entryLimit
+            self.window = window
+            self.rootURL = rootURL
+            self.rootDevice = rootDevice
+            self.rootMount = root.mount
+            self.frames = [Frame(
+                dir: root, identity: root.identity, logicalURL: rootURL
+            )]
+            self.liveCount = 1
+        }
+
+        /// Whether the walk is currently summing a bundle's subtree.
+        var isSizing: Bool { sizing != nil }
+
+        mutating func run() {
+            enumerate(index: 0)
+            walk: while !frames.isEmpty && !aborted {
+                let i = frames.count - 1
+                assert(frames[i].dir != nil, "I1")
+                assert(liveCount <= window, "I4")
+                assert(frames[0].dir != nil, "I3")
+
+                if frames[i].cursor == frames[i].pending.count {
+                    ValuablesDetector.testHook?(.willPop(depth: i))
+                    if sizing?.frameIndex == i { finishBundle() }
+                    // Re-anchor BEFORE the descriptor that makes `..`
+                    // reachable is dropped. A failure here is terminal: we
+                    // can never get back above this level, and continuing
+                    // would be a silent truncation.
+                    if i >= 1, frames[i - 1].dir == nil {
+                        guard reacquire(index: i - 1, from: frames[i].dir!)
+                        else {
+                            complete = false
+                            aborted = true
+                            break walk
+                        }
+                    }
+                    if frames[i].dir != nil { liveCount -= 1 }
+                    frames.removeLast()
+                    continue
+                }
+
+                let name = frames[i].pending[frames[i].cursor]
+                frames[i].cursor += 1
+                descend(name: name, from: i)
+            }
+            // A bundle still in flight when the budget ran out is finalized
+            // here: what WAS summed is a floor, and disclosing a floor is
+            // strictly better than hiding a real bundle (the probe is
+            // incomplete and therefore tokenless either way).
+            if sizing != nil { finishBundle() }
+            // Dropping every frame closes every descriptor on EVERY exit
+            // path — `SecureDirectory.deinit`, not review vigilance.
+            frames.removeAll()
+            liveCount = 0
+        }
+
+        // MARK: Enumeration
+
+        /// Read + vet one directory's children, descriptor-relative.
+        mutating func enumerate(index: Int) {
             let remaining = entryLimit - visited
             guard remaining > 0 else {
                 complete = false
-                break walk
+                aborted = true
+                return
             }
-            guard let read = boundedChildNames(of: dir, limit: remaining)
-            else {
+            guard let dir = frames[index].dir else {
                 complete = false
-                continue
+                return
+            }
+            guard let read = ValuablesDetector.boundedChildNames(
+                parentFD: dir.fd, limit: remaining, provider: provider
+            ) else {
+                // Unreadable branch: absence of valuables is UNPROVEN.
+                complete = false
+                return
             }
             if read.truncated { complete = false }
+            // Sorting a slice bounded by the REMAINING budget, never a whole
+            // million-entry build directory.
             let names = read.names
                 .sorted { $0.utf8.lexicographicallyPrecedes($1.utf8) }
-            var pendingDirectories: [URL] = []
+            ValuablesDetector.testHook?(
+                .didReadNames(logical: frames[index].logicalURL)
+            )
 
             for name in names {
                 guard visited < entryLimit else {
                     complete = false
-                    break walk
+                    aborted = true
+                    return
                 }
                 visited += 1
-
-                let child = dir.appendingPathComponent(name)
-                switch provider.probeKind(of: child) {
-                case .kind(.regularFile):
-                    guard let metadata = provider.leafMetadata(of: child) else {
-                        complete = false
-                        break
-                    }
-                    let (sum, overflow) = total
-                        .addingReportingOverflow(metadata.allocatedBytes)
-                    guard !overflow else {
-                        // Physically unreachable; still never saturated —
-                        // an unrepresentable sum is an incomplete sizing.
-                        complete = false
-                        break walk
-                    }
-                    total = sum
-                case .kind(.directory):
-                    // The SAME uncrossable boundary, against the SAME walk
-                    // root as the outer probe (the bundle was reached from
-                    // it, so it shares its device). An uncrossed branch makes
-                    // the size a FLOOR, so the sizing is incomplete.
-                    guard !crossesMountBoundary(
-                        child, rootDevice: rootDevice, provider: provider
-                    ) else {
-                        complete = false
-                        break
-                    }
-                    pendingDirectories.append(child)
+                // MANDATORY: a multi-component name defeats `O_NOFOLLOW`
+                // entirely (measured). `readdir` cannot produce one; this
+                // makes a future refactor a refusal instead of a hole.
+                guard FileSystemIdentityProvider.isSafeComponent(name) else {
+                    complete = false
+                    continue
+                }
+                let logical = frames[index].logicalURL
+                    .appendingPathComponent(name)
+                // ONE atomic no-follow stat, relative to the HELD parent:
+                // kind, identity, allocation and mtime together. This
+                // replaces the `probeKind(of:)` + `leafMetadata(of:)` PAIR,
+                // whose second path lstat was an independent re-resolution
+                // whose output fed the acknowledgement-token preimage.
+                switch provider.probeKind(
+                    inDirectory: dir.fd, named: name, logical: logical
+                ) {
+                case .kind(.regularFile, _, let metadata):
+                    record(file: name, logical: logical, metadata: metadata)
+                case .kind(.directory, let identity, let metadata):
+                    record(
+                        directory: name, logical: logical, index: index,
+                        identity: identity, metadata: metadata
+                    )
                 case .kind:
-                    // Symlink / special: 0 bytes, never followed.
+                    // Symlink / special: never followed, never a valuable.
                     break
                 case .absent:
+                    // Vanished mid-probe — the ordinary benign race.
                     break
                 case .failed:
                     complete = false
                 }
             }
-            stack.append(contentsOf: pendingDirectories.reversed())
+            ValuablesDetector.testHook?(
+                .didEnumerate(logical: frames[index].logicalURL)
+            )
         }
-        return (total, complete)
-    }
 
-    /// Does descending into `child` cross a mount boundary?
-    ///
-    /// The house rule VERBATIM — both signals, no third notion invented here:
-    /// (a) device-id change against the WALK ROOT, which catches foreign
-    /// volumes and injected test devices, and (b) the `statfs` mount-root
-    /// check, required because a unified APFS volume group presents ONE
-    /// `st_dev` across the system/Data pair so a firmlink mount is invisible
-    /// to (a). The SAME rule the sizer and the project walker apply
-    /// (`DirectorySizer.swift:289`, `ProjectTreeWalker.swift:405`); a `nil`
-    /// device on either side disables only arm (a), exactly as it does there.
-    /// Arm (b)'s ARGUMENT differs by necessity — see below: the sizer walks
-    /// an already-resolved root, this probe and the walker do not.
-    ///
-    /// `child` is lstat-probed as a real directory by both callers before
-    /// this runs, so a symlink pointing AT a volume root never reaches here
-    /// (and is never followed regardless — the no-follow rule).
-    ///
-    /// ## Arm (b) gets a CANONICAL path, and ONLY arm (b) (PR #457 review r4)
-    /// `isMountPoint` compares `statfs`'s `f_mntonname` — always canonical —
-    /// against the path handed to it, and documents that requirement
-    /// (`FileSystemIdentityProvider.swift:143`); the sizer satisfies it by
-    /// passing its already-resolved URLs. This probe cannot: it keeps the
-    /// UNRESOLVED spelling on purpose, because that is the path a deletion
-    /// removes and the one a no-follow `lstat` must land on. So an aliased
-    /// spelling — an artifact dir under a dev root declared through a
-    /// symlinked ancestor (`/tmp/work`, a symlinked home), or the cleaner's
-    /// frozen delete-time target — never equalled `f_mntonname`, and arm (b)
-    /// answered `false` for a real mount.
-    ///
-    /// On its own that is a false negative behind a working arm (a). It is
-    /// NOT defense-in-depth, because the two fail TOGETHER on a
-    /// firmlink-shaped mount that shares the walk root's `st_dev` — which is
-    /// exactly the case arm (b) exists to catch. Both silent means the probe
-    /// enumerates the mounted volume and calls the result COMPLETE: a "proven
-    /// clean" verdict derived from a filesystem the user never pointed this
-    /// scanner at, on the delete-time face that has no size report to back it
-    /// up.
-    ///
-    /// The canonical spelling is therefore computed HERE, as an argument, and
-    /// discarded. It is never returned, never stored, never pushed on the
-    /// stack, never sorted, and never reaches an item — canonicalizing the
-    /// traversal would break the `resolveTargetKeepingLeaf` doctrine
-    /// (identity is the canonical PARENT chain plus the UNRESOLVED leaf) and
-    /// point the walk at paths the deletion does not touch, which is a worse
-    /// bug than the one this fixes. Safe here specifically: `canonicalize`
-    /// resolves the leaf too, which the unresolved-leaf rule forbids
-    /// elsewhere (a mere LINK to a volume root must report `false`), but both
-    /// callers run inside `case .kind(.directory)`, so no symlink leaf can
-    /// reach this call and a real directory's own name is its canonical name.
-    /// Cost is one `realpath` per DIRECTORY child, on the arm-(a)-silent path
-    /// only, inside a walk already bounded to `entryLimit` entries and beside
-    /// a `DirectorySizer` pass that enumerates the same tree unbounded.
-    private static func crossesMountBoundary(
-        _ child: URL,
-        rootDevice: UInt64?,
-        provider: FileSystemIdentityProvider
-    ) -> Bool {
-        let childDevice = provider.deviceID(of: child)
-        if rootDevice != nil && childDevice != nil
-            && childDevice != rootDevice {
+        private mutating func record(
+            file name: String, logical: URL,
+            metadata: FileSystemIdentityProvider.LeafMetadata?
+        ) {
+            if isSizing {
+                guard let metadata else {
+                    sizing?.complete = false
+                    return
+                }
+                let (sum, overflow) = (sizing?.total ?? 0)
+                    .addingReportingOverflow(metadata.allocatedBytes)
+                guard !overflow else {
+                    // Physically unreachable; still never saturated — an
+                    // unrepresentable sum is an incomplete sizing.
+                    sizing?.complete = false
+                    aborted = true
+                    return
+                }
+                sizing?.total = sum
+                return
+            }
+            guard fileExtensions.contains(logical.pathExtension.lowercased())
+            else { return }
+            guard let metadata else {
+                // Metadata we cannot describe is a valuable we cannot
+                // describe — fail closed rather than skip silently.
+                complete = false
+                return
+            }
+            guard metadata.allocatedBytes >= minimumAllocatedBytes else {
+                return
+            }
+            found.append(ValuablesDetector.valuable(
+                name: name, at: logical, provider: provider,
+                metadata: metadata, allocatedBytes: metadata.allocatedBytes
+            ))
+        }
+
+        private mutating func record(
+            directory name: String, logical: URL, index: Int,
+            identity: FileSystemIdentityProvider.Identity,
+            metadata: FileSystemIdentityProvider.LeafMetadata?
+        ) {
+            frames[index].pending.append(name)
+            frames[index].vetted[name] = identity
+            guard !isSizing else { return }
+            guard bundleExtensions
+                .contains(logical.pathExtension.lowercased())
+            else { return }
+            guard let metadata else {
+                // A bundle we cannot describe is never disclosed and never
+                // sized: its size would enter a token preimage.
+                complete = false
+                frames[index].pending.removeLast()
+                return
+            }
+            frames[index].bundles[name] = metadata
+        }
+
+        // MARK: Descent
+
+        mutating func descend(name: String, from index: Int) {
+            guard let parent = frames[index].dir else {
+                complete = false
+                aborted = true
+                return
+            }
+            let logical = frames[index].logicalURL
+                .appendingPathComponent(name)
+            ValuablesDetector.testHook?(
+                .willDescend(name: name, logical: logical)
+            )
+
+            let fd = provider.openChildDirectory(
+                inDirectory: parent.fd, named: name, logical: logical
+            )
+            guard fd >= 0 else {
+                let code = errno
+                // ENOENT is the ordinary eviction race and stays BENIGN:
+                // classing it as a failure would make almost every probe of a
+                // live build directory incomplete. Everything else — ENOTDIR
+                // (the name is no longer a directory: swapped for a symlink,
+                // swapped for a file, or raced), EACCES, EMFILE — is unproven.
+                if code != ENOENT { complete = false }
+                return
+            }
+            guard let child = SecureDirectory(fd: fd, provider: provider)
+            else {
+                complete = false
+                return
+            }
+            // The corroborator. Sound now in a way it never was before: the
+            // vetted value came from an `fstatat` on THIS SAME held parent
+            // descriptor, so it cannot itself be a foreign object's identity.
+            // It catches the one swap `O_NOFOLLOW` cannot see — a directory
+            // re-bound to a DIFFERENT real directory.
+            guard let vetted = frames[index].vetted[name],
+                  child.identity == vetted
+            else {
+                complete = false
+                return
+            }
+            guard !crossesMountBoundary(child: child, logical: logical) else {
+                // We did not look past it: unproven, exactly like an
+                // unreadable branch.
+                complete = false
+                return
+            }
+
+            let bundle = isSizing ? nil : frames[index].bundles[name]
+            makeRoom()
+            frames.append(Frame(
+                dir: child, identity: child.identity, logicalURL: logical
+            ))
+            liveCount += 1
+            if let bundle {
+                sizing = BundleSizing(
+                    frameIndex: frames.count - 1, name: name,
+                    logicalURL: logical, metadata: bundle
+                )
+            }
+            enumerate(index: frames.count - 1)
+        }
+
+        /// A finished bundle: identity from the bundle ROOT's own `fstatat`,
+        /// size from the subtree just summed. A truncated sizing makes the
+        /// WHOLE probe incomplete — a token must never derive from a partial
+        /// size — while what WAS summed is still disclosed if it clears the
+        /// floor (hiding a real bundle because the budget ran out is strictly
+        /// worse; it is a floor on the warning, never a basis to authorize).
+        private mutating func finishBundle() {
+            guard let bundle = sizing else { return }
+            sizing = nil
+            if !bundle.complete { complete = false }
+            guard bundle.total >= minimumAllocatedBytes else { return }
+            found.append(ValuablesDetector.valuable(
+                name: bundle.name, at: bundle.logicalURL, provider: provider,
+                metadata: bundle.metadata, allocatedBytes: bundle.total
+            ))
+        }
+
+        // MARK: The descriptor window
+
+        /// Free a slot before a push, if the window is full. NEVER a refusal
+        /// and never charged to the entry budget.
+        private mutating func makeRoom() {
+            guard liveCount >= window else { return }
+            // The shallowest live frame BELOW the root — releasing it is what
+            // keeps the live set `{0} ∪ [k, count)` (I2), so restoring it is
+            // always exactly one `..` from the frame directly beneath it.
+            guard let shallowest = (1..<frames.count)
+                .first(where: { frames[$0].dir != nil })
+            else { return }
+            frames[shallowest].dir = nil          // deinit closes the fd
+            liveCount -= 1
+        }
+
+        /// Restore a released frame from the frame directly BELOW it.
+        ///
+        /// `..` is never a symlink, so no `O_NOFOLLOW` is needed; the identity
+        /// check is what makes the step safe — it detects the subtree having
+        /// been MOVED under a foreign parent, which is the one way a `..` can
+        /// land somewhere we never vetted.
+        private mutating func reacquire(
+            index: Int, from deeper: SecureDirectory
+        ) -> Bool {
+            guard let restored = SecureDirectory(
+                fd: provider.openParentDirectory(of: deeper.fd),
+                provider: provider
+            ) else { return false }
+            guard restored.identity == frames[index].identity else {
+                return false
+            }
+            frames[index].dir = restored
+            liveCount += 1
             return true
         }
-        return provider.isMountPoint(provider.canonicalize(child))
+
+        // MARK: Mount boundary
+
+        /// Does descending into an ALREADY-OPEN child cross a mount boundary?
+        ///
+        /// Two families of signal, and the descriptor family is the one that
+        /// carries the check:
+        ///
+        /// - `f_fsid` and `st_dev` of the CHILD'S OWN DESCRIPTOR against the
+        ///   root's. Immune to every path race, and `f_fsid` is the only
+        ///   discriminator that sees an APFS firmlink mount at all: measured
+        ///   on this machine `st_dev` is 16777230 for literally every path
+        ///   INCLUDING `/`, so the device arm alone is blind to exactly the
+        ///   system/Data split it was partly meant to catch.
+        /// - The two PATH arms this probe has always had. They are retained
+        ///   deliberately, not by oversight: they are the seam hermetic tests
+        ///   inject synthetic devices and mount points through, and they can
+        ///   only ever push the answer toward REFUSAL, so a path resolved
+        ///   through a hostile ancestor can make this walk stop early but can
+        ///   never make it descend something the descriptor arms refused. The
+        ///   alias-blindness that used to make `isMountPoint` answer `false`
+        ///   for an aliased spelling is no longer load-bearing, because
+        ///   `f_fsid` now catches that case first.
+        ///
+        /// Declared ORDERING shift: the check now runs AFTER the child is
+        /// opened rather than during its parent's enumeration, so under
+        /// truncation a boundary below the cut is no longer in the refusal
+        /// set. Truncation membership is already unspecified by contract and
+        /// a truncated probe is incomplete regardless.
+        private func crossesMountBoundary(
+            child: SecureDirectory, logical: URL
+        ) -> Bool {
+            if child.mount.device != rootMount.device { return true }
+            if child.mount.fsidMajor != rootMount.fsidMajor
+                || child.mount.fsidMinor != rootMount.fsidMinor {
+                return true
+            }
+            if let rootDevice, let childDevice = provider.deviceID(of: logical),
+               childDevice != rootDevice {
+                return true
+            }
+            return provider.isMountPoint(provider.canonicalize(logical))
+        }
     }
 
     /// BOUNDED directory read: at most `limit` basenames, plus whether MORE
@@ -770,10 +1074,25 @@ enum ValuablesDetector {
     /// exFAT/SMB/FUSE volume can deliver them. The read STOPS at the first
     /// undecodable entry: the directory is already unproven, and continuing
     /// would let a hostile directory full of such names defeat the budget.
+    ///
+    /// DESCRIPTOR-RELATIVE (PR #457 review r5): the enumeration handle comes
+    /// from `openat(parentFD, ".")` — never a path, never `dup`, never
+    /// `fcntl(F_DUPFD_CLOEXEC)`. `dup` clears `FD_CLOEXEC` (leaking directory
+    /// descriptors into every `posix_spawn`, and this app spawns a privileged
+    /// helper) and BOTH duplication forms share the anchor's file offset, so a
+    /// second enumeration through them silently returns zero entries.
+    /// `closedir` closes only this handle; the caller's anchor survives.
     private static func boundedChildNames(
-        of directory: URL, limit: Int
+        parentFD: Int32, limit: Int, provider: FileSystemIdentityProvider
     ) -> (names: [String], truncated: Bool)? {
-        guard let handle = opendir(directory.path) else { return nil }
+        let enumerationFD = provider.openSelfForEnumeration(parentFD)
+        guard enumerationFD >= 0 else { return nil }
+        guard let handle = fdopendir(enumerationFD) else {
+            close(enumerationFD)
+            return nil
+        }
+        // Closes the description `fdopendir` took ownership of; the anchor
+        // `parentFD` is a DIFFERENT description and is untouched.
         defer { closedir(handle) }
         var names: [String] = []
         var truncated = false

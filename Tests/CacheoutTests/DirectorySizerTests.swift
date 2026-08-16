@@ -389,6 +389,60 @@ final class DirectorySizerTests: XCTestCase {
         }
     }
 
+    // MARK: - A path the sizer cannot address is its OWN denial kind
+
+    /// The sizer walks by ABSOLUTE PATH, so a tree past `PATH_MAX` cannot be
+    /// measured — and Foundation's error for it says "the file name "d" is
+    /// invalid", which is false in a way that costs the user real time. The
+    /// names are ordinary; the DEPTH is the problem, and no rename of "d"
+    /// would ever help. Folded into `.other`, that sentence was what the
+    /// sweep displayed as the reason. It is now its own class, with a detail
+    /// that names the real cause and says what still works.
+    func testAPathPastPathMaxDeniesWithItsRealCauseNotAnInvalidFileName() throws {
+        let root = base.appendingPathComponent("past-path-max")
+        try mkdir(root)
+        // `FileManager` cannot address this tree either, so teardown needs
+        // the relative-traversal tool.
+        defer {
+            let rm = Process()
+            rm.executableURL = URL(fileURLWithPath: "/bin/rm")
+            rm.arguments = ["-rf", root.path]
+            try? rm.run()
+            rm.waitUntilExit()
+        }
+        var current = root.withUnsafeFileSystemRepresentation { path -> Int32 in
+            guard let path else { return -1 }
+            return open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+        }
+        guard current >= 0 else { throw XCTSkip("open failed: \(errno)") }
+        for _ in 0..<600 {
+            guard mkdirat(current, "d", 0o755) == 0 else {
+                close(current)
+                throw XCTSkip("mkdirat failed: \(errno)")
+            }
+            let next = openat(current, "d", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+            close(current)
+            guard next >= 0 else { throw XCTSkip("openat failed: \(errno)") }
+            current = next
+        }
+        close(current)
+
+        let report = DirectorySizer().measure(at: root, mode: .deletionTarget)
+        XCTAssertEqual(report.denials.count, 1)
+        let denial: SizeDenial = try XCTUnwrap(report.denials.first)
+        XCTAssertEqual(denial.kind, SizeDenial.Kind.unaddressablePath)
+        XCTAssertFalse(
+            denial.detail.contains("invalid"),
+            "the basename is innocent; blaming it sends the user after a "
+                + "rename that cannot help: \(denial.detail)"
+        )
+        XCTAssertTrue(denial.detail.contains("deeper than an absolute path"),
+                      denial.detail)
+        // And the honest half: this is a SIZING limit only.
+        XCTAssertTrue(denial.detail.contains("deletion is unaffected"),
+                      denial.detail)
+    }
+
     /// Marks chosen inodes as mount points while keeping real devices —
     /// hermetic stand-in for the same-st_dev APFS firmlink mount.
     private final class MountPointInjectingProvider: FileSystemIdentityProvider {

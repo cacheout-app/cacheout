@@ -87,6 +87,52 @@ final class OrphanedCacheClassifierTests: XCTestCase {
         SizeDenial(url: URL(fileURLWithPath: path), kind: .permission, detail: "EACCES")
     }
 
+    private func unaddressableDenial(
+        _ path: String = "/fixture/deep"
+    ) -> SizeDenial {
+        SizeDenial(
+            url: URL(fileURLWithPath: path), kind: .unaddressablePath,
+            detail: "this folder runs deeper than an absolute path can address"
+        )
+    }
+
+    // MARK: - Evidence names the real cause (PR #458 review)
+
+    /// "Couldn't fully scan: some content was unreadable" was FALSE for a
+    /// tree past `PATH_MAX`: every byte is readable by anything that walks
+    /// with descriptors, which the probe and the deletion both now do. Only
+    /// the SIZING failed. The evidence has to say which, or the user goes
+    /// looking for a permission that was never missing — and, worse, assumes
+    /// the item cannot be deleted, which is the state this whole review
+    /// round is about.
+    func testUnaddressablePathEvidenceNamesSizingNotReadability() throws {
+        let lines = OrphanedCacheClassifier.denialEvidence(
+            [unaddressableDenial()]
+        )
+        XCTAssertEqual(lines.count, 1, "\(lines)")
+        let line = try XCTUnwrap(lines.first)
+        XCTAssertTrue(line.contains("couldn't measure its size"), line)
+        XCTAssertTrue(line.contains("deleting it still works"), line)
+        XCTAssertFalse(
+            line.contains("unreadable"),
+            "nothing here is unreadable — the sizer just cannot spell it: "
+                + line
+        )
+    }
+
+    /// It is still fail-closed: an unmeasurable entry is never auto-clean
+    /// eligible, whatever the message says.
+    func testUnaddressablePathStillForcesTheEntryOffSafe() {
+        let classifier = makeClassifier(installedAppStatus: { _ in .unknown })
+        let entry = makeEntry(
+            name: "com.apple.SwiftUI.Drag.\(UUID().uuidString)",
+            denials: [unaddressableDenial()]
+        )
+        let classification = classifier.classify(entry)
+        XCTAssertNotEqual(classification.risk, .safe)
+        XCTAssertFalse(classification.automaticCleanEligible)
+    }
+
     // MARK: - R1: leak glob
 
     func testDragUUIDNamesAreKnownLeakSafeWithExactEvidence() {

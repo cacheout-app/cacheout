@@ -3591,9 +3591,7 @@ final class OrphanedCachesScannerTests: XCTestCase {
     /// descent (the eager-tail-release loop, `liveCount()`'s reduce, and the
     /// shallowest-live search), so a single-child chain grew quadratically
     /// in CPU while its entry count stayed flat: ~10⁹ frame inspections at
-    /// the 20,000-entry budget, before the walk even begins to unwind. Wall
-    /// clock cannot pin an asymptote deterministically; the walk's own
-    /// accounting can, so it reports how many frames each pass inspected.
+    /// the 20,000-entry budget, before the walk even begins to unwind.
     ///
     /// BOTH PASSES, AND THAT IS THE POINT (r8). The first fix reached only
     /// `makeRoom`, and the test that certified it sampled only `makeRoom`,
@@ -3601,8 +3599,23 @@ final class OrphanedCachesScannerTests: XCTestCase {
     /// single-child chain matches NOTHING and therefore scans the entire
     /// prefix, every pop, d²/2 inspections over the unwind: 5,121,601
     /// measured at depth 3200, ~2.0 × 10⁸ at the 20,000-entry budget —
-    /// survived a fix and a review round untouched. A metric that samples
-    /// half the loop certifies half the loop.
+    /// survived a fix and a review round untouched.
+    ///
+    /// AND THE NUMBER IS NO LONGER THE WALK'S OWN CLAIM (PR #458 review, the
+    /// pop-path mutation). Both earlier versions of this test read
+    /// `popInspected`/`inspected` — literals the walk maintained by hand —
+    /// so the mutation that matters most here passed them all: restore the
+    /// O(depth) prefix scan, leave `popInspected = 1` alone, suite green at
+    /// 672/672. What is asserted below is a difference of `FrameStateReads`,
+    /// charged INSIDE `Frame.cursor` and `Frame.pending`. Those two fields
+    /// are the only state a "does this frame still have work?" predicate can
+    /// consult, so a prefix scan cannot be written that does not pay for
+    /// itself, and cannot forget to.
+    ///
+    /// The bound asserted is a CONSTANT, not `2 × window`: neither pass has
+    /// any business reading more than the handful of fields it decides on,
+    /// and a window-shaped ceiling leaves room for a scan that a constant
+    /// does not.
     func testFrameBookkeepingIsBoundedByTheWindowNotTheDepth() throws {
         let entry = cachesRoot.appendingPathComponent("com.example.Bookkeeping")
         try mkdir(entry)
@@ -3622,11 +3635,11 @@ final class OrphanedCachesScannerTests: XCTestCase {
             entryLimit: OrphanedCachesScanner.defaultProbeEntryLimit,
             descriptorWindow: window
         ) { event in
-            guard case .frameBookkeeping(let inspected, _, let pass) = event
+            guard case .frameBookkeeping(let reads, _, let pass) = event
             else { return }
             switch pass {
-            case .descent: descent.record(inspected)
-            case .pop: pop.record(inspected)
+            case .descent: descent.record(reads)
+            case .pop: pop.record(reads)
             }
         }
 
@@ -3642,20 +3655,29 @@ final class OrphanedCachesScannerTests: XCTestCase {
                        "one accounting pass per popped frame, or this test is "
                            + "not measuring the pop path at all")
 
-        // W anchors is the whole population the accounting can see; anything
-        // above that is the frame STACK being scanned again.
+        // A pass decides on the frame it is standing on: measured, 3 field
+        // reads in the worst pass on either side, at ANY depth. Reading
+        // more than a handful means the frame STACK is being scanned again
+        // — at this depth a prefix scan reports ~\(2 * levels) per pop.
+        let ceiling = 4
+        XCTAssertLessThan(
+            ceiling, window,
+            "the bound must be a CONSTANT, tighter than the window — a "
+                + "window-shaped ceiling leaves room for the very scan this "
+                + "test exists to catch"
+        )
         for (name, tally) in [("descent", descent), ("pop", pop)] {
             XCTAssertLessThanOrEqual(
-                tally.worst, 2 * window,
-                "one \(name) accounting pass inspected \(tally.worst) frames "
-                    + "at a depth of \(levels) — the bookkeeping is a "
-                    + "function of DEPTH again"
+                tally.worst, ceiling,
+                "one \(name) pass READ \(tally.worst) frame-state fields at "
+                    + "a depth of \(levels) — the bookkeeping is a function "
+                    + "of DEPTH again"
             )
-            XCTAssertLessThan(
-                tally.total, (levels + 1) * 2 * window,
-                "\(tally.total) frame inspections over \(tally.passes) "
+            XCTAssertLessThanOrEqual(
+                tally.total, (levels + 1) * ceiling,
+                "\(tally.total) frame-state reads over \(tally.passes) "
                     + "\(name) passes — linear in entries is the contract; "
-                    + "a prefix scan would spend ~\(levels * levels / 2)"
+                    + "a prefix scan would spend ~\(levels * levels)"
             )
         }
     }

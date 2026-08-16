@@ -201,8 +201,29 @@ enum UserDataProbeObstruction: CaseIterable, Comparable, Sendable {
     /// ancestor swap): below its root the walk never spells a path at all,
     /// so neither cause can arise there. Measured: a 500-deep tree whose
     /// absolute path is 14,628 bytes reads fine through descriptors while
-    /// `open` on that path returns `ENAMETOOLONG` — which RETIRES a whole
-    /// stranding class rather than merely reclassifying it.
+    /// `open` on that path returns `ENAMETOOLONG`.
+    ///
+    /// THE CLAIM THAT USED TO STAND HERE — that descriptor-relative walking
+    /// "RETIRES a whole stranding class rather than merely reclassifying it"
+    /// — WAS FALSE WHEN IT WAS WRITTEN, and this file has now been bitten
+    /// twice by a comment asserting a property the code did not have. Only
+    /// the PROBE went descriptor-relative. `FileManager.removeItem` and
+    /// `DirectorySizer` still composed absolute paths, so the class did not
+    /// retire: it MOVED, from inspection to removal, and got worse on the
+    /// way. Measured at depths 446 / 600 / 2000 / 4000 (threshold exactly
+    /// `PATH_MAX`): probe `complete=true, obstructions=[]`; sizer
+    /// `denials=1`, "the file name "d" is invalid"; `removeItem`
+    /// NSCocoaErrorDomain 514 / ENAMETOOLONG, in 0.03 s, every time. The
+    /// item was pronounced clean, forced off `.safe` by the sizer denial,
+    /// and then refused by the only remaining route — deterministic,
+    /// unclearable, and blaming a basename that was never the problem.
+    ///
+    /// What retires the class is `DepthSafeRemoval`: the deletion traverses
+    /// by descriptor too, so it addresses exactly what the probe addresses.
+    /// RESIDUAL, STATED: `DirectorySizer` is still path-based, so such a
+    /// tree is still unmeasurable and still lands at review risk — with a
+    /// `.unaddressablePath` denial that now names the real cause, and a
+    /// deletion that works when the user confirms it.
     case unaddressablePath
     /// A mount boundary the walk refuses to cross (either signal: a device-id
     /// change against the walk root, or the `statfs` mount-root check).
@@ -1133,13 +1154,58 @@ struct OrphanedCachesScanner: @unchecked Sendable {
     /// with byte-ascending siblings, so a per-LEVEL frame makes live
     /// descriptors a function of DEPTH — and, with the window below, of a
     /// constant.
+    /// How many times the walk read a frame's TRAVERSAL STATE.
+    ///
+    /// THE POINT IS THAT NOBODY UPDATES IT (PR #458 review, the pop-path
+    /// mutation). The accounting the walk used to emit was hand-maintained —
+    /// `var popInspected = 1`, incremented where the author remembered to —
+    /// so a regressor that reintroduced the O(depth) prefix scan and left
+    /// the literal alone was invisible to every test that read it. Measured:
+    /// swapping `unexhausted.last` for
+    /// `frames[..<depth].lastIndex(where: { $0.cursor < $0.pending.count })`
+    /// with `popInspected = 1` untouched left the whole suite green. A
+    /// number a walk reports about itself is not evidence about the work it
+    /// does.
+    ///
+    /// This one is incremented BY THE ACCESS, inside `Frame.dir`,
+    /// `Frame.cursor` and `Frame.pending` — the only three fields a scan of
+    /// the frame stack can possibly consult, whether it is looking for the
+    /// next frame with work or for a descriptor to release. A prefix scan
+    /// therefore cannot be written without paying for it, and cannot forget
+    /// to. (`cursor`/`pending` alone were NOT enough: a sweep that
+    /// short-circuits on `dir != nil` never reaches them on a chain, where
+    /// eager tail release has already emptied almost every frame. Measured:
+    /// that mutation left the suite green until `dir` was counted too.)
+    ///
+    /// The live-descriptor list is deliberately NOT counted: `liveBelowRoot`
+    /// holds at most `window - 1` indices by I4, so scanning it is bounded
+    /// by a constant no matter how it is written — and the descriptor-census
+    /// tests pin that length independently.
+    private final class FrameStateReads {
+        var count = 0
+    }
+
     private struct Frame {
         /// `nil` ⇒ released to stay inside the window; re-acquirable in ONE
         /// `..` step from the frame below it.
-        var dir: SecureDirectory?
+        ///
+        /// COUNTED TOO, and that is not belt-and-braces: the first version
+        /// of this instrumentation charged only `cursor`/`pending`, and a
+        /// mutation that swept the WHOLE frame stack while short-circuiting
+        /// on `dir != nil` first went undetected — on a chain with eager
+        /// tail release almost every frame is released, so the counted
+        /// fields were never reached. Any prefix scan must look at one of
+        /// these three; all three charge.
+        var dir: SecureDirectory? {
+            get { reads.count += 1; return storedDir }
+            set { storedDir = newValue }
+        }
+        private var storedDir: SecureDirectory?
         /// Proven when this frame's descriptor was first opened; what a
         /// re-acquisition must match.
         let identity: FileSystemIdentityProvider.Identity
+        /// Shared with every other frame of the same walk — see the type.
+        let reads: FrameStateReads
         /// NO PATH IS STORED HERE. A `URL` per frame made the walk's own
         /// bookkeeping QUADRATIC in depth: level `k` retained a private copy
         /// of the whole prefix above it, so a 20,000-level chain of long
@@ -1154,11 +1220,34 @@ struct OrphanedCachesScanner: @unchecked Sendable {
         /// observer asks (`logicalURL(atDepth:)`).
         /// Subdirectory basenames, byte-wise ASCENDING — as VALIDATED
         /// components, so the descent below has nothing left to check.
-        var pending: [SafeComponent] = []
-        var cursor: Int = 0
+        ///
+        /// COMPUTED SO THE READ IS COUNTED (see `FrameStateReads`). The
+        /// storage is private to the frame; the only way to ask a frame
+        /// whether it still has work goes through here or through `cursor`,
+        /// and both charge for it.
+        var pending: [SafeComponent] {
+            get { reads.count += 1; return storedPending }
+            set { storedPending = newValue }
+        }
+        var cursor: Int {
+            get { reads.count += 1; return storedCursor }
+            set { storedCursor = newValue }
+        }
+        private var storedPending: [SafeComponent] = []
+        private var storedCursor: Int = 0
         /// The `fstatat` identity of each pending name, for the descent's
         /// cheap corroborator.
         var vetted: [String: FileSystemIdentityProvider.Identity] = [:]
+
+        init(
+            dir: SecureDirectory?,
+            identity: FileSystemIdentityProvider.Identity,
+            reads: FrameStateReads
+        ) {
+            self.storedDir = dir
+            self.identity = identity
+            self.reads = reads
+        }
     }
 
     /// Test-only observation points, passed as a PARAMETER rather than
@@ -1201,15 +1290,23 @@ struct OrphanedCachesScanner: @unchecked Sendable {
             /// The unwind, once per popped frame.
             case pop
         }
-        /// How many frame/live-index inspections ONE pass performed.
+        /// How many frame-state fields ONE pass actually READ — a MEASURED
+        /// difference of `FrameStateReads`, never a hand-kept tally.
         ///
         /// The walk's own bookkeeping is a RESOURCE, and the entry budget
         /// bounds ATTENTION, not resources — the distinction that has now
         /// cost this walk four times. Wall-clock cannot pin an asymptote
         /// deterministically; this can, so a test asserts the accounting is
-        /// bounded by the descriptor WINDOW rather than by DEPTH — for BOTH
-        /// passes.
-        case frameBookkeeping(inspected: Int, depth: Int, pass: BookkeepingPass)
+        /// bounded by a CONSTANT rather than by DEPTH — for BOTH passes.
+        ///
+        /// THE LABEL CHANGED BECAUSE THE MEANING DID. `inspected` was a
+        /// literal the author maintained, and a pop path that went back to
+        /// scanning the whole frame prefix while leaving `popInspected = 1`
+        /// alone passed every test that read it. `stateReads` is charged
+        /// inside `Frame.cursor`/`Frame.pending`, so the same regression now
+        /// reports ~2 × depth and the test fails on the work, not on the
+        /// claim.
+        case frameBookkeeping(stateReads: Int, depth: Int, pass: BookkeepingPass)
     }
 
     /// A basename PROVEN safe to hand to `openat`/`fstatat`.
@@ -1338,8 +1435,12 @@ struct OrphanedCachesScanner: @unchecked Sendable {
         // `continue`s; the ONLY `return` past this point is the single exit
         // at the end, which carries the whole set. The root checks above
         // may return early only because nothing is established yet there.
+        /// Charged by every read of a frame's `cursor`/`pending` — see
+        /// `FrameStateReads`. Shared by every frame of this walk.
+        let stateReads = FrameStateReads()
+
         var frames: [Frame] = [
-            Frame(dir: root, identity: root.identity)
+            Frame(dir: root, identity: root.identity, reads: stateReads)
         ]
 
         /// The walk's UNRESOLVED spelling of the CURRENT DFS PATH: ONE
@@ -1471,7 +1572,10 @@ struct OrphanedCachesScanner: @unchecked Sendable {
         ///
         /// `depth` is the frame the walk is descending FROM.
         func makeRoom(after depth: Int) {
-            var inspected = 1
+            // MEASURED, NOT CLAIMED: whatever this pass reads off the frame
+            // stack charges `stateReads`, so the number below is the work,
+            // not a literal somebody remembered to bump.
+            let readsBefore = stateReads.count
             // EAGER TAIL RELEASE, and it is FREE: a frame with nothing left
             // to descend into is never climbed back to, so releasing it
             // costs no `..` at all. On a pure deep chain this fires at every
@@ -1489,7 +1593,6 @@ struct OrphanedCachesScanner: @unchecked Sendable {
             if depth >= 1, frames[depth].dir != nil,
                frames[depth].cursor == frames[depth].pending.count {
                 frames[depth].dir = nil
-                inspected += liveBelowRoot.count
                 forgetLive(depth)
             }
             if liveCount() >= window, !liveBelowRoot.isEmpty {
@@ -1501,13 +1604,13 @@ struct OrphanedCachesScanner: @unchecked Sendable {
                 where liveBelowRoot[index] < liveBelowRoot[slot] {
                     slot = index
                 }
-                inspected += liveBelowRoot.count
                 frames[liveBelowRoot[slot]].dir = nil
                 liveBelowRoot.remove(at: slot)
             }
             if let emit = onEvent {
                 emit(.frameBookkeeping(
-                    inspected: inspected, depth: depth, pass: .descent
+                    stateReads: stateReads.count - readsBefore,
+                    depth: depth, pass: .descent
                 ))
             }
         }
@@ -1698,6 +1801,11 @@ struct OrphanedCachesScanner: @unchecked Sendable {
 
         walk: while !frames.isEmpty {
             let depth = frames.count - 1
+            // The pop pass's accounting starts BEFORE its own branch test:
+            // the two reads that decide "is this frame exhausted?" are part
+            // of the pass, and a regression that answered that question by
+            // scanning the stack would otherwise hide in the gap.
+            let readsAtPassStart = stateReads.count
 
             // POP — nothing left to descend into at this level.
             if frames[depth].cursor == frames[depth].pending.count {
@@ -1714,7 +1822,6 @@ struct OrphanedCachesScanner: @unchecked Sendable {
                 // strictly below it and `unexhausted.last` is the DEEPEST
                 // such frame, which is precisely what the retired
                 // `frames[..<depth].lastIndex(where:)` computed.
-                var popInspected = 1
                 let target = unexhausted.last
                 // I5, CHECKED: every index in `unexhausted` is strictly
                 // below the frame being popped. Unreachable — `frames[depth]`
@@ -1741,12 +1848,12 @@ struct OrphanedCachesScanner: @unchecked Sendable {
                     }
                 }
                 if frames[depth].dir != nil {
-                    popInspected += liveBelowRoot.count
                     forgetLive(depth)
                 }
                 if let emit = onEvent {
                     emit(.frameBookkeeping(
-                        inspected: popInspected, depth: depth, pass: .pop
+                        stateReads: stateReads.count - readsAtPassStart,
+                        depth: depth, pass: .pop
                     ))
                 }
                 frames.removeLast()   // `deinit` closes the descriptor
@@ -1869,7 +1976,9 @@ struct OrphanedCachesScanner: @unchecked Sendable {
             makeRoom(after: depth)   // never a refusal, never a budget spend
             // The two stacks move together: one basename pushed per frame,
             // popped with it. (`pathComponents.count == frames.count - 1`.)
-            frames.append(Frame(dir: child, identity: child.identity))
+            frames.append(Frame(
+                dir: child, identity: child.identity, reads: stateReads
+            ))
             liveBelowRoot.append(frames.count - 1)
             pathComponents.append(name)
             onEvent?(.descriptorCensus(
@@ -2512,7 +2621,7 @@ extension OrphanedCachesScanner: SpaceScanner {
         switch kind {
         case .tcc: return .tccDenied
         case .permission: return .permissionDenied
-        case .metadata, .other: return .unreadable
+        case .metadata, .other, .unaddressablePath: return .unreadable
         }
     }
 

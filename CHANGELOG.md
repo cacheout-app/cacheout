@@ -126,6 +126,23 @@ now 3 and destructive commands require `--confirm`. Coordinate MCP updates with
 
 ### Fixed
 
+- **Deleting a folder nested deeper than the system path limit now works.**
+  Inspection had been made descriptor-relative and could read such trees;
+  permanent deletion still went through `FileManager.removeItem`, which
+  builds an absolute path per entry and cannot. The result was a cache
+  folder reported as inspected and clean that no route in the app could ever
+  remove: it failed instantly, every time, with "the file name is invalid" —
+  a message naming a cause that did not exist, since the names were fine and
+  the DEPTH was the problem. `rm -rf` removed the identical folder in under a
+  second, so the refusal was the app's own. Permanent deletion now traverses
+  by open directory handle the same way, with the same no-follow and
+  mount-boundary rules as the inspection, and a constant number of open
+  handles at any depth. Moving to the Trash was never affected (it is a
+  rename). REMAINING, and now said honestly instead of being blamed on a
+  file name: the SIZE of such a folder still cannot be measured, so it is
+  listed at review risk with "couldn't measure its size: part of it sits
+  deeper than an absolute path can address — deleting it still works", and
+  the bytes it frees are under-reported.
 - **Orphaned-caches delete: a folder replaced after it was inspected is no
   longer deleted.** The pre-delete safety inspection holds the folder open,
   which is what stops it following a swap — and also what pins it to the
@@ -156,9 +173,7 @@ now 3 and destructive commands require `--confirm`. Coordinate MCP updates with
   side effects are user-visible: trees whose absolute paths exceed
   `PATH_MAX` are now inspected instead of being refused forever, and mount
   boundaries are detected by filesystem id rather than by path spelling, so
-  an aliased path can no longer hide one. NOTE (new, narrow): the probe is
-  now free of `PATH_MAX` while deletion is not, so a tree the probe
-  certifies can still fail to delete with its own path-length error.
+  an aliased path can no longer hide one.
 - **Freed-bytes over-report (D1).** Freed bytes were assumed from pre-scan
   totals even when deletion partially failed. Every deletion target is now
   measured immediately before deletion and settled through claim-based

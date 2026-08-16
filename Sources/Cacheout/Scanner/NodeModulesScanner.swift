@@ -450,7 +450,7 @@ actor NodeModulesScanner {
         switch denial.kind {
         case .tcc: kind = .tccDenied
         case .permission: kind = .permissionDenied
-        case .metadata, .other: kind = .unreadable
+        case .metadata, .other, .unaddressablePath: kind = .unreadable
         }
         return NodeModulesScanIssue(
             url: denial.url, kind: kind, detail: denial.detail

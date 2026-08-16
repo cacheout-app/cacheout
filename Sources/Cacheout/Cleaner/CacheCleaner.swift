@@ -80,9 +80,14 @@
 ///
 /// ## Deletion modes
 ///
-/// - **Permanent delete** (`moveToTrash: false`): `FileManager.removeItem()`
-///   offloaded to a background queue. Contents of category roots are removed
-///   individually (the root itself survives so tools/apps can recreate it).
+/// - **Permanent delete** (`moveToTrash: false`): `DepthSafeRemoval` —
+///   descriptor-relative, no-follow, mount-respecting — offloaded to a
+///   background queue. NOT `FileManager.removeItem()`, which composes an
+///   absolute path per entry and therefore refuses, forever and with a
+///   misattributed message, exactly the trees past `PATH_MAX` that the
+///   descriptor-relative probe can now inspect and pronounce clean. Contents
+///   of category roots are removed individually (the root itself survives so
+///   tools/apps can recreate it).
 /// - **Move to Trash** (`moveToTrash: true`): the injectable `@MainActor`
 ///   trash seam (production: `FileManager.trashItem`, which talks to Finder).
 ///   A trash failure is a per-child error — it never falls through to a
@@ -832,7 +837,7 @@ actor CacheCleaner {
                 try await trash(child)
             } else {
                 try await Self.removeItemConcurrently(
-                    at: child, fileManager: fileManager
+                    at: child, provider: provider
                 )
             }
         } catch {
@@ -1070,7 +1075,7 @@ actor CacheCleaner {
                 // contents-with-parent-preserved (R1/R15). The UNRESOLVED
                 // spelling: a symlink target is removed AS a link (R4).
                 try await Self.removeItemConcurrently(
-                    at: target, fileManager: fileManager
+                    at: target, provider: provider
                 )
             }
         } catch {
@@ -1181,11 +1186,24 @@ actor CacheCleaner {
 
     /// Synchronous disk I/O offloaded to a GCD background queue so the actor
     /// (and the cooperative thread pool) never blocks on a large unlink.
-    nonisolated private static func removeItemConcurrently(at url: URL, fileManager: FileManager) async throws {
+    ///
+    /// THE DELETION IS DESCRIPTOR-RELATIVE, and that is the fix rather than a
+    /// detail (PR #458 review — the stranding class that MOVED). Inspection
+    /// went descriptor-relative and could then read trees past `PATH_MAX`;
+    /// `FileManager.removeItem(at:)` composes an absolute path per entry and
+    /// cannot, so the codebase began producing items that were probed CLEAN
+    /// and COMPLETE and were nonetheless undeletable forever — measured,
+    /// NSCocoaErrorDomain 514 / ENAMETOOLONG, in 0.03 s, every time, with a
+    /// message blaming an "invalid file name". Both halves of one core now
+    /// traverse the same way, so neither can address a tree the other
+    /// cannot: `DepthSafeRemoval` reaches exactly what the probe reaches.
+    nonisolated private static func removeItemConcurrently(
+        at url: URL, provider: FileSystemIdentityProvider
+    ) async throws {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             DispatchQueue.global(qos: .userInitiated).async {
                 do {
-                    try fileManager.removeItem(at: url)
+                    try DepthSafeRemoval.remove(at: url, provider: provider)
                     continuation.resume()
                 } catch {
                     continuation.resume(throwing: error)

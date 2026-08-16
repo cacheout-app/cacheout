@@ -410,6 +410,19 @@ struct OrphanedCacheClassifier {
         if kinds.contains(.permission) {
             lines.append("couldn't fully scan: permission denied")
         }
+        if kinds.contains(.unaddressablePath) {
+            // NAMES THE REAL CAUSE (PR #458 review). "Some content was
+            // unreadable" was false: every byte here is readable by anything
+            // that walks with descriptors instead of paths — the probe does,
+            // and so does the deletion now. What failed is the SIZING, and
+            // only the sizing. Saying so is what stops a user hunting for a
+            // permission that was never missing, or renaming a file whose
+            // name was never the problem.
+            lines.append(
+                "couldn't measure its size: part of it sits deeper than an "
+                    + "absolute path can address — deleting it still works"
+            )
+        }
         if kinds.contains(.metadata) || kinds.contains(.other) {
             lines.append("couldn't fully scan: some content was unreadable")
         }

@@ -70,6 +70,21 @@ struct SizeDenial: Equatable {
         case permission
         /// Metadata unavailable (lstat/resourceValues failed mid-walk).
         case metadata
+        /// ENAMETOOLONG(63)/ELOOP(62): this walk composes an ABSOLUTE PATH
+        /// per entry, and the tree runs past what a path can address.
+        ///
+        /// ITS OWN KIND BECAUSE THE MESSAGE WAS A LIE (PR #458 review). The
+        /// Cocoa error Foundation raises here reads "The item couldn't be
+        /// opened because the file name "d" is invalid" — measured, on a
+        /// chain of perfectly valid single-letter names whose only sin is
+        /// being 446 levels down. Folded into `.other`, that sentence was
+        /// what the sweep showed a user as the reason their cache could not
+        /// be measured, and it names a cause that does not exist: no rename
+        /// of "d" would ever help. The remedy that would — restructuring or
+        /// shortening the tree — is only sayable once the class is
+        /// distinguished. What it is NOT any more is a reason the item
+        /// cannot be DELETED: `DepthSafeRemoval` addresses this tree.
+        case unaddressablePath
         /// Anything else — recorded, never swallowed.
         case other
     }
@@ -406,6 +421,16 @@ struct DirectorySizer {
             kind = .tcc
         case .some(Int(EACCES)):
             kind = .permission
+        case .some(Int(ENAMETOOLONG)), .some(Int(ELOOP)):
+            // The one class whose Cocoa message names the WRONG cause, so
+            // the detail is replaced rather than passed through: Foundation
+            // blames the basename, and the basename is innocent.
+            return SizeDenial(
+                url: url, kind: .unaddressablePath,
+                detail: "this folder runs deeper than an absolute path can "
+                    + "address (\(PATH_MAX)-byte limit), so its size could "
+                    + "not be measured — deletion is unaffected"
+            )
         default:
             // A bare Cocoa "read no permission" without a POSIX underlying
             // error is still a permission denial, not "other".
@@ -443,7 +468,7 @@ extension SizeDenial.Kind {
         switch self {
         case .tcc: return .tccDenied
         case .permission: return .permissionDenied
-        case .metadata, .other: return .other
+        case .metadata, .other, .unaddressablePath: return .other
         }
     }
 }

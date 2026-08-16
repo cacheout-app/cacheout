@@ -2166,6 +2166,129 @@ final class CacheCleanerTests: XCTestCase {
         }
     }
 
+    // MARK: - The stranding class that moved to the deletion (PR #458 review)
+
+    /// A chain of `levels` directories built with `mkdirat` — the ONLY way
+    /// one past `PATH_MAX` can exist. Holds two descriptors at a time.
+    private func makeDeepChain(
+        under root: URL, name: String, levels: Int
+    ) throws -> Int32 {
+        var current = root.withUnsafeFileSystemRepresentation { path -> Int32 in
+            guard let path else { return -1 }
+            return open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+        }
+        guard current >= 0 else { throw XCTSkip("open failed: \(errno)") }
+        for _ in 0..<levels {
+            guard mkdirat(current, name, 0o755) == 0 else {
+                close(current)
+                throw XCTSkip("mkdirat failed: \(errno)")
+            }
+            let next = openat(current, name, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+            close(current)
+            guard next >= 0 else { throw XCTSkip("openat failed: \(errno)") }
+            current = next
+        }
+        return current
+    }
+
+    /// THE defect, end to end, through the production cleaner.
+    ///
+    /// Making the probe descriptor-relative let INSPECTION read past
+    /// `PATH_MAX` while the deletion stayed on `FileManager.removeItem`, so
+    /// the app began manufacturing items that were provably clean and
+    /// permanently undeletable. Measured on this exact fixture shape at
+    /// depths 446 / 600 / 2000 / 4000 (threshold exactly `PATH_MAX`):
+    ///
+    /// - probe `complete=true, obstructions=[]`;
+    /// - sizer `itemCount=0, exact=0, denials=1`;
+    /// - `removeItem` NSCocoaErrorDomain 514 / ENAMETOOLONG in 0.03 s.
+    ///
+    /// The sizer denial forces the item off `.safe`, so
+    /// `automaticCleanEligible` is false and the ONLY remaining route is
+    /// explicit per-item confirmation — which re-enters `removeGuardedItem`
+    /// and fails identically, forever, blaming a file name that was never
+    /// the problem. BOTH routes are asserted here, because the auto route is
+    /// what a leak-tier entry takes and the confirmation route is what this
+    /// one is actually forced onto.
+    func testSweepItemPastPathMaxIsDeletedByBothRoutes() async throws {
+        for autoEligible in [false, true] {
+            let (home, caches, entry, snapshot) =
+                try makeSweepFixture("pastPathMax-\(autoEligible)")
+            defer {
+                let rm = Process()
+                rm.executableURL = URL(fileURLWithPath: "/bin/rm")
+                rm.arguments = ["-rf", home.path]
+                try? rm.run()
+                rm.waitUntilExit()
+            }
+
+            let levels = 600
+            let deepest = try makeDeepChain(
+                under: entry, name: "d", levels: levels
+            )
+            let leaf = openat(deepest, "payload.bin", O_CREAT | O_WRONLY, 0o644)
+            XCTAssertGreaterThanOrEqual(leaf, 0)
+            if leaf >= 0 {
+                var bytes = [UInt8](repeating: 0xAB, count: 8192)
+                XCTAssertEqual(write(leaf, &bytes, 8192), 8192)
+                close(leaf)
+            }
+            close(deepest)
+
+            // The fixture's own precondition: this tree is genuinely past
+            // what an absolute path can address.
+            var spelled = entry.path
+            for _ in 0..<levels { spelled += "/d" }
+            let byPath = spelled.withCString { open($0, O_RDONLY | O_DIRECTORY) }
+            if byPath >= 0 { close(byPath) }
+            XCTAssertEqual(byPath, -1, "fixture is not actually past PATH_MAX")
+
+            // What the two halves of the core say about it, INDEPENDENTLY
+            // measured — the probe reaches it, the sizer does not, and that
+            // asymmetry is exactly what stranded the item.
+            let probe = OrphanedCachesScanner.boundedUserDataShapeWalk(
+                at: entry, provider: FileSystemIdentityProvider(),
+                entryLimit: OrphanedCachesScanner.defaultProbeEntryLimit,
+                descriptorWindow: OrphanedCachesScanner.defaultDescriptorWindow()
+            )
+            XCTAssertTrue(probe.complete, "\(probe.obstructions)")
+            XCTAssertEqual(probe.obstructions, [])
+            let sized = DirectorySizer().measure(at: entry, mode: .deletionTarget)
+            XCTAssertEqual(sized.denials.map(\.kind), [.unaddressablePath],
+                           "the sizer still cannot measure it — stated residual")
+
+            let item = makeRemoveItem(
+                scannerID: OrphanedCachesScanner.registeredID,
+                displayName: entry.lastPathComponent,
+                origin: caches, target: entry, autoEligible: autoEligible
+            )
+            let cleaner = CacheCleaner(
+                home: home, containerRoots: [caches],
+                containerSnapshot: snapshot
+            )
+            let report = await cleaner.clean(items: [item], moveToTrash: false)
+
+            XCTAssertEqual(
+                report.errors.map(\.message), [],
+                "a tree `rm -rf` removes in under a second must not be "
+                    + "refused forever with a message about an invalid file "
+                    + "name (autoEligible: \(autoEligible))"
+            )
+            XCTAssertEqual(report.entries.count, 1)
+            XCTAssertFalse(
+                FileManager.default.fileExists(atPath: entry.path),
+                "the entry must be gone (autoEligible: \(autoEligible))"
+            )
+            // RESIDUAL, ASSERTED SO IT CANNOT BE FORGOTTEN: `DirectorySizer`
+            // is still path-based, so it counts only what it can reach —
+            // here the 4 KiB `payload.bin` at the top and NOT the 8 KiB one
+            // 600 levels down. The deletion is honest; the accounting
+            // under-reports, and the item carries a denial saying so.
+            XCTAssertEqual(report.entries.first?.exactBytes, 4096,
+                           "the deep payload's 8 KiB is not counted")
+        }
+    }
+
     func testAutoEligibleSweepItemUnchangedStillDeletes() async throws {
         let (home, caches, entry, snapshot) = try makeSweepFixture()
         defer { try? FileManager.default.removeItem(at: home) }

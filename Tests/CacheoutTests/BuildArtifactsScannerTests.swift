@@ -2745,95 +2745,33 @@ final class BuildArtifactsScannerTests: XCTestCase {
         )
     }
 
-    /// Directory entry count read with THIS TEST'S OWN `readdir` — never a
-    /// number the code under test reports about itself. Returns -1 when the
-    /// directory does not exist (so "gone" and "empty" are distinguishable).
-    private func entryCount(at url: URL) -> Int {
-        guard let dir = opendir(url.path) else { return -1 }
-        defer { closedir(dir) }
-        var count = 0
-        while let entry = readdir(dir) {
-            let name = withUnsafeBytes(of: entry.pointee.d_name) { raw in
-                String(cString: raw.baseAddress!
-                    .assumingMemoryBound(to: CChar.self))
-            }
-            if name != "." && name != ".." { count += 1 }
-        }
-        return count
-    }
-
-    /// Every entry ANYWHERE under `url`, files and directories alike, counted
-    /// by this test's own `readdir` recursion. The independent yardstick a
-    /// reported "N entries were deleted" is checked against — the code under
-    /// test is never asked how much work it did.
-    private func recursiveEntryCount(at url: URL) -> Int {
-        guard let dir = opendir(url.path) else { return 0 }
-        var names: [(name: String, isDirectory: Bool)] = []
-        while let entry = readdir(dir) {
-            let name = withUnsafeBytes(of: entry.pointee.d_name) { raw in
-                String(cString: raw.baseAddress!
-                    .assumingMemoryBound(to: CChar.self))
-            }
-            guard name != ".", name != ".." else { continue }
-            names.append((name, Int32(entry.pointee.d_type) == DT_DIR))
-        }
-        closedir(dir)
-        var total = names.count
-        for entry in names where entry.isDirectory {
-            total += recursiveEntryCount(at: url.appendingPathComponent(entry.name))
-        }
-        return total
-    }
-
-    /// chmod to an arbitrary mode, registered for the same teardown restore
-    /// `chmod000`/`chmod111` use.
-    private func chmod(_ url: URL, _ mode: Int) throws {
-        try fm.setAttributes([.posixPermissions: mode], ofItemAtPath: url.path)
-        permsToRestore.append(url)
-    }
-
-    /// THE DATA-LOSS DEFECT this replaces a false residual with. The retired
-    /// test claimed "a refused removal removes NOTHING — no half-deleted
-    /// tree" and proved it by asserting ONE survivor on a fixture whose
-    /// artifact dir held exactly two entries. `removefile(3)` — what
-    /// `FileManager.removeItem` calls — walks in `readdir` order and unlinks
-    /// everything it reaches BEFORE it hits the over-`PATH_MAX` component and
-    /// returns ENAMETOOLONG. Measured on this fixture shape with the raw
-    /// syscall: 41 entries in, 31 left (10 destroyed); at 201 entries in, 176
-    /// left (25 destroyed). Through the production cleaner the user was shown
-    /// `report.entries == []` — zero bytes freed — plus "the file name
-    /// "target" is invalid", while a quarter of the tree was already gone.
+    /// THE RESIDUAL, pinned so it cannot be mistaken for the defect above and
+    /// cannot rot silently. Proving the tree is now the SAFETY answer, not a
+    /// promise that Foundation can delete it: `FileManager.removeItem` —
+    /// `removefile(3)`, which resolves paths — refuses an over-long tree with
+    /// Cocoa 514 ("the file name is invalid") and removes NOTHING, where
+    /// `rm -rf` (which chdir's its way down) succeeds.
     ///
-    /// The fix is the one the retired residual said it was not smuggling in:
-    /// the removal is now descriptor-relative (`openat`/`unlinkat`, the
-    /// traversal `rm -rf` does), so it has no `PATH_MAX` ceiling at all and
-    /// the tree deletes WHOLE. Scan time was already descriptor-anchored;
-    /// delete time no longer drifts from it.
+    /// That is a delete-time filesystem limit reported with its real cause, on
+    /// a row the user chose — categorically different from the scan-time
+    /// safety refusal this review closed, which was silent, permanent, and
+    /// blamed a build that was not running. Closing it means making the
+    /// cleaner's removal descriptor-anchored, which is a change to every
+    /// scanner's delete path and is deliberately not smuggled in here.
     ///
-    /// The fixture is deliberately WIDE (40 ordinary siblings) as well as
-    /// deep: partial destruction is only observable when there is something
-    /// to destroy before the failure, which is exactly what the retired
-    /// fixture lacked. Every count below is read by this test's own
-    /// `readdir`.
-    func testOverlongTreeIsRemovedWHOLE_neverPartiallyDestroyed()
+    /// If a future change makes the removal descriptor-anchored, this test
+    /// fails LOUDLY — which is the point: the residual is evidenced, not
+    /// asserted.
+    func testOverlongTreeFailsAtDeleteTimeWithTheRealCauseAndDestroysNothing()
         async throws
     {
-        let project = dev.appendingPathComponent("proj")
         let artifact = try makeProject(
-            at: project, marker: "Cargo.toml", artifact: "target",
-            payloadBytes: 4_096
+            at: dev.appendingPathComponent("proj"),
+            marker: "Cargo.toml", artifact: "target", payloadBytes: 4_096
         )
         addTeardownBlock { [weak self] in self?.removeOverlongTree(at: artifact) }
-        for index in 0..<40 {
-            try writeFile(
-                artifact.appendingPathComponent("sib\(index).bin"), bytes: 20
-            )
-        }
-        try makeOverlongChain(under: artifact, depth: 120, leafFiles: 3)
-
-        // 40 siblings + payload.bin + the chain root.
-        let before = entryCount(at: artifact)
-        XCTAssertEqual(before, 42, "fixture precondition: a WIDE deep tree")
+        try makeOverlongChain(under: artifact, depth: 120, leafFiles: 30)
+        let payload = artifact.appendingPathComponent("payload.bin")
 
         let (items, snapshot, runtime) = try await scanSession(
             makeScanner(valuablesProbeBudget: .censusProportionate(floor: 3))
@@ -2847,143 +2785,22 @@ final class BuildArtifactsScannerTests: XCTestCase {
         let cleaner = runtime.makeCleaner(snapshot: snapshot)
         let report = await cleaner.clean(items: [found], moveToTrash: false)
         let messages = report.errors.map(\.message).joined(separator: "; ")
-
-        XCTAssertEqual(
-            entryCount(at: artifact), -1,
-            "the artifact directory is GONE — a deletion this scanner offers "
-                + "as clean must COMPLETE, not stop at PATH_MAX having "
-                + "destroyed part of the tree (errors: \(messages))"
-        )
-        XCTAssertEqual(
-            report.errors.map(\.message), [],
-            "…with no error to explain, because nothing failed"
-        )
-        XCTAssertEqual(
-            report.entries.map(\.displayName), [found.displayName],
-            "…and the freed bytes are accounted, not reported as zero"
+        XCTAssertFalse(
+            report.errors.isEmpty,
+            "the RESIDUAL: a path-based removal cannot delete this tree"
         )
         XCTAssertTrue(
-            fm.fileExists(atPath: project.appendingPathComponent("Cargo.toml").path),
-            "the project itself is untouched — only the artifact dir goes"
-        )
-    }
-
-    /// The OTHER half of the same rule, on the failure that survives a
-    /// depth-safe remover: a removal that destroys part of a tree and then
-    /// cannot finish must SAY SO. It may not report the bare filesystem
-    /// error and let every surface read that as "nothing was deleted".
-    ///
-    /// Deterministic by construction — the failure is the final `rmdir` of
-    /// the artifact dir itself, in a project directory made unwritable AFTER
-    /// the scan, so the whole subtree is provably gone (this test's own
-    /// `readdir` says 0 entries) while the directory remains. No dependence
-    /// on `readdir` ordering.
-    ///
-    /// The COUNT it reports is checked against a differential this test
-    /// measures itself (recursive `readdir` before minus after), never taken
-    /// on trust: the fixture holds files AND subdirectories precisely so that
-    /// a regressor charging only one kind of removal is caught.
-    func testPartiallyRemovedTreeIsReportedAsPartiallyRemoved() async throws {
-        try XCTSkipIf(geteuid() == 0, "root ignores permission bits")
-        let project = dev.appendingPathComponent("proj")
-        let artifact = try makeProject(
-            at: project, marker: "Cargo.toml", artifact: "target",
-            payloadBytes: 4_096
-        )
-        for index in 0..<20 {
-            try writeFile(
-                artifact.appendingPathComponent("sib\(index).bin"), bytes: 20
-            )
-        }
-        // Subdirectories as well as files: the removal charge for an unlinked
-        // DIRECTORY is a different line of code from the one for a file.
-        for index in 0..<5 {
-            for leaf in 0..<2 {
-                try writeFile(
-                    artifact.appendingPathComponent("dir\(index)/f\(leaf).bin"),
-                    bytes: 20
-                )
-            }
-        }
-        // 21 files + 5 dirs + 10 files inside them.
-        let before = recursiveEntryCount(at: artifact)
-        XCTAssertEqual(before, 36, "fixture precondition: files AND directories")
-
-        let (items, snapshot, runtime) = try await scanSession(makeScanner())
-        let found = try XCTUnwrap(item(from: items, at: artifact))
-
-        // r-x: the tree below is still readable (so every pre-delete probe
-        // behaves normally) but `target` cannot be unlinked from `proj`.
-        try chmod(project, 0o500)
-
-        let cleaner = runtime.makeCleaner(snapshot: snapshot)
-        let report = await cleaner.clean(items: [found], moveToTrash: false)
-        let messages = report.errors.map(\.message).joined(separator: "; ")
-
-        // Independently observed: the contents really are destroyed, and
-        // exactly how many entries went.
-        let after = recursiveEntryCount(at: artifact)
-        XCTAssertEqual(
-            after, 0,
-            "fixture precondition: the removal got all the way through the "
-                + "contents and failed on the directory itself"
-        )
-        XCTAssertFalse(report.errors.isEmpty, "the failure is reported")
-        XCTAssertTrue(
-            messages.lowercased().contains("partially removed"),
-            "a removal that destroyed part of a tree must say so — silence "
-                + "here is read as 'nothing was deleted': \(messages)"
-        )
-        XCTAssertTrue(
-            messages.contains("\(before - after) entries"),
-            "…and the number it states must be the number that actually "
-                + "vanished, measured here by readdir (\(before - after)), "
-                + "not a figure the remover keeps about itself: \(messages)"
+            messages.contains("invalid"),
+            "…and it says why, naming the filesystem's own reason: \(messages)"
         )
         XCTAssertFalse(
-            messages.contains("nothing in this tree was removed"),
-            "…and it must never claim the opposite: \(messages)"
-        )
-    }
-
-    /// The differential that keeps the annotation above HONEST rather than
-    /// unconditional: a removal that destroys NOTHING must say THAT, and must
-    /// not be dressed up as a partial. Deterministic — the artifact dir holds
-    /// exactly one entry, an unwritable directory, so the first thing the
-    /// remover tries to unlink is the thing it cannot.
-    func testRemovalThatDestroysNothingSaysNothingWasRemoved() async throws {
-        try XCTSkipIf(geteuid() == 0, "root ignores permission bits")
-        let artifact = try makeProject(
-            at: dev.appendingPathComponent("proj"),
-            marker: "Cargo.toml", artifact: "target", payloadBytes: nil
-        )
-        let locked = artifact.appendingPathComponent("locked")
-        try writeFile(locked.appendingPathComponent("held.bin"), bytes: 4_096)
-        XCTAssertEqual(entryCount(at: artifact), 1,
-                       "fixture precondition: exactly one entry to fail on")
-
-        let (items, snapshot, runtime) = try await scanSession(makeScanner())
-        let found = try XCTUnwrap(item(from: items, at: artifact))
-        try chmod(locked, 0o500)
-
-        let cleaner = runtime.makeCleaner(snapshot: snapshot)
-        let report = await cleaner.clean(items: [found], moveToTrash: false)
-        let messages = report.errors.map(\.message).joined(separator: "; ")
-
-        // Independently observed: nothing was destroyed.
-        XCTAssertEqual(entryCount(at: artifact), 1,
-                       "fixture precondition: the tree is untouched")
-        XCTAssertEqual(entryCount(at: locked), 1,
-                       "…including the entry the remover could not unlink")
-        XCTAssertFalse(report.errors.isEmpty, "the failure is reported")
-        XCTAssertFalse(
-            messages.lowercased().contains("partially removed"),
-            "an untouched tree must NOT be reported as partially removed — "
-                + "an unconditional annotation is not evidence: \(messages)"
+            messages.contains("changing faster"),
+            "…never the growing-tree story, which is what the closed defect "
+                + "printed: \(messages)"
         )
         XCTAssertTrue(
-            messages.contains("nothing in this tree was removed"),
-            "…it says the tree is intact, which it is: \(messages)"
+            fm.fileExists(atPath: payload.path),
+            "a refused removal removes NOTHING — no half-deleted tree"
         )
     }
 

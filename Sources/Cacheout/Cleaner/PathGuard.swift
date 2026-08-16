@@ -353,11 +353,9 @@ final class PathGuard {
     ///    snapshot is refused (fail-closed; the next session re-captures).
     ///
     /// Callers re-run this immediately before the destructive call. The
-    /// window between that final check and the removal's own `open` of the
-    /// target's parent remains open by explicit decision — the cleaner runs
-    /// unprivileged as the user, so a same-user racer could delete the target
-    /// directly. Below that parent the removal is descriptor-relative
-    /// (`DeepRemover`), so no later component can be re-pointed under it.
+    /// window between that final check and the path-based `removeItem`
+    /// remains open by explicit decision — the cleaner runs unprivileged as
+    /// the user, so a same-user racer could delete the target directly.
     func admitContainer(
         _ url: URL, snapshot: ContainerSnapshot
     ) throws -> AdmittedContainer {

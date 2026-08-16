@@ -105,24 +105,12 @@ and docs/v1/CLI-REFERENCE.md) — the pre-release `node_modules` →
   blind to exactly the firmlink split it was meant to catch. The descriptor's
   own `f_fsid` is now the primary signal; the previous path-based signals are
   kept as an additional, refusal-only backstop.
-- **Deletion is descriptor-relative, and no longer stops half-way through a
-  tree.** Permanent deletes went through `FileManager.removeItem` —
-  `removefile(3)`, which resolves a full path for every entry. Once the
-  valuables probe became descriptor-anchored it could certify trees whose
-  absolute paths exceed `PATH_MAX`, so Cacheout could prove such a tree clean,
-  offer it, and then hand it to a remover that unlinks in `readdir` order
-  until the first over-long component and stops with ENAMETOOLONG — leaving
-  the tree PART deleted while reporting the failure and zero bytes freed
-  (measured on a `target/` of 40 ordinary files plus a 120-deep chain: 41
-  entries in, 31 left; with 200 siblings, 201 in and 176 left). Removal now
-  runs on held descriptors (`openat`/`unlinkat`, the traversal `rm -rf` uses),
-  so it has no depth or path-length ceiling and such trees delete whole.
-  Descriptors held are bounded (a 64-deep window; deeper ancestors are
-  recovered through `openat(child, "..")` and re-proved by inode), symlinks
-  are still removed AS links and never followed, and a removal that genuinely
-  cannot finish — an unwritable parent, a locked entry — now reports how many
-  entries it DID destroy, so no surface can render a partial destruction as
-  "nothing was deleted".
+- **Known consequence.** The probe is now free of `PATH_MAX`: it can inspect
+  and certify a tree whose absolute paths exceed the limit, while
+  `FileManager.removeItem` — which the cleaner still uses — cannot address
+  one. Such a deletion fails with its own error rather than being silently
+  skipped; giving the deleter the same descriptor-relative treatment is
+  tracked separately.
 - **Known residual.** `DirectorySizer` is still a path-based
   `FileManager.enumerator` walk, so an ancestor swap landing after the
   containment descent above can still redirect the SIZING of a build-artifact

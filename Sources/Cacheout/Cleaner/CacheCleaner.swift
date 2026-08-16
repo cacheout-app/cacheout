@@ -81,14 +81,8 @@
 ///
 /// ## Deletion modes
 ///
-/// - **Permanent delete** (`moveToTrash: false`): `DeepRemover.removeTree`
-///   offloaded to a background queue — a descriptor-relative
-///   (`openat`/`unlinkat`) removal, NOT `FileManager.removeItem`. Below the
-///   removal root no operation takes a path, so the removal has no `PATH_MAX`
-///   ceiling and cannot stop half-way through a tree the descriptor-anchored
-///   scan walks whole (fn-4 r9). A removal it cannot finish reports the count
-///   of entries it DID destroy, so nothing renders a partial destruction as
-///   "nothing was deleted". Contents of category roots are removed
+/// - **Permanent delete** (`moveToTrash: false`): `FileManager.removeItem()`
+///   offloaded to a background queue. Contents of category roots are removed
 ///   individually (the root itself survives so tools/apps can recreate it).
 /// - **Move to Trash** (`moveToTrash: true`): the injectable `@MainActor`
 ///   trash seam (production: `FileManager.trashItem`, which talks to Finder).
@@ -873,7 +867,7 @@ actor CacheCleaner {
 
         // ANY mount boundary in the measured tree — the child itself, or a
         // mounted subtree nested anywhere beneath it — refuses the deletion.
-        // The sizer records-and-skips boundaries for SIZING, but the removal
+        // The sizer records-and-skips boundaries for SIZING, but `removeItem`
         // would recurse straight through an inner mount; refusal is the
         // epic's mount doctrine (R15). `validateContainedChild` is
         // descendant-only by design, so this is where the rule lands for
@@ -895,7 +889,9 @@ actor CacheCleaner {
                 // to a permanent delete (R11).
                 try await trash(child)
             } else {
-                try await Self.removeItemConcurrently(at: child)
+                try await Self.removeItemConcurrently(
+                    at: child, fileManager: fileManager
+                )
             }
         } catch {
             if error is PathGuardError {
@@ -1022,7 +1018,9 @@ actor CacheCleaner {
                 // Item mode deletes the target ITSELF — never its
                 // contents-with-parent-preserved (R1/R15). The UNRESOLVED
                 // spelling: a symlink target is removed AS a link (R4).
-                try await Self.removeItemConcurrently(at: target)
+                try await Self.removeItemConcurrently(
+                    at: target, fileManager: fileManager
+                )
             }
         } catch {
             if error is PathGuardError {
@@ -1132,19 +1130,11 @@ actor CacheCleaner {
 
     /// Synchronous disk I/O offloaded to a GCD background queue so the actor
     /// (and the cooperative thread pool) never blocks on a large unlink.
-    ///
-    /// The removal itself is `DeepRemover` — descriptor-relative, so it has
-    /// no `PATH_MAX` ceiling — and NOT `FileManager.removeItem`. The scan
-    /// walks (`ValuablesDetector`, `ProjectTreeWalker`) have been
-    /// descriptor-anchored since fn-4 r6; a path-based removal behind them
-    /// meant this app could prove a tree clean, offer it, and then destroy
-    /// PART of it while reporting that nothing was deleted. Scan time and
-    /// delete time now truncate in the same place: nowhere.
-    nonisolated private static func removeItemConcurrently(at url: URL) async throws {
+    nonisolated private static func removeItemConcurrently(at url: URL, fileManager: FileManager) async throws {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             DispatchQueue.global(qos: .userInitiated).async {
                 do {
-                    try DeepRemover.removeTree(at: url)
+                    try fileManager.removeItem(at: url)
                     continuation.resume()
                 } catch {
                     continuation.resume(throwing: error)

@@ -535,10 +535,11 @@ enum DepthSafeRemoval {
                 path: displayPath, cause: .unprovableLocation, depth: 0
             )
         }
-        try proveContainment(
-            of: current, in: parentIdentity, provider: provider,
-            displayPath: displayPath, depth: 0
-        )
+        // NOTE: the root's own containment proof is NOT taken here. It is
+        // taken by the `destructivePass` below, immediately before the
+        // enumeration it licences — one proof, at the seam that destroys,
+        // rather than one here and another one there that a later edit can
+        // let drift apart.
 
         // EVERY BOUNDARY IN THE WHOLE TREE, BEFORE THE FIRST `unlinkat`
         // (PR #458 review — the P2 the per-child check could not answer).

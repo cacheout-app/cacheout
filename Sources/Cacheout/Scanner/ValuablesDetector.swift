@@ -54,9 +54,37 @@
 /// guarantee.
 ///
 /// The UNRESOLVED spelling is unaffected and is now strictly safer: it is
-/// carried for display and identity ONLY (`Frame.logicalURL`), and below the
-/// root it is never opened, stat'd, or resolved. `displayURL` and
-/// `canonicalIdentityPath` are byte-identical to what they always were.
+/// carried for DISPLAY only (`Frame.logicalURL`), and below the root it is
+/// never opened, stat'd, or resolved.
+///
+/// ## THE IDENTITY PATH IS ANCHORED THE SAME WAY (PR #457 review, P2 #1)
+/// The walk was anchored and the identity DERIVATION was not: each disclosed
+/// valuable's `canonicalIdentityPath` came from
+/// `resolveTargetKeepingLeaf(discovered spelling)`, which re-resolves the
+/// whole parent chain — including directories this walk had already opened
+/// and was holding. Rename one of them and drop a symlink in its place while
+/// the probe is inside it (a real `rename(2)` + `symlink(2)`, driven from the
+/// `didReadNames` hook, pinned by a test) and the disclosure published the
+/// REAL held inode's integers under a path pointing OUTSIDE the artifact dir
+/// — measured: two different tokens over one unchanged file. That value is
+/// the acknowledgement-token preimage, so the same failure class as the
+/// anchored-probe defect: the walk was anchored, the authorization was not.
+///
+/// So the identity path is now COMPOSED, exactly as the traversal is: the
+/// root's canonical path is resolved ONCE, at core entry, BEFORE the walk
+/// holds anything (it is the value the root mount check already computed — the
+/// anchoring costs no extra resolution), and every level below appends the
+/// exact basename `readdir` produced and `openat` descended
+/// (`Frame.identityURL`). No ancestor is ever named to the kernel again after
+/// its descriptor is open.
+///
+/// Byte-identical to the old derivation for every non-attack tree, and by
+/// construction rather than by luck: below the root the composed components
+/// are the on-disk basenames `readdir` returned, which is precisely what
+/// `realpath` would have produced for a chain of real directories — and the
+/// walk descends nothing else (`O_NOFOLLOW` on every `openat`). Both faces
+/// enter through the same core, so scan time and delete time compose the
+/// identical path and therefore the identical token.
 ///
 /// The ROOT is the one thing the caller supplies, and there are now TWO ways
 /// to supply it. `probe(at:root:…)` takes a root the caller has ALREADY OPENED
@@ -143,6 +171,41 @@
 /// grants automatically, doubling from the subject's own census), an
 /// OBSTRUCTION only by removing the impediment. When both stop one walk the
 /// OBSTRUCTION is reported — it is the one no escalation can help.
+///
+/// ## IT WINDS DOWN WHEN CANCELLED (PR #457 review, P2 #2)
+/// The bound above is what made this urgent: while the budget was a flat
+/// 20,000 entries, the longest stretch of synchronous work between a
+/// cancellation and the walk noticing was 20,000 `readdir`s; census-
+/// proportionate escalation raised that ceiling to `20_000 << 16` ≈ 1.31e9,
+/// so our own fix widened the window by five orders of magnitude. The GUI
+/// deliberately AWAITS the producer's real completion after cancelling
+/// (`CacheoutViewModel`: `await session.untilProducerFinishes()`, holding the
+/// scan-in-progress guard so a new scan or a clean cannot overlap the trees
+/// still being walked), and a pending runtime replacement is applied in the
+/// same epilogue — so every entry read after the cancel is UI time.
+///
+/// `Task.isCancelled` is therefore polled at four places, which between them
+/// bound every loop that can run long: the `readdir` of ONE directory
+/// (`boundedChildNames`), the per-name vetting loop that consumes it, the DFS
+/// pop/descend loop, and the entry to every `enumerate`. Nothing else in the
+/// walk is unbounded.
+///
+/// A CANCELLED PROBE IS NEVER A CLEAN PROBE. It is INCOMPLETE with the
+/// OBSTRUCTION cause — deliberately not `.entryBudget`, which is the
+/// ESCALATABLE one: a cancelled walk reported as budget-exhausted would be
+/// re-run at twice the bound up to sixteen times by
+/// `ValuablesProbeBudget.escalating`, which is the exact opposite of winding
+/// down. Being incomplete it is tokenless on every surface and forces its item
+/// to review, so "we stopped looking" can never be read as "we looked and
+/// found nothing", and `preDeleteValuablesProbe` also skips the census
+/// enumeration it would otherwise pay for an entry-budget stop.
+///
+/// BOTH FACES POLL, because there is one core. Their CONSEQUENCES differ and
+/// both are fail-closed: at scan time the item is denied, unselected and
+/// tokenless (and a cancelled session adopts nothing anyway); at delete time
+/// the revalidator refuses that item and deletes nothing. A cancelled clean
+/// refusing to delete is the correct reading of cancellation, not a
+/// regression.
 ///
 /// ## Determinism contract (deliberately NARROW under truncation)
 /// For a COMPLETE probe the output is fully deterministic: every directory
@@ -244,11 +307,14 @@ struct ValuableIdentity: Equatable, Sendable {
 
 /// One release artifact found inside a matched artifact dir.
 ///
-/// `canonicalIdentityPath` is THE one stored identity path: the
-/// `resolveTargetKeepingLeaf` derivation (canonical parent chain + UNRESOLVED
-/// leaf — the house identity doctrine). It drives the canonical ORDERING, the
-/// token PREIMAGE, and the wire `path` field — one value, three consumers, so
-/// an alias-spelled root and the canonical root produce identical ordering and
+/// `canonicalIdentityPath` is THE one stored identity path: the house identity
+/// doctrine's value (canonical parent chain + UNRESOLVED leaf), COMPOSED by the
+/// probe from its anchored root plus the basenames it actually traversed —
+/// never re-resolved from the discovered spelling, because an ancestor swapped
+/// after the walk opened it would then redirect this value (see the
+/// `ValuablesDetector` header). It drives the canonical ORDERING, the token
+/// PREIMAGE, and the wire `path` field — one value, three consumers, so an
+/// alias-spelled root and the canonical root produce identical ordering and
 /// identical tokens.
 ///
 /// `displayURL` is the UNRESOLVED discovered spelling, for the confirmation
@@ -304,6 +370,11 @@ struct ValuablesDisclosure: Equatable, Sendable {
         /// basename, a descriptor that could not be re-anchored, metadata
         /// outside the pinned value domains. A bigger budget cannot help;
         /// fixing the impediment can.
+        ///
+        /// A CANCELLED walk lands here too, and deliberately: the alternative
+        /// cause is the escalatable one, and re-walking a cancelled tree at
+        /// twice the bound is the opposite of winding down. The remedy the
+        /// message names ("re-scan") is exactly the one that clears it.
         case obstruction
     }
 
@@ -758,9 +829,17 @@ enum ValuablesDetector {
         let parentDevice = provider.deviceID(
             of: directory.deletingLastPathComponent()
         )
+        // THE IDENTITY ANCHOR (PR #457 review, P2 #1). Resolved ONCE, here,
+        // BEFORE the walk holds anything — and then never again: every
+        // valuable's identity path is this value plus the exact basenames
+        // `readdir` handed the walk, so no ancestor is ever re-resolved after
+        // its descriptor was opened. See `ValuablesProbeWalk.Frame`.
+        // It is the value this mount check already needed, so the anchoring
+        // costs the probe not one extra path resolution.
+        let identityRoot = provider.canonicalize(directory)
         if (rootDevice != nil && parentDevice != nil
                 && rootDevice != parentDevice)
-            || provider.isMountPoint(provider.canonicalize(directory)) {
+            || provider.isMountPoint(identityRoot) {
             return .incomplete
         }
         // …plus the descriptor-relative arm, which is the one that actually
@@ -777,7 +856,8 @@ enum ValuablesDetector {
         var walk = ValuablesProbeWalk(
             provider: provider, entryLimit: entryLimit,
             window: max(2, descriptorWindow ?? defaultDescriptorWindow()),
-            rootURL: directory, rootDevice: rootDevice, root: root
+            rootURL: directory, identityRootURL: identityRoot,
+            rootDevice: rootDevice, root: root
         )
         walk.run()
 
@@ -837,10 +917,16 @@ enum ValuablesDetector {
     /// `device`/`inode`/`mtime` from the root's ONE lstat (`metadata`),
     /// `allocatedBytes` from the caller (leaf allocation for files, bounded
     /// subtree allocation for bundles).
+    ///
+    /// `identityPath` is COMPOSED by the walk (anchored root + the basenames
+    /// it actually traversed), never re-derived here: a
+    /// `resolveTargetKeepingLeaf` of the discovered spelling would resolve
+    /// ancestors the walk already holds open, and that value feeds the
+    /// acknowledgement token. See `ValuablesProbeWalk.Frame.identityURL`.
     private static func valuable(
         name: String,
         at url: URL,
-        provider: FileSystemIdentityProvider,
+        identityPath: String,
         metadata: FileSystemIdentityProvider.LeafMetadata,
         allocatedBytes: Int64
     ) -> DetectedValuable {
@@ -850,7 +936,7 @@ enum ValuablesDetector {
             displayURL: url,
             // Canonical parent + UNRESOLVED leaf: ordering, token preimage,
             // and the wire `path` all read THIS.
-            canonicalIdentityPath: provider.resolveTargetKeepingLeaf(url).path,
+            canonicalIdentityPath: identityPath,
             identity: ValuableIdentity(
                 allocatedBytes: allocatedBytes,
                 device: metadata.device,
@@ -925,9 +1011,17 @@ enum ValuablesDetector {
             /// Proven when this frame's descriptor was FIRST opened; the
             /// value a re-anchor must reproduce.
             let identity: FileSystemIdentityProvider.Identity
-            /// The UNRESOLVED spelling. Display and identity ONLY — it is
-            /// never opened, stat'd, or resolved below the root.
+            /// The UNRESOLVED spelling. Display ONLY — it is never opened,
+            /// stat'd, or resolved below the root.
             let logicalURL: URL
+            /// The ANCHORED IDENTITY spelling: the root's canonical path
+            /// (resolved ONCE, before this walk opened anything) plus the
+            /// exact basenames `readdir` handed us on the way down. It is
+            /// COMPOSED, never resolved — which is what makes it immune to an
+            /// ancestor swapped after its descriptor was opened, exactly as
+            /// the traversal itself is. This is the value that reaches the
+            /// acknowledgement-token preimage.
+            let identityURL: URL
             var pending: [String] = []
             var cursor = 0
             /// `fstatat` identity of each pending name, for the corroborator.
@@ -944,6 +1038,8 @@ enum ValuablesDetector {
             let frameIndex: Int
             let name: String
             let logicalURL: URL
+            /// Composed exactly like `Frame.identityURL`.
+            let identityURL: URL
             let metadata: FileSystemIdentityProvider.LeafMetadata
             var total: Int64 = 0
             var complete = true
@@ -992,11 +1088,31 @@ enum ValuablesDetector {
             }
         }
 
+        /// THE ONE COOPERATIVE-CANCELLATION POINT (PR #457 review, P2 #2).
+        /// `true` once the walk has been told to wind down; the walk is
+        /// INCOMPLETE from that moment and stops everywhere.
+        ///
+        /// Classed as an OBSTRUCTION, never `.entryBudget`, and that is the
+        /// safety-critical half: `.entryBudget` is the ESCALATABLE cause, so
+        /// a cancelled probe reported that way would be re-walked at twice
+        /// the bound, sixteen times over, by the very escalation driver the
+        /// cancellation is trying to wind down. An obstruction escalates
+        /// nothing and — the uniform rule — is tokenless and forces review, so
+        /// "we stopped looking" can never be read as "we looked and it was
+        /// clean".
+        mutating func windingDown() -> Bool {
+            guard Task.isCancelled else { return false }
+            fail(.obstruction)
+            aborted = true
+            return true
+        }
+
         init(
             provider: FileSystemIdentityProvider,
             entryLimit: Int,
             window: Int,
             rootURL: URL,
+            identityRootURL: URL,
             rootDevice: UInt64?,
             root: SecureDirectory
         ) {
@@ -1007,7 +1123,8 @@ enum ValuablesDetector {
             self.rootDevice = rootDevice
             self.rootMount = root.mount
             self.frames = [Frame(
-                dir: root, identity: root.identity, logicalURL: rootURL
+                dir: root, identity: root.identity, logicalURL: rootURL,
+                identityURL: identityRootURL
             )]
             self.liveCount = 1
         }
@@ -1018,6 +1135,7 @@ enum ValuablesDetector {
         mutating func run() {
             enumerate(index: 0)
             walk: while !frames.isEmpty && !aborted {
+                if windingDown() { break walk }
                 let i = frames.count - 1
                 assert(frames[i].dir != nil, "I1")
                 assert(liveCount <= window, "I4")
@@ -1062,6 +1180,7 @@ enum ValuablesDetector {
 
         /// Read + vet one directory's children, descriptor-relative.
         mutating func enumerate(index: Int) {
+            if windingDown() { return }
             let remaining = entryLimit - visited
             guard remaining > 0 else {
                 fail(.entryBudget)
@@ -1079,6 +1198,14 @@ enum ValuablesDetector {
                 fail(.obstruction)
                 return
             }
+            // The read winds down mid-directory too, and it is the arm that
+            // matters most: ONE directory can hold more entries than the whole
+            // rest of the walk (P2 #2).
+            if read.cancelled {
+                fail(.obstruction)
+                aborted = true
+                return
+            }
             // The two ways ONE directory read can come up short, kept apart:
             // entries left unread because the budget ended, versus a read that
             // FAILED or produced a name that could not be decoded.
@@ -1093,6 +1220,10 @@ enum ValuablesDetector {
             )
 
             for name in names {
+                // The VETTING loop runs one `fstatat` per name, up to the
+                // whole granted budget — it winds down per name, like the read
+                // that fed it.
+                if windingDown() { return }
                 guard visited < entryLimit else {
                     fail(.entryBudget)
                     aborted = true
@@ -1108,6 +1239,9 @@ enum ValuablesDetector {
                 }
                 let logical = frames[index].logicalURL
                     .appendingPathComponent(name)
+                // COMPOSED, never resolved (see `Frame.identityURL`).
+                let identityURL = frames[index].identityURL
+                    .appendingPathComponent(name)
                 // ONE atomic no-follow stat, relative to the HELD parent:
                 // kind, identity, allocation and mtime together. This
                 // replaces the `probeKind(of:)` + `leafMetadata(of:)` PAIR,
@@ -1117,7 +1251,10 @@ enum ValuablesDetector {
                     inDirectory: dir.fd, named: name, logical: logical
                 ) {
                 case .kind(.regularFile, _, let metadata):
-                    record(file: name, logical: logical, metadata: metadata)
+                    record(
+                        file: name, logical: logical, identity: identityURL,
+                        metadata: metadata
+                    )
                 case .kind(.directory, let identity, let metadata):
                     record(
                         directory: name, logical: logical, index: index,
@@ -1139,7 +1276,7 @@ enum ValuablesDetector {
         }
 
         private mutating func record(
-            file name: String, logical: URL,
+            file name: String, logical: URL, identity identityURL: URL,
             metadata: FileSystemIdentityProvider.LeafMetadata?
         ) {
             if isSizing {
@@ -1171,7 +1308,7 @@ enum ValuablesDetector {
                 return
             }
             found.append(ValuablesDetector.valuable(
-                name: name, at: logical, provider: provider,
+                name: name, at: logical, identityPath: identityURL.path,
                 metadata: metadata, allocatedBytes: metadata.allocatedBytes
             ))
         }
@@ -1248,15 +1385,22 @@ enum ValuablesDetector {
             }
 
             let bundle = isSizing ? nil : frames[index].bundles[name]
+            // COMPOSED from the parent frame's anchored identity — the same
+            // basename `readdir` produced and `openat` just descended, so the
+            // identity path names exactly the inode this frame holds.
+            let identityURL = frames[index].identityURL
+                .appendingPathComponent(name)
             makeRoom()
             frames.append(Frame(
-                dir: child, identity: child.identity, logicalURL: logical
+                dir: child, identity: child.identity, logicalURL: logical,
+                identityURL: identityURL
             ))
             liveCount += 1
             if let bundle {
                 sizing = BundleSizing(
                     frameIndex: frames.count - 1, name: name,
-                    logicalURL: logical, metadata: bundle
+                    logicalURL: logical, identityURL: identityURL,
+                    metadata: bundle
                 )
             }
             enumerate(index: frames.count - 1)
@@ -1278,7 +1422,8 @@ enum ValuablesDetector {
             if !bundle.complete { fail(.obstruction) }
             guard bundle.total >= minimumAllocatedBytes else { return }
             found.append(ValuablesDetector.valuable(
-                name: bundle.name, at: bundle.logicalURL, provider: provider,
+                name: bundle.name, at: bundle.logicalURL,
+                identityPath: bundle.identityURL.path,
                 metadata: bundle.metadata, allocatedBytes: bundle.total
             ))
         }
@@ -1404,9 +1549,30 @@ enum ValuablesDetector {
     /// helper) and BOTH duplication forms share the anchor's file offset, so a
     /// second enumeration through them silently returns zero entries.
     /// `closedir` closes only this handle; the caller's anchor survives.
-    private static func boundedChildNames(
+    ///
+    /// COOPERATIVELY CANCELLABLE (PR #457 review, P2 #2), and this is the loop
+    /// that most needed it: the bound it runs to is the WHOLE probe's entry
+    /// budget, which is no longer a flat 20,000 but proportionate to the
+    /// subject and escalating to `20_000 << 16` — so ONE directory read can be
+    /// three orders of magnitude longer than anything this code used to
+    /// perform between cancellation checks. The view model deliberately awaits
+    /// the producer's ACTUAL completion after cancelling
+    /// (`CacheoutViewModel.untilProducerFinishes`), so every entry read after
+    /// the cancel is time the UI spends unresponsive and a pending runtime
+    /// replacement spends queued. `cancelled` is reported SEPARATELY from
+    /// `obstructed` at this seam so the caller decides the verdict; the caller
+    /// maps it to an obstruction, never to the escalatable budget cause.
+    ///
+    /// NOT `private`: the cancellation policy is proven by calling this
+    /// directly on a real directory of thousands of entries, in the same
+    /// spirit as `decodedBasename` — the returned `names` are the WORK
+    /// ACTUALLY DONE, so the test measures the loop instead of asking it.
+    static func boundedChildNames(
         parentFD: Int32, limit: Int, provider: FileSystemIdentityProvider
-    ) -> (names: [String], budgetTruncated: Bool, obstructed: Bool)? {
+    ) -> (
+        names: [String], budgetTruncated: Bool, obstructed: Bool,
+        cancelled: Bool
+    )? {
         let enumerationFD = provider.openSelfForEnumeration(parentFD)
         guard enumerationFD >= 0 else { return nil }
         guard let handle = fdopendir(enumerationFD) else {
@@ -1419,7 +1585,15 @@ enum ValuablesDetector {
         var names: [String] = []
         var budgetTruncated = false
         var obstructed = false
+        var cancelled = false
         while true {
+            // Checked EVERY entry, not every N: the check is a flag read
+            // beside a `readdir`, and an interval would put a directory's own
+            // size back into the wind-down latency this exists to bound.
+            if Task.isCancelled {
+                cancelled = true
+                break
+            }
             // `readdir` returns nil for BOTH end-of-stream and error; errno
             // is the only discriminator, so it is cleared before each call.
             errno = 0
@@ -1444,7 +1618,7 @@ enum ValuablesDetector {
             }
             names.append(name)
         }
-        return (names, budgetTruncated, obstructed)
+        return (names, budgetTruncated, obstructed, cancelled)
     }
 
     /// The VALIDATING basename decode, factored out so the fail-closed policy

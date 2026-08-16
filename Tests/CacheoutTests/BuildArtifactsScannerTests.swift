@@ -6061,6 +6061,418 @@ final class BuildArtifactsScannerTests: XCTestCase {
         )
     }
 
+    // MARK: - The IDENTITY PATH is anchored too (PR #457 review, P2 #1)
+
+    /// THE LAST PATH BELOW THE ROOT. The walk is descriptor-anchored end to
+    /// end — and then the identity DERIVATION re-resolved the valuable's whole
+    /// parent chain by absolute path, long after those directories were open
+    /// and held. Swap one of them for a symlink in that window and the
+    /// disclosure carries metadata from the REAL held inode under a path that
+    /// names something else entirely: an external `canonicalIdentityPath`,
+    /// straight into the acknowledgement-token preimage that AUTHORIZES A
+    /// DELETION.
+    ///
+    /// The swap fires from the production `didReadNames` hook on the DEEPEST
+    /// directory — the instant after its names are read and before the
+    /// valuable is recorded — so it is deterministic by construction: a real
+    /// `rename(2)` + `symlink(2)`, one thread, no sleeps, no timing.
+    func testValuableIdentityPathsSurviveAnAncestorSwappedBelowTheWalkRoot()
+        throws
+    {
+        let outside = base.appendingPathComponent("outside-the-dev-root")
+        let decoy = outside.appendingPathComponent("decoy")
+        // A DIFFERENT file at the SAME relative spelling, so the path the
+        // pre-fix derivation published named a real foreign object.
+        let foreign = try writeBulkFile(
+            decoy.appendingPathComponent("bundle/dmg/Shipped.dmg"),
+            bytes: aboveFloorBytes + 1_000_000
+        )
+
+        let artifact = try makeProject(
+            at: dev.appendingPathComponent("murmur"),
+            marker: "Cargo.toml", artifact: "target", payloadBytes: nil
+        )
+        let release = artifact.appendingPathComponent("release")
+        let inspected = try writeBulkFile(
+            release.appendingPathComponent("bundle/dmg/Shipped.dmg"),
+            bytes: aboveFloorBytes
+        )
+        let relocated = artifact.appendingPathComponent("release.real")
+        // Computed BEFORE the swap: the honest identity path, from the
+        // house derivation, never echoed from the code under test.
+        let honestPath = identityPath(of: inspected)
+        let honestStat = try rawStat(inspected)
+
+        let deepest = release.appendingPathComponent("bundle/dmg")
+        let manager = fm
+        var swapped = false
+        ValuablesDetector.testHook = { event in
+            guard !swapped, case .didReadNames(let logical) = event,
+                  logical.path == deepest.path else { return }
+            swapped = true
+            try? manager.moveItem(at: release, to: relocated)
+            try? manager.createSymbolicLink(
+                at: release, withDestinationURL: decoy
+            )
+        }
+        defer { ValuablesDetector.testHook = nil }
+
+        let disclosure = ValuablesDetector.probe(
+            at: artifact, provider: FileSystemIdentityProvider()
+        )
+        ValuablesDetector.testHook = nil
+
+        XCTAssertTrue(swapped, "fixture precondition: the swap ran")
+        XCTAssertEqual(
+            try fm.destinationOfSymbolicLink(atPath: release.path), decoy.path,
+            "fixture precondition: an ancestor BELOW the walk root is now a "
+                + "symlink out of the tree"
+        )
+
+        // The WALK is unaffected — that is the point: it read the held
+        // inodes, so the integers describe the real file.
+        XCTAssertTrue(disclosure.probeComplete)
+        let found = try XCTUnwrap(disclosure.valuables.first)
+        XCTAssertEqual(disclosure.valuables.count, 1)
+        XCTAssertEqual(found.identity.inode, UInt64(honestStat.st_ino))
+        XCTAssertEqual(
+            found.identity.allocatedBytes,
+            Int64(honestStat.st_blocks) * 512
+        )
+
+        // …and the identity path must describe THAT file, not whatever the
+        // swapped ancestor now points at.
+        XCTAssertEqual(
+            found.canonicalIdentityPath, honestPath,
+            "the identity path was re-resolved through an ancestor the walk "
+                + "had already opened and held"
+        )
+        let foreignPrefix = FileSystemIdentityProvider()
+            .canonicalize(outside).path + "/"
+        XCTAssertFalse(
+            found.canonicalIdentityPath.hasPrefix(foreignPrefix),
+            "a path OUTSIDE the artifact dir was published as the identity "
+                + "of a file inside it: \(found.canonicalIdentityPath)"
+        )
+
+        // THE VALUE THAT AUTHORIZES A DELETION. Built here from the honest
+        // path and raw `lstat` integers — never echoed from the probe.
+        let expectedToken = ValuablesDisclosure.acknowledgementToken(
+            scannerID: BuildArtifactsScanner.registeredID,
+            itemID: "item",
+            valuables: [DetectedValuable(
+                name: "Shipped.dmg",
+                displayURL: inspected,
+                canonicalIdentityPath: honestPath,
+                identity: ValuableIdentity(
+                    allocatedBytes: Int64(honestStat.st_blocks) * 512,
+                    device: UInt64(bitPattern: Int64(honestStat.st_dev)),
+                    inode: UInt64(honestStat.st_ino),
+                    modifiedSeconds: Int64(honestStat.st_mtimespec.tv_sec),
+                    modifiedNanoseconds:
+                        Int64(honestStat.st_mtimespec.tv_nsec)
+                )
+            )],
+            probeComplete: true
+        )
+        XCTAssertEqual(
+            ValuablesDisclosure.acknowledgementToken(
+                scannerID: BuildArtifactsScanner.registeredID,
+                itemID: "item",
+                valuables: disclosure.valuables,
+                probeComplete: disclosure.probeComplete
+            ),
+            expectedToken,
+            "the acknowledgement token incorporated a path from outside the "
+                + "inspected tree"
+        )
+        XCTAssertTrue(fm.fileExists(atPath: foreign.path),
+                      "the foreign tree is byte-untouched")
+    }
+
+    /// The two faces compose the identity path IDENTICALLY. A token that
+    /// differs between scan time and delete time is worse than either.
+    func testBothFacesComposeTheSameNestedIdentityPathAndToken() throws {
+        let artifact = try makeProject(
+            at: dev.appendingPathComponent("murmur"),
+            marker: "Cargo.toml", artifact: "target", payloadBytes: nil
+        )
+        let nested = try writeBulkFile(
+            artifact.appendingPathComponent(
+                "release/bundle/dmg/Murmur_0.1.7_aarch64.dmg"
+            ),
+            bytes: aboveFloorBytes
+        )
+        let provider = FileSystemIdentityProvider()
+
+        // The DELETE-TIME face: a bare URL, opened by path.
+        let atDelete = BuildArtifactsScanner.preDeleteValuablesProbe(
+            at: artifact, provider: provider
+        )
+        // The SCAN-TIME face: entered with a root reached by containment.
+        let root = try XCTUnwrap(SecureDirectory(
+            fd: provider.openDirectoryNoFollow(at: artifact),
+            provider: provider
+        ))
+        let atScan = ValuablesDetector.probe(
+            at: artifact, root: root, provider: provider
+        )
+
+        XCTAssertEqual(
+            atScan.valuables.map(\.canonicalIdentityPath),
+            [identityPath(of: nested)]
+        )
+        XCTAssertEqual(
+            atScan.valuables.map(\.canonicalIdentityPath),
+            atDelete.valuables.map(\.canonicalIdentityPath)
+        )
+        XCTAssertEqual(
+            atScan.acknowledgementToken(for: ItemKey(
+                scannerID: BuildArtifactsScanner.registeredID, itemID: "i"
+            )),
+            atDelete.acknowledgementToken(for: ItemKey(
+                scannerID: BuildArtifactsScanner.registeredID, itemID: "i"
+            ))
+        )
+        XCTAssertNotNil(atScan.acknowledgementToken(for: ItemKey(
+            scannerID: BuildArtifactsScanner.registeredID, itemID: "i"
+        )))
+    }
+
+    // MARK: - The probe WINDS DOWN when cancelled (PR #457 review, P2 #2)
+
+    /// A directory of `count` empty entries, created `openat`-relative to the
+    /// directory itself — no per-file absolute path, no `FileManager` round
+    /// trip. Returns the number actually created (asserted by the callers).
+    @discardableResult
+    private func fillDirectory(_ url: URL, count: Int) throws -> Int {
+        try mkdir(url)
+        let fd = open(url.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+        guard fd >= 0 else { throw XCTSkip("cannot open \(url.path)") }
+        defer { close(fd) }
+        var made = 0
+        for index in 0..<count {
+            let child = openat(
+                fd, "entry-\(index).bin", O_CREAT | O_WRONLY | O_CLOEXEC, 0o644
+            )
+            guard child >= 0 else { break }
+            close(child)
+            made += 1
+        }
+        return made
+    }
+
+    /// THE READDIR LOOP, measured by the work it actually did.
+    ///
+    /// `boundedChildNames` reads one directory to its bound, and that bound is
+    /// no longer a flat 20,000: it is census-proportionate and escalates to
+    /// `20_000 << 16`. A cancelled scan that keeps reading is UI time — the
+    /// view model AWAITS the producer's real completion after cancelling — so
+    /// the loop must poll. The evidence is the RETURNED NAMES, which are the
+    /// entries genuinely read, not a counter the code keeps about itself.
+    func testTheDirectoryReadStopsWhenTheTaskIsCancelled() async throws {
+        let crowded = dev.appendingPathComponent("crowded")
+        let entries = 3_000
+        XCTAssertEqual(try fillDirectory(crowded, count: entries), entries)
+
+        let provider = FileSystemIdentityProvider()
+        let fd = provider.openDirectoryNoFollow(at: crowded)
+        XCTAssertGreaterThanOrEqual(fd, 0)
+        defer { close(fd) }
+
+        // The uncancelled control: the loop reads the whole directory.
+        let whole = try XCTUnwrap(ValuablesDetector.boundedChildNames(
+            parentFD: fd, limit: entries * 2, provider: provider
+        ))
+        XCTAssertEqual(whole.names.count, entries)
+        XCTAssertFalse(whole.cancelled)
+        XCTAssertFalse(whole.budgetTruncated)
+
+        // REAL cancellation, through the real `Task` machinery, at a
+        // deterministic instant: no sleeps, no threads, no timing.
+        let cancelled = await Task { () -> (names: Int, cancelled: Bool)? in
+            withUnsafeCurrentTask { $0?.cancel() }
+            guard let read = ValuablesDetector.boundedChildNames(
+                parentFD: fd, limit: entries * 2, provider: provider
+            ) else { return nil }
+            return (read.names.count, read.cancelled)
+        }.value
+
+        let read = try XCTUnwrap(cancelled)
+        XCTAssertTrue(read.cancelled,
+                      "a cancelled read must SAY it did not finish")
+        XCTAssertLessThan(
+            read.names, entries,
+            "the readdir loop ran to its bound after cancellation: \(read.names)"
+                + " of \(entries) entries were still read"
+        )
+        XCTAssertEqual(
+            read.names, 0,
+            "wind-down is checked per entry, so a cancel observed at the top "
+                + "of the loop reads nothing at all"
+        )
+    }
+
+    /// The WHOLE walk winds down, and — the half that matters — a cancelled
+    /// probe is never mistaken for a clean one.
+    func testCancelledProbeIsIncompleteTokenlessAndNeverReportedClean()
+        async throws
+    {
+        let artifact = try makeProject(
+            at: dev.appendingPathComponent("murmur"),
+            marker: "Cargo.toml", artifact: "target", payloadBytes: nil
+        )
+        try writeBulkFile(
+            artifact.appendingPathComponent("release/Shipped.dmg"),
+            bytes: aboveFloorBytes
+        )
+        try fillDirectory(
+            artifact.appendingPathComponent("release/deps"), count: 2_000
+        )
+
+        // The control: uncancelled, this tree is COMPLETE, discloses the DMG,
+        // and mints a token.
+        let counting = VettingCountingProvider()
+        let live = ValuablesDetector.probe(at: artifact, provider: counting)
+        XCTAssertTrue(live.probeComplete)
+        XCTAssertEqual(live.valuables.map(\.name), ["Shipped.dmg"])
+        let key = ItemKey(
+            scannerID: BuildArtifactsScanner.registeredID, itemID: "i"
+        )
+        XCTAssertNotNil(live.acknowledgementToken(for: key))
+        let liveVets = counting.vettedNames
+        XCTAssertGreaterThan(liveVets, 2_000,
+                             "fixture precondition: the tree is big enough "
+                                + "for the wind-down to be measurable")
+
+        counting.vettedNames = 0
+        let cancelled = await Task { () -> ValuablesDisclosure in
+            withUnsafeCurrentTask { $0?.cancel() }
+            return ValuablesDetector.probe(at: artifact, provider: counting)
+        }.value
+
+        // WORK, measured by the test's own count of production `fstatat`
+        // calls — never a number the probe reports about itself.
+        XCTAssertEqual(
+            counting.vettedNames, 0,
+            "the walk kept vetting entries after cancellation: "
+                + "\(counting.vettedNames) of \(liveVets)"
+        )
+        // VERDICT. Cancellation is not "we looked and found nothing".
+        XCTAssertFalse(cancelled.probeComplete)
+        XCTAssertTrue(cancelled.forcesReview)
+        XCTAssertNil(cancelled.acknowledgementToken(for: key),
+                     "a cancelled inspection can never authorize a deletion")
+        // …and NOT the escalatable cause: `escalating` would re-walk a
+        // cancelled tree at twice the bound, sixteen times over.
+        XCTAssertEqual(cancelled.incompleteness, .obstruction)
+        XCTAssertNotEqual(cancelled.incompleteness, .entryBudget)
+    }
+
+    /// Counts the production per-entry vetting calls — the test's OWN
+    /// instrumentation of work done, never the walk's self-report.
+    private final class VettingCountingProvider: FileSystemIdentityProvider {
+        var vettedNames = 0
+
+        override func probeKind(
+            inDirectory parent: Int32, named name: String, logical url: URL
+        ) -> DescriptorKindProbe {
+            vettedNames += 1
+            return super.probeKind(
+                inDirectory: parent, named: name, logical: url
+            )
+        }
+    }
+
+    /// The ESCALATION DRIVER must not turn one cancelled walk into sixteen.
+    /// Proven on the delete-time face, which is the one that censuses and
+    /// re-probes: a cancelled first pass returns the obstruction cause, so no
+    /// escalation round and no census enumeration is paid at all.
+    func testCancelledPreDeleteProbeNeitherEscalatesNorAuthorizes()
+        async throws
+    {
+        let artifact = try makeProject(
+            at: dev.appendingPathComponent("murmur"),
+            marker: "Cargo.toml", artifact: "target", payloadBytes: nil
+        )
+        try writeBulkFile(
+            artifact.appendingPathComponent("release/Shipped.dmg"),
+            bytes: aboveFloorBytes
+        )
+        // A bound far below the tree, so an UNCANCELLED probe is exactly the
+        // escalating case: it exhausts, censuses, doubles, and finishes.
+        let tight = ValuablesProbeBudget.censusProportionate(floor: 1)
+        let counting = VettingCountingProvider()
+
+        let live = BuildArtifactsScanner.preDeleteValuablesProbe(
+            at: artifact, provider: counting, budget: tight
+        )
+        XCTAssertTrue(live.probeComplete,
+                      "fixture precondition: escalation finishes this tree")
+        XCTAssertEqual(live.valuables.map(\.name), ["Shipped.dmg"])
+        XCTAssertGreaterThan(
+            counting.vettedNames, 2,
+            "fixture precondition: the uncancelled path took several passes"
+        )
+
+        counting.vettedNames = 0
+        let cancelled = await Task { () -> ValuablesDisclosure in
+            withUnsafeCurrentTask { $0?.cancel() }
+            return BuildArtifactsScanner.preDeleteValuablesProbe(
+                at: artifact, provider: counting, budget: tight
+            )
+        }.value
+
+        XCTAssertEqual(
+            counting.vettedNames, 0,
+            "a cancelled probe was escalated and re-walked: "
+                + "\(counting.vettedNames) entries vetted"
+        )
+        XCTAssertEqual(cancelled.incompleteness, .obstruction)
+        XCTAssertTrue(cancelled.valuables.isEmpty)
+    }
+
+    /// THE DELETE-TIME FACE, end to end: cancellation refuses the item and
+    /// deletes nothing. Fail-closed, and the correct reading of a cancelled
+    /// clean.
+    func testCancelledRevalidationRefusesAndDeletesNothing() async throws {
+        let artifact = try makeProject(
+            at: dev.appendingPathComponent("murmur"),
+            marker: "Cargo.toml", artifact: "target"
+        )
+        let outcome = try await runScan(makeScanner())
+        let scanned = try XCTUnwrap(item(outcome, at: artifact))
+        let revalidator = BuildArtifactsScanner.preDeleteRevalidator(
+            provider: FileSystemIdentityProvider()
+        )
+
+        // Uncancelled control: an ordinary build directory is allowed.
+        switch revalidator.revalidate(item: scanned, authorization: nil) {
+        case .allow: break
+        case .refuse(let reason, _, _):
+            XCTFail("fixture precondition: expected .allow, got \(reason)")
+        }
+
+        let verdict = await Task { () -> PreDeleteVerdict in
+            withUnsafeCurrentTask { $0?.cancel() }
+            return revalidator.revalidate(item: scanned, authorization: nil)
+        }.value
+
+        switch verdict {
+        case .allow:
+            XCTFail("a cancelled re-inspection authorized a deletion")
+        case .refuse(_, let valuables, let token):
+            XCTAssertTrue(valuables.isEmpty)
+            XCTAssertNil(token, "a cancelled probe hands out no token")
+        }
+        XCTAssertTrue(
+            fm.fileExists(
+                atPath: artifact.appendingPathComponent("payload.bin").path
+            ),
+            "nothing was deleted"
+        )
+    }
+
     // MARK: - The containment descent's own refusals, driven directly
 
     /// One open, vetted anchor per declared root — the shape `scan` hands

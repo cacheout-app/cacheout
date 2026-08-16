@@ -230,10 +230,25 @@ and docs/v1/CLI-REFERENCE.md) — the pre-release `node_modules` →
   folder's identity from an open handle BEFORE handing the deletion a path,
   and the deletion refuses unless the folder it opens is that same one —
   "the folder that holds this item is no longer the one the safety check
-  admitted", clearable by re-scanning. This covers both permanent deletes and
-  category contents cleans. REMAINING: a swap that happens BEFORE that
-  reading is invisible, because both sides then see the replacement and agree
-  about it.
+  admitted", clearable by re-scanning. This covers permanent deletes, category
+  contents cleans, and — see the next entry — Move to Trash. REMAINING: a swap
+  that happens BEFORE that reading is invisible, because both sides then see
+  the replacement and agree about it.
+- **"Move to Trash" now gets that same folder check — including for the items
+  that have no content check of their own.** Move to Trash is ON by default, so
+  it is the disposal most deletions use, and the folder check above landed on
+  permanent deletes only. Two paths still handed the system Trash a bare path:
+  EVERY category contents clean (those run no content inspection at all), and
+  every item from a scanner that does not offer one. For those, a folder
+  renamed away and replaced in that window sent the disposal into the
+  replacement — a same-named folder inside it went to the Trash, and the app
+  reported success with the byte count of the folder it had actually measured.
+  Cacheout now checks the holding folder from an open handle and identifies the
+  item under it immediately before the disposal, then checks what the Trash
+  actually took afterwards; anything it cannot prove is PUT BACK and reported
+  as a refusal, with nothing counted as freed. If the put-back cannot be
+  performed the item stays in the Trash and the error names its path, so it is
+  recoverable in one drag.
 - **"Move to Trash" undo: a put-back will not restore into a folder it cannot
   prove.** When the Trash turns out to have taken the wrong folder, Cacheout
   puts it back. That undo held its destination folder open but never checked

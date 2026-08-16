@@ -3629,4 +3629,88 @@ final class CacheCleanerTests: XCTestCase {
         XCTAssertTrue(message.contains("PUT BACK"), message)
         XCTAssertTrue(message.contains("nothing was freed"), message)
     }
+
+    /// Removes the child inside the ONE window between the container proof
+    /// and the leaf bind — the `probeChild` that reads the leaf under the
+    /// held container descriptor. A real `removeItem`, no sleeps.
+    private final class VanishTheChildAtTheBindProvider:
+        FileSystemIdentityProvider, @unchecked Sendable {
+        var child: URL!
+        private(set) var vanished = false
+
+        override func probeChild(
+            inDirectory descriptor: Int32, named name: String,
+            logical: @autoclosure () -> URL
+        ) -> ChildProbe {
+            let url = logical()
+            if !vanished,
+               url.standardizedFileURL.path
+                   == child.standardizedFileURL.path {
+                vanished = true
+                try? FileManager.default.removeItem(at: child)
+            }
+            return super.probeChild(
+                inDirectory: descriptor, named: name, logical: url
+            )
+        }
+    }
+
+    /// A LEAF THAT IS NOT THERE IS NOTHING TO BIND, AND UNBOUND IS REFUSED.
+    ///
+    /// The binding is taken under the proved container, so a child that
+    /// vanishes in that window yields `.absent` — and the disposal must NOT
+    /// go ahead unbound, because whatever answers to the name a moment later
+    /// is precisely what the Trash would then take with nothing to prove it
+    /// against. The refusal is the item-keyed `ENOENT` the disposal would
+    /// have produced anyway; what it adds is that the Trash is never touched.
+    func testTrashModeRefusesAChildThatVanishedBeforeItCouldBeBound()
+        async throws {
+        let home = try makeTempDir("home")
+        let base = try makeTempDir()
+        let trashDir = try makeTempDir("fake-trash")
+        defer {
+            try? FileManager.default.removeItem(at: home)
+            try? FileManager.default.removeItem(at: base)
+            try? FileManager.default.removeItem(at: trashDir)
+        }
+        let root = base.appendingPathComponent("cache-root")
+        let child = root.appendingPathComponent("entry")
+        try FileManager.default.createDirectory(
+            at: child, withIntermediateDirectories: true
+        )
+        try writeFile(child.appendingPathComponent("ours.bin"), bytes: 4096)
+
+        let provider = VanishTheChildAtTheBindProvider()
+        provider.child = child
+
+        let recorder = TrashRecorder()
+        let cleaner = CacheCleaner(
+            home: home, containerRoots: [], provider: provider,
+            trashHandler: makeTrashSeam(into: trashDir, recorder: recorder)
+        )
+        let report = await cleaner.clean(
+            items: categoryItems(
+                [makeScanResult(category: makeCategory(at: root))],
+                home: home, provider: provider
+            ),
+            moveToTrash: true
+        )
+
+        XCTAssertTrue(provider.vanished, "the fixture never removed the child")
+        XCTAssertTrue(
+            recorder.urls.isEmpty,
+            "a disposal with nothing to prove itself against must not run at "
+                + "all, got \(recorder.urls)"
+        )
+        XCTAssertTrue(
+            report.entries.isEmpty,
+            "nothing may be reported freed: \(report.entries)"
+        )
+        XCTAssertEqual(report.errors.count, 1)
+        let message = try XCTUnwrap(report.errors.first?.message)
+        XCTAssertTrue(
+            message.contains("No such file or directory"), message
+        )
+        XCTAssertTrue(message.contains(child.path), message)
+    }
 }

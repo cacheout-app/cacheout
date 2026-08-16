@@ -89,8 +89,20 @@
 ///   descriptor-relative probe can now inspect and pronounce clean. Contents
 ///   of category roots are removed individually (the root itself survives so
 ///   tools/apps can recreate it).
-/// - **Move to Trash** (`moveToTrash: true`): the injectable `@MainActor`
-///   trash seam (production: `FileManager.trashItem`, which talks to Finder).
+/// - **Move to Trash** (`moveToTrash: true` — the GUI's DEFAULT, see
+///   `CacheoutViewModel.moveToTrash`, so this is the arm most deletions take):
+///   the injectable `@MainActor` trash seam (production:
+///   `FileManager.trashItem`, which talks to Finder), reached ONLY through
+///   `TrashDisposal`. `trashItem` takes a URL and resolves it inside itself,
+///   so no binding can ride into the call; what rides in is a proof on either
+///   side of it, and a disposal that cannot be proved is PUT BACK and reported
+///   as a refusal — no entry, no bytes. WHICH fact the leaf is bound to
+///   depends on what the item has (a scanner's `PreDeleteRevalidator` verdict,
+///   or the object that stood at the name inside the admitted container), but
+///   every disposal is bound to one of them and nothing here hands the seam a
+///   bare URL. For three review rounds the two arms with no leaf verdict did
+///   exactly that — all of contents mode plus every `.unestablished` item —
+///   and this section described the arm as though they did not exist.
 ///   A trash failure is a per-child error — it never falls through to a
 ///   permanent delete.
 ///

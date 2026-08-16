@@ -464,6 +464,16 @@ struct ScanOutcome: Sendable {
 /// scanner's probe result, because `PreDeleteVerdict.allow` carries it and
 /// every revalidator has to name it. `OrphanedCachesScanner` keeps
 /// `UserDataProbeResult.InspectedRoot` as an alias for it.
+///
+/// IT IS NOT THE ONLY BINDING, AND A SCANNER WITH NO REVALIDATOR IS NOT AN
+/// UNBOUND DELETION. The cleaner additionally binds the folder that HOLDS the
+/// target (`DepthSafeRemoval.admittedParent`) and proves it on BOTH disposal
+/// arms — the permanent one at its parent open, the Trash one through
+/// `TrashDisposal.dispose(_:containedIn:…)`, which also binds the leaf under
+/// that proved container. That pair is what covers the `.unestablished`
+/// population the third case below describes, and it is worth naming here
+/// because "no verdict" was read as "nothing to bind" at two Trash call sites
+/// for three review rounds.
 enum PreDeleteInspectedObject: Equatable, Sendable {
     /// A real directory was opened and walked; this is the `fstat` identity
     /// of the descriptor the whole walk was anchored to.

@@ -1,6 +1,23 @@
 //  TrashDisposal.swift
-//  The Trash arm of the inspection binding — the disposal the GUI DEFAULTS
-//  to (`CacheoutViewModel.moveToTrash = true`).
+//  The Trash arm's bindings — the disposal the GUI DEFAULTS to
+//  (`CacheoutViewModel.moveToTrash = true`).
+//
+//  IT HAS TWO ENTRY POINTS BECAUSE THE PRODUCT HAS TWO POPULATIONS, AND FOR
+//  THREE REVIEW ROUNDS ONLY ONE OF THEM WAS COVERED. Read this before
+//  believing anything below it:
+//
+//  * `dispose(_:expecting:provider:containedIn:via:)` binds the LEAF to a
+//    scanner's `PreDeleteRevalidator` verdict. Reachable only for items whose
+//    scanner registers one.
+//  * `dispose(_:containedIn:provider:via:)` binds the leaf to what stood at
+//    its name INSIDE THE ADMITTED CONTAINER. This is the arm for everything
+//    else — ALL of contents mode (it runs no probe) and every item whose
+//    revalidator yields `.unestablished`.
+//
+//  Until the round that added the second one, that whole second population
+//  went from `CacheCleaner` straight to the seam with a BARE URL, and this
+//  header said the Trash arm was bound. It said so because the fix it
+//  described was real and the population it did not cover was never named.
 //
 //  WHY THIS EXISTS (PR #458 review — the P1 the permanent-delete fix left
 //  open). Threading `UserDataProbeResult.InspectedRoot` into
@@ -15,12 +32,36 @@
 //  the report read `entries=1, exactBytes=4096, errors=[]` — the byte count of
 //  the OTHER tree, the one still sitting at the stash path.
 //
+//  AND THE SAME MEASUREMENT, ON THE POPULATION THIS FILE DID NOT REACH (PR
+//  #458 review — the P1 that survived three rounds). Same production cleaner,
+//  same `moveToTrash: true`, two real `rename(2)`s at the seam:
+//
+//    item mode, `.unestablished`  stranger's `artifacts` moved to the Trash,
+//                                 entries=[exactBytes: 4096, .trash],
+//                                 errors=[]
+//    contents mode                identical, on the stranger's `entry`
+//    swap INSIDE the seam         stranger's tree LEFT in the Trash and its
+//                                 bytes reported freed — no put-back, because
+//                                 there was nothing to prove against
+//
+//  Pinned by `CacheCleanerTests.testTrashMode…` (three cases). The container
+//  binding was sitting in the caller for both of those arms and neither used
+//  it; see `dispose(_:containedIn:provider:via:)` for what carries it now.
+//
 //  THE BINDING CANNOT BE CARRIED INTO `trashItem`, AND THAT IS STATED RATHER
 //  THAN PAPERED OVER. `FileManager.trashItem(at:resultingItemURL:)` takes a
 //  URL and resolves it INSIDE itself; there is no `ftrashItem`, no
 //  descriptor-taking Trash primitive anywhere in Foundation, CoreServices or
 //  POSIX, and no way to pin a name to an inode for the duration of a call. So
 //  a proof taken before the call is exactly that — before the call.
+//
+//  WHAT THAT DOES *NOT* EXCUSE, AND WAS READ AS EXCUSING FOR THREE ROUNDS.
+//  "The binding cannot reach inside the API" is a fact about `trashItem`; it
+//  is not a reason to hand the API a URL with NOTHING established about the
+//  object at that name. The two are different claims, and the call sites that
+//  bypassed this file entirely were justified by the first while relying on
+//  the second. A binding that stops one call short of the destructive act is
+//  the defect, not the API's shape.
 //
 //  What closes the OUTCOME instead is the one property this disposal has and
 //  the permanent one does not: IT IS REVERSIBLE BY CONSTRUCTION. Moving to the
@@ -32,7 +73,10 @@
 //     so there is no window between deciding what stands there and holding it,
 //     and the identity is read from the object rather than from a second
 //     resolution of a name. This refuses the ordinary case without disturbing
-//     the user's Trash at all.
+//     the user's Trash at all. (The container-bound arm asks the same question
+//     one step further in: it opens and PROVES the container first, and reads
+//     the leaf under that descriptor with one `fstatat`, which additionally
+//     identifies non-directory leaves — see that arm for why that matters.)
 //  2. AFTER — the disposal reports WHERE IT PUT THE ITEM, and that object's
 //     identity is compared with the inspection's. A mismatch means the Trash
 //     took something nobody inspected, so it is PUT BACK
@@ -152,9 +196,15 @@ import Foundation
 
 /// Trash disposal that proves WHICH OBJECT it disposed of.
 ///
-/// Used only where an inspection verdict exists to bind to (the sweep's
-/// `automaticCleanEligible` items). Where none does, the cleaner calls the
-/// seam directly and says so at the call site.
+/// EVERY production Trash disposal goes through one of the two `dispose`
+/// entry points; the cleaner no longer calls the seam directly anywhere. The
+/// paragraph that stood here said the opposite — "Used only where an
+/// inspection verdict exists to bind to … where none does, the cleaner calls
+/// the seam directly and says so at the call site" — and the saying-so was
+/// true while the binding was absent, which is how the GUI's default disposal
+/// stayed unbound for three review rounds. The difference between the two
+/// entry points is now WHICH FACT the leaf is bound to, not WHETHER it is
+/// bound.
 enum TrashDisposal {
 
     /// Why a Trash disposal was refused AFTER the fact — the causes that
@@ -394,9 +444,16 @@ enum TrashDisposal {
         provider: FileSystemIdentityProvider
     ) throws -> FileSystemIdentityProvider.ChildFacts {
         let leaf = target.lastPathComponent
-        // The `probeChild` precondition, enforced rather than assumed: a
-        // multi-component name is resolved THROUGH the held directory, which
-        // is exactly the no-follow guarantee this call is here to keep.
+        // A PRECONDITION, DISCLOSED AS ONE RATHER THAN DRESSED AS A GUARD —
+        // the same disclosure `rollBack` carries for the same call.
+        // `probeChild` takes a SINGLE component and would resolve a
+        // multi-component one THROUGH the held directory, which is exactly the
+        // no-follow guarantee this call exists to keep. No production URL
+        // reaching here can violate it (`target` is an admitted item or an
+        // enumerated child), so deleting it — measured, both this and the copy
+        // in `facts` at once — leaves the FULL suite GREEN. It stays because
+        // the precondition is the primitive's, not this call's, and a future
+        // caller is what it is for.
         guard FileSystemIdentityProvider.isSafeComponent(leaf) else {
             throw DepthSafeRemoval.Failure(
                 path: target.path, cause: .invalidTarget, depth: 0
@@ -418,7 +475,17 @@ enum TrashDisposal {
             // disposal would have failed `ENOENT` on this name too, and an
             // item-keyed error is what that has always produced. What must
             // NOT happen is proceeding with nothing to prove the move
-            // against.
+            // against — whatever answers to the name a moment later is
+            // exactly what the Trash would take.
+            //
+            // LOAD-BEARING, MEASURED: substitute an identity that can never
+            // match instead of throwing and
+            // `testTrashModeRefusesAChildThatVanishedBeforeItCouldBeBound`
+            // goes red, because the disposal then RUNS. (It was subsumed
+            // before that test existed — the after-proof refused whatever
+            // came back — so the cost of losing it is not a wrong deletion
+            // but the user's Trash disturbed for nothing, and a re-scan
+            // clears it.)
             throw DepthSafeRemoval.Failure(
                 path: target.path, cause: .posix(ENOENT), depth: 0
             )
@@ -433,8 +500,10 @@ enum TrashDisposal {
     /// directory, read descriptor-relative.
     ///
     /// `nil` is "nothing could be identified here", which is never a match
-    /// and never a licence: the caller rolls back, and the rollback refuses
-    /// to move an object it cannot name.
+    /// and never a licence: `nil == bound` is false for every `bound`, so the
+    /// caller rolls back, and the rollback refuses to move an object it
+    /// cannot name. Its three `nil` arms are therefore not three guards —
+    /// they are one fail-closed default that the caller's comparison enforces.
     static func facts(
         at url: URL, provider: FileSystemIdentityProvider
     ) -> FileSystemIdentityProvider.ChildFacts? {

@@ -106,9 +106,14 @@
 //     returns `ENOTDIR` on a non-directory and `ENOTEMPTY` (errno 66) on a
 //     non-empty one, so a name swapped in that window costs at most ONE
 //     EMPTY directory — never a tree, never a file.
-//  3. THE WINDOW BEFORE THE CALLER'S CAPTURE. Both production call sites now
-//     pass `containedIn: .identity(…)` — `CacheCleaner.removeGuardedItem`
-//     and `CacheCleaner.cleanContents`, each taken through
+//  3. THE WINDOW BEFORE THE CALLER'S CAPTURE. All FOUR production disposal
+//     sites now pass `containedIn: .identity(…)` — `removeGuardedItem` and
+//     `cleanContents`, each on BOTH arms, since the Trash arm takes the same
+//     binding through `TrashDisposal` (`openAdmittedContainer` below is the
+//     one spelling both arms prove with). The sentence that stood here said
+//     "both production call sites", counted only the PERMANENT ones, and was
+//     read for three review rounds as though the product were covered. Each
+//     capture is taken through
 //     `admittedParent(directory:displayPath:provider:)` on THIS side of
 //     `removeItemConcurrently`'s queue hop (measured at 0.095–0.126 ms, the
 //     race this closes). What the binding cannot see is a swap that landed
@@ -131,6 +136,16 @@
 //     `testANonDirectoryVerdictCannotTellAbsenceFromAReplacement`. What
 //     closes it is a shape change to `PreDeleteInspectedObject` and its
 //     producer, not anything this file can do alone.
+//
+//     ITS SCOPE, STATED RATHER THAN LEFT TO BE INFERRED: this is a residual
+//     of the VERDICT type, so it applies wherever a `PreDeleteInspectedObject`
+//     is the binding — this file's `expecting:` and
+//     `TrashDisposal.dispose(_:expecting:…)`. It does NOT apply to
+//     `TrashDisposal.dispose(_:containedIn:…)`, which binds by `fstatat`
+//     under a proved container and therefore carries kind AND identity for
+//     non-directory leaves too. A future note here must not generalise "the
+//     Trash arm binds the same way" in either direction: the two arms bind
+//     differently, on purpose, because they have different facts available.
 //
 //  POSIX offers no primitive that closes 1, 2 or 3: there is no way to pin a
 //  directory to its parent for the duration of a read, no way to remove a

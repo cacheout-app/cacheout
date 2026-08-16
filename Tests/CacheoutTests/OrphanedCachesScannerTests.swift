@@ -3054,6 +3054,148 @@ final class OrphanedCachesScannerTests: XCTestCase {
         try assertCleanupLogContains(tag: "content-drift")
     }
 
+    /// `SwapAfterProbeProvider` with the ONE change that matters: the
+    /// attacker wins the race by one syscall instead of losing it by one.
+    ///
+    /// The sibling above lets the delete-time `lstat` see the NEW inode, so
+    /// the path check catches the swap. Here the swap is performed INSIDE
+    /// that `lstat` and the PRE-swap identity is returned — and, because a
+    /// swap that landed at instant T is invisible to every check that ran
+    /// before T, the frozen answer is given to ALL later path questions
+    /// about the target too. The fixture is therefore not more capable than
+    /// an attacker with a shell in `~/Library/Caches`; it is exactly an
+    /// attacker whose `rename(2)` + `mkdir(2)` land in the window between
+    /// the last path check and the deletion's `openat`. The real filesystem
+    /// mutation is performed for real, once, with real syscalls.
+    private final class RaceWonAtTheFinalCheckProvider:
+        FileSystemIdentityProvider {
+        var target: URL!
+        var stash: URL!
+        var replacement: URL!
+        private var armed = false
+        private var walkOpened = false
+        private(set) var swapped = false
+        /// The identity the probe's verdict is about, frozen at the swap.
+        private var frozen: Identity?
+        /// Last path question about the target, and the deletion's first
+        /// provider question — the window, measured rather than argued.
+        private(set) var lastTargetCheck: DispatchTime?
+        private(set) var firstDeletionQuestion: DispatchTime?
+
+        func arm() {
+            armed = true
+            walkOpened = false
+            swapped = false
+        }
+
+        /// Nanoseconds from the final path check to the first question the
+        /// deletion asks of a DESCRIPTOR — which is already past
+        /// `open(parent)` and `openat(leaf)`, so it is an UNDER-estimate of
+        /// the window. The window did not go away with the fix; it stopped
+        /// deciding anything, because the question asked at the end of it is
+        /// now asked of the inode rather than of the path.
+        var windowNanoseconds: UInt64? {
+            guard let lastTargetCheck, let firstDeletionQuestion,
+                  firstDeletionQuestion.uptimeNanoseconds
+                      >= lastTargetCheck.uptimeNanoseconds
+            else { return nil }
+            return firstDeletionQuestion.uptimeNanoseconds
+                - lastTargetCheck.uptimeNanoseconds
+        }
+
+        override func mountIdentity(ofDescriptor descriptor: Int32)
+            -> MountIdentity? {
+            walkOpened = true
+            return super.mountIdentity(ofDescriptor: descriptor)
+        }
+
+        /// The deletion's first question about the object it opened — and
+        /// the instrument that measures what the window actually is.
+        override func identity(ofDescriptor descriptor: Int32) -> Identity? {
+            if swapped, firstDeletionQuestion == nil {
+                firstDeletionQuestion = .now()
+            }
+            return super.identity(ofDescriptor: descriptor)
+        }
+
+        override func identity(of url: URL) -> Identity? {
+            guard armed, walkOpened,
+                  url.standardizedFileURL.path
+                      == target.standardizedFileURL.path
+            else { return super.identity(of: url) }
+            if !swapped {
+                frozen = super.identity(of: url)
+                swapped = true
+                try? FileManager.default.moveItem(at: target, to: stash)
+                try? FileManager.default.createDirectory(
+                    at: replacement, withIntermediateDirectories: true
+                )
+            }
+            lastTargetCheck = .now()
+            return frozen
+        }
+    }
+
+    /// THE BINDING MUST REACH THE DELETION, NOT THE LAST PATH CHECK.
+    ///
+    /// Same scenario as `testTargetReplacedBetweenTheProbeAndTheDeleteIsRefused`
+    /// with the race won rather than lost: every path question — container
+    /// admission, containment, deny list, mount, and the probe's own binding
+    /// `lstat` — answers about the object that WAS there, and the deletion
+    /// then opens the object that IS there. A path re-resolved after the
+    /// check is not a proof, so the only thing that can refuse here is a
+    /// question asked of the HELD DESCRIPTOR the deletion is about to empty.
+    ///
+    /// Before the fix this reported `entries=1, errors=[]` — SUCCESS, with
+    /// the byte count of a tree that still existed at the stash path — while
+    /// deleting the replacement's `Photos Library.photoslibrary`.
+    func testTargetReplacedAfterTheFinalPathCheckIsRefused() async throws {
+        let entry = cachesRoot.appendingPathComponent("com.apple.SwiftUI.Drag-RACE")
+        try mkdir(entry)
+        try writeFile(entry.appendingPathComponent("payload.bin"))
+
+        let provider = RaceWonAtTheFinalCheckProvider()
+        provider.target = entry
+        provider.stash = base.appendingPathComponent("drag-race-moved-away")
+        let library = entry.appendingPathComponent(
+            "Pictures/Photos Library.photoslibrary"
+        )
+        provider.replacement = library
+
+        let runtime = try makeRuntime(
+            [makeScanner(provider: provider)], provider: provider
+        )
+        let (items, snapshot) = await scanSession(runtime)
+        let leak = try XCTUnwrap(items.first)
+        XCTAssertTrue(leak.automaticCleanEligible,
+                      "the fixture entry scans as a clean known leak")
+
+        provider.arm()
+        let cleaner = runtime.makeCleaner(snapshot: snapshot)
+        let report = await cleaner.clean(items: [leak], moveToTrash: false)
+
+        XCTAssertTrue(provider.swapped, "the fixture never armed the swap")
+        if let window = provider.windowNanoseconds {
+            print("MEASURED-WINDOW-NS \(window)")
+        }
+        XCTAssertTrue(
+            fm.fileExists(atPath: library.path),
+            "the replacement's Photos Library was DELETED — the deletion "
+                + "held a descriptor and never asked it who it was"
+        )
+        XCTAssertTrue(fm.fileExists(atPath: provider.stash.path),
+                      "and the inspected tree is untouched too")
+        XCTAssertTrue(
+            report.entries.isEmpty,
+            "reported SUCCESS for a tree it never inspected: \(report.entries)"
+        )
+        XCTAssertEqual(report.errors.count, 1)
+        let message = try XCTUnwrap(report.errors.first?.message)
+        XCTAssertTrue(message.contains("no longer the one that was inspected"),
+                      message)
+        try assertCleanupLogContains(tag: "content-drift")
+    }
+
     /// The verdict SHAPE this arm binds to: an absent path proves the
     /// ABSENCE of a tree, and says so rather than reporting a directory it
     /// never saw. Kept as its own unit — it is a statement about the probe,

@@ -45,11 +45,41 @@
 //    check made on the way back up passes judgement on entries that are
 //    already unlinked.
 //
-//  What that leaves is a single irreducible window per directory: between the
-//  proof and the last `unlinkat` of that one level, entries added by whoever
-//  now owns a relocated directory are still reachable. It is bounded to one
-//  level, and POSIX offers no primitive that closes it — there is no way to
-//  pin a directory to its parent for the duration of a read.
+//  THE DELETION ALSO PROVES *WHOSE* TREE IT IS (PR #458 review — the P1 the
+//  descriptor-relative rewrite left open). Every proof above answers "am I
+//  still inside the parent I was admitted under?", which a swap of the TARGET
+//  ITSELF answers `yes` to: the replacement directory is created at the same
+//  name, in the same parent, on the same volume. The caller's inspection
+//  verdict is a fact about an OBJECT, so `remove(at:expecting:provider:)`
+//  takes that object's identity and `fstat`s the ROOT DESCRIPTOR IT OPENED
+//  before the first `unlinkat`. A path re-checked after the descriptor is
+//  held is not a proof of anything; the held inode is.
+//
+//  RESIDUALS, MEASURED — not "one directory's enumeration", which is what
+//  this comment used to claim and is false:
+//
+//  1. A relocated directory's ENTIRE REMAINING SUBTREE. `rename(2)` of a
+//     directory the traversal is standing in (or of any ancestor of where it
+//     is standing, up to the deletion root) leaves every descriptor and every
+//     containment proof below it perfectly valid — `..` from a child still
+//     names the relocated directory. So the traversal keeps going: it
+//     `readdir`s each not-yet-visited subdirectory AFTER the relocation and
+//     unlinks what it finds, at every depth, including entries the new owner
+//     wrote there. The bound is the relocated directory's own subtree (the
+//     unwind's `..` re-anchor refuses the moment it tries to climb OUT of
+//     it, so the damage never spreads to the new owner's siblings), and the
+//     deletion then fails `.relocated` — it does not report success.
+//     Evidenced by `testAncestorRelocationDestroysTheNewOwnersWholeSubtree`.
+//  2. The deletion root's final `rmdir`. There is no `frmdir(2)`: the last
+//     act names the leaf in the parent descriptor. Measured on this
+//     platform, that names what can be lost: `unlinkat(AT_REMOVEDIR)`
+//     returns `ENOTDIR` on a non-directory and `ENOTEMPTY` (errno 66) on a
+//     non-empty one, so a name swapped in that window costs at most ONE
+//     EMPTY directory — never a tree, never a file.
+//
+//  POSIX offers no primitive that closes either: there is no way to pin a
+//  directory to its parent for the duration of a read, and no way to remove
+//  a directory by descriptor.
 
 import Foundation
 
@@ -88,6 +118,10 @@ enum DepthSafeRemoval {
             case unprovableLocation
             /// A target with no removable leaf ("/", ".", "..").
             case invalidTarget
+            /// The object opened at the target's name is NOT the object the
+            /// caller's pre-delete inspection was about — or its identity
+            /// could not be read at all. Unprovable ⇒ refused.
+            case notTheInspectedObject
         }
 
         let path: String
@@ -122,6 +156,14 @@ enum DepthSafeRemoval {
                     + "this folder is on — refused, not deleted"
             case .invalidTarget:
                 return "\(place): not a removable item"
+            case .notTheInspectedObject:
+                // Deliberately the SAME sentence the cleaner's own path
+                // check produces: to the user these are one event, and the
+                // only difference is which layer caught it.
+                return "\(place): the folder at this path is no longer the "
+                    + "one that was inspected — it was replaced between the "
+                    + "safety check and the deletion; refused, re-scan "
+                    + "required"
             }
         }
     }
@@ -129,11 +171,19 @@ enum DepthSafeRemoval {
     /// Remove `url` — the item ITSELF, in its UNRESOLVED spelling: a symlink
     /// is removed AS a link, never through it (R4).
     ///
+    /// `inspected` is WHAT THE CALLER'S PRE-DELETE INSPECTION WAS ABOUT, and
+    /// it is proved against the descriptor this call opens, before anything
+    /// is destroyed. `nil` says — explicitly, at the call site, because there
+    /// is no default — that no inspection ran and there is nothing to bind
+    /// to; it is not a way to skip the check.
+    ///
     /// `provider` answers the mount question, and it is the same object the
     /// scanner's walk asks, so the two cannot classify a boundary
     /// differently. It is also the tests' injection seam.
     static func remove(
-        at url: URL, provider: FileSystemIdentityProvider
+        at url: URL,
+        expecting inspected: UserDataProbeResult.InspectedRoot?,
+        provider: FileSystemIdentityProvider
     ) throws {
         let leafName = url.lastPathComponent
         guard !leafName.isEmpty, leafName != "/", leafName != ".",
@@ -155,26 +205,94 @@ enum DepthSafeRemoval {
         }
         defer { close(parentFd) }
 
-        // The parent is the ONE reference point that is not supplied by the
-        // thing being judged, so every proof below is taken against it.
-        var leafStat = stat()
-        guard fstatat(parentFd, leaf, &leafStat, AT_SYMLINK_NOFOLLOW) == 0
-        else {
-            throw Failure(path: url.path, cause: .posix(errno), depth: 0)
-        }
-        guard (leafStat.st_mode & S_IFMT) == S_IFDIR else {
+        // THE KIND GATE **IS** THE OPEN — one syscall, so there is no window
+        // between deciding what stands here and taking hold of it (a gate
+        // BESIDE an open is a swap window by construction; this is the same
+        // shape the scanner's root open already has). `O_NOFOLLOW` is what
+        // makes the answer trustworthy rather than merely fast: measured on
+        // this platform, `openat(parent, link-to-dir, O_DIRECTORY)` WITHOUT
+        // it opens the link's target and the traversal below would then
+        // recursively empty a directory that is not the item at all, while
+        // WITH it the same call fails `ENOTDIR` and the link is unlinked AS
+        // a link (R4). `O_DIRECTORY` is what makes it safe to point at any
+        // leaf: on a fifo, a socket or a device node it fails `ENOTDIR`
+        // without ever entering the driver's open (measured — `/dev/tty`,
+        // `/dev/null`, `/dev/zero` and a real `mkfifo`, none of which
+        // blocked).
+        let root = openat(
+            parentFd, leaf, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+        )
+        guard root >= 0 else {
+            let code = errno
+            guard code == ENOTDIR else {
+                throw Failure(path: url.path, cause: .posix(code), depth: 0)
+            }
             // Symlink, regular file, fifo, socket, device: one unlink, and
             // never a resolution through it.
+            //
+            // THE BINDING FOR THIS ARM IS THE SYSCALL. A verdict of
+            // `.noDirectoryTree` is about the ABSENCE of a tree at this
+            // name, and `unlinkat` WITHOUT `AT_REMOVEDIR` cannot remove a
+            // directory — measured on this platform: `EPERM`. So a directory
+            // created here between the failed open and the unlink is refused
+            // by the kernel, not by a re-check that would have its own
+            // window.
+            if let inspected {
+                guard case .noDirectoryTree = inspected else {
+                    throw Failure(
+                        path: url.path, cause: .notTheInspectedObject,
+                        depth: 0
+                    )
+                }
+            }
             guard unlinkat(parentFd, leaf, 0) == 0 else {
                 throw Failure(path: url.path, cause: .posix(errno), depth: 0)
             }
             return
         }
 
+        // WHOSE TREE IS THIS? Asked of the OPENED INODE, before one entry is
+        // unlinked. Every other proof in this file answers "am I inside the
+        // parent I was admitted under?" — and a replacement directory
+        // created at the target's own name answers that `yes`, in the right
+        // parent, on the right volume, holding content nobody inspected.
+        do {
+            try proveInspectedRoot(
+                inspected, is: root, provider: provider, displayPath: url.path
+            )
+        } catch {
+            close(root)
+            throw error
+        }
+
         try removeTree(
-            named: leaf, in: parentFd, displayPath: url.path,
+            from: root, named: leaf, in: parentFd, displayPath: url.path,
             provider: provider
         )
+    }
+
+    /// Prove that the directory `root` names IS the object the caller's
+    /// pre-delete inspection was about.
+    ///
+    /// `fstat` OF THE HELD DESCRIPTOR, never a re-`lstat` of the path: the
+    /// path is exactly what an attacker re-points, and re-resolving it after
+    /// the descriptor is held re-opens the race the descriptor closed. An
+    /// identity that cannot be read is not a match — fail closed.
+    private static func proveInspectedRoot(
+        _ inspected: UserDataProbeResult.InspectedRoot?,
+        is root: Int32,
+        provider: FileSystemIdentityProvider,
+        displayPath: String
+    ) throws {
+        // No inspection ran (contents mode): nothing to bind to. The caller
+        // states this explicitly.
+        guard let inspected else { return }
+        guard case .directory(let expected) = inspected,
+              provider.identity(ofDescriptor: root) == expected else {
+            throw Failure(
+                path: displayPath, cause: .notTheInspectedObject, depth: 0
+            )
+        }
     }
 
     // MARK: - The traversal
@@ -186,22 +304,19 @@ enum DepthSafeRemoval {
         let parent: FileSystemIdentityProvider.Identity
     }
 
-    /// Empty `name`'s tree depth-first, then remove `name` itself.
+    /// Empty the tree `root` names depth-first, then remove `leaf` itself
+    /// from `parentFd`. TAKES OWNERSHIP of `root`.
     ///
     /// Iterative on purpose: recursion would hold one descriptor per level,
     /// which is the resource bill the scanner's walk already paid to retire.
     /// Here the bill is a constant — `parentFd`, the current directory, and
     /// at most one handle in flight — at ANY depth.
     private static func removeTree(
+        from root: Int32,
         named leaf: RawName, in parentFd: Int32, displayPath: String,
         provider: FileSystemIdentityProvider
     ) throws {
-        var current = openat(
-            parentFd, leaf, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
-        )
-        guard current >= 0 else {
-            throw Failure(path: displayPath, cause: .posix(errno), depth: 0)
-        }
+        var current = root
         defer { if current >= 0 { close(current) } }
 
         // THE ROOT'S MOUNT IS JUDGED AGAINST THE PARENT, NEVER AGAINST

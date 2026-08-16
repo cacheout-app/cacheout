@@ -836,8 +836,14 @@ actor CacheCleaner {
                 // to a permanent delete (R11).
                 try await trash(child)
             } else {
+                // NO INSPECTION VERDICT TO BIND TO, and the call site says
+                // so. Contents mode runs no user-data probe (only the
+                // orphaned-caches sweep carries a clean promise), so there
+                // is no inspected object here — the guards this deletion
+                // rests on are the containment chain above and the
+                // descriptor-relative traversal below.
                 try await Self.removeItemConcurrently(
-                    at: child, provider: provider
+                    at: child, expecting: nil, provider: provider
                 )
             }
         } catch {
@@ -865,12 +871,31 @@ actor CacheCleaner {
     /// deliberately asked of the UNRESOLVED target spelling, which is the
     /// one `removeItem` will act on.
     ///
-    /// RESIDUAL, STATED: the window between this `lstat` and the deletion
-    /// syscall is irreducible for as long as the deletion takes a path.
-    /// What it costs is unchanged from every other path check in this
-    /// method; what it buys is that the probe's whole inspection window —
-    /// the entire bounded walk, which is orders of magnitude longer — is no
-    /// longer part of the exposure.
+    /// LAYER TWO, AND SAID SO IN SOURCE (PR #458 review — the P1).
+    ///
+    /// The note that used to stand here called the window between this
+    /// `lstat` and the deletion syscall "irreducible for as long as the
+    /// deletion takes a path". BOTH HALVES WERE WRONG. The window was
+    /// measured through the production cleaner at 0.095 / 0.097 / 0.126 ms
+    /// over three runs — `removeItemConcurrently` hops to
+    /// `DispatchQueue.global` inside it — which is not a syscall's width but
+    /// an eternity for a `rename(2)` + `mkdir(2)` loop; and the deletion had
+    /// already stopped taking a path. It HOLDS A DESCRIPTOR and simply never
+    /// asked it who it was. It does now
+    /// (`DepthSafeRemoval.proveInspectedRoot`), so the load-bearing proof is
+    /// there, on the opened inode, past every window this method has.
+    ///
+    /// WHY THIS CHECK STAYS ANYWAY, honestly labelled: it is the arm that
+    /// refuses on an UNREADABLE target (`.failed`), where the removal would
+    /// only produce a raw errno; it refuses before the sweep spends a queue
+    /// hop; and it produces the sentence users act on. It is NOT what makes
+    /// the swap case safe. Its partner carries that, and the partner's
+    /// failing test is
+    /// `testTargetReplacedAfterTheFinalPathCheckIsRefused` — the fixture
+    /// that wins the race against this very `lstat`. Deleting this method's
+    /// body leaves that test GREEN; deleting the descriptor proof does not.
+    /// (Same disclosure discipline as the entry-budget guard in
+    /// `OrphanedCachesScanner.boundedUserDataShapeWalk`.)
     private func probedObjectStillAtTarget(
         _ inspected: UserDataProbeResult.InspectedRoot, target: URL
     ) -> Bool {
@@ -1046,16 +1071,25 @@ actor CacheCleaner {
             // containment chain re-validates.
             let recheck = try pathGuard.admitContainer(origin, snapshot: snapshot)
             try pathGuard.validateRemovableItem(target, inside: recheck)
-            // THE PROBE'S BINDING, AT THE LAST INSTANT BEFORE THE DELETE.
+            // THE PROBE'S BINDING, FIRST PASS — A PATH CHECK, WHICH IS NOT
+            // THE PROOF (PR #458 review — the P1).
             //
-            // Detecting a swap inside the probe and then deleting by path
-            // anyway would be no fix at all. The probe holds a DESCRIPTOR,
-            // so its verdict is a fact about an OBJECT; every check above —
-            // container admission, containment, deny list, mount — is a fact
-            // about a PATH, and a replacement directory created at the
-            // target's name after the probe satisfies all of them while
-            // holding content nobody inspected. This is where the path is
-            // proven to still name the object the verdict is about.
+            // The comment that stood here claimed "detecting the swap and
+            // then deleting by path anyway is structurally impossible". It
+            // was false: the deletion carried on by path, this check was the
+            // last thing between the sweep and a replacement directory, and
+            // a fixture that wins the race against this one `lstat` deleted
+            // a `Photos Library.photoslibrary` the app never opened while
+            // reporting SUCCESS and the OTHER tree's byte count.
+            //
+            // What is true: the probe holds a DESCRIPTOR, so its verdict is
+            // a fact about an OBJECT, while every check above — container
+            // admission, containment, deny list, mount — is a fact about a
+            // PATH that a replacement at the same name satisfies. Which is
+            // why the verdict now travels INTO the deletion
+            // (`expecting:` below) and is proved there against the inode it
+            // opens. This check is the earlier, cheaper, better-worded
+            // refusal; it is not the one that closes the window.
             if let probedObject,
                !probedObjectStillAtTarget(probedObject, target: target) {
                 let detail = "\(target.path): the folder at this path is no "
@@ -1074,8 +1108,13 @@ actor CacheCleaner {
                 // Item mode deletes the target ITSELF — never its
                 // contents-with-parent-preserved (R1/R15). The UNRESOLVED
                 // spelling: a symlink target is removed AS a link (R4).
+                //
+                // AND THE VERDICT GOES WITH IT. This is where the binding
+                // actually lands: the removal opens the target and proves
+                // the OPENED INODE is `probedObject` before it unlinks
+                // anything.
                 try await Self.removeItemConcurrently(
-                    at: target, provider: provider
+                    at: target, expecting: probedObject, provider: provider
                 )
             }
         } catch {
@@ -1084,7 +1123,18 @@ actor CacheCleaner {
                     label: item.displayName, tag: Self.refusalTag(error),
                     detail: "\(target.path): \(error.localizedDescription)"
                 )
+            } else if let failure = error as? DepthSafeRemoval.Failure,
+                      failure.cause == .notTheInspectedObject {
+                // The SAME event as the path check above — same tag, so the
+                // log does not report a swap caught one layer down as
+                // something else entirely.
+                logRefusal(
+                    label: item.displayName, tag: "content-drift",
+                    detail: "\(target.path): \(error.localizedDescription)"
+                )
             }
+            // Failed deletions never accept: `token` is abandoned, no entry
+            // is produced, and no bytes are reported.
             return (nil, [Self.itemError(item, error.localizedDescription)])
         }
 
@@ -1197,13 +1247,25 @@ actor CacheCleaner {
     /// message blaming an "invalid file name". Both halves of one core now
     /// traverse the same way, so neither can address a tree the other
     /// cannot: `DepthSafeRemoval` reaches exactly what the probe reaches.
+    ///
+    /// AND THE HOP IS WHY THE INSPECTION VERDICT TRAVELS WITH IT (PR #458
+    /// review — the P1). `expecting` is not plumbing: between the caller's
+    /// last path check and the first syscall below there is a queue hop,
+    /// measured through this very method at 0.095 / 0.097 / 0.126 ms over
+    /// three runs — an eternity for a `rename(2)` + `mkdir(2)` loop, and the
+    /// window in which the deletion used to acquire a descriptor it never
+    /// asked the identity of.
     nonisolated private static func removeItemConcurrently(
-        at url: URL, provider: FileSystemIdentityProvider
+        at url: URL,
+        expecting inspected: UserDataProbeResult.InspectedRoot?,
+        provider: FileSystemIdentityProvider
     ) async throws {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             DispatchQueue.global(qos: .userInitiated).async {
                 do {
-                    try DepthSafeRemoval.remove(at: url, provider: provider)
+                    try DepthSafeRemoval.remove(
+                        at: url, expecting: inspected, provider: provider
+                    )
                     continuation.resume()
                 } catch {
                     continuation.resume(throwing: error)

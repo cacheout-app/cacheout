@@ -174,7 +174,7 @@ final class DepthSafeRemovalTests: XCTestCase {
         }
 
         try DepthSafeRemoval.remove(
-            at: target, provider: FileSystemIdentityProvider()
+            at: target, expecting: nil, provider: FileSystemIdentityProvider()
         )
         XCTAssertFalse(exists(target),
                        "the whole tree must be gone, root included")
@@ -201,7 +201,7 @@ final class DepthSafeRemovalTests: XCTestCase {
         defer { setrlimit(RLIMIT_NOFILE, &original) }
 
         try DepthSafeRemoval.remove(
-            at: target, provider: FileSystemIdentityProvider()
+            at: target, expecting: nil, provider: FileSystemIdentityProvider()
         )
         XCTAssertFalse(exists(target))
     }
@@ -229,7 +229,7 @@ final class DepthSafeRemovalTests: XCTestCase {
         )
 
         try DepthSafeRemoval.remove(
-            at: target, provider: FileSystemIdentityProvider()
+            at: target, expecting: nil, provider: FileSystemIdentityProvider()
         )
         XCTAssertFalse(exists(target))
         XCTAssertTrue(exists(outside), "the symlink's target directory lives")
@@ -240,7 +240,7 @@ final class DepthSafeRemovalTests: XCTestCase {
         let linkTarget = base.appendingPathComponent("link-as-target")
         try fm.createSymbolicLink(at: linkTarget, withDestinationURL: outside)
         try DepthSafeRemoval.remove(
-            at: linkTarget, provider: FileSystemIdentityProvider()
+            at: linkTarget, expecting: nil, provider: FileSystemIdentityProvider()
         )
         XCTAssertFalse(exists(linkTarget))
         XCTAssertTrue(exists(outside))
@@ -287,7 +287,7 @@ final class DepthSafeRemovalTests: XCTestCase {
         close(nestedFd)
 
         try DepthSafeRemoval.remove(
-            at: target, provider: FileSystemIdentityProvider()
+            at: target, expecting: nil, provider: FileSystemIdentityProvider()
         )
         XCTAssertFalse(exists(target),
                        "an entry the traversal could not name would leave the "
@@ -321,7 +321,7 @@ final class DepthSafeRemovalTests: XCTestCase {
         close(nestedFd)
 
         try DepthSafeRemoval.remove(
-            at: target, provider: FileSystemIdentityProvider()
+            at: target, expecting: nil, provider: FileSystemIdentityProvider()
         )
         XCTAssertFalse(exists(target))
     }
@@ -332,7 +332,7 @@ final class DepthSafeRemovalTests: XCTestCase {
         let ghost = base.appendingPathComponent("nope/never")
         XCTAssertThrowsError(
             try DepthSafeRemoval.remove(
-                at: ghost, provider: FileSystemIdentityProvider()
+                at: ghost, expecting: nil, provider: FileSystemIdentityProvider()
             )
         )
     }
@@ -381,7 +381,7 @@ final class DepthSafeRemovalTests: XCTestCase {
             .identity(of: mounted)?.inode
 
         XCTAssertThrowsError(
-            try DepthSafeRemoval.remove(at: target, provider: provider)
+            try DepthSafeRemoval.remove(at: target, expecting: nil, provider: provider)
         ) { error in
             XCTAssertTrue(
                 error.localizedDescription.contains("mounted inside"),
@@ -432,7 +432,7 @@ final class DepthSafeRemovalTests: XCTestCase {
 
         XCTAssertThrowsError(
             try DepthSafeRemoval.remove(
-                at: target, provider: FileSystemIdentityProvider()
+                at: target, expecting: nil, provider: FileSystemIdentityProvider()
             )
         ) { error in
             XCTAssertTrue(
@@ -469,7 +469,7 @@ final class DepthSafeRemovalTests: XCTestCase {
         provider.foreignInode = try inode(of: target)
 
         XCTAssertThrowsError(
-            try DepthSafeRemoval.remove(at: target, provider: provider)
+            try DepthSafeRemoval.remove(at: target, expecting: nil, provider: provider)
         ) { error in
             XCTAssertTrue(
                 error.localizedDescription.contains("mount boundary"),
@@ -562,7 +562,7 @@ final class DepthSafeRemovalTests: XCTestCase {
         }
 
         XCTAssertThrowsError(
-            try DepthSafeRemoval.remove(at: target, provider: provider)
+            try DepthSafeRemoval.remove(at: target, expecting: nil, provider: provider)
         ) { error in
             XCTAssertTrue(
                 error.localizedDescription.contains("moved while it was"),
@@ -614,7 +614,7 @@ final class DepthSafeRemovalTests: XCTestCase {
         }
 
         XCTAssertThrowsError(
-            try DepthSafeRemoval.remove(at: target, provider: provider)
+            try DepthSafeRemoval.remove(at: target, expecting: nil, provider: provider)
         ) { error in
             XCTAssertTrue(
                 error.localizedDescription.contains("moved while it was"),
@@ -658,7 +658,7 @@ final class DepthSafeRemovalTests: XCTestCase {
         }
 
         XCTAssertThrowsError(
-            try DepthSafeRemoval.remove(at: target, provider: provider)
+            try DepthSafeRemoval.remove(at: target, expecting: nil, provider: provider)
         ) { error in
             XCTAssertTrue(
                 error.localizedDescription.contains("moved while it was"),
@@ -673,6 +673,269 @@ final class DepthSafeRemovalTests: XCTestCase {
             "content placed in the relocated root belongs to its new owner "
                 + "and must not be unlinked"
         )
+    }
+
+    // MARK: - The inspection binding (PR #458 review — the P1)
+
+    /// The verdict is a fact about an OBJECT, so the deletion proves the
+    /// object — from the descriptor it opened, not from the path.
+    ///
+    /// A path re-resolved after the descriptor is held re-opens the race the
+    /// descriptor closed; the cleaner's own pre-delete `lstat` is exactly
+    /// that, and a swap landing between it and this `openat` beats it. Here
+    /// the mismatch is stated directly instead of raced for: the caller
+    /// inspected some other inode, so this tree is not the one it vetted.
+    func testRefusesADeletionRootThatIsNotTheInspectedObject() throws {
+        let target = base.appendingPathComponent("bound-target")
+        try mkdir(target.appendingPathComponent("nested"))
+        let precious = target.appendingPathComponent("nested/precious.bin")
+        try write(precious, bytes: 4096)
+
+        let elsewhere = FileSystemIdentityProvider.Identity(
+            device: 0, inode: 0
+        )
+        XCTAssertThrowsError(
+            try DepthSafeRemoval.remove(
+                at: target, expecting: .directory(elsewhere),
+                provider: FileSystemIdentityProvider()
+            )
+        ) { error in
+            XCTAssertEqual(
+                (error as? DepthSafeRemoval.Failure)?.cause,
+                .notTheInspectedObject
+            )
+            XCTAssertTrue(
+                error.localizedDescription
+                    .contains("no longer the one that was inspected"),
+                error.localizedDescription
+            )
+        }
+        XCTAssertTrue(exists(precious),
+                      "a tree nobody inspected must not lose one entry")
+
+        // The positive control, so the guard is a proof and not a refusal
+        // machine: bound to the object that IS there, the same call deletes.
+        let identity = try XCTUnwrap(
+            FileSystemIdentityProvider().identity(of: target)
+        )
+        try DepthSafeRemoval.remove(
+            at: target, expecting: .directory(identity),
+            provider: FileSystemIdentityProvider()
+        )
+        XCTAssertFalse(exists(target))
+    }
+
+    /// A verdict about a DIRECTORY is not satisfied by whatever leaf now
+    /// stands at the name.
+    ///
+    /// The kind gate IS the open, so a swapped-in regular file arrives here
+    /// as `ENOTDIR` on the leaf arm — where an unbound deletion would simply
+    /// unlink it. It belongs to whoever put it there.
+    func testRefusesALeafStandingWhereADirectoryWasInspected() throws {
+        let target = base.appendingPathComponent("was-a-directory")
+        try write(target, bytes: 128)
+
+        let inspected = FileSystemIdentityProvider.Identity(
+            device: 1, inode: 1
+        )
+        XCTAssertThrowsError(
+            try DepthSafeRemoval.remove(
+                at: target, expecting: .directory(inspected),
+                provider: FileSystemIdentityProvider()
+            )
+        ) { error in
+            XCTAssertEqual(
+                (error as? DepthSafeRemoval.Failure)?.cause,
+                .notTheInspectedObject
+            )
+        }
+        XCTAssertTrue(exists(target), "the new owner's file survives")
+    }
+
+    /// The other arm of the same binding: a verdict of "there is no
+    /// directory tree here" is voided by a directory appearing at the name.
+    ///
+    /// `.unestablished` — a probe that proved nothing — is refused on the
+    /// same guard, because it is not a licence to delete anything.
+    func testRefusesADirectoryStandingWhereNoTreeWasInspected() throws {
+        let target = base.appendingPathComponent("appeared")
+        try mkdir(target)
+        let precious = target.appendingPathComponent("precious.bin")
+        try write(precious, bytes: 4096)
+
+        for verdict in [UserDataProbeResult.InspectedRoot.noDirectoryTree,
+                        .unestablished] {
+            XCTAssertThrowsError(
+                try DepthSafeRemoval.remove(
+                    at: target, expecting: verdict,
+                    provider: FileSystemIdentityProvider()
+                ), "\(verdict)"
+            ) { error in
+                XCTAssertEqual(
+                    (error as? DepthSafeRemoval.Failure)?.cause,
+                    .notTheInspectedObject, "\(verdict)"
+                )
+            }
+            XCTAssertTrue(exists(precious), "\(verdict)")
+        }
+
+        // And the leaf arm's own positive control: a link, bound to the
+        // verdict that is actually about it, is unlinked AS a link.
+        let link = base.appendingPathComponent("linked")
+        try fm.createSymbolicLink(at: link, withDestinationURL: target)
+        try DepthSafeRemoval.remove(
+            at: link, expecting: .noDirectoryTree,
+            provider: FileSystemIdentityProvider()
+        )
+        XCTAssertFalse(exists(link))
+        XCTAssertTrue(exists(precious), "and never through it")
+    }
+
+    // MARK: - Unprovable location
+
+    /// Blinds `mountIdentity(ofDescriptor:)` for ONE chosen inode — the
+    /// descriptor-shaped way to ask what happens when the question cannot be
+    /// answered at all (`fstatfs` failing on a held descriptor).
+    private final class UnprovableMountProvider: FileSystemIdentityProvider {
+        var blindInode: UInt64?
+
+        override func mountIdentity(
+            ofDescriptor descriptor: Int32
+        ) -> MountIdentity? {
+            if let blindInode,
+               super.identity(ofDescriptor: descriptor)?.inode == blindInode {
+                return nil
+            }
+            return super.mountIdentity(ofDescriptor: descriptor)
+        }
+    }
+
+    /// A mount question that cannot be answered REFUSES — on both sides of
+    /// the root's comparison.
+    ///
+    /// The root's boundary proof is `parent == root`, and an unreadable
+    /// answer on EITHER side leaves it unproven. Falling through to the
+    /// comparison would then delete on a `nil == nil` agreement or on an
+    /// arbitrary default — a mounted volume being emptied because the
+    /// question about it errored is the worst possible reading of the R15
+    /// doctrine. Unprovable ⇒ refused, nothing destroyed.
+    func testRefusesWhenAMountIdentityCannotBeRead() throws {
+        for blinded in ["parent", "root"] {
+            let target = base.appendingPathComponent("unprovable-\(blinded)")
+            try mkdir(target.appendingPathComponent("nested"))
+            let precious = target.appendingPathComponent("nested/keep.bin")
+            try write(precious, bytes: 2048)
+
+            let provider = UnprovableMountProvider()
+            provider.blindInode = try inode(
+                of: blinded == "parent" ? base : target
+            )
+
+            XCTAssertThrowsError(
+                try DepthSafeRemoval.remove(
+                    at: target, expecting: nil, provider: provider
+                ), blinded
+            ) { error in
+                XCTAssertEqual(
+                    (error as? DepthSafeRemoval.Failure)?.cause,
+                    .unprovableLocation, blinded
+                )
+                XCTAssertTrue(
+                    error.localizedDescription
+                        .contains("could not prove which volume"),
+                    error.localizedDescription
+                )
+            }
+            XCTAssertTrue(exists(precious),
+                          "nothing may be unlinked on an unproven volume "
+                              + "(\(blinded))")
+        }
+    }
+
+    // MARK: - Residual #1, MEASURED
+
+    /// THIS TEST PINS A RESIDUAL, NOT A GUARANTEE. It asserts what an
+    /// ancestor relocation actually costs, because the header comment used
+    /// to claim the exposure was "one directory's enumeration" and that is
+    /// false.
+    ///
+    /// A `rename(2)` of a directory the traversal has already entered and
+    /// proven leaves every proof BELOW it true — `..` from a child still
+    /// names the relocated directory — so the traversal keeps going and
+    /// keeps unlinking, at every depth, including entries the new owner
+    /// writes there after the move. Measured here: a file the new owner puts
+    /// one level down, another two levels down, and another in a sibling
+    /// branch not yet visited are ALL destroyed. What bounds it is the
+    /// unwind's `..` re-anchor, which refuses the moment the traversal tries
+    /// to climb OUT of the relocated tree — so the damage stops at that
+    /// subtree (a bystander elsewhere in the new parent survives), and the
+    /// deletion fails `.relocated` rather than reporting success.
+    ///
+    /// POSIX has no primitive that closes this: a directory cannot be pinned
+    /// to its parent for the duration of a read.
+    func testAncestorRelocationDestroysTheNewOwnersWholeSubtree() throws {
+        let target = base.appendingPathComponent("relocating-ancestor")
+        let ancestor = target.appendingPathComponent("a")
+        try mkdir(ancestor.appendingPathComponent("sub/deeper"))
+        try mkdir(ancestor.appendingPathComponent("other"))
+        let foreign = base.appendingPathComponent("new-owner")
+        try mkdir(foreign.appendingPathComponent("bystander"))
+        let bystander = foreign.appendingPathComponent("bystander/keep.bin")
+        try write(bystander, bytes: 1024)
+        let relocated = foreign.appendingPathComponent("moved")
+
+        // Fired while the traversal stands INSIDE `a/sub` — i.e. after `a`
+        // itself was entered and proven, which is the only way an ancestor
+        // relocation gets past the descent-time containment proof.
+        let planted = ["sub/one-level.bin", "sub/deeper/two-levels.bin",
+                       "other/sibling-branch.bin"]
+        /// What the fixture ACTUALLY created — a `XCTAssertFalse(exists:)`
+        /// over a file that was never written passes for the wrong reason.
+        var reallyPlanted: [String] = []
+        let provider = FirstDescentHook()
+        provider.watched = [try inode(of: ancestor.appendingPathComponent("sub"))]
+        provider.onFirstDescent = { _ in
+            guard rename(ancestor.path, relocated.path) == 0 else { return }
+            // The new owner writes into the tree it now owns, at three
+            // places the traversal has not looked at yet.
+            for name in planted {
+                let url = relocated.appendingPathComponent(name)
+                guard (try? self.write(url)) != nil, self.exists(url) else {
+                    continue
+                }
+                reallyPlanted.append(name)
+            }
+        }
+
+        XCTAssertThrowsError(
+            try DepthSafeRemoval.remove(
+                at: target, expecting: nil, provider: provider
+            )
+        ) { error in
+            XCTAssertEqual(
+                (error as? DepthSafeRemoval.Failure)?.cause, .relocated,
+                "the deletion must FAIL, never report success"
+            )
+        }
+        XCTAssertNotNil(provider.firedFor,
+                        "the fixture never performed the rename")
+
+        XCTAssertEqual(reallyPlanted, planted,
+                       "the fixture must really have written every file "
+                           + "whose loss this test measures")
+
+        // THE MEASURED BLAST RADIUS. Every one of these is the new owner's,
+        // and every one of them is gone.
+        for lost in planted {
+            XCTAssertFalse(
+                exists(relocated.appendingPathComponent(lost)),
+                "residual understated: \(lost) survived, so the scope claim "
+                    + "in the header is now too pessimistic — re-measure it"
+            )
+        }
+        // AND THE BOUND. It is the relocated subtree, not the new parent.
+        XCTAssertTrue(exists(bystander),
+                      "the damage must not spread outside the tree that moved")
     }
 
     // MARK: - The enumeration handle
@@ -760,7 +1023,7 @@ final class DepthSafeRemovalTests: XCTestCase {
         }, 0, "fixture fifo")
 
         try DepthSafeRemoval.remove(
-            at: target, provider: FileSystemIdentityProvider()
+            at: target, expecting: nil, provider: FileSystemIdentityProvider()
         )
         XCTAssertFalse(exists(target))
         XCTAssertTrue(exists(base), "the parent above the target survives")

@@ -32,6 +32,24 @@
 //  the directory it left — a `rename` of the current directory into a foreign
 //  parent otherwise redirects the rest of the deletion into somebody else's
 //  tree.
+//
+//  EVERY PROOF IS TAKEN AGAINST THE HELD PARENT, AND BEFORE THE DESTRUCTION,
+//  never against the object being judged and never after the fact. Both
+//  halves are load-bearing:
+//
+//  - anchored to the parent, because a root that supplies its own reference
+//    point cannot disagree with itself — read the mount identity FROM the
+//    opened root and a volume attached onto the target is invisible, every
+//    descendant matching the mounted filesystem it was compared against;
+//  - taken first, because a descriptor survives a `rename(2)` intact, so a
+//    check made on the way back up passes judgement on entries that are
+//    already unlinked.
+//
+//  What that leaves is a single irreducible window per directory: between the
+//  proof and the last `unlinkat` of that one level, entries added by whoever
+//  now owns a relocated directory are still reachable. It is bounded to one
+//  level, and POSIX offers no primitive that closes it — there is no way to
+//  pin a directory to its parent for the duration of a read.
 
 import Foundation
 

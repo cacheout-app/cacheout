@@ -2650,7 +2650,8 @@ final class OrphanedCachesScannerTests: XCTestCase {
             case .didEnumerate: sequence.append("enumerate")
             // Deliberately NOT in the sequence: the mid-climb detector below
             // keys on pop/census/reanchor ADJACENCY, and bookkeeping is
-            // emitted on descent, never inside a climb.
+            // emitted on descent and after a pop's climb has already
+            // finished — never between a climb's own steps.
             case .frameBookkeeping: break
             case .descriptorCensus(let live, let transient, _):
                 sequence.append("census")
@@ -3053,11 +3054,11 @@ final class OrphanedCachesScannerTests: XCTestCase {
         try assertCleanupLogContains(tag: "content-drift")
     }
 
-    /// The other arm of the binding: the probe's CLEAN verdict for an absent
-    /// or non-directory target says "there is no tree of ours here", and a
-    /// directory appearing at that name before the deletion voids it just as
-    /// surely as a swapped inode does.
-    func testDirectoryAppearingAtAnAbsentTargetIsRefused() throws {
+    /// The verdict SHAPE this arm binds to: an absent path proves the
+    /// ABSENCE of a tree, and says so rather than reporting a directory it
+    /// never saw. Kept as its own unit — it is a statement about the probe,
+    /// and the end-to-end refusal below is the statement about the cleaner.
+    func testAnAbsentTargetProbesAsNoDirectoryTree() throws {
         let ghost = cachesRoot.appendingPathComponent("com.example.Ghost")
         let probe = OrphanedCachesScanner.preDeleteUserDataProbe(
             at: ghost, provider: FileSystemIdentityProvider()
@@ -3067,6 +3068,171 @@ final class OrphanedCachesScannerTests: XCTestCase {
         XCTAssertEqual(probe.inspected, .noDirectoryTree,
                        "an absent target proves the ABSENCE of a tree — that "
                            + "is what the verdict is about")
+    }
+
+    /// The `.noDirectoryTree` sibling of `SwapAfterProbeProvider`: the target
+    /// is UNLINKED before the pre-delete probe opens it, so the probe's clean
+    /// verdict is about an ABSENCE — and a directory holding user data is
+    /// created at that same name before the deletion.
+    ///
+    /// EVERY MUTATION IS A REAL SYSCALL, and the seam is a question
+    /// production already asks at exactly those instants: the deny list's
+    /// `isMountPoint` of the target, once in the pre-probe
+    /// `validateRemovableItem` and once in the post-probe recheck. The
+    /// fixture is therefore never more capable than an attacker with a shell
+    /// — it only has better timing.
+    private final class DirectoryAfterAbsentProbeProvider:
+        FileSystemIdentityProvider {
+        var target: URL!
+        /// Where the real entry is moved to, before the probe looks.
+        var stash: URL!
+        /// Created (with intermediates) at the target's name after the probe.
+        var replacement: URL!
+        /// When set, chmod-000'd once the replacement lands, so the
+        /// delete-time `lstat` of the target fails EACCES for real.
+        var blinded: URL?
+        private var armed = false
+        private var mountChecks = 0
+        private(set) var removed = false
+        private(set) var recreated = false
+
+        /// Arm for the CLEAN only — the scan walks this same tree, and a
+        /// fixture that fired there would be testing scan-time staleness.
+        func arm() {
+            armed = true
+            mountChecks = 0
+            removed = false
+            recreated = false
+        }
+
+        override func isMountPoint(_ url: URL) -> Bool {
+            guard armed,
+                  url.lastPathComponent == target.lastPathComponent
+            else { return super.isMountPoint(url) }
+            mountChecks += 1
+            switch mountChecks {
+            case 1:
+                // Pre-probe admission: the owning app removes its own cache
+                // directory. The probe that follows finds nothing to open.
+                try? FileManager.default.moveItem(at: target, to: stash)
+                removed = true
+            case 2:
+                // Post-probe recheck: something recreates the name, holding
+                // content nobody has inspected.
+                try? FileManager.default.createDirectory(
+                    at: replacement, withIntermediateDirectories: true
+                )
+                recreated = true
+                if let blinded {
+                    try? FileManager.default.setAttributes(
+                        [.posixPermissions: 0o000], ofItemAtPath: blinded.path
+                    )
+                }
+            default:
+                break
+            }
+            return super.isMountPoint(url)
+        }
+    }
+
+    /// The other arm of the binding, END TO END — which is the whole point
+    /// (r8). The test that used to carry this name asserted only that the
+    /// probe SAYS `.noDirectoryTree` for an absent path: it built no item,
+    /// no cleaner and no refusal, so replacing the arm's body with `return
+    /// true` left the suite at 667/0. The arm is the ONLY thing standing
+    /// between an `automaticCleanEligible` sweep item whose target was
+    /// unlinked between scan and delete and the deletion of a tree nobody
+    /// ever opened — the same defect class as the swapped-inode arm above,
+    /// on the sibling branch of the same switch.
+    func testDirectoryAppearingAtAnAbsentTargetIsRefused() async throws {
+        let entry = cachesRoot
+            .appendingPathComponent("com.apple.SwiftUI.Drag-GONE")
+        try mkdir(entry)
+        try writeFile(entry.appendingPathComponent("payload.bin"))
+
+        let provider = DirectoryAfterAbsentProbeProvider()
+        provider.target = entry
+        provider.stash = base.appendingPathComponent("drag-gone-unlinked")
+        let library = entry.appendingPathComponent(
+            "Pictures/Photos Library.photoslibrary"
+        )
+        provider.replacement = library
+
+        let runtime = try makeRuntime(
+            [makeScanner(provider: provider)], provider: provider
+        )
+        let (items, snapshot) = await scanSession(runtime)
+        let leak = try XCTUnwrap(items.first)
+        XCTAssertTrue(leak.automaticCleanEligible,
+                      "the fixture entry scans as a clean known leak")
+
+        provider.arm()
+        let cleaner = runtime.makeCleaner(snapshot: snapshot)
+        let report = await cleaner.clean(items: [leak], moveToTrash: false)
+
+        XCTAssertTrue(provider.removed, "the fixture never unlinked the target")
+        XCTAssertTrue(provider.recreated,
+                      "the fixture never recreated the target")
+        XCTAssertTrue(report.entries.isEmpty, "nothing may be deleted")
+        XCTAssertEqual(report.errors.count, 1)
+        let message = try XCTUnwrap(report.errors.first?.message)
+        // THIS MESSAGE PROVES THE ORDERING, not just the verdict. Had the
+        // replacement landed BEFORE the probe, the probe would have walked
+        // it and refused with "user-data-shaped content" instead — so the
+        // fixture cannot silently degrade into testing the other arm.
+        XCTAssertTrue(message.contains("no longer the one that was inspected"),
+                      message)
+        XCTAssertTrue(
+            fm.fileExists(atPath: library.path),
+            "a directory created at the target's name after an ABSENT "
+                + "verdict was DELETED — the probe never opened one byte of it"
+        )
+        try assertCleanupLogContains(tag: "content-drift")
+    }
+
+    /// DIRECTION, at the same site. `kind(of:)` collapses "absent" and
+    /// "`lstat` failed" onto `nil`, so `kind(of: target) != .directory` was
+    /// TRUE for an unreadable target — an EACCES/EIO `lstat` ADMITTED the
+    /// deletion, while the sibling `.directory` arm fails closed on exactly
+    /// the same nil. A guard whose failure mode is "proceed" is not a guard.
+    ///
+    /// The EACCES is real: the target's parent is chmod-000'd for real
+    /// between the probe and the check, which is what a `lstat` of a child
+    /// of an unsearchable directory returns on this platform.
+    func testAnUnreadableTargetAfterAnAbsentProbeIsRefused() async throws {
+        let entry = cachesRoot
+            .appendingPathComponent("com.apple.SwiftUI.Drag-BLIND")
+        try mkdir(entry)
+        try writeFile(entry.appendingPathComponent("payload.bin"))
+
+        let provider = DirectoryAfterAbsentProbeProvider()
+        provider.target = entry
+        provider.stash = base.appendingPathComponent("drag-blind-unlinked")
+        provider.replacement = entry.appendingPathComponent("Documents")
+        provider.blinded = cachesRoot
+        defer { restorePerms(cachesRoot) }
+
+        let runtime = try makeRuntime(
+            [makeScanner(provider: provider)], provider: provider
+        )
+        let (items, snapshot) = await scanSession(runtime)
+        let leak = try XCTUnwrap(items.first)
+        XCTAssertTrue(leak.automaticCleanEligible)
+
+        provider.arm()
+        let cleaner = runtime.makeCleaner(snapshot: snapshot)
+        let report = await cleaner.clean(items: [leak], moveToTrash: false)
+        restorePerms(cachesRoot)
+
+        XCTAssertTrue(provider.recreated, "the fixture never armed the case")
+        XCTAssertTrue(report.entries.isEmpty, "nothing may be deleted")
+        let message = try XCTUnwrap(report.errors.first?.message)
+        // A refusal, NOT a POSIX error that happened to stop the delete:
+        // the guard must be what said no. Under a fail-open `.failed` arm
+        // the deletion is attempted and the message is the errno's.
+        XCTAssertTrue(message.contains("no longer the one that was inspected"),
+                      message)
+        try assertCleanupLogContains(tag: "content-drift")
     }
 
     // MARK: - The climb's per-level `..` re-proof (PR #458 review r7)
@@ -3406,6 +3572,19 @@ final class OrphanedCachesScannerTests: XCTestCase {
     // MARK: - The bookkeeping is bounded in CPU too (r7, thread
     //         PRRT_kwDORmg6_86ZkfDO)
 
+    /// One pass's accounting sample set.
+    private struct BookkeepingTally {
+        var passes = 0
+        var worst = 0
+        var total = 0
+
+        mutating func record(_ inspected: Int) {
+            passes += 1
+            worst = max(worst, inspected)
+            total += inspected
+        }
+    }
+
     /// THE BUDGET BOUNDS ATTENTION, NOT RESOURCES — and CPU is a resource.
     ///
     /// `makeRoom` used to rescan the WHOLE frame stack three times per
@@ -3415,6 +3594,15 @@ final class OrphanedCachesScannerTests: XCTestCase {
     /// the 20,000-entry budget, before the walk even begins to unwind. Wall
     /// clock cannot pin an asymptote deterministically; the walk's own
     /// accounting can, so it reports how many frames each pass inspected.
+    ///
+    /// BOTH PASSES, AND THAT IS THE POINT (r8). The first fix reached only
+    /// `makeRoom`, and the test that certified it sampled only `makeRoom`,
+    /// so the pop path's `frames[..<depth].lastIndex(where:)` — which on a
+    /// single-child chain matches NOTHING and therefore scans the entire
+    /// prefix, every pop, d²/2 inspections over the unwind: 5,121,601
+    /// measured at depth 3200, ~2.0 × 10⁸ at the 20,000-entry budget —
+    /// survived a fix and a review round untouched. A metric that samples
+    /// half the loop certifies half the loop.
     func testFrameBookkeepingIsBoundedByTheWindowNotTheDepth() throws {
         let entry = cachesRoot.appendingPathComponent("com.example.Bookkeeping")
         try mkdir(entry)
@@ -3427,39 +3615,49 @@ final class OrphanedCachesScannerTests: XCTestCase {
         defer { removeDeepChain(deepest: deepest, stopAt: entry, name: "d") }
 
         let window = 8
-        var passes = 0
-        var worst = 0
-        var total = 0
+        var descent = BookkeepingTally()
+        var pop = BookkeepingTally()
         let probe = OrphanedCachesScanner.boundedUserDataShapeWalk(
             at: entry, provider: FileSystemIdentityProvider(),
             entryLimit: OrphanedCachesScanner.defaultProbeEntryLimit,
             descriptorWindow: window
         ) { event in
-            guard case .frameBookkeeping(let inspected, _) = event else {
-                return
+            guard case .frameBookkeeping(let inspected, _, let pass) = event
+            else { return }
+            switch pass {
+            case .descent: descent.record(inspected)
+            case .pop: pop.record(inspected)
             }
-            passes += 1
-            worst = max(worst, inspected)
-            total += inspected
         }
 
         XCTAssertTrue(probe.complete, "\(probe.obstructions)")
-        XCTAssertEqual(passes, levels,
+        XCTAssertEqual(descent.passes, levels,
                        "one accounting pass per descent, or this test is not "
                            + "measuring the descent path at all")
+        // Every frame pushed is popped, root included — anything less and
+        // the pop assertions below are pinned to a sample set that misses
+        // the deep end of the unwind, which is exactly how this defect
+        // survived r7.
+        XCTAssertEqual(pop.passes, levels + 1,
+                       "one accounting pass per popped frame, or this test is "
+                           + "not measuring the pop path at all")
+
         // W anchors is the whole population the accounting can see; anything
         // above that is the frame STACK being scanned again.
-        XCTAssertLessThanOrEqual(
-            worst, 2 * window,
-            "one accounting pass inspected \(worst) frames at a depth of "
-                + "\(levels) — the bookkeeping is a function of DEPTH again"
-        )
-        XCTAssertLessThan(
-            total, levels * 2 * window,
-            "\(total) frame inspections over \(levels) descents — linear in "
-                + "entries is the contract; the retired shape spent "
-                + "~\(3 * levels * levels / 2)"
-        )
+        for (name, tally) in [("descent", descent), ("pop", pop)] {
+            XCTAssertLessThanOrEqual(
+                tally.worst, 2 * window,
+                "one \(name) accounting pass inspected \(tally.worst) frames "
+                    + "at a depth of \(levels) — the bookkeeping is a "
+                    + "function of DEPTH again"
+            )
+            XCTAssertLessThan(
+                tally.total, (levels + 1) * 2 * window,
+                "\(tally.total) frame inspections over \(tally.passes) "
+                    + "\(name) passes — linear in entries is the contract; "
+                    + "a prefix scan would spend ~\(levels * levels / 2)"
+            )
+        }
     }
 
     // MARK: - Platform errno pinning (PR #458 review, ancestor swap)

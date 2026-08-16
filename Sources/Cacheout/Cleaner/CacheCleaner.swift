@@ -877,7 +877,25 @@ actor CacheCleaner {
             // ours at that name (absent, symlink, regular file, special) —
             // deletion removes the leaf as-is. A directory standing there
             // now is a tree the probe never opened.
-            return provider.kind(of: target) != .directory
+            //
+            // `probeKind`, NOT `kind` (PR #458 review r8). `kind(of:)`
+            // collapses "absent" and "`lstat` failed" onto `nil`, so
+            // `kind(of:) != .directory` was TRUE for an EACCES or EIO
+            // `lstat` — this arm ADMITTED the deletion on a target it could
+            // not read, while the `.directory` arm below fails closed on
+            // exactly the same nil. Same site, opposite directions.
+            switch provider.probeKind(of: target) {
+            case .absent:
+                // Still nothing there: the verdict holds precisely.
+                return true
+            case .kind(let kind):
+                return kind != .directory
+            case .failed:
+                // We cannot tell what is standing there. Unverifiable ⇒
+                // refuse — and CLEARABLE: a re-scan of a readable target
+                // proceeds normally.
+                return false
+            }
         case .unestablished:
             // No verdict to bind to. Unreachable — an incomplete probe has
             // already refused above — so fail closed rather than assume.

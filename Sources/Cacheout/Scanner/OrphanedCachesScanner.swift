@@ -1186,14 +1186,30 @@ struct OrphanedCachesScanner: @unchecked Sendable {
         /// `live + transient` is the count an external observer of this
         /// process sees, and tests assert that equality.
         case descriptorCensus(live: Int, transient: Int, depth: Int)
-        /// How many frame/live-index inspections ONE `makeRoom` performed.
+        /// Which of the walk's two frame-stack passes an accounting sample
+        /// is about.
+        ///
+        /// THE DISCRIMINATOR IS THE FIX, not decoration (PR #458 review r8,
+        /// thread `PRRT_kwDORmg6_86ZkfDO`). The metric was emitted from
+        /// `makeRoom` alone, so the test that asserts it pinned its sample
+        /// set to DESCENTS — and the pop path, which carried an untouched
+        /// O(depth) prefix scan, was structurally invisible to it. A metric
+        /// that cannot see half the loop cannot fail on half the loop.
+        enum BookkeepingPass: Equatable {
+            /// `makeRoom`, once per descent.
+            case descent
+            /// The unwind, once per popped frame.
+            case pop
+        }
+        /// How many frame/live-index inspections ONE pass performed.
         ///
         /// The walk's own bookkeeping is a RESOURCE, and the entry budget
         /// bounds ATTENTION, not resources — the distinction that has now
-        /// cost this walk three times. Wall-clock cannot pin an asymptote
+        /// cost this walk four times. Wall-clock cannot pin an asymptote
         /// deterministically; this can, so a test asserts the accounting is
-        /// bounded by the descriptor WINDOW rather than by DEPTH.
-        case frameBookkeeping(inspected: Int, depth: Int)
+        /// bounded by the descriptor WINDOW rather than by DEPTH — for BOTH
+        /// passes.
+        case frameBookkeeping(inspected: Int, depth: Int, pass: BookkeepingPass)
     }
 
     /// A basename PROVEN safe to hand to `openat`/`fstatat`.
@@ -1376,8 +1392,64 @@ struct OrphanedCachesScanner: @unchecked Sendable {
         /// inspections before it even began to unwind: quadratic CPU inside
         /// a walk whose only bound is an ENTRY count, on exactly the deep
         /// trees e9de405 rescued. Kept incrementally, all three answers cost
-        /// `O(window)`, and the walk is linear in entries at any depth.
+        /// `O(window)`.
+        ///
+        /// THIS LIST ALONE DOES NOT MAKE THE WALK LINEAR, and the comment
+        /// that claimed it did outlived its own truth by a review round (r8,
+        /// thread `PRRT_kwDORmg6_86ZkfDO`). The DESCENT was linear; the POP
+        /// path still scanned the whole frame prefix looking for the next
+        /// frame with work. `unexhausted` below is the other half.
         var liveBelowRoot: [Int] = []
+
+        /// The frame indices whose `cursor` has NOT yet reached the end of
+        /// their `pending` list, ASCENDING — i.e. every frame the unwind
+        /// could still have to come back to.
+        ///
+        /// IT EXISTS FOR THE SAME REASON `liveBelowRoot` DOES, ON THE OTHER
+        /// PASS. The pop path asked `frames[..<depth].lastIndex(where: {
+        /// $0.cursor < $0.pending.count })`, and on a single-child chain —
+        /// the exact shape a deep leaked cache directory has, and the exact
+        /// shape the bookkeeping test builds — that predicate matches
+        /// NOTHING, so every pop scanned the entire prefix: d²/2 inspections
+        /// over the unwind. Measured with an explicit counting loop on
+        /// scratch builds of both shapes, at depths 200 / 400 / 800 / 1600 /
+        /// 3200 — prefix scan: 20,101 / 80,201 / 320,401 / 1,280,801 /
+        /// 5,121,601; this list: 202 / 402 / 802 / 1,602 / 3,202. That is
+        /// ~2.0 × 10⁸ against 2 × 10⁴ at the 20,000-entry budget, the same
+        /// order as the ~10⁹ the descent-side scan cost.
+        ///
+        /// WALL CLOCK IS NOT THE EVIDENCE, and is not offered as any: this
+        /// walk is syscall-bound at these depths, and best-of-5 release
+        /// timings over a pure chain (1.97 s → 1.90 s at 3200; a wash at 800
+        /// and 1600, where the run-to-run spread exceeds the difference)
+        /// cannot separate an asymptote from filesystem-cache weather. The
+        /// counted inspections can, deterministically, and a test asserts
+        /// them.
+        ///
+        /// THE STACK DISCIPLINE IS WHAT MAKES IT O(1), not a sorted search.
+        /// Only the DEEPEST frame's cursor ever advances (a frame's cursor
+        /// moves only while it is the frame the walk is standing on), and a
+        /// newly pushed frame's index exceeds every index already here, so
+        /// pushes and pops both happen at the END. At a pop, `frames[depth]`
+        /// is exhausted BY DEFINITION (that is why it is being popped) and
+        /// `depth` is the largest index there is, so `unexhausted.last` IS
+        /// `frames[..<depth].lastIndex(where:)` — in one array read.
+        var unexhausted: [Int] = []
+
+        /// Record whether `index` still has pending work, at the two — and
+        /// only two — instants its answer can change: when its `pending` is
+        /// first set (`enumerate`) and when its `cursor` advances.
+        ///
+        /// `index` is always the deepest frame at both, so this only ever
+        /// appends or removes at the end.
+        func noteWorkChanged(at index: Int) {
+            let hasWork = frames[index].cursor < frames[index].pending.count
+            if hasWork {
+                if unexhausted.last != index { unexhausted.append(index) }
+            } else if unexhausted.last == index {
+                unexhausted.removeLast()
+            }
+        }
 
         /// Live descriptors held by the frame stack (transients excluded).
         /// `+ 1` is the root, which is always live (I3).
@@ -1434,7 +1506,9 @@ struct OrphanedCachesScanner: @unchecked Sendable {
                 liveBelowRoot.remove(at: slot)
             }
             if let emit = onEvent {
-                emit(.frameBookkeeping(inspected: inspected, depth: depth))
+                emit(.frameBookkeeping(
+                    inspected: inspected, depth: depth, pass: .descent
+                ))
             }
         }
 
@@ -1620,6 +1694,7 @@ struct OrphanedCachesScanner: @unchecked Sendable {
                 inspected: .directory(root.identity)
             )
         }
+        noteWorkChanged(at: 0)
 
         walk: while !frames.isEmpty {
             let depth = frames.count - 1
@@ -1633,9 +1708,27 @@ struct OrphanedCachesScanner: @unchecked Sendable {
                 // released, it must be restored NOW, while this frame's
                 // descriptor — the only handle the climb can start from —
                 // still exists.
-                if let target = frames[..<depth].lastIndex(
-                    where: { $0.cursor < $0.pending.count }
-                ), frames[target].dir == nil {
+                // ONE ARRAY READ, not a prefix scan. `frames[depth]` is
+                // exhausted — that is the branch we are in — and `depth` is
+                // the top of the stack, so anything still holding work is
+                // strictly below it and `unexhausted.last` is the DEEPEST
+                // such frame, which is precisely what the retired
+                // `frames[..<depth].lastIndex(where:)` computed.
+                var popInspected = 1
+                let target = unexhausted.last
+                // I5, CHECKED: every index in `unexhausted` is strictly
+                // below the frame being popped. Unreachable — `frames[depth]`
+                // is exhausted by the branch condition, so it is not in the
+                // list, and nothing above it exists — but an incremental
+                // structure that has silently desynchronised would otherwise
+                // index a frame that is no longer there. Fail closed and say
+                // so, rather than trust it or trap: an INCOMPLETE verdict is
+                // never a deletion.
+                if let target, target >= depth {
+                    obstructions.insert(.transientFailure)
+                    break walk
+                }
+                if let target, frames[target].dir == nil {
                     guard let deepest = frames[depth].dir else {
                         obstructions.insert(.transientFailure)
                         break walk
@@ -1647,7 +1740,15 @@ struct OrphanedCachesScanner: @unchecked Sendable {
                         break walk
                     }
                 }
-                if frames[depth].dir != nil { forgetLive(depth) }
+                if frames[depth].dir != nil {
+                    popInspected += liveBelowRoot.count
+                    forgetLive(depth)
+                }
+                if let emit = onEvent {
+                    emit(.frameBookkeeping(
+                        inspected: popInspected, depth: depth, pass: .pop
+                    ))
+                }
                 frames.removeLast()   // `deinit` closes the descriptor
                 if !pathComponents.isEmpty { pathComponents.removeLast() }
                 continue
@@ -1655,6 +1756,11 @@ struct OrphanedCachesScanner: @unchecked Sendable {
 
             let name = frames[depth].pending[frames[depth].cursor].name
             frames[depth].cursor += 1
+            // One of the two instants a frame's "still has work" answer can
+            // change, and it is recorded HERE rather than recomputed at the
+            // pop — including on every `continue` below, which leaves the
+            // cursor advanced.
+            noteWorkChanged(at: depth)
 
             // The budget is checked BEFORE the child is opened, exactly as
             // the retired shape checked it before a popped directory was
@@ -1770,6 +1876,10 @@ struct OrphanedCachesScanner: @unchecked Sendable {
                 live: liveCount(), transient: 0, depth: frames.count - 1
             ))
             guard enumerate(frames.count - 1) else { break walk }
+            // The other instant: `pending` has just been set for the first
+            // time. The new index is greater than every index already in
+            // `unexhausted`, so this is a push.
+            noteWorkChanged(at: frames.count - 1)
         }
 
         // THE HELD ROOT, REVALIDATED AGAINST THE NAME (PR #458 review r7 —

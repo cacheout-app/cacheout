@@ -2792,6 +2792,139 @@ final class BuildArtifactsScannerTests: XCTestCase {
         )
     }
 
+    // MARK: R15 — the DESCRIPTOR mount arm, on a REAL firmlink (T14)
+
+    /// Blinds BOTH path mount arms and records every DESCRIPTOR-relative
+    /// probe the walk makes.
+    ///
+    /// Blinding is not a convenience. `isMountPoint` compares `f_mntonname` —
+    /// always canonical — against the path it is HANDED, so it is `false` for
+    /// any aliased spelling; the device arm is blind by construction across an
+    /// APFS volume group, where every path shares one `st_dev`; and both are
+    /// answers about a PATH, the thing an ancestor swap makes untrustworthy.
+    /// With them silent, one guard is left — the child descriptor's own
+    /// `f_fsid`/`st_dev` — and this is the only test that puts weight on it.
+    private final class PathMountArmsBlindProvider: FileSystemIdentityProvider {
+        private(set) var descriptorProbes: [String] = []
+
+        override func isMountPoint(_ url: URL) -> Bool { false }
+
+        override func probeKind(
+            inDirectory parent: Int32, named name: String, logical url: URL
+        ) -> DescriptorKindProbe {
+            descriptorProbes.append(url.path)
+            return super.probeKind(
+                inDirectory: parent, named: name, logical: url
+            )
+        }
+    }
+
+    /// T14, the platform fact the descriptor arm exists for — measured, not
+    /// assumed. `/` and `/System/Volumes/Data` are SEPARATE mounted volumes
+    /// that report the SAME `st_dev` and differ only in `f_fsid`. Every
+    /// `st_dev`-based mount test in this codebase is blind to that pair.
+    func testFirmlinkedVolumesShareOneDeviceAndSeparateOnlyByFsid() throws {
+        let data = "/System/Volumes/Data"
+        try XCTSkipUnless(
+            fm.fileExists(atPath: data),
+            "no /System/Volumes/Data firmlink on this machine"
+        )
+        let provider = FileSystemIdentityProvider()
+        let rootFD = provider.openDirectoryNoFollow(at: URL(fileURLWithPath: "/"))
+        let dataFD = provider.openDirectoryNoFollow(at: URL(fileURLWithPath: data))
+        defer { close(rootFD); close(dataFD) }
+
+        let rootMount = try XCTUnwrap(provider.mountIdentity(ofDescriptor: rootFD))
+        let dataMount = try XCTUnwrap(provider.mountIdentity(ofDescriptor: dataFD))
+
+        XCTAssertEqual(
+            rootMount.device, dataMount.device,
+            "two distinct volumes, ONE st_dev — this is why a device "
+                + "comparison cannot carry the mount check"
+        )
+        XCTAssertNotEqual(
+            [rootMount.fsidMajor, rootMount.fsidMinor],
+            [dataMount.fsidMajor, dataMount.fsidMinor],
+            "f_fsid is the only discriminator that sees the firmlink split"
+        )
+    }
+
+    /// The probe against that same real firmlink, with both path arms blind:
+    /// nothing under `/System/Volumes/Data` may be read. Crossing it would
+    /// spend the entry budget on the whole user data volume — outside any
+    /// configured dev root — and put what it found into a disclosure that
+    /// feeds an acknowledgement token.
+    func testProbeRefusesARealFirmlinkMountOnTheDescriptorArmAlone() throws {
+        let systemVolumes = URL(fileURLWithPath: "/System/Volumes")
+        let data = systemVolumes.appendingPathComponent("Data")
+        try XCTSkipUnless(
+            fm.fileExists(atPath: data.path),
+            "no /System/Volumes/Data firmlink on this machine"
+        )
+        let real = FileSystemIdentityProvider()
+        XCTAssertEqual(
+            real.deviceID(of: data), real.deviceID(of: systemVolumes),
+            "the firmlink must share its parent's st_dev, or the device arm "
+                + "would be doing this test's work"
+        )
+
+        let provider = PathMountArmsBlindProvider()
+        // A small budget so a REGRESSION costs a few hundred entries of the
+        // data volume rather than twenty thousand.
+        _ = ValuablesDetector.probe(
+            at: systemVolumes, provider: provider, entryLimit: 200
+        )
+
+        XCTAssertTrue(
+            provider.descriptorProbes.contains(data.path),
+            "precondition: the mount was reached and vetted, so the probe "
+                + "really had the chance to descend it"
+        )
+        let crossed = provider.descriptorProbes
+            .filter { $0.hasPrefix(data.path + "/") }
+        XCTAssertTrue(
+            crossed.isEmpty,
+            "the probe crossed a real mount boundary and read the data "
+                + "volume: \(crossed.prefix(5))"
+        )
+    }
+
+    /// …and the THIRD descriptor mount arm, the one the post-walk containment
+    /// descent added: a volume mounted over any component BETWEEN the dev root
+    /// and the artifact dir since the walk. Driven against the same real
+    /// firmlink, with both path arms blind, by handing the descent a root
+    /// anchor for `/System/Volumes` and asking it to re-reach `Data`.
+    func testContainmentDescentRefusesAMountThatAppearedOnTheChain() throws {
+        let systemVolumes = URL(fileURLWithPath: "/System/Volumes")
+        let data = systemVolumes.appendingPathComponent("Data")
+        try XCTSkipUnless(
+            fm.fileExists(atPath: data.path),
+            "no /System/Volumes/Data firmlink on this machine"
+        )
+        let provider = PathMountArmsBlindProvider()
+        let anchor = try XCTUnwrap(SecureDirectory(
+            fd: provider.openDirectoryNoFollow(at: systemVolumes),
+            provider: provider
+        ))
+        let candidate = BuildArtifactCandidate(
+            artifactDirectory: data, originRoot: systemVolumes,
+            rule: BuildArtifactRules.v1[0], marker: "Cargo.toml"
+        )
+
+        switch BuildArtifactsScanner.anchoredArtifactDirectory(
+            candidate, rootAnchors: [systemVolumes.path: anchor],
+            provider: provider
+        ) {
+        case .obstructed(let report):
+            XCTAssertTrue(report.rootMountBoundary)
+            XCTAssertEqual(report.mountBoundaries.map(\.path), [data.path])
+        case .anchored:
+            XCTFail("the descent crossed a real mount boundary")
+        case .vanished:
+            XCTFail("the firmlink is there; this is a boundary, not a vanish")
+        }
+    }
+
     // MARK: R3/R17 — the OPEN itself is no-follow (PR #457 review r5)
 
     /// Collapses the swap RACE into a lie, so no timing is involved: it
@@ -4976,6 +5109,277 @@ final class BuildArtifactsScannerTests: XCTestCase {
                 at: artifact, provider: FileSystemIdentityProvider()
             ).valuables.isEmpty
         )
+    }
+
+    // MARK: - The post-walk pass proves CONTAINMENT (review r6)
+
+    /// Fires a REAL `rename(2)` + `symlink(2)` at the ONE instant the
+    /// walker→scanner handoff left open: after the ENTIRE walk has finished
+    /// and before the post-walk pass touches the candidate.
+    ///
+    /// `resolveTargetKeepingLeaf` of the ARTIFACT path is the structural
+    /// marker for that instant — the walk never asks it (it canonicalizes
+    /// only children it DESCENDS, and a matched artifact dir is pruned), and
+    /// the dedupe pass asks it FIRST of every candidate. Firing there is
+    /// therefore post-walk by construction, not by timing, and it fires in
+    /// the pre-fix shape and the fixed shape alike, so the same test is a
+    /// real red against one and a real green against the other.
+    private final class PostWalkAncestorSwappingProvider:
+        FileSystemIdentityProvider
+    {
+        var trigger = ""
+        var swap: (() -> Void)?
+        private(set) var swapped = false
+
+        override func resolveTargetKeepingLeaf(_ url: URL) -> URL {
+            if !swapped, url.path == trigger {
+                swapped = true
+                swap?()
+            }
+            return super.resolveTargetKeepingLeaf(url)
+        }
+    }
+
+    /// THE HANDOFF HOLE. The walker held a vetted `SecureDirectory` for
+    /// `dev/proj` and emitted an event naming child `target`; the scanner
+    /// discarded that descriptor and kept a bare URL, and the post-walk pass
+    /// then re-resolved that absolute path four separate times (kind gate,
+    /// sizing, valuables probe, and the delete-time re-probe after it). A
+    /// concurrent writer INSIDE the user's dev root — a `build.rs`, an npm
+    /// postinstall, the very racer this work exists to defeat — does
+    /// `mv dev/proj dev/proj.real; ln -s outside dev/proj` in that window and
+    /// every one of those calls silently resolves through the new link.
+    ///
+    /// What that bought before this fix, verified by execution: an item whose
+    /// disclosure named `Foreign.dmg`, whose `canonicalIdentityPath` pointed
+    /// OUTSIDE the dev root, and — worst — a NON-NIL acknowledgement token,
+    /// derived entirely from a tree the artifact dir does not contain. That
+    /// token is what AUTHORIZES A DELETION, which is why this handoff, and
+    /// not the walk itself, was the last hole that mattered.
+    func testAncestorSwappedAfterTheWalkNeverMintsATokenOverAForeignTree()
+        async throws
+    {
+        let outside = base.appendingPathComponent("outside-the-dev-root")
+        let decoy = outside.appendingPathComponent("decoy")
+        try writeFile(decoy.appendingPathComponent("Cargo.toml"), bytes: 32)
+        let foreign = try writeBulkFile(
+            decoy.appendingPathComponent("target/Foreign.dmg"),
+            bytes: aboveFloorBytes
+        )
+
+        let project = dev.appendingPathComponent("proj")
+        let artifact = try makeProject(
+            at: project, marker: "Cargo.toml", artifact: "target",
+            payloadBytes: 8_192
+        )
+        let relocated = dev.appendingPathComponent("proj.real")
+
+        let provider = PostWalkAncestorSwappingProvider()
+        provider.trigger = artifact.path
+        let manager = fm
+        provider.swap = {
+            try? manager.moveItem(at: project, to: relocated)
+            try? manager.createSymbolicLink(
+                at: project, withDestinationURL: decoy
+            )
+        }
+
+        let outcome = try await runScan(makeScanner(provider: provider))
+
+        XCTAssertTrue(provider.swapped,
+                      "fixture precondition: the swap ran, post-walk")
+        XCTAssertEqual(
+            try fm.destinationOfSymbolicLink(atPath: project.path), decoy.path,
+            "fixture precondition: the ANCESTOR is a symlink out of the tree"
+        )
+
+        // THE CLAIM, strongest first: no token, ever. A token is the value a
+        // deletion is authorized against.
+        for found in outcome.items {
+            XCTAssertNil(
+                found.valuablesDisclosure?.acknowledgementToken(for: found.key),
+                "a token was minted over a tree reached through a swapped "
+                    + "ancestor: \(found.url?.path ?? found.displayName)"
+            )
+        }
+        let disclosed = outcome.items
+            .flatMap { $0.valuablesDisclosure?.valuables ?? [] }
+        XCTAssertTrue(
+            disclosed.isEmpty,
+            "release artifacts from OUTSIDE the dev root were attributed to "
+                + "an artifact dir inside it: "
+                + disclosed.map(\.canonicalIdentityPath).description
+        )
+        XCTAssertFalse(
+            itemPaths(outcome).contains { $0.hasPrefix(outside.path + "/") },
+            "an item identity resolved outside the dev root: "
+                + itemPaths(outcome).description
+        )
+        // Containment cannot be re-proven through a symlinked ancestor, so
+        // the candidate is simply not offered — the same answer a re-scan
+        // gives, and the fail-closed one.
+        XCTAssertTrue(outcome.items.isEmpty, itemPaths(outcome).description)
+        XCTAssertTrue(fm.fileExists(atPath: foreign.path),
+                      "the foreign tree is byte-untouched")
+    }
+
+    /// The same swap pointed at a sibling INSIDE the dev root, which is the
+    /// half `PathGuard`'s canonicalize-containment cannot answer: the
+    /// resolved target is genuinely under a configured container root, so
+    /// admission passes. With a marker planted alongside it, the pre-fix pass
+    /// emitted a fully-formed, deletable item for a directory the walk never
+    /// matched and the user never had offered to them.
+    func testAncestorSwappedToASiblingInsideTheDevRootIsRefusedToo()
+        async throws
+    {
+        // Not build output, and NOT matched at walk time — the marker is
+        // planted by the swap itself, after the walk has already decided.
+        let sibling = dev.appendingPathComponent("other")
+        let plantedTarget = sibling.appendingPathComponent("target")
+        let personal = try writeFile(
+            plantedTarget.appendingPathComponent("tax-returns.txt"), bytes: 4_096
+        )
+
+        let project = dev.appendingPathComponent("proj")
+        let artifact = try makeProject(
+            at: project, marker: "Cargo.toml", artifact: "target",
+            payloadBytes: 8_192
+        )
+        let relocated = dev.appendingPathComponent("proj.real")
+
+        let provider = PostWalkAncestorSwappingProvider()
+        provider.trigger = artifact.path
+        let manager = fm
+        provider.swap = {
+            try? manager.moveItem(at: project, to: relocated)
+            try? manager.createSymbolicLink(
+                at: project, withDestinationURL: sibling
+            )
+            try? Data(repeating: 0x41, count: 32).write(
+                to: sibling.appendingPathComponent("Cargo.toml")
+            )
+        }
+
+        let outcome = try await runScan(makeScanner(provider: provider))
+
+        XCTAssertTrue(provider.swapped,
+                      "fixture precondition: the swap ran, post-walk")
+        let plantedIdentity = FileSystemIdentityProvider()
+            .resolveTargetKeepingLeaf(plantedTarget).path
+        XCTAssertFalse(
+            itemPaths(outcome).contains(plantedIdentity),
+            "a directory the walk never matched was offered for deletion "
+                + "because the pass re-resolved a path instead of re-proving "
+                + "containment: \(itemPaths(outcome))"
+        )
+        XCTAssertTrue(outcome.items.isEmpty, itemPaths(outcome).description)
+        XCTAssertTrue(fm.fileExists(atPath: personal.path))
+    }
+
+    /// Refuses the child open with EACCES for one name — the containment
+    /// re-proof's OBSTRUCTED arm, which must be neither a silent drop nor a
+    /// silent trust.
+    private final class ChildOpenDenyingProvider: FileSystemIdentityProvider {
+        var deniedPaths: Set<String> = []
+        var denyErrno: Int32 = EACCES
+
+        override func openChildDirectory(
+            inDirectory parent: Int32, named name: String, logical url: URL
+        ) -> Int32 {
+            if deniedPaths.contains(url.path) {
+                errno = denyErrno
+                return -1
+            }
+            return super.openChildDirectory(
+                inDirectory: parent, named: name, logical: url
+            )
+        }
+    }
+
+    /// An impediment that is NOT a replacement may not vanish the item: it
+    /// becomes a classified, denied, unmeasured row with an INCOMPLETE (so
+    /// tokenless) disclosure — visible, honest, and clearable by fixing the
+    /// impediment and re-scanning.
+    func testUnprovableContainmentDeniesTheItemInsteadOfDroppingOrTrustingIt()
+        async throws
+    {
+        let project = dev.appendingPathComponent("proj")
+        let artifact = try makeProject(
+            at: project, marker: "Cargo.toml", artifact: "target",
+            payloadBytes: 8_192
+        )
+        let provider = ChildOpenDenyingProvider()
+        provider.deniedPaths = [artifact.path]
+
+        let outcome = try await runScan(makeScanner(provider: provider))
+
+        let found = try XCTUnwrap(
+            item(outcome, at: artifact, provider: provider),
+            "an unprovable candidate must stay VISIBLE: \(itemPaths(outcome))"
+        )
+        XCTAssertEqual(found.state, .denied)
+        XCTAssertEqual(found.rootRecords.map(\.status), [.deniedUnmeasured])
+        XCTAssertEqual(found.scanError?.kind, .permissionDenied,
+                       "EACCES is classified, never a silent zero")
+        XCTAssertEqual(found.allocatedBytes, 0)
+        XCTAssertEqual(found.valuablesDisclosure?.probeComplete, false,
+                       "nothing was inspected, so nothing is proven clean")
+        XCTAssertNil(found.valuablesDisclosure?.acknowledgementToken(
+            for: found.key
+        ))
+        XCTAssertEqual(found.risk, .review)
+        XCTAssertFalse(found.defaultSelected)
+    }
+
+    /// Retaining root anchors and descending to each candidate adds
+    /// descriptors to a pass that had none, so its exit paths get the same
+    /// treatment the probe's did: a WHOLE SCAN — success, replacement,
+    /// obstruction, several roots, several candidates — must return every
+    /// descriptor it took. ARC on `SecureDirectory` is what makes that true on
+    /// every arm including the refusals; this is the test that says so.
+    func testAWholeScanIsDescriptorBalancedAcrossEveryContainmentArm()
+        async throws
+    {
+        let second = base.appendingPathComponent("dev2")
+        try mkdir(second)
+        let clean = try makeProject(
+            at: dev.appendingPathComponent("rust"),
+            marker: "Cargo.toml", artifact: "target", payloadBytes: 8_192
+        )
+        try makeVenv(at: second.appendingPathComponent("env"))
+        let doomed = try makeProject(
+            at: dev.appendingPathComponent("gone"),
+            marker: "Cargo.toml", artifact: "target", payloadBytes: 4_096
+        )
+        let denied = try makeProject(
+            at: dev.appendingPathComponent("denied"),
+            marker: "Cargo.toml", artifact: "target", payloadBytes: 4_096
+        )
+        let provider = ChildOpenDenyingProvider()
+        provider.deniedPaths = [denied.path]
+
+        let baseline = openDescriptorCount()
+        for _ in 0..<3 {
+            _ = await makeScanner(roots: [dev, second], provider: provider)
+                .scan(context: ScanContext(trigger: .userInitiated))
+        }
+        XCTAssertEqual(
+            openDescriptorCount(), baseline,
+            "a descriptor leaked on some exit path of the scan"
+        )
+
+        // …and again with the replacement arm live (the candidate is a
+        // symlink now, so the descent refuses mid-chain).
+        try fm.removeItem(at: doomed)
+        try fm.createSymbolicLink(at: doomed, withDestinationURL: second)
+        let afterSwap = openDescriptorCount()
+        for _ in 0..<3 {
+            _ = await makeScanner(roots: [dev, second], provider: provider)
+                .scan(context: ScanContext(trigger: .userInitiated))
+        }
+        XCTAssertEqual(openDescriptorCount(), afterSwap,
+                       "a descriptor leaked on the refusal arm")
+        XCTAssertTrue(fm.fileExists(atPath: clean.path))
     }
 
     /// THREAD C. Overlapping roots: the outer artifact holds a mount

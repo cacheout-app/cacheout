@@ -81,6 +81,24 @@ and docs/v1/CLI-REFERENCE.md) — the pre-release `node_modules` →
   its depth budget), and exceeding that bound is never a refusal — anchors
   are released and restored with an identity-verified `..` step, so no tree
   depth can strand an item the way the retired depth cap did.
+- **The post-walk pass re-proves CONTAINMENT instead of re-resolving a
+  path.** Anchoring the walks was not enough on its own: the scanner threw the
+  walker's vetted descriptor away and kept a bare URL, then re-resolved that
+  absolute path after the whole walk had finished — for the kind gate, the
+  sizing, the valuables probe and the delete-time re-probe. A writer inside
+  the user's own dev root (a `build.rs`, an npm postinstall) that replaced an
+  intermediate directory with a symlink in that window sent all of them
+  somewhere else, and because the valuables probe's output is the
+  acknowledgement token's only preimage, the result was a valid-looking token
+  minted over a tree the artifact directory does not contain. The scan now
+  RETAINS each admitted dev root's descriptor and re-reaches every candidate
+  by single-component `openat` from it, so the artifact directory is proven
+  reachable by containment before one byte of it is read. A component swapped
+  for a symlink, a file, or nothing at all is simply not offered (the same
+  answer a re-scan gives); anything else — permissions, a mount that appeared
+  over the path — becomes a classified, denied, tokenless row rather than a
+  silent drop or a silent trust. Cost: one descriptor per configured dev root,
+  held for the duration of a scan.
 - **Mount boundaries are now discriminated by `f_fsid`.** Every path on an
   APFS volume group reports the same `st_dev` (measured: `/` and
   `/System/Volumes/Data` both report 16777230), so the device comparison was
@@ -92,6 +110,15 @@ and docs/v1/CLI-REFERENCE.md) — the pre-release `node_modules` →
   `FileManager.removeItem` — which the cleaner still uses — cannot address
   one. Such a deletion fails with its own error rather than being silently
   skipped; giving the deleter the same descriptor-relative treatment is
+  tracked separately.
+- **Known residual.** `DirectorySizer` is still a path-based
+  `FileManager.enumerator` walk, so an ancestor swap landing after the
+  containment descent above can still redirect the SIZING of a build-artifact
+  item. What that yields is bytes, dates and denial classifications — figures
+  an item displays. It cannot mint an acknowledgement token (that comes solely
+  from the descriptor-anchored valuables probe), cannot authorize a deletion,
+  and cannot move the deletion target, which stays the unresolved spelling the
+  cleaner re-admits and the revalidator re-proves. Converting the sizer is
   tracked separately.
 
 ### Changed

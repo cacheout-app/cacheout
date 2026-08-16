@@ -51,6 +51,29 @@
 ///    root is the user's deliberate addition.
 /// Sizing runs AFTER the collapse: one artifact is never measured twice.
 ///
+/// ## The post-walk pass proves CONTAINMENT (PR #457 review r6)
+/// Phase 3 runs after the ENTIRE walk, on candidates that are nothing but a
+/// URL — and it used to re-derive every one of them from that absolute path:
+/// a kind gate, a sizing, a valuables probe, and later a delete-time re-probe,
+/// four independent re-resolutions of a spelling whose ancestors a concurrent
+/// writer INSIDE the user's dev root can re-point in between. That is the
+/// ancestor swap the walks themselves were hardened against, arriving through
+/// the handoff instead: the walker held a vetted `SecureDirectory` for the
+/// parent and this file discarded it. Because the valuables probe's output is
+/// the acknowledgement token's ONLY preimage, the swap produced a non-nil
+/// token over a foreign tree — a value that AUTHORIZES A DELETION.
+///
+/// So the walk's root anchors are RETAINED (`didAnchorRoot`) and phase 3
+/// re-reaches each candidate by single-component `openat` from the root
+/// descriptor it has held since admission (`anchoredArtifactDirectory`).
+/// Safety is CONTAINMENT IN A HELD PARENT INODE, never a recorded identity —
+/// a recorded identity cannot help, since a swap landing before the vetting
+/// stat makes the "vetted" value the foreign object's already. Descriptor
+/// cost: one per admitted dev root for the scan's duration, plus two
+/// transients per descent. What the descent refuses, what it deliberately
+/// does not, and what remains path-based (the sizer) are stated on
+/// `anchoredArtifactDirectory` and in `DirectorySizer`'s header.
+///
 /// ## Item mapping (R10/R13/R15)
 /// Cloned VERBATIM from the candidate truth table of the retired
 /// `NodeModulesScanner` (subsumed by this scanner in fn-4.5, source deleted
@@ -178,7 +201,18 @@ struct BuildArtifactsScanner: @unchecked Sendable {
     func scan(context: ScanContext) async -> ScanOutcome {
         // (1) WALK + MATCH. The consumer accumulates candidates and returns
         // prune verdicts for exactly the matched dirs.
+        //
+        // …and the walk's ROOT ANCHORS are RETAINED (PR #457 review r6). The
+        // walker held an open, admitted, vetted descriptor for every root and
+        // used to drop it the moment the recursion unwound, which left phase 3
+        // below re-deriving every candidate from an ABSOLUTE PATH — four
+        // re-resolutions of a spelling whose ancestors a concurrent writer
+        // inside the user's own dev root (a `build.rs`, an npm postinstall)
+        // can re-point in between. Keeping the anchor is what lets phase 3
+        // prove containment instead of re-resolving. See
+        // `anchoredArtifactDirectory` for the descent and the bound.
         var candidates: [BuildArtifactCandidate] = []
+        var rootAnchors: [String: SecureDirectory] = [:]
         let walker = ProjectTreeWalker(
             home: home, pathGuard: pathGuard, provider: provider
         )
@@ -188,7 +222,10 @@ struct BuildArtifactsScanner: @unchecked Sendable {
             includeProtectedRoots: context.includeProtectedRoots,
             consumers: [{ event in
                 Self.consume(event, into: &candidates)
-            }]
+            }],
+            didAnchorRoot: { root, anchor in
+                rootAnchors[root.path] = anchor
+            }
         )
 
         // (2) DEDUPE — ancestor drop, then canonical-identity collapse. The
@@ -204,36 +241,87 @@ struct BuildArtifactsScanner: @unchecked Sendable {
             // Cooperative cancellation between candidates: a cancelled scan
             // must not keep sizing multi-GB trees nobody will read.
             if Task.isCancelled { break }
-            // THE FRESH KIND GATE (PR #457 review r3). The walker proved this
-            // subject was a real DIRECTORY at its event; this pass runs after
-            // the WHOLE walk, so the subject can have been replaced since —
-            // and a leaf-following sizing or probe would then measure and
-            // disclose a tree outside the configured dev root while deletion
-            // removes only the unresolved leaf. Re-`lstat` no-follow, and
-            // reject a subject the matcher itself would no longer match:
-            // - directory → the matched subject, unchanged; proceed;
-            // - symlink/regular/special → REPLACED: it is not the artifact
-            //   dir any more, so it produces no candidate at all (the same
-            //   answer the walker's matcher gives, and strictly the
-            //   fail-closed one: nothing is listed, so nothing is offered);
-            // - absent → a benign mid-scan vanish, and `.failed` an
-            //   impediment the sizer classifies and denies — both keep their
-            //   as-built emission rather than disappearing silently.
-            if case .kind(let kind) = provider
-                .probeKind(of: candidate.artifactDirectory),
-               kind != .directory {
+
+            // THE CONTAINMENT RE-PROOF (PR #457 review r6), which REPLACES the
+            // fresh `lstat` kind gate this pass used to open with. That gate
+            // asked "is the object at this SPELLING still a directory?" — a
+            // question about a path, answered by re-resolving every ancestor
+            // of it, which is precisely what an ancestor swap subverts: the
+            // gate, the sizer, the valuables probe and the delete-time
+            // re-probe each re-resolved the same spelling independently, and a
+            // symlink dropped in at `dev/proj` between the walk and here sent
+            // all four somewhere else. The valuables probe's answer enters the
+            // acknowledgement-token preimage, so that swap manufactured a
+            // NON-NIL token over a tree the artifact dir does not contain.
+            //
+            // The question asked now is the doctrine's: is this subject
+            // REACHABLE BY CONTAINMENT from the root descriptor we have held
+            // open and vetted since admission? It is answered by walking down
+            // to it one single-component `openat` at a time, so no ancestor is
+            // ever named to the kernel as part of a longer path.
+            switch Self.anchoredArtifactDirectory(
+                candidate, rootAnchors: rootAnchors, provider: provider
+            ) {
+            case .vanished:
+                // Gone, or no longer a directory reached by that name from
+                // the root: the same answer the walker's matcher gives on a
+                // re-scan, and the fail-closed one — nothing listed, nothing
+                // offered, no token. This UNIFIES the old gate's absent arm
+                // with its replaced arm, deliberately: the absent arm used to
+                // emit a zero-byte `.empty` item for a directory that is not
+                // there, which offers the user a row whose only possible
+                // outcome is a clean-time ENOENT.
                 continue
+
+            case .obstructed(let report):
+                // We could not re-prove containment for a reason that is NOT
+                // a replacement (permissions, a mount that appeared over the
+                // path, a descriptor we could not characterise). Never a
+                // silent drop and never a silent trust: a classified, denied,
+                // unmeasured item with an INCOMPLETE (therefore tokenless)
+                // disclosure — clearable by fixing the impediment and
+                // re-scanning.
+                emissions.append(reclaimableItem(
+                    from: candidate, report: report, disclosure: .incomplete
+                ))
+
+            case .anchored(let anchor):
+                // THE VALUABLES GATE, on the HELD descriptor. This is the
+                // output that authorizes a deletion, so it is the one that
+                // must never be re-derived from a path.
+                let disclosure = ValuablesDetector.probe(
+                    at: candidate.artifactDirectory, root: anchor,
+                    provider: provider, entryLimit: valuablesProbeEntryLimit
+                )
+                // `.deletionTarget`, never `.scanRoot`: the sizing subject IS
+                // the deletion target, so the identity doctrine applies to it
+                // — canonical parent chain, leaf NEVER resolved.
+                //
+                // RESIDUAL, stated rather than hidden: this walk is still
+                // path-based (`FileManager.enumerator`), so it is the one
+                // phase-3 read an ancestor swap landing AFTER the descent
+                // above can still redirect. What that buys an attacker is
+                // BYTES, DATES and DENIAL CLASSIFICATIONS — figures the item
+                // displays. It cannot mint a token (the disclosure above is
+                // descriptor-anchored and is the token's sole preimage), it
+                // cannot authorize a deletion, and it cannot move the deletion
+                // target, which stays the unresolved spelling the cleaner
+                // re-admits and the revalidator re-proves. The item's IDENTITY
+                // path (and therefore its id and display url) is
+                // `resolveTargetKeepingLeaf` and shares that residual exactly:
+                // a swap after this point can misname the row. `F_GETPATH` on
+                // the held anchor would close it and would also change the
+                // identity doctrine for every scanner — a separate decision,
+                // not a rider on this fix.
+                let report = sizer.measure(
+                    at: candidate.artifactDirectory, mode: .deletionTarget
+                )
+                emissions.append(reclaimableItem(
+                    from: candidate, report: report, disclosure: disclosure
+                ))
+                // The anchor dies here, at the end of its candidate — the
+                // phase-3 descriptor cost is per-candidate, never cumulative.
             }
-            // `.deletionTarget`, never `.scanRoot`: the sizing subject IS the
-            // deletion target, so the identity doctrine applies to it —
-            // canonical parent chain, leaf NEVER resolved. Identical to
-            // `.scanRoot` for the real directory the matcher proved (the leaf
-            // resolves to itself); different exactly when the leaf was swapped
-            // out from under us, which is the case that must not follow.
-            let report = sizer.measure(
-                at: candidate.artifactDirectory, mode: .deletionTarget
-            )
-            emissions.append(reclaimableItem(from: candidate, report: report))
         }
 
         // (4) ORDER — deterministic and TOTAL.
@@ -245,6 +333,181 @@ struct BuildArtifactsScanner: @unchecked Sendable {
             // `state`/`scanError` (two-surface rule).
             errors: devRoots.issues + walkIssues
         )
+    }
+
+    // MARK: - Containment re-proof for the post-walk pass (review r6)
+
+    /// What re-establishing containment for one candidate produced.
+    enum AnchoredArtifact {
+        /// The artifact dir, OPEN and reached by single-component descent
+        /// from the retained root anchor.
+        case anchored(SecureDirectory)
+        /// Not there any more under that name, or no longer a directory: a
+        /// replacement or a benign vanish. Produces NO item — exactly what a
+        /// re-scan would produce, and the fail-closed answer.
+        case vanished
+        /// Containment could not be re-proven for an impediment that is not a
+        /// replacement. Carries the pre-filled report the denied item is
+        /// mapped from, so the classification runs through the same seam every
+        /// other denial does.
+        case obstructed(SizeReport)
+    }
+
+    /// Re-reach `candidate.artifactDirectory` from the descriptor the walk
+    /// opened for `candidate.originRoot` and this scan has held ever since.
+    ///
+    /// ## Why a descent and not a re-open
+    /// Re-opening the artifact dir by its absolute path — even with
+    /// `O_NOFOLLOW` — proves nothing: `O_NOFOLLOW` guards only the FINAL
+    /// component, so every ancestor between the dev root and the artifact dir
+    /// is still resolved by name at that instant, and any one of them may have
+    /// become a symlink since the walk listed it. Re-opening the dev ROOT by
+    /// path has the same defect one level up. Only a chain of
+    /// single-component `openat`s from a descriptor that was never re-resolved
+    /// establishes that the object we end up holding is the one the walk's
+    /// spelling names — proof by CONTAINMENT, not by comparing a recorded
+    /// identity (a recorded identity cannot help: if the swap preceded the
+    /// vetting stat, the "vetted" value is already the foreign object's).
+    ///
+    /// ## What it refuses
+    /// - a component swapped for a SYMLINK — `openat` with
+    ///   `O_NOFOLLOW | O_DIRECTORY` reports ENOTDIR (measured on this OS);
+    /// - a component swapped for a FILE or a special — ENOTDIR likewise;
+    /// - a component that vanished — ENOENT;
+    /// - a MOUNT that appeared anywhere along the chain — the descriptor's own
+    ///   `f_fsid`/`st_dev` against the root anchor's, the same two signals the
+    ///   walker descends by, and the arm no path spelling can be aliased past;
+    /// - a candidate whose artifact path does not COMPONENT-WISE extend its
+    ///   origin root, or whose origin root was never anchored (structurally
+    ///   unreachable — every candidate came from a walk of that root — and
+    ///   therefore refused rather than assumed).
+    ///
+    /// ## What it deliberately does NOT refuse
+    /// An ancestor re-bound to a DIFFERENT REAL DIRECTORY that is still inside
+    /// the dev root passes, and should: the chain is genuinely symlink-free,
+    /// the object we hold is genuinely what the deletion target names, and the
+    /// delete-time rule re-proof re-checks the marker on that same subject. It
+    /// is a stale-provenance case, not an escape.
+    ///
+    /// ## Descriptor bound
+    /// TWO live at once during the descent (the frame below and the child
+    /// being opened), plus the ONE returned anchor, plus the retained root
+    /// anchors. The chain is a loop, not a recursion, and each parent is
+    /// released as soon as its child is open — depth costs syscalls, never
+    /// descriptors. Retained root anchors are one per ADMITTED dev root, live
+    /// from admission until `scan` returns; with the probe's own window
+    /// (≤ 64, 48 in the shipped `.app`) the scan's peak is
+    /// `keptRoots + window + 3`. A dev-root list long enough to exhaust
+    /// `RLIMIT_NOFILE` surfaces as EMFILE here — a classified, visible,
+    /// clearable obstruction on the affected items, never a silent trust.
+    static func anchoredArtifactDirectory(
+        _ candidate: BuildArtifactCandidate,
+        rootAnchors: [String: SecureDirectory],
+        provider: FileSystemIdentityProvider
+    ) -> AnchoredArtifact {
+        guard let rootAnchor = rootAnchors[candidate.originRoot.path] else {
+            return .obstructed(Self.obstruction(
+                at: candidate.artifactDirectory,
+                detail: "the dev root this artifact was found under is no "
+                    + "longer open for this scan"
+            ))
+        }
+
+        // COMPONENT-WISE containment of the spelling, never a string prefix
+        // (`/a/bc` must never read as inside `/a/b` — PathGuard doctrine).
+        let rootComponents = candidate.originRoot.pathComponents
+        let artifactComponents = candidate.artifactDirectory.pathComponents
+        guard artifactComponents.count >= rootComponents.count,
+              Array(artifactComponents.prefix(rootComponents.count))
+                == rootComponents
+        else {
+            return .obstructed(Self.obstruction(
+                at: candidate.artifactDirectory,
+                detail: "this artifact directory is not spelled inside the "
+                    + "dev root it was discovered under"
+            ))
+        }
+
+        var anchor = rootAnchor
+        var logical = candidate.originRoot
+        for name in artifactComponents.dropFirst(rootComponents.count) {
+            // MANDATORY before any syscall: a multi-component name defeats
+            // `O_NOFOLLOW` outright (measured — `openat` opens a foreign file
+            // through a symlinked intermediate component).
+            guard FileSystemIdentityProvider.isSafeComponent(name) else {
+                return .obstructed(Self.obstruction(
+                    at: candidate.artifactDirectory,
+                    detail: "'\(name)' is not a single safe path component"
+                ))
+            }
+            logical.appendPathComponent(name)
+
+            let fd = provider.openChildDirectory(
+                inDirectory: anchor.fd, named: name, logical: logical
+            )
+            guard fd >= 0 else {
+                let code = errno
+                // ENOENT: gone. ENOTDIR: this name is no longer a directory —
+                // swapped for a symlink, a file, or raced. ELOOP is not
+                // reachable through `O_DIRECTORY` on this OS but is the same
+                // event where it is. All three are "the matcher would not
+                // match this any more", which is a drop, not a denial.
+                if code == ENOENT || code == ENOTDIR || code == ELOOP {
+                    return .vanished
+                }
+                return .obstructed(Self.obstruction(
+                    at: logical, errno: code,
+                    detail: "couldn't re-open '\(name)' from the dev root: "
+                        + String(cString: strerror(code))
+                ))
+            }
+            guard let child = SecureDirectory(fd: fd, provider: provider)
+            else {
+                return .obstructed(Self.obstruction(
+                    at: logical,
+                    detail: "couldn't characterise the directory descriptor "
+                        + "for '\(name)'"
+                ))
+            }
+            // MOUNT BOUNDARY ON THE CHAIN, on the CHILD'S OWN DESCRIPTOR. A
+            // volume mounted over any component between the dev root and the
+            // artifact dir since the walk would otherwise be descended into
+            // silently. `f_fsid` is the arm that carries this: `st_dev` is
+            // identical for every path in an APFS volume group (measured: `/`
+            // and `/System/Volumes/Data` both report 16777230), so a firmlink-
+            // shaped mount is invisible to a device comparison, and no path
+            // spelling can be trusted here at all.
+            guard child.mount.fsidMajor == rootAnchor.mount.fsidMajor,
+                  child.mount.fsidMinor == rootAnchor.mount.fsidMinor,
+                  child.mount.device == rootAnchor.mount.device
+            else {
+                var report = SizeReport()
+                report.rootMountBoundary = true
+                report.mountBoundaries = [logical]
+                return .obstructed(report)
+            }
+            anchor = child
+        }
+        return .anchored(anchor)
+    }
+
+    /// A one-denial report for a containment impediment, classified on the
+    /// SAME frozen taxonomy every other denial uses (EPERM → TCC, EACCES →
+    /// BSD permissions, everything else a metadata failure).
+    private static func obstruction(
+        at url: URL, errno code: Int32 = EIO, detail: String
+    ) -> SizeReport {
+        var report = SizeReport()
+        let kind: SizeDenial.Kind
+        switch code {
+        case EPERM: kind = .tcc
+        case EACCES: kind = .permission
+        default: kind = .metadata
+        }
+        report.denials.append(
+            SizeDenial(url: url, kind: kind, detail: detail)
+        )
+        return report
     }
 
     // MARK: - Matching + prune verdicts (R1/R2)
@@ -503,7 +766,8 @@ struct BuildArtifactsScanner: @unchecked Sendable {
     /// what let a `Cargo.toml`-less, repurposed `target/` full of ordinary
     /// files delete on a clean, complete probe.
     private func reclaimableItem(
-        from candidate: BuildArtifactCandidate, report: SizeReport
+        from candidate: BuildArtifactCandidate, report: SizeReport,
+        disclosure: ValuablesDisclosure
     ) -> (item: ReclaimableItem, identityPath: String) {
         let hasBoundary = report.rootMountBoundary
             || !report.mountBoundaries.isEmpty
@@ -545,15 +809,14 @@ struct BuildArtifactsScanner: @unchecked Sendable {
             status: state == .denied ? .deniedUnmeasured : .measured
         )
 
-        // THE VALUABLES GATE. The bounded no-follow probe runs on the matched
-        // artifact dir ONLY — never a general sweep — and its result decides
-        // the forcing below. Sorted into the ONE canonical order inside the
-        // probe, so nothing here (or downstream) re-sorts.
-        let disclosure = ValuablesDetector.probe(
-            at: candidate.artifactDirectory, provider: provider,
-            entryLimit: valuablesProbeEntryLimit
-        )
-
+        // THE VALUABLES GATE runs in `scan`, on the HELD artifact-dir
+        // descriptor, and arrives here as a value: this seam must never
+        // re-derive it from a path, because a disclosure re-read through a
+        // swapped ancestor is a token minted over someone else's tree. An
+        // item whose containment could not be re-proven is handed
+        // `.incomplete` — tokenless, forced to review, never "clean".
+        // Sorted into the ONE canonical order inside the probe, so nothing
+        // here (or downstream) re-sorts.
         let days = daysSinceNewestContent(report.newestContentDate)
         let item = ReclaimableItem(
             id: ReclaimableItem.stableID(

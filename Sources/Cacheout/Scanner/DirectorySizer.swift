@@ -54,6 +54,31 @@
 ///   symlink → 0 bytes, never walked (deleting it removes the link only);
 ///   regular file → its own allocated size; directory → enumerated;
 ///   fifo/socket/device → 0 bytes plus a recorded skip.
+///
+/// ## RESIDUAL: this walk is still PATH-BASED (PR #457 review r6)
+///
+/// Unlike `ProjectTreeWalker` and `ValuablesDetector`, this type has not been
+/// converted to the descriptor-anchored doctrine ("below a walk root, no
+/// filesystem operation takes a path"): `FileManager.enumerator` yields
+/// resolved child URLs and every per-entry check here re-`lstat`s one. An
+/// attacker who can replace an ANCESTOR of the measured root between the
+/// caller's own checks and this walk therefore redirects the MEASUREMENT.
+///
+/// What that buys, stated precisely so nobody has to re-derive it: BYTES,
+/// DATES, and DENIAL CLASSIFICATIONS — the figures an item displays. It buys
+/// NO acknowledgement token (`ValuablesDetector`'s descriptor-anchored probe
+/// is that token's only preimage), NO deletion authorization, and NO change of
+/// deletion target (the target is the caller's unresolved spelling, re-admitted
+/// by `PathGuard` and re-proven by the item's pre-delete revalidator at delete
+/// time). A boundary HIDDEN from this walk is likewise re-checked by the
+/// cleaner, which refuses any tree containing one whole.
+///
+/// Converting it is a larger change than the security value justifies right
+/// now: this is the shared sizer for every scanner and for delete-time
+/// claim-based accounting, and a rewrite must reproduce
+/// `totalFileAllocatedSize` sparse semantics, hardlink claims, and Cocoa error
+/// classification exactly. Tracked separately, deliberately not smuggled into
+/// a security fix.
 
 import Foundation
 

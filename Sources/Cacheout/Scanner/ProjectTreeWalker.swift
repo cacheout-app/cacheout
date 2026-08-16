@@ -195,11 +195,23 @@ struct ProjectTreeWalker {
     ///   - consumers: verdict-returning event receivers (see
     ///     `ProjectTreeConsumer`). All of them see every event of every
     ///     kept root — ONE walk, N consumers.
+    ///   - didAnchorRoot: handed the ADMITTED, VETTED, still-OPEN anchor of
+    ///     every root this walk actually traverses, at the instant it is
+    ///     opened. A caller that RETAINS the `SecureDirectory` keeps the walk
+    ///     root inode-pinned past the walk, which is the only way a POST-WALK
+    ///     pass can re-establish CONTAINMENT for something the walk found:
+    ///     re-opening the root by path afterwards would re-resolve the root's
+    ///     own name and could anchor a foreign directory (`BuildArtifactsScanner`
+    ///     phase 3 does exactly this re-descent). Default nil — nothing is
+    ///     retained, the anchor dies with its recursion, and the walk's
+    ///     descriptor profile is unchanged. RETENTION COST, on the caller:
+    ///     one descriptor per admitted root, live until the caller drops it.
     func walk(
         roots: [URL],
         maxDepth: Int = ProjectTreeWalker.defaultMaxDepth,
         includeProtectedRoots: Bool = true,
-        consumers: [ProjectTreeConsumer]
+        consumers: [ProjectTreeConsumer],
+        didAnchorRoot: ((URL, SecureDirectory) -> Void)? = nil
     ) -> [ScanIssue] {
         var issues: [ScanIssue] = []
 
@@ -276,6 +288,13 @@ struct ProjectTreeWalker {
                 issues.append(Self.issue(forFailedOpen: root, errno: EIO))
                 continue
             }
+
+            // The vetted anchor, offered to the caller BEFORE the traversal
+            // that consumes it. A retaining caller now holds the same
+            // inode-pinned handle this walk descends from, so anything it
+            // discovers can be re-reached later by CONTAINMENT rather than by
+            // re-resolving a path an attacker may have re-pointed.
+            didAnchorRoot?(root, anchor)
 
             // Boundary reference: children on a DIFFERENT device than the
             // root never descend. The root itself may be a mount point

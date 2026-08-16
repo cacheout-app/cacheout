@@ -58,11 +58,24 @@
 /// root it is never opened, stat'd, or resolved. `displayURL` and
 /// `canonicalIdentityPath` are byte-identical to what they always were.
 ///
-/// RESIDUAL, accepted and documented: the ROOT open still resolves the root's
-/// ancestors, so an attacker who already owns the scan root's PARENT can
-/// redirect the whole walk. `O_NOFOLLOW_ANY` would close it and would also
-/// break the legitimate aliased roots this codebase supports (`/tmp` →
-/// `/private/tmp`, a symlinked `$HOME`). Also unclosed: a vetted subtree
+/// The ROOT is the one thing the caller supplies, and there are now TWO ways
+/// to supply it. `probe(at:root:…)` takes a root the caller has ALREADY OPENED
+/// and reached by containment — that is what the scan-time face does, from the
+/// dev-root descriptor it has held since admission — so the artifact dir's own
+/// ancestors are never resolved at all. `probe(at:provider:…)` opens the root
+/// by path, and there the RESIDUAL stands, accepted and documented: that open
+/// resolves the root's ancestors, so an attacker who already owns the probed
+/// directory's PARENT can redirect the walk. `O_NOFOLLOW_ANY` would close it
+/// and would also break the legitimate aliased roots this codebase supports
+/// (`/tmp` → `/private/tmp`, a symlinked `$HOME`). The DELETE-TIME face is
+/// still that shape — it is handed a bare URL and has no descriptor to
+/// descend from. Its exposure is narrower in one direction and unchanged in
+/// the other: for an item that DISCLOSED valuables, a redirected probe cannot
+/// reproduce the acknowledged token and the deletion is refused; for an item
+/// that disclosed none, a redirected CLEAN probe allows, and what is then
+/// deleted is whatever the cleaner's own path admission accepts. Delete-time
+/// path safety is `PathGuard`'s and `CacheCleaner`'s layer, not this one's,
+/// and it is tracked there. Also unclosed: a vetted subtree
 /// RELOCATED mid-walk keeps being read (correctly — those are the vetted
 /// inodes) even though "inside this artifact dir" has gone stale;
 /// delete-time re-proves separately, so that is scan-time staleness, not an
@@ -467,6 +480,37 @@ enum ValuablesDetector {
             provider: provider
         ) else { return .incomplete }
 
+        return probe(
+            at: directory, root: root, provider: provider,
+            entryLimit: entryLimit, descriptorWindow: descriptorWindow
+        )
+    }
+
+    /// The SAME bounded core, entered with the root ALREADY OPEN and ALREADY
+    /// VETTED by the caller — no path-based kind gate and no path-based root
+    /// open, because there is no path left to race.
+    ///
+    /// This is the entry point for a caller that reached `directory` by
+    /// CONTAINMENT: it descended to it component by component from a
+    /// descriptor it has held continuously since admission, so the object
+    /// under `root` is provably the one that chain names. Re-deriving it from
+    /// `directory.path` here would throw that proof away and re-resolve every
+    /// ancestor — the exact hole `BuildArtifactsScanner`'s post-walk pass had,
+    /// and the one that mattered most, since what this probe returns enters
+    /// the acknowledgement-token preimage that AUTHORIZES A DELETION.
+    ///
+    /// `directory` is still required, and still only for what it was always
+    /// for: the UNRESOLVED display/identity spelling. It is never opened here.
+    ///
+    /// The mount checks are unchanged and all of them still run, including the
+    /// path-based arms: they can only ever push the answer toward INCOMPLETE.
+    static func probe(
+        at directory: URL,
+        root: SecureDirectory,
+        provider: FileSystemIdentityProvider,
+        entryLimit: Int = defaultProbeEntryLimit,
+        descriptorWindow: Int? = nil
+    ) -> ValuablesDisclosure {
         // MOUNT BOUNDARY AT THE ROOT. The sizer applies these signals to its
         // OWN root (`DirectorySizer.swift:202`) and declines to enumerate; the
         // probe must decline identically, or the delete-time face — which has

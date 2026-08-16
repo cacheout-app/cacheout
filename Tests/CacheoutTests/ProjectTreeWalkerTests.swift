@@ -679,6 +679,178 @@ final class ProjectTreeWalkerTests: XCTestCase {
         }
     }
 
+    // MARK: - R9/R11: the DESCRIPTOR mount arm, on a REAL firmlink (T14)
+
+    /// Blinds BOTH path mount arms and nothing else.
+    ///
+    /// This is not a convenience: it is the state the path arms are actually
+    /// in whenever this walk matters. `isMountPoint` compares `f_mntonname` —
+    /// always canonical — against the path it is HANDED, so it answers `false`
+    /// for any aliased spelling; and the device arm is blind by construction
+    /// on an APFS volume group, where every path shares one `st_dev`. Both are
+    /// also answers about a PATH, which is precisely what an ancestor swap
+    /// makes untrustworthy. Blinding them leaves exactly one guard standing —
+    /// the child descriptor's own `f_fsid`/`st_dev` — which is the guard with
+    /// no coverage at all before this test.
+    private final class PathMountArmsBlindProvider: FileSystemIdentityProvider {
+        override func isMountPoint(_ url: URL) -> Bool { false }
+    }
+
+    /// T14, on the real firmlink every macOS 11+ machine has.
+    ///
+    /// `/System/Volumes/Data` is a genuine mount root that SHARES `st_dev`
+    /// with its parent (measured here: both `16777230`, `f_fsid`
+    /// `{16777235,26}` vs `{16777230,26}`). With both path arms blind it is
+    /// indistinguishable from an ordinary directory by every signal except the
+    /// descriptor's own `f_fsid` — so if the walk descends into it, the whole
+    /// user data volume is inside a "dev root" the user never configured.
+    func testRealFirmlinkMountIsNeverDescendedWithBothPathArmsBlind() throws {
+        let systemVolumes = URL(fileURLWithPath: "/System/Volumes")
+        let data = systemVolumes.appendingPathComponent("Data")
+        try XCTSkipUnless(
+            fm.fileExists(atPath: data.path),
+            "no /System/Volumes/Data firmlink on this machine"
+        )
+
+        // THE PLATFORM FACTS this arm exists for, asserted rather than
+        // assumed — if they ever stop holding, this test must say so instead
+        // of passing vacuously.
+        let real = FileSystemIdentityProvider()
+        XCTAssertEqual(
+            real.deviceID(of: data), real.deviceID(of: systemVolumes),
+            "the firmlink must share its parent's st_dev, or the device arm "
+                + "would be doing this test's work"
+        )
+        let blind = PathMountArmsBlindProvider()
+        XCTAssertFalse(blind.isMountPoint(blind.canonicalize(data)),
+                       "fixture precondition: the statfs arm is blind")
+
+        let (events, _) = recordedWalk(
+            roots: [systemVolumes], maxDepth: 1, provider: blind
+        )
+
+        let rootEvent = try XCTUnwrap(
+            event(events, at: systemVolumes),
+            "precondition: the walk must actually have run"
+        )
+        XCTAssertTrue(
+            rootEvent.entries.contains(.init(name: "Data", kind: .directory)),
+            "precondition: the mount is LISTED, so the walk really had the "
+                + "chance to descend it: \(rootEvent.entries.map(\.name))"
+        )
+        XCTAssertFalse(
+            eventPaths(events).contains {
+                $0 == data.path || $0.hasPrefix(data.path + "/")
+            },
+            "the walk crossed a real mount boundary into the data volume: "
+                + eventPaths(events).description
+        )
+    }
+
+    // MARK: - R11: the DESCENT is descriptor-relative (P2, review r6)
+
+    /// Performs a REAL `rename(2)` + `symlink(2)` from the child-vetting seam
+    /// itself, at the instant a directory's children are being probed — the
+    /// exact window an ancestor swap lives in, with zero timing dependence.
+    ///
+    /// It fires through the seam BOTH shapes call, so the same test exercises
+    /// the descriptor-relative walk and a path-resolving one: what changes
+    /// between them is only whether the vetting stat and the descent open
+    /// resolve `dev/proj` again.
+    private final class MidEnumerationSwappingProvider:
+        FileSystemIdentityProvider
+    {
+        /// Fire when a child OF THIS directory is being vetted.
+        var armedUnder = ""
+        var swap: (() -> Void)?
+        private(set) var swapped = false
+
+        override func probeKind(
+            inDirectory parent: Int32, named name: String, logical url: URL
+        ) -> DescriptorKindProbe {
+            if !swapped, url.deletingLastPathComponent().path == armedUnder {
+                swapped = true
+                swap?()
+            }
+            return super.probeKind(
+                inDirectory: parent, named: name, logical: url
+            )
+        }
+    }
+
+    /// THE ANCESTOR SWAP, against the walker itself. `dev/proj` is moved aside
+    /// and replaced by a symlink out of the dev root while the walk is
+    /// enumerating it — after `proj` was listed, vetted and opened.
+    ///
+    /// A path-resolving descent cannot survive this and no identity re-proof
+    /// can save it: after the swap the vetting `lstat` of `dev/proj/target`
+    /// and the `O_NOFOLLOW` open of it BOTH resolve through the new link
+    /// (`O_NOFOLLOW` guards only the final component), so the recorded
+    /// "vetted" identity is already the foreign directory's and the
+    /// corroborator compares foreign against foreign and passes. The walk then
+    /// emits the foreign tree's contents as events spelled INSIDE the dev
+    /// root, and every consumer matches rules against someone else's files.
+    ///
+    /// A descriptor-anchored descent is immune by construction: `proj`'s
+    /// descriptor is inode-pinned, so `fstatat`/`openat` through it keep
+    /// reaching the real directory whatever its name now points at.
+    func testAncestorSwappedMidEnumerationIsNeverFollowedByTheDescent() throws {
+        let root = base.appendingPathComponent("dev")
+        let outside = base.appendingPathComponent("outside-the-dev-root")
+        // Named to COLLIDE with the real project's children, so a
+        // path-resolving descent lands on foreign objects that pass every
+        // name, kind and identity check there is.
+        try mkdir(outside.appendingPathComponent("target/Foreign-Only-Dir"))
+        try writeFile(outside.appendingPathComponent("Cargo.toml"))
+        try writeFile(outside.appendingPathComponent("target/secret.bin"))
+
+        let project = root.appendingPathComponent("proj")
+        try mkdir(project.appendingPathComponent("target"))
+        try writeFile(project.appendingPathComponent("Cargo.toml"))
+        try writeFile(project.appendingPathComponent("target/payload.bin"))
+        let relocated = root.appendingPathComponent("proj.real")
+
+        let provider = MidEnumerationSwappingProvider()
+        provider.armedUnder = project.path
+        let manager = fm
+        provider.swap = {
+            try? manager.moveItem(at: project, to: relocated)
+            try? manager.createSymbolicLink(
+                at: project, withDestinationURL: outside
+            )
+        }
+
+        let (events, _) = recordedWalk(roots: [root], provider: provider)
+
+        XCTAssertTrue(provider.swapped,
+                      "fixture precondition: the swap ran mid-enumeration")
+        XCTAssertEqual(
+            try fm.destinationOfSymbolicLink(atPath: project.path),
+            outside.path,
+            "fixture precondition: the ancestor is a symlink out of the tree"
+        )
+
+        let artifactEvent = try XCTUnwrap(
+            event(events, at: project.appendingPathComponent("target")),
+            "the walk keeps reading the inode it vetted — it does not lose "
+                + "the subtree, it just refuses to be redirected"
+        )
+        XCTAssertEqual(
+            artifactEvent.entries.map(\.name), ["payload.bin"],
+            "the descent followed the swapped ancestor and listed a foreign "
+                + "directory's children under an in-tree spelling: "
+                + artifactEvent.entries.map(\.name).description
+        )
+        for walked in events {
+            XCTAssertFalse(
+                walked.entries.contains { $0.name == "secret.bin" }
+                    || walked.entries.contains { $0.name == "Foreign-Only-Dir" },
+                "foreign entries surfaced at \(walked.directory.path): "
+                    + walked.entries.map(\.name).description
+            )
+        }
+    }
+
     // MARK: - R9: maxDepth budget
 
     func testMaxDepthDefaultEightMeasuredFromRootAndConfigurable() throws {

@@ -631,6 +631,50 @@ final class DepthSafeRemovalTests: XCTestCase {
         )
     }
 
+    /// The deletion ROOT is proven the same way, against the parent
+    /// descriptor held since the first line.
+    ///
+    /// The target is opened by name in that parent and then, before anything
+    /// is unlinked, several syscalls go by. A `rename(2)` in that window
+    /// moves the whole deletion into a tree the user never selected, and the
+    /// first thing an unproven traversal does there is empty the root — the
+    /// deepest-reaching mistake this type could make, since the root is
+    /// where the largest directories are.
+    func testRefusesADeletionRootThatLeftItsParentBeforeTheDeletion() throws {
+        let target = base.appendingPathComponent("escaping-root")
+        try mkdir(target)
+        try write(target.appendingPathComponent("own.bin"))
+        let foreign = base.appendingPathComponent("foreign")
+        try mkdir(foreign)
+        let relocated = foreign.appendingPathComponent("moved")
+
+        let provider = FirstDescentHook()
+        provider.watched = [try inode(of: target)]
+        provider.onFirstDescent = { _ in
+            rename(target.path, relocated.path)
+            try? self.write(
+                relocated.appendingPathComponent("precious.bin"), bytes: 4096
+            )
+        }
+
+        XCTAssertThrowsError(
+            try DepthSafeRemoval.remove(at: target, provider: provider)
+        ) { error in
+            XCTAssertTrue(
+                error.localizedDescription.contains("moved while it was"),
+                "the refusal must name the relocation: "
+                    + error.localizedDescription
+            )
+        }
+        XCTAssertNotNil(provider.firedFor,
+                        "the fixture never performed the rename")
+        XCTAssertTrue(
+            exists(relocated.appendingPathComponent("precious.bin")),
+            "content placed in the relocated root belongs to its new owner "
+                + "and must not be unlinked"
+        )
+    }
+
     // MARK: - The enumeration handle
 
     /// Every entry name `fdopendir` hands back for the descriptor, sorted.

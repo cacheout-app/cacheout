@@ -876,12 +876,13 @@ actor CacheCleaner {
     /// The note that used to stand here called the window between this
     /// `lstat` and the deletion syscall "irreducible for as long as the
     /// deletion takes a path". BOTH HALVES WERE WRONG. The window was
-    /// measured through the production cleaner at 0.095 / 0.097 / 0.126 ms
-    /// over three runs — `removeItemConcurrently` hops to
-    /// `DispatchQueue.global` inside it — which is not a syscall's width but
-    /// an eternity for a `rename(2)` + `mkdir(2)` loop; and the deletion had
-    /// already stopped taking a path. It HOLDS A DESCRIPTOR and simply never
-    /// asked it who it was. It does now
+    /// measured through the production cleaner — from this `lstat` to the
+    /// deletion's first question about a descriptor, an under-estimate —
+    /// at 0.095 / 0.097 / 0.126 ms over three runs, because
+    /// `removeItemConcurrently` hops to `DispatchQueue.global` inside it:
+    /// not a syscall's width but an eternity for a `rename(2)` + `mkdir(2)`
+    /// loop. And the deletion had already stopped taking a path. It HOLDS A
+    /// DESCRIPTOR and simply never asked it who it was. It does now
     /// (`DepthSafeRemoval.proveInspectedRoot`), so the load-bearing proof is
     /// there, on the opened inode, past every window this method has.
     ///
@@ -1249,12 +1250,17 @@ actor CacheCleaner {
     /// cannot: `DepthSafeRemoval` reaches exactly what the probe reaches.
     ///
     /// AND THE HOP IS WHY THE INSPECTION VERDICT TRAVELS WITH IT (PR #458
-    /// review — the P1). `expecting` is not plumbing: between the caller's
-    /// last path check and the first syscall below there is a queue hop,
-    /// measured through this very method at 0.095 / 0.097 / 0.126 ms over
-    /// three runs — an eternity for a `rename(2)` + `mkdir(2)` loop, and the
-    /// window in which the deletion used to acquire a descriptor it never
-    /// asked the identity of.
+    /// review — the P1). `expecting` is not plumbing: this queue hop sits
+    /// between the caller's last path check and the deletion, and it is not
+    /// a syscall wide. Measured through this method, from the last
+    /// `identity(of: target)` to the deletion's first question about a
+    /// DESCRIPTOR — which is already past `open(parent)` and `openat(leaf)`,
+    /// so it under-states the window — 0.095 / 0.097 / 0.126 ms over three
+    /// runs before the fix, at the seam
+    /// `testTargetReplacedAfterTheFinalPathCheckIsRefused` still prints.
+    /// That is an eternity for a `rename(2)` + `mkdir(2)` loop, and it is
+    /// where the deletion used to acquire a descriptor it never asked the
+    /// identity of.
     nonisolated private static func removeItemConcurrently(
         at url: URL,
         expecting inspected: UserDataProbeResult.InspectedRoot?,

@@ -2906,6 +2906,19 @@ final class BuildArtifactsScannerTests: XCTestCase {
                       "…and what actually clears it: \(message)")
         XCTAssertFalse(message.contains("changing faster"), message)
         XCTAssertFalse(message.contains("couldn't inspect"), message)
+
+        // The GUI row for a `.denied` item renders the frozen state label
+        // ("Access denied — not scanned"), which is NOT what happened here.
+        // The honest cause therefore has to ride the evidence — the string
+        // the row's tooltip and the confirmation sheet render in full.
+        XCTAssertTrue(found.evidence.contains("REFUSED"), found.evidence)
+        XCTAssertTrue(found.evidence.contains("-byte path"), found.evidence)
+        XCTAssertTrue(found.evidence.contains("shorten"), found.evidence)
+        XCTAssertFalse(
+            found.evidence.contains("couldn't"),
+            "the probe finished — nothing here failed to inspect: "
+                + found.evidence
+        )
     }
 
     /// THE DELETE-TIME FACE, driven through the PRODUCTION cleaner — and the
@@ -2944,6 +2957,65 @@ final class BuildArtifactsScannerTests: XCTestCase {
         XCTAssertFalse(messages.contains("changing faster"), messages)
     }
 
+    /// THE DELETE-TIME FACE ON ITS OWN — the case the scan-time refusal
+    /// CANNOT cover, and therefore the one that proves the revalidator arm
+    /// is load-bearing rather than decorative.
+    ///
+    /// The scan sees an ordinary short tree and offers it. The branch grows
+    /// over-long AFTER the scan (a build running while the user reads the
+    /// list — the same drift `ContainerSnapshot` cannot bind, since it binds
+    /// the dev root's identity and not the artifact dir's contents). The held
+    /// item is still `.measured`, so the cleaner's `.denied` gate waves it
+    /// through, and only the delete-time revalidation stands between that
+    /// item and a half-deleted build directory.
+    func testATreeThatGrowsOverlongAfterTheScanIsRefusedAtDeleteTime()
+        async throws
+    {
+        let artifact = try makeProject(
+            at: dev.appendingPathComponent("proj"),
+            marker: "Cargo.toml", artifact: "target", payloadBytes: 4_096
+        )
+        for index in 0..<200 {
+            try writeFile(
+                artifact.appendingPathComponent(
+                    String(format: "sib%04d/chunk.js", index)
+                ),
+                bytes: 64
+            )
+        }
+        addTeardownBlock { [weak self] in self?.removeOverlongTree(at: artifact) }
+
+        let (items, snapshot, runtime) = try await scanSession(makeScanner())
+        let found = try XCTUnwrap(item(from: items, at: artifact))
+        XCTAssertEqual(found.state, .measured,
+                       "precondition: the scan offered this row")
+
+        // …and only THEN does the tree grow past the removal's reach.
+        let branch = artifact.appendingPathComponent("zdeep")
+        try mkdir(branch)
+        try makeOverlongChain(under: branch, depth: 120, leafFiles: 5)
+
+        // The revalidator's own verdict, first — refuse, no token.
+        let verdict = revalidator.revalidate(item: found, authorization: nil)
+        guard case .refuse(let reason, _, let token) = verdict else {
+            return XCTFail("the revalidator must refuse: \(verdict)")
+        }
+        XCTAssertNil(token, "there is nothing here to acknowledge")
+        XCTAssertTrue(reason.contains("too long"), reason)
+        XCTAssertTrue(reason.contains("shorten"), reason)
+
+        // …and the production cleaner, driven with the SAME held item,
+        // destroys nothing.
+        let before = entryCountFDRelative(under: artifact)
+        let report = await runtime.makeCleaner(snapshot: snapshot)
+            .clean(items: [found], moveToTrash: false)
+        XCTAssertEqual(entryCountFDRelative(under: artifact), before,
+                       "REFUSED ⇒ NOTHING DESTROYED")
+        XCTAssertTrue(report.entries.isEmpty)
+        let messages = report.errors.map(\.message).joined(separator: "; ")
+        XCTAssertTrue(messages.contains("too long"), messages)
+    }
+
     /// IT IS CLEARABLE — the property the retired deterministic bounds never
     /// had. Shorten the tree and the very same directory becomes an ordinary
     /// offered row that actually deletes. A refusal whose stated remedy
@@ -2979,12 +3051,49 @@ final class BuildArtifactsScannerTests: XCTestCase {
                        "…and it really deletes")
     }
 
+    /// The LONGEST deepest-descendant path, in bytes, for which
+    /// `FileManager.removeItem` actually removes a tree WHOLE on this
+    /// machine — found by BINARY SEARCH against the real filesystem, and
+    /// deliberately derived from neither `PATH_MAX` nor
+    /// `removablePathByteLimit`. The property is monotone (a longer path
+    /// never starts working again), so the search is sound.
+    ///
+    /// This is the independent oracle the constant is checked against. Using
+    /// the constant to build the fixture instead would make the assertion
+    /// self-referential — a mutated constant would simply move the fixture
+    /// with it and the test would stay green (it did, until this replaced it).
+    private func measuredRemovalPathLimit() throws -> Int {
+        let scratch = FileSystemIdentityProvider()
+            .canonicalize(base)
+            .appendingPathComponent("limit-probe")
+        let treeURL = scratch.appendingPathComponent("t")
+        // The shortest length this fixture shape can even express (the
+        // scratch prefix plus a one-byte leaf) — known-good by construction.
+        var low = treeURL.path.utf8.count + 2
+        var high = 4_096    // known-bad on any Darwin
+        XCTAssertLessThan(low, high, "scratch prefix must leave room")
+        while high - low > 1 {
+            let middle = (low + high) / 2
+            removeOverlongTree(at: scratch)
+            try mkdir(scratch)
+            let tree = treeURL
+            try mkdir(tree)
+            try makeChain(under: tree, deepestPathBytes: middle)
+            let removed = (try? fm.removeItem(at: tree)) != nil
+            if removed { low = middle } else { high = middle }
+        }
+        removeOverlongTree(at: scratch)
+        return low
+    }
+
     /// THE BOUNDARY, measured against the filesystem itself rather than
     /// assumed from `PATH_MAX` — BOTH sides, in one test, so the constant can
     /// never drift off the behaviour it encodes:
-    /// - a deepest descendant of exactly `removablePathByteLimit` bytes is
-    ///   offered AND really deletes (so the refusal is not one byte early,
-    ///   which would strand a tree that works);
+    /// - the constant IS the length the filesystem stops at (binary-searched
+    ///   above, independently of the constant);
+    /// - a deepest descendant of exactly that length is offered AND really
+    ///   deletes (so the refusal is not one byte early, which would strand a
+    ///   tree that works);
     /// - one byte more is refused (so it is not one byte late, which is the
     ///   half-deleting case).
     ///
@@ -2999,6 +3108,14 @@ final class BuildArtifactsScannerTests: XCTestCase {
     func testTheRefusalBoundaryIsExactlyWhereTheRemovalStartsFailing()
         async throws
     {
+        let measured = try measuredRemovalPathLimit()
+        XCTAssertEqual(
+            ValuablesDetector.removablePathByteLimit, measured,
+            "the constant must BE the length this filesystem stops at — "
+                + "one byte high half-deletes, one byte low strands a tree "
+                + "that removes fine"
+        )
+
         let canonicalDev = FileSystemIdentityProvider().canonicalize(dev)
         for (overshoot, expected) in [(0, ScanState.measured),
                                       (1, ScanState.denied)] {
@@ -3006,7 +3123,7 @@ final class BuildArtifactsScannerTests: XCTestCase {
                 at: canonicalDev.appendingPathComponent("proj\(overshoot)"),
                 marker: "Cargo.toml", artifact: "target", payloadBytes: 4_096
             )
-            let deepest = ValuablesDetector.removablePathByteLimit + overshoot
+            let deepest = measured + overshoot
             try makeChain(under: artifact, deepestPathBytes: deepest)
             addTeardownBlock { [weak self] in
                 self?.removeOverlongTree(at: artifact)
@@ -3018,8 +3135,8 @@ final class BuildArtifactsScannerTests: XCTestCase {
             let found = try XCTUnwrap(item(from: items, at: artifact))
             XCTAssertEqual(
                 found.state, expected,
-                "a deepest descendant of \(deepest) bytes against a limit of "
-                    + "\(ValuablesDetector.removablePathByteLimit); "
+                "a deepest descendant of \(deepest) bytes against a measured "
+                    + "removal limit of \(measured); "
                     + "scanError=\(found.scanError?.message ?? "nil")"
             )
             guard expected == .measured else { continue }

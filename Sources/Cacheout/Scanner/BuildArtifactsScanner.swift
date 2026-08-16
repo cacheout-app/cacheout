@@ -874,6 +874,32 @@ struct BuildArtifactsScanner: @unchecked Sendable {
             scanError = Self.mountBoundaryScanError(
                 from: report, candidate: candidate.artifactDirectory
             )
+        } else if let bytes = disclosure.overlongDescendantPathBytes {
+            // THE PATH-LIMIT REFUSAL (review r10). The probe read this tree
+            // WHOLE and found a descendant whose absolute path is longer than
+            // the cleaner's `FileManager.removeItem` can address. That removal
+            // unlinks what it reaches and THEN fails, so offering this row
+            // could only ever half-delete the user's build directory and
+            // report zero bytes freed. `.denied` is the state whose contract
+            // is exactly "nothing here is deletable": zero components, no
+            // logical figure, unselectable in every GUI surface, `refuse` in
+            // the CLI plan — the same shape the mount-boundary arm above uses
+            // for the same reason.
+            //
+            // Ranked ABOVE the sizer's denials because it CAUSES one: the
+            // path-based sizing walk dies on the same descendant with
+            // ENAMETOOLONG and would otherwise classify this as an
+            // uninformative `.metadata` failure. Ranked BELOW the boundary arm
+            // because a boundary-bearing tree is refused for a reason that is
+            // true whatever its paths measure, and that message names the
+            // boundary.
+            state = .denied
+            scanError = ScanError(
+                kind: .other,
+                message: Self.pathLimitRefusal(
+                    at: candidate.artifactDirectory, deepestPathBytes: bytes
+                )
+            )
         } else if !report.denials.isEmpty {
             state = measuredAnything ? .partiallyDenied : .denied
             scanError = CacheScanner.deriveScanError(
@@ -1180,6 +1206,32 @@ struct BuildArtifactsScanner: @unchecked Sendable {
                 let current = preDeleteValuablesProbe(
                     at: target, provider: provider, budget: budget
                 )
+                // THE PATH-LIMIT REFUSAL, delete-time face (review r10) —
+                // BEFORE the completeness check, because it is the one verdict
+                // here that is CERTAIN whether or not the walk finished: a
+                // descendant the walk actually composed an over-long path for
+                // is over-long, full stop, and no further reading can change
+                // it. Its remedy is also the more specific of the two, and
+                // printing the incompleteness remedy ("re-scan", "retry when
+                // it settles") for a tree that will refuse identically for
+                // ever is exactly the strand shape both messages exist to
+                // avoid.
+                //
+                // Scan-time and delete-time therefore agree by construction:
+                // the scan maps this same fact to `.denied` from the same
+                // probe core, and this is the arm that catches a stale item
+                // from an earlier session, a CLI clean addressing the target
+                // directly, and a branch that grew over-long between the scan
+                // and the clean.
+                if let bytes = current.overlongDescendantPathBytes {
+                    return .refuse(
+                        reason: pathLimitRefusal(
+                            at: target, deepestPathBytes: bytes
+                        ),
+                        valuables: current.valuables,
+                        acknowledgementToken: nil
+                    )
+                }
                 guard current.probeComplete else {
                     // The two causes get two refusals: they differ in what
                     // clears them, and one message for both is what made
@@ -1226,6 +1278,35 @@ struct BuildArtifactsScanner: @unchecked Sendable {
                 )
             }
         )
+    }
+
+    /// THE PATH-LIMIT REFUSAL SENTENCE — ONE definition, consumed by BOTH
+    /// faces (the scan-time `scanError` and the delete-time revalidator), so
+    /// the two can never say different things about the same tree.
+    ///
+    /// It names the REAL cause (a path length, with both the measured figure
+    /// and the limit it exceeded) and a remedy that ACTUALLY CLEARS IT
+    /// (shorten, move, or delete the over-long branch — proven by
+    /// `testShorteningTheTreeMakesTheItemOfferableAndDeletableAgain`, which
+    /// performs exactly that and watches the row come back as an ordinary
+    /// deletable item).
+    ///
+    /// What it deliberately does NOT say: "couldn't inspect" (the probe
+    /// inspected it completely — that is how it knows), "changing faster than
+    /// it can be read" (nothing is changing), or a bare "re-scan required"
+    /// (a re-scan of an unchanged tree refuses identically, which is the
+    /// deterministic-strand shape this codebase has closed twice already).
+    /// The trailing "then scan again" follows an action that changes the
+    /// tree; it is never the action itself.
+    static func pathLimitRefusal(
+        at target: URL, deepestPathBytes bytes: Int
+    ) -> String {
+        "\(target.path): a file inside has a \(bytes)-byte path — too long "
+            + "for the removal to address (the limit is "
+            + "\(ValuablesDetector.removablePathByteLimit) bytes), so this "
+            + "folder cannot be deleted whole and is refused, nothing "
+            + "deleted; shorten or move the tree (or delete the over-long "
+            + "branch), then scan again"
     }
 
     /// The delete-time refusal text for each incompleteness CAUSE, with the
@@ -1361,6 +1442,23 @@ struct BuildArtifactsScanner: @unchecked Sendable {
         }
         let base = "\(name)/ \(relation) \(candidate.marker); "
             + lastBuildPhrase(days: days)
+        // THE PATH-LIMIT CLAUSE (review r10). The GUI row for a `.denied`
+        // item renders the frozen state label ("Access denied — not
+        // scanned"), which is not what happened here — the tree was read
+        // whole — so the honest cause rides the evidence, which is the text
+        // the row's tooltip and the confirmation sheet show in full and the
+        // CLI emits verbatim. Its own clause, deliberately outside
+        // `valuablesWarning`: that clause set belongs to the valuables gate
+        // and is keyed on `forcesReview`, and a path limit is neither a
+        // valuable nor an unfinished inspection.
+        if let bytes = disclosure.overlongDescendantPathBytes {
+            return base + " — REFUSED: a file inside has a \(bytes)-byte "
+                + "path, past the "
+                + "\(ValuablesDetector.removablePathByteLimit)-byte limit the "
+                + "removal can address, so this folder cannot be deleted "
+                + "whole; shorten or move the tree (or delete the over-long "
+                + "branch), then scan again"
+        }
         guard let warning = valuablesWarning(disclosure) else { return base }
         return base + " — " + warning
     }

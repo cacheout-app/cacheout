@@ -385,6 +385,33 @@ struct ValuablesDisclosure: Equatable, Sendable {
     /// `ProbeIncompleteness`.
     let incompleteness: ProbeIncompleteness?
 
+    /// The BYTE length of the longest descendant path this walk composed
+    /// under the subject's OWN spelling, reported only when at least one is
+    /// longer than `ValuablesDetector.removablePathByteLimit`. `nil` means
+    /// every path this walk saw is one the cleaner's removal can name.
+    ///
+    /// NOT an incompleteness — the walk finished; it read the whole tree and
+    /// found a FACT about it. Kept as its own field precisely so it can never
+    /// be flattened into `.entryBudget` (which the budget policy would
+    /// re-walk sixteen times at doubled bounds, for a condition no bound can
+    /// change) or into `.obstruction` (whose printed remedy is "re-scan",
+    /// which cannot change it either). Its remedy is specific and it works:
+    /// shorten or restructure the tree.
+    ///
+    /// FAIL-CLOSED ASYMMETRY, deliberate: a COMPLETE probe reporting `nil`
+    /// has PROVEN there is no such descendant, because a complete probe read
+    /// every entry. An INCOMPLETE probe reporting `nil` has proven nothing —
+    /// and needs to prove nothing, because an incomplete probe is already
+    /// tokenless on every surface and refused whole by the delete-time
+    /// revalidator.
+    ///
+    /// This field is NOT part of the acknowledgement-token preimage and must
+    /// never become part of it: the token authorizes deletion of a tree whose
+    /// valuables the user acknowledged, and an over-long tree is refused
+    /// BEFORE any token is consulted. Adding it would rotate tokens for a
+    /// reason acknowledgement has nothing to do with.
+    let overlongDescendantPathBytes: Int?
+
     /// Why a bounded inspection stopped short. The question that separates
     /// them is the house one: *can a retry, unaided, change this?*
     enum ProbeIncompleteness: Equatable, Sendable {
@@ -415,12 +442,14 @@ struct ValuablesDisclosure: Equatable, Sendable {
     init(
         valuables: [DetectedValuable],
         probeComplete: Bool,
-        incompleteness: ProbeIncompleteness? = nil
+        incompleteness: ProbeIncompleteness? = nil,
+        overlongDescendantPathBytes: Int? = nil
     ) {
         self.valuables = valuables
         self.probeComplete = probeComplete
         self.incompleteness = probeComplete
             ? nil : (incompleteness ?? .obstruction)
+        self.overlongDescendantPathBytes = overlongDescendantPathBytes
     }
 
     /// The probe result that forces nothing: nothing found, inspection
@@ -732,6 +761,44 @@ enum ValuablesDetector {
     /// on why there is no second, depth-shaped bound).
     static let defaultProbeEntryLimit = 20_000
 
+    // MARK: The path-length limit a PATH-BASED removal can name (review r10)
+
+    /// The longest absolute path, IN BYTES, that the cleaner's removal can
+    /// actually name — and therefore the longest one this scanner may OFFER
+    /// a tree containing.
+    ///
+    /// ## Why a walk that does not need it measures it anyway
+    /// This walk is descriptor-anchored and runs past `PATH_MAX` happily. The
+    /// REMOVAL does not: `CacheCleaner`'s permanent arm is
+    /// `FileManager.removeItem` → `removefile(3)`, which composes and
+    /// RESOLVES an absolute path for every entry it recurses into. Handed a
+    /// tree with one over-long descendant it unlinks everything it reaches
+    /// FIRST and then fails with ENAMETOOLONG — measured on this machine over
+    /// a 200-sibling `target/`: 38 of 521 entries destroyed, deterministically,
+    /// the target left standing, and the caller handed nothing but Cocoa 514.
+    /// No cleanup entry, zero bytes reported freed, and a half-deleted build
+    /// directory. Offering a row whose removal can only end that way is the
+    /// worst outcome this codebase can produce, so the probe — the one walk
+    /// that CAN see past the limit — is where the fact is surfaced, and the
+    /// scanner refuses the item outright (`BuildArtifactsScanner`'s
+    /// `pathLimitScanError`, and the delete-time revalidator's matching
+    /// refusal).
+    ///
+    /// ## Why this number
+    /// `PATH_MAX - 1`: `PATH_MAX` (1024 on Darwin) counts the terminating
+    /// NUL. MEASURED rather than reasoned, with a chain built fd-relatively
+    /// and removed with `FileManager.removeItem`: deepest paths of 1020, 1021,
+    /// 1022 and 1023 bytes all remove cleanly; 1024, 1025 and 1026 all fail
+    /// with Cocoa 514. `testTheRefusalBoundaryIsExactlyWhereTheRemovalStarts‐
+    /// Failing` pins both sides of that edge against the real filesystem, so
+    /// the constant cannot drift off the behaviour it encodes.
+    ///
+    /// NOT a bound on this walk, and deliberately not spelled as one: nothing
+    /// here stops reading at the limit. The probe still reads the whole tree
+    /// (that is what makes the refusal COMPLETE and therefore trustworthy);
+    /// it just records that the tree cannot be removed whole.
+    static let removablePathByteLimit = Int(PATH_MAX) - 1
+
     // MARK: The ONE bounded probe core
 
     /// Bounded, no-follow inspection of ONE matched artifact dir.
@@ -902,7 +969,8 @@ enum ValuablesDetector {
                     .lexicographicallyPrecedes($1.canonicalIdentityPath.utf8)
             },
             probeComplete: walk.complete,
-            incompleteness: walk.incompleteness
+            incompleteness: walk.incompleteness,
+            overlongDescendantPathBytes: walk.overlongDescendantPathBytes
         )
     }
 
@@ -1094,6 +1162,17 @@ enum ValuablesDetector {
         /// Did anything OTHER than the budget stop it anywhere?
         var obstructed = false
 
+        /// The LONGEST over-limit descendant path this walk composed, or nil
+        /// when every one of them fits (review r10).
+        ///
+        /// Recorded, never acted on: nothing here stops, skips, or shortens
+        /// anything because of it. This walk is descriptor-anchored and reads
+        /// past the limit perfectly well — it is the CLEANER's path-based
+        /// removal that cannot, and the scanner's refusal is what that fact
+        /// feeds. Keeping the walk exhaustive is what makes the refusal
+        /// COMPLETE, and therefore trustworthy.
+        var overlongDescendantPathBytes: Int?
+
         /// The ONE incompleteness verdict, or nil for a finished walk.
         ///
         /// An obstruction WINS over budget exhaustion whenever both happened:
@@ -1267,6 +1346,29 @@ enum ValuablesDetector {
                 }
                 let logical = frames[index].logicalURL
                     .appendingPathComponent(name)
+                // THE REMOVAL'S LIMIT, measured on the removal's OWN spelling
+                // (review r10). `logicalURL` is rooted at the exact
+                // UNRESOLVED URL the cleaner passes to `FileManager
+                // .removeItem`, so a length composed here is the length
+                // `removefile(3)` would compose there — the two cannot drift.
+                // Every entry is checked, files included: an over-long FILE is
+                // as fatal to the removal as an over-long directory.
+                //
+                // Cost: `URL.path` on an already-built URL, measured at
+                // 258.6 ns/entry against the 567.4 ns `fstatat` and the
+                // ~1971 ns `appendingPathComponent` this loop already pays per
+                // entry — ~10% of the per-entry cost, and zero syscalls. The
+                // alternative (carrying a running byte count on each frame)
+                // would re-implement path composition beside Foundation's and
+                // could silently disagree with it; this reads the very string
+                // whose length is the question.
+                if logical.path.utf8.count
+                    > ValuablesDetector.removablePathByteLimit {
+                    overlongDescendantPathBytes = max(
+                        overlongDescendantPathBytes ?? 0,
+                        logical.path.utf8.count
+                    )
+                }
                 // COMPOSED, never resolved (see `Frame.identityURL`).
                 let identityURL = frames[index].identityURL
                     .appendingPathComponent(name)

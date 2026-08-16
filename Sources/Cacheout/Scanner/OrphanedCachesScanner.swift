@@ -995,27 +995,30 @@ struct OrphanedCachesScanner: @unchecked Sendable {
     ///    delete then fails with its own error. Fail-closed, but real — the
     ///    proper fix is to give the deleter the same descriptor-relative
     ///    treatment.
-    /// 7. **The DISCOVERY race — a name that vanishes between `readdir` and
-    ///    its `fstatat` — is still benign** (`.absent`, no obstruction),
-    ///    while the same disappearance one step later, at the `openat` of a
-    ///    name already PROVEN to be a directory, is now `.transientFailure`.
-    ///    The asymmetry is deliberate, and the line is what has been PROVEN:
-    ///    at the `openat` a subtree is known to exist, so losing it means
-    ///    something went uninspected; at the `fstatat` nothing is known —
-    ///    the name may have been a file, and cache FILES are evicted under a
-    ///    running scan constantly, so obstructing there would make almost
-    ///    every probe of a live cache incomplete and no known-leak entry
-    ///    would ever be auto-cleanable again.
-    ///    WHAT REMAINS EXPLOITABLE, precisely: a writer inside the entry can
-    ///    `rename` a SUBDIRECTORY inside that narrower window, and the walk
-    ///    then reports `complete` without having inspected it. The renamer
-    ///    needs write permission on the enclosing cache directory — which is
-    ///    also permission to delete that subtree outright — so it buys an
-    ///    attacker no destruction they could not perform directly; what it
-    ///    buys is a false "inspected and clean", and the realistic victim is
-    ///    a legitimate app churning its own cache while Quick Clean runs.
-    ///    Closing it needs a second bounded re-read of any directory that
-    ///    saw an `.absent`, which is not in this change.
+    /// 7. **The DISCOVERY race is CLOSED, and the asymmetry that used to be
+    ///    defended here is retired** (PR #458 review r11, thread
+    ///    `PRRT_kwDORmg6_86ZmmYY`). A name that vanishes between `readdir`
+    ///    and its `fstatat` now records `.transientFailure`, exactly as the
+    ///    same disappearance one step later at the `openat` already did.
+    ///    The defence that stood here — "at the `fstatat` nothing is known,
+    ///    the name may have been a file" — answered the wrong question. The
+    ///    question is not what KIND vanished, it is whether the content can
+    ///    still be inside the tree the deletion is about to remove, and
+    ///    `rename(2)` says yes: absence of a NAME is not absence of CONTENT.
+    ///    Its companion claim — that cache FILES are evicted constantly, so
+    ///    obstructing would make almost every probe incomplete — was never
+    ///    measured. It has been now: six full sweeps of the field machine's
+    ///    `~/Library/Caches` (185 entries, 445,938 child probes) produced
+    ///    ZERO `.absent` results, and the complete/incomplete split was
+    ///    174/11 both before and after. The window is one `fstatat` wide per
+    ///    name.
+    ///    WHAT REMAINS, precisely and separately: content CREATED in a
+    ///    directory after that directory was enumerated. No name vanished, no
+    ///    identity changed, and the closing root re-bind cannot see it —
+    ///    inode identity is not content identity. Unclosable by the same
+    ///    means as (3) and tracked as its own finding; the compensating
+    ///    control is the delete-time re-probe, which re-reads every directory
+    ///    from scratch.
     /// 8. **`DirectorySizer` (called from `sweepFacts`) is still a
     ///    path-based `FileManager.enumerator` walk.** An ancestor swapped
     ///    for a different REAL directory between this probe and the sizing
@@ -1810,9 +1813,46 @@ struct OrphanedCachesScanner: @unchecked Sendable {
                     // above, never descended (the no-follow rule).
                     break
                 case .absent:
-                    // Vanished mid-probe — benign race: it holds nothing
-                    // deletable any more.
-                    break
+                    // ABSENCE OF A NAME IS NOT ABSENCE OF CONTENT (PR #458
+                    // review r11, thread `PRRT_kwDORmg6_86ZmmYY`).
+                    //
+                    // This arm used to say "it holds nothing deletable any
+                    // more" and break. That is the SAME sentence the descent's
+                    // `openat` arm below already refutes at length — written
+                    // twice, 180 lines apart, in opposite directions.
+                    // `rename(2)` destroys nothing: the subtree can still be
+                    // inside this very tree under a name the captured `names`
+                    // array never held, past this byte-ascending read's
+                    // cursor, so the walk never visits it and reports
+                    // `complete, matches: []` about a tree it has not seen the
+                    // whole of. Measured with a real `rename(2)` fired at
+                    // `didEnumerate` — the one instant between the read and
+                    // this `fstatat`: `complete=true obstructions=[]
+                    // matches=[]` while `<entry>/renamed/Documents` was still
+                    // on disk. That verdict sets `automaticCleanEligible`, so
+                    // Quick Clean deletes it with no confirmation.
+                    //
+                    // ROUTED THROUGH THE SAME CLASSIFIER AS ITS PARTNER rather
+                    // than through a second literal: `probeChild` reports
+                    // `.absent` for exactly `ENOENT`/`ENOTDIR`, and the
+                    // descent's failure arm hands its errno to
+                    // `obstruction(forErrno:)`. One router, one rule, and no
+                    // way for the two sites to disagree again.
+                    //
+                    // WHAT IT COSTS, MEASURED RATHER THAN GUESSED. The retired
+                    // asymmetry rested on "cache FILES are evicted under a
+                    // running scan constantly, so obstructing here would make
+                    // almost every probe of a live cache incomplete". Six full
+                    // sweeps of the field machine's own `~/Library/Caches`
+                    // (185 entries) issued 445,938 child probes and produced
+                    // ZERO `.absent` results: this window is one `fstatat`
+                    // wide per name, not a scan wide. The complete/incomplete
+                    // split was 174/11 before the change and 174/11 after it.
+                    // And unlike `.budgetExhausted` the class is CLEARABLE —
+                    // `.transientFailure`'s remedy is `retryAlone` — so a
+                    // directory that really is churning costs one deferred
+                    // sweep, never permanent exclusion.
+                    obstructions.insert(obstruction(forErrno: ENOENT))
                 case .failed(let code):
                     obstructions.insert(obstruction(forErrno: code))
                 }

@@ -418,9 +418,33 @@ struct OrphanedCacheClassifier {
             // only the sizing. Saying so is what stops a user hunting for a
             // permission that was never missing, or renaming a file whose
             // name was never the problem.
+            //
+            // AND IT NAMES BOTH CAUSES, BECAUSE THE KIND CARRIES BOTH (PR
+            // #458 review r11, thread `PRRT_kwDORmg6_86Zn1Ph` — the same
+            // defect one layer up from `DirectorySizer.classifyDenial`). This
+            // line is derived from the KIND, which is shared by
+            // `ENAMETOOLONG` and `ELOOP` because their REMEDY is shared
+            // (restructure the path; no re-scan clears either). Their
+            // SENTENCE is not shared, and this one told only the length
+            // story, so a symlink cycle was reported to the user as a path
+            // too long — sending them to shorten something that was never
+            // long. The wording now matches the taxonomy's own, in
+            // `UserDataProbeObstruction.unaddressablePath.guidance`.
+            //
+            // THE DELETION CLAUSE IS GONE, and that is the honest half. It is
+            // earned for LENGTH — `DepthSafeRemoval` walks by descriptor — but
+            // not for a cycle ABOVE the target, which defeats the one path
+            // the removal resolves (measured: `remove` threw `posix(62)`,
+            // evidenced by
+            // `testACycleAboveTheTargetDefeatsTheRemovalsOneResolvedPath`).
+            // A kind cannot tell the two apart, so the promise cannot be made
+            // here. What the line still does is the thing it was added for:
+            // say this is a MEASUREMENT limit, not a permission problem.
             lines.append(
-                "couldn't measure its size: part of it sits deeper than an "
-                    + "absolute path can address — deleting it still works"
+                "couldn't measure its size: part of it sits at a path the "
+                    + "sizing cannot address — it is too long, or it resolves "
+                    + "through too many symbolic links; this is a measurement "
+                    + "limit, not a permission problem"
             )
         }
         if kinds.contains(.metadata) || kinds.contains(.other) {

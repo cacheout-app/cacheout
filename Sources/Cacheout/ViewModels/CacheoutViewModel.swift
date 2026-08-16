@@ -661,12 +661,14 @@ class CacheoutViewModel: ObservableObject {
         + "retry. It will be SKIPPED by this cleanup."
 
     /// The same row, blocked because the inspection ran out of its ENTRY
-    /// BUDGET rather than because something obstructed it. The budget is
-    /// derived from the folder's own exhaustive count, so reaching it means
-    /// the folder is CHANGING while it is read — which a retry genuinely can
-    /// clear, and a permissions fix cannot. Two causes, two remedies: telling
-    /// a user to "scan again" for an impediment no scan can move is what the
-    /// retired fixed budget did.
+    /// BUDGET rather than because something obstructed it. The budget starts
+    /// at the folder's own count and DOUBLES until the inspection finishes
+    /// (`ValuablesProbeBudget`), so surviving all of it means the folder is
+    /// CHANGING while it is read — which a retry genuinely can clear, and a
+    /// permissions fix cannot. Two causes, two remedies: telling a user to
+    /// "scan again" for an impediment no scan can move is what the retired
+    /// fixed budget did, and telling one to wait for a build that is not
+    /// running is what a bound derived from a truncated count did (review r8).
     nonisolated static let growingFolderSheetGuidance =
         "This folder is changing faster than it can be inspected for release "
         + "artifacts (.dmg, .pkg, .app, …), so it can't be cleaned yet — let "

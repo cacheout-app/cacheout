@@ -32,6 +32,11 @@ final class BuildArtifactsScannerTests: XCTestCase {
     /// chmod-000 fixtures registered for teardown restore (house rule).
     private var permsToRestore: [URL] = []
 
+    /// One entry per PROBE PASS over a watched artifact dir (the walk reads
+    /// its root exactly once per pass), recorded through the production
+    /// `ValuablesDetector.testHook` seam.
+    private var probePasses: [String] = []
+
     override func setUpWithError() throws {
         base = fm.temporaryDirectory
             .appendingPathComponent("BuildArtifactsScannerTests-\(UUID().uuidString)")
@@ -2365,6 +2370,68 @@ final class BuildArtifactsScannerTests: XCTestCase {
 
     // MARK: - The entry budget is PROPORTIONATE, not a constant (review r7)
 
+    /// A chain of `depth` directories, each component 20 bytes wide, with
+    /// `leafFiles` files at the bottom — built ENTIRELY fd-relatively
+    /// (`mkdirat`/`openat`), because past `PATH_MAX` no path-based API can
+    /// create, stat, enumerate or delete it. Returns the number of directory
+    /// ENTRIES the chain adds (`depth` directories + `leafFiles` files), which
+    /// is what a descriptor-anchored walk must visit.
+    ///
+    /// At depth 120 under a temp root the deepest logical path measures ~2.6 KB
+    /// against a `PATH_MAX` of 1024 — the shape a real Rust/`node_modules`
+    /// tree reaches by nesting, and the one where a PATH-based walk stops and
+    /// a descriptor-anchored one does not.
+    ///
+    /// A construction failure THROWS (and so fails the test); it never skips —
+    /// a fixture that silently did not get built would make every claim below
+    /// it vacuously true.
+    @discardableResult
+    private func makeOverlongChain(
+        under root: URL, depth: Int, leafFiles: Int
+    ) throws -> Int {
+        struct FixtureError: Error { let detail: String }
+        var fd = open(root.path, O_RDONLY | O_DIRECTORY)
+        guard fd >= 0 else {
+            throw FixtureError(detail: "open(\(root.path)): \(errno)")
+        }
+        defer { close(fd) }
+        for index in 0..<depth {
+            let name = String(format: "d%019d", index)
+            XCTAssertEqual(name.utf8.count, 20, "fixture component width")
+            guard mkdirat(fd, name, 0o755) == 0 || errno == EEXIST else {
+                throw FixtureError(detail: "mkdirat(\(name)): \(errno)")
+            }
+            let child = openat(fd, name, O_RDONLY | O_DIRECTORY)
+            guard child >= 0 else {
+                throw FixtureError(detail: "openat(\(name)): \(errno)")
+            }
+            close(fd)
+            fd = child
+        }
+        for index in 0..<leafFiles {
+            let file = openat(fd, "f\(index).bin", O_CREAT | O_WRONLY, 0o644)
+            guard file >= 0 else {
+                throw FixtureError(detail: "openat(create f\(index)): \(errno)")
+            }
+            var byte: UInt8 = 0x7
+            _ = withUnsafeBytes(of: &byte) { write(file, $0.baseAddress, 1) }
+            close(file)
+        }
+        return depth + leafFiles
+    }
+
+    /// Remove a fixture whose paths run past `PATH_MAX` — `FileManager` and
+    /// `removefile(3)` both refuse it (measured: Cocoa 514, "the file name is
+    /// invalid"), and the teardown that runs after every test uses
+    /// `FileManager`. `rm -rf` chdir's its way down and succeeds.
+    private func removeOverlongTree(at url: URL) {
+        let rm = Process()
+        rm.executableURL = URL(fileURLWithPath: "/bin/rm")
+        rm.arguments = ["-rf", url.path]
+        try? rm.run()
+        rm.waitUntilExit()
+    }
+
     /// An artifact tree of at least `entries` directory entries under one
     /// project, returning the artifact dir. Flat and cheap on purpose: what
     /// matters is the COUNT the census sees, not the shape.
@@ -2585,6 +2652,308 @@ final class BuildArtifactsScannerTests: XCTestCase {
         XCTAssertEqual(pinned.limit(census: 10_000), 7,
                        "an explicitly pinned bound is honored verbatim")
         XCTAssertNil(pinned.escalation(census: 10_000), "…and never escalates")
+    }
+
+    // MARK: - review r8: the census is a HINT, the doubling is the guarantee
+
+    /// THE DEFECT. The census comes from `DirectorySizer`, a PATH-BASED walk;
+    /// the probe it budgets is DESCRIPTOR-ANCHORED. They truncate in different
+    /// places, so twice the census is not an upper bound on the probe's work —
+    /// it is an undercount — and an undercount used as the probe's ONLY bound
+    /// made a STATIC tree deterministically INCOMPLETE: tokenless on every
+    /// surface, dropped from the GUI clean set, and told (falsely) that it was
+    /// "changing faster than it can be inspected — let the build finish".
+    /// Nothing was changing, and no retry, chmod, unmount or re-scan could
+    /// ever clear it.
+    ///
+    /// The divergence is measured, not hypothesised: at 120 components of 20
+    /// bytes the deepest path is ~2.6 KB against a `PATH_MAX` of 1024, and the
+    /// path walk stops there with ENAMETOOLONG having counted 44 of this
+    /// fixture's 151 entries while the descriptor walk reads the tree whole
+    /// (the exact split shifts with the length of the temp root, which is why
+    /// the assertions below are relational).
+    ///
+    /// The floor is pinned small so the fixture is 150 entries rather than the
+    /// 21,000 the same shape needs to reproduce at the production floor;
+    /// nothing else about the policy differs.
+    func testStaticTreeWhosePathCensusTruncatesIsStillProvenAndNeverBlamed()
+        async throws
+    {
+        let artifact = try makeProject(
+            at: dev.appendingPathComponent("proj"),
+            marker: "Cargo.toml", artifact: "target", payloadBytes: 4_096
+        )
+        addTeardownBlock { [weak self] in self?.removeOverlongTree(at: artifact) }
+        let chainEntries = try makeOverlongChain(
+            under: artifact, depth: 120, leafFiles: 30
+        )
+        let reachable = chainEntries + 1  // + the top-level payload.bin
+
+        // PRECONDITION 1 — the CENSUS walk truncates, and says so. It cannot
+        // even count the chain it is standing in.
+        let census = DirectorySizer()
+            .measure(at: artifact, mode: .deletionTarget)
+        XCTAssertLessThan(
+            census.enumeratedEntries, reachable,
+            "fixture precondition: the path-based census must UNDERCOUNT the "
+                + "tree the probe walks"
+        )
+        XCTAssertFalse(
+            census.denials.isEmpty,
+            "fixture precondition: the sizer records the truncation"
+        )
+
+        // PRECONDITION 2 — the census-derived bound is genuinely too small for
+        // the descriptor-anchored walk, so the OLD single-pass probe was
+        // deterministically incomplete.
+        let atCensusBound = ValuablesDetector.probe(
+            at: artifact, provider: FileSystemIdentityProvider(),
+            entryLimit: max(3, ValuablesProbeBudget.slackFactor
+                * census.enumeratedEntries)
+        )
+        XCTAssertEqual(
+            atCensusBound.incompleteness, .entryBudget,
+            "fixture precondition: twice the truncated census cannot finish "
+                + "the walk"
+        )
+
+        // THE CLAIM: the STATIC tree is proven anyway, at both faces.
+        let budget = ValuablesProbeBudget.censusProportionate(floor: 3)
+        let outcome = try await runScan(
+            makeScanner(valuablesProbeBudget: budget)
+        )
+        let found = try XCTUnwrap(item(outcome, at: artifact))
+        let disclosure = try XCTUnwrap(found.valuablesDisclosure)
+        XCTAssertEqual(
+            disclosure, .clean,
+            "a static tree the probe can read whole must be PROVEN, whatever "
+                + "some other walk managed to count"
+        )
+        XCTAssertNil(
+            CacheoutViewModel.blockedReason(for: found),
+            "…so no surface may drop the row, and none may claim this "
+                + "unchanging tree is 'changing faster than it can be read'"
+        )
+        XCTAssertEqual(
+            BuildArtifactsScanner.preDeleteValuablesProbe(
+                at: artifact, provider: FileSystemIdentityProvider(),
+                budget: budget
+            ),
+            disclosure,
+            "and the delete-time face, which starts from the same truncated "
+                + "census, agrees instead of refusing for ever"
+        )
+    }
+
+    /// THE RESIDUAL, pinned so it cannot be mistaken for the defect above and
+    /// cannot rot silently. Proving the tree is now the SAFETY answer, not a
+    /// promise that Foundation can delete it: `FileManager.removeItem` —
+    /// `removefile(3)`, which resolves paths — refuses an over-long tree with
+    /// Cocoa 514 ("the file name is invalid") and removes NOTHING, where
+    /// `rm -rf` (which chdir's its way down) succeeds.
+    ///
+    /// That is a delete-time filesystem limit reported with its real cause, on
+    /// a row the user chose — categorically different from the scan-time
+    /// safety refusal this review closed, which was silent, permanent, and
+    /// blamed a build that was not running. Closing it means making the
+    /// cleaner's removal descriptor-anchored, which is a change to every
+    /// scanner's delete path and is deliberately not smuggled in here.
+    ///
+    /// If a future change makes the removal descriptor-anchored, this test
+    /// fails LOUDLY — which is the point: the residual is evidenced, not
+    /// asserted.
+    func testOverlongTreeFailsAtDeleteTimeWithTheRealCauseAndDestroysNothing()
+        async throws
+    {
+        let artifact = try makeProject(
+            at: dev.appendingPathComponent("proj"),
+            marker: "Cargo.toml", artifact: "target", payloadBytes: 4_096
+        )
+        addTeardownBlock { [weak self] in self?.removeOverlongTree(at: artifact) }
+        try makeOverlongChain(under: artifact, depth: 120, leafFiles: 30)
+        let payload = artifact.appendingPathComponent("payload.bin")
+
+        let (items, snapshot, runtime) = try await scanSession(
+            makeScanner(valuablesProbeBudget: .censusProportionate(floor: 3))
+        )
+        let found = try XCTUnwrap(item(from: items, at: artifact))
+        XCTAssertEqual(
+            found.valuablesDisclosure, .clean,
+            "the safety gate is satisfied — this row is offered, not blocked"
+        )
+
+        let cleaner = runtime.makeCleaner(snapshot: snapshot)
+        let report = await cleaner.clean(items: [found], moveToTrash: false)
+        let messages = report.errors.map(\.message).joined(separator: "; ")
+        XCTAssertFalse(
+            report.errors.isEmpty,
+            "the RESIDUAL: a path-based removal cannot delete this tree"
+        )
+        XCTAssertTrue(
+            messages.contains("invalid"),
+            "…and it says why, naming the filesystem's own reason: \(messages)"
+        )
+        XCTAssertFalse(
+            messages.contains("changing faster"),
+            "…never the growing-tree story, which is what the closed defect "
+                + "printed: \(messages)"
+        )
+        XCTAssertTrue(
+            fm.fileExists(atPath: payload.path),
+            "a refused removal removes NOTHING — no half-deleted tree"
+        )
+    }
+
+    /// The same tree at the PRODUCTION policy shape — no pinned floor, no
+    /// injected budget — proving the escalation is not a test-only path: the
+    /// production default is `.censusProportionate`, and its first pass over
+    /// this fixture starts at the FLOOR (20,000), which the 151-entry tree
+    /// never reaches. The pinned-floor test above is what exercises the
+    /// escalation itself; this one pins that the shipped policy is the one
+    /// that owns the doubling.
+    func testProductionBudgetPolicyOwnsTheEscalation() {
+        let production = ValuablesProbeBudget.censusProportionate(
+            floor: ValuablesDetector.defaultProbeEntryLimit
+        )
+        XCTAssertEqual(production.escalated(beyond: 20_000), 40_000,
+                       "a pass that exhausted its bound is retried at twice it")
+        XCTAssertEqual(
+            production.escalated(beyond: Int.max), nil,
+            "a bound with nowhere left to grow stops, it never wraps"
+        )
+        XCTAssertEqual(production.escalated(beyond: 0), 2,
+                       "…and a zero bound still escalates instead of doubling "
+                        + "zero for ever")
+        XCTAssertNil(
+            ValuablesProbeBudget.fixed(20_000).escalated(beyond: 20_000),
+            "a pinned bound is honored verbatim and NEVER escalates"
+        )
+    }
+
+    /// The escalation TERMINATES, and what survives it is the one case the
+    /// "still changing" guidance is TRUE for. A probe that keeps exhausting
+    /// every bound it is granted gets exactly `rounds` doublings and then the
+    /// honest `.entryBudget` verdict — never an unbounded loop, and never a
+    /// rescued obstruction.
+    func testEscalationDoublesUpToItsRoundCeilingThenReportsTheBudget() {
+        let starved = ValuablesDisclosure(
+            valuables: [], probeComplete: false, incompleteness: .entryBudget
+        )
+        let obstructed = ValuablesDisclosure(
+            valuables: [], probeComplete: false, incompleteness: .obstruction
+        )
+        let budget = ValuablesProbeBudget.censusProportionate(floor: 10)
+
+        var bounds: [Int] = []
+        let exhausted = budget.escalating(starved, spent: 10, rounds: 3) {
+            bounds.append($0)
+            return starved
+        }
+        XCTAssertEqual(bounds, [20, 40, 80],
+                       "doubling, and exactly the rounds it was granted")
+        XCTAssertEqual(exhausted.incompleteness, .entryBudget,
+                       "what outlives every doubling is reported as itself")
+
+        bounds = []
+        let finished = budget.escalating(starved, spent: 10, rounds: 3) {
+            bounds.append($0)
+            return .clean
+        }
+        XCTAssertEqual(bounds, [20], "…and it stops the moment one finishes")
+        XCTAssertEqual(finished, ValuablesDisclosure.clean)
+
+        bounds = []
+        XCTAssertEqual(
+            budget.escalating(obstructed, spent: 10, rounds: 3, {
+                bounds.append($0)
+                return .clean
+            }),
+            obstructed,
+            "an OBSTRUCTION is never escalated: no bound reads an unreadable "
+                + "branch, and pretending otherwise prints the wrong remedy"
+        )
+        XCTAssertTrue(bounds.isEmpty)
+
+        bounds = []
+        _ = ValuablesProbeBudget.fixed(10)
+            .escalating(starved, spent: 10, rounds: 3) {
+                bounds.append($0)
+                return .clean
+            }
+        XCTAssertTrue(bounds.isEmpty,
+                      "a pinned bound never escalates, whatever stopped it")
+
+        // The shipped ceiling: 16 doublings from the 20,000 floor is
+        // 1,310,720,000 entries — unreachable for a static tree, so reaching
+        // it means what the guidance says it means.
+        XCTAssertEqual(ValuablesProbeBudget.escalationRounds, 16)
+    }
+
+    /// THE CENSUS SOURCE, evidenced. `SizeReport.enumeratedEntries` counts
+    /// EVERY directory entry the sizing walk yielded; `itemCount` counts
+    /// REGULAR FILES only — no directories, symlinks, specials, or entries
+    /// that raced away. Swapping one for the other at either face leaves every
+    /// outcome identical (the doubling rescues it) and every existing test
+    /// green, which is exactly why the near-neighbour survived undetected: the
+    /// difference is WORK, so work is what this measures.
+    ///
+    /// The fixture is directory-heavy on purpose — 60 subdirectories and one
+    /// file — so `enumeratedEntries` (61) and `itemCount` (1) are two orders
+    /// of magnitude apart and the file-only count is below the pinned floor.
+    func testCensusIsEveryEnumeratedEntryNotOnlyTheRegularFiles() async throws {
+        let artifact = try makeProject(
+            at: dev.appendingPathComponent("proj"),
+            marker: "Cargo.toml", artifact: "target", payloadBytes: nil
+        )
+        for index in 0..<60 {
+            try mkdir(artifact.appendingPathComponent("obj\(index)"))
+        }
+        try writeFile(artifact.appendingPathComponent("app.o"), bytes: 64)
+
+        // Independent fixture math, never the code under test.
+        let census = DirectorySizer()
+            .measure(at: artifact, mode: .deletionTarget)
+        XCTAssertEqual(census.enumeratedEntries, 61,
+                       "fixture precondition: 60 directories + 1 file")
+        XCTAssertEqual(census.itemCount, 1,
+                       "fixture precondition: the regular-file count is the "
+                        + "near-neighbour that undercounts by 60x")
+
+        probePasses = []
+        ValuablesDetector.testHook = { [weak self] event in
+            guard case .didReadNames(let logical) = event,
+                  logical.path == artifact.path else { return }
+            self?.probePasses.append(logical.path)
+        }
+        defer { ValuablesDetector.testHook = nil }
+
+        let budget = ValuablesProbeBudget.censusProportionate(floor: 3)
+        let outcome = try await runScan(
+            makeScanner(valuablesProbeBudget: budget)
+        )
+        let found = try XCTUnwrap(item(outcome, at: artifact))
+        XCTAssertEqual(found.valuablesDisclosure, .clean)
+        XCTAssertEqual(
+            probePasses.count, 1,
+            "the scan-time census is the subject's EXHAUSTIVE entry count, so "
+                + "ONE pass proves the tree; a regular-file count would start "
+                + "below the floor and pay six re-walks to reach the same "
+                + "answer"
+        )
+
+        probePasses = []
+        XCTAssertEqual(
+            BuildArtifactsScanner.preDeleteValuablesProbe(
+                at: artifact, provider: FileSystemIdentityProvider(),
+                budget: budget
+            ),
+            .clean
+        )
+        XCTAssertEqual(
+            probePasses.count, 2,
+            "delete time: the floor pass, then ONE census-proportionate pass "
+                + "— the census it earns must be the count that finishes it"
+        )
     }
 
     func testDeepArtifactTreeWithoutValuablesIsProvenCleanAndStaysCleanable()

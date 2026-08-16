@@ -1649,9 +1649,9 @@ struct CLIHandler {
     /// The plan/dry-run note for THIS item's incompleteness CAUSE. The two
     /// causes end differently, so they may not print one remedy: an
     /// obstruction is cleared by fixing it and re-scanning, while an entry
-    /// budget derived from the tree's own exhaustive census is only reached
-    /// by a tree that is still changing — and "re-scan" is the advice that
-    /// cannot work for it.
+    /// budget that starts at the tree's own census and DOUBLES until the
+    /// inspection finishes is only reached by a tree that is still changing —
+    /// and "re-scan" is the advice that cannot work for it.
     static func incompleteProbeNote(
         for cause: ValuablesDisclosure.ProbeIncompleteness?
     ) -> String {

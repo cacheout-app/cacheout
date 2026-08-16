@@ -132,14 +132,19 @@ struct SizeReport {
     /// the root itself. `itemCount` counts regular files ONLY, so it is not
     /// a census; this is.
     ///
-    /// It exists because it is the ONE exhaustive count of the same subject
-    /// the bounded valuables probe walks, taken by the same pass: the probe's
-    /// entry budget is derived from it (`ValuablesProbeBudget`), which is
-    /// what stops a fixed constant from deterministically stranding the
-    /// largest real artifact trees. A FLOOR, not a guarantee: a walk that hit
-    /// denials or a mount boundary counted nothing past them, and a probe
-    /// budget derived from such a census can still run out — honestly, and
-    /// alongside the denial that explains it.
+    /// It exists because it is the closest count of the same subject the
+    /// bounded valuables probe walks that this pass can take for free: the
+    /// probe's STARTING entry budget is derived from it
+    /// (`ValuablesProbeBudget`), which is what stops a fixed constant from
+    /// deterministically stranding the largest real artifact trees.
+    ///
+    /// A FLOOR, never a bound (PR #457 review r8). THIS walk is path-based and
+    /// the probe's is descriptor-anchored, so they truncate in different
+    /// places: a walk that hit denials, a mount boundary, or a path past
+    /// `PATH_MAX` (ENAMETOOLONG — measured: 44 entries counted of a 151-entry
+    /// tree) counted nothing past them, while the probe keeps walking. Nothing
+    /// may treat this number as an upper bound on the probe's work; the
+    /// probe's own doubling is what guarantees it finishes.
     var enumeratedEntries: Int = 0
     var denials: [SizeDenial] = []
     /// Directories recorded as mount boundaries; their subtrees are uncounted.

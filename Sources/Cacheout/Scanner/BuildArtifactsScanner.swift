@@ -334,16 +334,35 @@ struct BuildArtifactsScanner: @unchecked Sendable {
                 )
                 // THE VALUABLES GATE, on the HELD descriptor. This is the
                 // output that authorizes a deletion, so it is the one that
-                // must never be re-derived from a path — and the one bound it
-                // spends is PROPORTIONATE to the census above rather than a
+                // must never be re-derived from a path — and the bound it
+                // spends is PROPORTIONATE to its subject rather than a
                 // constant, so an ordinary large `node_modules` is PROVEN
                 // instead of stranded (see `ValuablesProbeBudget`).
-                let disclosure = ValuablesDetector.probe(
-                    at: candidate.artifactDirectory, root: anchor,
-                    provider: provider,
-                    entryLimit: valuablesProbeBudget.limit(
-                        census: report.enumeratedEntries
+                //
+                // The census above is the STARTING bound only (review r8): it
+                // comes from a PATH-based walk that truncates where this
+                // descriptor-anchored one does not — past `PATH_MAX` the sizer
+                // stops with ENAMETOOLONG while the probe walks on — so twice
+                // it can be an undercount, and an undercount used as the ONLY
+                // bound made a STATIC tree deterministically incomplete,
+                // tokenless, and falsely reported as "changing". What
+                // finishes the walk is the doubling, which is derived from the
+                // bound actually spent and so cannot be undercounted.
+                //
+                // The anchor is reused across passes: `ValuablesProbeWalk`
+                // enumerates through `openat(fd, ".")` descriptions of its
+                // own, never the anchor's, and holds only a reference to it.
+                let probe = { (entryLimit: Int) in
+                    ValuablesDetector.probe(
+                        at: candidate.artifactDirectory, root: anchor,
+                        provider: provider, entryLimit: entryLimit
                     )
+                }
+                let start = valuablesProbeBudget.limit(
+                    census: report.enumeratedEntries
+                )
+                let disclosure = valuablesProbeBudget.escalating(
+                    probe(start), spent: start, probe
                 )
                 emissions.append(reclaimableItem(
                     from: candidate, report: report, disclosure: disclosure
@@ -996,41 +1015,57 @@ struct BuildArtifactsScanner: @unchecked Sendable {
     /// their kind gating are the same code, not the same intent.
     ///
     /// ## The budget is proportionate HERE TOO (review r7)
-    /// The scan-time face has an exhaustive census in hand before it probes
-    /// (the sizing of the same candidate); this face is handed a bare URL and
-    /// has none, so it earns one only when it needs one. It probes at the
-    /// policy's FIRST-PASS bound, and ONLY when that bound — and nothing else
-    /// — is what stopped the walk does it take an exhaustive census of the
-    /// same subject and probe again proportionately. A tree big enough to
-    /// exhaust the floor pays one extra enumeration; every ordinary tree pays
-    /// nothing. Without this the two faces would drift in the one direction
-    /// that matters: the scan would prove a large `node_modules` clean and
-    /// mint its token, and the delete-time revalidation would refuse it
-    /// forever at a bound the scan no longer uses.
+    /// The scan-time face has a census in hand before it probes (the sizing of
+    /// the same candidate); this face is handed a bare URL and has none, so it
+    /// earns one only when it needs one. It probes at the policy's FIRST-PASS
+    /// bound, and ONLY when that bound — and nothing else — is what stopped
+    /// the walk does it census the same subject and probe again
+    /// proportionately, doubling from there until the walk finishes. A tree
+    /// big enough to exhaust the floor pays one extra enumeration; every
+    /// ordinary tree pays nothing. Without this the two faces would drift in
+    /// the one direction that matters: the scan would prove a large
+    /// `node_modules` clean and mint its token, and the delete-time
+    /// revalidation would refuse it forever at a bound the scan no longer
+    /// uses.
     ///
-    /// The census is derived from a PATH-based walk, which is the delete-time
-    /// face's documented residual — and it is safe to derive a BOUND from:
-    /// a wrong census can only make this probe do more work or refuse, never
-    /// disclose less or authorize more (the probe's own reads are what they
-    /// always were).
+    /// The census is derived from a PATH-based walk, and that walk TRUNCATES
+    /// WHERE THIS ONE DOES NOT (review r8): past `PATH_MAX` the sizer stops
+    /// with ENAMETOOLONG after a few dozen entries while the descriptor-
+    /// anchored probe walks the whole tree. So the census is taken for what it
+    /// honestly is — a STARTING HINT that finishes an ordinary large tree in
+    /// one extra pass — and the guarantee comes from the DOUBLING that
+    /// follows it, which is derived from the bound actually spent and can
+    /// therefore grow straight past a census that undercounts. Without that,
+    /// a static tree with an over-long path was refused at every bound, for
+    /// ever, with the one remedy ("let it settle and retry") that could not
+    /// work.
+    ///
+    /// A wrong census is still safe in the only direction that matters: it can
+    /// only make this probe do more work, never disclose less or authorize
+    /// more (the probe's own reads are what they always were).
     static func preDeleteValuablesProbe(
         at target: URL, provider: FileSystemIdentityProvider,
         budget: ValuablesProbeBudget = .censusProportionate(
             floor: ValuablesDetector.defaultProbeEntryLimit
         )
     ) -> ValuablesDisclosure {
-        let firstPass = ValuablesDetector.probe(
-            at: target, provider: provider, entryLimit: budget.firstPass
-        )
-        guard firstPass.incompleteness == .entryBudget else { return firstPass }
+        let probe = { (entryLimit: Int) in
+            ValuablesDetector.probe(
+                at: target, provider: provider, entryLimit: entryLimit
+            )
+        }
+        var bound = budget.firstPass
+        var result = probe(bound)
+        // The census is EARNED, not paid for up front: only a walk stopped by
+        // the budget — and by nothing else — is worth an extra enumeration.
+        guard result.incompleteness == .entryBudget else { return result }
         let census = DirectorySizer(provider: provider)
             .measure(at: target, mode: .deletionTarget).enumeratedEntries
-        guard let escalated = budget.escalation(census: census) else {
-            return firstPass
+        if let escalated = budget.escalation(census: census) {
+            bound = escalated
+            result = probe(bound)
         }
-        return ValuablesDetector.probe(
-            at: target, provider: provider, entryLimit: escalated
-        )
+        return budget.escalating(result, spent: bound, probe)
     }
 
     // MARK: - Pre-delete revalidator (fn-4.8, R17/D8)
@@ -1198,11 +1233,16 @@ struct BuildArtifactsScanner: @unchecked Sendable {
     ///
     /// - An OBSTRUCTION is cleared by fixing the impediment (permissions, a
     ///   mount, a foreign-encoded basename) — a re-scan then finishes.
-    /// - The ENTRY BUDGET reaching its PROPORTIONATE bound means the tree grew
-    ///   past twice its own exhaustive census while it was being inspected, or
-    ///   could not be censused at all. A retry, unaided, genuinely can clear
-    ///   that — so it says so, instead of demanding a re-scan that cannot
-    ///   change anything.
+    /// - The ENTRY BUDGET surviving every DOUBLING the policy grants means the
+    ///   tree outgrew each of them while it was being inspected. A retry,
+    ///   unaided, genuinely can clear that — so it says so, instead of
+    ///   demanding a re-scan that cannot change anything.
+    ///
+    /// The "or could not be counted" hedge this message used to carry is gone
+    /// (review r8): a subject the census could not count is exactly the case
+    /// the doubling now finishes, so keeping the hedge would name a cause that
+    /// can no longer produce this refusal — and pair it with a retry that
+    /// would not have helped it.
     static func incompleteProbeRefusal(
         _ cause: ValuablesDisclosure.ProbeIncompleteness?
     ) -> String {
@@ -1210,8 +1250,7 @@ struct BuildArtifactsScanner: @unchecked Sendable {
         case .entryBudget:
             return "the release-artifact inspection ran out of its entry "
                 + "budget — this directory is growing faster than it can be "
-                + "read, or could not be counted — refused, nothing deleted; "
-                + "retry when it settles"
+                + "read — refused, nothing deleted; retry when it settles"
         case .obstruction, .none:
             return "couldn't fully re-inspect the directory for release "
                 + "artifacts at delete time — refused (an inspection that "

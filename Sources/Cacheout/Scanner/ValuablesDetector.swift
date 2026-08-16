@@ -130,16 +130,19 @@
 /// one size larger: measured on this machine it fired on `node_modules` up to
 /// 44,468 entries and `.build` up to 53,924, against a 20,000-entry cap. So
 /// the bound is now PROPORTIONATE to its subject — see `ValuablesProbeBudget`
-/// — and a tree this pass can enumerate at all is a tree the probe can prove.
-/// Budget exhaustion survives only as what it should always have been: the
+/// — starting from the subject's own census and DOUBLING until the walk
+/// finishes, so that no tree THIS walk can read is stranded by a count some
+/// OTHER walk took (review r8: the census is path-based and stops at
+/// `PATH_MAX`; this walk is descriptor-anchored and does not). Budget
+/// exhaustion survives only as what it should always have been: the
 /// non-deterministic, retry-clearable case of a tree that is still growing.
 ///
 /// The probe is INCOMPLETE for two separately reported REASONS
 /// (`ValuablesDisclosure.ProbeIncompleteness`), because they clear
 /// differently: an ENTRY BUDGET is cleared by a bigger one (which the policy
-/// grants automatically from the subject's own census), an OBSTRUCTION only
-/// by removing the impediment. When both stop one walk the OBSTRUCTION is
-/// reported — it is the one no escalation can help.
+/// grants automatically, doubling from the subject's own census), an
+/// OBSTRUCTION only by removing the impediment. When both stop one walk the
+/// OBSTRUCTION is reported — it is the one no escalation can help.
 ///
 /// ## Determinism contract (deliberately NARROW under truncation)
 /// For a COMPLETE probe the output is fully deterministic: every directory
@@ -291,8 +294,10 @@ struct ValuablesDisclosure: Equatable, Sendable {
     enum ProbeIncompleteness: Equatable, Sendable {
         /// The ENTRY BUDGET ran out, and nothing else went wrong. The tree is
         /// bigger than the bound it was granted, so a bigger bound — which
-        /// the census-proportionate policy grants automatically from the
-        /// subject's own exhaustive count — is exactly what changes it.
+        /// the census-proportionate policy grants automatically, starting at
+        /// the subject's own count and doubling from there — is exactly what
+        /// changes it. Surviving every one of those doublings is what a tree
+        /// that is still GROWING does; a static one cannot.
         case entryBudget
         /// Something the probe could not read, characterise, decode, or
         /// cross: an unreadable branch, a mount boundary, an undecodable
@@ -413,17 +418,42 @@ struct ValuablesDisclosure: Equatable, Sendable {
 /// `node_modules` and three of thirteen `.build` trees over the cap.
 ///
 /// So the bound stops being a constant and becomes PROPORTIONATE to its
-/// subject: the probe is granted twice the entries an EXHAUSTIVE enumeration
-/// of that very tree just cost (`SizeReport.enumeratedEntries`). For a static
-/// tree the budget therefore cannot run out — budget exhaustion stops being an
-/// event at all, which is the honest end state for a bound nothing could
-/// clear. What CAN still exhaust it is a tree that grew between the census and
-/// the probe, and that is the clearable case by construction: it is not
+/// subject: the probe starts at twice the entries an enumeration of that very
+/// tree just cost (`SizeReport.enumeratedEntries`), and — when even that runs
+/// out — DOUBLES until the walk finishes. For a static tree the budget
+/// therefore cannot run out: budget exhaustion stops being an event at all,
+/// which is the honest end state for a bound nothing could clear. What CAN
+/// still exhaust it is a tree that keeps growing faster than the bound
+/// doubles, and that is the clearable case by construction: it is not
 /// deterministic, and a retry over a tree that stopped growing completes.
 ///
-/// The bound still exists, and still guarantees termination: the probe's total
-/// work is capped at twice what an enumeration of the same subject already
-/// cost in the same pass. Raising it costs nothing that pass was not already
+/// ## Why the census is a HINT and the DOUBLING is the guarantee (review r8)
+/// The census comes from `DirectorySizer`, which is a PATH-BASED walk
+/// (`FileManager.enumerator`, per-item absolute-path `lstat`), while the probe
+/// is DESCRIPTOR-ANCHORED (`openat` one component at a time). The two truncate
+/// in DIFFERENT PLACES, so a census is only a sound BOUND for the probe if
+/// both walks stop together — and they measurably do not. A 120-deep chain of
+/// 20-character components puts the deepest path past `PATH_MAX` (measured:
+/// 2634 bytes against 1024): the sizer dies there with ENAMETOOLONG after 44
+/// entries and one recorded denial, while the probe walks the whole 151-entry
+/// tree — and at the production floor the same shape with 21,000 files at the
+/// bottom counted 43 of 21,121 entries, for a budget of 20,000 against a need
+/// of 21,121. Twice a truncated census is not a bound, it is an undercount, and
+/// deriving the probe's ONLY bound from it made a STATIC tree deterministically
+/// incomplete — tokenless on every surface, dropped from the GUI clean set,
+/// and told it was "changing faster than it can be inspected" when nothing
+/// about it was changing.
+///
+/// So the census keeps only the job it is honest for: a STARTING HINT that
+/// saves rounds when it is right (an exhaustive census finishes the probe in
+/// ONE pass; on real trees it is exact to within a rounding of 1 — measured:
+/// `.build` 13021 → 13022, `node_modules` 19265 → 19265). The GUARANTEE is
+/// progress-driven and needs no census at all: a pass that exhausted its bound
+/// is retried at TWICE that bound, which no walk's truncation can undercount.
+///
+/// The bound still exists, and still guarantees termination: at most
+/// `escalationRounds` doublings, and the total work of all passes is under
+/// twice the final bound. Raising it costs nothing that pass was not already
 /// paying — `DirectorySizer.measure` walks the identical tree with
 /// `FileManager.enumerator` and NO cap (and at strictly higher cost per entry),
 /// and the deletion that follows unlinks every entry — so the probe was never
@@ -437,10 +467,29 @@ enum ValuablesProbeBudget: Equatable, Sendable {
     /// it — an explicitly pinned bound is honored verbatim.
     case fixed(Int)
 
-    /// Twice the census. The census is exact for a static tree, so the factor
-    /// is pure slack: it covers entries created between the two walks and the
-    /// small census differences two enumerators can have at a boundary.
+    /// Twice the census, and the factor every escalation round multiplies by.
+    /// The census is exact for a static tree the sizer can walk WHOLE, so the
+    /// factor is pure slack there: it covers entries created between the two
+    /// walks and the small census differences two enumerators can have at a
+    /// boundary.
     static let slackFactor = 2
+
+    /// How many DOUBLINGS a probe may take beyond its starting bound.
+    ///
+    /// Sized so that no static tree can ever reach it and no growing one is
+    /// stopped early by anything else: from the production floor of 20,000 the
+    /// ceiling is `20_000 << 16` = 1,310,720,000 entries — three orders of
+    /// magnitude past the largest tree this scanner has ever been pointed at
+    /// (measured on this machine: `.build` 53,924 entries, `node_modules`
+    /// 44,468). Reaching it therefore means exactly one thing, and it is the
+    /// thing the "still changing" guidance says: the subject outgrew every
+    /// bound a doubling could grant it.
+    ///
+    /// It is a ROUND count and not an entry ceiling on purpose: rounds bound
+    /// the number of re-walks (the cost the user waits on), while the entry
+    /// ceiling they imply scales with whatever bound the subject's own census
+    /// started at.
+    static let escalationRounds = 16
 
     /// The bound to spend when no census is available yet (the delete-time
     /// first pass).
@@ -470,6 +519,62 @@ enum ValuablesProbeBudget: Equatable, Sendable {
     func escalation(census: Int) -> Int? {
         let escalated = limit(census: census)
         return escalated > firstPass ? escalated : nil
+    }
+
+    /// The bound to retry a pass that EXHAUSTED `bound` at — DOUBLING, and
+    /// derived from nothing but the bound that was actually spent, so no
+    /// walk's truncation can hold it down. `nil` when it cannot grow: a
+    /// `.fixed` policy is honored verbatim and never escalates, and a bound
+    /// already at `Int.max` has nowhere left to go.
+    ///
+    /// `max(1, bound)` so a floor of 0 (or a nonsense negative one) still
+    /// escalates instead of doubling zero forever.
+    func escalated(beyond bound: Int) -> Int? {
+        switch self {
+        case .fixed:
+            return nil
+        case .censusProportionate:
+            let (doubled, overflow) = max(1, bound)
+                .multipliedReportingOverflow(by: Self.slackFactor)
+            let next = overflow ? Int.max : doubled
+            return next > bound ? next : nil
+        }
+    }
+
+    /// THE ONE ESCALATION DRIVER, consumed by BOTH faces of the scanner (the
+    /// scan-time probe and `preDeleteValuablesProbe`), so the two can neither
+    /// drift nor disagree about when a probe is finished.
+    ///
+    /// `result` is what a probe ALREADY run at `bound` produced. While — and
+    /// only while — the ENTRY BUDGET is what stopped it, the probe is re-run
+    /// at a doubled bound. An OBSTRUCTION is never escalated: no bound can
+    /// read an unreadable branch, and `ValuablesProbeWalk.incompleteness`
+    /// already reports the obstruction whenever both causes fired.
+    ///
+    /// Termination: `rounds` is a hard round count, `escalated(beyond:)`
+    /// saturates, and each pass is itself bounded — so the driver performs at
+    /// most `rounds` extra walks and the sum of every pass's bound is under
+    /// twice the last one's.
+    ///
+    /// - Parameter rounds: TEST SEAM. Production takes the default; a test
+    ///   pins it small to prove the ceiling arm without a billion-entry
+    ///   fixture.
+    func escalating(
+        _ result: ValuablesDisclosure,
+        spent bound: Int,
+        rounds: Int = ValuablesProbeBudget.escalationRounds,
+        _ probe: (Int) -> ValuablesDisclosure
+    ) -> ValuablesDisclosure {
+        var result = result
+        var bound = bound
+        var remaining = rounds
+        while result.incompleteness == .entryBudget, remaining > 0,
+              let next = escalated(beyond: bound) {
+            bound = next
+            result = probe(bound)
+            remaining -= 1
+        }
+        return result
     }
 }
 

@@ -86,9 +86,16 @@ enum DepthSafeRemoval {
             case .posix(let code):
                 return "\(place): \(String(cString: strerror(code)))"
             case .mountBoundary:
-                return "\(place): a volume is mounted inside this folder and "
-                    + "the deletion never crosses a mount boundary — refused, "
-                    + "not deleted"
+                // WHERE the boundary is changes what the user has to do
+                // about it, so the two are not one sentence: a volume ON the
+                // target is ejected, a volume INSIDE it is a nested mount.
+                return depth == 0
+                    ? "\(place): a volume is mounted here and the deletion "
+                        + "never crosses a mount boundary — refused, not "
+                        + "deleted"
+                    : "\(place): a volume is mounted inside this folder and "
+                        + "the deletion never crosses a mount boundary — "
+                        + "refused, not deleted"
             case .relocated:
                 return "\(place): the folder moved while it was being "
                     + "deleted — refused, re-scan required"
@@ -130,6 +137,8 @@ enum DepthSafeRemoval {
         }
         defer { close(parentFd) }
 
+        // The parent is the ONE reference point that is not supplied by the
+        // thing being judged, so every proof below is taken against it.
         var leafStat = stat()
         guard fstatat(parentFd, leaf, &leafStat, AT_SYMLINK_NOFOLLOW) == 0
         else {
@@ -177,12 +186,44 @@ enum DepthSafeRemoval {
         }
         defer { if current >= 0 { close(current) } }
 
+        // THE ROOT'S MOUNT IS JUDGED AGAINST THE PARENT, NEVER AGAINST
+        // ITSELF. Taking the reference from the tree being deleted makes the
+        // one case that matters most invisible: a volume attached ONTO the
+        // target after the admission-time path check and before this
+        // descriptor was opened (this runs on a background queue, so that
+        // window is real and is not small) supplies its OWN filesystem id as
+        // the baseline, every descendant then agrees with it, and the
+        // traversal recursively empties somebody else's volume while
+        // believing it never crossed a boundary. `removefile(3)`, which this
+        // type replaces, does not cross mount points; inheriting that
+        // guarantee means proving the root's mount from OUTSIDE the root.
+        guard let parentMount = provider.mountIdentity(ofDescriptor: parentFd)
+        else {
+            throw Failure(
+                path: displayPath, cause: .unprovableLocation, depth: 0
+            )
+        }
         guard let rootMount = provider.mountIdentity(ofDescriptor: current)
         else {
             throw Failure(
                 path: displayPath, cause: .unprovableLocation, depth: 0
             )
         }
+        guard rootMount == parentMount else {
+            throw Failure(
+                path: displayPath, cause: .mountBoundary, depth: 0
+            )
+        }
+        guard let parentIdentity = provider.identity(ofDescriptor: parentFd)
+        else {
+            throw Failure(
+                path: displayPath, cause: .unprovableLocation, depth: 0
+            )
+        }
+        try proveContainment(
+            of: current, in: parentIdentity, provider: provider,
+            displayPath: displayPath, depth: 0
+        )
 
         /// Subdirectory names not yet descended into, one list per level of
         /// the CURRENT path. Bounded by what is actually on the path, exactly
@@ -253,6 +294,24 @@ enum DepthSafeRemoval {
                         depth: depth + 1
                     )
                 }
+                // BEFORE the first `unlinkat`, not after the level is empty.
+                // A `rename(2)` between the `openat` above and this point
+                // leaves the descriptor perfectly valid — that is what
+                // descriptors do — pointing at a directory that now lives in
+                // somebody else's tree, and the destructive pass would then
+                // unlink whatever the new owner has put in it. The check on
+                // the way back up (below) cannot save that: by the time it
+                // runs the contents are gone, and a check that validates
+                // what was already destroyed is not a guard.
+                do {
+                    try proveContainment(
+                        of: child, in: identity, provider: provider,
+                        displayPath: displayPath, depth: depth + 1
+                    )
+                } catch {
+                    close(child)
+                    throw error
+                }
                 close(current)
                 current = child
                 ascent.append(Ascent(name: name, parent: identity))
@@ -305,6 +364,65 @@ enum DepthSafeRemoval {
         }
     }
 
+    /// Prove that `directory` is STILL inside the inode we are holding, and
+    /// throw if it is not — or if the question cannot be answered.
+    ///
+    /// The proof is containment, taken at this instant: `..` opened from the
+    /// held descriptor, and its identity compared with the parent's. It is
+    /// deliberately NOT a comparison against an identity recorded for
+    /// `directory` itself — the descriptor keeps that identity through any
+    /// number of renames, so a recorded-identity check agrees with a
+    /// relocation instead of catching it.
+    ///
+    /// Errno classes are kept apart: a `..` that cannot be OPENED is a posix
+    /// failure with its own code, while a `..` that opens but whose identity
+    /// cannot be read is unprovable. Neither is treated as containment.
+    private static func proveContainment(
+        of directory: Int32,
+        in parent: FileSystemIdentityProvider.Identity,
+        provider: FileSystemIdentityProvider,
+        displayPath: String,
+        depth: Int
+    ) throws {
+        let up = openat(directory, "..", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+        guard up >= 0 else {
+            throw Failure(
+                path: displayPath, cause: .posix(errno), depth: depth
+            )
+        }
+        defer { close(up) }
+        guard let here = provider.identity(ofDescriptor: up) else {
+            throw Failure(
+                path: displayPath, cause: .unprovableLocation, depth: depth
+            )
+        }
+        guard here == parent else {
+            throw Failure(
+                path: displayPath, cause: .relocated, depth: depth
+            )
+        }
+    }
+
+    /// A SECOND, INDEPENDENT description of the directory `fd` names, for
+    /// `fdopendir` to take ownership of.
+    ///
+    /// `dup(fd)` is wrong twice, both measured on this platform:
+    ///
+    /// - it CLEARS `FD_CLOEXEC` (`fcntl(F_GETFD)` reports 0 on the copy),
+    ///   so the handle is inheritable by anything this process spawns while
+    ///   a permanent deletion is in flight, and
+    /// - it SHARES the file offset with `fd`, so a second enumeration of the
+    ///   same directory returns 0 entries (measured: 5, then 0) — a directory
+    ///   silently reported as empty is the worst possible answer for a
+    ///   deleter.
+    ///
+    /// `openat(fd, ".", O_CLOEXEC)` has neither property (measured: 5, then
+    /// 5, `FD_CLOEXEC` set), and it is the SAME shape the scanner's bounded
+    /// read uses — scan-time and delete-time do not get to drift.
+    static func enumerationDescriptor(for fd: Int32) -> Int32 {
+        openat(fd, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+    }
+
     /// Unlink every non-directory child of `fd` and return the names of the
     /// directories left behind, in reverse traversal order (the caller pops
     /// from the end).
@@ -319,7 +437,7 @@ enum DepthSafeRemoval {
     ) throws -> [RawName] {
         // `fdopendir` takes ownership of the descriptor it is handed, and
         // the caller still needs `fd`.
-        let handle = dup(fd)
+        let handle = enumerationDescriptor(for: fd)
         guard handle >= 0 else {
             throw Failure(path: displayPath, cause: .posix(errno), depth: depth)
         }

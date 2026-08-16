@@ -20,6 +20,13 @@ final class DepthSafeRemovalTests: XCTestCase {
 
     override func tearDownWithError() throws {
         guard let base else { return }
+        // A REAL volume may still be attached inside the fixture (the mount
+        // cases below). `rm -rf` does NOT set `FTS_XDEV`, so it would happily
+        // walk into a mounted volume and erase it — the very thing the code
+        // under test refuses to do. Detach first, always, before deleting.
+        for mounted in Self.mountPoints(under: base).sorted(by: >) {
+            _ = Self.run("/usr/bin/hdiutil", ["detach", mounted, "-force"])
+        }
         // `rm -rf` uses `fts`, i.e. relative traversal, so it can clean up
         // fixtures that `FileManager` cannot address.
         let rm = Process()
@@ -27,6 +34,50 @@ final class DepthSafeRemovalTests: XCTestCase {
         rm.arguments = ["-rf", base.path]
         try? rm.run()
         rm.waitUntilExit()
+    }
+
+    // MARK: - Real-volume plumbing
+
+    /// Every currently mounted filesystem whose mount point is at or below
+    /// `url`, read from `getmntinfo(3)` — the kernel's own table, not a
+    /// string guess.
+    private static func mountPoints(under url: URL) -> [String] {
+        // The kernel spells mount points canonically (`/private/var/...`);
+        // `FileManager.temporaryDirectory` spells them through the `/var`
+        // symlink, so an unresolved comparison silently finds NOTHING — and
+        // this list is what keeps `rm -rf` out of an attached volume.
+        let root = FileSystemIdentityProvider().realPath(of: url.path)
+            ?? url.path
+        var buffer: UnsafeMutablePointer<statfs>?
+        let count = getmntinfo(&buffer, MNT_NOWAIT)
+        guard count > 0, let buffer else { return [] }
+        var found: [String] = []
+        for index in 0..<Int(count) {
+            var entry = buffer[index]
+            let mountedOn = withUnsafeBytes(of: &entry.f_mntonname) { raw in
+                String(cString: raw.bindMemory(to: CChar.self).baseAddress!)
+            }
+            if mountedOn == root || mountedOn.hasPrefix(root + "/") {
+                found.append(mountedOn)
+            }
+        }
+        return found
+    }
+
+    @discardableResult
+    private static func run(_ tool: String, _ arguments: [String]) -> Int32 {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: tool)
+        process.arguments = arguments
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        do { try process.run() } catch { return -1 }
+        process.waitUntilExit()
+        return process.terminationStatus
+    }
+
+    private func inode(of url: URL) throws -> UInt64 {
+        try XCTUnwrap(FileSystemIdentityProvider().identity(of: url)?.inode)
     }
 
     // MARK: - Fixtures
@@ -342,6 +393,97 @@ final class DepthSafeRemovalTests: XCTestCase {
                       "content on the other volume must be untouched")
     }
 
+    /// A volume mounted ON THE TARGET ITSELF refuses the deletion, with a
+    /// REAL attached volume rather than an injected identity.
+    ///
+    /// The admission-time mount check (`PathGuard`) is a PATH check taken
+    /// before the item is queued; this deletion runs later, on a background
+    /// queue. A volume attached in between makes the target a mount root, and
+    /// nothing the guard did earlier is still true. The proof has to be taken
+    /// here, from the descriptor actually opened, against the parent
+    /// descriptor held OUTSIDE it — a root that supplies its own reference
+    /// point can never disagree with itself.
+    func testRefusesADeletionRootThatBecameAMountedVolume() throws {
+        let target = base.appendingPathComponent("attached-root")
+        try mkdir(target)
+        let image = base.appendingPathComponent("volume.dmg")
+        guard Self.run("/usr/bin/hdiutil", [
+            "create", "-size", "8m", "-fs", "APFS", "-volname",
+            "CacheoutDepthSafe", "-type", "UDIF", "-quiet", image.path,
+        ]) == 0 else { throw XCTSkip("hdiutil create unavailable") }
+        guard Self.run("/usr/bin/hdiutil", [
+            "attach", image.path, "-mountpoint", target.path,
+            "-nobrowse", "-noverify", "-quiet",
+        ]) == 0 else { throw XCTSkip("hdiutil attach unavailable") }
+        defer {
+            _ = Self.run("/usr/bin/hdiutil", ["detach", target.path, "-force"])
+        }
+        XCTAssertEqual(
+            Self.mountPoints(under: target).count, 1,
+            "fixture: the target must really be a mount root"
+        )
+
+        let precious = target.appendingPathComponent("precious.bin")
+        try write(precious, bytes: 4096)
+        let nested = target.appendingPathComponent("nested")
+        try mkdir(nested)
+        let deep = nested.appendingPathComponent("deep.bin")
+        try write(deep, bytes: 4096)
+
+        XCTAssertThrowsError(
+            try DepthSafeRemoval.remove(
+                at: target, provider: FileSystemIdentityProvider()
+            )
+        ) { error in
+            XCTAssertTrue(
+                error.localizedDescription.contains("mount boundary"),
+                "the refusal must name the boundary: "
+                    + error.localizedDescription
+            )
+        }
+        XCTAssertTrue(exists(precious),
+                      "a file at the mounted volume's root must survive")
+        XCTAssertTrue(exists(deep),
+                      "and so must everything below it")
+    }
+
+    /// The same refusal, hermetically: the ROOT's mount differs from the
+    /// mount of the parent descriptor the removal already holds.
+    ///
+    /// This is the case a root-anchored comparison structurally cannot see —
+    /// take the reference from the opened root and every descendant agrees
+    /// with it by construction, so the boundary check answers a question
+    /// about the mounted volume's INTERIOR while the volume itself is being
+    /// emptied.
+    func testRefusesADeletionRootWhoseMountDiffersFromTheHeldParent() throws {
+        let target = base.appendingPathComponent("foreign-root")
+        try mkdir(target)
+        let precious = target.appendingPathComponent("volume-data.bin")
+        try write(precious, bytes: 2048)
+        let nested = target.appendingPathComponent("nested")
+        try mkdir(nested)
+        let deep = nested.appendingPathComponent("deep.bin")
+        try write(deep, bytes: 2048)
+
+        let provider = ForeignMountProvider()
+        provider.foreignInode = try inode(of: target)
+
+        XCTAssertThrowsError(
+            try DepthSafeRemoval.remove(at: target, provider: provider)
+        ) { error in
+            XCTAssertTrue(
+                error.localizedDescription.contains("mount boundary"),
+                "the refusal must name the boundary: "
+                    + error.localizedDescription
+            )
+        }
+        XCTAssertTrue(exists(precious),
+                      "nothing on the other volume may be unlinked, and the "
+                          + "root's own files are the FIRST thing an "
+                          + "unguarded traversal unlinks")
+        XCTAssertTrue(exists(deep))
+    }
+
     // MARK: - `..` is a lookup, not a proof
 
     /// Fires a caller-supplied side effect the FIRST time the deletion opens
@@ -367,44 +509,50 @@ final class DepthSafeRemovalTests: XCTestCase {
         }
     }
 
-    /// A directory renamed into a FOREIGN parent while the deletion stands
-    /// inside it must STOP the deletion, not redirect it.
+    /// A directory relocated while the deletion stands BELOW it must STOP the
+    /// deletion on the way back up, not redirect it.
     ///
     /// `openat(cur, "..")` names whatever the current directory's parent is
-    /// NOW — it is a lookup, not a proof. Relocate the current directory and
-    /// `..` lands in somebody else's tree, where the sibling names still
-    /// pending from the REAL parent would then be opened and emptied by
-    /// name. The rename below is a real `rename(2)`, fired at that exact
-    /// instant; with the identity check deleted this test loses
-    /// `foreign/<sibling>/precious.bin`.
-    func testRefusesWhenTheCurrentDirectoryIsRelocatedMidDeletion() throws {
+    /// NOW — it is a lookup, not a proof. The rename here moves a level the
+    /// traversal has ALREADY entered and proven, while it is one level
+    /// deeper still, so no check taken on the way DOWN can see it: the
+    /// grandchild's own binding to its parent is untouched by the move. Only
+    /// the ascent check catches it, and it must, because `..` then lands in
+    /// somebody else's tree where the sibling names still pending from the
+    /// REAL parent would be opened and emptied by name. The rename is a real
+    /// `rename(2)`, fired at that exact instant; with the ascent identity
+    /// check deleted this test loses `foreign/<sibling>/precious.bin`.
+    func testRefusesWhenAnEnteredDirectoryIsRelocatedMidDeletion() throws {
         let target = base.appendingPathComponent("relocating-target")
         let parent = target.appendingPathComponent("a")
         let siblings = ["p", "q"].map { parent.appendingPathComponent($0) }
         for sibling in siblings {
-            try mkdir(sibling)
-            try write(sibling.appendingPathComponent("f.bin"))
+            try mkdir(sibling.appendingPathComponent("inner"))
+            try write(sibling.appendingPathComponent("inner/f.bin"))
         }
         let foreign = base.appendingPathComponent("foreign")
         try mkdir(foreign)
 
-        let real = FileSystemIdentityProvider()
-        var byInode: [UInt64: URL] = [:]
+        // Keyed by the GRANDCHILD's inode: the rename fires when the
+        // traversal is standing inside `inner`, i.e. after `p` itself has
+        // been entered, proven and emptied.
+        var byInnerInode: [UInt64: URL] = [:]
         for sibling in siblings {
-            byInode[try XCTUnwrap(real.identity(of: sibling)?.inode)] = sibling
+            let inner = sibling.appendingPathComponent("inner")
+            byInnerInode[try inode(of: inner)] = sibling
         }
 
         let provider = FirstDescentHook()
-        provider.watched = Set(byInode.keys)
+        provider.watched = Set(byInnerInode.keys)
         // The decoys are planted AT THE INSTANT of the rename, so the
         // fixture does not have to guess which sibling `readdir` hands back
         // first: whichever one the deletion entered is the one that moves,
         // and the OTHER name is the one still pending against the parent it
         // will fail to return to.
-        provider.onFirstDescent = { inode in
-            guard let moved = byInode[inode] else { return }
+        provider.onFirstDescent = { inner in
+            guard let moved = byInnerInode[inner] else { return }
             rename(moved.path, foreign.appendingPathComponent("moved").path)
-            for (other, url) in byInode where other != inode {
+            for (other, url) in byInnerInode where other != inner {
                 let decoy = foreign.appendingPathComponent(url.lastPathComponent)
                 try? self.mkdir(decoy)
                 try? self.write(
@@ -424,7 +572,7 @@ final class DepthSafeRemovalTests: XCTestCase {
         }
         let fired = try XCTUnwrap(provider.firedFor,
                                   "the fixture never performed the rename")
-        for (inode, url) in byInode where inode != fired {
+        for (inner, url) in byInnerInode where inner != fired {
             XCTAssertTrue(
                 exists(foreign.appendingPathComponent(
                     "\(url.lastPathComponent)/precious.bin"
@@ -432,6 +580,117 @@ final class DepthSafeRemovalTests: XCTestCase {
                 "content in the foreign parent must not be deleted by name"
             )
         }
+    }
+
+    /// A directory that left the held parent BEFORE it was emptied must not
+    /// be emptied at all.
+    ///
+    /// The descriptor survives the `rename(2)` — that is what descriptors
+    /// do — so the destructive pass runs happily inside a directory that now
+    /// lives in somebody else's tree, unlinking whatever its new owner has
+    /// put there. A check taken on the way back UP cannot help: by then the
+    /// contents are gone. The binding has to be re-proven against the held
+    /// parent BEFORE the first `unlinkat`, and the proof is containment —
+    /// the child's `..` still resolving to the inode we are holding — not a
+    /// path and not a recorded name.
+    func testRefusesToEmptyAChildThatLeftTheHeldParentFirst() throws {
+        let target = base.appendingPathComponent("escaping-child")
+        let child = target.appendingPathComponent("c")
+        try mkdir(child)
+        try write(child.appendingPathComponent("own.bin"))
+        let foreign = base.appendingPathComponent("foreign")
+        try mkdir(foreign)
+        let relocated = foreign.appendingPathComponent("moved")
+
+        let provider = FirstDescentHook()
+        provider.watched = [try inode(of: child)]
+        // Real `rename(2)` at the instant the child is open and about to be
+        // emptied, followed by the new owner writing into that location.
+        provider.onFirstDescent = { _ in
+            rename(child.path, relocated.path)
+            try? self.write(
+                relocated.appendingPathComponent("precious.bin"), bytes: 4096
+            )
+        }
+
+        XCTAssertThrowsError(
+            try DepthSafeRemoval.remove(at: target, provider: provider)
+        ) { error in
+            XCTAssertTrue(
+                error.localizedDescription.contains("moved while it was"),
+                "the refusal must name the relocation: "
+                    + error.localizedDescription
+            )
+        }
+        XCTAssertNotNil(provider.firedFor,
+                        "the fixture never performed the rename")
+        XCTAssertTrue(
+            exists(relocated.appendingPathComponent("precious.bin")),
+            "content placed in the relocated directory belongs to its new "
+                + "owner and must not be unlinked"
+        )
+    }
+
+    // MARK: - The enumeration handle
+
+    /// Every entry name `fdopendir` hands back for the descriptor, sorted.
+    /// The descriptor is CONSUMED, exactly as production consumes it.
+    private func names(consuming descriptor: Int32) -> [String] {
+        guard let stream = fdopendir(descriptor) else {
+            close(descriptor)
+            return ["<fdopendir failed: \(errno)>"]
+        }
+        defer { closedir(stream) }
+        var found: [String] = []
+        while let entry = readdir(stream) {
+            var raw = entry.pointee.d_name
+            let name = withUnsafeBytes(of: &raw) { bytes in
+                String(cString: bytes.bindMemory(to: CChar.self).baseAddress!)
+            }
+            found.append(name)
+        }
+        return found.sorted()
+    }
+
+    /// The handle `fdopendir` consumes must be close-on-exec AND its own
+    /// description — two properties `dup(2)` gives up, both of them silently.
+    ///
+    /// Close-on-exec because this process spawns children (`Process`) while
+    /// permanent deletions run on a background queue, and an inherited
+    /// directory handle keeps deleted objects alive for the child's
+    /// lifetime. Own description because `dup` shares the FILE OFFSET with
+    /// the descriptor the traversal keeps holding, so a second read of the
+    /// same directory reports it EMPTY — the one answer a deleter must never
+    /// be given wrongly. Asked of the kernel (`fcntl(F_GETFD)`, a real second
+    /// `readdir` pass), not of the code under test.
+    func testTheEnumerationHandleIsCloseOnExecAndSeparatelyPositioned() throws {
+        let directory = base.appendingPathComponent("enumerable")
+        try mkdir(directory)
+        for index in 0..<3 {
+            try write(directory.appendingPathComponent("f\(index).bin"))
+        }
+        let held = try openDirectory(directory)
+        defer { close(held) }
+
+        let first = DepthSafeRemoval.enumerationDescriptor(for: held)
+        XCTAssertGreaterThanOrEqual(first, 0, "enumeration handle")
+        XCTAssertEqual(
+            fcntl(first, F_GETFD) & FD_CLOEXEC, FD_CLOEXEC,
+            "the handle is inheritable by anything this process spawns"
+        )
+        let firstPass = names(consuming: first)
+        XCTAssertEqual(
+            firstPass, [".", "..", "f0.bin", "f1.bin", "f2.bin"],
+            "fixture: the directory's real contents"
+        )
+
+        let second = DepthSafeRemoval.enumerationDescriptor(for: held)
+        XCTAssertGreaterThanOrEqual(second, 0, "second enumeration handle")
+        XCTAssertEqual(
+            names(consuming: second), firstPass,
+            "a second enumeration of the same held descriptor must see the "
+                + "same directory, not an empty one"
+        )
     }
 
     // MARK: - Ordinary trees are still ordinary

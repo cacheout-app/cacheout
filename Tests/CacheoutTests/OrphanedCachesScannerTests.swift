@@ -79,6 +79,23 @@ final class OrphanedCachesScannerTests: XCTestCase {
         (try? fm.contentsOfDirectory(atPath: "/dev/fd").count) ?? -1
     }
 
+    /// The same question asked WITHOUT opening a descriptor to ask it.
+    /// `contentsOfDirectory("/dev/fd")` needs a handle of its own, and that
+    /// handle is the same order of magnitude as the quantity under test, so
+    /// it cannot be used to sample a peak. `fcntl(F_GETFD)` allocates
+    /// nothing, so a sample taken from inside a walk event is exactly what
+    /// the walk was holding at that instant.
+    private func heldDescriptorCount() -> Int {
+        var limits = rlimit()
+        guard getrlimit(RLIMIT_NOFILE, &limits) == 0 else { return -1 }
+        let ceiling = Int32(clamping: min(limits.rlim_cur, 65_536))
+        var count = 0
+        for descriptor in 0..<ceiling where fcntl(descriptor, F_GETFD) >= 0 {
+            count += 1
+        }
+        return count
+    }
+
     /// Run `body` and assert it leaked no descriptors. `SecureDirectory`'s
     /// `deinit` is what makes this pass on `break walk` and early-refusal
     /// paths alike; this is the enforcement, not review vigilance.
@@ -1591,8 +1608,13 @@ final class OrphanedCachesScannerTests: XCTestCase {
         /// it, and recording it is how "did not cross" is proven by the
         /// ABSENCE of any touch rather than by an empty result.
         override func probeChild(
-            inDirectory descriptor: Int32, named name: String, logical: URL
+            inDirectory descriptor: Int32, named name: String,
+            logical: @autoclosure () -> URL
         ) -> ChildProbe {
+            // Evaluated ONCE, here: the walk composes no path below its root
+            // (hence the autoclosure), so a double that keys on the spelling
+            // is the one that pays for composing it.
+            let logical = logical()
             probedPaths.append(logical.standardizedFileURL.path)
             return super.probeChild(
                 inDirectory: descriptor, named: name, logical: logical
@@ -1742,8 +1764,13 @@ final class OrphanedCachesScannerTests: XCTestCase {
         }
 
         override func probeChild(
-            inDirectory descriptor: Int32, named name: String, logical: URL
+            inDirectory descriptor: Int32, named name: String,
+            logical: @autoclosure () -> URL
         ) -> ChildProbe {
+            // Evaluated ONCE, here: the walk composes no path below its root
+            // (hence the autoclosure), so a double that keys on the spelling
+            // is the one that pays for composing it.
+            let logical = logical()
             probedPaths.append(logical.path)
             return super.probeChild(
                 inDirectory: descriptor, named: name, logical: logical
@@ -1885,8 +1912,13 @@ final class OrphanedCachesScannerTests: XCTestCase {
         private(set) var probedPaths: [String] = []
 
         override func probeChild(
-            inDirectory descriptor: Int32, named name: String, logical: URL
+            inDirectory descriptor: Int32, named name: String,
+            logical: @autoclosure () -> URL
         ) -> ChildProbe {
+            // Evaluated ONCE, here: the walk composes no path below its root
+            // (hence the autoclosure), so a double that keys on the spelling
+            // is the one that pays for composing it.
+            let logical = logical()
             probedPaths.append(logical.path)
             let real = super.probeChild(
                 inDirectory: descriptor, named: name, logical: logical
@@ -1965,8 +1997,13 @@ final class OrphanedCachesScannerTests: XCTestCase {
         /// an ancestor swap the same comparison proves nothing, which is
         /// why containment, not identity, is the guarantee.)
         override func probeChild(
-            inDirectory descriptor: Int32, named name: String, logical: URL
+            inDirectory descriptor: Int32, named name: String,
+            logical: @autoclosure () -> URL
         ) -> ChildProbe {
+            // Evaluated ONCE, here: the walk composes no path below its root
+            // (hence the autoclosure), so a double that keys on the spelling
+            // is the one that pays for composing it.
+            let logical = logical()
             probedPaths.append(logical.path)
             let real = super.probeChild(
                 inDirectory: descriptor, named: name, logical: logical
@@ -2041,8 +2078,13 @@ final class OrphanedCachesScannerTests: XCTestCase {
         private(set) var probedPaths: [String] = []
 
         override func probeChild(
-            inDirectory descriptor: Int32, named name: String, logical: URL
+            inDirectory descriptor: Int32, named name: String,
+            logical: @autoclosure () -> URL
         ) -> ChildProbe {
+            // Evaluated ONCE, here: the walk composes no path below its root
+            // (hence the autoclosure), so a double that keys on the spelling
+            // is the one that pays for composing it.
+            let logical = logical()
             probedPaths.append(logical.path)
             if !swapped, logical.standardizedFileURL.path.hasSuffix(swapWhenProbing) {
                 swapped = true
@@ -2151,6 +2193,93 @@ final class OrphanedCachesScannerTests: XCTestCase {
         XCTAssertTrue(probe.complete, "\(probe.obstructions)")
     }
 
+    // MARK: - A subtree PROVEN to exist that the open cannot find
+
+    /// The window between the discovery `fstatat` — which PROVED, against a
+    /// parent descriptor we hold, that this name is a DIRECTORY — and the
+    /// `openat` that descends into it. A real `rename(2)` fired inside that
+    /// window moves the subtree to a name the bounded read has already gone
+    /// past, so this walk never inspects it, and the bytes are still there.
+    ///
+    /// Recording NOTHING at that site is the fail-open: the entry comes back
+    /// `complete` with no matches, which for a known-leak tier is exactly
+    /// the input Quick Clean deletes with no per-item confirmation
+    /// (`OrphanedCacheClassifier.cleanKnownLeak`).
+    func testRenameBetweenVettingAndOpenIsRecordedNotSwallowed() throws {
+        let entry = cachesRoot.appendingPathComponent("com.example.Leak")
+        try mkdir(entry.appendingPathComponent("aaa"))
+        try mkdir(entry.appendingPathComponent("zzz/Documents"))
+
+        var renamed = false
+        let probe = OrphanedCachesScanner.boundedUserDataShapeWalk(
+            at: entry, provider: FileSystemIdentityProvider(),
+            entryLimit: OrphanedCachesScanner.defaultProbeEntryLimit
+        ) { event in
+            guard case .willDescend(let name, let from) = event,
+                  name == "zzz", !renamed else { return }
+            // A REAL `rename(2)`, single-threaded, at the one deterministic
+            // instant the race lives in. `bbb` sorts BEFORE `zzz`, so the
+            // byte-ascending read has already passed it: nothing else in
+            // this walk will ever look at it.
+            let moved = rename(from.appendingPathComponent("zzz").path,
+                               from.appendingPathComponent("bbb").path)
+            XCTAssertEqual(moved, 0, "fixture rename failed: \(errno)")
+            renamed = true
+        }
+
+        XCTAssertTrue(renamed, "the fixture never armed the rename")
+        XCTAssertTrue(
+            fm.fileExists(
+                atPath: entry.appendingPathComponent("bbb/Documents").path
+            ),
+            "the subtree must still be ON DISK — renamed, not deleted"
+        )
+        XCTAssertTrue(probe.matches.isEmpty,
+                      "the shape was never seen: \(probe.matches)")
+        XCTAssertEqual(
+            probe.obstructions, [.transientFailure],
+            "a directory the walk PROVED exists and then could not open was "
+                + "never inspected; a rename is retryable, so it is a "
+                + "transient failure, not silence"
+        )
+        XCTAssertFalse(
+            probe.complete,
+            "UNINSPECTED IS NOT CLEAN: complete + no matches on a known-leak "
+                + "entry is automatically clean-eligible, and Quick Clean "
+                + "would delete the uninspected Documents tree"
+        )
+        XCTAssertTrue(
+            OrphanedCachesScanner.remediationGuidance(for: probe.obstructions)
+                .hasSuffix("Re-scan and try again."),
+            "and the refusal must be CLEARABLE by a retry"
+        )
+    }
+
+    /// The same instant, but the directory is genuinely UNLINKED rather than
+    /// renamed. Indistinguishable from the rename at the `openat` — both
+    /// return ENOENT — so it is classified the same way, and this test
+    /// pins that the fail-closed choice was made deliberately rather than
+    /// by accident of which fixture was written.
+    func testDirectoryUnlinkedBetweenVettingAndOpenIsAlsoRecorded() throws {
+        let entry = cachesRoot.appendingPathComponent("com.example.Evicted")
+        try mkdir(entry.appendingPathComponent("gone"))
+
+        var removed = false
+        let probe = OrphanedCachesScanner.boundedUserDataShapeWalk(
+            at: entry, provider: FileSystemIdentityProvider(),
+            entryLimit: OrphanedCachesScanner.defaultProbeEntryLimit
+        ) { event in
+            guard case .willDescend(let name, let from) = event,
+                  name == "gone", !removed else { return }
+            try? self.fm.removeItem(at: from.appendingPathComponent("gone"))
+            removed = true
+        }
+
+        XCTAssertTrue(removed, "the fixture never armed the removal")
+        XCTAssertEqual(probe.obstructions, [.transientFailure])
+        XCTAssertFalse(probe.complete)
+    }
+
     // MARK: - The descriptor bound never becomes a refusal (constraint 3)
 
     /// Builds `levels` nested directories with `mkdirat`, holding at most
@@ -2223,6 +2352,7 @@ final class OrphanedCachesScannerTests: XCTestCase {
 
         var reanchors = 0
         var peakLive = 0
+        var peakHeld = 0
         let probe = OrphanedCachesScanner.boundedUserDataShapeWalk(
             at: entry, provider: FileSystemIdentityProvider(),
             entryLimit: OrphanedCachesScanner.defaultProbeEntryLimit,
@@ -2230,7 +2360,9 @@ final class OrphanedCachesScannerTests: XCTestCase {
         ) { event in
             switch event {
             case .didReanchor: reanchors += 1
-            case .descriptorCensus(let live, _): peakLive = max(peakLive, live)
+            case .descriptorCensus(let live, let transient, _):
+                peakLive = max(peakLive, live)
+                peakHeld = max(peakHeld, live + transient)
             default: break
             }
         }
@@ -2245,16 +2377,33 @@ final class OrphanedCachesScannerTests: XCTestCase {
                        "a pure deep chain must not re-anchor even once")
         XCTAssertLessThanOrEqual(peakLive, 2,
                                  "tail release should hold root + current only")
+        // And the TRUE peak, transients included: root, the level being left
+        // behind, and the one handle in flight. 500 levels deep, under a
+        // soft limit of 96.
+        XCTAssertEqual(peakHeld, 3,
+                       "a pure chain must peak at root + current + one "
+                           + "in-flight handle, at ANY depth")
     }
 
     /// The formula, enforced rather than asserted in prose:
     /// `peak_live_fds = min(depth + 1, W) + 2`.
+    ///
+    /// AND ENFORCED WHERE THE PEAK ACTUALLY IS. The previous version of this
+    /// test sampled only the post-append census — the one instant of the
+    /// loop at which the walk holds NO transient handle — so the margin it
+    /// asserted could never be approached and a regression inside it could
+    /// not have failed the test. Every sample here is taken at a moment the
+    /// walk is holding an extra descriptor (mid-read, mid-descent,
+    /// mid-climb), and each one is cross-checked against a real `fcntl`
+    /// count of this process's descriptors so the census cannot flatter
+    /// itself.
     func testDescriptorPeakStaysInsideTheWindow() throws {
         let entry = cachesRoot.appendingPathComponent("com.example.Peak")
         // A COMB: every level keeps a pending sibling, so no tail release
         // is free and the window is the only thing holding the count down.
         var here = entry
-        for level in 0..<12 {
+        let depth = 12
+        for level in 0..<depth {
             try mkdir(here.appendingPathComponent("keep\(level)"))
             here = here.appendingPathComponent("down")
             try mkdir(here)
@@ -2262,33 +2411,255 @@ final class OrphanedCachesScannerTests: XCTestCase {
 
         let window = 4
         var peakLive = 0
-        var peakProcess = 0
-        let before = openDescriptorCount()
+        var peakCensus = 0
+        var peakMeasured = 0
+        var samples = 0
+        var disagreements: [String] = []
+        let before = heldDescriptorCount()
         let probe = OrphanedCachesScanner.boundedUserDataShapeWalk(
             at: entry, provider: FileSystemIdentityProvider(),
             entryLimit: OrphanedCachesScanner.defaultProbeEntryLimit,
             descriptorWindow: window
         ) { event in
-            if case .descriptorCensus(let live, _) = event {
-                peakLive = max(peakLive, live)
-                peakProcess = max(peakProcess, self.openDescriptorCount() - before)
+            guard case .descriptorCensus(let live, let transient, _) = event
+            else { return }
+            let measured = self.heldDescriptorCount() - before
+            samples += 1
+            peakLive = max(peakLive, live)
+            peakCensus = max(peakCensus, live + transient)
+            peakMeasured = max(peakMeasured, measured)
+            if measured != live + transient {
+                disagreements.append(
+                    "census \(live)+\(transient) vs measured \(measured)"
+                )
             }
         }
 
         XCTAssertTrue(probe.complete, "\(probe.obstructions)")
+        XCTAssertGreaterThan(samples, depth,
+                             "the walk must be sampled throughout, not once")
         XCTAssertEqual(peakLive, window,
                        "the comb must actually FILL the window, or this "
                            + "test proves nothing")
-        XCTAssertGreaterThan(peakProcess, 1,
-                             "the /dev/fd census must be observing real "
-                                 + "descriptors, or the bound is vacuous")
+        // THE CENSUS CANNOT LIE: at every sampled instant it equals what
+        // `fcntl` says this process is really holding. A census that
+        // undercounts its own transients would show up here, not as a
+        // silently comfortable margin.
+        XCTAssertEqual(disagreements, [],
+                       "the census disagreed with the kernel: \(disagreements)")
+        // THE PEAK IS REACHED, not merely bounded: W frame anchors plus the
+        // one handle in flight. Written as an equality so that a change
+        // which stops holding the peak — or one that starts holding more —
+        // both fail here.
+        XCTAssertEqual(peakMeasured, window + 1,
+                       "the observed peak must be exactly W + 1")
         XCTAssertLessThanOrEqual(
-            peakProcess, window + 2,
+            peakMeasured, min(depth + 1, window) + 2,
             "peak = min(depth + 1, W) + 2 — the +2 covers the enumeration "
                 + "handle, the in-flight child, and the `..` descriptor, "
                 + "which are mutually exclusive"
         )
-        XCTAssertEqual(openDescriptorCount(), before,
+        XCTAssertEqual(heldDescriptorCount(), before,
+                       "and every one of them is released")
+    }
+
+    /// This process's resident bytes, sampled without allocating.
+    private func residentBytes() -> Int64 {
+        var info = mach_task_basic_info()
+        var count = mach_msg_type_number_t(
+            MemoryLayout<mach_task_basic_info>.size / MemoryLayout<natural_t>.size
+        )
+        let status = withUnsafeMutablePointer(to: &info) { raw in
+            raw.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                task_info(mach_task_self_,
+                          task_flavor_t(MACH_TASK_BASIC_INFO), $0, &count)
+            }
+        }
+        return status == KERN_SUCCESS ? Int64(info.resident_size) : -1
+    }
+
+    /// Samples this process's resident size at every per-entry syscall,
+    /// WITHOUT evaluating `logical` — which is exactly the production
+    /// contract: nothing below the walk root composes a path.
+    private final class MemorySamplingProvider: FileSystemIdentityProvider {
+        var sample: (() -> Void)?
+
+        override func probeChild(
+            inDirectory descriptor: Int32, named name: String,
+            logical: @autoclosure () -> URL
+        ) -> ChildProbe {
+            sample?()
+            // `logical` is deliberately NOT evaluated.
+            return super.probeChild(
+                inDirectory: descriptor, named: name,
+                logical: URL(fileURLWithPath: "/")
+            )
+        }
+    }
+
+    /// THE ENTRY BUDGET BOUNDS ATTENTION, NOT RESOURCES — the third time
+    /// that distinction has cost this walk something (after
+    /// `contentsOfDirectory` materialising a whole directory before any cap
+    /// could apply). A `URL` stored per frame retained a private copy of the
+    /// whole prefix above it, so the walk's own bookkeeping grew
+    /// QUADRATICALLY with depth while the entry count stayed flat: this
+    /// fixture — 1,800 levels of 240-byte basenames, 1,800 entries out of a
+    /// 20,000-entry budget — retains hundreds of megabytes of duplicated
+    /// path prefixes that way, before the tree is even large.
+    ///
+    /// Sampled from the PROVIDER rather than from a `WalkEvent` observer on
+    /// purpose: an observer asks for URLs, and asking is what costs.
+    func testDeepChainDoesNotRetainQuadraticPathPrefixes() throws {
+        let entry = cachesRoot.appendingPathComponent("com.example.LongNames")
+        try mkdir(entry)
+        let levels = 1_800
+        let name = String(repeating: "n", count: 240)
+        let deepest = try makeDeepChain(under: entry, name: name, levels: levels)
+        defer { removeDeepChain(deepest: deepest, stopAt: entry, name: name) }
+
+        let provider = MemorySamplingProvider()
+        let baseline = residentBytes()
+        var peak = baseline
+        provider.sample = { peak = max(peak, self.residentBytes()) }
+
+        let probe = OrphanedCachesScanner.boundedUserDataShapeWalk(
+            at: entry, provider: provider,
+            entryLimit: OrphanedCachesScanner.defaultProbeEntryLimit
+        )
+
+        XCTAssertTrue(probe.complete, "\(probe.obstructions)")
+        XCTAssertTrue(probe.matches.isEmpty)
+        let grew = peak - baseline
+        // The bookkeeping is now ONE basename per level — 1,800 × 240 bytes,
+        // under half a megabyte — so this margin is orders of magnitude
+        // clear of the fix and comfortably under the defect.
+        XCTAssertLessThan(
+            grew, 48 * 1_024 * 1_024,
+            "the walk grew \(grew / 1_048_576) MiB of bookkeeping over "
+                + "\(levels) levels — a full prefix per level is back"
+        )
+    }
+
+    /// The refactor must not change the spelling an observer sees: the
+    /// composed-on-demand URL has to equal the URL the per-frame copy used
+    /// to carry, at every level and for every awkward basename.
+    ///
+    /// The expected values are composed WITHOUT touching the filesystem, and
+    /// that is the point of the assertion as much as the components are: the
+    /// bare `appendingPathComponent(_:)` the walk used to call decides its
+    /// trailing slash by statting the composed path, which makes an
+    /// observer's spelling depend on what is on disk at the moment it is
+    /// composed — including on a rename an attacker just landed.
+    func testOnDemandSpellingMatchesComponentWiseComposition() throws {
+        let entry = cachesRoot.appendingPathComponent("com.example.Spelling")
+        // Awkward on purpose: spaces, leading dots, a percent, non-ASCII.
+        let components = ["a b", "..dots", "100%", "Ünïcodé", ".hidden", "z"]
+        var expected: [URL] = [entry]
+        var here = entry
+        for component in components {
+            here = here.appendingPathComponent(component, isDirectory: true)
+            expected.append(here)
+        }
+        try mkdir(here)
+
+        var enumerated: [URL] = []
+        var descended: [String: URL] = [:]
+        let probe = OrphanedCachesScanner.boundedUserDataShapeWalk(
+            at: entry, provider: FileSystemIdentityProvider(),
+            entryLimit: OrphanedCachesScanner.defaultProbeEntryLimit
+        ) { event in
+            switch event {
+            case .didEnumerate(let logical, _): enumerated.append(logical)
+            case .willDescend(let name, let from): descended[name] = from
+            default: break
+            }
+        }
+
+        XCTAssertTrue(probe.complete, "\(probe.obstructions)")
+        XCTAssertEqual(enumerated, expected,
+                       "an observer must see the walk's OWN spelling, "
+                           + "composed root-first, one component per level")
+        for (index, component) in components.enumerated() {
+            XCTAssertEqual(descended[component], expected[index],
+                           "descent into \(component) was reported from the "
+                               + "wrong parent spelling")
+        }
+    }
+
+    /// The peak of a walk that is CLIMBING: a comb narrower than its depth
+    /// forces `..` re-anchors, and a climb holds two handles of its own
+    /// (the level it is standing on and the level it just opened) on top of
+    /// the frame stack. Sampled mid-climb, which no census taken after the
+    /// climb finished could ever see.
+    func testDescriptorPeakDuringAReAnchorClimb() throws {
+        let entry = cachesRoot.appendingPathComponent("com.example.Climb")
+        var here = entry
+        let depth = 8
+        for level in 0..<depth {
+            try mkdir(here.appendingPathComponent("keep\(level)"))
+            here = here.appendingPathComponent("down")
+            try mkdir(here)
+        }
+
+        let window = 2   // the floor: every pop past it must climb
+        var reanchors = 0
+        var peakMeasured = 0
+        var peakCensus = 0
+        var disagreements: [String] = []
+        // The event SEQUENCE, so "was a sample taken while the climb was in
+        // flight" is decided by position rather than by hope: a mid-climb
+        // census lands strictly between the pop that started the climb and
+        // the re-anchor that ended it.
+        var sequence: [String] = []
+        let before = heldDescriptorCount()
+        let probe = OrphanedCachesScanner.boundedUserDataShapeWalk(
+            at: entry, provider: FileSystemIdentityProvider(),
+            entryLimit: OrphanedCachesScanner.defaultProbeEntryLimit,
+            descriptorWindow: window
+        ) { event in
+            switch event {
+            case .didReanchor:
+                reanchors += 1
+                sequence.append("reanchor")
+            case .willPop: sequence.append("pop")
+            case .willDescend: sequence.append("descend")
+            case .didEnumerate: sequence.append("enumerate")
+            case .descriptorCensus(let live, let transient, _):
+                sequence.append("census")
+                let measured = self.heldDescriptorCount() - before
+                peakCensus = max(peakCensus, live + transient)
+                peakMeasured = max(peakMeasured, measured)
+                if measured != live + transient {
+                    disagreements.append(
+                        "census \(live)+\(transient) vs measured \(measured)"
+                    )
+                }
+            }
+        }
+
+        XCTAssertTrue(probe.complete, "\(probe.obstructions)")
+        XCTAssertGreaterThan(reanchors, 0, "the fixture never forced a climb")
+        XCTAssertEqual(disagreements, [],
+                       "the census disagreed with the kernel: \(disagreements)")
+        let midClimbSamples = sequence.indices.filter { index in
+            index + 2 < sequence.count
+                && sequence[index] == "pop"
+                && sequence[index + 1] == "census"
+                && sequence[index + 2] == "reanchor"
+        }.count
+        XCTAssertGreaterThan(
+            midClimbSamples, 0,
+            "not one sample was taken WHILE a climb held its extra "
+                + "descriptors — the peak of the climb is unobserved: "
+                + "\(sequence.prefix(24))"
+        )
+        XCTAssertEqual(peakMeasured, peakCensus,
+                       "the census must reach the measured peak")
+        XCTAssertLessThanOrEqual(
+            peakMeasured, min(depth + 1, window) + 2,
+            "a climb must stay inside min(depth + 1, W) + 2"
+        )
+        XCTAssertEqual(heldDescriptorCount(), before,
                        "and every one of them is released")
     }
 
@@ -2902,8 +3273,13 @@ final class OrphanedCachesScannerTests: XCTestCase {
         var failures: [String: Int32] = [:]
 
         override func probeChild(
-            inDirectory descriptor: Int32, named name: String, logical: URL
+            inDirectory descriptor: Int32, named name: String,
+            logical: @autoclosure () -> URL
         ) -> ChildProbe {
+            // Evaluated ONCE, here: the walk composes no path below its root
+            // (hence the autoclosure), so a double that keys on the spelling
+            // is the one that pays for composing it.
+            let logical = logical()
             if let code = failures[logical.standardizedFileURL.path] {
                 return .failed(errno: code)
             }

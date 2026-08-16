@@ -2150,8 +2150,13 @@ final class CacheCleanerTests: XCTestCase {
         /// believes it is at, which production ignores and a test injects
         /// on.
         override func probeChild(
-            inDirectory descriptor: Int32, named name: String, logical: URL
+            inDirectory descriptor: Int32, named name: String,
+            logical: @autoclosure () -> URL
         ) -> ChildProbe {
+            // Evaluated ONCE, here: the walk composes no path below its root
+            // (hence the autoclosure), so a double that keys on the spelling
+            // is the one that pays for composing it.
+            let logical = logical()
             if let code = failures[logical.standardizedFileURL.path] {
                 return .failed(errno: code)
             }

@@ -174,13 +174,22 @@ class FileSystemIdentityProvider {
     /// carried solely so tests can key overrides and touch-recording on the
     /// path the walk believes it is at.
     ///
+    /// IT IS AN `@autoclosure` PRECISELY BECAUSE PRODUCTION IGNORES IT. The
+    /// walk keeps its spelling as one basename per level and composes a URL
+    /// only for whoever actually wants one, so the per-entry
+    /// `appendingPathComponent` against a full parent path — O(depth) work
+    /// per entry, and O(depth²) retained bytes down a deep chain — is not
+    /// performed at all unless an override evaluates it. Overrides evaluate
+    /// `logical()` once and pass the value on.
+    ///
     /// `name` MUST be a single safe component — callers validate before
     /// calling, because `openat`/`fstatat` happily accept a MULTI-COMPONENT
     /// relative path, and `O_NOFOLLOW` then guards only its last component
     /// (measured: `openat(base, "cache/mid/secret.bin", O_NOFOLLOW)` opens a
     /// foreign file through a symlinked `mid`).
     func probeChild(
-        inDirectory descriptor: Int32, named name: String, logical: URL
+        inDirectory descriptor: Int32, named name: String,
+        logical: @autoclosure () -> URL
     ) -> ChildProbe {
         var st = stat()
         guard fstatat(descriptor, name, &st, AT_SYMLINK_NOFOLLOW) == 0 else {
@@ -219,8 +228,11 @@ class FileSystemIdentityProvider {
     /// not from re-checking a recorded identity, which an ancestor swap
     /// makes meaningless (the recorded value is then already the foreign
     /// object's).
+    /// `logical` is lazy for the same reason as `probeChild`'s: production
+    /// never composes it.
     func openChildDirectory(
-        inDirectory descriptor: Int32, named name: String, logical: URL
+        inDirectory descriptor: Int32, named name: String,
+        logical: @autoclosure () -> URL
     ) -> DescriptorOpen {
         let fd = openat(
             descriptor, name, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW

@@ -921,6 +921,49 @@ struct OrphanedCachesScanner: @unchecked Sendable {
     ///    delete then fails with its own error. Fail-closed, but real — the
     ///    proper fix is to give the deleter the same descriptor-relative
     ///    treatment.
+    /// 7. **The DISCOVERY race — a name that vanishes between `readdir` and
+    ///    its `fstatat` — is still benign** (`.absent`, no obstruction),
+    ///    while the same disappearance one step later, at the `openat` of a
+    ///    name already PROVEN to be a directory, is now `.transientFailure`.
+    ///    The asymmetry is deliberate, and the line is what has been PROVEN:
+    ///    at the `openat` a subtree is known to exist, so losing it means
+    ///    something went uninspected; at the `fstatat` nothing is known —
+    ///    the name may have been a file, and cache FILES are evicted under a
+    ///    running scan constantly, so obstructing there would make almost
+    ///    every probe of a live cache incomplete and no known-leak entry
+    ///    would ever be auto-cleanable again.
+    ///    WHAT REMAINS EXPLOITABLE, precisely: a writer inside the entry can
+    ///    `rename` a SUBDIRECTORY inside that narrower window, and the walk
+    ///    then reports `complete` without having inspected it. The renamer
+    ///    needs write permission on the enclosing cache directory — which is
+    ///    also permission to delete that subtree outright — so it buys an
+    ///    attacker no destruction they could not perform directly; what it
+    ///    buys is a false "inspected and clean", and the realistic victim is
+    ///    a legitimate app churning its own cache while Quick Clean runs.
+    ///    Closing it needs a second bounded re-read of any directory that
+    ///    saw an `.absent`, which is not in this change.
+    /// 8. **`DirectorySizer` (called from `sweepFacts`) is still a
+    ///    path-based `FileManager.enumerator` walk.** An ancestor swapped
+    ///    for a different REAL directory between this probe and the sizing
+    ///    pass makes it attribute foreign bytes, dates and denials to the
+    ///    cache entry. No user-data DISCLOSURE and no deletion
+    ///    AUTHORISATION flows from it — the shapes verdict, which is what
+    ///    gates automatic cleaning, comes from this descriptor-anchored walk
+    ///    — so what an attacker gains is a wrong SIZE, a wrong newest-date,
+    ///    and possibly a spurious denial on one row. Converting the sizer to
+    ///    the same discipline is the follow-on that this walk's
+    ///    `SecureDirectory`/`Frame` shape exists to make small.
+    /// 9. **At SCAN time the walk root arrives already canonical.**
+    ///    `sweepFacts` enumerates with `contentsOfDirectory(at:)`, whose
+    ///    children are returned FULLY RESOLVED (measured), so `entryURL` —
+    ///    and therefore `SweptCacheEntry.url` and every spelling composed
+    ///    below it — carries a canonical prefix rather than the unresolved
+    ///    one the project's rule (`resolveTargetKeepingLeaf`) calls for.
+    ///    Pre-existing and unchanged by this commit. It is a DISPLAY and
+    ///    ADDRESSING divergence (under a symlinked `~/Library/Caches`, rows
+    ///    are shown and addressed by their resolved path); the deletion path
+    ///    re-derives its own target and re-probes, so no authorisation
+    ///    decision is taken on this spelling.
     ///
     /// NO-CROSS rule (safety — PR #458 review, matching the sizer's own
     /// root check at `DirectorySizer.swift:205` and its within-walk check at
@@ -949,13 +992,16 @@ struct OrphanedCachesScanner: @unchecked Sendable {
     /// removes the link, never its target, so no deletable content went
     /// uninspected.
     ///
-    /// UNRESOLVED SPELLING, unchanged and now stronger: `Frame.logicalURL`
+    /// UNRESOLVED SPELLING, unchanged and now stronger: the walk's spelling
     /// is composed exactly as before (the walk's own root plus
     /// `appendingPathComponent` per level) and is used for DISPLAY and
     /// IDENTITY only. Below the root it is not merely "the path we lstat" —
     /// it is not a path anything is reached by at all. No `realpath` /
     /// `canonicalize` output may ever be substituted for it, and it may
     /// never be handed to `open`, `opendir`, `stat` or `FileManager`.
+    /// It is now also never MATERIALISED unless an observer asks for it:
+    /// the stack keeps one basename per level (`pathComponents`), and a URL
+    /// is composed on demand from the root. See `logicalURL(atDepth:)`.
     ///
     /// ## ONE budget, and NO depth cap (PR #456 follow-up)
     /// The ENTRY budget is this walk's only bound, and it alone guarantees
@@ -1051,9 +1097,18 @@ struct OrphanedCachesScanner: @unchecked Sendable {
         /// Proven when this frame's descriptor was first opened; what a
         /// re-acquisition must match.
         let identity: FileSystemIdentityProvider.Identity
-        /// The walk's UNRESOLVED spelling. Display and identity ONLY —
-        /// never opened, never stat'd, never handed to `FileManager`.
-        let logicalURL: URL
+        /// NO PATH IS STORED HERE. A `URL` per frame made the walk's own
+        /// bookkeeping QUADRATIC in depth: level `k` retained a private copy
+        /// of the whole prefix above it, so a 20,000-level chain of long
+        /// legal basenames retained tens of gigabytes of duplicated
+        /// prefixes, and the entry budget did not bound it — the budget
+        /// bounds ATTENTION (how many entries are inspected), never
+        /// RESOURCES. That distinction has now cost this walk three times:
+        /// the flat sibling stack's descriptor bill, `contentsOfDirectory`
+        /// materialising a whole directory before any cap could apply, and
+        /// this. The spelling lives once, as one basename per level, in the
+        /// walk's `pathComponents`, and is composed into a URL only when an
+        /// observer asks (`logicalURL(atDepth:)`).
         /// Subdirectory basenames, byte-wise ASCENDING.
         var pending: [String] = []
         var cursor: Int = 0
@@ -1074,8 +1129,19 @@ struct OrphanedCachesScanner: @unchecked Sendable {
         /// A released frame was restored with one `openat(child, "..")` —
         /// the ONLY cost of exceeding the descriptor window.
         case didReanchor(depth: Int)
-        /// After a descent: how many descriptors the frame stack holds.
-        case descriptorCensus(live: Int, depth: Int)
+        /// Every descriptor this walk holds AT THIS INSTANT, split into the
+        /// `live` frame-stack anchors (what the window bounds) and the
+        /// `transient` handles held outside the stack: the enumeration
+        /// handle, the in-flight child, and the `..` descriptors of a climb.
+        ///
+        /// EMITTED AT THE PEAKS, not between them (PR #458 review, axis 7).
+        /// A single census taken after the child frame was appended and
+        /// before `enumerate` ran sampled the one instant of the loop when
+        /// NO transient exists, so the margin the test asserted could never
+        /// be approached and a regression in it could not fail the test.
+        /// `live + transient` is the count an external observer of this
+        /// process sees, and tests assert that equality.
+        case descriptorCensus(live: Int, transient: Int, depth: Int)
     }
 
     /// A basename that may be handed to `openat`/`fstatat`.
@@ -1175,8 +1241,41 @@ struct OrphanedCachesScanner: @unchecked Sendable {
         // at the end, which carries the whole set. The root checks above
         // may return early only because nothing is established yet there.
         var frames: [Frame] = [
-            Frame(dir: root, identity: root.identity, logicalURL: entryURL)
+            Frame(dir: root, identity: root.identity)
         ]
+
+        /// The walk's UNRESOLVED spelling of the CURRENT DFS PATH: ONE
+        /// basename per level below the root, pushed on descent and popped
+        /// on pop. `pathComponents.count == frames.count - 1` always.
+        ///
+        /// This is the whole path bookkeeping the walk retains — the bytes
+        /// of the path it is standing on, once, rather than a full prefix
+        /// copy per level.
+        var pathComponents: [String] = []
+
+        /// Compose the spelling of the frame at `depth`, root-first, exactly
+        /// as the per-frame URL was composed before.
+        ///
+        /// LAZY BY CONTRACT: production never calls this — no path below the
+        /// root reaches a syscall — so the O(depth) composition is paid only
+        /// when a `WalkEvent` observer or a test double actually wants a
+        /// URL. Every provider argument below is an `@autoclosure` for the
+        /// same reason: passing one costs nothing until someone evaluates it.
+        ///
+        /// `isDirectory:` IS SPELLED OUT, and that is a fix, not a detail.
+        /// The bare `appendingPathComponent(_:)` decides its trailing slash
+        /// by STATTING THE COMPOSED PATH — a path-based filesystem access
+        /// below the walk root, performed once per entry, whose answer
+        /// depends on whether an attacker's rename has already landed. Every
+        /// frame is a directory (it was opened `O_DIRECTORY`), so the answer
+        /// is known without asking anyone.
+        func logicalURL(atDepth depth: Int) -> URL {
+            var url = entryURL
+            for component in pathComponents.prefix(depth) {
+                url = url.appendingPathComponent(component, isDirectory: true)
+            }
+            return url
+        }
 
         /// Live descriptors held by the frame stack (transients excluded).
         func liveCount() -> Int {
@@ -1232,6 +1331,10 @@ struct OrphanedCachesScanner: @unchecked Sendable {
                    at depth: Int) -> Bool {
             var current = deepest
             var level = depth
+            // `deepest` is still frames[depth]'s, so the first iteration
+            // holds nothing outside the stack; from the second on, `current`
+            // is a climb-owned handle.
+            var transient = 0
             while level > target {
                 let up = openat(
                     current.fd, "..", O_RDONLY | O_DIRECTORY | O_CLOEXEC
@@ -1245,14 +1348,20 @@ struct OrphanedCachesScanner: @unchecked Sendable {
                     obstructions.insert(.transientFailure)
                     return false
                 }
+                // THE CLIMB'S PEAK: the stack, plus `current`, plus `parent`.
+                onEvent?(.descriptorCensus(
+                    live: liveCount(), transient: transient + 1, depth: level
+                ))
                 level -= 1
                 guard parent.identity == frames[level].identity else {
                     obstructions.insert(.transientFailure)
                     return false
                 }
-                // The previous `current` is released here by ARC: at most
-                // two transient descriptors exist during a climb.
+                // The previous `current` is released here by ARC unless it is
+                // still the frame's own anchor: at most two climb-owned
+                // descriptors exist at once.
                 current = parent
+                transient = 1
             }
             frames[target].dir = current
             onEvent?(.didReanchor(depth: target))
@@ -1272,9 +1381,20 @@ struct OrphanedCachesScanner: @unchecked Sendable {
                 obstructions.insert(.transientFailure)
                 return false
             }
-            let logical = frames[index].logicalURL
             let names: [String]
-            switch boundedChildNames(inDirectory: dir.fd, limit: remaining) {
+            let census: (() -> Void)? = onEvent.map { emit in
+                {
+                    // THE READ'S PEAK: the stack plus the fresh description
+                    // `fdopendir` consumes — the "+1 enumeration handle" the
+                    // bound's formula names, sampled WHILE it is open.
+                    emit(.descriptorCensus(
+                        live: liveCount(), transient: 1, depth: index
+                    ))
+                }
+            }
+            switch boundedChildNames(
+                inDirectory: dir.fd, limit: remaining, whileReading: census
+            ) {
             case .unreadable(let cause):
                 // Unreadable branch: absence of matches is unproven, and the
                 // walk continues elsewhere.
@@ -1287,7 +1407,14 @@ struct OrphanedCachesScanner: @unchecked Sendable {
                     $0.utf8.lexicographicallyPrecedes($1.utf8)
                 }
             }
-            onEvent?(.didEnumerate(logical: logical, names: names))
+            // Composed ONLY for an observer that exists (`if let`, not
+            // optional chaining, so the laziness is on the page rather than
+            // in a language rule a reader has to recall).
+            if let emit = onEvent {
+                emit(.didEnumerate(
+                    logical: logicalURL(atDepth: index), names: names
+                ))
+            }
 
             var pending: [String] = []
             var vetted: [String: FileSystemIdentityProvider.Identity] = [:]
@@ -1306,10 +1433,6 @@ struct OrphanedCachesScanner: @unchecked Sendable {
                     obstructions.insert(.transientFailure)
                     continue
                 }
-                // The walk's OWN spelling — composed, never resolved. It is
-                // display and identity only; nothing below the root is ever
-                // reached BY it.
-                let child = logical.appendingPathComponent(name)
                 // FNM_CASEFOLD (PR #456 review): the guard protects user
                 // content in ANY casing. Fail-safe by direction —
                 // casefolding can only ADD matches, which only forces
@@ -1320,9 +1443,18 @@ struct OrphanedCachesScanner: @unchecked Sendable {
                 }
                 // ONE `fstatat` against the HELD parent: kind and identity
                 // from a single atomic resolution that no path swap can
-                // re-point.
+                // re-point. `logical` is the walk's OWN spelling — composed,
+                // never resolved, display and identity only; nothing below
+                // the root is ever reached BY it — and it is an
+                // `@autoclosure`, so production, which ignores it, composes
+                // nothing at all.
                 switch provider.probeChild(
-                    inDirectory: dir.fd, named: name, logical: child
+                    inDirectory: dir.fd, named: name,
+                    // `isDirectory: false`: this child's kind is what the
+                    // probe is about to establish, so the spelling claims
+                    // nothing about it (and never stats to find out).
+                    logical: logicalURL(atDepth: index)
+                        .appendingPathComponent(name, isDirectory: false)
                 ) {
                 case .facts(let facts) where facts.kind == .directory:
                     // ALWAYS descended: discovering this directory already
@@ -1379,6 +1511,7 @@ struct OrphanedCachesScanner: @unchecked Sendable {
                     }
                 }
                 frames.removeLast()   // `deinit` closes the descriptor
+                if !pathComponents.isEmpty { pathComponents.removeLast() }
                 continue
             }
 
@@ -1394,32 +1527,68 @@ struct OrphanedCachesScanner: @unchecked Sendable {
                 obstructions.insert(.budgetExhausted)
                 break walk
             }
-            guard let parent = frames[depth].dir else {
+            guard frames[depth].dir != nil else {
                 obstructions.insert(.transientFailure)
                 break walk
             }
-            let childURL = frames[depth].logicalURL.appendingPathComponent(name)
-            onEvent?(.willDescend(name: name, from: frames[depth].logicalURL))
+            if let emit = onEvent {
+                emit(.willDescend(name: name, from: logicalURL(atDepth: depth)))
+            }
 
             guard isSafeComponent(name) else {
                 obstructions.insert(.transientFailure)
                 continue
             }
-            let opened = provider.openChildDirectory(
-                inDirectory: parent.fd, named: name, logical: childURL
-            )
+            // THE PARENT REFERENCE IS SCOPED ON PURPOSE. A `let parent =
+            // frames[depth].dir` held across the rest of this iteration
+            // outlives `makeRoom`'s release of that very frame and keeps its
+            // descriptor OPEN — so the process held one more anchor than the
+            // window accounted for, for the whole tail of every iteration
+            // (measured against `fcntl`: census W, kernel W + 1). Inside the
+            // documented `+2`, but unaccounted, and an unaccounted
+            // descriptor is how a window stops being a bound.
+            let opened: FileSystemIdentityProvider.DescriptorOpen
+            do {
+                guard let parent = frames[depth].dir else {
+                    obstructions.insert(.transientFailure)
+                    break walk
+                }
+                opened = provider.openChildDirectory(
+                    inDirectory: parent.fd, named: name,
+                    // A vetted directory: `isDirectory: true` states what
+                    // the discovery `fstatat` already proved.
+                    logical: logicalURL(atDepth: depth)
+                        .appendingPathComponent(name, isDirectory: true)
+                )
+            }
             let childDescriptor: Int32
             switch opened {
             case .opened(let fd):
                 childDescriptor = fd
             case .failed(let code):
-                // ENOENT is the ordinary cache-eviction race and stays
-                // BENIGN, exactly as an `.absent` kind probe does: classing
-                // it as an obstruction would make almost every probe of a
-                // live cache incomplete. Everything else fails closed —
-                // including ENOTDIR, which is what a leaf swapped for a
-                // symlink OR for a file returns under `O_DIRECTORY`.
-                if code != ENOENT { obstructions.insert(obstruction(forErrno: code)) }
+                // EVERY failure here is recorded, ENOENT INCLUDED.
+                //
+                // This site is NOT the discovery race, and treating it like
+                // one was a fail-open regression (measured with a real
+                // `rename(2)` fired at this exact instant: `matches=[]
+                // obstructions=[] complete=true` while the subtree was still
+                // on disk under its new name). The difference is what has
+                // already been PROVEN: this name reached `pending` only
+                // because an `fstatat` against THIS held parent said
+                // `directory`, so a subtree is known to exist. "It vanished,
+                // so it holds nothing deletable any more" is simply FALSE
+                // for a rename — the bytes are still there, under a name
+                // this walk's bounded, byte-ascending read has already gone
+                // past, and `openat` cannot tell a rename from an unlink.
+                //
+                // Uninspected is not clean. `complete` feeds
+                // `automaticCleanEligible`, which deletes a known-leak entry
+                // whole with no per-item confirmation, so the only sound
+                // classification is the one that makes the verdict
+                // INCOMPLETE. `.transientFailure` is both honest and
+                // CLEARABLE: a re-scan finds the subtree under its new name
+                // (or genuinely absent) and completes.
+                obstructions.insert(obstruction(forErrno: code))
                 continue
             }
             guard let child = SecureDirectory(
@@ -1428,6 +1597,13 @@ struct OrphanedCachesScanner: @unchecked Sendable {
                 obstructions.insert(.transientFailure)
                 continue
             }
+            // THE DESCENT'S PEAK: the whole stack is still held and the
+            // child is open but not yet framed, so `makeRoom` has not run.
+            // Every refusal below this line — identity mismatch, mount
+            // boundary — is sampled here too.
+            onEvent?(.descriptorCensus(
+                live: liveCount(), transient: 1, depth: depth + 1
+            ))
             // The corroborator, now SOUND: the vetted value came from an
             // `fstatat` on THIS same held parent, so it cannot already
             // belong to a foreign object the way a path `lstat`'s could.
@@ -1445,10 +1621,13 @@ struct OrphanedCachesScanner: @unchecked Sendable {
             }
 
             makeRoom()   // never a refusal, never a budget spend
-            frames.append(Frame(
-                dir: child, identity: child.identity, logicalURL: childURL
+            // The two stacks move together: one basename pushed per frame,
+            // popped with it. (`pathComponents.count == frames.count - 1`.)
+            frames.append(Frame(dir: child, identity: child.identity))
+            pathComponents.append(name)
+            onEvent?(.descriptorCensus(
+                live: liveCount(), transient: 0, depth: frames.count - 1
             ))
-            onEvent?(.descriptorCensus(live: liveCount(), depth: frames.count - 1))
             guard enumerate(frames.count - 1) else { break walk }
         }
 
@@ -1569,9 +1748,14 @@ struct OrphanedCachesScanner: @unchecked Sendable {
     /// The caller hands over a parent descriptor it already holds and has
     /// already vetted; NO PATH IS RESOLVED HERE AT ALL, so there is no
     /// window between vetting and reading for anything to be swapped into.
+    ///
+    /// `whileReading` is called ONCE, with the enumeration handle open, so a
+    /// descriptor census can be taken at the instant this read is holding
+    /// its extra descriptor rather than after it has given it back.
     static func boundedChildNames(
         inDirectory parentDescriptor: Int32,
         limit: Int,
+        whileReading: (() -> Void)? = nil,
         decode: (UnsafePointer<CChar>) -> String? = decodedBasename(fromCString:)
     ) -> BoundedDirectoryRead {
         // A FRESH DESCRIPTION of the SAME directory, for `fdopendir` to
@@ -1600,6 +1784,7 @@ struct OrphanedCachesScanner: @unchecked Sendable {
         }
         // `closedir` closes the descriptor `fdopendir` took ownership of.
         defer { closedir(handle) }
+        whileReading?()
         var names: [String] = []
         var truncated: Set<UserDataProbeObstruction> = []
 

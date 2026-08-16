@@ -3184,9 +3184,11 @@ final class BuildArtifactsScannerTests: XCTestCase {
     /// PATH — so after the swap BOTH the vetting `lstat` and the `O_NOFOLLOW`
     /// open resolved to the foreign object, the recorded "vetted" identity
     /// was ALREADY the foreign one, and the `fstat` re-proof compared foreign
-    /// against foreign and PASSED. Verified independently at
-    /// `scratchpad/ancestor_repro.c`, which drives the same syscall sequence
-    /// and enumerates `Foreign.dmg`.
+    /// against foreign and PASSED — verified independently by driving the
+    /// raw syscall sequence outside this suite, which enumerates
+    /// `Foreign.dmg`, and confirmed against this very test by reverting the
+    /// descent to its pre-fix path shape, which makes it disclose
+    /// `Foreign.dmg` here too.
     ///
     /// A descriptor-relative walk is immune because the vetting `fstatat` and
     /// the descending `openat` are both relative to the descriptor already

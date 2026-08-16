@@ -1161,6 +1161,337 @@ final class DepthSafeRemovalTests: XCTestCase {
         )
     }
 
+    // MARK: - A boundary is found before anything is destroyed
+
+    /// A volume mounted INSIDE the target refuses the deletion WHOLESALE —
+    /// with nothing unlinked, not after the traversal has walked into it.
+    ///
+    /// The per-child mount comparison is a GUARD, and a guard is not an
+    /// ORDER. Reached level by level it fires only when the traversal
+    /// arrives at the boundary, which is after this level's ordinary files
+    /// are already gone: measured on this exact fixture before the preflight
+    /// existed, `keep.bin` was unlinked, the refusal came next, and the
+    /// report carried zero bytes freed — a partial deletion presented as a
+    /// refusal. The cleaner refuses boundary-bearing items wholesale when the
+    /// sizer could measure them; this is the same answer for the trees it
+    /// could not.
+    ///
+    /// A REAL attached volume, because the thing being tested is that the
+    /// KERNEL'S mount table is consulted before the first `unlinkat` — an
+    /// injected identity would prove nothing about that.
+    func testANestedVolumeIsRefusedBeforeAnythingIsUnlinked() throws {
+        let target = base.appendingPathComponent("nested-volume")
+        try mkdir(target)
+        let keep = target.appendingPathComponent("keep.bin")
+        try write(keep, bytes: 2048)
+        let sibling = target.appendingPathComponent("sibling")
+        try mkdir(sibling)
+        let siblingFile = sibling.appendingPathComponent("sibling.bin")
+        try write(siblingFile, bytes: 2048)
+        let mountPoint = target.appendingPathComponent("volume")
+        try mkdir(mountPoint)
+
+        let image = base.appendingPathComponent("nested.dmg")
+        guard Self.run("/usr/bin/hdiutil", [
+            "create", "-size", "8m", "-fs", "APFS", "-volname",
+            "CacheoutNested", "-type", "UDIF", "-quiet", image.path,
+        ]) == 0 else { throw XCTSkip("hdiutil create unavailable") }
+        guard Self.run("/usr/bin/hdiutil", [
+            "attach", image.path, "-mountpoint", mountPoint.path,
+            "-nobrowse", "-noverify", "-quiet",
+        ]) == 0 else { throw XCTSkip("hdiutil attach unavailable") }
+        defer {
+            _ = Self.run("/usr/bin/hdiutil", [
+                "detach", mountPoint.path, "-force",
+            ])
+        }
+        XCTAssertEqual(
+            Self.mountPoints(under: target).count, 1,
+            "fixture: a real volume must really be mounted inside the target"
+        )
+        let onVolume = mountPoint.appendingPathComponent("their-data.bin")
+        try write(onVolume, bytes: 4096)
+
+        XCTAssertThrowsError(
+            try DepthSafeRemoval.remove(
+                at: target, expecting: nil,
+                provider: FileSystemIdentityProvider()
+            )
+        ) { error in
+            XCTAssertEqual(
+                (error as? DepthSafeRemoval.Failure)?.cause, .mountBoundary
+            )
+            XCTAssertTrue(
+                error.localizedDescription.contains("mounted inside"),
+                "the refusal must name the boundary and WHERE it is: "
+                    + error.localizedDescription
+            )
+        }
+        XCTAssertTrue(
+            exists(keep),
+            "an ordinary file beside the boundary is the FIRST thing the "
+                + "traversal unlinks — a refusal issued after it is gone is "
+                + "a partial deletion reported as a refusal"
+        )
+        XCTAssertTrue(exists(siblingFile),
+                      "and so is a whole sibling subtree")
+        XCTAssertTrue(exists(onVolume), "nothing on the other volume, ever")
+    }
+
+    // MARK: - The parent is proved too (PR #458 review — the P1 at the open)
+
+    /// The one path this operation resolves is the target's PARENT, and it
+    /// resolves it after the queue hop. A `rename(2)` pair in that window
+    /// puts a foreign directory at that path, and every descriptor-relative
+    /// proof below is then perfectly self-consistent INSIDE THE STRANGER'S
+    /// TREE — proving X against X.
+    ///
+    /// So the caller's admitted container travels in, exactly like the
+    /// inspection verdict, and is proved against the `fstat` of the opened
+    /// parent BEFORE the leaf is even opened.
+    func testRefusesAParentThatIsNotTheAdmittedContainer() throws {
+        let container = base.appendingPathComponent("container")
+        let target = container.appendingPathComponent("cache")
+        try mkdir(target)
+        try write(target.appendingPathComponent("ours.bin"))
+
+        // The binding as a caller must take it: the identity of a descriptor
+        // opened on the container it admitted.
+        let opened = try openDirectory(container)
+        let admitted = try XCTUnwrap(
+            FileSystemIdentityProvider().identity(ofDescriptor: opened)
+        )
+        close(opened)
+
+        let foreign = base.appendingPathComponent("foreign")
+        let foreignCache = foreign.appendingPathComponent("cache")
+        try mkdir(foreignCache)
+        try write(foreignCache.appendingPathComponent("precious.bin"),
+                  bytes: 4096)
+        XCTAssertEqual(
+            rename(container.path, base.appendingPathComponent("gone").path),
+            0, "fixture: the admitted container is renamed away"
+        )
+        XCTAssertEqual(
+            rename(foreign.path, container.path), 0,
+            "fixture: a stranger's directory takes its place, holding a tree "
+                + "with the target's own name"
+        )
+
+        XCTAssertThrowsError(
+            try DepthSafeRemoval.remove(
+                at: target, expecting: nil,
+                provider: FileSystemIdentityProvider(),
+                containedIn: .identity(admitted)
+            )
+        ) { error in
+            XCTAssertEqual(
+                (error as? DepthSafeRemoval.Failure)?.cause,
+                .notTheAdmittedContainer
+            )
+        }
+        XCTAssertTrue(
+            exists(container.appendingPathComponent("cache/precious.bin")),
+            "the stranger's tree must be untouched"
+        )
+    }
+
+    /// The same swap, with NO parent binding but a leaf one: refused anyway,
+    /// because a foreign parent cannot hold the inspected INODE at that name.
+    ///
+    /// This is why `containedIn:` is the answer for the callers that have
+    /// nothing to bind at the leaf, and not a replacement for `expecting:`.
+    func testALeafBindingAlsoRefusesAForeignParent() throws {
+        let container = base.appendingPathComponent("container")
+        let target = container.appendingPathComponent("cache")
+        try mkdir(target)
+        try write(target.appendingPathComponent("ours.bin"))
+        let inspected = try XCTUnwrap(
+            FileSystemIdentityProvider().identity(of: target)
+        )
+
+        let foreign = base.appendingPathComponent("foreign")
+        try mkdir(foreign.appendingPathComponent("cache"))
+        try write(foreign.appendingPathComponent("cache/precious.bin"),
+                  bytes: 4096)
+        XCTAssertEqual(
+            rename(container.path, base.appendingPathComponent("gone").path), 0
+        )
+        XCTAssertEqual(rename(foreign.path, container.path), 0)
+
+        XCTAssertThrowsError(
+            try DepthSafeRemoval.remove(
+                at: target, expecting: .directory(inspected),
+                provider: FileSystemIdentityProvider()
+            )
+        ) { error in
+            XCTAssertEqual(
+                (error as? DepthSafeRemoval.Failure)?.cause,
+                .notTheInspectedObject
+            )
+        }
+        XCTAssertTrue(
+            exists(container.appendingPathComponent("cache/precious.bin"))
+        )
+    }
+
+    /// THIS TEST PINS A RESIDUAL, NOT A GUARANTEE — and it is written to FAIL
+    /// the moment the residual is closed.
+    ///
+    /// A caller that binds NEITHER the leaf (`expecting: nil`, which is
+    /// contents mode and any scanner whose revalidator says
+    /// `.unestablished`) NOR the parent (`containedIn: .unbound`, which is
+    /// what both production call sites still pass, because they live in a
+    /// file this change could not touch) has stated nothing about the object
+    /// or its container, and the swapped-in stranger's tree is deleted with
+    /// SUCCESS reported. Measured here, with two real `rename(2)`s.
+    ///
+    /// When `CacheCleaner` passes the identity it already admits, this test
+    /// goes red and must be rewritten as the refusal it becomes — which is
+    /// the point of pinning it.
+    func testAnUnboundCallerStillDeletesAStrangersTreeAfterAParentSwap() throws {
+        let container = base.appendingPathComponent("container")
+        let target = container.appendingPathComponent("cache")
+        try mkdir(target)
+        try write(target.appendingPathComponent("ours.bin"))
+        let foreign = base.appendingPathComponent("foreign")
+        try mkdir(foreign.appendingPathComponent("cache"))
+        let precious = "cache/precious.bin"
+        try write(foreign.appendingPathComponent(precious), bytes: 4096)
+        XCTAssertEqual(
+            rename(container.path, base.appendingPathComponent("gone").path), 0
+        )
+        XCTAssertEqual(rename(foreign.path, container.path), 0)
+
+        XCTAssertNoThrow(
+            try DepthSafeRemoval.remove(
+                at: target, expecting: nil,
+                provider: FileSystemIdentityProvider()
+            ),
+            "residual: an unbound caller cannot see the parent swap"
+        )
+        XCTAssertFalse(
+            exists(container.appendingPathComponent(precious)),
+            "residual overstated: the stranger's tree survived, so a binding "
+                + "is now reaching this path — re-measure and rewrite this "
+                + "test as the refusal"
+        )
+    }
+
+    // MARK: - The enumeration is bounded, and every pass is proved
+
+    /// A pass stops at the limit and SAYS there is more, instead of holding
+    /// a directory's entire width in memory.
+    ///
+    /// The deletion's only allocation that scales with the tree is the held
+    /// names, and unbounded it scales with the widest directory — held at the
+    /// moment that directory's ordinary files are already unlinked, so the
+    /// out-of-memory kill lands mid-deletion. Asked of the pass directly,
+    /// because "the tree came out deleted" is true with or without the bound.
+    func testAnEnumerationPassStopsAtItsLimit() throws {
+        let directory = base.appendingPathComponent("wide")
+        try mkdir(directory)
+        for index in 0..<5 {
+            try mkdir(directory.appendingPathComponent("d\(index)"))
+        }
+        for index in 0..<3 {
+            try write(directory.appendingPathComponent("f\(index).bin"))
+        }
+        let held = try openDirectory(directory)
+        defer { close(held) }
+
+        let batch = try DepthSafeRemoval.emptyOfNonDirectories(
+            held, limit: 2, displayPath: directory.path, depth: 0
+        )
+        XCTAssertEqual(batch.names.count, 2,
+                       "the pass must stop at the limit it was given")
+        XCTAssertTrue(batch.hasMore, "and must say the level is not spent")
+
+        let rest = try DepthSafeRemoval.emptyOfNonDirectories(
+            held, limit: 99, displayPath: directory.path, depth: 0
+        )
+        XCTAssertEqual(rest.names.count, 5,
+                       "a pass under a limit it cannot reach returns "
+                           + "everything, and nothing was lost by stopping")
+        XCTAssertFalse(rest.hasMore)
+    }
+
+    /// A directory far wider than the limit is still removed WHOLE — the
+    /// re-enumeration resumes it, and nothing is left behind.
+    func testAWideTreeIsRemovedWholeUnderATinyLimit() throws {
+        let target = base.appendingPathComponent("wide-target")
+        try mkdir(target)
+        for index in 0..<40 {
+            let child = target.appendingPathComponent("d\(index)")
+            try mkdir(child.appendingPathComponent("nested"))
+            try write(child.appendingPathComponent("nested/leaf.bin"))
+            try write(child.appendingPathComponent("own.bin"))
+        }
+        for index in 0..<40 {
+            try write(target.appendingPathComponent("f\(index).bin"))
+        }
+
+        try DepthSafeRemoval.remove(
+            at: target, expecting: nil,
+            provider: FileSystemIdentityProvider(), batchLimit: 1
+        )
+        XCTAssertFalse(exists(target),
+                       "every batch must be resumed, or the final rmdir "
+                           + "fails ENOTEMPTY and the tree is left half gone")
+    }
+
+    /// A REFILL IS A NEW DESTRUCTION, SO IT CARRIES A NEW PROOF.
+    ///
+    /// The level is re-enumerated an arbitrary amount of time after the first
+    /// pass — a whole subtree later — and a `rename(2)` in between moves the
+    /// deletion root into somebody else's tree while leaving every descriptor
+    /// and every proof BELOW it valid. If the refill were "just another
+    /// `readdir`", it would unlink what the new owner has since written
+    /// there, on the first pass's evidence. It is not: `destructivePass` is
+    /// the only door, and it proves containment first.
+    func testARefilledLevelIsProvenBeforeItUnlinksAgain() throws {
+        let target = base.appendingPathComponent("refilling-root")
+        try mkdir(target.appendingPathComponent("a"))
+        try write(target.appendingPathComponent("a/a.bin"))
+        try mkdir(target.appendingPathComponent("b"))
+        try write(target.appendingPathComponent("b/b.bin"))
+        let foreign = base.appendingPathComponent("new-owner")
+        try mkdir(foreign)
+        let relocated = foreign.appendingPathComponent("moved")
+        let planted = relocated.appendingPathComponent("their-file.bin")
+
+        // Fired the first time the traversal descends into ONE of the two
+        // subdirectories — i.e. with the root's first (limit-1) batch spent
+        // and its refill still to come.
+        let provider = FirstDescentHook()
+        provider.watched = [
+            try inode(of: target.appendingPathComponent("a")),
+            try inode(of: target.appendingPathComponent("b")),
+        ]
+        provider.onFirstDescent = { _ in
+            guard rename(target.path, relocated.path) == 0 else { return }
+            try? self.write(planted, bytes: 4096)
+        }
+
+        XCTAssertThrowsError(
+            try DepthSafeRemoval.remove(
+                at: target, expecting: nil, provider: provider, batchLimit: 1
+            )
+        ) { error in
+            XCTAssertEqual(
+                (error as? DepthSafeRemoval.Failure)?.cause, .relocated,
+                "the refill must refuse, not resume"
+            )
+        }
+        XCTAssertNotNil(provider.firedFor,
+                        "the fixture never performed the rename")
+        XCTAssertTrue(
+            exists(planted),
+            "the new owner's file was written into the relocated root before "
+                + "the refill — an unproven refill unlinks it"
+        )
+    }
+
     // MARK: - Ordinary trees are still ordinary
 
     /// Wide, mixed, nested content: files, subdirectories, hardlinks and a

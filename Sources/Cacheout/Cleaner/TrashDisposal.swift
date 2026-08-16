@@ -47,10 +47,21 @@
 //  URL inside itself. Only the first part of it can be timed from out here,
 //  and it is timed: through the production cleaner, from the pre-proof's
 //  question about the opened inode to the instant the disposal seam is
-//  entered (an `@MainActor` hop, because `trashItem` talks to Finder) —
-//  19.2 / 21.1 / 22.5 / 22.5 / 33.5 µs over five runs, printed by
+//  entered, printed by
 //  `testATrashDisposalThatTookTheWrongObjectPutsItBackAndRefuses` as
 //  `MEASURED-TRASH-WINDOW-NS`.
+//
+//  AND IT HAS NO UPPER BOUND, which an earlier version of this note quoted a
+//  five-sample idle range as if it did. That prefix is an `@MainActor` HOP —
+//  `trashItem` talks to Finder — so its width is a SCHEDULING DELAY, not a
+//  syscall cost, and scheduling delays do not have maxima. Measured both
+//  ways, 12 runs each, same machine, same fixture:
+//
+//      quiet:     min 21.5 µs   median 24.8 µs   p90 35.5 µs   max 41.2 µs
+//      contended: min 23.7 µs   median 59.7 µs   p90 297 µs    max 1382 µs
+//
+//  (contended = 2×`hw.ncpu` spinners; an incidental sample taken while a
+//  parallel `swift build` was running read 5.60 ms — 170× the quiet max.)
 //
 //  The REST of the window is inside `trashItem`, and its scale is the reason
 //  this file exists. Measured on this machine, on the real home volume: one
@@ -58,11 +69,11 @@
 //  / 456 µs (max) over nine calls, while the ONE syscall that defeats it —
 //  `renamex_np(RENAME_SWAP)` of two directories, the atomic form of the
 //  fixture's `rename(2)` + `mkdir(2)` — takes 61 µs (min) / 69–83 µs (median)
-//  on the same volume. The swap does NOT fit inside the 19–34 µs prefix that
-//  can be timed; it fits several times over inside the call that follows it.
-//  Narrowing the prefix therefore buys nothing, which is precisely why the
-//  load-bearing proof here is the one taken AFTER the disposal: the window
-//  stays open, and stops deciding the outcome.
+//  on the same volume. So the swap fits several times over inside the call
+//  that follows the prefix, and on a BUSY machine it fits inside the prefix
+//  as well. Narrowing the prefix therefore buys nothing, which is precisely
+//  why the load-bearing proof here is the one taken AFTER the disposal: the
+//  window stays open — unboundedly so — and stops deciding the outcome.
 //
 //  WHAT REMAINS AFTER THE PUT-BACK, HONESTLY: the wrongly-taken item is in the
 //  Trash for the width of one `renamex_np`, and if the put-back cannot be

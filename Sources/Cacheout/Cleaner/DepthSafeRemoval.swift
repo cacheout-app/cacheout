@@ -344,24 +344,20 @@ enum DepthSafeRemoval {
         // PARENT — always inside `PATH_MAX`, because the target itself came
         // through the path guard's admission. Everything below is relative
         // to the descriptor opened here.
-        let parentFd = openContainer(at: url.deletingLastPathComponent())
-        guard parentFd >= 0 else {
-            throw Failure(path: url.path, cause: .posix(errno), depth: 0)
-        }
-        defer { close(parentFd) }
-
+        //
         // WHOSE PARENT IS THIS? Asked of the OPENED INODE, before the leaf
         // is even opened — an `openat` inside a foreign parent is already
         // the wrong question, and everything after it agrees with the wrong
         // answer. `fstat` of the held descriptor, never a re-`lstat` of the
-        // path that produced it.
-        if case .identity(let expected) = admittedParent {
-            guard provider.identity(ofDescriptor: parentFd) == expected else {
-                throw Failure(
-                    path: url.path, cause: .notTheAdmittedContainer, depth: 0
-                )
-            }
-        }
+        // path that produced it. The open and that question are ONE function
+        // (`openAdmittedContainer`) because the Trash arm needs the identical
+        // pair, and two spellings of one proof is how the two arms drift.
+        let parentFd = try openAdmittedContainer(
+            at: url.deletingLastPathComponent(),
+            provenAgainst: admittedParent, displayPath: url.path,
+            provider: provider
+        )
+        defer { close(parentFd) }
 
         // THE KIND GATE **IS** THE OPEN — one syscall, so there is no window
         // between deciding what stands here and taking hold of it (a gate
@@ -458,6 +454,44 @@ enum DepthSafeRemoval {
     /// `O_NOFOLLOW` further down; this is its container.
     private static func openContainer(at url: URL) -> Int32 {
         url.path.withCString { open($0, O_RDONLY | O_DIRECTORY | O_CLOEXEC) }
+    }
+
+    /// OPEN THE CONTAINER AND PROVE IT, AS ONE ACT — the pair every
+    /// destructive arm needs, spelled once (PR #458 review — the Trash arm's
+    /// P1).
+    ///
+    /// `remove` opens the target's parent and `fstat`s it against the
+    /// caller's admitted identity; `TrashDisposal` has to do the IDENTICAL
+    /// thing, because `trashItem` resolves a URL inside itself and the only
+    /// place the container can be interrogated is out here. Two copies of
+    /// that pair are two places a later edit can let the arms drift apart —
+    /// which is exactly the drift that left the Trash arm unbound for three
+    /// review rounds while the permanent one was fixed.
+    ///
+    /// FAIL CLOSED, AND THE CALLER OWNS THE DESCRIPTOR. An unopenable
+    /// container throws its errno; an identity that disagrees (or cannot be
+    /// read at all) throws `.notTheAdmittedContainer` AFTER closing the
+    /// descriptor, so the refusal path leaks nothing.
+    static func openAdmittedContainer(
+        at url: URL,
+        provenAgainst admittedParent: AdmittedParent,
+        displayPath: String,
+        provider: FileSystemIdentityProvider
+    ) throws -> Int32 {
+        let fd = openContainer(at: url)
+        guard fd >= 0 else {
+            throw Failure(path: displayPath, cause: .posix(errno), depth: 0)
+        }
+        if case .identity(let expected) = admittedParent {
+            guard provider.identity(ofDescriptor: fd) == expected else {
+                close(fd)
+                throw Failure(
+                    path: displayPath, cause: .notTheAdmittedContainer,
+                    depth: 0
+                )
+            }
+        }
+        return fd
     }
 
     /// THE BINDING A CALLER MUST TAKE, TAKEN THE WAY THIS FILE PROVES IT.

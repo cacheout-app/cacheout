@@ -3353,4 +3353,280 @@ final class CacheCleanerTests: XCTestCase {
             "one word for one event, whichever mode caught it"
         )
     }
+
+    // MARK: - The SAME folder, on the disposal the GUI actually uses
+
+    /// THE CONTAINER BINDING ON THE ARM MOST USERS TAKE (PR #458 review — the
+    /// P1 three rounds of permanent-delete fixes left open).
+    ///
+    /// `CacheoutViewModel.moveToTrash` is `true` out of the box, so the two
+    /// tests above bound the disposal MOST DELETIONS DO NOT USE. This is the
+    /// item-mode twin of `testAnItemWhoseParentIsSwappedAtTheQueueHopIsRefused`
+    /// — identical fixture, identical two real `rename(2)`s, one flag flipped
+    /// — and before the fix the identical outcome the permanent arm used to
+    /// produce: the STRANGER's `artifacts` moved to the Trash, `entries=1`
+    /// carrying the byte count of the tree the app had actually measured, and
+    /// `errors=[]`.
+    ///
+    /// The item carries NO leaf binding (`fixture_scanner` declares no
+    /// `PreDeleteRevalidator`, so `preDeleteOutcome` yields `.unestablished`),
+    /// which is exactly the population the container binding exists for.
+    func testTrashModeRefusesAnItemWhoseParentIsSwappedBeforeTheDisposal()
+        async throws {
+        let home = try makeTempDir("home")
+        let base = try makeTempDir()
+        let trashDir = try makeTempDir("fake-trash")
+        defer {
+            try? FileManager.default.removeItem(at: home)
+            try? FileManager.default.removeItem(at: base)
+            try? FileManager.default.removeItem(at: trashDir)
+        }
+        let container = base.appendingPathComponent("projects")
+        let parent = container.appendingPathComponent("proj")
+        let target = parent.appendingPathComponent("artifacts")
+        try FileManager.default.createDirectory(
+            at: target, withIntermediateDirectories: true
+        )
+        try writeFile(target.appendingPathComponent("ours.bin"))
+
+        let stranger = base.appendingPathComponent("stranger")
+        let precious = stranger
+            .appendingPathComponent("artifacts/precious.bin")
+        try FileManager.default.createDirectory(
+            at: precious.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try writeFile(precious, bytes: 4096)
+
+        let provider = SwapTheItemsParentAtTheHopProvider()
+        provider.container = provider.canonicalize(container)
+        provider.parent = parent
+        provider.parentMovedAway = base.appendingPathComponent("proj-gone")
+        provider.stranger = stranger
+
+        let recorder = TrashRecorder()
+        let cleaner = CacheCleaner(
+            home: home,
+            containerRoots: [container],
+            containerSnapshot: sessionSnapshot(of: [container]),
+            provider: provider,
+            trashHandler: makeTrashSeam(into: trashDir, recorder: recorder)
+        )
+        let report = await cleaner.clean(
+            items: [removableItem(
+                at: target, originContainer: container, provider: provider
+            )],
+            moveToTrash: true
+        )
+
+        XCTAssertTrue(provider.swapped, "the fixture never performed the swap")
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: parent.appendingPathComponent(
+                    "artifacts/precious.bin"
+                ).path
+            ),
+            "the STRANGER's tree was moved to the TRASH — the disposal acted "
+                + "on whatever answered to the path, with no binding at all"
+        )
+        XCTAssertTrue(
+            recorder.urls.isEmpty,
+            "the disposal ran: a container proof that cannot reach the mover "
+                + "must refuse BEFORE anything reaches the Trash, got "
+                + "\(recorder.urls)"
+        )
+        XCTAssertTrue(
+            report.entries.isEmpty,
+            "reported freed bytes for a stranger's tree: \(report.entries)"
+        )
+        XCTAssertEqual(report.errors.count, 1)
+        let message = try XCTUnwrap(report.errors.first?.message)
+        XCTAssertTrue(
+            message.contains(
+                "the folder that holds this item is no longer the one the "
+                    + "safety check admitted"
+            ),
+            message
+        )
+        XCTAssertTrue(
+            logContents(home: home).contains("REFUSED [container-drift]"),
+            "one word for one event, whichever DISPOSAL caught it"
+        )
+    }
+
+    /// CONTENTS MODE ON THE TRASH ARM HAS NO BINDING WHATSOEVER — the twin of
+    /// `testContentsModeRefusesARootSwappedAfterItsChildrenWereEnumerated`,
+    /// with `moveToTrash: true`.
+    ///
+    /// Contents mode runs no user-data probe, so `expecting:` is `nil` by
+    /// construction; before the fix the Trash arm additionally ignored the
+    /// container binding the permanent arm had just been given, so NOTHING
+    /// could notice the enumerated root being swapped: the stranger's
+    /// identically-named child went to the Trash and its bytes were reported
+    /// as freed.
+    func testTrashModeContentsRefusesARootSwappedAfterEnumeration()
+        async throws {
+        let home = try makeTempDir("home")
+        let base = try makeTempDir()
+        let trashDir = try makeTempDir("fake-trash")
+        defer {
+            try? FileManager.default.removeItem(at: home)
+            try? FileManager.default.removeItem(at: base)
+            try? FileManager.default.removeItem(at: trashDir)
+        }
+        let root = base.appendingPathComponent("cache-root")
+        let child = root.appendingPathComponent("entry")
+        try FileManager.default.createDirectory(
+            at: child, withIntermediateDirectories: true
+        )
+        try writeFile(child.appendingPathComponent("ours.bin"))
+
+        let stranger = base.appendingPathComponent("stranger")
+        let precious = stranger.appendingPathComponent("entry/precious.bin")
+        try FileManager.default.createDirectory(
+            at: precious.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try writeFile(precious, bytes: 4096)
+
+        let provider = SwapTheCategoryRootMidLoopProvider()
+        provider.child = child
+        provider.root = root
+        provider.rootMovedAway = base.appendingPathComponent("cache-root-gone")
+        provider.stranger = stranger
+
+        let recorder = TrashRecorder()
+        let cleaner = CacheCleaner(
+            home: home, containerRoots: [], provider: provider,
+            trashHandler: makeTrashSeam(into: trashDir, recorder: recorder)
+        )
+        let report = await cleaner.clean(
+            items: categoryItems(
+                [makeScanResult(category: makeCategory(at: root))],
+                home: home, provider: provider
+            ),
+            moveToTrash: true
+        )
+
+        XCTAssertTrue(provider.swapped, "the fixture never performed the swap")
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: root.appendingPathComponent("entry/precious.bin").path
+            ),
+            "the STRANGER's child was moved to the Trash — a contents-mode "
+                + "disposal has no leaf binding, so the container binding is "
+                + "the only thing that can refuse here, on EITHER arm"
+        )
+        XCTAssertTrue(
+            recorder.urls.isEmpty,
+            "the disposal ran: nothing may reach the Trash, got \(recorder.urls)"
+        )
+        XCTAssertTrue(
+            report.entries.isEmpty,
+            "reported freed bytes for a stranger's tree: \(report.entries)"
+        )
+        XCTAssertEqual(report.errors.count, 1)
+        let message = try XCTUnwrap(report.errors.first?.message)
+        XCTAssertTrue(
+            message.contains(
+                "the folder that holds this item is no longer the one the "
+                    + "safety check admitted"
+            ),
+            message
+        )
+        XCTAssertTrue(
+            logContents(home: home).contains("REFUSED [container-drift]"),
+            "one word for one event, whichever DISPOSAL caught it"
+        )
+    }
+
+    /// THE WINDOW NO PRE-CALL PROOF CAN REACH, ON THE UNBOUND POPULATION.
+    ///
+    /// `FileManager.trashItem(at:)` takes a URL and resolves it INSIDE itself,
+    /// so the swap performed here — inside the disposal seam, which is exactly
+    /// where production's own resolution happens — beats every proof taken
+    /// before the call. The Trash is reversible by construction, so what
+    /// closes the OUTCOME is the proof taken AFTER: what landed is compared
+    /// with the leaf the cleaner bound UNDER the admitted container, and a
+    /// mismatch is PUT BACK and refused.
+    ///
+    /// Before the fix this arm had no binding on either side: the stranger's
+    /// tree stayed in the Trash and its bytes were reported as freed.
+    func testTrashModeContentsPutsBackAChildTheDisposalTookWrongly()
+        async throws {
+        let home = try makeTempDir("home")
+        let base = try makeTempDir()
+        let trashDir = try makeTempDir("fake-trash")
+        defer {
+            try? FileManager.default.removeItem(at: home)
+            try? FileManager.default.removeItem(at: base)
+            try? FileManager.default.removeItem(at: trashDir)
+        }
+        let root = base.appendingPathComponent("cache-root")
+        let child = root.appendingPathComponent("entry")
+        try FileManager.default.createDirectory(
+            at: child, withIntermediateDirectories: true
+        )
+        try writeFile(child.appendingPathComponent("ours.bin"))
+        let ourChildMovedAway = base.appendingPathComponent("entry-moved-away")
+        // The stranger's tree, one rename away from standing at the child's
+        // own name INSIDE the admitted (and still correct) container.
+        let stranger = base.appendingPathComponent("stranger-entry")
+        try FileManager.default.createDirectory(
+            at: stranger, withIntermediateDirectories: true
+        )
+        try writeFile(
+            stranger.appendingPathComponent("precious.bin"), bytes: 4096
+        )
+
+        let recorder = TrashRecorder()
+        let cleaner = CacheCleaner(
+            home: home, containerRoots: [],
+            trashHandler: { url in
+                // Real syscalls at the one instant no pre-call proof reaches:
+                // after the binding, inside the disposal.
+                try FileManager.default.moveItem(at: child, to: ourChildMovedAway)
+                try FileManager.default.moveItem(at: stranger, to: child)
+                recorder.record(url)
+                let landed = trashDir
+                    .appendingPathComponent(url.lastPathComponent)
+                try FileManager.default.moveItem(at: url, to: landed)
+                return landed
+            }
+        )
+        let report = await cleaner.clean(
+            items: categoryItems(
+                [makeScanResult(category: makeCategory(at: root))], home: home
+            ),
+            moveToTrash: true
+        )
+
+        XCTAssertEqual(recorder.urls.count, 1,
+                       "the fixture never reached the disposal")
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: child.appendingPathComponent("precious.bin").path
+            ),
+            "the wrongly-taken tree was left in the Trash — a disposal that "
+                + "cannot be proved must be UNDONE, not merely reported"
+        )
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: trashDir.appendingPathComponent("entry").path
+            ),
+            "and nothing of it may remain in the Trash"
+        )
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: ourChildMovedAway.path),
+            "our own child is untouched wherever the fixture put it"
+        )
+        XCTAssertTrue(
+            report.entries.isEmpty,
+            "reported freed bytes for a tree it never bound: \(report.entries)"
+        )
+        XCTAssertEqual(report.errors.count, 1)
+        let message = try XCTUnwrap(report.errors.first?.message)
+        XCTAssertTrue(message.contains("PUT BACK"), message)
+        XCTAssertTrue(message.contains("nothing was freed"), message)
+    }
 }

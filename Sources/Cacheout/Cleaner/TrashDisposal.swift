@@ -301,11 +301,168 @@ enum TrashDisposal {
             throw Failure(
                 path: target.path,
                 cause: rollBack(
-                    sighting, from: landed, to: target,
+                    identified(sighting), from: landed, to: target,
                     containedIn: admittedParent, provider: provider
                 )
             )
         }
+    }
+
+    // MARK: - The arm for callers with NO leaf verdict
+
+    /// Move `target` to the Trash through `disposal`, bound to the object
+    /// that stood AT THAT NAME INSIDE THE ADMITTED CONTAINER.
+    ///
+    /// WHY A SECOND ENTRY POINT EXISTS (PR #458 review — the P1 that survived
+    /// three rounds). `dispose(_:expecting:…)` above is only reachable when a
+    /// scanner's `PreDeleteRevalidator` produced a verdict about the leaf.
+    /// The population with NO leaf verdict is large and precisely known — ALL
+    /// of contents mode (it runs no probe at all) plus every item whose
+    /// scanner registers no revalidator (`preDeleteOutcome` yields
+    /// `.unestablished`) — and for three rounds those two call sites handed a
+    /// BARE URL straight to the mover. Measured on this branch through the
+    /// production cleaner, `moveToTrash: true`, two real `rename(2)`s at the
+    /// seam: the stranger's tree went to the Trash and the report read
+    /// `entries=[exactBytes: 4096, disposal: .trash]`, `errors=[]` — the byte
+    /// count of a tree the app had measured and then not touched.
+    ///
+    /// THE BINDING IS THE ONE THE CALLER ALREADY HAS, CARRIED ONE CALL
+    /// FURTHER. There is no leaf verdict to bind to, but there IS an admitted
+    /// container, and a leaf read UNDER a proved container descriptor is a
+    /// fact about an OBJECT — which is what the mover needs and what a URL is
+    /// not. So:
+    ///
+    /// 1. BEFORE — the container is opened and `fstat`ed against
+    ///    `DepthSafeRemoval.admittedParent`'s identity (the same
+    ///    `openAdmittedContainer` the permanent arm proves with, so the two
+    ///    cannot drift), and the leaf is bound under THAT descriptor with one
+    ///    `fstatat` (`probeChild`: kind and identity from a single
+    ///    resolution that no rename can re-point). A container already
+    ///    swapped when we get here refuses without disturbing the Trash at
+    ///    all; a leaf that is not there refuses with the `ENOENT` the
+    ///    disposal would have produced anyway.
+    /// 2. AFTER — `trashItem` resolves the URL inside itself, so the swap can
+    ///    still land in a window no proof out here reaches. The Trash is
+    ///    reversible by construction, so the load-bearing proof is the one
+    ///    taken after: what landed is read the same descriptor-relative way
+    ///    and compared with the bound facts. A mismatch is PUT BACK through
+    ///    `rollBack` — which proves its own destination against the same
+    ///    admitted container — and reported as a refusal: no entry, no bytes.
+    ///
+    /// `probeChild` rather than `look` on both sides ON PURPOSE: `look`'s kind
+    /// gate is an `O_DIRECTORY` open, so it can only identify DIRECTORIES,
+    /// and contents mode trashes regular files and symlinks by the thousand.
+    /// One `fstatat` identifies every kind, which is what makes this arm a
+    /// binding for the whole population rather than for the directory-shaped
+    /// part of it.
+    static func dispose(
+        _ target: URL,
+        containedIn admittedParent: DepthSafeRemoval.AdmittedParent,
+        provider: FileSystemIdentityProvider,
+        via disposal: (URL) async throws -> URL?
+    ) async throws {
+        let bound = try boundLeaf(
+            of: target, containedIn: admittedParent, provider: provider
+        )
+
+        let landed = try await disposal(target)
+
+        guard let landed else {
+            throw Failure(path: target.path, cause: .destinationUnknown)
+        }
+        let observed = facts(at: landed, provider: provider)
+        guard observed == bound else {
+            throw Failure(
+                path: target.path,
+                cause: rollBack(
+                    observed, from: landed, to: target,
+                    containedIn: admittedParent, provider: provider
+                )
+            )
+        }
+    }
+
+    /// WHAT STANDS AT `target`'s NAME INSIDE THE ADMITTED CONTAINER — the
+    /// binding the disposal above is proved against.
+    ///
+    /// The container proof and the leaf read are ONE sequence against ONE
+    /// held descriptor: proving the container and then re-resolving the
+    /// target's whole path would be a check of a different thing.
+    static func boundLeaf(
+        of target: URL,
+        containedIn admittedParent: DepthSafeRemoval.AdmittedParent,
+        provider: FileSystemIdentityProvider
+    ) throws -> FileSystemIdentityProvider.ChildFacts {
+        let leaf = target.lastPathComponent
+        // The `probeChild` precondition, enforced rather than assumed: a
+        // multi-component name is resolved THROUGH the held directory, which
+        // is exactly the no-follow guarantee this call is here to keep.
+        guard FileSystemIdentityProvider.isSafeComponent(leaf) else {
+            throw DepthSafeRemoval.Failure(
+                path: target.path, cause: .invalidTarget, depth: 0
+            )
+        }
+        let containerFD = try DepthSafeRemoval.openAdmittedContainer(
+            at: target.deletingLastPathComponent(),
+            provenAgainst: admittedParent, displayPath: target.path,
+            provider: provider
+        )
+        defer { close(containerFD) }
+        switch provider.probeChild(
+            inDirectory: containerFD, named: leaf, logical: target
+        ) {
+        case .facts(let facts):
+            return facts
+        case .absent:
+            // The frozen ghost-target behaviour, moved one call earlier: the
+            // disposal would have failed `ENOENT` on this name too, and an
+            // item-keyed error is what that has always produced. What must
+            // NOT happen is proceeding with nothing to prove the move
+            // against.
+            throw DepthSafeRemoval.Failure(
+                path: target.path, cause: .posix(ENOENT), depth: 0
+            )
+        case .failed(let code):
+            throw DepthSafeRemoval.Failure(
+                path: target.path, cause: .posix(code), depth: 0
+            )
+        }
+    }
+
+    /// Kind AND identity of whatever answers to `url`'s NAME inside `url`'s
+    /// directory, read descriptor-relative.
+    ///
+    /// `nil` is "nothing could be identified here", which is never a match
+    /// and never a licence: the caller rolls back, and the rollback refuses
+    /// to move an object it cannot name.
+    static func facts(
+        at url: URL, provider: FileSystemIdentityProvider
+    ) -> FileSystemIdentityProvider.ChildFacts? {
+        let name = url.lastPathComponent
+        guard FileSystemIdentityProvider.isSafeComponent(name) else {
+            return nil
+        }
+        let fd = provider.openDirectoryNoFollow(
+            at: url.deletingLastPathComponent()
+        )
+        guard fd >= 0 else { return nil }
+        defer { close(fd) }
+        guard case .facts(let facts) = provider.probeChild(
+            inDirectory: fd, named: name, logical: url
+        ) else { return nil }
+        return facts
+    }
+
+    /// The `Sighting` → `ChildFacts` narrowing, in ONE place: only a
+    /// `.directory` sighting names an object, and every other case is
+    /// "nothing identified".
+    private static func identified(
+        _ sighting: Sighting
+    ) -> FileSystemIdentityProvider.ChildFacts? {
+        guard case .directory(let identity) = sighting else { return nil }
+        return FileSystemIdentityProvider.ChildFacts(
+            kind: .directory, identity: identity
+        )
     }
 
     // MARK: - The proofs
@@ -493,7 +650,8 @@ enum TrashDisposal {
     ///   folder. A descriptor cannot vouch for itself; the identity the
     ///   cleaner captured before the disposal can.
     private static func rollBack(
-        _ sighting: Sighting, from landed: URL, to target: URL,
+        _ observed: FileSystemIdentityProvider.ChildFacts?,
+        from landed: URL, to target: URL,
         containedIn admittedParent: DepthSafeRemoval.AdmittedParent,
         provider: FileSystemIdentityProvider
     ) -> Failure.Cause {
@@ -509,7 +667,14 @@ enum TrashDisposal {
         // partner (the `probeChild` comparison below) carries the refusal;
         // this arm buys two `open` calls and a cause that names the right
         // fact.
-        guard case .directory(let observed) = sighting else {
+        //
+        // IT TAKES FACTS, NOT A `Sighting`, because both arms roll back
+        // through it and one of them binds NON-DIRECTORIES (see
+        // `dispose(_:containedIn:…)`). The verdict-bound arm narrows its own
+        // sighting at the call (`identified`), so a `.directory` landing is
+        // the only thing that ever reached this code before and the only
+        // thing it can produce now.
+        guard let observed else {
             return .lastSeenInTrash(landed.path)
         }
         let source = landed.lastPathComponent
@@ -537,9 +702,7 @@ enum TrashDisposal {
         guard containerFD >= 0 else { return .lastSeenInTrash(landed.path) }
         defer { close(containerFD) }
 
-        let bound = FileSystemIdentityProvider.ChildProbe.facts(
-            .init(kind: .directory, identity: observed)
-        )
+        let bound = FileSystemIdentityProvider.ChildProbe.facts(observed)
         guard provider.probeChild(
             inDirectory: trashFD, named: source, logical: landed
         ) == bound else {

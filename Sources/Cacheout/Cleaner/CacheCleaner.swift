@@ -952,12 +952,26 @@ actor CacheCleaner {
                 // A trash failure is a child error — it never falls through
                 // to a permanent delete (R11).
                 //
-                // NO INSPECTION VERDICT TO BIND TO, the same absence the
-                // permanent arm below states: contents mode runs no user-data
-                // probe, so there is no inspected object for `TrashDisposal`
-                // to prove this disposal against. The guards here are the
-                // containment chain and the mount doctrine above.
-                try await trash(child)
+                // NO INSPECTION VERDICT TO BIND TO, WHICH IS WHY THE
+                // CONTAINER BINDING IS NOT OPTIONAL HERE EITHER (PR #458
+                // review — the P1 the permanent-arm rounds left open). The
+                // note that stood here justified handing a BARE URL to the
+                // mover with a fact about the LEAF: contents mode runs no
+                // user-data probe, so there is no inspected object. True, and
+                // beside the point — the very next branch was already
+                // carrying `admittedParent` for exactly this absence, and
+                // this branch ignored it. Measured with two real `rename(2)`s
+                // at the seam: the stranger's identically-named child went to
+                // the Trash and its bytes were reported as freed.
+                //
+                // So this arm binds what it HAS. `TrashDisposal` proves the
+                // container, binds the child under that descriptor, and
+                // proves what the disposal actually took on the far side of
+                // a call it cannot be given a descriptor for.
+                try await TrashDisposal.dispose(
+                    child, containedIn: admittedParent, provider: provider,
+                    via: { try await self.trash($0) }
+                )
             } else {
                 // NO INSPECTION VERDICT TO BIND TO, and the call site says
                 // so. Contents mode runs no user-data probe (only the
@@ -984,6 +998,15 @@ actor CacheCleaner {
                 // same event, so the cleanup log has ONE word for it.
                 logRefusal(
                     label: label, tag: "container-drift",
+                    detail: "\(child.path): \(error.localizedDescription)"
+                )
+            } else if error is TrashDisposal.Failure {
+                // The swap landed inside `trashItem`'s own resolution, so it
+                // was caught AFTER the move and undone. Same event as the one
+                // above, one disposal over — and the same tag item mode uses
+                // for it.
+                logRefusal(
+                    label: label, tag: "content-drift",
                     detail: "\(child.path): \(error.localizedDescription)"
                 )
             }
@@ -1255,13 +1278,30 @@ actor CacheCleaner {
                         via: { try await self.trash($0) }
                     )
                 } else {
-                    // NOTHING TO BIND TO (the `else` above states why), so the
-                    // disposal is the seam alone. `admittedParent` is not used
-                    // here on purpose: this arm never rolls anything back, so
-                    // there is no destination to prove — the only mover is
-                    // `trashItem`, which takes a URL and resolves it inside
-                    // itself.
-                    try await trash(target)
+                    // NO LEAF VERDICT — WHICH IS NOT THE SAME AS NOTHING TO
+                    // BIND (PR #458 review — the P1 that survived three
+                    // rounds). The note that stood here justified handing a
+                    // bare URL to the mover with a fact about the ROLLBACK:
+                    // "`admittedParent` is not used here on purpose: this arm
+                    // never rolls anything back, so there is no destination to
+                    // prove." That reasoned about the wrong object. The
+                    // question is not what the UNDO would restore into, it is
+                    // which folder the DISPOSAL resolves the target's name
+                    // in — and `admittedParent`, captured a few lines up from
+                    // a descriptor, answers exactly that. Measured with two
+                    // real `rename(2)`s at the seam, `moveToTrash: true`: the
+                    // stranger's tree went to the Trash and the report read
+                    // `entries=[exactBytes: 4096, .trash]`, `errors=[]`.
+                    //
+                    // So the container binding goes here too, and the
+                    // disposal binds the leaf under it. Once it does, this arm
+                    // rolls back like the other one — which is the second
+                    // reason the old note was wrong about itself.
+                    try await TrashDisposal.dispose(
+                        target, containedIn: admittedParent,
+                        provider: provider,
+                        via: { try await self.trash($0) }
+                    )
                 }
             } else {
                 // Item mode deletes the target ITSELF — never its

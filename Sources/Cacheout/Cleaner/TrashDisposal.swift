@@ -69,6 +69,58 @@
 //  performed — something else already occupies the original name — it STAYS in
 //  the Trash and the error says so by path. Recoverable in one drag, never
 //  destroyed, and never reported as freed.
+//
+//  AND THE PUT-BACK NEEDS A BINDING OF ITS OWN (PR #458 review — the P2 on
+//  this very fix). The rollback is not a read. It MOVES an object INTO the
+//  user's cache tree, which makes it the same kind of destructive call as the
+//  disposal it is undoing, and it was written as `renamex_np(landed, target)`
+//  — two PATHS, re-resolved, binding nothing. A Finder "Put Back" of the real
+//  item between the failed proof and the rollback vacates `landed`; any other
+//  Trash entry arriving at that name is then what gets moved into
+//  `~/Library/Caches`, while the wrongly-taken tree stays in the Trash under a
+//  name the error never mentions and the report says `.putBack` — a recovery
+//  that did not happen. Measured on this branch through the production
+//  cleaner (`testAPutBackWillNotMoveAnObjectItNeverSawTheTrashTake`).
+//
+//  So the rollback carries the SIGHTING the proof took, and asks the same two
+//  questions the disposal does, on the same two sides:
+//
+//  * BEFORE — the Trash directory is held by DESCRIPTOR and the name is
+//    re-bound under it (`fstatat`, via `probeChild`) to the identity the proof
+//    actually looked at. An identity that does not match is not moved at all.
+//  * AFTER — `renameatx_np(RENAME_EXCL)` returning 0 says A NAME MOVED, not
+//    that OUR object did, so the arrival is proved under the held destination
+//    descriptor before `.putBack` is reported.
+//
+//  The descriptors are what make the re-bind and the rename talk about the
+//  same directory, and that is EVIDENCED rather than asserted: spell the
+//  rename `renamex_np(landed.path, target.path)` and
+//  `testAPutBackFollowsTheTrashDirectoryItCheckedNotItsName` goes red,
+//  because re-pointing the Trash DIRECTORY between the two sends a
+//  path-spelled rename into a different directory to move whatever answers
+//  to the same leaf.
+//
+//  THE RESIDUAL OF THE ROLLBACK, NAMED AND MEASURED — not called narrow and
+//  left at that. Between that `fstatat` and the `renameatx_np` the name can
+//  still be re-pointed inside the pinned directory, and it is NOT closable:
+//  macOS has no rename that takes its SOURCE as a descriptor (`renameatx_np`
+//  takes a directory descriptor and a NAME).
+//
+//  Its width, on this machine and on the real home volume, 25 pairs per run
+//  over three runs: from the `fstatat` returning to the `renameatx_np`
+//  RETURNING — which OVER-states it, because the true close is the kernel's
+//  own lookup of the source name partway through that call — 32.6 / 32.6 /
+//  32.7 µs (min), 37.6 / 37.8 / 38.1 µs (median). The `renamex_np(RENAME_SWAP)`
+//  that defeats it costs 44.3 / 44.4 / 45.2 µs (min) on the same volume.
+//
+//  THAT COMPARISON IS NOT A SAFETY ARGUMENT AND IS NOT OFFERED AS ONE — an
+//  attacker's swap can already be in flight. It is offered because the
+//  numbers are the reason the outcome is not left resting on the race: the
+//  window is exercised
+//  (`testAPutBackThatMovedSomethingElseSaysSoRatherThanClaimingRecovery`) and
+//  the after-proof turns losing it into an honest report — the item is
+//  refused, the bytes are not reported, and the error says plainly that what
+//  now stands at the cache path came out of the Trash.
 
 import Foundation
 
@@ -81,14 +133,36 @@ enum TrashDisposal {
 
     /// Why a Trash disposal was refused AFTER the fact — the causes that
     /// exist only because the disposal cannot be given a descriptor.
+    ///
+    /// THE FOUR ROLLBACK CAUSES ARE FOUR DIFFERENT PROOFS, not one outcome
+    /// with adjectives (PR #458 review — the P2). Each says exactly what was
+    /// established: that the object is back, that it is still in the Trash,
+    /// that it is no longer where the Trash said, or that the rollback moved
+    /// something else. Collapsing them is how `.putBack` came to be reported
+    /// for a recovery nobody had verified.
     struct Failure: LocalizedError {
         enum Cause: Equatable {
-            /// The Trash took an object that is not the inspected one, and it
-            /// has been moved back to where it was.
+            /// PROVED: the object the Trash took is not the inspected one,
+            /// and it now stands at the original name again — the arrival
+            /// was identified under the held destination descriptor.
             case putBack
-            /// Same, but the put-back could not be performed. The payload is
-            /// where the item is now, so the user can do it by hand.
+            /// PROVED: the object was still at `landed` when the rollback
+            /// re-bound it, and the move itself could not be performed
+            /// (typically the original name is occupied again). The payload
+            /// is where the item is, so the user can finish it in one drag.
             case strandedInTrash(String)
+            /// NOT PROVED, so NOTHING WAS MOVED: the object the disposal took
+            /// is no longer at the name the disposal reported (it was moved,
+            /// replaced, or cannot be read). The payload is the last place it
+            /// was seen. Moving whatever took its place is the bug, not the
+            /// undo.
+            case lastSeenInTrash(String)
+            /// The rollback moved an object out of the Trash and the arrival
+            /// is NOT the one it looked at — the name was re-pointed inside
+            /// the one-syscall window the Trash directory descriptor cannot
+            /// close. The payload is the Trash name it came from. Nothing
+            /// further is attempted: a second unproven move is not a fix.
+            case putBackTookAnotherObject(String)
             /// The disposal would not say where it put the item, so what it
             /// took cannot be established at all.
             case destinationUnknown
@@ -114,6 +188,23 @@ enum TrashDisposal {
                     + "be put back automatically — it is in the Trash at "
                     + "\(landed). Move it back from there; nothing was "
                     + "reported freed; refused, re-scan required"
+            case .lastSeenInTrash(let landed):
+                return "\(path): the folder at this path is no longer the one "
+                    + "that was inspected, and what the Trash took could not "
+                    + "be put back — it is no longer at \(landed), where the "
+                    + "Trash reported putting it, so nothing was moved rather "
+                    + "than moving whatever took its place. Look in the Trash "
+                    + "for it; nothing was reported freed; refused, re-scan "
+                    + "required"
+            case .putBackTookAnotherObject(let landed):
+                return "\(path): the folder at this path is no longer the one "
+                    + "that was inspected, and putting back what the Trash "
+                    + "took moved a DIFFERENT object — the Trash name it came "
+                    + "from (\(landed)) was re-used while the undo was "
+                    + "running. Whatever now stands at \(path) came out of "
+                    + "the Trash and was NOT put there by you, and the item "
+                    + "the Trash took is still in the Trash; nothing was "
+                    + "reported freed; refused, re-scan required"
             case .destinationUnknown:
                 return "\(path): the Trash did not report where it put the "
                     + "item, so which folder it took cannot be established — "
@@ -129,8 +220,9 @@ enum TrashDisposal {
     /// about.
     ///
     /// Throws — and nothing is left in the Trash — when the proof fails on
-    /// either side, except in the one disclosed case where the put-back itself
-    /// cannot be performed (`.strandedInTrash`, which names where the item is).
+    /// either side, except in the disclosed cases where the put-back itself
+    /// cannot be performed or cannot be proved, each of which names where the
+    /// item was last seen.
     static func dispose(
         _ target: URL,
         expecting inspected: UserDataProbeResult.InspectedRoot,
@@ -148,15 +240,21 @@ enum TrashDisposal {
         guard let landed else {
             throw Failure(path: target.path, cause: .destinationUnknown)
         }
-        do {
-            try proveTaken(inspected, at: landed, provider: provider)
-        } catch {
-            guard putBack(landed, to: target) else {
-                throw Failure(
-                    path: target.path, cause: .strandedInTrash(landed.path)
+        // THE SIGHTING IS KEPT, NOT JUST JUDGED (PR #458 review — the P2).
+        // The rollback below moves an object into the user's cache tree, so
+        // it needs to know WHICH object the proof looked at. A `throws`-only
+        // proof discards exactly that and leaves the undo to re-resolve a
+        // path — which is the defect it is undoing, one layer down.
+        let sighting = look(at: landed, provider: provider)
+        guard disagreement(inspected, with: sighting, absenceProves: false)
+                == nil
+        else {
+            throw Failure(
+                path: target.path,
+                cause: rollBack(
+                    sighting, from: landed, to: target, provider: provider
                 )
-            }
-            throw Failure(path: target.path, cause: .putBack)
+            )
         }
     }
 
@@ -180,9 +278,9 @@ enum TrashDisposal {
     ///
     /// An ABSENCE proves NOTHING here. The disposal said it put an item at
     /// this URL; if nothing is there, what it took cannot be established, and
-    /// unestablished is refused (the put-back then has nothing to move, and
-    /// the caller reports `.strandedInTrash` — which is the honest answer,
-    /// because the item is somewhere we cannot name).
+    /// unestablished is refused (the rollback then has nothing it may move,
+    /// and the caller reports `.lastSeenInTrash` — the honest answer, because
+    /// the item is somewhere we cannot name).
     static func proveTaken(
         _ inspected: UserDataProbeResult.InspectedRoot,
         at url: URL, provider: FileSystemIdentityProvider
@@ -190,70 +288,230 @@ enum TrashDisposal {
         try prove(inspected, at: url, provider: provider, absenceProves: false)
     }
 
-    /// THE KIND GATE **IS** THE OPEN, and the identity comes off the OPENED
-    /// INODE — the same shape `DepthSafeRemoval.remove` uses, for the same
-    /// reason: a gate beside an open is a swap window by construction, and an
-    /// `lstat` of a path is a second resolution of a name anyone can re-point.
-    ///
-    /// The refusal is `DepthSafeRemoval.Failure(.notTheInspectedObject)` on
-    /// purpose, not a private twin: the user is told the same thing whichever
-    /// disposal they chose, and the cleaner's log keeps classifying it under
-    /// the one `content-drift` tag.
+    /// The `throws` face of `look` + `disagreement`, for the call sites that
+    /// only need the verdict. `dispose` uses the two halves directly, because
+    /// its rollback needs the SIGHTING and not merely the verdict.
     private static func prove(
         _ inspected: UserDataProbeResult.InspectedRoot,
         at url: URL, provider: FileSystemIdentityProvider,
         absenceProves: Bool
     ) throws {
-        let fd = url.path.withCString {
-            open($0, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        if let cause = disagreement(
+            inspected, with: look(at: url, provider: provider),
+            absenceProves: absenceProves
+        ) {
+            throw DepthSafeRemoval.Failure(
+                path: url.path, cause: cause, depth: 0
+            )
+        }
+    }
+
+    /// WHAT ONE LOOK AT A NAME SAW — the evidence, before anyone judges it.
+    ///
+    /// Kept as a value rather than folded into a `throws` because two callers
+    /// need two different things from the same look: `prove` needs the
+    /// verdict, and the rollback needs the IDENTITY, so that the object it
+    /// moves is the object the proof rejected rather than whatever answers to
+    /// the name a moment later.
+    enum Sighting: Equatable {
+        /// A directory was OPENED here, and this is its `fstat` identity.
+        case directory(FileSystemIdentityProvider.Identity)
+        /// Nothing is here at all (ENOENT).
+        case absent
+        /// Something is here and it is NOT a directory tree of ours — a
+        /// regular file, a symlink (never followed), a fifo, a device.
+        case noDirectoryTree
+        /// A directory was opened but would not say who it is.
+        case unidentifiable
+        /// The look itself failed (EACCES, EIO, …). Unprovable, never
+        /// admitted, and never a licence to move anything.
+        case unreadable(errno: Int32)
+    }
+
+    /// THE KIND GATE **IS** THE OPEN, and the identity comes off the OPENED
+    /// INODE — the same shape `DepthSafeRemoval.remove` uses, for the same
+    /// reason: a gate beside an open is a swap window by construction, and an
+    /// `lstat` of a path is a second resolution of a name anyone can re-point.
+    static func look(
+        at url: URL, provider: FileSystemIdentityProvider
+    ) -> Sighting {
+        // The errno is READ INSIDE the closure, next to the call that set it
+        // — the same discipline as
+        // `FileSystemIdentityProvider.openChildDirectoryCarryingErrno`.
+        // Anything at all between the `open` and a later `errno` read may
+        // clobber the global, and this one decides whether the object is
+        // absent, not-a-tree, or merely unreadable.
+        var code: Int32 = 0
+        let fd = url.path.withCString { path -> Int32 in
+            let descriptor = open(
+                path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+            )
+            if descriptor < 0 { code = errno }
+            return descriptor
         }
         guard fd >= 0 else {
-            let code = errno
+            switch code {
+            case ENOENT: return .absent
             // ENOTDIR/ELOOP: something that is NOT a directory tree stands
-            // here — a file, a symlink (never followed), a fifo, a device.
-            // That is exactly what `.noDirectoryTree` is a verdict about.
-            let noTree = code == ENOTDIR || code == ELOOP
-                || (code == ENOENT && absenceProves)
-            guard noTree, case .noDirectoryTree = inspected else {
-                // An unreadable target (EACCES, EIO, …) lands here too, and
-                // it must: unprovable is refused, never admitted.
-                throw DepthSafeRemoval.Failure(
-                    path: url.path,
-                    cause: code == ENOENT || code == ENOTDIR || code == ELOOP
-                        ? .notTheInspectedObject
-                        : .posix(code),
-                    depth: 0
-                )
+            // here. That is exactly what `.noDirectoryTree` is about.
+            case ENOTDIR, ELOOP: return .noDirectoryTree
+            default: return .unreadable(errno: code)
             }
-            return
         }
         defer { close(fd) }
-        // A directory stands here. Only a `.directory` verdict about THIS
-        // inode admits it; `.noDirectoryTree` and `.unestablished` are
-        // refusals, and so is an identity that cannot be read.
-        guard case .directory(let expected) = inspected,
-              provider.identity(ofDescriptor: fd) == expected else {
-            throw DepthSafeRemoval.Failure(
-                path: url.path, cause: .notTheInspectedObject, depth: 0
-            )
+        guard let identity = provider.identity(ofDescriptor: fd) else {
+            return .unidentifiable
+        }
+        return .directory(identity)
+    }
+
+    /// Why `sighting` does NOT satisfy `inspected` — `nil` when it does.
+    ///
+    /// The refusal is `DepthSafeRemoval.Failure.Cause` on purpose, not a
+    /// private twin: the user is told the same thing whichever disposal they
+    /// chose, and the cleaner's log keeps classifying it under the one
+    /// `content-drift` tag.
+    ///
+    /// `absenceProves` is the ONE asymmetry between the two sides of the
+    /// disposal, and it is a parameter rather than a second copy of this
+    /// function so the two can never drift apart.
+    ///
+    /// THE ONE PLACE THE TWO REPRESENTATIONS MEET. `Sighting` already keeps
+    /// `.absent` and `.noDirectoryTree` apart, because the rollback needs to
+    /// know whether there was anything there at all; `InspectedRoot` folds
+    /// them into one case today, and `absenceProves` is how that fold is
+    /// unfolded per side. If the verdict type ever splits them for real, this
+    /// function is the whole of the change — no other site in this file looks
+    /// at either enum.
+    static func disagreement(
+        _ inspected: UserDataProbeResult.InspectedRoot,
+        with sighting: Sighting, absenceProves: Bool
+    ) -> DepthSafeRemoval.Failure.Cause? {
+        switch sighting {
+        case .directory(let seen):
+            // Only a `.directory` verdict about THIS inode admits it;
+            // `.noDirectoryTree` and `.unestablished` are refusals.
+            guard case .directory(let expected) = inspected, seen == expected
+            else { return .notTheInspectedObject }
+            return nil
+        case .noDirectoryTree:
+            guard case .noDirectoryTree = inspected else {
+                return .notTheInspectedObject
+            }
+            return nil
+        case .absent:
+            guard absenceProves, case .noDirectoryTree = inspected else {
+                return .notTheInspectedObject
+            }
+            return nil
+        case .unidentifiable:
+            return .notTheInspectedObject
+        case .unreadable(let code):
+            // Unprovable is refused, never admitted — and the errno is kept,
+            // because "we could not look" is a different fact from "it is not
+            // the object", and only one of them clears on a re-scan.
+            return .posix(code)
         }
     }
 
     // MARK: - Undo
 
-    /// Move `landed` back to `target`, refusing to overwrite whatever may now
-    /// stand there.
+    /// Move the object `sighting` saw at `landed` back to `target`, or refuse
+    /// and say why — never move an object nobody looked at.
     ///
-    /// `renamex_np(RENAME_EXCL)` rather than `FileManager.moveItem`: the
-    /// exclusion is enforced by the KERNEL in the same call that moves, so an
-    /// undo cannot itself destroy something that appeared at the target's name
-    /// while we were in the Trash. `moveItem` checks the destination first and
-    /// then renames — two operations, and the second one clobbers.
-    private static func putBack(_ landed: URL, to target: URL) -> Bool {
-        landed.path.withCString { from in
-            target.path.withCString { to in
-                renamex_np(from, to, UInt32(RENAME_EXCL)) == 0
+    /// The two proofs, and what each one buys:
+    ///
+    /// * The Trash directory and the destination directory are HELD BY
+    ///   DESCRIPTOR, and the re-bind (`fstatat`, through `probeChild`) and
+    ///   the move (`renameatx_np`) both go through those descriptors. An
+    ///   `fstatat` under one dirfd followed by a rename through a re-resolved
+    ///   PATH would be a check of a different thing.
+    /// * `RENAME_EXCL` is enforced by the KERNEL in the same call that moves,
+    ///   so an undo cannot destroy something that appeared at the target's
+    ///   name while we were in the Trash. `FileManager.moveItem` checks the
+    ///   destination first and then renames — two operations, and the second
+    ///   one clobbers.
+    /// * The ARRIVAL is proved, because a rename returning 0 says a name
+    ///   moved, not that OUR object did.
+    private static func rollBack(
+        _ sighting: Sighting, from landed: URL, to target: URL,
+        provider: FileSystemIdentityProvider
+    ) -> Failure.Cause {
+        // NOTHING IDENTIFIED, NOTHING MOVED. An absent, unreadable or
+        // unidentifiable landing means the object the disposal took cannot be
+        // named, and an undo that moves an unnamed object is the bug.
+        //
+        // NOT AN INDEPENDENTLY-EVIDENCED GUARD, AND SAID SO: it is the
+        // extraction of the value everything below binds to, and it is
+        // SUBSUMED by the re-bind — measured, by substituting an identity
+        // that can never match instead of removing it, which leaves the whole
+        // trash suite GREEN because the re-bind refuses on its own. Its
+        // partner (the `probeChild` comparison below) carries the refusal;
+        // this arm buys two `open` calls and a cause that names the right
+        // fact.
+        guard case .directory(let observed) = sighting else {
+            return .lastSeenInTrash(landed.path)
+        }
+        let source = landed.lastPathComponent
+        let destination = target.lastPathComponent
+        // A PRECONDITION, DISCLOSED AS ONE RATHER THAN DRESSED AS A GUARD.
+        // `probeChild`/`renameatx_np` take a SINGLE component and resolve a
+        // multi-component one through the held directory, which would let a
+        // symlinked middle component out of it. No production URL reaching
+        // here can violate that (`landed` comes from `trashItem`, `target`
+        // from an admitted item), so no test FAILS when this is deleted —
+        // it is the same precondition `FileSystemIdentityProvider` documents
+        // on both primitives, restated where they are called.
+        guard FileSystemIdentityProvider.isSafeComponent(source),
+              FileSystemIdentityProvider.isSafeComponent(destination)
+        else { return .lastSeenInTrash(landed.path) }
+
+        let trashFD = provider.openDirectoryNoFollow(
+            at: landed.deletingLastPathComponent()
+        )
+        guard trashFD >= 0 else { return .lastSeenInTrash(landed.path) }
+        defer { close(trashFD) }
+        let containerFD = provider.openDirectoryNoFollow(
+            at: target.deletingLastPathComponent()
+        )
+        guard containerFD >= 0 else { return .lastSeenInTrash(landed.path) }
+        defer { close(containerFD) }
+
+        let bound = FileSystemIdentityProvider.ChildProbe.facts(
+            .init(kind: .directory, identity: observed)
+        )
+        guard provider.probeChild(
+            inDirectory: trashFD, named: source, logical: landed
+        ) == bound else {
+            return .lastSeenInTrash(landed.path)
+        }
+
+        var failure: Int32 = 0
+        let moved = source.withCString { from in
+            destination.withCString { to in
+                if renameatx_np(
+                    trashFD, from, containerFD, to, UInt32(RENAME_EXCL)
+                ) == 0 { return true }
+                failure = errno
+                return false
             }
         }
+        guard moved else {
+            // ERRNO CLASSES, NOT ONE OUTCOME. ENOENT means the source went
+            // away between the re-bind and the rename, so the item is NOT
+            // where this would otherwise claim; every other failure
+            // (EEXIST/ENOTEMPTY from `RENAME_EXCL`, EACCES, EROFS, EXDEV)
+            // leaves the source exactly where it was, which is a fact worth
+            // telling the user by path.
+            return failure == ENOENT
+                ? .lastSeenInTrash(landed.path)
+                : .strandedInTrash(landed.path)
+        }
+        guard provider.probeChild(
+            inDirectory: containerFD, named: destination, logical: target
+        ) == bound else {
+            return .putBackTookAnotherObject(landed.path)
+        }
+        return .putBack
     }
 }

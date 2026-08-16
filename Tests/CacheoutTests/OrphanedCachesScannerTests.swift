@@ -3523,6 +3523,496 @@ final class OrphanedCachesScannerTests: XCTestCase {
         try assertCleanupLogContains(tag: "content-drift")
     }
 
+    // MARK: - The rollback is a MOVE, so it needs a binding of its own
+
+    /// Re-points the Trash entry at the ONE instant the rollback's binding
+    /// has to survive: after the post-disposal proof has looked at the landed
+    /// object and rejected it, before the put-back moves anything.
+    ///
+    /// The seam is a question production already asks at exactly that point —
+    /// `identity(ofDescriptor:)` on the descriptor the proof opened for the
+    /// landed URL — and every mutation is a real syscall (`rename(2)`,
+    /// `mkdir(2)`, `open(2)`), so the fixture is never more capable than an
+    /// attacker with a shell: a Finder "Put Back" of the real item plus any
+    /// other Trash entry arriving at the vacated name does the same thing.
+    private final class SwapTheTrashEntryAfterItIsRejectedProvider:
+        FileSystemIdentityProvider {
+        /// Where the disposal said it put the item.
+        var landed: URL!
+        /// Where the wrongly-taken tree goes — still in the Trash, under a
+        /// name nobody recorded.
+        var elsewhere: URL!
+        /// An unrelated Trash entry that takes over `landed`'s name.
+        var intruder: URL!
+        private(set) var swapped = false
+
+        override func identity(ofDescriptor fd: Int32) -> Identity? {
+            let answer = super.identity(ofDescriptor: fd)
+            guard !swapped, let answer, answer == super.identity(of: landed)
+            else { return answer }
+            swapped = true
+            try? FileManager.default.moveItem(at: landed, to: elsewhere)
+            try? FileManager.default.createDirectory(
+                at: landed, withIntermediateDirectories: true
+            )
+            FileManager.default.createFile(
+                atPath: intruder.path, contents: Data("intruder".utf8)
+            )
+            return answer
+        }
+    }
+
+    /// A PUT-BACK MAY ONLY MOVE THE OBJECT THE PROOF LOOKED AT (PR #458
+    /// review — the P2 on the P1's own fix).
+    ///
+    /// The rollback is not a read: it MOVES an object INTO the user's cache
+    /// tree. `putBack` did that by path — `renamex_np(landed, target)` — so
+    /// whatever occupied `landed` at rename time was moved, not the object
+    /// whose failed proof triggered the rollback. Before the fix this
+    /// fixture moved an unrelated Trash entry into `~/Library/Caches`, left
+    /// the wrongly-taken `Photos Library.photoslibrary` sitting in the Trash
+    /// under a name the error never mentioned, and reported `.putBack` —
+    /// "the item the Trash took has been PUT BACK" — for a recovery that
+    /// never happened.
+    ///
+    /// Same class as the finding above it, one layer down: a proof taken
+    /// about an object must reach the destructive call, and the rollback IS
+    /// a destructive call.
+    func testAPutBackWillNotMoveAnObjectItNeverSawTheTrashTake() async throws {
+        let entry = cachesRoot
+            .appendingPathComponent("com.apple.SwiftUI.Drag-REBIND")
+        try mkdir(entry)
+        try writeFile(entry.appendingPathComponent("payload.bin"))
+        let stash = base.appendingPathComponent("drag-rebind-moved-away")
+        let library = entry.appendingPathComponent(
+            "Pictures/Photos Library.photoslibrary"
+        )
+        let trashDir = base.appendingPathComponent("fake-trash-rebind")
+        try mkdir(trashDir)
+        let landed = trashDir.appendingPathComponent(entry.lastPathComponent)
+
+        let provider = SwapTheTrashEntryAfterItIsRejectedProvider()
+        provider.landed = landed
+        provider.elsewhere = trashDir.appendingPathComponent("some-other-name")
+        provider.intruder = landed.appendingPathComponent("intruder.bin")
+
+        let runtime = try makeRuntime(
+            [makeScanner(provider: provider)], provider: provider
+        )
+        let (items, snapshot) = await scanSession(runtime)
+        let leak = try XCTUnwrap(items.first)
+        XCTAssertTrue(leak.automaticCleanEligible,
+                      "the fixture entry scans as a clean known leak")
+
+        let cleaner = runtime.makeCleaner(
+            snapshot: snapshot,
+            trashHandler: { url in
+                // The disposal takes the wrong object (the residual
+                // `testATrashDisposalThatTookTheWrongObjectPutsItBackAndRefuses`
+                // measures), which is what arms the rollback at all.
+                try FileManager.default.moveItem(at: entry, to: stash)
+                try FileManager.default.createDirectory(
+                    at: library, withIntermediateDirectories: true
+                )
+                try FileManager.default.moveItem(at: url, to: landed)
+                return landed
+            }
+        )
+        let report = await cleaner.clean(items: [leak], moveToTrash: true)
+
+        XCTAssertTrue(provider.swapped,
+                      "the fixture never re-pointed the Trash entry")
+        XCTAssertFalse(
+            fm.fileExists(atPath: entry.appendingPathComponent("intruder.bin").path),
+            "the put-back moved an object it never saw the Trash take INTO "
+                + "the user's cache tree — a rollback is a move, and a move "
+                + "with no binding is the very bug it is undoing"
+        )
+        XCTAssertTrue(
+            fm.fileExists(atPath: provider.intruder.path),
+            "the unrelated Trash entry must be left exactly where it was"
+        )
+        XCTAssertTrue(
+            fm.fileExists(
+                atPath: provider.elsewhere
+                    .appendingPathComponent(
+                        "Pictures/Photos Library.photoslibrary"
+                    ).path
+            ),
+            "the wrongly-taken tree is still whole, wherever it now is"
+        )
+        XCTAssertTrue(report.entries.isEmpty,
+                      "nothing may be reported freed: \(report.entries)")
+        XCTAssertEqual(report.errors.count, 1)
+        let message = try XCTUnwrap(report.errors.first?.message)
+        XCTAssertFalse(
+            message.contains("PUT BACK"),
+            "claimed a recovery that did not happen: \(message)"
+        )
+        XCTAssertTrue(
+            message.contains(landed.path),
+            "the refusal must name where the item was last seen: \(message)"
+        )
+        XCTAssertTrue(fm.fileExists(atPath: stash.path),
+                      "the inspected tree is untouched")
+        try assertCleanupLogContains(tag: "content-drift")
+    }
+
+    /// Re-points the Trash entry INSIDE the rollback's own re-bind — after
+    /// the `fstatat` has answered, before `renameatx_np` uses the name.
+    ///
+    /// That window is one syscall wide inside a directory held by
+    /// descriptor, and it cannot be closed: macOS has no rename that takes
+    /// the SOURCE as a descriptor. So it is exercised rather than argued,
+    /// and what the fixture pins is that losing it produces an honest report
+    /// instead of a claimed recovery.
+    private final class SwapTheTrashEntryInsideTheReBindProvider:
+        FileSystemIdentityProvider {
+        var landed: URL!
+        var elsewhere: URL!
+        /// `nil` re-points the name at NOTHING, so the rename fails ENOENT;
+        /// non-nil re-points it at an unrelated object, so the rename
+        /// SUCCEEDS on the wrong one. Two different errno classes out of one
+        /// window, which is the whole reason they are not flattened.
+        var intruder: URL?
+        private(set) var swapped = false
+
+        override func probeChild(
+            inDirectory descriptor: Int32, named name: String,
+            logical: @autoclosure () -> URL
+        ) -> ChildProbe {
+            let url = logical()
+            let answer = super.probeChild(
+                inDirectory: descriptor, named: name, logical: url
+            )
+            guard !swapped,
+                  url.standardizedFileURL.path
+                      == landed.standardizedFileURL.path
+            else { return answer }
+            swapped = true
+            try? FileManager.default.moveItem(at: landed, to: elsewhere)
+            if let intruder {
+                try? FileManager.default.createDirectory(
+                    at: landed, withIntermediateDirectories: true
+                )
+                FileManager.default.createFile(
+                    atPath: intruder.path, contents: Data("intruder".utf8)
+                )
+            }
+            // The STALE answer — exactly what losing this race yields.
+            return answer
+        }
+    }
+
+    /// A RENAME THAT RETURNS 0 SAYS A NAME MOVED, NOT THAT OUR OBJECT DID.
+    ///
+    /// The re-bind above it narrows the rollback to one syscall; this is
+    /// what happens when that syscall is lost anyway. The put-back moves
+    /// SOMETHING into the cache path, and the only acceptable answer is to
+    /// prove the arrival and, failing that, say plainly that the object now
+    /// standing there came out of the Trash and was not put there by the
+    /// user. Reporting `.putBack` here would be the byte-count lie in
+    /// another costume.
+    func testAPutBackThatMovedSomethingElseSaysSoRatherThanClaimingRecovery()
+        async throws {
+        let entry = cachesRoot
+            .appendingPathComponent("com.apple.SwiftUI.Drag-ARRIVAL")
+        try mkdir(entry)
+        try writeFile(entry.appendingPathComponent("payload.bin"))
+        let stash = base.appendingPathComponent("drag-arrival-moved-away")
+        let library = entry.appendingPathComponent(
+            "Pictures/Photos Library.photoslibrary"
+        )
+        let trashDir = base.appendingPathComponent("fake-trash-arrival")
+        try mkdir(trashDir)
+        let landed = trashDir.appendingPathComponent(entry.lastPathComponent)
+
+        let provider = SwapTheTrashEntryInsideTheReBindProvider()
+        provider.landed = landed
+        provider.elsewhere = trashDir.appendingPathComponent("some-other-name")
+        provider.intruder = landed.appendingPathComponent("intruder.bin")
+
+        let runtime = try makeRuntime(
+            [makeScanner(provider: provider)], provider: provider
+        )
+        let (items, snapshot) = await scanSession(runtime)
+        let leak = try XCTUnwrap(items.first)
+
+        let cleaner = runtime.makeCleaner(
+            snapshot: snapshot,
+            trashHandler: { url in
+                try FileManager.default.moveItem(at: entry, to: stash)
+                try FileManager.default.createDirectory(
+                    at: library, withIntermediateDirectories: true
+                )
+                try FileManager.default.moveItem(at: url, to: landed)
+                return landed
+            }
+        )
+        let report = await cleaner.clean(items: [leak], moveToTrash: true)
+
+        XCTAssertTrue(provider.swapped,
+                      "the fixture never re-pointed the Trash entry")
+        XCTAssertTrue(report.entries.isEmpty,
+                      "nothing may be reported freed: \(report.entries)")
+        XCTAssertEqual(report.errors.count, 1)
+        let message = try XCTUnwrap(report.errors.first?.message)
+        XCTAssertFalse(
+            message.contains("PUT BACK"),
+            "claimed a recovery of an object it did not move: \(message)"
+        )
+        XCTAssertTrue(
+            message.contains(landed.path) && message.contains(entry.path),
+            "the refusal must name BOTH the Trash name it moved from and "
+                + "the path the stranger now occupies: \(message)"
+        )
+        XCTAssertTrue(fm.fileExists(atPath: stash.path),
+                      "the inspected tree is untouched")
+        try assertCleanupLogContains(tag: "content-drift")
+    }
+
+    /// Swaps the TRASH DIRECTORY ITSELF — not the entry in it — inside the
+    /// rollback's re-bind, which is the mutation a path-spelled rename
+    /// cannot survive and a descriptor-relative one does not notice.
+    private final class SwapTheTrashDirectoryInsideTheReBindProvider:
+        FileSystemIdentityProvider {
+        var landed: URL!
+        /// Where the WHOLE Trash directory goes.
+        var trashMovedAway: URL!
+        /// The decoy that answers to `landed`'s spelling afterwards.
+        var intruder: URL!
+        private(set) var swapped = false
+
+        override func probeChild(
+            inDirectory descriptor: Int32, named name: String,
+            logical: @autoclosure () -> URL
+        ) -> ChildProbe {
+            let url = logical()
+            let answer = super.probeChild(
+                inDirectory: descriptor, named: name, logical: url
+            )
+            guard !swapped,
+                  url.standardizedFileURL.path
+                      == landed.standardizedFileURL.path
+            else { return answer }
+            swapped = true
+            let trash = landed.deletingLastPathComponent()
+            try? FileManager.default.moveItem(at: trash, to: trashMovedAway)
+            try? FileManager.default.createDirectory(
+                at: intruder.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            FileManager.default.createFile(
+                atPath: intruder.path, contents: Data("intruder".utf8)
+            )
+            return answer
+        }
+    }
+
+    /// THE ROLLBACK'S RENAME GOES THROUGH THE DIRECTORY IT CHECKED, NOT
+    /// THROUGH THAT DIRECTORY'S NAME.
+    ///
+    /// An `fstatat` under a held directory descriptor followed by a rename
+    /// through a re-resolved PATH is a check of one thing and a move of
+    /// another: re-point the Trash directory between them and the path-spelled
+    /// rename walks into a NEW directory and moves whatever answers to the
+    /// same leaf. `renameatx_np` against the descriptor the re-bind used
+    /// cannot be redirected that way — it moves the object out of the inode
+    /// it verified, wherever that inode's name has gone.
+    ///
+    /// This is the test that makes the descriptors load-bearing rather than
+    /// decorative: spell the rename `renamex_np(landed.path, target.path)`
+    /// and it goes RED, reporting `putBackTookAnotherObject` for a recovery
+    /// that would otherwise have succeeded.
+    func testAPutBackFollowsTheTrashDirectoryItCheckedNotItsName() async throws {
+        let entry = cachesRoot
+            .appendingPathComponent("com.apple.SwiftUI.Drag-PINNED")
+        try mkdir(entry)
+        try writeFile(entry.appendingPathComponent("payload.bin"))
+        let stash = base.appendingPathComponent("drag-pinned-moved-away")
+        let library = entry.appendingPathComponent(
+            "Pictures/Photos Library.photoslibrary"
+        )
+        let trashDir = base.appendingPathComponent("fake-trash-pinned")
+        try mkdir(trashDir)
+        let landed = trashDir.appendingPathComponent(entry.lastPathComponent)
+
+        let provider = SwapTheTrashDirectoryInsideTheReBindProvider()
+        provider.landed = landed
+        provider.trashMovedAway = base
+            .appendingPathComponent("fake-trash-pinned-moved-away")
+        provider.intruder = landed.appendingPathComponent("intruder.bin")
+
+        let runtime = try makeRuntime(
+            [makeScanner(provider: provider)], provider: provider
+        )
+        let (items, snapshot) = await scanSession(runtime)
+        let leak = try XCTUnwrap(items.first)
+
+        let cleaner = runtime.makeCleaner(
+            snapshot: snapshot,
+            trashHandler: { url in
+                try FileManager.default.moveItem(at: entry, to: stash)
+                try FileManager.default.createDirectory(
+                    at: library, withIntermediateDirectories: true
+                )
+                try FileManager.default.moveItem(at: url, to: landed)
+                return landed
+            }
+        )
+        let report = await cleaner.clean(items: [leak], moveToTrash: true)
+
+        XCTAssertTrue(provider.swapped,
+                      "the fixture never re-pointed the Trash directory")
+        XCTAssertTrue(report.entries.isEmpty,
+                      "nothing may be reported freed: \(report.entries)")
+        let message = try XCTUnwrap(report.errors.first?.message)
+        XCTAssertTrue(
+            message.contains("PUT BACK"),
+            "the object the re-bind verified was reachable through the "
+                + "descriptor it verified it in — the recovery should have "
+                + "succeeded: \(message)"
+        )
+        XCTAssertTrue(
+            fm.fileExists(atPath: library.path),
+            "the wrongly-taken tree must be back at its own path, not "
+                + "whatever the Trash's NAME now leads to"
+        )
+        XCTAssertTrue(
+            fm.fileExists(atPath: provider.intruder.path),
+            "the decoy standing at the re-spelled Trash name must be "
+                + "untouched — a rollback that follows a name moves it "
+                + "instead"
+        )
+        XCTAssertTrue(fm.fileExists(atPath: stash.path),
+                      "the inspected tree is untouched")
+        try assertCleanupLogContains(tag: "content-drift")
+    }
+
+    /// "COULD NOT BE PUT BACK" AND "IS NOT WHERE THE TRASH SAID" ARE
+    /// DIFFERENT FACTS, AND ONLY ONE OF THEM CAN BE ACTED ON.
+    ///
+    /// The rename's errno separates them: `EEXIST` from `RENAME_EXCL` leaves
+    /// the item exactly where the re-bind found it (`.strandedInTrash`, "move
+    /// it back from there"), while `ENOENT` means it went away in the window
+    /// the descriptor cannot close, and telling the user to drag it back from
+    /// a path nothing occupies is the flattened-errno lie in miniature.
+    ///
+    /// Same one-syscall window as the test above, one errno over.
+    func testAPutBackWhoseSourceVanishedDoesNotSendTheUserToAnEmptyPath()
+        async throws {
+        let entry = cachesRoot
+            .appendingPathComponent("com.apple.SwiftUI.Drag-VANISH")
+        try mkdir(entry)
+        try writeFile(entry.appendingPathComponent("payload.bin"))
+        let stash = base.appendingPathComponent("drag-vanish-moved-away")
+        let library = entry.appendingPathComponent(
+            "Pictures/Photos Library.photoslibrary"
+        )
+        let trashDir = base.appendingPathComponent("fake-trash-vanish")
+        try mkdir(trashDir)
+        let landed = trashDir.appendingPathComponent(entry.lastPathComponent)
+
+        let provider = SwapTheTrashEntryInsideTheReBindProvider()
+        provider.landed = landed
+        provider.elsewhere = trashDir.appendingPathComponent("some-other-name")
+        provider.intruder = nil
+
+        let runtime = try makeRuntime(
+            [makeScanner(provider: provider)], provider: provider
+        )
+        let (items, snapshot) = await scanSession(runtime)
+        let leak = try XCTUnwrap(items.first)
+
+        let cleaner = runtime.makeCleaner(
+            snapshot: snapshot,
+            trashHandler: { url in
+                try FileManager.default.moveItem(at: entry, to: stash)
+                try FileManager.default.createDirectory(
+                    at: library, withIntermediateDirectories: true
+                )
+                try FileManager.default.moveItem(at: url, to: landed)
+                return landed
+            }
+        )
+        let report = await cleaner.clean(items: [leak], moveToTrash: true)
+
+        XCTAssertTrue(provider.swapped,
+                      "the fixture never re-pointed the Trash entry")
+        XCTAssertFalse(fm.fileExists(atPath: landed.path),
+                       "the fixture's premise: the name is empty now")
+        XCTAssertTrue(report.entries.isEmpty,
+                      "nothing may be reported freed: \(report.entries)")
+        let message = try XCTUnwrap(report.errors.first?.message)
+        XCTAssertFalse(
+            message.contains("it is in the Trash at"),
+            "sent the user to a path nothing occupies: \(message)"
+        )
+        XCTAssertTrue(
+            message.contains("no longer at \(landed.path)"),
+            "the refusal must say the item is not where the Trash put it: "
+                + message
+        )
+        XCTAssertFalse(
+            fm.fileExists(atPath: entry.path),
+            "nothing may be moved into the cache tree when the object the "
+                + "rollback bound to is gone"
+        )
+        try assertCleanupLogContains(tag: "content-drift")
+    }
+
+    /// A DISPOSAL THAT REPORTS A NAME NOTHING OCCUPIES HAS PUT NOTHING THERE.
+    ///
+    /// `.absent` at the landing proves nothing (that is what `proveTaken`'s
+    /// asymmetry says), and the rollback then has NO object to bind to. The
+    /// old put-back tried the rename anyway, got its own ENOENT, and reported
+    /// "it is in the Trash at <path>. Move it back from there" — an
+    /// instruction pointing at an empty name. Nothing identified, nothing
+    /// moved, and the error says where it was last claimed to be.
+    func testAPutBackWithNothingToBindToMovesNothingAndSaysSo() async throws {
+        let entry = cachesRoot
+            .appendingPathComponent("com.apple.SwiftUI.Drag-NOWHERE")
+        try mkdir(entry)
+        try writeFile(entry.appendingPathComponent("payload.bin"))
+        let trashDir = base.appendingPathComponent("fake-trash-nowhere")
+        try mkdir(trashDir)
+        let actual = trashDir.appendingPathComponent("where-it-really-went")
+        let claimed = trashDir.appendingPathComponent("nothing-is-here")
+
+        let runtime = try makeRuntime([makeScanner()])
+        let (items, snapshot) = await scanSession(runtime)
+        let leak = try XCTUnwrap(items.first)
+
+        let cleaner = runtime.makeCleaner(
+            snapshot: snapshot,
+            trashHandler: { url in
+                try FileManager.default.moveItem(at: url, to: actual)
+                return claimed
+            }
+        )
+        let report = await cleaner.clean(items: [leak], moveToTrash: true)
+
+        XCTAssertTrue(report.entries.isEmpty,
+                      "nothing may be reported freed: \(report.entries)")
+        let message = try XCTUnwrap(report.errors.first?.message)
+        XCTAssertFalse(
+            message.contains("it is in the Trash at"),
+            "told the user to drag back an item from an empty name: \(message)"
+        )
+        XCTAssertTrue(message.contains(claimed.path), message)
+        XCTAssertFalse(
+            fm.fileExists(atPath: entry.path),
+            "moved something into the cache tree with nothing to bind to"
+        )
+        XCTAssertTrue(
+            fm.fileExists(
+                atPath: actual.appendingPathComponent("payload.bin").path
+            ),
+            "the item is where the disposal really put it, untouched"
+        )
+        try assertCleanupLogContains(tag: "content-drift")
+    }
+
     /// A DISPOSAL THAT WILL NOT SAY WHAT IT TOOK HAS NOT BEEN PROVED.
     ///
     /// The whole after-the-fact proof rests on `trashItem` reporting where it

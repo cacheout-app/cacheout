@@ -13,7 +13,7 @@ Built for developers on space-constrained Macs (especially the 256GB M4 Mac Mini
 ## Features
 
 - **Built-in cache categories** — Xcode, Docker, npm, Yarn, pnpm, Homebrew, Playwright, CocoaPods, Swift PM, Gradle, browser caches, VS Code, Electron, pip, and more (the full list lives in [docs/v1/CATEGORIES.md](docs/v1/CATEGORIES.md))
-- **node_modules finder** — Recursively scans your project directories to find every `node_modules` folder, shows project name, size, and staleness (30d+), with per-project selection
+- **Project build-artifact scanner** — Walks your configured dev roots for build output proven by an ecosystem marker file (`target/` beside `Cargo.toml`, `node_modules/` beside `package.json`, `.venv/` containing `pyvenv.cfg`, and more), shows size and staleness (30d+), and refuses to delete a directory holding release artifacts (`.dmg`, `.pkg`, `.ipa`, `.app`, `.xcarchive`, `.dSYM`) until you acknowledge them
 - **Risk-level indicators** — Each category rated Safe / Review / Caution so you know what's risk-free
 - **Async parallel scanning** — Scans all categories concurrently for fast results
 - **Sparse file awareness** — Reports allocated (on-disk) usage everywhere, so sparse files — Docker's disk image, simulator disk images, and anything else logically larger than it really is — show what they actually consume, not inflated logical sizes
@@ -77,15 +77,34 @@ open Package.swift
 
 This table is a sample — see [docs/v1/CATEGORIES.md](docs/v1/CATEGORIES.md) for every category with paths, discovery method, and risk level.
 
-## node_modules Finder
+## Project Build Artifacts
 
-Cacheout includes a dedicated project scanner that recursively searches common developer directories (`~/Documents`, `~/Developer`, `~/Projects`, `~/Code`, `~/Desktop`, `~/Dropbox`, etc.) for `node_modules` folders.
+Cacheout walks your configured dev roots (by default `~/Documents`,
+`~/Developer`, `~/Projects`, `~/Code`, `~/Sites`, `~/Desktop`, `~/Dropbox`,
+`~/repos`, `~/src`, `~/work` — editable in Settings) for build-output
+directories, and reports each one it can PROVE: a `target/` beside a
+`Cargo.toml`, a `node_modules/` beside a `package.json`, a directory
+containing a `pyvenv.cfg`, and the rest of the rule table. A directory with
+the right name but no marker is never touched.
 
-Each discovered `node_modules` shows the project name, full path, size, and how old it is. Projects with stale node_modules (30+ days untouched) are flagged with an age badge. You can quickly select all stale projects, or pick individually.
+Each find shows its path, size and how long since the last build; anything
+untouched for 30+ days gets an age badge, and you can select all stale finds
+at once or pick individually. Sizes are allocated, sparse-aware bytes — a
+Rust `target/` that looks like 57 GB but occupies 31 GB reports 31 GB, with
+the apparent size shown separately so the number you budget against is the
+number you get back.
 
-This is especially impactful on space-constrained Macs — a single project's `node_modules` can be 500MB-1GB, and most developers have 5-20 projects sitting around.
+**Release artifacts are protected.** Before deleting, Cacheout inspects the
+directory for `.dmg`, `.pkg`, `.ipa`, `.app`, `.xcarchive` and `.dSYM`
+payloads. Anything it finds is listed on the confirmation sheet and the
+delete is refused until you acknowledge exactly what is there — and it
+re-checks immediately before deleting, so an artifact produced after the scan
+still stops the deletion.
 
-The finder is also available headlessly: `--cli scan` lists discovered `node_modules` directories, and `--cli clean node_modules --confirm` (or `node_modules:<item-id>` for one project) deletes them. See [docs/v1/CLI-REFERENCE.md](docs/v1/CLI-REFERENCE.md).
+Headless too: `--cli scan` lists every find as a `scanner_items` row, and
+`--cli clean build_artifacts --confirm` (or
+`build_artifacts:<item-id>` for one) deletes them. See
+[docs/v1/CLI-REFERENCE.md](docs/v1/CLI-REFERENCE.md).
 
 ## How it works
 

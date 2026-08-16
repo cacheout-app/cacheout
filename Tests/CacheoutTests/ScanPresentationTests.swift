@@ -70,11 +70,13 @@ final class ScanPresentationTests: XCTestCase {
     }
 
     /// Hermetic view model (fn-2.4): a fixture-home RUNTIME — empty category
-    /// registry, injected search roots, zero reads of the real `$HOME`. The
+    /// registry, injected dev roots, zero reads of the real `$HOME`. The
     /// cleaner is runtime-constructed, exactly as production composes it.
+    /// The per-item scanner is `build_artifacts` (fn-4.5's atomic swap; the
+    /// node_modules scanner it replaced was deleted in fn-4.7).
     @MainActor
     private func makeViewModel(
-        searchRoots: [URL] = []
+        devRoots: [URL] = []
     ) throws -> CacheoutViewModel {
         let provider = FileSystemIdentityProvider()
         let runtime = try SpaceScannerRuntime(
@@ -83,8 +85,11 @@ final class ScanPresentationTests: XCTestCase {
                     categories: [],
                     scanner: CacheScanner(home: fixtureHome, provider: provider)
                 ),
-                NodeModulesScanner(
-                    home: fixtureHome, searchRoots: searchRoots,
+                BuildArtifactsScanner(
+                    home: fixtureHome,
+                    devRoots: DevRootsResolution(
+                        keptRoots: devRoots, issues: []
+                    ),
                     provider: provider
                 ),
             ],
@@ -585,9 +590,10 @@ final class ScanPresentationTests: XCTestCase {
         let viewModel = try makeViewModel()
         XCTAssertFalse(viewModel.isAnyScanInProgress)
 
-        // The category scanner reports in seconds while node_modules keeps
-        // running 10–30s longer — ANY pending scanner must read as scanning.
-        viewModel.scanningScannerIDs = [NodeModulesScanner.registeredID]
+        // The category scanner reports in seconds while the project walk
+        // keeps running 10–30s longer — ANY pending scanner must read as
+        // scanning.
+        viewModel.scanningScannerIDs = [BuildArtifactsScanner.registeredID]
         XCTAssertTrue(viewModel.isAnyScanInProgress)
         XCTAssertFalse(viewModel.shouldAutoRescan,
                        "an in-flight scan must never trigger an auto-rescan")
@@ -599,8 +605,8 @@ final class ScanPresentationTests: XCTestCase {
     @MainActor
     func testCleanRefusedWhileAnyScannerStillPending() async throws {
         let viewModel = try makeViewModel()
-        // categories already reported; node_modules still pending
-        viewModel.scanningScannerIDs = [NodeModulesScanner.registeredID]
+        // categories already reported; build_artifacts still pending
+        viewModel.scanningScannerIDs = [BuildArtifactsScanner.registeredID]
 
         await viewModel.clean()
 
@@ -613,7 +619,7 @@ final class ScanPresentationTests: XCTestCase {
     @MainActor
     func testScanReentrancyRefusedWhileAnyScannerPending() async throws {
         let viewModel = try makeViewModel()
-        viewModel.scanningScannerIDs = [NodeModulesScanner.registeredID]
+        viewModel.scanningScannerIDs = [BuildArtifactsScanner.registeredID]
 
         await viewModel.scan(trigger: .userInitiated)
 
@@ -698,7 +704,7 @@ final class ScanPresentationTests: XCTestCase {
                        "the auto-selected safe category IS cleaned")
     }
 
-    // MARK: - node_modules issues in the view model (R14) + TCC gating (R9)
+    // MARK: - Per-item scanner issues in the view model (R14) + TCC gating (R9)
 
     @MainActor
     func testDeniedSearchRootIssueVisibleOnUserInitiatedScanOnly() async throws {
@@ -713,8 +719,8 @@ final class ScanPresentationTests: XCTestCase {
             try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: docs.path)
         }
 
-        let viewModel = try makeViewModel(searchRoots: [docs])
-        let nm = NodeModulesScanner.registeredID
+        let viewModel = try makeViewModel(devRoots: [docs])
+        let nm = BuildArtifactsScanner.registeredID
 
         await viewModel.scan(trigger: .userInitiated)
         XCTAssertFalse(viewModel.issues(forScanner: nm).isEmpty,
@@ -735,13 +741,16 @@ final class ScanPresentationTests: XCTestCase {
         // Readable protected-named root with a real project: user-initiated
         // finds it; automatic skips it (trigger plumbing end-to-end).
         let docs = fixtureHome.appendingPathComponent("Documents")
-        let dep = docs.appendingPathComponent("proj/node_modules/dep")
+        let project = docs.appendingPathComponent("proj")
+        let dep = project.appendingPathComponent("node_modules/dep")
         try fm.createDirectory(at: dep, withIntermediateDirectories: true)
+        try Data(repeating: 0xC3, count: 64)
+            .write(to: project.appendingPathComponent("package.json"))
         try Data(repeating: 0xCD, count: 4096)
             .write(to: dep.appendingPathComponent("index.js"))
 
-        let viewModel = try makeViewModel(searchRoots: [docs])
-        let nm = NodeModulesScanner.registeredID
+        let viewModel = try makeViewModel(devRoots: [docs])
+        let nm = BuildArtifactsScanner.registeredID
 
         await viewModel.scan(trigger: .automatic)
         XCTAssertTrue(viewModel.items(forScanner: nm).isEmpty,
@@ -750,7 +759,10 @@ final class ScanPresentationTests: XCTestCase {
                       "a policy skip is not a scan problem")
 
         await viewModel.scan(trigger: .userInitiated)
-        XCTAssertEqual(viewModel.items(forScanner: nm).map(\.displayName), ["proj"],
-                       "user-initiated scans include protected roots (R9)")
+        XCTAssertEqual(
+            viewModel.items(forScanner: nm).map(\.displayName),
+            ["node_modules"],
+            "user-initiated scans include protected roots (R9)"
+        )
     }
 }

@@ -354,7 +354,8 @@ final class DepthSafeRemovalTests: XCTestCase {
             if let foreignInode,
                super.identity(ofDescriptor: descriptor)?.inode == foreignInode {
                 return MountIdentity(
-                    filesystemID: (real.filesystemID.0 &+ 1, real.filesystemID.1),
+                    fsidMajor: real.fsidMajor &+ 1,
+                    fsidMinor: real.fsidMinor,
                     device: real.device &+ 1
                 )
             }

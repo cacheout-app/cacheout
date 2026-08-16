@@ -163,15 +163,15 @@ create_bundle() {
     <key>NSHumanReadableCopyright</key>
     <string>Copyright © 2025 This Local, Inc. MIT License.</string>
     <!-- TCC usage strings (R9). Key set mirrors
-         NodeModulesScanner.tccProtectedRootNames — keep the three locations
+         ProjectTreeWalker.tccProtectedAncestorNames — keep the three locations
          in sync: this heredoc, Sources/Cacheout/Info.plist, and the
          INFOPLIST_KEY_* entries in project.yml. Downloads is defensive:
          no current scan walks ~/Downloads, but the key ships so any future
          Downloads-reaching scanner prompts with an explanation. -->
     <key>NSDocumentsFolderUsageDescription</key>
-    <string>Cacheout looks for developer project node_modules folders in Documents during scans you start. Nothing is deleted without your confirmation.</string>
+    <string>Cacheout looks for developer build-artifact folders (target/, node_modules/, .venv/ and similar) in Documents during scans you start. Nothing is deleted without your confirmation.</string>
     <key>NSDesktopFolderUsageDescription</key>
-    <string>Cacheout looks for developer project node_modules folders on your Desktop during scans you start. Nothing is deleted without your confirmation.</string>
+    <string>Cacheout looks for developer build-artifact folders (target/, node_modules/, .venv/ and similar) on your Desktop during scans you start. Nothing is deleted without your confirmation.</string>
     <key>NSDownloadsFolderUsageDescription</key>
     <string>Cacheout reads Downloads only if a scan you start includes it, to find developer caches. Nothing is deleted without your confirmation.</string>
 </dict>

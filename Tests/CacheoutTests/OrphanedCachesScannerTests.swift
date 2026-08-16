@@ -119,8 +119,8 @@ final class OrphanedCachesScannerTests: XCTestCase {
         forInode inode: UInt64, device: UInt64
     ) -> FileSystemIdentityProvider.MountIdentity {
         FileSystemIdentityProvider.MountIdentity(
-            filesystemID: (Int32(bitPattern: 0xDEAD_BEEF),
-                           Int32(bitPattern: UInt32(truncatingIfNeeded: inode))),
+            fsidMajor: Int32(bitPattern: 0xDEAD_BEEF),
+            fsidMinor: Int32(bitPattern: UInt32(truncatingIfNeeded: inode)),
             device: device
         )
     }
@@ -478,7 +478,8 @@ final class OrphanedCachesScannerTests: XCTestCase {
             }
             if let device = deviceOverridesByInode[id.inode] {
                 return MountIdentity(
-                    filesystemID: real.filesystemID, device: device
+                    fsidMajor: real.fsidMajor, fsidMinor: real.fsidMinor,
+                    device: device
                 )
             }
             return real
@@ -1418,6 +1419,124 @@ final class OrphanedCachesScannerTests: XCTestCase {
         XCTAssertTrue(fresh.evidence.contains(
             "verify the original still exists before deleting"
         ), fresh.evidence)
+        XCTAssertFalse(fresh.requiresPreDeleteRevalidation,
+                       "a non-eligible sweep item keeps its accepted "
+                           + "conscious-confirmation residual, unmarked")
+    }
+
+    // MARK: - Revalidator seam migration (fn-4.8, R17/D8)
+
+    func testMarkerEmittedForExactlyTheAutoCleanEligibleSweepEntries() async throws {
+        // The migration's emission half: the scanner-agnostic
+        // `requiresPreDeleteRevalidation` marker rides EXACTLY the set the
+        // registered revalidator's predicate deems applicable — the entries
+        // the removed hard-coded cleaner gate re-probed. One scan, both
+        // shapes.
+        let clean = cachesRoot.appendingPathComponent("com.apple.SwiftUI.Drag-CLEAN")
+        try mkdir(clean)
+        try writeFile(clean.appendingPathComponent("payload.bin"))
+        let shaped = cachesRoot.appendingPathComponent("com.apple.SwiftUI.Drag-SHAPED")
+        try mkdir(shaped.appendingPathComponent("Pictures"))
+        try writeFile(shaped.appendingPathComponent("payload.bin"))
+
+        let scanner = makeScanner()
+        let (byName, outcome) = await scanItems(scanner)
+        try assertValidates(outcome, scanner: scanner)
+
+        let eligible = try XCTUnwrap(byName["com.apple.SwiftUI.Drag-CLEAN"])
+        XCTAssertTrue(eligible.automaticCleanEligible)
+        XCTAssertTrue(eligible.requiresPreDeleteRevalidation,
+                      "an auto-clean-eligible sweep entry is marked")
+
+        let reviewed = try XCTUnwrap(byName["com.apple.SwiftUI.Drag-SHAPED"])
+        XCTAssertFalse(reviewed.automaticCleanEligible)
+        XCTAssertFalse(reviewed.requiresPreDeleteRevalidation,
+                       "a review-tier entry stays unmarked — behavior preserved")
+
+        // The predicate and the emission agree ITEM FOR ITEM: that equality
+        // is what the runtime's marker invariant enforces.
+        let revalidator = OrphanedCachesScanner.preDeleteRevalidator(
+            provider: FileSystemIdentityProvider()
+        )
+        for item in outcome.items {
+            XCTAssertEqual(
+                revalidator.requiresRevalidation(item: item),
+                item.requiresPreDeleteRevalidation,
+                "declared applicability must match the emitted marker: "
+                    + item.displayName
+            )
+        }
+    }
+
+    func testMarkerForgottenApplicableItemFailsRuntimeValidation() async throws {
+        // BELT-AND-BRACES, the scan-time half (the cleaner half — the same
+        // shape still re-probed at the chokepoint — lives in
+        // `CacheCleanerTests`). A mapping regression that emits an
+        // `automaticCleanEligible` entry WITHOUT the marker is a structural
+        // violation: the whole outcome is replaced by the synthesized
+        // path-less `malformed_outcome`, so nothing from it is listable,
+        // addressable, or deletable. This invariant is what allowed the old
+        // hard-coded cleaner gate to be removed in the same change.
+        let entry = cachesRoot.appendingPathComponent("com.apple.SwiftUI.Drag-UNMARKED")
+        try mkdir(entry)
+        try writeFile(entry.appendingPathComponent("payload.bin"))
+
+        let scanner = makeScanner()
+        let (_, outcome) = await scanItems(scanner)
+        let emitted = try XCTUnwrap(outcome.items.first)
+        XCTAssertTrue(emitted.requiresPreDeleteRevalidation)
+
+        // The HONEST outcome validates; only the stripped one malforms —
+        // so the fixture proves the marker, not some unrelated field.
+        let runtime = try makeRuntime([scanner])
+        guard case .outcome = runtime.validatedOutcome(
+            outcome, from: OrphanedCachesScanner.registeredID
+        ) else {
+            return XCTFail("the marked outcome must validate")
+        }
+
+        let stripped = ScanOutcome(
+            items: [Self.withoutRevalidationMarker(emitted)],
+            errors: outcome.errors
+        )
+        switch runtime.validatedOutcome(
+            stripped, from: OrphanedCachesScanner.registeredID
+        ) {
+        case .outcome:
+            XCTFail("an applicable-but-unmarked item must malform the outcome")
+        case .malformed(let scannerID, let issue):
+            XCTAssertEqual(scannerID, OrphanedCachesScanner.registeredID)
+            XCTAssertEqual(issue.kind, .malformedOutcome)
+            XCTAssertNil(issue.url, "the synthesized issue is path-less")
+            XCTAssertTrue(
+                issue.detail.contains("requiresPreDeleteRevalidation"),
+                issue.detail
+            )
+        }
+    }
+
+    /// The mapping regression, spelled out: the SAME item with the marker
+    /// dropped (every other field byte-identical).
+    private static func withoutRevalidationMarker(
+        _ item: ReclaimableItem
+    ) -> ReclaimableItem {
+        ReclaimableItem(
+            id: item.id, scannerID: item.scannerID,
+            displayName: item.displayName,
+            exactBytes: item.exactBytes,
+            estimatedUpToBytes: item.estimatedUpToBytes,
+            logicalBytes: item.logicalBytes, itemCount: item.itemCount,
+            url: item.url, declaredDisplayPath: item.declaredDisplayPath,
+            rootRecords: item.rootRecords, state: item.state,
+            scanError: item.scanError, risk: item.risk,
+            evidence: item.evidence, rebuildNote: item.rebuildNote,
+            action: item.action, admission: item.admission,
+            defaultSelected: item.defaultSelected,
+            automaticCleanEligible: item.automaticCleanEligible,
+            isStale: item.isStale,
+            valuablesDisclosure: item.valuablesDisclosure,
+            requiresPreDeleteRevalidation: false
+        )
     }
 
     func testCaseVariantUserDataForcesReviewAtScanTime() async throws {
@@ -1633,7 +1752,8 @@ final class OrphanedCachesScannerTests: XCTestCase {
             }
             if let device = deviceOverridesByInode[id.inode] {
                 return MountIdentity(
-                    filesystemID: real.filesystemID, device: device
+                    fsidMajor: real.fsidMajor, fsidMinor: real.fsidMinor,
+                    device: device
                 )
             }
             return real
@@ -3880,7 +4000,7 @@ final class OrphanedCachesScannerTests: XCTestCase {
             )
         }
 
-        override func openChildDirectory(
+        override func openChildDirectoryCarryingErrno(
             inDirectory descriptor: Int32, named name: String,
             logical: @autoclosure () -> URL
         ) -> DescriptorOpen {
@@ -3888,7 +4008,7 @@ final class OrphanedCachesScannerTests: XCTestCase {
                 openedInside.append(id.inode)
             }
             namesOpened.append(name)
-            return super.openChildDirectory(
+            return super.openChildDirectoryCarryingErrno(
                 inDirectory: descriptor, named: name, logical: logical()
             )
         }
@@ -4089,13 +4209,13 @@ final class OrphanedCachesScannerTests: XCTestCase {
                 )
             }
 
-            override func openChildDirectory(
+            override func openChildDirectoryCarryingErrno(
                 inDirectory descriptor: Int32, named name: String,
                 logical: @autoclosure () -> URL
             ) -> DescriptorOpen {
                 let logical = logical()
                 opened[name] = logical.absoluteString
-                return super.openChildDirectory(
+                return super.openChildDirectoryCarryingErrno(
                     inDirectory: descriptor, named: name, logical: logical
                 )
             }

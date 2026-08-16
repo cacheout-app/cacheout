@@ -47,7 +47,7 @@ Each line follows this format:
 ```
 [2026-01-15T10:30:00Z] Cleaned Xcode DerivedData: 5.2 GB
 [2026-01-15T10:30:01Z] Cleaned npm Cache: 1.8 GB
-[2026-01-15T10:30:01Z] Cleaned node_modules/my-project: 890 MB
+[2026-01-15T10:30:01Z] Cleaned build_artifacts/node_modules: 890 MB
 ```
 
 ### Spotlight Markers

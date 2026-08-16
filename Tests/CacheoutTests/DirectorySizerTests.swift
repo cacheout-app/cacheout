@@ -539,6 +539,67 @@ final class DirectorySizerTests: XCTestCase {
         XCTAssertEqual(report.measuredBytes, 0)
         XCTAssertEqual(report.itemCount, 0)
     }
+
+    /// Mirrors the PRODUCTION `isMountPoint` contract — true only for the
+    /// CANONICAL spelling, exactly as `statfs` compares `f_mntonname` — and
+    /// records every spelling the sizer hands it.
+    private final class CanonicalSpellingMountProvider:
+        FileSystemIdentityProvider
+    {
+        var canonicalMountPaths: Set<String> = []
+        private(set) var mountCheckedPaths: [String] = []
+
+        override func isMountPoint(_ url: URL) -> Bool {
+            mountCheckedPaths.append(url.path)
+            if canonicalMountPaths.contains(url.path) { return true }
+            return super.isMountPoint(url)
+        }
+    }
+
+    func testSizerAlwaysHandsTheMountCheckACanonicalSpelling() throws {
+        // The AUDIT cell for PR #457 review r4, which fixed three callers that
+        // handed `isMountPoint` an aliased spelling. The sizer was judged
+        // correct BY READING (`.scanRoot` canonicalizes, `.deletionTarget`
+        // target-resolves, and the enumerator's children are rooted at that
+        // resolved root) — this proves it instead, in both modes, through a
+        // request whose ancestor really is a symlink.
+        let real = base.appendingPathComponent("real")
+        try mkdir(real.appendingPathComponent("tree/sub"))
+        let alias = base.appendingPathComponent("aliaslink")
+        try fm.createSymbolicLink(at: alias, withDestinationURL: real)
+        let requested = alias.appendingPathComponent("tree")
+        try writeFile(requested.appendingPathComponent("sub/payload.bin"),
+                      bytes: 4_096)
+        // The BOUNDARY is declared by its canonical spelling only — the shape
+        // the three fixed callers were blind to.
+        let canonicalSub = FileSystemIdentityProvider()
+            .canonicalize(requested.appendingPathComponent("sub")).path
+        XCTAssertNotEqual(canonicalSub,
+                          requested.appendingPathComponent("sub").path,
+                          "the fixture must really be aliased")
+
+        for mode in [DirectorySizer.Mode.scanRoot, .deletionTarget] {
+            let provider = CanonicalSpellingMountProvider()
+            provider.canonicalMountPaths = [canonicalSub]
+
+            let report = makeSizer(provider: provider)
+                .measure(at: requested, mode: mode)
+
+            XCTAssertEqual(
+                report.mountBoundaries.map(\.lastPathComponent), ["sub"],
+                "\(mode): the boundary is seen through the alias, so every "
+                    + "path this walk hands the check is already canonical"
+            )
+            XCTAssertEqual(report.itemCount, 0, "\(mode): subtree not counted")
+            XCTAssertFalse(
+                provider.mountCheckedPaths.contains {
+                    $0 == requested.path || $0.hasPrefix(requested.path + "/")
+                },
+                "\(mode): not one ALIASED spelling reaches the check: "
+                    + "\(provider.mountCheckedPaths)"
+            )
+        }
+    }
 }
 
 /// `CacheScanner` scan-time admission + `ScanResult` state derivation

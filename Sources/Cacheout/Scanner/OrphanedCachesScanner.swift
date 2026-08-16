@@ -336,20 +336,14 @@ struct UserDataProbeResult: Equatable {
     /// not a fact about a PATH; it is a fact about an OBJECT, and it has to
     /// travel with enough identity for the deletion to prove the path still
     /// names that object (`CacheCleaner.removeGuardedItem`).
-    enum InspectedRoot: Equatable {
-        /// A real directory was opened and walked; this is the `fstat`
-        /// identity of the descriptor the whole walk was anchored to.
-        case directory(FileSystemIdentityProvider.Identity)
-        /// The root open reported `ENOENT`/`ENOTDIR`: there is no directory
-        /// TREE of ours at that name — absent, symlink, regular file,
-        /// special file — and deletion removes the leaf as-is. The clean
-        /// verdict is about the ABSENCE of a tree, so a directory appearing
-        /// at that name since voids it just as surely as a swapped inode.
-        case noDirectoryTree
-        /// Nothing was established: the probe refused before it could bind
-        /// anything. NEVER a licence to delete.
-        case unestablished
-    }
+    ///
+    /// THE TYPE ITSELF NOW LIVES ON THE GENERAL SEAM (merge of #457/#458):
+    /// `PreDeleteInspectedObject` in `SpaceScanner.swift`, because the
+    /// binding travels on `PreDeleteVerdict.allow` — the scanner-agnostic
+    /// chokepoint #457 generalized — and a type that every revalidator has
+    /// to name cannot live inside one scanner's result. The spelling here is
+    /// kept so this file (and its tests) read exactly as before.
+    typealias InspectedRoot = PreDeleteInspectedObject
 
     /// Matched pattern NAMES in table order, deduplicated.
     let matches: [String]
@@ -793,7 +787,8 @@ struct OrphanedCachesScanner: @unchecked Sendable {
         )
     }
 
-    /// DELETE-TIME REVALIDATION entry point (cleaner seam, PR #456 review):
+    /// DELETE-TIME REVALIDATION entry point (cleaner seam, PR #456 review;
+    /// reached through fn-4.8's generalized `preDeleteRevalidator` below):
     /// a sweep entry removed and RECREATED at the same name between scan
     /// and confirmation passes the cleaner's container-snapshot check (the
     /// snapshot binds the `~/Library/Caches` root's identity, not the
@@ -1965,7 +1960,7 @@ struct OrphanedCachesScanner: @unchecked Sendable {
                     obstructions.insert(.transientFailure)
                     break walk
                 }
-                opened = provider.openChildDirectory(
+                opened = provider.openChildDirectoryCarryingErrno(
                     inDirectory: parent.fd, named: name,
                     // A vetted directory: `isDirectory: true` states what
                     // the discovery `fstatat` already proved.
@@ -2506,6 +2501,103 @@ extension OrphanedCachesScanner: SpaceScanner {
     /// PathGuard's delete-time admission (nothing item-side can widen it).
     var trustedContainerRoots: [URL] { [cachesRoot] }
 
+    /// The sweep's DELETE-TIME revalidator — the seam's first client
+    /// (fn-4.8). Declared here, captured by the runtime at registration,
+    /// and run by the cleaner at the one chokepoint; it replaces, with no
+    /// behavioural change, the scanner-keyed gate the cleaner used to
+    /// hard-code.
+    var preDeleteRevalidator: PreDeleteRevalidator? {
+        Self.preDeleteRevalidator(provider: provider)
+    }
+
+    /// The revalidator VALUE, constructible without a scanner instance so a
+    /// cleaner built directly (tests, headless paths) can register exactly
+    /// what production registers.
+    ///
+    /// APPLICABILITY (the pure predicate — no filesystem access, no state):
+    /// exactly the items that carry the CLEAN PROMISE. `automaticCleanEligible`
+    /// is set by the classifier ONLY when the scan-time user-data probe
+    /// found nothing AND completed, so re-establishing that promise at
+    /// delete time is precisely what must be re-proven. Non-eligible sweep
+    /// items reach deletion only through conscious per-item confirmation
+    /// against DISPLAYED caution evidence (the verified-Photos-library field
+    /// case); re-refusing them on the same disclosed state would make them
+    /// permanently undeletable, so they keep the epic's accepted
+    /// conscious-confirmation TOCTOU residual — and the emission marks
+    /// exactly this same set, so scan-time validation and delete-time
+    /// dispatch agree item for item.
+    ///
+    /// VERDICT: the promise re-establishes (no matches AND complete) →
+    /// `.allow`; anything else → a fail-closed refusal. The sweep has no
+    /// valuables model, so its refusals carry an EMPTY payload and NO token
+    /// (the uniform R17 rule: there is nothing here to acknowledge, and the
+    /// `authorization` entry is deliberately unread — a sweep refusal is
+    /// resolved by re-scanning, never by acknowledging).
+    static func preDeleteRevalidator(
+        provider: FileSystemIdentityProvider
+    ) -> PreDeleteRevalidator {
+        PreDeleteRevalidator(
+            requiresRevalidation: { $0.automaticCleanEligible },
+            revalidate: { item, _ in
+                guard case .containerItem(_, let target) = item.admission else {
+                    // Structurally unreachable (the validator and the
+                    // cleaner both refuse a `.removeItem` item without the
+                    // container descriptor) — fail closed rather than
+                    // assume a target.
+                    return .refuse(
+                        reason: "refused: a sweep item without a "
+                            + "container-item target cannot be re-inspected "
+                            + "before deletion",
+                        valuables: [], acknowledgementToken: nil
+                    )
+                }
+                let probe = preDeleteUserDataProbe(at: target, provider: provider)
+                if !probe.matches.isEmpty {
+                    let names = probe.matches.joined(separator: ", ")
+                    return .refuse(
+                        reason: "\(target.path): contents changed since scan "
+                            + "— user-data-shaped content (\(names)) present "
+                            + "at delete time; refused, re-scan required",
+                        valuables: [], acknowledgementToken: nil
+                    )
+                }
+                if !probe.complete {
+                    // GUIDANCE KEYED TO THE ACTUAL CAUSE (PR #458 review) —
+                    // restored here through #457's generalized seam, which
+                    // was written against the flat sentence this replaced.
+                    //
+                    // That sentence has now been wrong in both directions: it
+                    // first prescribed "re-scan required" for causes a re-scan
+                    // reproduces exactly, then — over-correcting — asserted
+                    // the opposite for a set that includes a mid-walk race and
+                    // transient I/O, which a re-scan clears routinely. Both
+                    // FLATTENED causes that genuinely differ, and the second
+                    // is the more dangerous: it steers a user toward the
+                    // riskier explicit-confirmation path over a disk hiccup.
+                    // The walk distinguishes its causes
+                    // (`UserDataProbeObstruction`), so the message says which
+                    // one happened and what actually clears it.
+                    return .refuse(
+                        reason: "\(target.path): couldn't fully inspect "
+                            + "contents at delete time — refused (an "
+                            + "inspection that could not finish is treated "
+                            + "like a change since scan). "
+                            + remediationGuidance(for: probe.obstructions),
+                        valuables: [], acknowledgementToken: nil
+                    )
+                }
+                // THE BINDING TRAVELS WITH THE ALLOW (PR #458 review r7).
+                // The probe held a DESCRIPTOR, so its verdict is a fact about
+                // an OBJECT; every gate the cleaner has run so far — container
+                // admission, containment, deny list, mount — is a fact about a
+                // PATH, which a replacement directory at the same name
+                // satisfies. `probe.inspected` is what the deletion proves the
+                // path still names, on BOTH the permanent and the Trash arm.
+                return .allow(inspected: probe.inspected)
+            }
+        )
+    }
+
     /// Protocol scan. The sweep ignores `categoryFilter` (category-scanner
     /// only) and runs on BOTH triggers — `~/Library/Caches` is not a
     /// TCC-gated search root; per-entry TCC denials are still classified by
@@ -2660,7 +2752,16 @@ extension OrphanedCachesScanner: SpaceScanner {
             ),
             defaultSelected: selectable,
             automaticCleanEligible: selectable,
-            isStale: isStale
+            isStale: isStale,
+            // The sweep runs no valuables probe — nothing to disclose.
+            valuablesDisclosure: nil,
+            // The scanner-agnostic revalidation marker (fn-4.8, R17/D8),
+            // emitted for EXACTLY the set the registered revalidator's
+            // predicate deems applicable (`automaticCleanEligible`) — the
+            // runtime's marker invariant malforms the outcome if these two
+            // ever disagree. Non-eligible sweep items stay unmarked: their
+            // accepted conscious-confirmation residual is preserved exactly.
+            requiresPreDeleteRevalidation: selectable
         )
     }
 

@@ -352,44 +352,6 @@ struct CleanupReport {
 
 ---
 
-### `NodeModulesItem`
-
-**File:** `Sources/Cacheout/Models/NodeModulesItem.swift`
-
-A discovered `node_modules` directory — the scanner's INTERNAL discovery
-model. The `SpaceScanner` conformance (below) maps each to a
-`ReclaimableItem` with a stable full-hash id; consumers outside the scanner
-work with `ReclaimableItem`, not this type.
-
-```swift
-struct NodeModulesItem: Identifiable, Hashable {
-    let id: UUID
-    let projectName: String
-    let projectPath: URL
-    let nodeModulesPath: URL
-    let sizeBytes: Int64
-    let lastModified: Date?
-    var isSelected: Bool
-}
-```
-
-**Properties:**
-
-| Property | Type | Description |
-|----------|------|-------------|
-| `projectName` | `String` | Parent directory name (project name) |
-| `projectPath` | `URL` | Path to the project root |
-| `nodeModulesPath` | `URL` | Path to the node_modules directory |
-| `sizeBytes` | `Int64` | Total allocated size in bytes |
-| `lastModified` | `Date?` | Modification date of the node_modules directory |
-| `isSelected` | `Bool` | User selection state (mutable) |
-| `formattedSize` | `String` | Human-readable size |
-| `daysSinceModified` | `Int?` | Calendar days since last modification |
-| `isStale` | `Bool` | True if >30 days old |
-| `staleBadge` | `String?` | Age label (e.g., "3mo old", "1y old") or nil |
-
----
-
 ## Scanner Registry (SpaceScanner)
 
 **File:** `Sources/Cacheout/Scanner/SpaceScanner.swift`
@@ -547,13 +509,15 @@ struct ReclaimableItem: Equatable, Sendable {
 | `declaredDisplayPath` | `String` | The declared spelling, for presenting unresolved/missing items honestly without a fake resolution |
 | `rootRecords` | `[RootScanRecord]` | The scan's per-root capture, carried verbatim. Empty for `.missing`; single-element for per-item scanners |
 | `state` / `scanError` | `ScanState` / `ScanError?` | Item-level error surface — never flatten `denied` into `empty` (D6) |
-| `risk` | `RiskLevel` | node_modules items are frozen at `.review` |
+| `risk` | `RiskLevel` | Evidence confidence, not clean eligibility. `build_artifacts` items carry the matched RULE ROW's risk, narrowed to `.review` by the valuables gate |
 | `evidence` | `String` | Renders in the confirmation sheet per item (aggregates: the category description) |
 | `action` | `ReclaimAction` | How the cleaner reclaims this item's bytes |
 | `admission` | `AdmissionDescriptor` | Which PathGuard mode applies at the chokepoint |
 | `defaultSelected` | `Bool` | GUI initial selection — applied ONLY when a key is emitted for the first time |
-| `automaticCleanEligible` | `Bool` | `false` excludes the item from Quick Clean AND CLI smart-clean (node_modules ships `false` — CLI-visible is not auto-cleanable) |
-| `isStale` | `Bool?` | nil = staleness not applicable ("Select Stale" operates on `isStale == true`) |
+| `automaticCleanEligible` | `Bool` | `false` excludes the item from Quick Clean AND CLI smart-clean (every per-item scanner row ships `false` — CLI-visible is not auto-cleanable) |
+| `isStale` | `Bool?` | nil = staleness not applicable OR unknowable ("Select Stale" operates on `isStale == true`); the 30-day threshold is `ReclaimableItem.isStale(daysSinceModified:)` |
+| `valuablesDisclosure` | `ValuablesDisclosure?` | ADDITIVE. What the release-artifact probe SAW, plus its completeness flag. DISCLOSURE, never consent — acknowledgement lives only in the per-clean authorization context |
+| `requiresPreDeleteRevalidation` | `Bool` | ADDITIVE, scanner-agnostic. `true` means the item MUST be re-inspected immediately before deletion; a cleaner holding no revalidator for its scanner refuses it fail-closed |
 | `key` | `ItemKey` | Computed composite identity |
 | `allocatedBytes` | `Int64` | COMPUTED component sum — display convenience only, never stored |
 
@@ -604,8 +568,8 @@ protocol SpaceScanner: Sendable {
 
 Adding a scanner = implement this + register with the runtime — nothing else:
 the runtime derives delete-time admission from registration. Conformers:
-`CategoryScanner` (id `categories`), `NodeModulesScanner` (id `node_modules`),
-`OrphanedCachesScanner` (id `orphaned_caches`).
+`CategoryScanner` (id `categories`), `BuildArtifactsScanner`
+(id `build_artifacts`), `OrphanedCachesScanner` (id `orphaned_caches`).
 
 ### `ValidatedScannerEvent` / `SpaceScannerRegistrationError`
 
@@ -650,7 +614,7 @@ struct SpaceScannerRuntime {
 | Member | Description |
 |--------|-------------|
 | `init` | Registration + FOLDED validation as one check: scanner-id slug syntax, scanner-id uniqueness, category-slug syntax, and the combined category-slug/scanner-slug namespace collision check (covers the frozen `categories` id). Injectable for tests — registering a fixture scanner requires zero production edits |
-| `production()` | The production registry — the single place scanners are registered (`CategoryScanner` + `NodeModulesScanner` + `OrphanedCachesScanner` today). `orphanedCachesThresholds` threads the sweep's invocation-scoped config (nil resolves defaults → UserDefaults) |
+| `production()` | The production registry — the single place scanners are registered (`CategoryScanner` + `BuildArtifactsScanner` + `OrphanedCachesScanner` today). `orphanedCachesThresholds` threads the sweep's invocation-scoped config and `devRoots` the build-artifact roots (nil resolves defaults → UserDefaults) |
 | `makeCleaner(snapshot:trashHandler:)` | Builds the `CacheCleaner` whose PathGuard container roots are the runtime union — delete-time container admission covers exactly what registration declared, never anything an item claims. `snapshot` is the producing scan session's `ContainerSnapshot` (`ValidatedScanSession.snapshot`); nil FAIL-CLOSES every `.removeItem` deletion (`container-unavailable`) — items must be cleaned with the session that produced them |
 | `scanValidatedSession(scannerIDs:context:)` | The scan-and-validate entry point returning one SESSION: the progressive validated event stream, the producer handle (`untilProducerFinishes()`), and the session's `ContainerSnapshot` — every registered container root's no-follow (device, inode), captured BEFORE any scanner task launches (absent roots omitted). Delete-time `.removeItem` admission is identity-bound to this snapshot |
 | `scanValidated(scannerIDs:context:)` | Thin wrapper over `scanValidatedSession` returning just the event stream. The scan `TaskGroup` and ALL validation live inside; each event is one scanner's validated outcome or its synthesized `malformedOutcome` issue, yielded in completion order. `scannerIDs` scopes to a scanner subset (nil = all); the context's `categoryFilter` gives category-granular scoping inside `CategoryScanner`. Consumers pick scope and consumption style, never validation |
@@ -708,34 +672,6 @@ the single sizing routine shared with delete-time measurement.
 
 ---
 
-### `NodeModulesScanner`
-
-**File:** `Sources/Cacheout/Scanner/NodeModulesScanner.swift`
-
-Thread-safe scanner that recursively finds `node_modules` directories. The
-first per-item `SpaceScanner` (registered id: `node_modules`).
-
-**SpaceScanner conformance:**
-
-| Member | Description |
-|--------|-------------|
-| `id` | `node_modules` (`registeredID`) |
-| `displayName` | "Project node_modules" |
-| `trustedContainerRoots` | The scanner's search roots — declaring them at registration is what puts node_modules deletion admission into the runtime's container-root union |
-| `scan(context:)` | Maps the context's derived `includeProtectedRoots` onto the legacy gate below and emits one `ReclaimableItem` per discovered directory: stable full-hash id (`ReclaimableItem.stableID`), frozen `.review` risk, `automaticCleanEligible: false`, `isStale` populated, `.removeItem` action with the `.containerItem` admission descriptor. Classified `NodeModulesScanIssue`s generalize to `ScanIssue`s |
-
-**Methods:**
-
-| Method | Signature | Description |
-|--------|-----------|-------------|
-| `scan` | `func scan(maxDepth: Int = 6, includeProtectedRoots: Bool = true) async -> NodeModulesScanOutcome` | Scan all search roots for node_modules. Returns discovered items (each carrying `originContainer` provenance) plus classified `NodeModulesScanIssue` errors. With `includeProtectedRoots: false` (automatic/background scans), TCC-prompting roots (Documents / Desktop / Downloads) are skipped so a background rescan never fires a macOS privacy prompt. |
-
-**Search Roots:** Documents, Developer, Projects, Code, Sites, Desktop, Dropbox, repos, src, work
-
-**Skip Directories:** .Trash, .git, .hg, node_modules, .build, DerivedData, Pods, .next, dist, build, Library, .cache, .npm, .yarn
-
----
-
 ### `CacheCleaner`
 
 **File:** `Sources/Cacheout/Cleaner/CacheCleaner.swift`
@@ -753,8 +689,7 @@ safety model and accounting design.
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| `clean` | `func clean(items: [ReclaimableItem], moveToTrash: Bool) async -> CleanupReport` | THE one clean path. Dispatches on `ReclaimAction` at the chokepoint with a FROZEN check order: (1) structural action/descriptor/provenance compatibility on every item regardless of state, (2) well-formed `.missing` skip, (3) non-`.missing` zero-root-record refusal, (4) state eligibility (`.denied` refused even when selected; `.empty` no-op; `.commands` zero-measured skip), (5) dispatch. Independently refuses the same malformed shapes the runtime validator rejects — the chokepoint never assumes validation ran. |
-| `clean` (compatibility) | `func clean(results: [ScanResult], nodeModules: [NodeModulesItem] = [], moveToTrash: Bool) async -> CleanupReport` | Thin adapter with no production caller left: builds `ReclaimableItem`s and forwards to `clean(items:moveToTrash:)` — one dispatch, no second code path. |
+| `clean` | `func clean(items: [ReclaimableItem], moveToTrash: Bool, authorization: PreDeleteAuthorizationContext = [:]) async -> CleanupReport` | THE one and only clean path (the pre-unification `clean(results:nodeModules:)` adapter was deleted in fn-4.7). Dispatches on `ReclaimAction` at the chokepoint with a FROZEN check order: (1) structural action/descriptor/provenance compatibility on every item regardless of state, (2) well-formed `.missing` skip, (3) non-`.missing` zero-root-record refusal, (4) state eligibility (`.denied` refused even when selected; `.empty` no-op; `.commands` zero-measured skip), (5) dispatch. Independently refuses the same malformed shapes the runtime validator rejects — the chokepoint never assumes validation ran. |
 
 **Private Methods:**
 
@@ -786,7 +721,7 @@ and validation, the view model owns reconciliation and presentation.
 |----------|------|-------------|
 | `outcomesByScannerID` | `[String: ScanOutcome]` | Each scanner's latest VALIDATED outcome. A malformed event never lands here — the previous outcome is retained (fail-closed) |
 | `selectedItemKeys` | `Set<ItemKey>` | THE selection surface — composite keys only. Selections AND explicit deselections survive rescans; `defaultSelected` applies only to first-ever emissions; vanished keys are pruned when the stream completes, never mid-scan |
-| `scanningScannerIDs` | `Set<String>` | Scanners whose event has not arrived in the current scan (replaces the split `isScanning`/`isNodeModulesScanning` flags) |
+| `scanningScannerIDs` | `Set<String>` | Scanners whose event has not arrived in the current scan (replaces the pre-unification split per-scanner `isScanning` flags) |
 | `malformedIssuesByScannerID` | `[String: ScanIssue]` | The synthesized path-less issue for a scanner whose last event was malformed, surfaced beside the retained previous items |
 | `isCleaning` | `Bool` | Whether cleanup is in progress |
 | `diskInfo` | `DiskInfo?` | Current disk space info |
@@ -812,7 +747,7 @@ and validation, the view model owns reconciliation and presentation.
 | `hasResults` / `hasSelection` / `selectedCount` | — | Selection/result predicates |
 | `isAnyScanInProgress` | `Bool` | True while ANY scanner's event is pending — clean must never act on a half-built result set |
 | `categoryRows` | `[CategoryRowModel]` | Category aggregates presented through the unchanged `CategoryRow` inputs; list identity is the composite key |
-| `perItemSections` | `[ScannerSectionModel]` | One generic section per non-category scanner, in registry order (the node_modules section, generalized) |
+| `perItemSections` | `[ScannerSectionModel]` | One generic section per non-category scanner, in registry order |
 | `categoryScanIssues` | `[ScanIssue]` | Category-scanner issues incl. a synthesized `malformedOutcome` |
 | `confirmationRows` | `[ConfirmationRowModel]` | Unified confirmation-sheet rows — every row carries its item's `evidence` |
 | `totalRecoverable` / `totalSelectedSize` / `selectedSize(forScanner:)` / `totalSize(forScanner:)` | `Int64` | Byte totals through one shared aggregation helper with explicit scope/inclusion predicates |
@@ -832,7 +767,7 @@ and validation, the view model owns reconciliation and presentation.
 | `toggleSelection(for:)` | Toggle one `ItemKey`'s selection (unselectable states refused) |
 | `selectAllSafe()` | Policy (b): `automaticCleanEligible && risk == .safe`, across every scanner |
 | `deselectAll()` | Clear the whole selection |
-| `selectStale(inScanner:)` / `selectAll(inScanner:)` / `deselectAll(inScanner:)` | Scanner-scoped batch selection (the node_modules buttons, generalized) |
+| `selectStale(inScanner:)` / `selectAll(inScanner:)` / `deselectAll(inScanner:)` | Scanner-scoped batch selection |
 
 ---
 
@@ -880,9 +815,9 @@ Capsule-shaped risk level indicator.
 
 ### `ScannerItemSection`
 
-**File:** `Sources/Cacheout/Views/NodeModulesSection.swift`
+**File:** `Sources/Cacheout/Views/ScannerItemSection.swift`
 
-Collapsible per-item scanner section (the node_modules section, generalized):
+Collapsible per-item scanner section:
 item list, batch selection buttons ("Select Stale" renders only where
 staleness applies), and scan-issue disclosure via `ScanIssuesBlock`.
 
@@ -890,7 +825,7 @@ staleness applies), and scan-issue disclosure via `ScanIssuesBlock`.
 
 ### `ScannerItemRow`
 
-**File:** `Sources/Cacheout/Views/NodeModulesSection.swift`
+**File:** `Sources/Cacheout/Views/ScannerItemSection.swift`
 
 Single per-item row with checkbox, display name, path, stale badge, and size.
 

@@ -45,13 +45,13 @@ targets:
         INFOPLIST_KEY_LSUIElement: false
         INFOPLIST_KEY_NSHighResolutionCapable: true
         # TCC usage strings (R9). Key set mirrors
-        # NodeModulesScanner.tccProtectedRootNames — keep the three locations
+        # ProjectTreeWalker.tccProtectedAncestorNames — keep the three locations
         # in sync: scripts/bundle.sh heredoc, Sources/Cacheout/Info.plist,
         # and these entries. Downloads is defensive: no current scan walks
         # ~/Downloads, but the key ships so any future Downloads-reaching
         # scanner prompts with an explanation.
-        INFOPLIST_KEY_NSDocumentsFolderUsageDescription: "Cacheout looks for developer project node_modules folders in Documents during scans you start. Nothing is deleted without your confirmation."
-        INFOPLIST_KEY_NSDesktopFolderUsageDescription: "Cacheout looks for developer project node_modules folders on your Desktop during scans you start. Nothing is deleted without your confirmation."
+        INFOPLIST_KEY_NSDocumentsFolderUsageDescription: "Cacheout looks for developer build-artifact folders (target/, node_modules/, .venv/ and similar) in Documents during scans you start. Nothing is deleted without your confirmation."
+        INFOPLIST_KEY_NSDesktopFolderUsageDescription: "Cacheout looks for developer build-artifact folders (target/, node_modules/, .venv/ and similar) on your Desktop during scans you start. Nothing is deleted without your confirmation."
         INFOPLIST_KEY_NSDownloadsFolderUsageDescription: "Cacheout reads Downloads only if a scan you start includes it, to find developer caches. Nothing is deleted without your confirmation."
     scheme:
       testTargets: []

@@ -174,7 +174,8 @@ final class DepthSafeRemovalTests: XCTestCase {
         }
 
         try DepthSafeRemoval.remove(
-            at: target, expecting: nil, provider: FileSystemIdentityProvider()
+            at: target, expecting: nil, provider: FileSystemIdentityProvider(),
+            containedIn: .unbound
         )
         XCTAssertFalse(exists(target),
                        "the whole tree must be gone, root included")
@@ -201,7 +202,8 @@ final class DepthSafeRemovalTests: XCTestCase {
         defer { setrlimit(RLIMIT_NOFILE, &original) }
 
         try DepthSafeRemoval.remove(
-            at: target, expecting: nil, provider: FileSystemIdentityProvider()
+            at: target, expecting: nil, provider: FileSystemIdentityProvider(),
+            containedIn: .unbound
         )
         XCTAssertFalse(exists(target))
     }
@@ -229,7 +231,8 @@ final class DepthSafeRemovalTests: XCTestCase {
         )
 
         try DepthSafeRemoval.remove(
-            at: target, expecting: nil, provider: FileSystemIdentityProvider()
+            at: target, expecting: nil, provider: FileSystemIdentityProvider(),
+            containedIn: .unbound
         )
         XCTAssertFalse(exists(target))
         XCTAssertTrue(exists(outside), "the symlink's target directory lives")
@@ -240,7 +243,8 @@ final class DepthSafeRemovalTests: XCTestCase {
         let linkTarget = base.appendingPathComponent("link-as-target")
         try fm.createSymbolicLink(at: linkTarget, withDestinationURL: outside)
         try DepthSafeRemoval.remove(
-            at: linkTarget, expecting: nil, provider: FileSystemIdentityProvider()
+            at: linkTarget, expecting: nil, provider: FileSystemIdentityProvider(),
+            containedIn: .unbound
         )
         XCTAssertFalse(exists(linkTarget))
         XCTAssertTrue(exists(outside))
@@ -287,7 +291,8 @@ final class DepthSafeRemovalTests: XCTestCase {
         close(nestedFd)
 
         try DepthSafeRemoval.remove(
-            at: target, expecting: nil, provider: FileSystemIdentityProvider()
+            at: target, expecting: nil, provider: FileSystemIdentityProvider(),
+            containedIn: .unbound
         )
         XCTAssertFalse(exists(target),
                        "an entry the traversal could not name would leave the "
@@ -321,7 +326,8 @@ final class DepthSafeRemovalTests: XCTestCase {
         close(nestedFd)
 
         try DepthSafeRemoval.remove(
-            at: target, expecting: nil, provider: FileSystemIdentityProvider()
+            at: target, expecting: nil, provider: FileSystemIdentityProvider(),
+            containedIn: .unbound
         )
         XCTAssertFalse(exists(target))
     }
@@ -332,7 +338,8 @@ final class DepthSafeRemovalTests: XCTestCase {
         let ghost = base.appendingPathComponent("nope/never")
         XCTAssertThrowsError(
             try DepthSafeRemoval.remove(
-                at: ghost, expecting: nil, provider: FileSystemIdentityProvider()
+                at: ghost, expecting: nil, provider: FileSystemIdentityProvider(),
+                containedIn: .unbound
             )
         )
     }
@@ -382,7 +389,10 @@ final class DepthSafeRemovalTests: XCTestCase {
             .identity(of: mounted)?.inode
 
         XCTAssertThrowsError(
-            try DepthSafeRemoval.remove(at: target, expecting: nil, provider: provider)
+            try DepthSafeRemoval.remove(
+                at: target, expecting: nil, provider: provider,
+                containedIn: .unbound
+            )
         ) { error in
             XCTAssertTrue(
                 error.localizedDescription.contains("mounted inside"),
@@ -433,7 +443,8 @@ final class DepthSafeRemovalTests: XCTestCase {
 
         XCTAssertThrowsError(
             try DepthSafeRemoval.remove(
-                at: target, expecting: nil, provider: FileSystemIdentityProvider()
+                at: target, expecting: nil, provider: FileSystemIdentityProvider(),
+                containedIn: .unbound
             )
         ) { error in
             XCTAssertTrue(
@@ -470,7 +481,10 @@ final class DepthSafeRemovalTests: XCTestCase {
         provider.foreignInode = try inode(of: target)
 
         XCTAssertThrowsError(
-            try DepthSafeRemoval.remove(at: target, expecting: nil, provider: provider)
+            try DepthSafeRemoval.remove(
+                at: target, expecting: nil, provider: provider,
+                containedIn: .unbound
+            )
         ) { error in
             XCTAssertTrue(
                 error.localizedDescription.contains("mount boundary"),
@@ -563,7 +577,10 @@ final class DepthSafeRemovalTests: XCTestCase {
         }
 
         XCTAssertThrowsError(
-            try DepthSafeRemoval.remove(at: target, expecting: nil, provider: provider)
+            try DepthSafeRemoval.remove(
+                at: target, expecting: nil, provider: provider,
+                containedIn: .unbound
+            )
         ) { error in
             XCTAssertTrue(
                 error.localizedDescription.contains("moved while it was"),
@@ -615,7 +632,10 @@ final class DepthSafeRemovalTests: XCTestCase {
         }
 
         XCTAssertThrowsError(
-            try DepthSafeRemoval.remove(at: target, expecting: nil, provider: provider)
+            try DepthSafeRemoval.remove(
+                at: target, expecting: nil, provider: provider,
+                containedIn: .unbound
+            )
         ) { error in
             XCTAssertTrue(
                 error.localizedDescription.contains("moved while it was"),
@@ -659,7 +679,10 @@ final class DepthSafeRemovalTests: XCTestCase {
         }
 
         XCTAssertThrowsError(
-            try DepthSafeRemoval.remove(at: target, expecting: nil, provider: provider)
+            try DepthSafeRemoval.remove(
+                at: target, expecting: nil, provider: provider,
+                containedIn: .unbound
+            )
         ) { error in
             XCTAssertTrue(
                 error.localizedDescription.contains("moved while it was"),
@@ -698,7 +721,8 @@ final class DepthSafeRemovalTests: XCTestCase {
         XCTAssertThrowsError(
             try DepthSafeRemoval.remove(
                 at: target, expecting: .directory(elsewhere),
-                provider: FileSystemIdentityProvider()
+                provider: FileSystemIdentityProvider(),
+                containedIn: .unbound
             )
         ) { error in
             XCTAssertEqual(
@@ -721,7 +745,8 @@ final class DepthSafeRemovalTests: XCTestCase {
         )
         try DepthSafeRemoval.remove(
             at: target, expecting: .directory(identity),
-            provider: FileSystemIdentityProvider()
+            provider: FileSystemIdentityProvider(),
+            containedIn: .unbound
         )
         XCTAssertFalse(exists(target))
     }
@@ -742,7 +767,8 @@ final class DepthSafeRemovalTests: XCTestCase {
         XCTAssertThrowsError(
             try DepthSafeRemoval.remove(
                 at: target, expecting: .directory(inspected),
-                provider: FileSystemIdentityProvider()
+                provider: FileSystemIdentityProvider(),
+                containedIn: .unbound
             )
         ) { error in
             XCTAssertEqual(
@@ -769,7 +795,8 @@ final class DepthSafeRemovalTests: XCTestCase {
             XCTAssertThrowsError(
                 try DepthSafeRemoval.remove(
                     at: target, expecting: verdict,
-                    provider: FileSystemIdentityProvider()
+                    provider: FileSystemIdentityProvider(),
+                    containedIn: .unbound
                 ), "\(verdict)"
             ) { error in
                 XCTAssertEqual(
@@ -786,7 +813,8 @@ final class DepthSafeRemovalTests: XCTestCase {
         try fm.createSymbolicLink(at: link, withDestinationURL: target)
         try DepthSafeRemoval.remove(
             at: link, expecting: .noDirectoryTree,
-            provider: FileSystemIdentityProvider()
+            provider: FileSystemIdentityProvider(),
+            containedIn: .unbound
         )
         XCTAssertFalse(exists(link))
         XCTAssertTrue(exists(precious), "and never through it")
@@ -826,7 +854,8 @@ final class DepthSafeRemovalTests: XCTestCase {
         XCTAssertNoThrow(
             try DepthSafeRemoval.remove(
                 at: target, expecting: .noDirectoryTree,
-                provider: FileSystemIdentityProvider()
+                provider: FileSystemIdentityProvider(),
+                containedIn: .unbound
             ),
             "residual: a kind-only verdict admits any non-directory"
         )
@@ -871,7 +900,8 @@ final class DepthSafeRemovalTests: XCTestCase {
         XCTAssertThrowsError(
             try DepthSafeRemoval.remove(
                 at: target, expecting: nil,
-                provider: FileSystemIdentityProvider()
+                provider: FileSystemIdentityProvider(),
+                containedIn: .unbound
             )
         ) { error in
             XCTAssertEqual(
@@ -954,7 +984,8 @@ final class DepthSafeRemovalTests: XCTestCase {
 
             XCTAssertThrowsError(
                 try DepthSafeRemoval.remove(
-                    at: target, expecting: nil, provider: provider
+                    at: target, expecting: nil, provider: provider,
+                    containedIn: .unbound
                 ), label
             ) { error in
                 let failure = error as? DepthSafeRemoval.Failure
@@ -995,7 +1026,8 @@ final class DepthSafeRemovalTests: XCTestCase {
 
             XCTAssertThrowsError(
                 try DepthSafeRemoval.remove(
-                    at: target, expecting: nil, provider: provider
+                    at: target, expecting: nil, provider: provider,
+                    containedIn: .unbound
                 ), blinded
             ) { error in
                 XCTAssertEqual(
@@ -1043,7 +1075,8 @@ final class DepthSafeRemovalTests: XCTestCase {
 
         XCTAssertThrowsError(
             try DepthSafeRemoval.remove(
-                at: target, expecting: nil, provider: provider
+                at: target, expecting: nil, provider: provider,
+                containedIn: .unbound
             )
         ) { error in
             let failure = error as? DepthSafeRemoval.Failure
@@ -1116,7 +1149,8 @@ final class DepthSafeRemovalTests: XCTestCase {
 
         XCTAssertThrowsError(
             try DepthSafeRemoval.remove(
-                at: target, expecting: nil, provider: provider
+                at: target, expecting: nil, provider: provider,
+                containedIn: .unbound
             )
         ) { error in
             XCTAssertEqual(
@@ -1261,7 +1295,8 @@ final class DepthSafeRemovalTests: XCTestCase {
         XCTAssertThrowsError(
             try DepthSafeRemoval.remove(
                 at: target, expecting: nil,
-                provider: FileSystemIdentityProvider()
+                provider: FileSystemIdentityProvider(),
+                containedIn: .unbound
             )
         ) { error in
             XCTAssertEqual(
@@ -1368,7 +1403,8 @@ final class DepthSafeRemovalTests: XCTestCase {
         XCTAssertThrowsError(
             try DepthSafeRemoval.remove(
                 at: target, expecting: .directory(inspected),
-                provider: FileSystemIdentityProvider()
+                provider: FileSystemIdentityProvider(),
+                containedIn: .unbound
             )
         ) { error in
             XCTAssertEqual(
@@ -1381,46 +1417,96 @@ final class DepthSafeRemovalTests: XCTestCase {
         )
     }
 
-    /// THIS TEST PINS A RESIDUAL, NOT A GUARANTEE — and it is written to FAIL
-    /// the moment the residual is closed.
+    /// THE CAPTURE API IS THE BINDING, AND IT CLOSES THE CASE THE UNBOUND
+    /// CALLER COULD NOT SEE.
     ///
-    /// A caller that binds NEITHER the leaf (`expecting: nil`, which is
-    /// contents mode and any scanner whose revalidator says
-    /// `.unestablished`) NOR the parent (`containedIn: .unbound`, which is
-    /// what both production call sites still pass, because they live in a
-    /// file this change could not touch) has stated nothing about the object
-    /// or its container, and the swapped-in stranger's tree is deleted with
-    /// SUCCESS reported. Measured here, with two real `rename(2)`s.
+    /// This test used to pin the opposite — it asserted `XCTAssertNoThrow`
+    /// and that the stranger's tree was GONE, because both production call
+    /// sites passed `containedIn: .unbound` and a caller with no leaf binding
+    /// either (contents mode, and any item whose revalidator says
+    /// `.unestablished`) had stated nothing at all. It was written to go RED
+    /// the moment a call site started passing the identity it already admits.
+    /// It has, so this is the refusal it became.
     ///
-    /// When `CacheCleaner` passes the identity it already admits, this test
-    /// goes red and must be rewritten as the refusal it becomes — which is
-    /// the point of pinning it.
-    func testAnUnboundCallerStillDeletesAStrangersTreeAfterAParentSwap() throws {
-        let container = base.appendingPathComponent("container")
-        let target = container.appendingPathComponent("cache")
-        try mkdir(target)
-        try write(target.appendingPathComponent("ours.bin"))
-        let foreign = base.appendingPathComponent("foreign")
-        try mkdir(foreign.appendingPathComponent("cache"))
+    /// The binding is taken through `admittedParent(directory:...)` — the
+    /// same call `CacheCleaner` makes — rather than by hand, so the seam the
+    /// product actually uses is the seam under test.
+    ///
+    /// AND THE SECOND HALF IS THE RESIDUAL THAT REPLACES IT, stated as
+    /// precisely: a swap that lands BEFORE the capture is invisible, because
+    /// both opens then find the stranger and agree about it. That is residual
+    /// #3 in this file's header, and it is why the cleaner takes the capture
+    /// as early on its side of the queue hop as it can.
+    func testACapturedParentBindingRefusesTheSwapAnUnboundCallerCannotSee()
+        throws {
+        let provider = FileSystemIdentityProvider()
         let precious = "cache/precious.bin"
-        try write(foreign.appendingPathComponent(precious), bytes: 4096)
-        XCTAssertEqual(
-            rename(container.path, base.appendingPathComponent("gone").path), 0
-        )
-        XCTAssertEqual(rename(foreign.path, container.path), 0)
 
+        func plantSwapFixture(_ label: String) throws -> (URL, URL) {
+            let container = base.appendingPathComponent("container-\(label)")
+            let target = container.appendingPathComponent("cache")
+            try mkdir(target)
+            try write(target.appendingPathComponent("ours.bin"))
+            let foreign = base.appendingPathComponent("foreign-\(label)")
+            try mkdir(foreign.appendingPathComponent("cache"))
+            try write(foreign.appendingPathComponent(precious), bytes: 4096)
+            return (container, foreign)
+        }
+        func performSwap(_ container: URL, _ foreign: URL, _ label: String) {
+            XCTAssertEqual(
+                rename(container.path,
+                       base.appendingPathComponent("gone-\(label)").path),
+                0, "fixture: the admitted container is renamed away"
+            )
+            XCTAssertEqual(rename(foreign.path, container.path), 0,
+                           "fixture: a stranger's directory takes its place")
+        }
+
+        // (1) CAPTURE, THEN SWAP — the production ordering. Refused.
+        let (container, foreign) = try plantSwapFixture("closed")
+        let target = container.appendingPathComponent("cache")
+        let bound = try DepthSafeRemoval.admittedParent(
+            directory: target.deletingLastPathComponent(),
+            displayPath: target.path, provider: provider
+        )
+        performSwap(container, foreign, "closed")
+        XCTAssertThrowsError(
+            try DepthSafeRemoval.remove(
+                at: target, expecting: nil, provider: provider,
+                containedIn: bound
+            ),
+            "a caller with no leaf binding is carried entirely by this one"
+        ) { error in
+            XCTAssertEqual(
+                (error as? DepthSafeRemoval.Failure)?.cause,
+                .notTheAdmittedContainer
+            )
+        }
+        XCTAssertTrue(
+            exists(container.appendingPathComponent(precious)),
+            "the stranger's tree must be untouched"
+        )
+
+        // (2) SWAP, THEN CAPTURE — the residual, measured rather than
+        // asserted away. Both opens find the stranger, so they agree, and
+        // nothing here can tell them apart.
+        let (early, earlyForeign) = try plantSwapFixture("residual")
+        let earlyTarget = early.appendingPathComponent("cache")
+        performSwap(early, earlyForeign, "residual")
+        let stale = try DepthSafeRemoval.admittedParent(
+            directory: earlyTarget.deletingLastPathComponent(),
+            displayPath: earlyTarget.path, provider: provider
+        )
         XCTAssertNoThrow(
             try DepthSafeRemoval.remove(
-                at: target, expecting: nil,
-                provider: FileSystemIdentityProvider()
+                at: earlyTarget, expecting: nil, provider: provider,
+                containedIn: stale
             ),
-            "residual: an unbound caller cannot see the parent swap"
+            "residual: a binding taken AFTER the swap agrees with it"
         )
         XCTAssertFalse(
-            exists(container.appendingPathComponent(precious)),
-            "residual overstated: the stranger's tree survived, so a binding "
-                + "is now reaching this path — re-measure and rewrite this "
-                + "test as the refusal"
+            exists(early.appendingPathComponent(precious)),
+            "residual overstated — re-measure it and rewrite this half"
         )
     }
 
@@ -1434,6 +1520,15 @@ final class DepthSafeRemovalTests: XCTestCase {
     /// moment that directory's ordinary files are already unlinked, so the
     /// out-of-memory kill lands mid-deletion. Asked of the pass directly,
     /// because "the tree came out deleted" is true with or without the bound.
+    ///
+    /// THROUGH `destructivePass`, NOT AROUND IT (PR #458 review — the P2).
+    /// `destructivePass` claims there is no way to reach the enumeration
+    /// without a fresh containment proof; this test used to be that claim's
+    /// counterexample, calling `emptyOfNonDirectories` directly because it
+    /// was `static` rather than `private static`. The enumeration is private
+    /// now and the seam is the PROVED door, so exercising the bound cannot
+    /// bypass the proof — `testTheEnumerationSeamCannotBeReachedWithoutItsProof`
+    /// below is the other half of that.
     func testAnEnumerationPassStopsAtItsLimit() throws {
         let directory = base.appendingPathComponent("wide")
         try mkdir(directory)
@@ -1445,21 +1540,61 @@ final class DepthSafeRemovalTests: XCTestCase {
         }
         let held = try openDirectory(directory)
         defer { close(held) }
+        let provider = FileSystemIdentityProvider()
+        let parent = try XCTUnwrap(provider.identity(of: base))
 
-        let batch = try DepthSafeRemoval.emptyOfNonDirectories(
-            held, limit: 2, displayPath: directory.path, depth: 0
+        let batch = try DepthSafeRemoval.destructivePass(
+            held, containedIn: parent, limit: 2, provider: provider,
+            displayPath: directory.path, depth: 0
         )
         XCTAssertEqual(batch.names.count, 2,
                        "the pass must stop at the limit it was given")
         XCTAssertTrue(batch.hasMore, "and must say the level is not spent")
 
-        let rest = try DepthSafeRemoval.emptyOfNonDirectories(
-            held, limit: 99, displayPath: directory.path, depth: 0
+        let rest = try DepthSafeRemoval.destructivePass(
+            held, containedIn: parent, limit: 99, provider: provider,
+            displayPath: directory.path, depth: 0
         )
         XCTAssertEqual(rest.names.count, 5,
                        "a pass under a limit it cannot reach returns "
                            + "everything, and nothing was lost by stopping")
         XCTAssertFalse(rest.hasMore)
+    }
+
+    /// THE SEAM THE TESTS DRIVE IS THE ONE THAT PROVES (PR #458 review — the
+    /// P2).
+    ///
+    /// The point of making `emptyOfNonDirectories` private is that no caller
+    /// — production or test — can unlink anything on stale evidence. Handing
+    /// the same descriptor a containment claim it does not satisfy must
+    /// refuse BEFORE a single entry is unlinked, which is what makes the
+    /// private-ization load-bearing rather than cosmetic.
+    func testTheEnumerationSeamCannotBeReachedWithoutItsProof() throws {
+        let directory = base.appendingPathComponent("proved-seam")
+        try mkdir(directory)
+        let file = directory.appendingPathComponent("keep.bin")
+        try write(file)
+        let held = try openDirectory(directory)
+        defer { close(held) }
+
+        let stranger = FileSystemIdentityProvider.Identity(
+            device: 0, inode: 0
+        )
+        XCTAssertThrowsError(
+            try DepthSafeRemoval.destructivePass(
+                held, containedIn: stranger, limit: 4096,
+                provider: FileSystemIdentityProvider(),
+                displayPath: directory.path, depth: 0
+            )
+        ) { error in
+            XCTAssertEqual(
+                (error as? DepthSafeRemoval.Failure)?.cause, .relocated
+            )
+        }
+        XCTAssertTrue(
+            exists(file),
+            "the pass unlinked on a containment claim it never proved"
+        )
     }
 
     /// A directory far wider than the limit is still removed WHOLE — the
@@ -1479,7 +1614,8 @@ final class DepthSafeRemovalTests: XCTestCase {
 
         try DepthSafeRemoval.remove(
             at: target, expecting: nil,
-            provider: FileSystemIdentityProvider(), batchLimit: 1
+            provider: FileSystemIdentityProvider(), containedIn: .unbound,
+            batchLimit: 1
         )
         XCTAssertFalse(exists(target),
                        "every batch must be resumed, or the final rmdir "
@@ -1521,7 +1657,9 @@ final class DepthSafeRemovalTests: XCTestCase {
 
         XCTAssertThrowsError(
             try DepthSafeRemoval.remove(
-                at: target, expecting: nil, provider: provider, batchLimit: 1
+                at: target, expecting: nil, provider: provider,
+                containedIn: .unbound,
+                batchLimit: 1
             )
         ) { error in
             XCTAssertEqual(
@@ -1561,7 +1699,8 @@ final class DepthSafeRemovalTests: XCTestCase {
         }, 0, "fixture fifo")
 
         try DepthSafeRemoval.remove(
-            at: target, expecting: nil, provider: FileSystemIdentityProvider()
+            at: target, expecting: nil, provider: FileSystemIdentityProvider(),
+            containedIn: .unbound
         )
         XCTAssertFalse(exists(target))
         XCTAssertTrue(exists(base), "the parent above the target survives")

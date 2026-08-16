@@ -815,6 +815,27 @@ actor CacheCleaner {
                 continue
             }
 
+            // WHICH FOLDER ARE THESE CHILDREN CHILDREN OF (PR #458 review —
+            // the P1). Every child deleted below is opened by the removal
+            // through THIS directory's path, on the far side of a queue hop,
+            // and contents mode has no leaf binding at all (no probe runs
+            // here), so a `rename(2)` pair at that seam pointed the whole
+            // per-child loop into a stranger's directory with SUCCESS
+            // reported. The identity is read from a descriptor ONCE per root
+            // — before the enumeration, so the names the loop works from and
+            // the folder they are unlinked out of are the same folder.
+            let admittedParent: DepthSafeRemoval.AdmittedParent
+            do {
+                admittedParent = try DepthSafeRemoval.admittedParent(
+                    directory: admitted.requestedURL,
+                    displayPath: admitted.requestedURL.path,
+                    provider: provider
+                )
+            } catch {
+                errors.append(Self.itemError(item, error.localizedDescription))
+                continue
+            }
+
             // Enumerate children under the UNRESOLVED spelling — deletion
             // must remove exactly what sits at the requested location, and a
             // symlink child must be removed AS a link (R4). Containment
@@ -831,7 +852,8 @@ actor CacheCleaner {
 
             for child in children {
                 switch await deleteGuardedChild(
-                    child, of: admitted, registry: registry,
+                    child, of: admitted, containedIn: admittedParent,
+                    registry: registry,
                     moveToTrash: moveToTrash, label: item.displayName
                 ) {
                 case .accepted(let components):
@@ -872,6 +894,7 @@ actor CacheCleaner {
     /// failure is returned, never thrown.
     private func deleteGuardedChild(
         _ child: URL, of root: AdmittedRoot,
+        containedIn admittedParent: DepthSafeRemoval.AdmittedParent,
         registry: InodeAccountingRegistry,
         moveToTrash: Bool, label: String
     ) async -> ChildOutcome {
@@ -939,17 +962,28 @@ actor CacheCleaner {
                 // NO INSPECTION VERDICT TO BIND TO, and the call site says
                 // so. Contents mode runs no user-data probe (only the
                 // orphaned-caches sweep carries a clean promise), so there
-                // is no inspected object here — the guards this deletion
-                // rests on are the containment chain above and the
-                // descriptor-relative traversal below.
+                // is no inspected object here — which is precisely why the
+                // CONTAINER binding below is not optional for this arm: with
+                // `expecting: nil` there is nothing else that can notice the
+                // folder these children were enumerated from being swapped.
                 try await Self.removeItemConcurrently(
-                    at: child, expecting: nil, provider: provider
+                    at: child, expecting: nil, provider: provider,
+                    containedIn: admittedParent
                 )
             }
         } catch {
             if error is PathGuardError {
                 logRefusal(
                     label: label, tag: Self.refusalTag(error),
+                    detail: "\(child.path): \(error.localizedDescription)"
+                )
+            } else if let failure = error as? DepthSafeRemoval.Failure,
+                      failure.cause == .notTheAdmittedContainer {
+                // The category root these children were enumerated from was
+                // replaced under the loop. Same tag item mode uses for the
+                // same event, so the cleanup log has ONE word for it.
+                logRefusal(
+                    label: label, tag: "container-drift",
                     detail: "\(child.path): \(error.localizedDescription)"
                 )
             }
@@ -1144,6 +1178,28 @@ actor CacheCleaner {
         let token = await registry.registerObservations(report.claims)
 
         do {
+            // WHICH FOLDER HOLDS THIS ITEM — READ FROM A DESCRIPTOR, HERE,
+            // ON THIS SIDE OF THE QUEUE HOP (PR #458 review — the P1).
+            //
+            // The deletion resolves exactly one path, the target's parent,
+            // and it resolves it after `removeItemConcurrently` hops to a
+            // background queue — measured at 0.095 / 0.097 / 0.126 ms, which
+            // is an eternity for a `rename(2)` + `mkdir(2)` pair. Nothing
+            // else here binds that folder: `admitContainer` binds the
+            // CONTAINER ROOT to the session snapshot, and a target is a
+            // strict DESCENDANT of it, so for the ordinary
+            // `<dev-root>/proj/node_modules` shape the directory the deletion
+            // actually opens (`proj`) is bound by nothing at all.
+            //
+            // Taken FIRST, before the rechecks below, because everything
+            // after the capture is what the binding covers; taken last it
+            // would cover only the hop. It fails closed and costs nothing to
+            // do so — the removal performs the identical open a moment later,
+            // so an open that fails here would have failed there.
+            let admittedParent = try DepthSafeRemoval.admittedParent(
+                directory: target.deletingLastPathComponent(),
+                displayPath: target.path, provider: provider
+            )
             // TOCTOU narrowing, immediately pre-delete: the SAME no-follow
             // + snapshot-identity admission re-runs (a container swapped
             // between the checks above and here is refused), then the
@@ -1195,11 +1251,16 @@ actor CacheCleaner {
                 if let probedObject {
                     try await TrashDisposal.dispose(
                         target, expecting: probedObject, provider: provider,
+                        containedIn: admittedParent,
                         via: { try await self.trash($0) }
                     )
                 } else {
                     // NOTHING TO BIND TO (the `else` above states why), so the
-                    // disposal is the seam alone.
+                    // disposal is the seam alone. `admittedParent` is not used
+                    // here on purpose: this arm never rolls anything back, so
+                    // there is no destination to prove — the only mover is
+                    // `trashItem`, which takes a URL and resolves it inside
+                    // itself.
                     try await trash(target)
                 }
             } else {
@@ -1212,7 +1273,8 @@ actor CacheCleaner {
                 // the OPENED INODE is `probedObject` before it unlinks
                 // anything.
                 try await Self.removeItemConcurrently(
-                    at: target, expecting: probedObject, provider: provider
+                    at: target, expecting: probedObject, provider: provider,
+                    containedIn: admittedParent
                 )
             }
         } catch {
@@ -1228,6 +1290,17 @@ actor CacheCleaner {
                 // something else entirely.
                 logRefusal(
                     label: item.displayName, tag: "content-drift",
+                    detail: "\(target.path): \(error.localizedDescription)"
+                )
+            } else if let failure = error as? DepthSafeRemoval.Failure,
+                      failure.cause == .notTheAdmittedContainer {
+                // A DIFFERENT EVENT, SO A DIFFERENT TAG. `content-drift` says
+                // the item changed; this says the item is where it always was
+                // and the FOLDER THAT HOLDS IT was replaced — which is what
+                // the user has to go and look at, and which the cleanup log
+                // must not blur into the other.
+                logRefusal(
+                    label: item.displayName, tag: "container-drift",
                     detail: "\(target.path): \(error.localizedDescription)"
                 )
             } else if error is TrashDisposal.Failure {
@@ -1366,16 +1439,29 @@ actor CacheCleaner {
     /// That is an eternity for a `rename(2)` + `mkdir(2)` loop, and it is
     /// where the deletion used to acquire a descriptor it never asked the
     /// identity of.
+    ///
+    /// AND SO DOES THE CONTAINER BINDING (PR #458 review — the P1 the round
+    /// that built `containedIn:` left at zero call sites). The deletion's ONE
+    /// path resolution is the target's parent, and it happens on the far side
+    /// of this hop: a `rename(2)` pair inside those 0.095–0.126 ms puts a
+    /// stranger's directory at that path, after which every
+    /// descriptor-relative proof below is self-consistent INSIDE THE
+    /// STRANGER. `containedIn` is the identity the caller read from a
+    /// descriptor on THIS side, and it has no default here either — the hop
+    /// is the whole reason the parameter exists, so a caller that reaches it
+    /// without stating a binding must not compile.
     nonisolated private static func removeItemConcurrently(
         at url: URL,
         expecting inspected: UserDataProbeResult.InspectedRoot?,
-        provider: FileSystemIdentityProvider
+        provider: FileSystemIdentityProvider,
+        containedIn admittedParent: DepthSafeRemoval.AdmittedParent
     ) async throws {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             DispatchQueue.global(qos: .userInitiated).async {
                 do {
                     try DepthSafeRemoval.remove(
-                        at: url, expecting: inspected, provider: provider
+                        at: url, expecting: inspected, provider: provider,
+                        containedIn: admittedParent
                     )
                     continuation.resume()
                 } catch {

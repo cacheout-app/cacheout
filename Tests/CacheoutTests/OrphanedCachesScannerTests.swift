@@ -3771,6 +3771,141 @@ final class OrphanedCachesScannerTests: XCTestCase {
         try assertCleanupLogContains(tag: "content-drift")
     }
 
+    /// Swaps THE CACHE ROOT — the directory the put-back would restore INTO
+    /// — at the instant the post-disposal proof rejects what the Trash took,
+    /// i.e. after the rollback's destination descriptor is about to be opened
+    /// and before it is used.
+    ///
+    /// The seam is production's own question: `identity(ofDescriptor:)` on
+    /// the descriptor `look(at: landed)` opened. Every mutation is a real
+    /// `rename(2)`/`mkdir(2)` — an app reinstalling its cache folder does
+    /// exactly this.
+    private final class SwapTheDestinationContainerBeforeThePutBackProvider:
+        FileSystemIdentityProvider {
+        var landed: URL!
+        /// The cache root the item was admitted under.
+        var container: URL!
+        /// Where that root goes.
+        var containerMovedAway: URL!
+        private(set) var swapped = false
+
+        override func identity(ofDescriptor fd: Int32) -> Identity? {
+            let answer = super.identity(ofDescriptor: fd)
+            guard !swapped, let answer, answer == super.identity(of: landed)
+            else { return answer }
+            swapped = true
+            try? FileManager.default.moveItem(
+                at: container, to: containerMovedAway
+            )
+            try? FileManager.default.createDirectory(
+                at: container, withIntermediateDirectories: true
+            )
+            return answer
+        }
+    }
+
+    /// A PUT-BACK MUST PROVE WHERE IT IS PUTTING THINGS BACK (PR #458 review
+    /// — the P2 on the P2).
+    ///
+    /// The rollback HELD its destination directory by descriptor and never
+    /// PROVED it: the descriptor was opened from a path, and a container swap
+    /// in that window aimed the undo at a stranger's directory. Worse, the
+    /// arrival proof that follows is taken under THAT SAME unproven
+    /// descriptor, so it self-confirms — before the fix this moved the
+    /// wrongly-taken `Photos Library.photoslibrary` out of the Trash into a
+    /// directory nobody admitted and reported `.putBack`, "the item the Trash
+    /// took has been PUT BACK", for a recovery into somebody else's folder.
+    ///
+    /// A descriptor cannot be its own reference point. The identity the
+    /// cleaner captured BEFORE the disposal is from outside it, so that is
+    /// what the destination is proved against — and when it disagrees,
+    /// NOTHING is moved and the error says where the item still is.
+    func testAPutBackWillNotRestoreIntoAContainerItCannotProve() async throws {
+        let entry = cachesRoot
+            .appendingPathComponent("com.apple.SwiftUI.Drag-DESTINATION")
+        try mkdir(entry)
+        try writeFile(entry.appendingPathComponent("payload.bin"))
+        let stash = base.appendingPathComponent("drag-destination-moved-away")
+        let library = entry.appendingPathComponent(
+            "Pictures/Photos Library.photoslibrary"
+        )
+        let trashDir = base.appendingPathComponent("fake-trash-destination")
+        try mkdir(trashDir)
+        let landed = trashDir.appendingPathComponent(entry.lastPathComponent)
+
+        let provider = SwapTheDestinationContainerBeforeThePutBackProvider()
+        provider.landed = landed
+        provider.container = cachesRoot
+        provider.containerMovedAway = base
+            .appendingPathComponent("caches-root-moved-away")
+
+        let runtime = try makeRuntime(
+            [makeScanner(provider: provider)], provider: provider
+        )
+        let (items, snapshot) = await scanSession(runtime)
+        let leak = try XCTUnwrap(items.first)
+        XCTAssertTrue(leak.automaticCleanEligible,
+                      "the fixture entry scans as a clean known leak")
+
+        let cleaner = runtime.makeCleaner(
+            snapshot: snapshot,
+            trashHandler: { url in
+                // The disposal takes the WRONG object, which is what arms the
+                // rollback at all (the residual
+                // `testATrashDisposalThatTookTheWrongObjectPutsItBackAndRefuses`
+                // measures).
+                try FileManager.default.moveItem(at: entry, to: stash)
+                try FileManager.default.createDirectory(
+                    at: library, withIntermediateDirectories: true
+                )
+                try FileManager.default.moveItem(at: url, to: landed)
+                return landed
+            }
+        )
+        let report = await cleaner.clean(items: [leak], moveToTrash: true)
+
+        XCTAssertTrue(provider.swapped,
+                      "the fixture never re-pointed the cache root")
+        XCTAssertTrue(
+            fm.fileExists(
+                atPath: landed
+                    .appendingPathComponent(
+                        "Pictures/Photos Library.photoslibrary"
+                    ).path
+            ),
+            "the wrongly-taken tree was moved OUT of the Trash and into a "
+                + "directory the safety check never admitted — and the "
+                + "arrival proof, taken under that same unproven descriptor, "
+                + "confirmed it"
+        )
+        XCTAssertFalse(
+            fm.fileExists(atPath: entry.path),
+            "nothing may be restored into the stranger's directory"
+        )
+        XCTAssertTrue(report.entries.isEmpty,
+                      "nothing may be reported freed: \(report.entries)")
+        XCTAssertEqual(report.errors.count, 1)
+        let message = try XCTUnwrap(report.errors.first?.message)
+        XCTAssertFalse(
+            message.contains("PUT BACK"),
+            "claimed a recovery into a folder it could not prove: \(message)"
+        )
+        XCTAssertTrue(
+            message.contains(landed.path),
+            "the refusal must name where the item still is: \(message)"
+        )
+        XCTAssertTrue(
+            message.contains(
+                "the folder that HOLDS it is no longer the one the safety "
+                    + "check admitted"
+            ),
+            message
+        )
+        XCTAssertTrue(fm.fileExists(atPath: stash.path),
+                      "the inspected tree is untouched")
+        try assertCleanupLogContains(tag: "content-drift")
+    }
+
     /// Swaps the TRASH DIRECTORY ITSELF — not the entry in it — inside the
     /// rollback's re-bind, which is the mutation a path-spelled rename
     /// cannot survive and a descriptor-relative one does not notice.

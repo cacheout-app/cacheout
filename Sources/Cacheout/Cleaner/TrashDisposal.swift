@@ -103,6 +103,21 @@
 //    that OUR object did, so the arrival is proved under the held destination
 //    descriptor before `.putBack` is reported.
 //
+//  AND THE DESTINATION IS PROVED AGAINST SOMETHING OUTSIDE ITSELF (PR #458
+//  review — the P2 on the P2). Holding the put-back's destination directory
+//  by descriptor is not the same as knowing WHICH directory it is: the
+//  descriptor was opened from a path, across the whole disposal, and never
+//  interrogated. A container swap in that window aims the undo at a
+//  stranger's directory — and the arrival proof above, taken under that SAME
+//  unproven descriptor, then CONFIRMS the arrival and reports `.putBack` for
+//  a restore into somebody else's folder. Self-confirmation is not proof, so
+//  the rollback now compares that descriptor's `fstat` with the admitted
+//  container identity the cleaner captured BEFORE the disposal
+//  (`DepthSafeRemoval.admittedParent`), and moves nothing when they disagree
+//  — `.destinationNotTheAdmittedContainer`, item still in the Trash, nothing
+//  reported freed. Evidenced by
+//  `testAPutBackWillNotRestoreIntoAContainerItCannotProve`.
+//
 //  The descriptors are what make the re-bind and the rename talk about the
 //  same directory, and that is EVIDENCED rather than asserted: spell the
 //  rename `renamex_np(landed.path, target.path)` and
@@ -174,6 +189,14 @@ enum TrashDisposal {
             /// close. The payload is the Trash name it came from. Nothing
             /// further is attempted: a second unproven move is not a fix.
             case putBackTookAnotherObject(String)
+            /// NOT PROVED, so NOTHING WAS MOVED: the directory the put-back
+            /// would restore INTO is not the container the caller admitted.
+            /// The payload is where the item still is. A separate cause from
+            /// `strandedInTrash` for the same reason
+            /// `DepthSafeRemoval.Failure.Cause` separates its two: the item
+            /// is fine and something happened to the FOLDER THAT HOLDS IT,
+            /// which is the thing the user has to go and look at.
+            case destinationNotTheAdmittedContainer(String)
             /// The disposal would not say where it put the item, so what it
             /// took cannot be established at all.
             case destinationUnknown
@@ -216,6 +239,14 @@ enum TrashDisposal {
                     + "the Trash and was NOT put there by you, and the item "
                     + "the Trash took is still in the Trash; nothing was "
                     + "reported freed; refused, re-scan required"
+            case .destinationNotTheAdmittedContainer(let landed):
+                return "\(path): the folder at this path is no longer the one "
+                    + "that was inspected, and the folder that HOLDS it is no "
+                    + "longer the one the safety check admitted either — so "
+                    + "what the Trash took was NOT put back into it. It is in "
+                    + "the Trash at \(landed). Move it back once the folder "
+                    + "at \(path) is the one you expect; nothing was reported "
+                    + "freed; refused, re-scan required"
             case .destinationUnknown:
                 return "\(path): the Trash did not report where it put the "
                     + "item, so which folder it took cannot be established — "
@@ -234,10 +265,17 @@ enum TrashDisposal {
     /// either side, except in the disclosed cases where the put-back itself
     /// cannot be performed or cannot be proved, each of which names where the
     /// item was last seen.
+    ///
+    /// `containedIn` is the caller's admitted container, and it is what the
+    /// ROLLBACK's destination is proved against — see `rollBack`. It has NO
+    /// DEFAULT, the same rule `DepthSafeRemoval.remove` follows: a default
+    /// would make a caller that supplies nothing silently restore into an
+    /// unproven directory instead of failing to compile.
     static func dispose(
         _ target: URL,
         expecting inspected: UserDataProbeResult.InspectedRoot,
         provider: FileSystemIdentityProvider,
+        containedIn admittedParent: DepthSafeRemoval.AdmittedParent,
         via disposal: (URL) async throws -> URL?
     ) async throws {
         // (1) The cheap refusal, and the one that keeps the Trash untouched.
@@ -263,7 +301,8 @@ enum TrashDisposal {
             throw Failure(
                 path: target.path,
                 cause: rollBack(
-                    sighting, from: landed, to: target, provider: provider
+                    sighting, from: landed, to: target,
+                    containedIn: admittedParent, provider: provider
                 )
             )
         }
@@ -444,8 +483,18 @@ enum TrashDisposal {
     ///   one clobbers.
     /// * The ARRIVAL is proved, because a rename returning 0 says a name
     ///   moved, not that OUR object did.
+    /// * The DESTINATION DIRECTORY is proved against the caller's admitted
+    ///   container, which is a fact from OUTSIDE it (PR #458 review — the
+    ///   P2 on this fix). The destination was held by descriptor and never
+    ///   PROVED: a container swap in that window put a stranger's directory
+    ///   at the cache path, the undo moved the user's tree into it, and the
+    ///   arrival proof — taken under that same unproven descriptor — agreed,
+    ///   so `.putBack` was reported for a restore into somebody else's
+    ///   folder. A descriptor cannot vouch for itself; the identity the
+    ///   cleaner captured before the disposal can.
     private static func rollBack(
         _ sighting: Sighting, from landed: URL, to target: URL,
+        containedIn admittedParent: DepthSafeRemoval.AdmittedParent,
         provider: FileSystemIdentityProvider
     ) -> Failure.Cause {
         // NOTHING IDENTIFIED, NOTHING MOVED. An absent, unreadable or
@@ -495,6 +544,30 @@ enum TrashDisposal {
             inDirectory: trashFD, named: source, logical: landed
         ) == bound else {
             return .lastSeenInTrash(landed.path)
+        }
+
+        // WHOSE FOLDER ARE WE RESTORING INTO? Asked of the HELD DESTINATION
+        // INODE, against a fact taken OUTSIDE it — the identity the cleaner
+        // captured before the disposal. `containerFD` was held across the
+        // whole disposal and never interrogated, so a container swap in that
+        // window aimed the undo at a stranger's directory; and the arrival
+        // proof below runs under THIS SAME descriptor, so it confirmed the
+        // move rather than catching it. A descriptor cannot be its own
+        // reference point.
+        //
+        // Taken AFTER the re-bind on purpose: by here the object is known to
+        // still be at `landed`, which is exactly what the refusal tells the
+        // user to go and get. Comparing an `fstat` of this descriptor with an
+        // identity captured through `DepthSafeRemoval.admittedParent` is
+        // apples to apples — both are `fstat`s of a following open, and
+        // reaching this line at all means `openDirectoryNoFollow` succeeded,
+        // i.e. the container's last component is a real directory and not a
+        // link the two opens could disagree about.
+        if case .identity(let expected) = admittedParent {
+            guard provider.identity(ofDescriptor: containerFD) == expected
+            else {
+                return .destinationNotTheAdmittedContainer(landed.path)
+            }
         }
 
         var failure: Int32 = 0

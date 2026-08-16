@@ -547,7 +547,8 @@ final class DirectorySizerTests: XCTestCase {
         XCTAssertThrowsError(
             try DepthSafeRemoval.remove(
                 at: spelled, expecting: nil,
-                provider: FileSystemIdentityProvider()
+                provider: FileSystemIdentityProvider(),
+                containedIn: .unbound
             )
         ) { error in
             guard let failure = error as? DepthSafeRemoval.Failure else {

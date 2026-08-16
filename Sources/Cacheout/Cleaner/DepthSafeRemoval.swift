@@ -106,15 +106,22 @@
 //     returns `ENOTDIR` on a non-directory and `ENOTEMPTY` (errno 66) on a
 //     non-empty one, so a name swapped in that window costs at most ONE
 //     EMPTY directory — never a tree, never a file.
-//  3. A caller that binds NEITHER the leaf NOR the parent. Both production
-//     call sites still pass `containedIn: .unbound`, because they live in
-//     `CacheCleaner.swift`, which the change that added the parameter could
-//     not touch; contents mode has no leaf binding either, so for that
-//     population the parent swap above is still deleted-with-success.
-//     Measured and pinned by
-//     `testAnUnboundCallerStillDeletesAStrangersTreeAfterAParentSwap`, which
-//     is written to go RED — deliberately — the moment a call site starts
-//     passing the identity it already admits.
+//  3. THE WINDOW BEFORE THE CALLER'S CAPTURE. Both production call sites now
+//     pass `containedIn: .identity(…)` — `CacheCleaner.removeGuardedItem`
+//     and `CacheCleaner.cleanContents`, each taken through
+//     `admittedParent(directory:displayPath:provider:)` on THIS side of
+//     `removeItemConcurrently`'s queue hop (measured at 0.095–0.126 ms, the
+//     race this closes). What the binding cannot see is a swap that landed
+//     BEFORE the capture: both opens then find the stranger and agree about
+//     it. For item mode the container root itself is covered by
+//     `PathGuard.admitContainer`'s snapshot identity; what neither covers is
+//     an INTERMEDIATE directory between an admitted container root and a
+//     deeper target (`<dev-root>/proj/node_modules` — nothing binds `proj`)
+//     swapped before the capture. Pinned by
+//     `testAnItemWhoseParentIsSwappedAtTheQueueHopIsRefused`, whose fixture
+//     performs the swap after the capture and is refused; move the same two
+//     `rename(2)`s one step earlier and the deletion proceeds inside the
+//     stranger.
 //
 //  4. A NON-DIRECTORY leaf. `.noDirectoryTree` carries no identity and does
 //     not separate "nothing was there" from "something that is not a
@@ -125,10 +132,11 @@
 //     closes it is a shape change to `PreDeleteInspectedObject` and its
 //     producer, not anything this file can do alone.
 //
-//  POSIX offers no primitive that closes 1 or 2: there is no way to pin a
-//  directory to its parent for the duration of a read, and no way to remove
-//  a directory by descriptor. 3 is one argument at each of two call sites;
-//  4 is two cases on a shared type.
+//  POSIX offers no primitive that closes 1, 2 or 3: there is no way to pin a
+//  directory to its parent for the duration of a read, no way to remove a
+//  directory by descriptor, and no way to hand a deletion the descriptor an
+//  admission opened instead of the path it was opened from. 4 is two cases
+//  on a shared type.
 
 import Foundation
 
@@ -309,18 +317,20 @@ enum DepthSafeRemoval {
     /// NOTHING to bind at the leaf — contents mode, and any scanner whose
     /// revalidator says `.unestablished` — use instead.
     ///
-    /// ITS DEFAULT IS A DISCLOSED MIGRATION SHIM, NOT A POLICY. `.unbound`
-    /// means the caller stated nothing, and it leaves exactly the residual
-    /// measured above. Both production call sites still take it, because they
-    /// live in `CacheCleaner.swift`, which the change that added this could
-    /// not touch; each needs ONE argument — the identity of the descriptor
-    /// the cleaner already admits — and this sentence stops being true the
-    /// moment they pass it, so it must change with them.
+    /// IT HAS NO DEFAULT, AND THAT IS THE POINT (PR #458 review — the round
+    /// that shipped one). A default turns "this caller forgot" into silence
+    /// instead of a compile error, and the forgetting is exactly what
+    /// happened: the round that added this parameter gave it `= .unbound` and
+    /// wired it to ZERO production call sites, so the mechanism was proved
+    /// and the product was unchanged. Both call sites now state their binding
+    /// (`CacheCleaner`, via `admittedParent(directory:displayPath:provider:)`),
+    /// and a third that states nothing does not compile. Same rule as
+    /// `expecting:` above, for the same reason.
     static func remove(
         at url: URL,
         expecting inspected: UserDataProbeResult.InspectedRoot?,
         provider: FileSystemIdentityProvider,
-        containedIn admittedParent: AdmittedParent = .unbound,
+        containedIn admittedParent: AdmittedParent,
         batchLimit: Int = subdirectoryBatchLimit
     ) throws {
         let leafName = url.lastPathComponent
@@ -334,10 +344,7 @@ enum DepthSafeRemoval {
         // PARENT — always inside `PATH_MAX`, because the target itself came
         // through the path guard's admission. Everything below is relative
         // to the descriptor opened here.
-        let parentPath = url.deletingLastPathComponent().path
-        let parentFd = parentPath.withCString {
-            open($0, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
-        }
+        let parentFd = openContainer(at: url.deletingLastPathComponent())
         guard parentFd >= 0 else {
             throw Failure(path: url.path, cause: .posix(errno), depth: 0)
         }
@@ -436,6 +443,59 @@ enum DepthSafeRemoval {
             from: root, named: leaf, in: parentFd, displayPath: url.path,
             provider: provider, batchLimit: batchLimit
         )
+    }
+
+    /// THE ONE SPELLING OF THE CONTAINER OPEN — the open `remove` proves
+    /// against, and the open `admittedParent` captures from.
+    ///
+    /// Two spellings here would be two different questions wearing one name.
+    /// It deliberately FOLLOWS symlinks (no `O_NOFOLLOW`): a container
+    /// legitimately reached through a symlinked ancestor, or spelled with a
+    /// symlinked last component, is a real directory that both sides must
+    /// arrive at, and a no-follow open would refuse it while `remove`'s open
+    /// succeeded — a binding that refuses every deletion under a symlinked
+    /// cache root. The leaf, which is the thing being destroyed, is opened
+    /// `O_NOFOLLOW` further down; this is its container.
+    private static func openContainer(at url: URL) -> Int32 {
+        url.path.withCString { open($0, O_RDONLY | O_DIRECTORY | O_CLOEXEC) }
+    }
+
+    /// THE BINDING A CALLER MUST TAKE, TAKEN THE WAY THIS FILE PROVES IT.
+    ///
+    /// `remove` resolves exactly one path — the target's container — and it
+    /// resolves it AFTER a queue hop. A caller that wants that open bound has
+    /// to read the same fact the same way, which is why this lives here and
+    /// not at the call site: it goes through `openContainer` and `fstat`s the
+    /// descriptor, so a caller cannot accidentally hand over an `lstat` of
+    /// the path (a symlinked container would then never match and every
+    /// deletion under it would be refused) or a no-follow open (which would
+    /// not even open it).
+    ///
+    /// FAIL CLOSED, AND AT NO COST: an unopenable container throws its errno
+    /// and an unreadable identity throws `.unprovableLocation`, and neither
+    /// strands anything, because `remove` performs the IDENTICAL open one
+    /// moment later and would fail on it too. What the caller loses is
+    /// nothing; what it gains is that the failure is named where the caller
+    /// can attribute it.
+    ///
+    /// `displayPath` is the caller's own spelling of what it is about to
+    /// destroy, so the refusal names the ITEM rather than its folder — the
+    /// same locator every other `Failure` in this file carries.
+    static func admittedParent(
+        directory url: URL, displayPath: String,
+        provider: FileSystemIdentityProvider
+    ) throws -> AdmittedParent {
+        let fd = openContainer(at: url)
+        guard fd >= 0 else {
+            throw Failure(path: displayPath, cause: .posix(errno), depth: 0)
+        }
+        defer { close(fd) }
+        guard let identity = provider.identity(ofDescriptor: fd) else {
+            throw Failure(
+                path: displayPath, cause: .unprovableLocation, depth: 0
+            )
+        }
+        return .identity(identity)
     }
 
     /// Prove that the directory `root` names IS the object the caller's
@@ -731,6 +791,14 @@ enum DepthSafeRemoval {
     /// `emptyOfNonDirectories` without `proveContainment` having just
     /// succeeded, and adding a third caller cannot forget it.
     ///
+    /// AND THAT SENTENCE IS NOW TRUE OF THE TESTS TOO (PR #458 review — the
+    /// P2). It was false: `emptyOfNonDirectories` was `static` rather than
+    /// `private static`, and `testAnEnumerationPassStopsAtItsLimit` reached
+    /// it directly — a structural claim with a live counterexample inside
+    /// the same target. The enumeration is private now and THIS is the seam
+    /// the test drives, so exercising the bound cannot bypass the proof that
+    /// licences it.
+    ///
     /// WHAT IT DOES NOT CLOSE, and this is measured, not assumed: a
     /// `rename(2)` of an ANCESTOR of this directory leaves this directory's
     /// own `..` untouched, so the proof still passes and residual #1 in the
@@ -741,7 +809,7 @@ enum DepthSafeRemoval {
     /// exists to delete — and it would still leave the window between the
     /// walk and the `unlinkat`. POSIX has no primitive that pins a directory
     /// to its parent for the duration of a read.
-    private static func destructivePass(
+    static func destructivePass(
         _ fd: Int32,
         containedIn parent: FileSystemIdentityProvider.Identity,
         limit: Int,
@@ -872,7 +940,13 @@ enum DepthSafeRemoval {
     /// structural: `hasMore` is set only when `limit ≥ 1` names were
     /// collected, and every one of them is removed before the level is read
     /// again.
-    static func emptyOfNonDirectories(
+    ///
+    /// PRIVATE, AND THE HEADER'S CLAIM DEPENDS ON IT (PR #458 review — the
+    /// P2). `destructivePass` says there is no way to reach this enumeration
+    /// without a fresh `proveContainment`; while this was `static` that was
+    /// simply untrue inside the test target, and a comment asserting a
+    /// property the code lacks is worse than no comment.
+    private static func emptyOfNonDirectories(
         _ fd: Int32, limit: Int, displayPath: String, depth: Int
     ) throws -> Batch {
         // `fdopendir` takes ownership of the descriptor it is handed, and

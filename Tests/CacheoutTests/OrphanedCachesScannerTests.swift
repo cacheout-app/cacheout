@@ -59,6 +59,55 @@ final class OrphanedCachesScannerTests: XCTestCase {
         try fm.setAttributes([.modificationDate: date], ofItemAtPath: url.path)
     }
 
+    /// Open a directory for the descriptor-relative primitives the walk is
+    /// built from. The caller owns the descriptor.
+    private func openDirectory(
+        _ url: URL, file: StaticString = #filePath, line: UInt = #line
+    ) throws -> Int32 {
+        let fd = open(url.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+        if fd < 0 {
+            let code = errno
+            XCTFail("open(\(url.path)) failed: \(code)", file: file, line: line)
+            throw POSIXError(POSIXErrorCode(rawValue: code) ?? .EIO)
+        }
+        return fd
+    }
+
+    /// How many descriptors this process holds — the fd-balance net that
+    /// wraps every probe test, including every refusal path.
+    private func openDescriptorCount() -> Int {
+        (try? fm.contentsOfDirectory(atPath: "/dev/fd").count) ?? -1
+    }
+
+    /// Run `body` and assert it leaked no descriptors. `SecureDirectory`'s
+    /// `deinit` is what makes this pass on `break walk` and early-refusal
+    /// paths alike; this is the enforcement, not review vigilance.
+    private func assertNoDescriptorLeak(
+        file: StaticString = #filePath, line: UInt = #line,
+        _ body: () throws -> Void
+    ) rethrows {
+        let before = openDescriptorCount()
+        try body()
+        let after = openDescriptorCount()
+        XCTAssertEqual(after, before,
+                       "the probe leaked \(after - before) descriptor(s)",
+                       file: file, line: line)
+    }
+
+    /// A `MountIdentity` guaranteed distinct from any real one, and distinct
+    /// per inode — the descriptor-shaped replacement for injecting
+    /// `isMountPoint` by inode (which a path SPELLING could defeat, and did:
+    /// that whole failure class dies with the path form).
+    private static func injectedMount(
+        forInode inode: UInt64, device: UInt64
+    ) -> FileSystemIdentityProvider.MountIdentity {
+        FileSystemIdentityProvider.MountIdentity(
+            filesystemID: (Int32(bitPattern: 0xDEAD_BEEF),
+                           Int32(bitPattern: UInt32(truncatingIfNeeded: inode))),
+            device: device
+        )
+    }
+
     /// The production sweep scanner over the fixture home. `categories: []`
     /// by default — exclusion has its own test; everything else must not
     /// depend on the production category list.
@@ -396,6 +445,26 @@ final class OrphanedCachesScannerTests: XCTestCase {
                 return true
             }
             return super.isMountPoint(url)
+        }
+
+        /// The same two injections, descriptor-shaped, so the probe's own
+        /// mount rule sees what the sizer's path rule sees.
+        override func mountIdentity(ofDescriptor descriptor: Int32)
+            -> MountIdentity? {
+            guard let real = super.mountIdentity(ofDescriptor: descriptor),
+                  let id = super.identity(ofDescriptor: descriptor)
+            else { return nil }
+            if mountPointInodes.contains(id.inode) {
+                return OrphanedCachesScannerTests.injectedMount(
+                    forInode: id.inode, device: real.device
+                )
+            }
+            if let device = deviceOverridesByInode[id.inode] {
+                return MountIdentity(
+                    filesystemID: real.filesystemID, device: device
+                )
+            }
+            return real
         }
     }
 
@@ -1517,6 +1586,37 @@ final class OrphanedCachesScannerTests: XCTestCase {
             return super.probeKind(of: url)
         }
 
+        /// The walk's ONE per-entry syscall, descriptor-relative. `logical`
+        /// is the spelling the walk believes it is at — production ignores
+        /// it, and recording it is how "did not cross" is proven by the
+        /// ABSENCE of any touch rather than by an empty result.
+        override func probeChild(
+            inDirectory descriptor: Int32, named name: String, logical: URL
+        ) -> ChildProbe {
+            probedPaths.append(logical.standardizedFileURL.path)
+            return super.probeChild(
+                inDirectory: descriptor, named: name, logical: logical
+            )
+        }
+
+        override func mountIdentity(ofDescriptor descriptor: Int32)
+            -> MountIdentity? {
+            guard let real = super.mountIdentity(ofDescriptor: descriptor),
+                  let id = super.identity(ofDescriptor: descriptor)
+            else { return nil }
+            if mountPointInodes.contains(id.inode) {
+                return OrphanedCachesScannerTests.injectedMount(
+                    forInode: id.inode, device: real.device
+                )
+            }
+            if let device = deviceOverridesByInode[id.inode] {
+                return MountIdentity(
+                    filesystemID: real.filesystemID, device: device
+                )
+            }
+            return real
+        }
+
         func reset() { probedPaths = [] }
 
         /// Did anything STRICTLY BELOW `url` get touched?
@@ -1613,28 +1713,41 @@ final class OrphanedCachesScannerTests: XCTestCase {
         XCTAssertFalse(probe.complete)
     }
 
-    // MARK: - Aliased spellings vs the mount check (PR #458 review r4)
+    // MARK: - Aliased spellings vs the mount check (PR #458 review r4/r6)
 
-    /// Mirrors the PRODUCTION `isMountPoint` contract rather than injecting
-    /// by inode: `statfs` resolves whatever path it is handed and reports
-    /// the CANONICAL mount root, so the real helper answers `true` only for
-    /// a canonical spelling (`FileSystemIdentityProvider.swift:94`, whose
-    /// own doc requires canonical input). A provider that answered by inode
-    /// would hide precisely the defect under test. Devices are deliberately
-    /// NOT overridden, so both sides share one `st_dev` — the firmlink
-    /// shape, where the device arm cannot fire either and `statfs` is the
-    /// only signal left.
-    private final class CanonicalSpellingMountProvider: FileSystemIdentityProvider {
-        var canonicalMountPoints: Set<String> = []
+    /// The mount rule now reads DESCRIPTORS (`fstatfs`'s `f_fsid`, plus
+    /// `st_dev`), so injection is keyed to the INODE and cannot be
+    /// spelling-sensitive — which is the entire point. The retired path
+    /// form compared `statfs`'s `f_mntonname` against whatever spelling it
+    /// was handed, so a root reached through a symlinked ancestor never
+    /// equalled it and the arm silently answered `false` for a real mount;
+    /// on a firmlink-shaped mount (one `st_dev` on both sides) the device
+    /// arm was silent too, and the walk enumerated a mounted volume while
+    /// calling the result COMPLETE. Devices are deliberately NOT overridden
+    /// here, so these fixtures keep that firmlink shape.
+    private final class AliasedSpellingMountProvider: FileSystemIdentityProvider {
+        /// Inodes to present as sitting on a DIFFERENT mount.
+        var mountedInodes: Set<UInt64> = []
         private(set) var probedPaths: [String] = []
 
-        override func isMountPoint(_ url: URL) -> Bool {
-            canonicalMountPoints.contains(url.path)
+        override func mountIdentity(ofDescriptor descriptor: Int32)
+            -> MountIdentity? {
+            guard let real = super.mountIdentity(ofDescriptor: descriptor),
+                  let id = super.identity(ofDescriptor: descriptor)
+            else { return nil }
+            guard mountedInodes.contains(id.inode) else { return real }
+            return OrphanedCachesScannerTests.injectedMount(
+                forInode: id.inode, device: real.device
+            )
         }
 
-        override func probeKind(of url: URL) -> KindProbe {
-            probedPaths.append(url.path)
-            return super.probeKind(of: url)
+        override func probeChild(
+            inDirectory descriptor: Int32, named name: String, logical: URL
+        ) -> ChildProbe {
+            probedPaths.append(logical.path)
+            return super.probeChild(
+                inDirectory: descriptor, named: name, logical: logical
+            )
         }
 
         func reset() { probedPaths = [] }
@@ -1663,20 +1776,17 @@ final class OrphanedCachesScannerTests: XCTestCase {
         return (aliased, real)
     }
 
-    /// BOTH boundary signals fail at once on a firmlink-shaped nested mount
-    /// reached through a symlinked ancestor: the device arm is silent
-    /// because the mount shares the root's `st_dev`, and the `statfs` arm is
-    /// silent because it was handed the walk's deliberately unresolved
-    /// spelling, which never equals `f_mntonname`. The walk then enumerates
-    /// the mounted tree — the exact thing the boundary rule exists to stop.
+    /// A nested mount reached through a symlinked ancestor. The descriptor
+    /// form has no spelling to be defeated by, so it is caught.
     func testNestedMountIsDetectedThroughAnAliasedSpelling() throws {
         let (aliased, real) = try aliasedEntry(named: "com.example.AliasedMount")
         try writeFile(real.appendingPathComponent("payload.bin"))
         let realMount = real.appendingPathComponent("volume")
         try mkdir(realMount.appendingPathComponent("Pictures/Photos Library.photoslibrary"))
 
-        let provider = CanonicalSpellingMountProvider()
-        provider.canonicalMountPoints.insert(provider.canonicalize(realMount).path)
+        let provider = AliasedSpellingMountProvider()
+        let inode = try XCTUnwrap(provider.identity(of: realMount)?.inode)
+        provider.mountedInodes.insert(inode)
         // Precondition: the two spellings really do differ, or the fixture
         // is not exercising the alias at all.
         let aliasedMount = aliased.appendingPathComponent("volume")
@@ -1686,9 +1796,12 @@ final class OrphanedCachesScannerTests: XCTestCase {
         )
         provider.reset()
 
-        let probe = OrphanedCachesScanner.preDeleteUserDataProbe(
-            at: aliased, provider: provider
-        )
+        var probe = UserDataProbeResult.complete()
+        assertNoDescriptorLeak {
+            probe = OrphanedCachesScanner.preDeleteUserDataProbe(
+                at: aliased, provider: provider
+            )
+        }
 
         XCTAssertFalse(
             provider.touchedAnythingBelow(aliasedMount),
@@ -1700,29 +1813,34 @@ final class OrphanedCachesScannerTests: XCTestCase {
         XCTAssertEqual(probe.obstructions, [.mountBoundary])
 
         // …and the TRAVERSAL still used the walk's own unresolved spelling.
-        // Canonicalizing for the boundary check must never leak into the
-        // paths the walk lstats — those are the ones a deletion removes
-        // (the `resolveTargetKeepingLeaf` doctrine).
+        // Nothing canonical may leak into the paths the walk reports — those
+        // are the ones a deletion removes (the `resolveTargetKeepingLeaf`
+        // doctrine).
         XCTAssertTrue(
             provider.probedPaths.allSatisfy { $0.hasPrefix(aliased.path) },
             "traversal must keep the unresolved spelling: \(provider.probedPaths)"
         )
     }
 
-    /// The same hole at the ROOT arm, which has its own copy of the rule.
+    /// The same, at the ROOT — where the check is `openat(root, "..")` and a
+    /// mount comparison against the parent, never a path.
     func testRootMountIsDetectedThroughAnAliasedSpelling() throws {
         let (aliased, real) = try aliasedEntry(named: "com.example.AliasedRoot")
         try mkdir(real.appendingPathComponent("Pictures"))
 
-        let provider = CanonicalSpellingMountProvider()
-        provider.canonicalMountPoints.insert(provider.canonicalize(real).path)
+        let provider = AliasedSpellingMountProvider()
+        let inode = try XCTUnwrap(provider.identity(of: real)?.inode)
+        provider.mountedInodes.insert(inode)
         try XCTSkipIf(provider.canonicalize(aliased).path == aliased.path,
                       "fixture is already canonical")
         provider.reset()
 
-        let probe = OrphanedCachesScanner.preDeleteUserDataProbe(
-            at: aliased, provider: provider
-        )
+        var probe = UserDataProbeResult.complete()
+        assertNoDescriptorLeak {
+            probe = OrphanedCachesScanner.preDeleteUserDataProbe(
+                at: aliased, provider: provider
+            )
+        }
 
         XCTAssertFalse(
             provider.touchedAnythingBelow(aliased),
@@ -1734,13 +1852,13 @@ final class OrphanedCachesScannerTests: XCTestCase {
 
     /// The guard against over-correcting: an ordinary aliased tree with no
     /// mount anywhere still probes COMPLETE, and every path the walk
-    /// touched is the unresolved spelling it was given.
+    /// reported is the unresolved spelling it was given.
     func testAliasedTreeWithoutAMountStaysCompleteAndUnresolved() throws {
         let (aliased, real) = try aliasedEntry(named: "com.example.AliasedClean")
         try mkdir(real.appendingPathComponent("sub/deeper"))
         try writeFile(real.appendingPathComponent("sub/deeper/payload.bin"))
 
-        let provider = CanonicalSpellingMountProvider()
+        let provider = AliasedSpellingMountProvider()
         let probe = OrphanedCachesScanner.preDeleteUserDataProbe(
             at: aliased, provider: provider
         )
@@ -1766,12 +1884,17 @@ final class OrphanedCachesScannerTests: XCTestCase {
         var reportedAsDirectory: Set<String> = []
         private(set) var probedPaths: [String] = []
 
-        override func probeKind(of url: URL) -> KindProbe {
-            probedPaths.append(url.path)
-            if reportedAsDirectory.contains(url.path) {
-                return .kind(.directory)
-            }
-            return super.probeKind(of: url)
+        override func probeChild(
+            inDirectory descriptor: Int32, named name: String, logical: URL
+        ) -> ChildProbe {
+            probedPaths.append(logical.path)
+            let real = super.probeChild(
+                inDirectory: descriptor, named: name, logical: logical
+            )
+            guard reportedAsDirectory.contains(logical.path),
+                  case .facts(let facts) = real
+            else { return real }
+            return .facts(ChildFacts(kind: .directory, identity: facts.identity))
         }
 
         func touchedAnythingBelow(_ url: URL) -> Bool {
@@ -1835,9 +1958,27 @@ final class OrphanedCachesScannerTests: XCTestCase {
             return Identity(device: real.device, inode: real.inode &+ 1)
         }
 
-        override func probeKind(of url: URL) -> KindProbe {
-            probedPaths.append(url.path)
-            return super.probeKind(of: url)
+        /// The VETTED value is the one that is wrong here — the descent's
+        /// `fstat` of what it actually opened is left honest, which is what
+        /// makes the corroborator fire. (It is only sound BECAUSE the
+        /// vetted value came from an `fstatat` on the held parent; against
+        /// an ancestor swap the same comparison proves nothing, which is
+        /// why containment, not identity, is the guarantee.)
+        override func probeChild(
+            inDirectory descriptor: Int32, named name: String, logical: URL
+        ) -> ChildProbe {
+            probedPaths.append(logical.path)
+            let real = super.probeChild(
+                inDirectory: descriptor, named: name, logical: logical
+            )
+            guard bogusInodeFor.contains(logical.path),
+                  case .facts(let facts) = real
+            else { return real }
+            return .facts(ChildFacts(
+                kind: facts.kind,
+                identity: Identity(device: facts.identity.device,
+                                   inode: facts.identity.inode &+ 1)
+            ))
         }
 
         func touchedAnythingBelow(_ url: URL) -> Bool {
@@ -1870,6 +2011,679 @@ final class OrphanedCachesScannerTests: XCTestCase {
         XCTAssertEqual(probe.obstructions, [.transientFailure])
     }
 
+
+    // MARK: - ANCESTOR swap (PR #458 review, thread PRRT_kwDORmg6_86ZjZf9)
+
+    /// Performs a REAL ancestor swap at the exact instant the walk is
+    /// vulnerable — deterministically, with no timing and no threads.
+    ///
+    /// The window is between the parent's directory read finishing (its
+    /// descriptor closed) and the per-child metadata call that vets the
+    /// grandchild. The provider IS that call, so the swap is performed
+    /// inside it: single-threaded, and the real kernel decides what the
+    /// walk then sees.
+    private final class AncestorSwappingProvider: FileSystemIdentityProvider {
+        /// Fires the first time a logical path ENDING IN this is probed.
+        /// A suffix, not an absolute path: the scan-time face hands the walk
+        /// `contentsOfDirectory`\'s already-resolved spelling
+        /// (`/var` → `/private/var`), so an absolute comparison would
+        /// silently never fire on one of the two faces.
+        var swapWhenProbing: String = ""
+        /// The ancestor to move out of the way.
+        var ancestor: URL!
+        /// Where the original ancestor goes.
+        var stash: URL!
+        /// What takes its place (a symlink to this, or this itself moved in).
+        var replacement: URL!
+        /// Replace with a SYMLINK to `replacement` (else move it in whole).
+        var replaceWithSymlink = true
+        private(set) var swapped = false
+        private(set) var probedPaths: [String] = []
+
+        override func probeChild(
+            inDirectory descriptor: Int32, named name: String, logical: URL
+        ) -> ChildProbe {
+            probedPaths.append(logical.path)
+            if !swapped, logical.standardizedFileURL.path.hasSuffix(swapWhenProbing) {
+                swapped = true
+                try? FileManager.default.moveItem(at: ancestor, to: stash)
+                if replaceWithSymlink {
+                    try? FileManager.default.createSymbolicLink(
+                        at: ancestor, withDestinationURL: replacement
+                    )
+                } else {
+                    try? FileManager.default.moveItem(at: replacement, to: ancestor)
+                }
+            }
+            return super.probeChild(
+                inDirectory: descriptor, named: name, logical: logical
+            )
+        }
+
+        func touched(_ url: URL) -> Bool { probedPaths.contains(url.path) }
+    }
+
+    /// An ANCESTOR replaced by a symlink after the walk read it, but BEFORE
+    /// the grandchild is vetted. `O_NOFOLLOW` guards only the final
+    /// component, and the identity the discovery `lstat` recorded already
+    /// belongs to the FOREIGN object — so the descriptor re-proof compares
+    /// foreign against foreign and passes. The probe then reads outside the
+    /// cache tree and attributes what it finds to this entry.
+    func testAncestorSwappedToASymlinkIsNeverFollowed() throws {
+        let foreign = base.appendingPathComponent("outside-the-cache-tree")
+        try mkdir(foreign.appendingPathComponent("deep/Documents"))
+        try writeFile(foreign.appendingPathComponent("deep/secret.bin"))
+
+        let entry = cachesRoot.appendingPathComponent("com.example.AncestorSwap")
+        let mid = entry.appendingPathComponent("mid")
+        try mkdir(mid.appendingPathComponent("deep/keeper"))
+        try writeFile(entry.appendingPathComponent("payload.bin"))
+
+        let provider = AncestorSwappingProvider()
+        provider.swapWhenProbing = "/\(mid.lastPathComponent)/deep"
+        provider.ancestor = mid
+        provider.stash = base.appendingPathComponent("stashed-mid")
+        provider.replacement = foreign
+        provider.replaceWithSymlink = true
+
+        let probe = OrphanedCachesScanner.preDeleteUserDataProbe(
+            at: entry, provider: provider
+        )
+
+        XCTAssertTrue(provider.swapped, "the fixture never armed the swap")
+        XCTAssertFalse(
+            provider.touched(mid.appendingPathComponent("deep/Documents")),
+            "the walk resolved a child through the swapped ancestor and read "
+                + "OUTSIDE the cache tree: \(provider.probedPaths)"
+        )
+        XCTAssertTrue(
+            probe.matches.isEmpty,
+            "user-data shapes from outside the tree were attributed to this "
+                + "entry: \(probe.matches)"
+        )
+        // Held descriptors are inode-pinned: the walk keeps reading the
+        // VETTED objects at their new location. That is the correct
+        // outcome — complete over what was vetted, foreign content unread.
+        XCTAssertTrue(
+            provider.touched(mid.appendingPathComponent("deep/keeper")),
+            "the walk should have kept reading the vetted inodes: "
+                + "\(provider.probedPaths)"
+        )
+    }
+
+    /// The same swap to a DIFFERENT REAL DIRECTORY — the case `O_NOFOLLOW`
+    /// cannot see at all, since no symlink is ever traversed.
+    func testAncestorSwappedToADifferentDirectoryIsNeverFollowed() throws {
+        let foreign = base.appendingPathComponent("outside-real-dir")
+        try mkdir(foreign.appendingPathComponent("deep/Documents"))
+
+        let entry = cachesRoot.appendingPathComponent("com.example.AncestorMoved")
+        let mid = entry.appendingPathComponent("mid")
+        try mkdir(mid.appendingPathComponent("deep/keeper"))
+
+        let provider = AncestorSwappingProvider()
+        provider.swapWhenProbing = "/\(mid.lastPathComponent)/deep"
+        provider.ancestor = mid
+        provider.stash = base.appendingPathComponent("stashed-mid-2")
+        provider.replacement = foreign
+        provider.replaceWithSymlink = false
+
+        let probe = OrphanedCachesScanner.preDeleteUserDataProbe(
+            at: entry, provider: provider
+        )
+
+        XCTAssertTrue(provider.swapped, "the fixture never armed the swap")
+        XCTAssertFalse(
+            provider.touched(mid.appendingPathComponent("deep/Documents")),
+            "the walk descended into a foreign directory swapped in above "
+                + "the child: \(provider.probedPaths)"
+        )
+        XCTAssertTrue(probe.matches.isEmpty, "\(probe.matches)")
+        // Held descriptors are inode-pinned: the vetted objects keep being
+        // read at their new location. Anything that resolves the child by
+        // PATH — even with `O_NOFOLLOW` — loses them, so this is the
+        // assertion that separates "refused" from "correct".
+        XCTAssertTrue(
+            provider.touched(mid.appendingPathComponent("deep/keeper")),
+            "the walk should have kept reading the vetted inodes: "
+                + "\(provider.probedPaths)"
+        )
+        XCTAssertTrue(probe.complete, "\(probe.obstructions)")
+    }
+
+    // MARK: - The descriptor bound never becomes a refusal (constraint 3)
+
+    /// Builds `levels` nested directories with `mkdirat`, holding at most
+    /// TWO descriptors at a time (the fixture must not itself exhaust the
+    /// lowered descriptor limit the test then imposes). Returns the deepest
+    /// descriptor, which the caller owns.
+    private func makeDeepChain(
+        under root: URL, name: String, levels: Int
+    ) throws -> Int32 {
+        var current = try openDirectory(root)
+        for _ in 0..<levels {
+            guard mkdirat(current, name, 0o755) == 0 else {
+                close(current)
+                throw XCTSkip("mkdirat failed: \(errno)")
+            }
+            let next = openat(current, name, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+            close(current)
+            guard next >= 0 else { throw XCTSkip("openat failed: \(errno)") }
+            current = next
+        }
+        return current
+    }
+
+    /// Tears such a chain down bottom-up by climbing `..`, which is the only
+    /// way past `PATH_MAX` — `FileManager.removeItem` cannot address it.
+    /// Consumes `deepest`.
+    private func removeDeepChain(deepest: Int32, stopAt: URL, name: String) {
+        var current = deepest
+        let stopInode = FileSystemIdentityProvider().identity(of: stopAt)?.inode
+        while true {
+            var here = stat()
+            if fstat(current, &here) == 0, UInt64(here.st_ino) == stopInode {
+                break
+            }
+            let parent = openat(current, "..", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+            if parent < 0 { break }
+            close(current)
+            unlinkat(parent, name, AT_REMOVEDIR)
+            current = parent
+        }
+        close(current)
+    }
+
+    /// THE acceptance criterion for "the depth cap did not come back".
+    ///
+    /// A tree an order of magnitude deeper than the descriptor window, with
+    /// the process's own descriptor limit lowered under it, must be READ —
+    /// with an EMPTY obstruction set. A design whose descriptor bound is a
+    /// refusal (an `.excessiveNesting`, an fd-pressure abort) fails here,
+    /// and it would be the retired depth cap with a better error message:
+    /// deterministic, adversary-triggerable, and unclearable by any retry.
+    func testFiveHundredDeepTreeCompletesUnderALoweredDescriptorLimit() throws {
+        let entry = cachesRoot.appendingPathComponent("com.example.VeryDeep")
+        try mkdir(entry)
+        let deepest = try makeDeepChain(under: entry, name: "d", levels: 500)
+        defer { removeDeepChain(deepest: deepest, stopAt: entry, name: "d") }
+
+        // Lower the process limit for the duration, exactly as a launchd
+        // -spawned app sees it (measured soft limit there: 256).
+        var original = rlimit()
+        guard getrlimit(RLIMIT_NOFILE, &original) == 0 else {
+            throw XCTSkip("getrlimit failed")
+        }
+        var lowered = original
+        lowered.rlim_cur = 96
+        guard setrlimit(RLIMIT_NOFILE, &lowered) == 0 else {
+            throw XCTSkip("setrlimit failed: \(errno)")
+        }
+        defer { setrlimit(RLIMIT_NOFILE, &original) }
+
+        var reanchors = 0
+        var peakLive = 0
+        let probe = OrphanedCachesScanner.boundedUserDataShapeWalk(
+            at: entry, provider: FileSystemIdentityProvider(),
+            entryLimit: OrphanedCachesScanner.defaultProbeEntryLimit,
+            descriptorWindow: OrphanedCachesScanner.defaultDescriptorWindow()
+        ) { event in
+            switch event {
+            case .didReanchor: reanchors += 1
+            case .descriptorCensus(let live, _): peakLive = max(peakLive, live)
+            default: break
+            }
+        }
+
+        XCTAssertEqual(probe.obstructions, [],
+                       "a 500-deep tree must be READ, not refused")
+        XCTAssertTrue(probe.complete)
+        XCTAssertTrue(probe.matches.isEmpty)
+        // EAGER TAIL RELEASE: a pure chain never needs to climb back, so it
+        // holds ~2 descriptors the whole way down and spends no `..` at all.
+        XCTAssertEqual(reanchors, 0,
+                       "a pure deep chain must not re-anchor even once")
+        XCTAssertLessThanOrEqual(peakLive, 2,
+                                 "tail release should hold root + current only")
+    }
+
+    /// The formula, enforced rather than asserted in prose:
+    /// `peak_live_fds = min(depth + 1, W) + 2`.
+    func testDescriptorPeakStaysInsideTheWindow() throws {
+        let entry = cachesRoot.appendingPathComponent("com.example.Peak")
+        // A COMB: every level keeps a pending sibling, so no tail release
+        // is free and the window is the only thing holding the count down.
+        var here = entry
+        for level in 0..<12 {
+            try mkdir(here.appendingPathComponent("keep\(level)"))
+            here = here.appendingPathComponent("down")
+            try mkdir(here)
+        }
+
+        let window = 4
+        var peakLive = 0
+        var peakProcess = 0
+        let before = openDescriptorCount()
+        let probe = OrphanedCachesScanner.boundedUserDataShapeWalk(
+            at: entry, provider: FileSystemIdentityProvider(),
+            entryLimit: OrphanedCachesScanner.defaultProbeEntryLimit,
+            descriptorWindow: window
+        ) { event in
+            if case .descriptorCensus(let live, _) = event {
+                peakLive = max(peakLive, live)
+                peakProcess = max(peakProcess, self.openDescriptorCount() - before)
+            }
+        }
+
+        XCTAssertTrue(probe.complete, "\(probe.obstructions)")
+        XCTAssertEqual(peakLive, window,
+                       "the comb must actually FILL the window, or this "
+                           + "test proves nothing")
+        XCTAssertGreaterThan(peakProcess, 1,
+                             "the /dev/fd census must be observing real "
+                                 + "descriptors, or the bound is vacuous")
+        XCTAssertLessThanOrEqual(
+            peakProcess, window + 2,
+            "peak = min(depth + 1, W) + 2 — the +2 covers the enumeration "
+                + "handle, the in-flight child, and the `..` descriptor, "
+                + "which are mutually exclusive"
+        )
+        XCTAssertEqual(openDescriptorCount(), before,
+                       "and every one of them is released")
+    }
+
+    /// `descriptorWindow` is a PERFORMANCE knob: shrinking it to 3 must not
+    /// change one byte of the output, on either tree shape. The comb pays
+    /// one `..` per level past the window; the chain pays none.
+    func testTinyDescriptorWindowChangesNothingButSyscallCount() throws {
+        let comb = cachesRoot.appendingPathComponent("com.example.Comb")
+        var here = comb
+        for level in 0..<6 {
+            try mkdir(here.appendingPathComponent("sibling\(level)"))
+            here = here.appendingPathComponent("down")
+            try mkdir(here)
+        }
+        try mkdir(here.appendingPathComponent("Documents"))
+
+        let chain = cachesRoot.appendingPathComponent("com.example.Chain")
+        try mkdir(chain.appendingPathComponent(deepChain(6) + "/Pictures"))
+
+        for tree in [comb, chain] {
+            var reanchors = 0
+            let narrow = OrphanedCachesScanner.boundedUserDataShapeWalk(
+                at: tree, provider: FileSystemIdentityProvider(),
+                entryLimit: OrphanedCachesScanner.defaultProbeEntryLimit,
+                descriptorWindow: 3
+            ) { if case .didReanchor = $0 { reanchors += 1 } }
+            let wide = OrphanedCachesScanner.boundedUserDataShapeWalk(
+                at: tree, provider: FileSystemIdentityProvider(),
+                entryLimit: OrphanedCachesScanner.defaultProbeEntryLimit,
+                descriptorWindow: 64
+            )
+
+            XCTAssertEqual(narrow, wide,
+                           "W changed the OUTPUT at \(tree.lastPathComponent)")
+            XCTAssertTrue(narrow.complete, "\(narrow.obstructions)")
+            if tree == chain {
+                XCTAssertEqual(reanchors, 0,
+                               "a chain releases its tail for free and never "
+                                   + "climbs back")
+            } else {
+                XCTAssertGreaterThan(reanchors, 0,
+                                     "a comb past the window must re-anchor")
+            }
+        }
+    }
+
+    /// A re-anchor that cannot prove it landed where it left ENDS the walk,
+    /// fail-closed. We can never get back above that level, and continuing
+    /// would be a silent truncation.
+    func testAReAnchorThatLandsElsewhereTerminatesTheWalk() throws {
+        let foreign = base.appendingPathComponent("foreign-parent")
+        try mkdir(foreign)
+
+        let entry = cachesRoot.appendingPathComponent("com.example.Reanchor")
+        let a = entry.appendingPathComponent("a")
+        let b = a.appendingPathComponent("b")
+        let c = b.appendingPathComponent("c")
+        try mkdir(c)
+        // A second sibling under `a`, so `a` is NOT tail-released and the
+        // climb back to it really is required.
+        try mkdir(a.appendingPathComponent("z"))
+
+        var moved = false
+        let probe = OrphanedCachesScanner.boundedUserDataShapeWalk(
+            at: entry, provider: FileSystemIdentityProvider(),
+            entryLimit: OrphanedCachesScanner.defaultProbeEntryLimit,
+            descriptorWindow: 2
+        ) { event in
+            // The instant before the walk climbs back out of the bottom of
+            // the chain, move that bottom under a foreign parent: `..` now
+            // names something the walk never vetted.
+            guard case .willPop(let depth) = event, depth == 3, !moved else {
+                return
+            }
+            moved = true
+            try? FileManager.default.moveItem(
+                at: c, to: foreign.appendingPathComponent("c")
+            )
+        }
+
+        XCTAssertTrue(moved, "the fixture never armed the move")
+        XCTAssertEqual(probe.obstructions, [.transientFailure])
+        XCTAssertFalse(probe.complete)
+    }
+
+    /// THE fd-balance net: every exit path the probe has — success, budget
+    /// exhaustion, a mount refusal, a root that cannot be opened, a
+    /// mid-walk `openat` failure, an ancestor swap, and a terminated walk —
+    /// must leave the process holding exactly the descriptors it started
+    /// with. A descriptor leaked on a refusal path is this design's number
+    /// one hazard; `SecureDirectory`'s `deinit` is what closes it, and this
+    /// is the enforcement rather than review vigilance.
+    func testEveryProbeExitPathReleasesEveryDescriptor() throws {
+        try XCTSkipIf(geteuid() == 0, "root ignores permission bits")
+        let plain = FileSystemIdentityProvider()
+
+        // (a) plain success over a real tree
+        let ok = cachesRoot.appendingPathComponent("fdbalance-ok")
+        try mkdir(ok.appendingPathComponent("a/b/c"))
+        try writeFile(ok.appendingPathComponent("a/f.bin"), bytes: 1)
+
+        // (b) budget exhaustion
+        let wide = cachesRoot.appendingPathComponent("fdbalance-wide")
+        try mkdir(wide)
+        for index in 0..<12 {
+            try mkdir(wide.appendingPathComponent("d\(index)"))
+        }
+
+        // (c) mount refusal, nested and at the root
+        let mounted = cachesRoot.appendingPathComponent("fdbalance-mount")
+        let inner = mounted.appendingPathComponent("volume")
+        try mkdir(inner.appendingPathComponent("Documents"))
+        let mountProvider = AliasedSpellingMountProvider()
+        mountProvider.mountedInodes.insert(
+            try XCTUnwrap(plain.identity(of: inner)?.inode)
+        )
+        let rootMountProvider = AliasedSpellingMountProvider()
+        rootMountProvider.mountedInodes.insert(
+            try XCTUnwrap(plain.identity(of: mounted)?.inode)
+        )
+
+        // (d) an unopenable root and an unopenable branch
+        let lockedRoot = cachesRoot.appendingPathComponent("fdbalance-locked")
+        try mkdir(lockedRoot)
+        try chmod000(lockedRoot)
+        defer { restorePerms(lockedRoot) }
+        let lockedBranch = cachesRoot.appendingPathComponent("fdbalance-branch")
+        let branch = lockedBranch.appendingPathComponent("sub")
+        try mkdir(branch)
+        try chmod000(branch)
+        defer { restorePerms(branch) }
+
+        // (e) a leaf swapped for a symlink (mid-walk `openat` failure)
+        let swapped = cachesRoot.appendingPathComponent("fdbalance-swap")
+        try mkdir(swapped)
+        let link = swapped.appendingPathComponent("sub")
+        try fm.createSymbolicLink(
+            at: link, withDestinationURL: base.appendingPathComponent("elsewhere")
+        )
+        let swapProvider = SwapSimulatingProvider()
+        swapProvider.reportedAsDirectory.insert(link.path)
+
+        // (f) a terminated walk: the re-anchor lands somewhere else
+        let moved = cachesRoot.appendingPathComponent("fdbalance-moved")
+        let movedC = moved.appendingPathComponent("a/b/c")
+        try mkdir(movedC)
+        try mkdir(moved.appendingPathComponent("a/z"))
+        let foreign = base.appendingPathComponent("fdbalance-foreign")
+        try mkdir(foreign)
+
+        let scenarios: [(String, () -> Void)] = [
+            ("success", {
+                _ = OrphanedCachesScanner.preDeleteUserDataProbe(
+                    at: ok, provider: plain
+                )
+            }),
+            ("budget", {
+                _ = OrphanedCachesScanner.boundedUserDataShapeWalk(
+                    at: wide, provider: plain, entryLimit: 3
+                )
+            }),
+            ("nested mount", {
+                _ = OrphanedCachesScanner.preDeleteUserDataProbe(
+                    at: mounted, provider: mountProvider
+                )
+            }),
+            ("root mount", {
+                _ = OrphanedCachesScanner.preDeleteUserDataProbe(
+                    at: mounted, provider: rootMountProvider
+                )
+            }),
+            ("absent root", {
+                _ = OrphanedCachesScanner.preDeleteUserDataProbe(
+                    at: self.cachesRoot.appendingPathComponent("nope"),
+                    provider: plain
+                )
+            }),
+            ("unopenable root", {
+                _ = OrphanedCachesScanner.preDeleteUserDataProbe(
+                    at: lockedRoot, provider: plain
+                )
+            }),
+            ("unopenable branch", {
+                _ = OrphanedCachesScanner.preDeleteUserDataProbe(
+                    at: lockedBranch, provider: plain
+                )
+            }),
+            ("leaf swap", {
+                _ = OrphanedCachesScanner.preDeleteUserDataProbe(
+                    at: swapped, provider: swapProvider
+                )
+            }),
+            ("terminated walk", {
+                var armed = false
+                _ = OrphanedCachesScanner.boundedUserDataShapeWalk(
+                    at: moved, provider: plain,
+                    entryLimit: OrphanedCachesScanner.defaultProbeEntryLimit,
+                    descriptorWindow: 2
+                ) { event in
+                    guard case .willPop(let depth) = event, depth == 3, !armed
+                    else { return }
+                    armed = true
+                    try? FileManager.default.moveItem(
+                        at: movedC, to: foreign.appendingPathComponent("c")
+                    )
+                }
+            }),
+        ]
+
+        for (name, run) in scenarios {
+            // One warm-up: Foundation caches on first use, and this test is
+            // about the WALK's descriptors, not about lazy globals.
+            run()
+            let before = openDescriptorCount()
+            run()
+            XCTAssertEqual(openDescriptorCount(), before,
+                           "\(name) leaked a descriptor")
+        }
+    }
+
+    // MARK: - Platform errno pinning (PR #458 review, ancestor swap)
+
+    /// The taxonomy is routed by errno, so the errnos themselves are pinned.
+    /// A future macOS change breaks THIS test, loudly, instead of silently
+    /// re-routing obstruction classes.
+    func testPlatformErrnosThisTaxonomyIsRoutedBy() throws {
+        let dir = base.appendingPathComponent("errno-pinning")
+        try mkdir(dir.appendingPathComponent("real"))
+        let link = dir.appendingPathComponent("link")
+        try fm.createSymbolicLink(
+            at: link, withDestinationURL: dir.appendingPathComponent("real")
+        )
+
+        // A symlink leaf under O_DIRECTORY|O_NOFOLLOW is ENOTDIR, NEVER
+        // ELOOP — which is why the `openObstruction` disambiguator this
+        // review deleted had never once fired in production.
+        let swapped = open(link.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
+        XCTAssertEqual(swapped, -1)
+        XCTAssertEqual(errno, ENOTDIR, "a swapped leaf must classify as ENOTDIR")
+        if swapped >= 0 { close(swapped) }
+        XCTAssertEqual(OrphanedCachesScanner.obstruction(forErrno: ENOTDIR),
+                       .transientFailure)
+
+        // ELOOP does survive O_DIRECTORY for a genuine ANCESTOR cycle —
+        // which is the only way it can still reach this walk, and only at
+        // the root open.
+        let loopA = dir.appendingPathComponent("loopA")
+        let loopB = dir.appendingPathComponent("loopB")
+        try fm.createSymbolicLink(at: loopA, withDestinationURL: loopB)
+        try fm.createSymbolicLink(at: loopB, withDestinationURL: loopA)
+        let cycle = open(
+            loopA.appendingPathComponent("x").path, O_RDONLY | O_DIRECTORY
+        )
+        XCTAssertEqual(cycle, -1)
+        XCTAssertEqual(errno, ELOOP, "a structural cycle must stay ELOOP")
+        if cycle >= 0 { close(cycle) }
+        XCTAssertEqual(OrphanedCachesScanner.obstruction(forErrno: ELOOP),
+                       .unaddressablePath)
+    }
+
+    /// A multi-component name defeats `O_NOFOLLOW` entirely — measured:
+    /// `openat(base, "cache/mid/secret.bin", O_NOFOLLOW)` opens a foreign
+    /// file through a symlinked `mid`. `readdir` cannot produce such a name
+    /// today; the guard turns a future refactor that could into a refusal.
+    func testUnsafeComponentsAreRefusedBeforeAnySyscall() {
+        XCTAssertFalse(OrphanedCachesScanner.isSafeComponent("a/b"))
+        XCTAssertFalse(OrphanedCachesScanner.isSafeComponent("/"))
+        XCTAssertFalse(OrphanedCachesScanner.isSafeComponent("."))
+        XCTAssertFalse(OrphanedCachesScanner.isSafeComponent(".."))
+        XCTAssertFalse(OrphanedCachesScanner.isSafeComponent(""))
+        XCTAssertTrue(OrphanedCachesScanner.isSafeComponent("Photos Library.photoslibrary"))
+        XCTAssertTrue(OrphanedCachesScanner.isSafeComponent(".hidden"))
+    }
+
+    /// The mount discriminator, against a REAL firmlink rather than an
+    /// injected fake: `/` and `/System/Volumes/Data` share one `st_dev` on
+    /// every macOS 11+ machine, and only `f_fsid` separates them. The old
+    /// device arm was blind to exactly this.
+    func testRealFirmlinkIsDistinguishedByFilesystemID() throws {
+        let dataVolume = URL(fileURLWithPath: "/System/Volumes/Data")
+        try XCTSkipIf(!fm.fileExists(atPath: dataVolume.path),
+                      "no firmlinked data volume on this machine")
+        let provider = FileSystemIdentityProvider()
+        let rootFD = try openDirectory(URL(fileURLWithPath: "/"))
+        defer { close(rootFD) }
+        let dataFD = try openDirectory(dataVolume)
+        defer { close(dataFD) }
+
+        let rootMount = try XCTUnwrap(provider.mountIdentity(ofDescriptor: rootFD))
+        let dataMount = try XCTUnwrap(provider.mountIdentity(ofDescriptor: dataFD))
+
+        XCTAssertEqual(rootMount.device, dataMount.device,
+                       "precondition: the firmlink pair shares one st_dev, "
+                           + "which is why a device comparison cannot see it")
+        XCTAssertNotEqual(rootMount, dataMount,
+                          "f_fsid is what actually carries the mount check")
+    }
+
+    // MARK: - Order and budget are unchanged (constraint 7)
+
+    /// Byte-wise ascending siblings, depth-first pre-order, one global entry
+    /// budget — the same sequence the flat-URL stack produced, now driven by
+    /// a per-level frame. Recorded through the walk's own hook and compared
+    /// against the order computed independently from the fixture.
+    func testVisitOrderIsDeterministicDepthFirstAndByteAscending() throws {
+        let entry = cachesRoot.appendingPathComponent("com.example.Order")
+        for name in ["b", "a", "C", "a/deep", "a/deep/z", "a/deep/y", "b/x"] {
+            try mkdir(entry.appendingPathComponent(name))
+        }
+        try writeFile(entry.appendingPathComponent("a/file.bin"), bytes: 1)
+
+        func record() -> [String] {
+            var sequence: [String] = []
+            _ = OrphanedCachesScanner.boundedUserDataShapeWalk(
+                at: entry, provider: FileSystemIdentityProvider(),
+                entryLimit: OrphanedCachesScanner.defaultProbeEntryLimit
+            ) { event in
+                if case .didEnumerate(let logical, let names) = event {
+                    sequence.append(
+                        "\(logical.lastPathComponent):\(names.joined(separator: ","))"
+                    )
+                }
+            }
+            return sequence
+        }
+
+        let first = record()
+        XCTAssertEqual(first, record(), "the walk must be deterministic")
+        XCTAssertEqual(first, [
+            "com.example.Order:C,a,b",   // byte-wise: uppercase sorts first
+            "C:",
+            "a:deep,file.bin",
+            "deep:y,z",
+            "y:",
+            "z:",
+            "b:x",
+            "x:",
+        ], "depth-first pre-order, siblings byte-ascending")
+    }
+
+    /// The budget is ONE global count across the whole frame stack, and a
+    /// tree bigger than it truncates at the SAME place every time.
+    func testBudgetTruncationIsGlobalAndReproducible() throws {
+        let entry = cachesRoot.appendingPathComponent("com.example.Budget")
+        for name in ["a", "b", "c"] {
+            try mkdir(entry.appendingPathComponent("\(name)/inner"))
+        }
+
+        func run() -> UserDataProbeResult {
+            OrphanedCachesScanner.boundedUserDataShapeWalk(
+                at: entry, provider: FileSystemIdentityProvider(), entryLimit: 4
+            )
+        }
+        let first = run()
+        XCTAssertEqual(first, run())
+        XCTAssertEqual(first.obstructions, [.budgetExhausted])
+        XCTAssertFalse(first.complete)
+    }
+
+    /// Constraint 5: the scan-time and delete-time faces are ONE core, so an
+    /// ancestor swap is refused identically on both — including the item the
+    /// scan-time face builds out of it.
+    func testAncestorSwapIsRefusedOnBothFaces() async throws {
+        let foreign = base.appendingPathComponent("outside-both-faces")
+        try mkdir(foreign.appendingPathComponent("deep/Documents"))
+
+        let entry = cachesRoot.appendingPathComponent("com.example.BothFaces")
+        let mid = entry.appendingPathComponent("mid")
+        try mkdir(mid.appendingPathComponent("deep/keeper"))
+        try writeFile(entry.appendingPathComponent("payload.bin"))
+
+        let provider = AncestorSwappingProvider()
+        provider.swapWhenProbing = "/\(mid.lastPathComponent)/deep"
+        provider.ancestor = mid
+        provider.stash = base.appendingPathComponent("stashed-both")
+        provider.replacement = foreign
+        provider.replaceWithSymlink = true
+
+        guard case .entries(let facts) =
+            makeScanner(provider: provider).enumerateFacts() else {
+            return XCTFail("expected facts")
+        }
+        let fact = try XCTUnwrap(
+            facts.first { $0.name == entry.lastPathComponent }
+        )
+        XCTAssertTrue(provider.swapped, "the fixture never armed the swap")
+        XCTAssertTrue(fact.userDataShapeMatches.isEmpty,
+                      "the scan-time face attributed foreign user data to "
+                          + "this entry: \(fact.userDataShapeMatches)")
+        XCTAssertTrue(fact.userDataProbeComplete,
+                      "and it stayed COMPLETE over the vetted inodes — the "
+                          + "held descriptors keep reading the objects that "
+                          + "were proven, wherever the swap moved them")
+    }
+
     // MARK: - The budget bounds WORK, not just attention (PR #458 review)
 
     /// The entry budget must bound what the walk MATERIALIZES, not only what
@@ -1878,15 +2692,19 @@ final class OrphanedCachesScannerTests: XCTestCase {
     /// directory with millions of entries could spike memory and stall the
     /// scan while only 20,000 entries were ever looked at.
     func testBoundedDirectoryReadStopsAtTheBudgetAndReportsTruncation() throws {
-        let plainProvider = FileSystemIdentityProvider()
         let wide = cachesRoot.appendingPathComponent("wide")
         try mkdir(wide)
         for index in 0..<2_000 {
             try writeFile(wide.appendingPathComponent("f\(index).bin"), bytes: 1)
         }
 
+        // The read is DESCRIPTOR-RELATIVE now: the caller hands over a
+        // parent it already holds, so there is no path resolution here at
+        // all and nothing to swap under it.
+        let wideFD = try openDirectory(wide)
+        defer { close(wideFD) }
         let bounded = OrphanedCachesScanner.boundedChildNames(
-            of: wide, limit: 5, vettedIdentity: nil, provider: plainProvider
+            inDirectory: wideFD, limit: 5
         )
         guard case .read(let names, let truncatedBy) = bounded else {
             return XCTFail("expected a bounded read, got \(bounded)")
@@ -1896,31 +2714,44 @@ final class OrphanedCachesScannerTests: XCTestCase {
         XCTAssertEqual(truncatedBy, [.budgetExhausted],
                        "and the read reports that more entries remained")
 
+        // The anchor SURVIVES the read (`closedir` closes only the
+        // enumeration handle `openat(fd, ".")` produced), and a second pass
+        // starts from offset 0 — which `dup`/`F_DUPFD_CLOEXEC` would not,
+        // since both share the file offset and return zero entries.
+        let second = OrphanedCachesScanner.boundedChildNames(
+            inDirectory: wideFD, limit: 5
+        )
+        guard case .read(let secondNames, _) = second else {
+            return XCTFail("the anchor did not survive the first read")
+        }
+        XCTAssertEqual(secondNames.count, 5,
+                       "a re-enumeration must not start at a shared offset")
+
         // Read whole when it fits, and PROVEN exhausted — the completeness
         // signal the fail-closed rule depends on.
         let small = cachesRoot.appendingPathComponent("narrow")
         try mkdir(small)
         try writeFile(small.appendingPathComponent("only.bin"), bytes: 1)
+        let smallFD = try openDirectory(small)
+        defer { close(smallFD) }
         XCTAssertEqual(
-            OrphanedCachesScanner.boundedChildNames(
-                of: small, limit: 5, vettedIdentity: nil,
-                provider: plainProvider
-            ),
+            OrphanedCachesScanner.boundedChildNames(inDirectory: smallFD, limit: 5),
             .read(["only.bin"], truncatedBy: [])
         )
 
-        // An unopenable directory is reported as such, attributed.
+        // An unopenable directory is refused BEFORE any descriptor exists,
+        // and the walk attributes it — the same class, one level up.
         try XCTSkipIf(geteuid() == 0, "root ignores permission bits")
-        let locked = cachesRoot.appendingPathComponent("locked")
+        let blocked = cachesRoot.appendingPathComponent("blocked-read")
+        let locked = blocked.appendingPathComponent("locked")
         try mkdir(locked)
         try chmod000(locked)
         defer { restorePerms(locked) }
         XCTAssertEqual(
-            OrphanedCachesScanner.boundedChildNames(
-                of: locked, limit: 5, vettedIdentity: nil,
-                provider: plainProvider
-            ),
-            .unreadable(.accessDenied)
+            OrphanedCachesScanner.preDeleteUserDataProbe(
+                at: blocked, provider: FileSystemIdentityProvider()
+            ).obstructions,
+            [.accessDenied]
         )
     }
 
@@ -1958,9 +2789,10 @@ final class OrphanedCachesScannerTests: XCTestCase {
             return realEntriesSeen > limit ? nil : name
         }
 
+        let wideFD = try openDirectory(wide)
+        defer { close(wideFD) }
         let bounded = OrphanedCachesScanner.boundedChildNames(
-            of: wide, limit: limit, vettedIdentity: nil,
-            provider: FileSystemIdentityProvider(), decode: sentinelUndecodable
+            inDirectory: wideFD, limit: limit, decode: sentinelUndecodable
         )
 
         guard case .read(let names, let causes) = bounded else {
@@ -2002,9 +2834,10 @@ final class OrphanedCachesScannerTests: XCTestCase {
             return realEntriesSeen == 1 ? nil : name
         }
 
+        let wideFD = try openDirectory(wide)
+        defer { close(wideFD) }
         let bounded = OrphanedCachesScanner.boundedChildNames(
-            of: wide, limit: 4, vettedIdentity: nil,
-            provider: FileSystemIdentityProvider(), decode: firstUndecodable
+            inDirectory: wideFD, limit: 4, decode: firstUndecodable
         )
 
         XCTAssertEqual(bounded, .read([], truncatedBy: [.undecodableName]),
@@ -2068,11 +2901,15 @@ final class OrphanedCachesScannerTests: XCTestCase {
     private final class ErrnoInjectingProvider: FileSystemIdentityProvider {
         var failures: [String: Int32] = [:]
 
-        override func probeKind(of url: URL) -> KindProbe {
-            if let code = failures[url.standardizedFileURL.path] {
+        override func probeChild(
+            inDirectory descriptor: Int32, named name: String, logical: URL
+        ) -> ChildProbe {
+            if let code = failures[logical.standardizedFileURL.path] {
                 return .failed(errno: code)
             }
-            return super.probeKind(of: url)
+            return super.probeChild(
+                inDirectory: descriptor, named: name, logical: logical
+            )
         }
     }
 
@@ -2294,24 +3131,57 @@ final class OrphanedCachesScannerTests: XCTestCase {
         for fd in fds { close(fd) }
     }
 
-    /// End to end: a path the walk cannot address is DETERMINISTIC, so the
-    /// delete-time refusal must not tell the user to re-scan and retry.
-    func testOverlongPathIsNotReportedAsATemporaryFailure() throws {
+    /// A path beyond `PATH_MAX` now COMPLETES instead of stranding (PR #458
+    /// review, ancestor swap). The walk spells no path below its root, so
+    /// `ENAMETOOLONG` cannot arise there at all — measured: a 500-deep tree
+    /// reads fine descriptor-relative while `open` on its 14,628-byte
+    /// absolute path returns errno 63.
+    ///
+    /// This retires a whole stranding class rather than reclassifying it.
+    /// The entry used to probe permanently unprovable, which downstream is
+    /// permanent removal from Quick Clean and smart-clean — over a tree
+    /// nothing actually obstructed. And the user data at the bottom of it,
+    /// which the old walk never saw, is now FOUND.
+    func testOverlongPathNowCompletesInsteadOfStranding() throws {
         let entry = cachesRoot.appendingPathComponent("com.example.Overlong")
         try mkdir(entry)
         // 7 × 200 characters clears PATH_MAX (1024) from any temp root.
         let segment = String(repeating: "n", count: 200)
         let fds = try makeOverlongChain(under: entry, segment: segment, levels: 7)
-        defer { teardownOverlongChain(fds, segment: segment) }
+        guard mkdirat(fds.last!, "Documents", 0o755) == 0 else {
+            throw XCTSkip("mkdirat failed: \(errno)")
+        }
+        defer {
+            unlinkat(fds.last!, "Documents", AT_REMOVEDIR)
+            teardownOverlongChain(fds, segment: segment)
+        }
 
-        let probe = OrphanedCachesScanner.preDeleteUserDataProbe(
-            at: entry, provider: FileSystemIdentityProvider()
+        // The platform fact this test exists on top of: that same tree is
+        // unaddressable BY PATH.
+        let overlong = entry.appendingPathComponent(
+            Array(repeating: segment, count: 7).joined(separator: "/")
         )
+        let byPath = open(overlong.path, O_RDONLY | O_DIRECTORY)
+        XCTAssertEqual(byPath, -1, "fixture is not actually past PATH_MAX")
+        XCTAssertEqual(errno, ENAMETOOLONG)
+        if byPath >= 0 { close(byPath) }
 
-        XCTAssertFalse(probe.complete, "fail-closed is untouched")
-        XCTAssertEqual(probe.obstructions, [.unaddressablePath])
+        var probe = UserDataProbeResult.complete()
+        assertNoDescriptorLeak {
+            probe = OrphanedCachesScanner.preDeleteUserDataProbe(
+                at: entry, provider: FileSystemIdentityProvider()
+            )
+        }
+
+        XCTAssertTrue(probe.complete,
+                      "nothing obstructed this walk: \(probe.obstructions)")
+        XCTAssertEqual(probe.matches, ["documents-directory"],
+                       "user data below the old PATH_MAX wall must be found")
+
+        // The taxonomy entry survives for the ROOT open, and still never
+        // promises a retry it cannot honour.
         let guidance = OrphanedCachesScanner.remediationGuidance(
-            for: probe.obstructions
+            for: [.unaddressablePath]
         )
         XCTAssertFalse(
             guidance.hasSuffix("Re-scan and try again."),

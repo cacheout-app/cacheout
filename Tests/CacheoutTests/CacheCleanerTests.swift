@@ -2144,6 +2144,21 @@ final class CacheCleanerTests: XCTestCase {
             }
             return super.probeKind(of: url)
         }
+
+        /// The probe's per-entry syscall is DESCRIPTOR-RELATIVE now (PR #458
+        /// review, ancestor swap): `logical` is the spelling the walk
+        /// believes it is at, which production ignores and a test injects
+        /// on.
+        override func probeChild(
+            inDirectory descriptor: Int32, named name: String, logical: URL
+        ) -> ChildProbe {
+            if let code = failures[logical.standardizedFileURL.path] {
+                return .failed(errno: code)
+            }
+            return super.probeChild(
+                inDirectory: descriptor, named: name, logical: logical
+            )
+        }
     }
 
     func testAutoEligibleSweepItemUnchangedStillDeletes() async throws {

@@ -97,6 +97,137 @@ class FileSystemIdentityProvider {
         )
     }
 
+    // MARK: - Descriptor-relative primitives (PR #458 review, ancestor swap)
+
+    /// Which MOUNT an open descriptor sits on.
+    ///
+    /// `f_fsid` rather than `f_mntonname` or `st_dev` alone, measured on
+    /// this platform: EVERY path on a modern APFS system volume group
+    /// reports the SAME `st_dev` (16777230 — `/`, `/System/Volumes/Data`
+    /// and `/private/tmp` alike), so a device comparison is blind to the
+    /// system/data firmlink split it was partly meant to catch. `f_fsid`
+    /// separates them ({16777235,26} vs {16777230,26}). The device is kept
+    /// as a second arm because it still catches ordinary external volumes
+    /// (and is the arm hermetic tests inject), but `f_fsid` is what
+    /// actually carries the check.
+    ///
+    /// Read from a DESCRIPTOR, never a path: the path form
+    /// (`isMountPoint`) compares `f_mntonname` against the spelling it was
+    /// handed, so an aliased spelling silently answered `false` — a whole
+    /// failure class that dies with this method.
+    struct MountIdentity: Equatable {
+        /// `statfs.f_fsid.val` — the filesystem's own id pair.
+        let filesystemID: (Int32, Int32)
+        /// `st_dev` of the descriptor itself.
+        let device: UInt64
+
+        static func == (lhs: MountIdentity, rhs: MountIdentity) -> Bool {
+            lhs.filesystemID == rhs.filesystemID && lhs.device == rhs.device
+        }
+    }
+
+    /// `(f_fsid, st_dev)` of an OPEN DESCRIPTOR. `nil` when either call
+    /// fails, which callers must treat as unvetted.
+    ///
+    /// Override point for hermetic mount tests: injecting a foreign
+    /// `filesystemID` (or `device`) here is the descriptor-shaped
+    /// equivalent of the retired `isMountPoint` inode injection, and it
+    /// cannot be defeated by path spelling.
+    func mountIdentity(ofDescriptor descriptor: Int32) -> MountIdentity? {
+        var fs = statfs()
+        guard fstatfs(descriptor, &fs) == 0 else { return nil }
+        var st = stat()
+        guard fstat(descriptor, &st) == 0 else { return nil }
+        return MountIdentity(
+            filesystemID: (fs.f_fsid.val.0, fs.f_fsid.val.1),
+            device: UInt64(bitPattern: Int64(st.st_dev))
+        )
+    }
+
+    /// Kind AND identity of one child, from ONE atomic `fstatat`.
+    ///
+    /// Two separate path `lstat`s of the same name (one for the kind, one
+    /// for the identity) are two independent resolutions with a window
+    /// between them; one `fstatat` against a HELD parent descriptor is a
+    /// single resolution that cannot be re-pointed, because the parent is
+    /// an inode we already hold rather than a path anyone can swap.
+    struct ChildFacts: Equatable {
+        let kind: FileKind
+        let identity: Identity
+    }
+
+    /// Errno-aware descriptor-relative probe result — the `KindProbe`
+    /// shape, carrying the identity the same stat established.
+    enum ChildProbe: Equatable {
+        case facts(ChildFacts)
+        /// ENOENT/ENOTDIR — the entry simply is not there any more.
+        case absent
+        /// `fstatat` failed for another reason (EACCES, EIO, …).
+        case failed(errno: Int32)
+    }
+
+    /// `fstatat(descriptor, name, AT_SYMLINK_NOFOLLOW)` — the walk's ONE
+    /// per-entry syscall below its root.
+    ///
+    /// `logical` is the walk's UNRESOLVED spelling of the child. Production
+    /// IGNORES it completely (no path ever reaches a syscall here); it is
+    /// carried solely so tests can key overrides and touch-recording on the
+    /// path the walk believes it is at.
+    ///
+    /// `name` MUST be a single safe component — callers validate before
+    /// calling, because `openat`/`fstatat` happily accept a MULTI-COMPONENT
+    /// relative path, and `O_NOFOLLOW` then guards only its last component
+    /// (measured: `openat(base, "cache/mid/secret.bin", O_NOFOLLOW)` opens a
+    /// foreign file through a symlinked `mid`).
+    func probeChild(
+        inDirectory descriptor: Int32, named name: String, logical: URL
+    ) -> ChildProbe {
+        var st = stat()
+        guard fstatat(descriptor, name, &st, AT_SYMLINK_NOFOLLOW) == 0 else {
+            let code = errno
+            return (code == ENOENT || code == ENOTDIR)
+                ? .absent
+                : .failed(errno: code)
+        }
+        let kind: FileKind
+        switch st.st_mode & S_IFMT {
+        case S_IFREG: kind = .regularFile
+        case S_IFDIR: kind = .directory
+        case S_IFLNK: kind = .symlink
+        default: kind = .other
+        }
+        return .facts(ChildFacts(
+            kind: kind,
+            identity: Identity(
+                device: UInt64(bitPattern: Int64(st.st_dev)),
+                inode: UInt64(st.st_ino)
+            )
+        ))
+    }
+
+    /// The outcome of a descriptor-relative directory open — errno carried
+    /// rather than left in the global, which an override could clobber.
+    enum DescriptorOpen: Equatable {
+        case opened(Int32)
+        case failed(errno: Int32)
+    }
+
+    /// `openat(descriptor, name, O_RDONLY|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW)`.
+    ///
+    /// Single component only (see `probeChild`). The descent's safety comes
+    /// from CONTAINMENT — the child is resolved inside an inode we hold —
+    /// not from re-checking a recorded identity, which an ancestor swap
+    /// makes meaningless (the recorded value is then already the foreign
+    /// object's).
+    func openChildDirectory(
+        inDirectory descriptor: Int32, named name: String, logical: URL
+    ) -> DescriptorOpen {
+        let fd = openat(
+            descriptor, name, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW
+        )
+        return fd >= 0 ? .opened(fd) : .failed(errno: errno)
+    }
+
     /// `st_nlink` of the object at `url` (no-follow). Hardlink detection:
     /// `linkCount > 1` on a regular file.
     func linkCount(of url: URL) -> UInt64? {

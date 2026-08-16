@@ -126,6 +126,22 @@ now 3 and destructive commands require `--confirm`. Coordinate MCP updates with
 
 ### Fixed
 
+- **Orphaned-caches probe: ancestor-swap disclosure.** The bounded
+  user-data probe resolved each child by absolute path, so a directory
+  replaced by a symlink after its parent had been read (but before the
+  child was vetted) redirected the walk outside `~/Library/Caches` — up to
+  the full 20,000-entry budget — and attributed what it found there to the
+  cache entry. `O_NOFOLLOW` guards only the final component, and the
+  identity re-proof could not help because the identity it compared was
+  already the foreign object's. The probe now holds each parent open and
+  discovers, stats and descends every child relative to that descriptor by
+  single-component basename, at a bounded number of live descriptors. Two
+  side effects are user-visible: trees whose absolute paths exceed
+  `PATH_MAX` are now inspected instead of being refused forever, and mount
+  boundaries are detected by filesystem id rather than by path spelling, so
+  an aliased path can no longer hide one. NOTE (new, narrow): the probe is
+  now free of `PATH_MAX` while deletion is not, so a tree the probe
+  certifies can still fail to delete with its own path-length error.
 - **Freed-bytes over-report (D1).** Freed bytes were assumed from pre-scan
   totals even when deletion partially failed. Every deletion target is now
   measured immediately before deletion and settled through claim-based

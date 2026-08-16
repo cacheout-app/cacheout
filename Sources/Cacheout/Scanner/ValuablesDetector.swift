@@ -184,11 +184,20 @@
 /// still being walked), and a pending runtime replacement is applied in the
 /// same epilogue — so every entry read after the cancel is UI time.
 ///
-/// `Task.isCancelled` is therefore polled at four places, which between them
-/// bound every loop that can run long: the `readdir` of ONE directory
-/// (`boundedChildNames`), the per-name vetting loop that consumes it, the DFS
-/// pop/descend loop, and the entry to every `enumerate`. Nothing else in the
-/// walk is unbounded.
+/// `Task.isCancelled` is therefore polled at exactly three places — the three
+/// loops that can run long, and no more, because a guard no test can kill is
+/// one a refactor keeps for the wrong reason:
+/// - the `readdir` of ONE directory (`boundedChildNames`), which reports a
+///   cancelled read through the SAME `obstructed` channel an unreadable branch
+///   uses — one mapping, no second cancellation vocabulary to drift;
+/// - the per-name VETTING loop that consumes those names, one `fstatat` each,
+///   for a directory whose names are ALREADY read (the readdir poll cannot
+///   help there);
+/// - the DFS pop/descend loop, which would otherwise `openat` + `fdopendir`
+///   its way through every pending sibling on the stack.
+/// Each is pinned by a test that measures the work actually performed —
+/// entries read, `fstatat`s issued, children opened — and each of those tests
+/// goes red when its own poll is deleted.
 ///
 /// A CANCELLED PROBE IS NEVER A CLEAN PROBE. It is INCOMPLETE with the
 /// OBSTRUCTION cause — deliberately not `.entryBudget`, which is the
@@ -1179,8 +1188,14 @@ enum ValuablesDetector {
         // MARK: Enumeration
 
         /// Read + vet one directory's children, descriptor-relative.
+        ///
+        /// No cancellation check on ENTRY, deliberately: the very next thing
+        /// this does is the `readdir` loop, which polls before its first
+        /// entry, and the walk loop polls before it gets here — a third check
+        /// between them would bound nothing either of those does not, and an
+        /// unevidenced guard is one a later refactor keeps for the wrong
+        /// reason.
         mutating func enumerate(index: Int) {
-            if windingDown() { return }
             let remaining = entryLimit - visited
             guard remaining > 0 else {
                 fail(.entryBudget)
@@ -1196,14 +1211,6 @@ enum ValuablesDetector {
             ) else {
                 // Unreadable branch: absence of valuables is UNPROVEN.
                 fail(.obstruction)
-                return
-            }
-            // The read winds down mid-directory too, and it is the arm that
-            // matters most: ONE directory can hold more entries than the whole
-            // rest of the walk (P2 #2).
-            if read.cancelled {
-                fail(.obstruction)
-                aborted = true
                 return
             }
             // The two ways ONE directory read can come up short, kept apart:
@@ -1559,9 +1566,15 @@ enum ValuablesDetector {
     /// the producer's ACTUAL completion after cancelling
     /// (`CacheoutViewModel.untilProducerFinishes`), so every entry read after
     /// the cancel is time the UI spends unresponsive and a pending runtime
-    /// replacement spends queued. `cancelled` is reported SEPARATELY from
-    /// `obstructed` at this seam so the caller decides the verdict; the caller
-    /// maps it to an obstruction, never to the escalatable budget cause.
+    /// replacement spends queued.
+    ///
+    /// A cancelled read reports itself `obstructed` — the SAME channel an
+    /// unreadable branch uses, and deliberately so: both mean "this directory
+    /// was not proven empty of valuables and no bigger budget changes that",
+    /// which is exactly the verdict cancellation deserves. Reporting it as
+    /// `budgetTruncated` would send `ValuablesProbeBudget.escalating` off to
+    /// re-walk a cancelled tree at twice the bound, sixteen times over. One
+    /// mapping, no second cancellation vocabulary to drift.
     ///
     /// NOT `private`: the cancellation policy is proven by calling this
     /// directly on a real directory of thousands of entries, in the same
@@ -1569,10 +1582,7 @@ enum ValuablesDetector {
     /// ACTUALLY DONE, so the test measures the loop instead of asking it.
     static func boundedChildNames(
         parentFD: Int32, limit: Int, provider: FileSystemIdentityProvider
-    ) -> (
-        names: [String], budgetTruncated: Bool, obstructed: Bool,
-        cancelled: Bool
-    )? {
+    ) -> (names: [String], budgetTruncated: Bool, obstructed: Bool)? {
         let enumerationFD = provider.openSelfForEnumeration(parentFD)
         guard enumerationFD >= 0 else { return nil }
         guard let handle = fdopendir(enumerationFD) else {
@@ -1585,13 +1595,12 @@ enum ValuablesDetector {
         var names: [String] = []
         var budgetTruncated = false
         var obstructed = false
-        var cancelled = false
         while true {
             // Checked EVERY entry, not every N: the check is a flag read
             // beside a `readdir`, and an interval would put a directory's own
             // size back into the wind-down latency this exists to bound.
             if Task.isCancelled {
-                cancelled = true
+                obstructed = true
                 break
             }
             // `readdir` returns nil for BOTH end-of-stream and error; errno
@@ -1618,7 +1627,7 @@ enum ValuablesDetector {
             }
             names.append(name)
         }
-        return (names, budgetTruncated, obstructed, cancelled)
+        return (names, budgetTruncated, obstructed)
     }
 
     /// The VALIDATING basename decode, factored out so the fail-closed policy

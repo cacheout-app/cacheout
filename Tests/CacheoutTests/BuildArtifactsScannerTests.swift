@@ -6280,27 +6280,31 @@ final class BuildArtifactsScannerTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(fd, 0)
         defer { close(fd) }
 
-        // The uncancelled control: the loop reads the whole directory.
+        // The uncancelled control: the loop reads the whole directory, and
+        // says so.
         let whole = try XCTUnwrap(ValuablesDetector.boundedChildNames(
             parentFD: fd, limit: entries * 2, provider: provider
         ))
         XCTAssertEqual(whole.names.count, entries)
-        XCTAssertFalse(whole.cancelled)
+        XCTAssertFalse(whole.obstructed)
         XCTAssertFalse(whole.budgetTruncated)
 
         // REAL cancellation, through the real `Task` machinery, at a
         // deterministic instant: no sleeps, no threads, no timing.
-        let cancelled = await Task { () -> (names: Int, cancelled: Bool)? in
+        let cancelled = await Task { () -> (names: Int, unfinished: Bool)? in
             withUnsafeCurrentTask { $0?.cancel() }
             guard let read = ValuablesDetector.boundedChildNames(
                 parentFD: fd, limit: entries * 2, provider: provider
             ) else { return nil }
-            return (read.names.count, read.cancelled)
+            return (read.names.count, read.obstructed)
         }.value
 
         let read = try XCTUnwrap(cancelled)
-        XCTAssertTrue(read.cancelled,
-                      "a cancelled read must SAY it did not finish")
+        XCTAssertTrue(
+            read.unfinished,
+            "a cancelled read must SAY it did not finish — reported as an "
+                + "obstruction, never as the escalatable budget cause"
+        )
         XCTAssertLessThan(
             read.names, entries,
             "the readdir loop ran to its bound after cancellation: \(read.names)"
@@ -6369,10 +6373,12 @@ final class BuildArtifactsScannerTests: XCTestCase {
         XCTAssertNotEqual(cancelled.incompleteness, .entryBudget)
     }
 
-    /// Counts the production per-entry vetting calls — the test's OWN
-    /// instrumentation of work done, never the walk's self-report.
+    /// Counts the production per-entry work — the test's OWN instrumentation,
+    /// never the walk's self-report: `fstatat` vets and child opens are the
+    /// two syscalls the DFS spends per entry.
     private final class VettingCountingProvider: FileSystemIdentityProvider {
         var vettedNames = 0
+        var openedChildren = 0
 
         override func probeKind(
             inDirectory parent: Int32, named name: String, logical url: URL
@@ -6382,6 +6388,121 @@ final class BuildArtifactsScannerTests: XCTestCase {
                 inDirectory: parent, named: name, logical: url
             )
         }
+
+        override func openChildDirectory(
+            inDirectory parent: Int32, named name: String, logical url: URL
+        ) -> Int32 {
+            openedChildren += 1
+            return super.openChildDirectory(
+                inDirectory: parent, named: name, logical: url
+            )
+        }
+    }
+
+    /// THE VETTING LOOP, which the `readdir` poll cannot help: by the time it
+    /// runs, the directory's names are ALREADY read, and it spends one
+    /// `fstatat` per name — up to the whole granted budget. Cancellation
+    /// arrives from the production `didReadNames` hook, i.e. exactly between
+    /// the read and the first vet, so the instant is structural, not timed.
+    func testTheVettingLoopWindsDownWhenCancelledMidDirectory() async throws {
+        let artifact = try makeProject(
+            at: dev.appendingPathComponent("murmur"),
+            marker: "Cargo.toml", artifact: "target", payloadBytes: nil
+        )
+        let crowded = artifact.appendingPathComponent("deps")
+        let entries = 3_000
+        XCTAssertEqual(try fillDirectory(crowded, count: entries), entries)
+
+        let counting = VettingCountingProvider()
+        let live = ValuablesDetector.probe(at: artifact, provider: counting)
+        XCTAssertTrue(live.probeComplete)
+        XCTAssertGreaterThan(
+            counting.vettedNames, entries,
+            "fixture precondition: the uncancelled walk vets every entry"
+        )
+
+        var vettedBeforeTheCancel = 0
+        var cancelled = false
+        ValuablesDetector.testHook = { event in
+            guard !cancelled, case .didReadNames(let logical) = event,
+                  logical.path == crowded.path else { return }
+            cancelled = true
+            vettedBeforeTheCancel = counting.vettedNames
+            withUnsafeCurrentTask { $0?.cancel() }
+        }
+        defer { ValuablesDetector.testHook = nil }
+
+        counting.vettedNames = 0
+        let disclosure = await Task { () -> ValuablesDisclosure in
+            ValuablesDetector.probe(at: artifact, provider: counting)
+        }.value
+        ValuablesDetector.testHook = nil
+
+        XCTAssertTrue(cancelled, "fixture precondition: the cancel fired "
+                        + "after a 3,000-entry directory was read")
+        XCTAssertEqual(
+            counting.vettedNames - vettedBeforeTheCancel, 0,
+            "the vetting loop kept `fstatat`-ing after cancellation: "
+                + "\(counting.vettedNames - vettedBeforeTheCancel) of "
+                + "\(entries) already-read names"
+        )
+        XCTAssertFalse(disclosure.probeComplete)
+        XCTAssertEqual(disclosure.incompleteness, .obstruction)
+    }
+
+    /// THE DFS LOOP. Cancellation lands after a directory is fully vetted and
+    /// while its children are being descended one `openat` + `fdopendir` at a
+    /// time — the phase where neither the read poll nor the vetting poll runs.
+    func testTheDescentLoopWindsDownWhenCancelledBetweenChildren()
+        async throws
+    {
+        let artifact = try makeProject(
+            at: dev.appendingPathComponent("murmur"),
+            marker: "Cargo.toml", artifact: "target", payloadBytes: nil
+        )
+        let parent = artifact.appendingPathComponent("deps")
+        try mkdir(parent)
+        let children = 500
+        for index in 0..<children {
+            try mkdir(parent.appendingPathComponent("pkg-\(index)"))
+        }
+
+        let counting = VettingCountingProvider()
+        let live = ValuablesDetector.probe(at: artifact, provider: counting)
+        XCTAssertTrue(live.probeComplete)
+        XCTAssertGreaterThanOrEqual(
+            counting.openedChildren, children,
+            "fixture precondition: the uncancelled walk descends them all"
+        )
+
+        var openedBeforeTheCancel = 0
+        var cancelled = false
+        ValuablesDetector.testHook = { event in
+            // Every child of `deps` is vetted; the descents are next.
+            guard !cancelled, case .didEnumerate(let logical) = event,
+                  logical.path == parent.path else { return }
+            cancelled = true
+            openedBeforeTheCancel = counting.openedChildren
+            withUnsafeCurrentTask { $0?.cancel() }
+        }
+        defer { ValuablesDetector.testHook = nil }
+
+        counting.openedChildren = 0
+        let disclosure = await Task { () -> ValuablesDisclosure in
+            ValuablesDetector.probe(at: artifact, provider: counting)
+        }.value
+        ValuablesDetector.testHook = nil
+
+        XCTAssertTrue(cancelled, "fixture precondition: the cancel fired "
+                        + "with 500 vetted children still to descend")
+        XCTAssertEqual(
+            counting.openedChildren - openedBeforeTheCancel, 0,
+            "the descent loop kept opening children after cancellation: "
+                + "\(counting.openedChildren - openedBeforeTheCancel) of "
+                + "\(children)"
+        )
+        XCTAssertFalse(disclosure.probeComplete)
+        XCTAssertEqual(disclosure.incompleteness, .obstruction)
     }
 
     /// The ESCALATION DRIVER must not turn one cancelled walk into sixteen.

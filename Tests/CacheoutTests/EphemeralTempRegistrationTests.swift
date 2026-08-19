@@ -311,6 +311,66 @@ final class EphemeralTempRegistrationTests: XCTestCase {
                       "the temp ROOT is never a deletion target")
     }
 
+    /// SCANNER-DEFINED STALENESS IS THE BULK-SELECTION CONTRACT (PR #459
+    /// review r4, codex C2 — DISCLOSURE). At the SHIPPED default thresholds
+    /// (7 days / 10 MB), an 8-day-old entry is `isStale: true` and the
+    /// section's "Select Stale" action enrolls it, while the 30-day helper
+    /// (`ReclaimableItem.isStale(daysSinceModified:)`, build_artifacts' own
+    /// predicate) says false for 8 days. That divergence is WHY the button
+    /// label carries no numeral: the retired 30-day parenthetical claimed
+    /// month-old-only for a selection this cell proves enrolls an 8-day-old
+    /// entry in the default configuration. This cell pins all three facts so
+    /// neither a re-coupling of temp staleness to 30 days nor a numeral's
+    /// return can ship unnoticed. (The 30-day fixture cells elsewhere cannot
+    /// see this: only a sub-30-day fixture distinguishes the two predicates.)
+    @MainActor
+    func testAnEightDayOldEntryIsEnrolledByTheSelectStaleBulkSelection() async throws {
+        let entry = tempRoot.appendingPathComponent("eight-day-scratch")
+        try fm.createDirectory(at: entry, withIntermediateDirectories: true)
+        try Data(repeating: 0x41, count: 12_000_000)
+            .write(to: entry.appendingPathComponent("payload.bin"))
+        try backdate(entry, to: clock.addingTimeInterval(-8 * 86_400))
+
+        let clock = self.clock
+        let scanner = EphemeralTempScanner(
+            roots: [EphemeralTempRoot(
+                url: canonical(tempRoot),
+                label: "Shared temp",
+                cleanupEvidence: EphemeralTempRoots.sharedTempEvidence,
+                writability: .worldWritable
+            )],
+            home: fixtureHome,
+            thresholds: EphemeralTempSweepConfig.defaultThresholds,
+            now: { clock }
+        )
+        let runtime = try makeRuntime([scanner])
+        let viewModel = CacheoutViewModel(runtime: runtime)
+        await viewModel.scan(
+            trigger: .userInitiated,
+            scannerIDs: [EphemeralTempScanner.registeredID]
+        )
+
+        let section = try XCTUnwrap(viewModel.perItemSections.first {
+            $0.scannerID == EphemeralTempScanner.registeredID
+        })
+        let item = try XCTUnwrap(section.items.first)
+        XCTAssertEqual(item.isStale, true,
+                       "8 days > the shipped 7-day default: stale by the "
+                        + "scanner that judged it")
+        XCTAssertFalse(ReclaimableItem.isStale(daysSinceModified: 8),
+                       "…while the 30-day helper disagrees — the two "
+                        + "predicates MUST diverge for this cell to pin "
+                        + "anything")
+        XCTAssertTrue(section.supportsStaleness,
+                      "the Select Stale control renders for this section")
+        XCTAssertTrue(item.evidence.contains("8 days"),
+                      "the TRUE age is the row's evidence: \(item.evidence)")
+
+        viewModel.selectStale(inScanner: EphemeralTempScanner.registeredID)
+        XCTAssertEqual(viewModel.selectedItemKeys, [item.key],
+                       "the bulk selection enrolls the 8-day-old entry")
+    }
+
     // MARK: - R10: the CLI surface
 
     /// `--cli scan` lists the fixture item under `ephemeral_tmp`, an

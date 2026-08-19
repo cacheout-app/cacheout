@@ -10,8 +10,15 @@
 /// Scanner `displayName` + item count + section total.
 ///
 /// ## Quick Actions
-/// - **Select Stale (30d+)**: only where staleness applies to the scanner's
-///   items (`isStale == nil` = control hidden/inapplicable)
+/// - **Select Stale**: only where staleness applies to the scanner's
+///   items (`isStale == nil` = control hidden/inapplicable). The label makes
+///   NO numeric claim on purpose (PR #459 review r4, codex C2): each scanner
+///   judges staleness by its OWN configurable threshold (build_artifacts 30
+///   days, orphaned_caches 60-day default, ephemeral_tmp 7-day default), and
+///   the retired 30-day parenthetical was false in the shipped DEFAULT
+///   configuration the moment a sub-30-day scanner registered. The per-item
+///   age is stated where it is true: the row's evidence string and the
+///   confirmation sheet.
 /// - **Select All** / **Deselect All**: section-scoped
 ///
 /// ## Rows
@@ -93,7 +100,7 @@ struct ScannerItemSection: View {
                 // Quick actions (section-scoped)
                 HStack(spacing: 12) {
                     if section.supportsStaleness {
-                        Button("Select Stale (30d+)") {
+                        Button("Select Stale") {
                             viewModel.selectStale(inScanner: section.scannerID)
                         }
                         .font(.caption)

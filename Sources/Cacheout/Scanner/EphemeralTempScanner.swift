@@ -580,7 +580,7 @@ struct EphemeralTempScanner: @unchecked Sendable {
                 // verdicts on timing alone: "not stale, silently excluded" one
                 // microsecond before the stage-1 read, "STALE, badged and
                 // BULK-selectable" one microsecond after. `isStale` is the key
-                // of the section's one-click "Select Stale (30d+)" button, so
+                // of the section's one-click "Select Stale" button, so
                 // its honesty is load-bearing.
                 //
                 // The same no-follow read (`leafDate` → `lstat`) and the SAME
@@ -1288,7 +1288,7 @@ struct EphemeralTempScanner: @unchecked Sendable {
                 originContainer: root.url, requestedTargetURL: entry
             ),
             // Never preselected. Note the opt-in is not strictly per entry:
-            // the section ships a "Select Stale (30d+)" button whose handler
+            // the section ships a "Select Stale" button whose handler
             // selects EVERY `isStale == true` selectable row in one click
             // (`ScannerItemSection.swift` → `CacheoutViewModel.selectStale`),
             // so `isStale` is a BULK-SELECTION KEY and its honesty is

@@ -1212,7 +1212,7 @@ final class EphemeralTempScannerTests: XCTestCase {
     // been re-verified since before the sizing walk. Nothing is deleted
     // autonomously — `defaultSelected: false`, `.review` risk, smart-clean
     // excluded — but `isStale` is the key of the section's one-click
-    // "Select Stale (30d+)" bulk selection, so a false one is one click from
+    // "Select Stale" bulk selection, so a false one is one click from
     // a deletion.
 
     /// The exact mirror of the fresh-FILE cell above, with a DIRECTORY landing

@@ -669,10 +669,19 @@ final class CLIGateTests: XCTestCase {
     /// minority orderings per 2000 scans of this exact fixture (0.85%), which
     /// predicts the ~1.7% two-scan disagreement rate observed.
     ///
-    /// Both halves PRE-DATE this PR (the cell and the sorting line are both at
-    /// merge base f7b2087, and `git diff f7b2087..HEAD` touches neither file),
-    /// so this is not a regression introduced here — it is a known flake being
-    /// closed rather than left undescribed.
+    /// Both halves PRE-DATE this PR: the cell and the sorting line are both
+    /// present verbatim at merge base f7b2087, so this is not a regression
+    /// introduced here — it is a known flake being closed rather than left
+    /// undescribed. (r4 correction of the sentence that stood here and of
+    /// fc006ab's commit body, which repeated it: both claimed `git diff
+    /// f7b2087..HEAD` "touches neither file" — false the moment it was
+    /// written, because fc006ab, the commit CARRYING the claim, is what
+    /// modified both files. Measured: `git diff --stat f7b2087..HEAD --
+    /// Sources/Cacheout/Scanner/CacheScanner.swift
+    /// Sources/Cacheout/CLIHandler.swift` → "2 files changed, 29
+    /// insertions(+), 3 deletions(-)", all of it fc006ab's own fix. The
+    /// pre-existence claim stands on the merge-base FILE CONTENTS, never on
+    /// an untouched diff.)
     ///
     /// The fixture is arranged so a single run is usually enough to catch a
     /// regression rather than needing luck: `empty_cat` sorts BEFORE

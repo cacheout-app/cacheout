@@ -388,7 +388,23 @@ struct ValuablesDisclosure: Equatable, Sendable {
     /// The BYTE length of the longest descendant path this walk composed
     /// under the subject's OWN spelling, reported only when at least one is
     /// longer than `ValuablesDetector.removablePathByteLimit`. `nil` means
-    /// every path this walk saw is one the cleaner's removal can name.
+    /// every path this walk saw is one a PATH-BASED API can name.
+    ///
+    /// IT NO LONGER DECIDES ANYTHING DESTRUCTIVE, and the sentence that used
+    /// to stand here ("longer than the cleaner's removal can name") is the
+    /// reason to say so explicitly. It was true while the cleaner deleted with
+    /// `FileManager.removeItem`, and `BuildArtifactsScanner` refused such trees
+    /// outright for it (PR #457 review r10). PR #458 replaced the permanent
+    /// remover with the descriptor-relative `DepthSafeRemoval`, and the Trash
+    /// arm was measured on the same fixtures — a real `FileManager.trashItem`
+    /// moves such a tree WHOLE, because an on-volume Trash move is a
+    /// `rename(2)` of the top directory. The gate is retired; this field's
+    /// consumer is now the row's SIZE CAVEAT.
+    ///
+    /// What it still reports is a real and useful fact, because the SIZER is
+    /// path-based: a tree carrying such a descendant cannot be fully measured,
+    /// so the byte figure on its row is a floor. That is what
+    /// `BuildArtifactsScanner.evidence(for:days:disclosure:)` says with it.
     ///
     /// NOT an incompleteness — the walk finished; it read the whole tree and
     /// found a FACT about it. Kept as its own field precisely so it can never
@@ -396,20 +412,20 @@ struct ValuablesDisclosure: Equatable, Sendable {
     /// re-walk sixteen times at doubled bounds, for a condition no bound can
     /// change) or into `.obstruction` (whose printed remedy is "re-scan",
     /// which cannot change it either). Its remedy is specific and it works:
-    /// shorten or restructure the tree.
+    /// shorten or restructure the tree, and the measurement completes.
     ///
-    /// FAIL-CLOSED ASYMMETRY, deliberate: a COMPLETE probe reporting `nil`
-    /// has PROVEN there is no such descendant, because a complete probe read
-    /// every entry. An INCOMPLETE probe reporting `nil` has proven nothing —
-    /// and needs to prove nothing, because an incomplete probe is already
-    /// tokenless on every surface and refused whole by the delete-time
-    /// revalidator.
+    /// ASYMMETRY, deliberate and now merely honest rather than fail-closed: a
+    /// COMPLETE probe reporting `nil` has PROVEN there is no such descendant,
+    /// because a complete probe read every entry. An INCOMPLETE probe
+    /// reporting `nil` has proven nothing — and needs to prove nothing,
+    /// because an incomplete probe is already tokenless on every surface and
+    /// refused whole by the delete-time revalidator.
     ///
     /// This field is NOT part of the acknowledgement-token preimage and must
     /// never become part of it: the token authorizes deletion of a tree whose
-    /// valuables the user acknowledged, and an over-long tree is refused
-    /// BEFORE any token is consulted. Adding it would rotate tokens for a
-    /// reason acknowledgement has nothing to do with.
+    /// valuables the user acknowledged, and a path length is not a valuable.
+    /// Adding it would rotate tokens for a reason acknowledgement has nothing
+    /// to do with.
     let overlongDescendantPathBytes: Int?
 
     /// Why a bounded inspection stopped short. The question that separates

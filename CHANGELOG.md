@@ -105,12 +105,13 @@ and docs/v1/CLI-REFERENCE.md) — the pre-release `node_modules` →
   blind to exactly the firmlink split it was meant to catch. The descriptor's
   own `f_fsid` is now the primary signal; the previous path-based signals are
   kept as an additional, refusal-only backstop.
-- **Known consequence.** The probe is now free of `PATH_MAX`: it can inspect
-  and certify a tree whose absolute paths exceed the limit, while
-  `FileManager.removeItem` — which the cleaner still uses — cannot address
-  one. Such a deletion fails with its own error rather than being silently
-  skipped; giving the deleter the same descriptor-relative treatment is
-  tracked separately.
+- **Resolved consequence.** The probe was made free of `PATH_MAX` — it can
+  inspect and certify a tree whose absolute paths exceed the limit — before
+  the deleter was, and while that gap existed the build-artifacts scanner
+  refused such trees outright so it could not offer a row that only
+  half-deleted. Both deletion routes now handle them (see "Build folders
+  nested deeper than the system path limit" under Fixed), and that refusal is
+  retired.
 - **Known residual.** `DirectorySizer` is still a path-based
   `FileManager.enumerator` walk, so an ancestor swap landing after the
   containment descent above can still redirect the SIZING of a build-artifact
@@ -120,6 +121,32 @@ and docs/v1/CLI-REFERENCE.md) — the pre-release `node_modules` →
   and cannot move the deletion target, which stays the unresolved spelling the
   cleaner re-admits and the revalidator re-proves. Converting the sizer is
   tracked separately.
+- **Known residual: content created in a folder Cacheout has already looked
+  inside can still be swept.** Every safety check that binds an OBJECT —
+  the held directory handles, the `..` re-anchors, the final identity
+  re-check — answers "is this the same folder?", and when an app ADDS
+  something (a `Documents` folder, say) to a folder that was already read,
+  the answer is correctly YES: nothing was renamed, nothing was replaced,
+  the folder has the same identity it always had. Identity says which object;
+  it says nothing about what is now inside it. So the inspection reports no
+  user data and no obstruction, and the entry can be moved to the Trash or
+  deleted permanently even though the new content was never looked at.
+  Retiring the depth cap WIDENED this: folders past the old limit used to
+  come back "couldn't finish inspecting" and were therefore never cleanable
+  automatically; they now come back clean, which is the point of the fix and
+  is also what exposes them. It needs a writer into `~/Library/Caches` whose
+  write lands between the pre-delete inspection reading that folder and the
+  deletion itself, on an entry already eligible for automatic cleaning. The
+  window is measured, not assumed: the tail from inspection to deletion is
+  ~0.5 ms and does not grow, but the folder read FIRST stays exposed for the
+  rest of the walk — ~23 µs per entry inspected, so ~20 ms on an 840-entry
+  tree and ~0.46 s projected on a 20,000-entry one. What limits the damage
+  today is that the app's default is Move to Trash, which destroys nothing
+  and is undone with one drag; a permanent delete has no such consolation.
+  Closing it properly means checking for user data DURING the removal — the
+  deletion already walks the tree by open handle and is the only step in a
+  position to refuse what it is about to unlink — and that is tracked
+  separately.
 
 ### Changed
 
@@ -189,6 +216,21 @@ and docs/v1/CLI-REFERENCE.md) — the pre-release `node_modules` →
   listed at review risk with "couldn't measure its size: part of it sits
   deeper than an absolute path can address — deleting it still works", and
   the bytes it frees are under-reported.
+- **Build folders nested deeper than the system path limit are listed again.**
+  They were withheld on purpose: while permanent deletion went through
+  `FileManager.removeItem`, such a folder could only ever be HALF deleted —
+  the removal unlinked what it reached and then failed (measured: 202 → 181
+  entries, and "0 bytes freed" reported to you) — so offering the row would
+  have offered something no route could finish. Deletion no longer works that
+  way. The permanent route traverses by open directory handle, and Move to
+  Trash — the default — is a rename of the top folder, measured on a real
+  over-limit tree: every entry arrived, nothing was left behind, nothing was
+  half-moved. Both routes remove it whole, so the row is offered again. What
+  is left is a MEASUREMENT limit, not a deletion one, and it is all the row
+  now claims: the size shown is a FLOOR, the row is listed at review risk and
+  never selected automatically, and it says so — "SIZE IS A FLOOR … deleting
+  it still removes it whole; shorten or move the tree … to see its full
+  size". Shorten the tree and it becomes an ordinary fully measured row.
 - **Orphaned-caches delete: a folder replaced after it was inspected is no
   longer deleted.** The pre-delete safety inspection holds the folder open,
   which is what stops it following a swap — and also what pins it to the

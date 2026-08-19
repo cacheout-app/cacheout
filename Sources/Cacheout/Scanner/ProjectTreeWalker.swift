@@ -606,11 +606,12 @@ struct ProjectTreeWalker {
         // carries is the sizer's own sentence naming the PATH-LENGTH cause
         // and the `PATH_MAX` limit — not the "file name is invalid" lie the
         // Cocoa error told. Nor does anything here authorize a deletion: a
-        // walk denial only ever produces a visible issue. The build-artifacts
-        // DELETION decision for an over-long tree is made independently and
-        // fail-closed from the descriptor-anchored probe's
-        // `overlongDescendantPathBytes` (scan-time `.denied` item + the
-        // delete-time revalidator's path-limit refusal).
+        // walk denial only ever produces a visible issue. Nor does the
+        // build-artifacts DELETION decision hang on it: an over-long tree is
+        // deleted whole by both disposal arms (`DepthSafeRemoval`; the Trash
+        // arm's top-level `rename(2)`), and the descriptor-anchored probe's
+        // `overlongDescendantPathBytes` now feeds the row's SIZE CAVEAT only
+        // — the refusal it used to drive was retired with its premise.
         case .metadata, .other, .unaddressablePath: kind = .unreadable
         }
         return ScanIssue(url: denial.url, kind: kind, detail: denial.detail)

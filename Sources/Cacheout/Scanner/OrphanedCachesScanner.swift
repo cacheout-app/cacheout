@@ -989,12 +989,15 @@ struct OrphanedCachesScanner: @unchecked Sendable {
     ///    pre-mount object, so the boundary surfaces on the NEXT scan, not
     ///    this one. Correct — we keep reading what we vetted — but worth
     ///    knowing.
-    /// 6. **New scan/delete drift.** This walk is now free of `PATH_MAX`
-    ///    while `FileManager.removeItem` (`CacheCleaner.swift`) is not, so
-    ///    the probe can certify a tree the deleter cannot address; the
-    ///    delete then fails with its own error. Fail-closed, but real — the
-    ///    proper fix is to give the deleter the same descriptor-relative
-    ///    treatment.
+    /// 6. **~~New scan/delete drift.~~ CLOSED.** This walk was made free of
+    ///    `PATH_MAX` while `FileManager.removeItem` was not, so the probe
+    ///    could certify a tree the deleter could not address. Both disposal
+    ///    arms now handle such trees: permanent deletion goes through
+    ///    `DepthSafeRemoval` (descriptor-relative, measured at depths
+    ///    446/600/2000/4000), and a Trash move is a `rename(2)` of the top
+    ///    directory (measured on a real over-limit tree). What is left is a
+    ///    MEASUREMENT gap, not a deletion one: `DirectorySizer` is still
+    ///    path-based, so such an entry's size is a floor.
     /// 7. **The DISCOVERY race is CLOSED, and the asymmetry that used to be
     ///    defended here is retired** (PR #458 review r11, thread
     ///    `PRRT_kwDORmg6_86ZmmYY`). A name that vanishes between `readdir`
@@ -1015,10 +1018,12 @@ struct OrphanedCachesScanner: @unchecked Sendable {
     ///    WHAT REMAINS, precisely and separately: content CREATED in a
     ///    directory after that directory was enumerated. No name vanished, no
     ///    identity changed, and the closing root re-bind cannot see it —
-    ///    inode identity is not content identity. Unclosable by the same
-    ///    means as (3) and tracked as its own finding; the compensating
-    ///    control is the delete-time re-probe, which re-reads every directory
-    ///    from scratch.
+    ///    inode identity is not content identity. The delete-time re-probe
+    ///    re-reads every directory from scratch, which is why an insertion
+    ///    before it is caught; an insertion INSIDE its own window is not.
+    ///    That is an ACCEPTED RESIDUAL with its window measured and its
+    ///    preconditions named, written up in full at the closing root re-bind
+    ///    in `userDataProbe` — read it before acting on this line.
     /// 8. **`DirectorySizer` (called from `sweepFacts`) is still a
     ///    path-based `FileManager.enumerator` walk.** An ancestor swapped
     ///    for a different REAL directory between this probe and the sizing
@@ -2125,6 +2130,80 @@ struct OrphanedCachesScanner: @unchecked Sendable {
         // the reason this is acceptable here and is not below the root,
         // where a two-`lstat` kind+identity pair really could admit a
         // swapped object (`probeChild` exists for exactly that).
+        // ═════════════════════════════════════════════════════════════════
+        // ACCEPTED RESIDUAL — THE INSERTION RACE (PR #458 review, thread
+        // `PRRT_kwDORmg6_86ZoCCT`). Accepted by the maintainer as a known
+        // residual and recorded here rather than fixed. It is NOT closed by
+        // anything below, and every identity binding in this file passes
+        // CORRECTLY while it is happening — which is the reason it needs
+        // writing down.
+        //
+        // WHAT IT IS. An INSERTION, not a swap. An app creates user-data-
+        // shaped content — say a `Documents` directory — in a directory that
+        // this walk has ALREADY enumerated. The walk root is never renamed,
+        // never replaced; the directory keeps the same inode. So the check
+        // immediately below compares the root's identity with itself, finds
+        // it unchanged, inserts no obstruction, and the probe returns with no
+        // match and no incompleteness. That verdict is what
+        // `automaticCleanEligible` reads, and the item can then be moved to
+        // the Trash or permanently deleted although the probe never looked at
+        // the new content.
+        //
+        // WHY NO CHECK HERE CATCHES IT, stated precisely so nobody reaches for
+        // a stronger identity proof as the fix: IDENTITY ANSWERS "WHICH
+        // OBJECT", NOT "WHAT IS INSIDE IT". The `fstat`/`lstat` pair below,
+        // the held parent descriptors, the `..` re-anchors and the child
+        // `fstatat`s all bind objects, and every one of them is telling the
+        // truth here — the object IS the one that was inspected. Contents
+        // changed underneath a correct answer to a different question.
+        // (Cf. the `WHAT THIS DOES NOT CLOSE` list, items 3 and 7.)
+        //
+        // RETIRING THE DEPTH CAP WIDENED IT, and that is this branch's own
+        // doing rather than an inherited condition. A tree past the old
+        // depth-3 cap used to yield an INCOMPLETE verdict, and an incomplete
+        // verdict is unauthorizable: no automatic clean, no token, refused at
+        // delete time. Those trees now yield CLEAN verdicts — which is the
+        // point of the retirement, and it is also what newly exposes them to
+        // this race. On the field machine that was ~20% of cache directories.
+        //
+        // PRECONDITIONS, all of which must hold together: a writer into
+        // `~/Library/Caches` (or into the entry being cleaned); its write
+        // landing inside the window between the delete-time probe reading the
+        // directory it writes into and the disposal; and an item the
+        // classifier already made `automaticCleanEligible`. An entry the user
+        // must select by hand narrows the last one but does not remove it.
+        //
+        // THE WINDOW, MEASURED rather than called narrow — through the
+        // production runtime and the production cleaner (`ProbeClock` harness
+        // over `probeChild`, timestamped against the disposal seam; the
+        // fixture is a `~/Library/Caches` entry of uniform breadth and depth):
+        //
+        //     entries read   last read → disposal      first read → disposal
+        //     84             502–588 µs (5 runs)       2.46–3.68 ms
+        //     840            523–588 µs (3 runs)       19.7–20.1 ms
+        //
+        // Two facts fall out. The TAIL — probe exit to destructive call — is
+        // ~0.5 ms and does not grow with the tree. The window for the
+        // directory read FIRST grows linearly with the entry count, at
+        // ~23 µs per entry, because it includes the rest of the walk; a
+        // 20,000-entry cache entry projects to ~0.46 s of exposure for its
+        // earliest-read directory. So this is not a syscall-width race.
+        //
+        // WHAT MITIGATES IT TODAY: the GUI's default disposal is Move to
+        // Trash (`CacheoutViewModel.moveToTrash = true`), which destroys
+        // nothing — wrongly-swept content is recoverable in one drag. The
+        // permanent arm has no such consolation, and the CLI's `--confirm`
+        // runs choose it explicitly.
+        //
+        // WHAT WOULD ACTUALLY CLOSE IT, so the next reader does not spend the
+        // effort on a stronger identity: BIND THE CONTENT CHECK TO THE
+        // DISPOSAL, not the identity. The deletion already holds the tree by
+        // descriptor (`DepthSafeRemoval`), and it is that traversal — the one
+        // that is about to unlink each directory — that is in a position to
+        // refuse when it meets a user-data shape. Re-probing a second time
+        // before the disposal only moves the window; checking during the
+        // removal removes it. That is a follow-up, not a rider on this PR.
+        // ═════════════════════════════════════════════════════════════════
         if let current = provider.identity(of: entryURL) {
             if current != root.identity { obstructions.insert(.transientFailure) }
         } else {

@@ -91,8 +91,8 @@ These actors provide thread-safe business logic:
 | Actor | Purpose | Key Methods |
 |-------|---------|-------------|
 | `CacheScanner` | Parallel category scanning (sizing delegated to `DirectorySizer`) | `scanAll()`, `scanCategory()` |
-| `BuildArtifactsScanner` | Project build-artifact discovery over the dev roots (a `SpaceScanner`; a value type, listed here beside its peers) | `scan(context:)`, `preDeleteRevalidator(provider:)` |
-| `EphemeralTempScanner` | Stale first-level entries in the three ephemeral temp roots (a `SpaceScanner`; a value type, listed here beside its peers). Runs on user-initiated scans only | `scan(context:)` |
+| `BuildArtifactsScanner` | Project build-artifact discovery over the dev roots (a `SpaceScanner`; a value type, listed here beside its peers) | `scan(context:)`, `preDeleteRevalidator` |
+| `EphemeralTempScanner` | Stale first-level entries in the three ephemeral temp roots (a `SpaceScanner`; a value type, listed here beside its peers). Runs on user-initiated scans only | `participates(in:)`, `scan(context:)`, `preDeleteRevalidator` |
 | `CacheCleaner` | Guarded deletion, freed-bytes accounting, logging | `clean(items:moveToTrash:)`, `runCleanCommand()` |
 | `InodeAccountingRegistry` | Per-operation claim-based freed-bytes settlement | `registerObservations(_:)`, `acceptSuccessful(_:)` |
 

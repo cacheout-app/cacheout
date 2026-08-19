@@ -567,9 +567,22 @@ protocol SpaceScanner: Sendable {
     var id: String { get }                       // stable slug, [a-z0-9_]+
     var displayName: String { get }
     var trustedContainerRoots: [URL] { get }     // declared at REGISTRATION
+    var preDeleteRevalidator: PreDeleteRevalidator? { get }  // default nil
+    func participates(in context: ScanContext) -> Bool       // default true
     func scan(context: ScanContext) async -> ScanOutcome
 }
 ```
+
+`preDeleteRevalidator` and `participates(in:)` carry protocol-extension
+defaults, so a scanner that wants neither implements neither.
+
+`participates(in:)` is how a scanner declines a whole session — never by
+returning an empty `ScanOutcome`, which asserts "I looked and there is nothing
+there" and makes the consumer replace the scanner's rows, issues and the user's
+selections. `SpaceScannerRuntime.scanValidatedSession` filters on it, so a
+declining scanner produces no task and no event at all: every caller of a
+session (the ViewModel, `CLIHandler.collectValidatedScan`, and any future one)
+gets the deferral without opting in.
 
 Adding a scanner = implement this + register with the runtime — nothing else:
 the runtime derives delete-time admission from registration. Conformers:
@@ -670,7 +683,9 @@ first-level entry, `risk: .review`, `defaultSelected: false`,
 |--------|-------------|
 | `registeredID` (static) | The scanner slug `ephemeral_tmp` — the CLI address prefix and the GUI section key |
 | `trustedContainerRoots` | The resolved roots in their ONE canonical spelling — what registration hands delete-time admission |
-| `scan(context:)` | Runs ONLY on `.userInitiated`; on `.automatic` it returns an empty outcome having enumerated nothing (no items, no issues). Ignores `categoryFilter` |
+| `participates(in:)` | Where the trigger policy lives: `true` only for `.userInitiated`. On `.automatic` the runtime leaves the scanner OUT of the session entirely — no task, no event, so previously displayed temp rows, their issues and the user's ticks all survive the refresh |
+| `scan(context:)` | Ignores `categoryFilter`. Repeats the trigger gate as defense in depth for a caller that constructs a scanner and bypasses the runtime; that arm returns an empty outcome, which is why it is a last resort and not the policy |
+| `preDeleteRevalidator` | Declared for EVERY temp item. Re-inspects the entry from one held descriptor immediately before deletion: it proves the object is the one the scan inspected (device+inode), refuses anything that is no longer a directory or regular file, re-checks staleness and the advisory lock, and re-checks ownership only under a `.worldWritable` root |
 | `EphemeralTempRoots.resolve(provider:confstrPath:)` | The closed 3-root declaration resolved to canonical URLs: `/private/tmp` plus the `confstr(3)` temp/cache containers, trailing slash normalized, canonicalized once, de-duped by inode identity. A failed lookup drops that root silently — never a hardcoded `/var/folders` guess |
 | `EphemeralTempSweepConfig` | Keys `cacheout.ephemeralTmp.ageDays` / `cacheout.ephemeralTmp.minSizeMB`, defaults 7 days / 10 MB, layered defaults → UserDefaults → CLI override; an invalid persisted value falls back WITHOUT being rewritten |
 

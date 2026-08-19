@@ -1049,6 +1049,59 @@ final class CacheoutViewModelTests: XCTestCase {
         XCTAssertEqual(viewModel.overcountCaveat, DiskSpaceCaveat.overcount)
     }
 
+    /// WHICH TOTALS A CROSS-SCANNER DUPLICATE INFLATES, and which it does not
+    /// (PR #459 review r2). There is NO cross-scanner de-duplication: a
+    /// directory that two registered scanners both recognise is published
+    /// twice, same bytes, different `ItemKey`s. The totals are KEY-based, so
+    /// ticking both copies counts the bytes twice — but only in the scopes
+    /// that span scanners.
+    ///
+    /// This cell exists to EARN the sentence `docs/v1/CATEGORIES.md` ships
+    /// about overlapping roots. Round 1's write-up said, unqualified, that
+    /// "the total double-counts"; that is false of the product's own
+    /// Reclaimable figure, which is category-scoped and counts these bytes
+    /// ZERO times.
+    @MainActor
+    func testACrossScannerDuplicateInflatesOnlyTheSelectedScopes() throws {
+        let runtime = try makeRuntime([])
+        let viewModel = CacheoutViewModel(runtime: runtime)
+        seed(viewModel, scanner: CategoryScanner.registeredID, items: [
+            aggregate(slug: "cat_a", state: .measured, exact: 4_096, items: 1,
+                      defaultSelected: false),
+        ])
+        // ONE directory, published by two per-item scanners with the same
+        // byte figure — the shape an overlapping root produces.
+        seed(viewModel, scanner: BuildArtifactsScanner.registeredID, items: [
+            perItem(scanner: BuildArtifactsScanner.registeredID,
+                    id: "dup", bytes: 12_000),
+        ])
+        seed(viewModel, scanner: EphemeralTempScanner.registeredID, items: [
+            perItem(scanner: EphemeralTempScanner.registeredID,
+                    id: "dup", bytes: 12_000),
+        ])
+        viewModel.toggleSelection(
+            for: key(BuildArtifactsScanner.registeredID, "dup")
+        )
+        viewModel.toggleSelection(
+            for: key(EphemeralTempScanner.registeredID, "dup")
+        )
+
+        XCTAssertEqual(viewModel.totalSelectedSize, 24_000,
+                       "scope 3 spans scanners and counts the bytes twice")
+        XCTAssertEqual(viewModel.totalCleanableSelectedSize, 24_000,
+                       "and so does the figure the confirmation sheet quotes")
+        XCTAssertEqual(
+            viewModel.selectedSize(forScanner: EphemeralTempScanner.registeredID),
+            12_000,
+            "each per-scanner section total counts its own copy once"
+        )
+        XCTAssertEqual(
+            viewModel.totalRecoverable, 4_096,
+            "and the product's Reclaimable figure is CATEGORY-scoped: it "
+                + "counts these bytes zero times, not twice"
+        )
+    }
+
     @MainActor
     func testMultiScannerTotalsSaturateInsteadOfTrapping() async throws {
         // Round 8: the runtime validator bounds every SINGLE outcome's

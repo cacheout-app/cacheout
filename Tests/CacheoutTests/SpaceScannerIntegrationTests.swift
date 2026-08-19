@@ -512,9 +512,14 @@ final class SpaceScannerIntegrationTests: XCTestCase {
     /// fixture tree sits several levels below; the fixture is also seconds
     /// old, so the 7-day age gate would emit nothing regardless. The
     /// cross-scanner listing question is therefore not answerable in this
-    /// file at all, and it is not answered anywhere in this one either:
-    /// `EphemeralTempRegistrationTests`' new
-    /// `testADevRootThatIsATempRootIsRefused…` cell is where it lives.
+    /// file at all. It is answered in `EphemeralTempRegistrationTests`, over
+    /// injected fixture roots, by `testTwoScannersOverOneRootPublishTheSame
+    /// DirectoryTwice` — which is the CHARACTERIZATION, not a refusal: there
+    /// is no cross-scanner de-duplication anywhere, and round 1's attempt to
+    /// create one at root granularity was reverted in review r2 (it discarded
+    /// the entire build-artifacts walk of the colliding root). The
+    /// `~/Library/Caches` instance of the same class is pinned there too, by
+    /// `testTwoScannersOverOneCachesRootPublishTheSameDirectoryTwice`.
     private func perItemScannerIDs(_ runtime: SpaceScannerRuntime) -> Set<String> {
         Set(runtime.scanners.map(\.id))
             .subtracting([

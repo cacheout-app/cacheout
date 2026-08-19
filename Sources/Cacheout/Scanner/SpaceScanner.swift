@@ -398,10 +398,17 @@ struct ReclaimableItem: Equatable, Sendable {
 
 // MARK: - Scan outcome & issues
 
-/// A classified, non-fatal root/scanner-level problem that produced NO item.
+/// A classified, non-fatal root- or scanner-level problem, reported ALONGSIDE
+/// whatever the scan did produce rather than on an item.
+///
 /// Two-surface rule (epic contract): impediments attributable to an emitted
-/// item ride the item's `state`/`scanError`; only root/scanner-level
-/// problems with no recognized candidate land here.
+/// item ride the item's `state`/`scanError`; only root/scanner-level problems
+/// with no recognized candidate land here.
+///
+/// It does NOT mean "produced no item", which is what this comment used to say
+/// (corrected PR #459 review r2): `.configInvalid` reports an unparsable
+/// persisted value while the resolution falls back to the seeds, and those
+/// seeds produce items in the very same outcome.
 struct ScanIssue: Equatable, Sendable {
     /// EXTENSIBLE taxonomy (proven by `malformedOutcome`) — never write
     /// consumers that assume the case list is closed. Generalizes the

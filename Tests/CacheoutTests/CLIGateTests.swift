@@ -2185,6 +2185,59 @@ final class CLIGateTests: XCTestCase {
         }
     }
 
+    /// AN EPHEMERAL TEMP ROOT IS A LEGAL `--dev-root` VALUE (PR #459 review
+    /// r2) — the seam where round 1's regression actually lived.
+    ///
+    /// `--dev-root` is a whole-set REPLACEMENT and this helper promotes ANY
+    /// `.containerRefused` in the resolution to INVALID_ARGUMENTS for the
+    /// entire invocation. Round 1 taught `DevRootsStore` to manufacture that
+    /// refusal for a path the shared policy admits, so
+    /// `--cli scan --dev-root /private/tmp` returned `{"ok": false, "code":
+    /// "INVALID_ARGUMENTS", … "Nothing was scanned."}` — every scanner, not
+    /// just `build_artifacts` — and a sibling `--dev-root ~/Documents` in the
+    /// same invocation died with it.
+    ///
+    /// The literal `/private/tmp` is deliberate: it is a CONSTANT member of
+    /// `EphemeralTempRoots.resolve()`, so this exercises an exact-root
+    /// collision with no machine-specific value. `devRootsOverride`
+    /// constructs its own `DevRootsStore` with no temp-root seam, so a
+    /// fixture subdirectory would be NESTED rather than equal and would stay
+    /// green if a store-level refusal re-landed. This goes red.
+    func testAnEphemeralTempRootIsALegalDevRootValue() throws {
+        let documents = fixtureHome.appendingPathComponent("Documents")
+        try fm.createDirectory(at: documents, withIntermediateDirectories: true)
+
+        switch CLIHandler.devRootsOverride(
+            from: ["/private/tmp"], occurrences: 1, home: fixtureHome
+        ) {
+        case .failure(let error):
+            XCTFail("/private/tmp is a legal dev root: \(error.message)")
+        case .success(let resolution):
+            XCTAssertEqual(
+                resolution?.keptRoots.map(\.path), ["/private/tmp"],
+                "the root is kept and will be walked"
+            )
+            XCTAssertEqual(resolution?.issues.count, 0,
+                           "\(resolution?.issues ?? [])")
+        }
+
+        // AND IT DOES NOT TAKE ITS SIBLINGS DOWN WITH IT: the promotion is
+        // whole-invocation, so one manufactured refusal killed every other
+        // root in the same command line.
+        switch CLIHandler.devRootsOverride(
+            from: [documents.path, "/private/tmp"],
+            occurrences: 2, home: fixtureHome
+        ) {
+        case .failure(let error):
+            XCTFail("neither root may be refused: \(error.message)")
+        case .success(let resolution):
+            XCTAssertEqual(
+                resolution?.keptRoots.map(\.path),
+                [documents.path, "/private/tmp"]
+            )
+        }
+    }
+
     /// REPLACEMENT semantics (R8): the flag's values are the WHOLE effective
     /// set — the persisted list and its seeds are not consulted, nothing is
     /// written — with exact-canonical-duplicate dedupe (declared spellings

@@ -431,6 +431,13 @@ final class DocumentedContractTests: XCTestCase {
     /// rule must name every NON-filesystem kind.
     func testDocumentedScannerErrorKindsCoverTheWireTaxonomy() throws {
         let text = try protocolDoc()
+        // HAND-MAINTAINED, not `CaseIterable` (noted PR #459 review r2):
+        // `ScanIssue.Kind` carries associated-value-free cases but does not
+        // conform, so a kind added without touching THIS array ships
+        // undocumented with a green suite. Extend both together. The
+        // documented taxonomy is EXTENSIBLE by contract — that is about
+        // CONSUMERS tolerating unknown kinds, not about this list being
+        // allowed to lag.
         let allKinds: [ScanIssue.Kind] = [
             .containerRefused, .symlinkRoot, .tccDenied, .permissionDenied,
             .unreadable, .configInvalid, .malformedOutcome,

@@ -672,6 +672,33 @@ final class EphemeralTempRegistrationTests: XCTestCase {
         )
     }
 
+    /// AND THE REAL STORE KEEPS IT (PR #459 review r2). The cell above proves
+    /// the two policies do not conflict; this one proves the SHIPPED
+    /// resolution actually keeps the path, through a `DevRootsStore` with NO
+    /// seam injected — there is no temp-root seam left to inject, which is
+    /// half the point of the revert.
+    ///
+    /// `/private/tmp` is a CONSTANT member of `EphemeralTempRoots.resolve()`
+    /// (not confstr-derived), so this needs no machine-specific value and
+    /// reads no real `$HOME`; the fixture home is the resolution's home. It
+    /// goes RED the moment any store-level overlap refusal returns.
+    func testTheRealStoreKeepsPrivateTmpAsADeclaredDevRoot() throws {
+        let suite = try makeSuite()
+        let declared = URL(fileURLWithPath: "/private/tmp")
+
+        let resolution = DevRootsStore(defaults: suite)
+            .effectiveRoots(replacing: [declared], home: fixtureHome)
+
+        XCTAssertEqual(
+            resolution.keptRoots.map(\.path), [declared.path],
+            "the shipped resolution keeps it: \(resolution.keptRoots)"
+        )
+        XCTAssertTrue(
+            resolution.issues.isEmpty,
+            "and raises no issue about it: \(resolution.issues)"
+        )
+    }
+
     /// A stale, >floor Python venv as a FIRST-LEVEL entry of the fixture temp
     /// root — the one shape both scanners claim: `markerInside("pyvenv.cfg")`
     /// matches the walked directory itself at depth 1, which is exactly the
@@ -726,11 +753,16 @@ final class EphemeralTempRegistrationTests: XCTestCase {
     /// only, so nothing else in the stack notices.
     ///
     /// This cell does NOT go through `DevRootsStore`, deliberately: it is the
-    /// standing property the overlap refusal below narrows but does not
-    /// remove. A dev root NESTED inside a temp root
-    /// (`--dev-root /private/tmp/claude-501`) still reaches exactly this
-    /// state, as does a dev root inside `~/Library/Caches` — the pre-existing
-    /// accepted class D7 documents, and neither is covered by any rule.
+    /// STANDING property, and nothing anywhere narrows it (PR #459 review r2 —
+    /// round 1's overlap refusal, which this comment used to point at, is
+    /// reverted; it destroyed the whole build-artifacts walk of the colliding
+    /// root and aborted the CLI invocation to suppress one duplicated row).
+    /// Every route reaches exactly this state: a dev root that IS a temp root,
+    /// a dev root NESTED inside one (`--dev-root /private/tmp/claude-501`),
+    /// and a dev root inside `~/Library/Caches`. The pre-existing accepted
+    /// class D7 documents, characterized for the caches instance in
+    /// `testTwoScannersOverOneCachesRootPublishTheSameDirectoryTwice` below
+    /// and written up in `docs/v1/CATEGORIES.md`.
     func testTwoScannersOverOneRootPublishTheSameDirectoryTwice() async throws {
         let venv = try stageFirstLevelVenv()
         let shared = canonical(tempRoot)
@@ -759,54 +791,106 @@ final class EphemeralTempRegistrationTests: XCTestCase {
                         + "double-counted: \(found.bytes)")
     }
 
-    /// THE REFUSAL. `DevRootsStore` drops a dev root that IS a temp root,
-    /// visibly, so the exact collision above is unreachable through
-    /// configuration — the directory is then listed by `ephemeral_tmp` alone.
+    /// A DEV ROOT THAT IS A TEMP ROOT IS ACCEPTED (PR #459 review r2 — this
+    /// cell replaces round 1's `testADevRootThatIsATempRootIsRefused…`).
     ///
-    /// Everything is INJECTED: the "temp root" is the fixture directory,
-    /// handed to `DevRootsStore` through its `ephemeralTempRoots` seam, so no
-    /// real temp root is read or walked.
-    func testADevRootThatIsATempRootIsRefusedSoNothingIsListedTwice() async throws {
-        let venv = try stageFirstLevelVenv()
+    /// Round 1 answered a DISCLOSURE defect — one directory listed twice —
+    /// with a root-granular refusal, and the trade was measured catastrophic:
+    /// `--dev-root /private/tmp` returned `{"ok": false, "code":
+    /// "INVALID_ARGUMENTS", … "Nothing was scanned."}` for the WHOLE
+    /// invocation, and the persisted/Settings route silently discarded the
+    /// entire depth-8 build-artifacts walk beneath the root. `ephemeral_tmp`
+    /// is no substitute for it: it lists FIRST-LEVEL entries only, at or above
+    /// a size floor, and only when both staleness halves pass.
+    ///
+    /// So the load-bearing assertion is the SECOND one. Round 1's cell only
+    /// checked the first-level venv, which is precisely the entry both
+    /// scanners claim — that is why it could stay green while everything
+    /// deeper vanished. This cell stages a tree BELOW first level and asserts
+    /// it is still listed, which goes red the moment any root-level refusal
+    /// returns.
+    func testADevRootThatIsATempRootIsAcceptedAndItsDeeperTreesStayListed()
+        async throws {
+        try stageFirstLevelVenv()
+        // BELOW first level, and fresh: invisible to `ephemeral_tmp` on both
+        // counts, so `build_artifacts` is the only scanner that can list it.
+        let project = tempRoot.appendingPathComponent("proj")
+        let modules = project.appendingPathComponent("node_modules")
+        try fm.createDirectory(at: modules, withIntermediateDirectories: true)
+        try Data().write(to: project.appendingPathComponent("package.json"))
+        try Data(repeating: 0x42, count: 2_000_000).write(
+            to: modules.appendingPathComponent("big.bin")
+        )
+
         let declared = canonical(tempRoot)
         let suite = try makeSuite()
-        let store = DevRootsStore(
-            defaults: suite,
-            ephemeralTempRoots: { [declared] }
-        )
+        let resolution = DevRootsStore(defaults: suite)
+            .effectiveRoots(replacing: [declared], home: fixtureHome)
 
-        let resolution = store.effectiveRoots(
-            replacing: [declared], home: fixtureHome
-        )
+        XCTAssertEqual(resolution.keptRoots.map(\.path), [declared.path],
+                       "the root is walked: \(resolution.keptRoots)")
+        XCTAssertTrue(resolution.issues.isEmpty, "\(resolution.issues)")
 
-        XCTAssertTrue(
-            resolution.keptRoots.isEmpty,
-            "a dev root that IS a temp root is refused: \(resolution.keptRoots)"
-        )
-        XCTAssertEqual(resolution.issues.count, 1, "\(resolution.issues)")
-        XCTAssertEqual(resolution.issues.first?.kind, .containerRefused,
-                       "visible, never a silent drop (R16)")
-        XCTAssertEqual(resolution.issues.first?.url?.path, declared.path)
-        XCTAssertTrue(
-            resolution.issues.first?.detail
-                .contains("ephemeral temp root") == true,
-            "\(resolution.issues.first?.detail ?? "no issue")"
-        )
-
-        // AND THE CONSEQUENCE, through the real runtime and the real
-        // validator: with the refused root the build-artifacts scanner has
-        // nothing to walk, so the venv is listed ONCE.
         let runtime = try makeRuntime([
             BuildArtifactsScanner(home: fixtureHome, devRoots: resolution),
             makeScanner(),
         ])
+        let deep = try await listedBy(
+            runtime,
+            path: FileSystemIdentityProvider()
+                .resolveTargetKeepingLeaf(canonical(modules)).path
+        )
+        XCTAssertEqual(
+            deep.scanners, [BuildArtifactsScanner.registeredID],
+            "a tree below first level is listed by build_artifacts and by "
+                + "NOBODY else — a root-level refusal would lose it entirely"
+        )
+    }
+
+    /// THE SAME OVERLAP, PRE-EXISTING AND OLDER THAN fn-6 (PR #459 review r2).
+    ///
+    /// `~/Library/Caches` is an admissible dev root (the shared policy refuses
+    /// only `/`, volume roots/mount points and `$HOME`) and it is the
+    /// orphaned-caches sweep's own root, so a dev root configured there
+    /// publishes the same directory under `build_artifacts` AND
+    /// `orphaned_caches`. Pinned here so the class is not misattributed to
+    /// fn-6: there is no cross-scanner de-duplication anywhere, and the temp
+    /// instance is one instance of that, not a new defect.
+    func testTwoScannersOverOneCachesRootPublishTheSameDirectoryTwice()
+        async throws {
+        let caches = base.appendingPathComponent("Caches")
+        let bundle = caches.appendingPathComponent("com.fixture.stale")
+        try fm.createDirectory(
+            at: bundle.appendingPathComponent("lib"),
+            withIntermediateDirectories: true
+        )
+        try Data().write(to: bundle.appendingPathComponent("pyvenv.cfg"))
+        try Data(repeating: 0x41, count: 12_000_000).write(
+            to: bundle.appendingPathComponent("lib/big.bin")
+        )
+        try backdate(bundle, to: Date().addingTimeInterval(-120 * 86_400))
+
+        let shared = canonical(caches)
+        let runtime = try makeRuntime([
+            BuildArtifactsScanner(
+                home: fixtureHome,
+                devRoots: DevRootsResolution(keptRoots: [shared], issues: [])
+            ),
+            OrphanedCachesScanner(home: fixtureHome, cachesRoot: shared),
+        ])
+
         let found = try await listedBy(
             runtime,
             path: FileSystemIdentityProvider()
-                .resolveTargetKeepingLeaf(canonical(venv)).path
+                .resolveTargetKeepingLeaf(canonical(bundle)).path
         )
-        XCTAssertEqual(found.scanners, [EphemeralTempScanner.registeredID],
-                       "exactly one scanner lists the directory")
+
+        XCTAssertEqual(
+            found.scanners,
+            [BuildArtifactsScanner.registeredID,
+             OrphanedCachesScanner.registeredID],
+            "the overlap class predates fn-6 and is not temp-specific"
+        )
     }
 
     // MARK: - PR #459 review r1: a deferral must not erase what is displayed

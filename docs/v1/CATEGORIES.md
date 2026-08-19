@@ -360,17 +360,40 @@ symlink-alias spellings alike; protected children such as `~/Documents`
 remain legal.
 
 An **ephemeral temp root** (`/private/tmp`, or the per-user `…/T` and `…/C`
-containers) is also refused as a dev root, in either spelling, with a visible
-"configured dev root refused" issue. The `ephemeral_tmp` scanner already lists
-first-level entries there; registering the same directory as a dev root too
-would list and count the same directories under two scanners at once.
+containers) is a legal dev root, and so is any directory inside one. Cacheout
+does **not** de-duplicate findings across scanners: a directory two registered
+scanners both recognise is listed twice — once per scanner, same path and same
+byte figure, different item ids.
 
-There is no cross-scanner de-duplication in general, so a dev root configured
-*inside* one of those locations — or inside `~/Library/Caches`, which the
-orphaned-caches sweep owns — still overlaps: the same bytes can appear in two
-sections and be counted twice in the total, and cleaning the outer item first
-makes the inner one report a "no longer there" error. Only the exact-same-root
-case is refused.
+Where that can happen: a dev root that IS a temp root, a dev root nested
+inside one (`build_artifacts` and `ephemeral_tmp`), and a dev root in or under
+`~/Library/Caches`, which the orphaned-caches sweep owns (`build_artifacts`
+and `orphaned_caches`). Each root is walked independently in every case; none
+of them is refused.
+
+The two sets overlap narrowly, because the directory must satisfy BOTH
+scanners' rules at once. Under a temp root, `build_artifacts` walks to its
+full 8-level depth budget with no age gate and no size floor, while
+`ephemeral_tmp` lists only that root's FIRST-LEVEL entries that are at least
+10 MB and whose own timestamp and newest content are both older than 7 days.
+The one artifact shape that can match a first-level entry without needing a
+sibling marker in the root itself is a Python venv (`pyvenv.cfg` inside), so
+in practice that is what shows up twice.
+
+What the duplication does and does not affect:
+
+- The **Reclaimable** figure is category-scoped and does not count per-item
+  scanner bytes at all, so it is unaffected.
+- The **selected-size** figure — including the one the clean confirmation
+  quotes — spans scanners, so ticking both copies counts the bytes twice.
+  Each per-scanner section total counts its own copy once.
+- **Cleaning is not doubled.** Selecting both copies deletes the directory
+  once; the second row is refused by its scanner's delete-time re-check
+  (the folder it was bound to is gone) with nothing removed and nothing
+  reported freed, and the cleanup report's freed total counts the bytes once.
+- **Cleaning by address is unaffected**: `clean build_artifacts:<id>` runs
+  only that scanner, so the duplicate pair is reachable on the clean path
+  only if you pass both addresses in one invocation.
 
 ### Scanning Behavior
 

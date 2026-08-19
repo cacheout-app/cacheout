@@ -1048,6 +1048,7 @@ final class CLIGateTests: XCTestCase {
             (.symlinkRoot, "symlink_root"),
             (.permissionDenied, "permission_denied"),
             (.unreadable, "unreadable"),
+            (.enumerationTruncated, "enumeration_truncated"),
         ]
         for (kind, wire) in filesystemKinds {
             let row = CLIHandler.scannerErrorRowJSON(

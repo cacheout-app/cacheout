@@ -80,8 +80,8 @@
 /// - **W1** pre-filter lstat → pre-filter walk;
 /// - **W2** the sizer's own `probeKind` → its path-based enumerator open, plus
 ///   Foundation's per-level descent (deep enumeration descends BY PATH);
-/// - **W3** the root-level `probeKind` gate → `contentsOfDirectory` listing —
-///   the roots themselves are same-user-replaceable.
+/// - **W3** the root-level `probeKind` gate → the bounded `readdir` root
+///   listing — the roots themselves are same-user-replaceable.
 ///
 /// What a swap landing inside these can and cannot do (PR #459 review r4 —
 /// the previous census said "never deletion" of a same-kind swap, which was
@@ -192,6 +192,25 @@ struct EphemeralTempScanner: @unchecked Sendable {
     /// scanner useless exactly where it exists to help.
     static let defaultPrefilterEntryLimit = 20_000
 
+    /// PRODUCTION cap on the first-level ROOT listing (PR #459 review r4,
+    /// codex C3 — AVAILABILITY). `/private/tmp` is world-writable, so any
+    /// local user controls this population, and the eager
+    /// `contentsOfDirectory` listing plus the per-name sort ran as ONE
+    /// uninterruptible synchronous stretch on the scan's cooperative-pool
+    /// worker — measured on a staged ~494k-entry root this session: 6.8 s
+    /// list + 16.4 s sort, transient RSS 5.7 MB → 8.24 GB, with no
+    /// cancellation point anywhere inside. The bounded `readdir` read at
+    /// this cap on the SAME root: 99 ms, +2 MB. Real machines measured
+    /// 14/213/401 first-level entries across the three roots, so the cap is
+    /// ~50× the largest observed population. A cap hit is DISCLOSED as a
+    /// root-level issue, and it is NOT a deterministic strand: it gates only
+    /// the VISIBILITY of never-listed entries (never the deletion of an
+    /// emitted item), and cleaning the listed items itself shrinks the
+    /// population, so repeated scan+clean cycles genuinely converge below
+    /// the cap — unlike the orphaned-caches fixed depth cap, a retry here
+    /// CAN differ.
+    static let defaultRootEntryLimit = 20_000
+
     // MARK: - Seams
 
     /// The cooperative candidate-lock probe's outcome (epic D2 revised).
@@ -227,7 +246,15 @@ struct EphemeralTempScanner: @unchecked Sendable {
     /// ASSERTABLE, and so the chain-bearing denial class (a Cocoa error
     /// wrapping a POSIX one) can be exercised — a real single-uid fixture can
     /// produce a chain-EACCES throw but never a chain-EPERM one.
-    typealias DirectoryLister = @Sendable (URL) throws -> [URL]
+    ///
+    /// The shape is BOUNDED BY CONSTRUCTION (PR #459 review r4, codex C3):
+    /// the previous `(URL) throws -> [URL]` return type forced every
+    /// implementation — injected or production — to materialize the full
+    /// array before the scanner saw one entry. Basenames and a truncation
+    /// flag, never URLs: the scan rebuilds each entry under the DECLARED
+    /// canonical root spelling anyway.
+    typealias DirectoryLister =
+        @Sendable (URL, Int) throws -> (names: [String], truncated: Bool)
 
     /// Injection seam for stage-2 sizing. Carries the MODE so a test can
     /// assert what production passes (`.deletionTarget`), and gives the
@@ -254,6 +281,8 @@ struct EphemeralTempScanner: @unchecked Sendable {
     private let pathGuard: PathGuard
     private let sizer: DirectorySizer
     private let prefilterEntryLimit: Int
+    /// Cap on the first-level root listing (see `defaultRootEntryLimit`).
+    private let rootEntryLimit: Int
     /// Injected clock — a PROVIDER, not a `Date`: the scanner is long-lived
     /// and each scan dates content against its own "now".
     private let now: @Sendable () -> Date
@@ -270,6 +299,7 @@ struct EphemeralTempScanner: @unchecked Sendable {
         provider: FileSystemIdentityProvider = FileSystemIdentityProvider(),
         prefilterEntryLimit: Int =
             EphemeralTempScanner.defaultPrefilterEntryLimit,
+        rootEntryLimit: Int = EphemeralTempScanner.defaultRootEntryLimit,
         now: @escaping @Sendable () -> Date = { Date() },
         // Closure literals, not bare static-function references: a static
         // `func` value is not inferred `@Sendable`, and the warning it raises
@@ -278,7 +308,7 @@ struct EphemeralTempScanner: @unchecked Sendable {
             EphemeralTempScanner.cooperativeLockProbe($0)
         },
         listDirectory: @escaping DirectoryLister = {
-            try EphemeralTempScanner.firstLevelEntries(of: $0)
+            try EphemeralTempScanner.boundedFirstLevelNames(of: $0, limit: $1)
         },
         candidateSizer: CandidateSizer? = nil
     ) {
@@ -291,15 +321,49 @@ struct EphemeralTempScanner: @unchecked Sendable {
         )
         self.sizer = DirectorySizer(provider: provider)
         self.prefilterEntryLimit = prefilterEntryLimit
+        self.rootEntryLimit = rootEntryLimit
         self.now = now
         self.lockProbe = lockProbe
         self.listDirectory = listDirectory
         self.candidateSizer = candidateSizer
     }
 
-    /// The PRODUCTION first-level listing: `options: []` deliberately — never
-    /// `.skipsHiddenFiles`, because dotfile scratch directories are real
-    /// payload (the sweep-scanner lesson: a hidden-file skip hid a 23G class).
+    /// The PRODUCTION first-level listing — BOUNDED (PR #459 review r4, codex
+    /// C3): a `readdir` loop that stops at `limit`, never the eager
+    /// `contentsOfDirectory` (both of its overloads materialize the WHOLE
+    /// directory before any cap can apply — `boundedChildNames`'s own trap
+    /// note; measured this session on a staged ~494k-entry root, the eager
+    /// list + sort ran 6.8 s + 16.4 s uninterruptible with an 8.24 GB
+    /// transient RSS, while this read at the 20,000 cap returned in 99 ms
+    /// holding +2 MB). `readdir` skips nothing, preserving the retired
+    /// listing's `options: []` semantics — dotfile scratch directories are
+    /// real payload (the sweep-scanner lesson: a hidden-file skip hid a 23G
+    /// class).
+    ///
+    /// The FAILURE arm re-asks through `firstLevelEntries` to harvest the
+    /// chain-bearing Cocoa error the class-(a) denial classification needs —
+    /// a raw `opendir` errno is class (b) and may not claim TCC. That call
+    /// fails AT OPEN, before materializing anything, so the eager path stays
+    /// unreachable on the success path; the one way through it is the
+    /// open-failed-then-cleared race, where success means the materialization
+    /// already happened and the cap is applied to what it returned.
+    static func boundedFirstLevelNames(
+        of root: URL, limit: Int
+    ) throws -> (names: [String], truncated: Bool) {
+        switch boundedChildNames(of: root, limit: limit) {
+        case .names(let names, let truncated):
+            return (names, truncated)
+        case .failed:
+            let children = try firstLevelEntries(of: root)
+            let names = children.map(\.lastPathComponent)
+            guard names.count > limit else { return (names, false) }
+            return (Array(names.prefix(limit)), true)
+        }
+    }
+
+    /// The CHAIN-ERROR HARVEST arm of `boundedFirstLevelNames`, and nothing
+    /// else (PR #459 review r4 — this WAS the production listing, and its
+    /// unbounded eager materialization is why it no longer is).
     static func firstLevelEntries(of root: URL) throws -> [URL] {
         try FileManager.default.contentsOfDirectory(
             at: root, includingPropertiesForKeys: nil, options: []
@@ -432,9 +496,9 @@ struct EphemeralTempScanner: @unchecked Sendable {
                 continue
             }
 
-            let children: [URL]
+            let listing: (names: [String], truncated: Bool)
             do {
-                children = try listDirectory(root.url)
+                listing = try listDirectory(root.url, rootEntryLimit)
             } catch {
                 // A root that lstats as a directory but refuses enumeration
                 // is a classified, VISIBLE issue — never empty-looking
@@ -445,16 +509,42 @@ struct EphemeralTempScanner: @unchecked Sendable {
                 continue
             }
 
-            for child in children.sorted(by: {
-                $0.lastPathComponent < $1.lastPathComponent
+            // A truncated listing is DISCLOSED, never silent (the silent
+            // half would be a bounded cousin of the TCC-silent-zero class).
+            // Not a strand: the cap gates only the VISIBILITY of never-listed
+            // entries — no emitted item's deletion ever waits on it — and
+            // temp populations churn by design, so cleaning the listed items
+            // itself lets a later scan see further. The wording states that
+            // FACT and never promises a bare "re-scan and retry" (the
+            // deterministic-bound lesson: promise a retry only where a retry
+            // can differ, and say WHY it can).
+            if listing.truncated {
+                let detail = listing.names.count == rootEntryLimit
+                    ? "\(root.label) holds more than \(rootEntryLimit) "
+                        + "first-level entries — only the first "
+                        + "\(rootEntryLimit) the directory returned were "
+                        + "inspected; clearing entries, including cleaning "
+                        + "the items listed here, lets a later scan see the "
+                        + "rest"
+                    : "\(root.label) could not be enumerated completely — "
+                        + "only \(listing.names.count) first-level entries "
+                        + "were readable; what follows covers those"
+                issues.append(ScanIssue(
+                    url: root.url, kind: .enumerationTruncated, detail: detail
+                ))
+            }
+
+            // utf8-lexicographic, the same comparator the pre-filter walk
+            // uses — never the locale-collating String `<`, whose cost on an
+            // adversarial population was the measured 16 s sort tail.
+            for name in listing.names.sorted(by: {
+                $0.utf8.lexicographicallyPrecedes($1.utf8)
             }) {
                 if Task.isCancelled { break }
-                // Rebuild under the DECLARED canonical root: the enumeration's
-                // own URLs carry Foundation's resolution of the directory
-                // argument, and identity/display/deletion must all speak the
-                // root spelling this scanner declared.
-                let entry = root.url
-                    .appendingPathComponent(child.lastPathComponent)
+                // Build under the DECLARED canonical root: the listing hands
+                // back bare basenames, and identity/display/deletion must all
+                // speak the root spelling this scanner declared.
+                let entry = root.url.appendingPathComponent(name)
 
                 // (1) KIND DISPATCH, no-follow.
                 let kind: FileSystemIdentityProvider.FileKind

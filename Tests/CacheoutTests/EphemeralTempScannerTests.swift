@@ -156,6 +156,7 @@ final class EphemeralTempScannerTests: XCTestCase {
         thresholds: EphemeralTempSweepConfig.Thresholds? = nil,
         prefilterEntryLimit: Int =
             EphemeralTempScanner.defaultPrefilterEntryLimit,
+        rootEntryLimit: Int = EphemeralTempScanner.defaultRootEntryLimit,
         lockProbe: EphemeralTempScanner.LockProber? = nil,
         listDirectory: EphemeralTempScanner.DirectoryLister? = nil,
         candidateSizer: EphemeralTempScanner.CandidateSizer? = nil
@@ -167,10 +168,13 @@ final class EphemeralTempScannerTests: XCTestCase {
             thresholds: thresholds ?? self.thresholds,
             provider: provider,
             prefilterEntryLimit: prefilterEntryLimit,
+            rootEntryLimit: rootEntryLimit,
             now: { clock },
             lockProbe: lockProbe ?? { EphemeralTempScanner.cooperativeLockProbe($0) },
             listDirectory: listDirectory ?? {
-                try EphemeralTempScanner.firstLevelEntries(of: $0)
+                try EphemeralTempScanner.boundedFirstLevelNames(
+                    of: $0, limit: $1
+                )
             },
             candidateSizer: candidateSizer
         )
@@ -239,10 +243,14 @@ final class EphemeralTempScannerTests: XCTestCase {
         private(set) var listed: [URL] = []
         var stubError: Error?
 
-        func list(_ url: URL) throws -> [URL] {
+        func list(
+            _ url: URL, _ limit: Int
+        ) throws -> (names: [String], truncated: Bool) {
             listed.append(url)
             if let stubError { throw stubError }
-            return try EphemeralTempScanner.firstLevelEntries(of: url)
+            return try EphemeralTempScanner.boundedFirstLevelNames(
+                of: url, limit: limit
+            )
         }
     }
 
@@ -983,7 +991,7 @@ final class EphemeralTempScannerTests: XCTestCase {
 
         let outcome = await scan(makeScanner(
             roots: [sharedRoot()],
-            listDirectory: { [lister] url in try lister.list(url) }
+            listDirectory: { [lister] url, limit in try lister.list(url, limit) }
         ))
 
         XCTAssertEqual(outcome.errors.count, 1)
@@ -1003,7 +1011,7 @@ final class EphemeralTempScannerTests: XCTestCase {
 
         let outcome = await scan(makeScanner(
             roots: [sharedRoot()],
-            listDirectory: { [lister] url in try lister.list(url) }
+            listDirectory: { [lister] url, limit in try lister.list(url, limit) }
         ))
 
         XCTAssertEqual(outcome.errors.first?.kind, .permissionDenied)
@@ -1058,7 +1066,7 @@ final class EphemeralTempScannerTests: XCTestCase {
         let outcome = await scan(
             makeScanner(
                 roots: [sharedRoot(), userRoot()],
-                listDirectory: { [lister] url in try lister.list(url) },
+                listDirectory: { [lister] url, limit in try lister.list(url, limit) },
                 candidateSizer: { [spy] url, mode in spy.measure(url, mode) }
             ),
             trigger: .automatic
@@ -1079,7 +1087,7 @@ final class EphemeralTempScannerTests: XCTestCase {
 
         let outcome = await scan(makeScanner(
             roots: [sharedRoot(), userRoot()],
-            listDirectory: { [lister] url in try lister.list(url) }
+            listDirectory: { [lister] url, limit in try lister.list(url, limit) }
         ))
 
         XCTAssertEqual(
@@ -1636,6 +1644,89 @@ final class EphemeralTempScannerTests: XCTestCase {
                        "a silent zero for a denied root is the TCC-silent-zero "
                         + "defect class")
         XCTAssertEqual(issue.url?.path, canonical(sharedRootURL).path)
+    }
+
+    /// THE ROOT LISTING IS BOUNDED, AND A CAP HIT IS DISCLOSED (PR #459
+    /// review r4, codex C3 — AVAILABILITY). No lister is injected: the
+    /// PRODUCTION bounded read runs, per the house doctrine that injecting a
+    /// fixture past a seam does not evidence the seam's production default.
+    /// The eager listing this replaces materialized a world-writable root's
+    /// ENTIRE population in one uninterruptible stretch (measured: 6.8 s
+    /// list + 16.4 s sort and an 8.2 GB transient RSS on a staged
+    /// ~494k-entry root).
+    func testRootListingIsBoundedAndTruncationIsAVisibleIssue() async throws {
+        for name in ["cap-a", "cap-b", "cap-c", "cap-d", "cap-e"] {
+            try makeStaleCandidate(name, under: sharedRootURL)
+        }
+
+        let scanner = makeScanner(roots: [sharedRoot()], rootEntryLimit: 3)
+        let outcome = await scan(scanner)
+        try assertValidates(outcome, scanner: scanner)
+
+        XCTAssertEqual(outcome.items.count, 3,
+                       "exactly the capped subset is inspected: "
+                        + "\(outcome.items.map(\.displayName))")
+        XCTAssertEqual(outcome.errors.count, 1)
+        let issue = try XCTUnwrap(outcome.errors.first)
+        XCTAssertEqual(issue.kind, .enumerationTruncated)
+        XCTAssertEqual(issue.kind.wireString, "enumeration_truncated",
+                       "frozen wire string")
+        XCTAssertEqual(issue.url?.path, canonical(sharedRootURL).path)
+        // Pinned VERBATIM: the wording states the convergence FACT (cleaning
+        // shrinks the population) and never promises a bare "re-scan and
+        // retry" — a promise is only honest where a retry can differ, and
+        // this sentence says why it can.
+        XCTAssertEqual(
+            issue.detail,
+            "Shared temp holds more than 3 first-level entries — only the "
+                + "first 3 the directory returned were inspected; clearing "
+                + "entries, including cleaning the items listed here, lets a "
+                + "later scan see the rest"
+        )
+    }
+
+    /// The FAILURE arm of the production lister throws the CHAIN-BEARING
+    /// Cocoa error, never the raw `opendir` errno (PR #459 review r4, codex
+    /// C3). The distinction is doctrinal, not cosmetic: class-(a)
+    /// classification is licensed by Foundation PROVENANCE — a raw errno
+    /// EPERM may NOT claim TCC (class (b)) — and mutation testing showed the
+    /// kind-level assertions alone cannot see the difference (a top-level
+    /// POSIX EACCES classifies like a chain-EACCES), so this cell pins the
+    /// ERROR SHAPE the harvest exists to produce.
+    func testBoundedListerFailureThrowsTheChainBearingCocoaError() throws {
+        try skipUnderRoot()
+        let dir = try mkdir(base.appendingPathComponent("no-read-root"))
+        try chmod000(dir)
+
+        XCTAssertThrowsError(
+            try EphemeralTempScanner.boundedFirstLevelNames(of: dir, limit: 5)
+        ) { error in
+            let ns = error as NSError
+            XCTAssertEqual(ns.domain, NSCocoaErrorDomain,
+                           "the harvested error is Foundation's, carrying "
+                            + "provenance — got \(ns)")
+            let underlying = ns.userInfo[NSUnderlyingErrorKey] as? NSError
+            XCTAssertEqual(underlying?.domain, NSPOSIXErrorDomain,
+                           "…wrapping the POSIX cause: \(ns)")
+            XCTAssertEqual(underlying?.code, Int(EACCES))
+        }
+    }
+
+    /// The boundary is honest in the other direction: a population AT the cap
+    /// is fully inspected and reports nothing.
+    func testRootListingAtExactlyTheCapIsNotTruncated() async throws {
+        for name in ["fit-a", "fit-b", "fit-c"] {
+            try makeStaleCandidate(name, under: sharedRootURL)
+        }
+
+        let scanner = makeScanner(roots: [sharedRoot()], rootEntryLimit: 3)
+        let outcome = await scan(scanner)
+        try assertValidates(outcome, scanner: scanner)
+
+        XCTAssertEqual(outcome.items.count, 3)
+        XCTAssertTrue(outcome.errors.isEmpty,
+                      "no truncation row for an exhaustive listing: "
+                       + "\(outcome.errors)")
     }
 
     func testSymlinkRootIsNeverTraversed() async throws {

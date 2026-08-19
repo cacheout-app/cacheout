@@ -440,7 +440,8 @@ final class DocumentedContractTests: XCTestCase {
         // allowed to lag.
         let allKinds: [ScanIssue.Kind] = [
             .containerRefused, .symlinkRoot, .tccDenied, .permissionDenied,
-            .unreadable, .configInvalid, .malformedOutcome,
+            .unreadable, .enumerationTruncated, .configInvalid,
+            .malformedOutcome,
         ]
         for kind in allKinds {
             XCTAssertTrue(text.contains("`\"\(kind.wireString)\"`"),

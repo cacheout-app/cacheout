@@ -112,9 +112,11 @@ final class EphemeralTempRegistrationTests: XCTestCase {
             home: fixtureHome,
             thresholds: thresholds,
             now: { clock },
-            listDirectory: { root in
+            listDirectory: { root, limit in
                 counter?.bump()
-                return try EphemeralTempScanner.firstLevelEntries(of: root)
+                return try EphemeralTempScanner.boundedFirstLevelNames(
+                    of: root, limit: limit
+                )
             }
         )
     }

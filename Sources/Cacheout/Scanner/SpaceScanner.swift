@@ -427,6 +427,12 @@ struct ScanIssue: Equatable, Sendable {
         case permissionDenied
         /// Enumeration or metadata failure that is not a permission problem.
         case unreadable
+        /// A root listing hit its entry cap (or could not be proven
+        /// exhaustive): everything listed is real, but MORE remained
+        /// uninspected (PR #459 review r4, codex C3 — the bound that keeps a
+        /// world-writable root's population from stalling the scan). A
+        /// FILESYSTEM kind: `url` names the truncated root.
+        case enumerationTruncated
         /// A PERSISTED configuration value this build cannot parse (fn-4,
         /// R8/R16 — e.g. a `devRoots` array whose shape is invalid). The
         /// scanner fell back to its defaults WITHOUT rewriting the stored
@@ -455,6 +461,7 @@ struct ScanIssue: Equatable, Sendable {
             case .tccDenied: return "tcc_denied"
             case .permissionDenied: return "permission_denied"
             case .unreadable: return "unreadable"
+            case .enumerationTruncated: return "enumeration_truncated"
             case .configInvalid: return "config_invalid"
             case .malformedOutcome: return "malformed_outcome"
             }

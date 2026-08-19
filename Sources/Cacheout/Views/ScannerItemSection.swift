@@ -238,6 +238,7 @@ struct ScanIssueRowPresentation: Equatable {
         case .tccDenied: return "access denied by macOS privacy settings"
         case .permissionDenied: return "permission denied"
         case .unreadable: return "unreadable"
+        case .enumerationTruncated: return "too many entries — partially inspected"
         case .configInvalid: return "invalid saved configuration — defaults in effect"
         case .malformedOutcome: return "rejected — malformed scanner output; previous results kept"
         }

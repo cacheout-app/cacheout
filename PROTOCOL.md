@@ -291,7 +291,7 @@ refreshes.
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `scanner_id` | string | yes | Which scanner reported (or failed validation) |
-| `kind` | string | yes | One of: `"container_refused"`, `"symlink_root"`, `"tcc_denied"`, `"permission_denied"`, `"unreadable"`, `"config_invalid"`, `"malformed_outcome"`. The list is EXTENSIBLE — consumers must tolerate unknown kinds |
+| `kind` | string | yes | One of: `"container_refused"`, `"symlink_root"`, `"tcc_denied"`, `"permission_denied"`, `"unreadable"`, `"enumeration_truncated"`, `"config_invalid"`, `"malformed_outcome"`. The list is EXTENSIBLE — consumers must tolerate unknown kinds |
 | `detail` | string | yes | Human-readable description |
 | `path` | string | conditional | Present for the FILESYSTEM kinds; ABSENT for the NON-FILESYSTEM kinds — `"malformed_outcome"` and `"config_invalid"` — where no filesystem location exists and a fake path is therefore never invented |
 | `grant_hint` | string | no | Present only when `kind == "tcc_denied"` — the same user-side remedy (Full Disk Access) as category and `scanner_items` rows, since macOS denies CLI processes silently |

@@ -554,7 +554,7 @@ Two-surface rule: impediments attributable to an emitted item ride the item's
 candidate land in `ScanOutcome.errors`. `Kind` is EXTENSIBLE — never write
 consumers that assume the case list is closed. Wire strings (frozen):
 `container_refused`, `symlink_root`, `tcc_denied`, `permission_denied`,
-`unreadable`, `config_invalid`, `malformed_outcome`. `.malformedOutcome` is
+`unreadable`, `enumeration_truncated`, `config_invalid`, `malformed_outcome`. `.malformedOutcome` is
 synthesized ONLY by the runtime's validation, never by scanners.
 `config_invalid` was missing from this list while the binary could emit it
 (fixed in PR #459 review r2; `DocumentedContractTests` only reads

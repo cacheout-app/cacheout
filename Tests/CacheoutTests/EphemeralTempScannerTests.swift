@@ -304,6 +304,32 @@ final class EphemeralTempScannerTests: XCTestCase {
         }
     }
 
+    /// Fires a caller-supplied side effect ONCE, immediately after the
+    /// staleness pre-filter's metadata read of a chosen walked child has
+    /// already been answered.
+    ///
+    /// This is a TIMING hook, not a behaviour stub: every answer it returns is
+    /// `super`'s, and the side effect it runs is a real `rename` + `mkfifo`
+    /// that any process sharing a world-writable temp root can perform. It
+    /// exists because the window it opens — after the root-level `probeKind`
+    /// filter and the ownership gate, before the cooperative lock probe — is
+    /// otherwise reachable only by racing a concurrent thread against the
+    /// scan (measured: reproduces, but only within 2-4 scan iterations).
+    private final class MidWalkSideEffectProvider: FileSystemIdentityProvider {
+        /// Basename of the walked CHILD whose metadata read triggers it.
+        var trigger: String = ""
+        var effect: (() -> Void)?
+
+        override func leafMetadata(of url: URL) -> LeafMetadata? {
+            let answer = super.leafMetadata(of: url)
+            if url.lastPathComponent == trigger, let effect {
+                self.effect = nil
+                effect()
+            }
+            return answer
+        }
+    }
+
     /// Injects mount points by inode (the house hermetic pattern).
     private final class BoundaryInjectingProvider: FileSystemIdentityProvider {
         var mountPointInodes: Set<UInt64> = []
@@ -682,6 +708,189 @@ final class EphemeralTempScannerTests: XCTestCase {
         XCTAssertEqual(spy.calls.map(\.url.lastPathComponent), ["real-entry"],
                        "neither the FIFO nor the symlink is ever sized")
         XCTAssertTrue(outcome.errors.isEmpty, "both are skipped SILENTLY")
+    }
+
+    /// F1 (PR #459 review r3): a FIFO planted at a candidate's name inside the
+    /// scan's own swap window must not wedge `scan`.
+    ///
+    /// The probe cannot carry `O_DIRECTORY` (regular-file candidates must open
+    /// too), so without `O_NONBLOCK` its `open` is the FIFO driver's, which
+    /// waits for a writer FOREVER. Measured: the un-flagged open did not
+    /// return in 3s, and a real `scan` driven onto one never returned at all.
+    /// There is no timeout downstream — the scan body runs on a cooperative
+    /// pool thread and the session's task group never drains — so this is
+    /// asserted through the WHOLE production scan, not against the probe
+    /// function, and with the DEFAULT `lockProbe`: r2 fixed the delete-time
+    /// twin with a flag-level test and this sibling call site was missed.
+    ///
+    /// The window is opened by a real `rename` + `mkfifo` run from the
+    /// pre-filter walk's metadata read, which is after the root-level
+    /// `probeKind` filter that normally skips special files and before the
+    /// lock probe. `zz-control` proves the scan did not merely bail out early.
+    ///
+    /// A bounded wait is the assertion: if the guard is removed the detached
+    /// task never completes, so the cell reddens on the timeout rather than on
+    /// a value — which is itself the proof that the open really blocks.
+    func testAFIFOPlantedInTheSwapWindowNeitherWedgesTheScanNorIsListed()
+        throws {
+        let root = canonical(sharedRootURL)
+        try makeStaleCandidate("swap-me", under: sharedRootURL)
+        try makeStaleCandidate("zz-control", under: sharedRootURL)
+        let candidate = root.appendingPathComponent("swap-me")
+        let away = root.appendingPathComponent("swap-me.away")
+
+        let provider = MidWalkSideEffectProvider()
+        provider.trigger = "payload.bin"
+        provider.effect = {
+            XCTAssertEqual(rename(candidate.path, away.path), 0,
+                           "the fixture must free the candidate's name")
+            XCTAssertEqual(mkfifo(candidate.path, 0o600), 0,
+                           "the fixture must actually stage a named pipe")
+        }
+        // Releases a reader left blocked by a REMOVED guard, so the mutation
+        // run reddens this cell without stranding a thread for the whole
+        // suite. With the guard present there is no reader and this returns
+        // ENXIO immediately.
+        defer {
+            let writer = open(candidate.path, O_WRONLY | O_NONBLOCK)
+            if writer >= 0 { close(writer) }
+        }
+
+        let spy = SizingSpy()
+        let scanner = makeScanner(
+            roots: [sharedRoot()], provider: provider,
+            candidateSizer: { [spy] url, mode in spy.measure(url, mode) }
+        )
+        let box = OutcomeBox()
+        let finished = DispatchSemaphore(value: 0)
+        Task.detached {
+            box.value = await scanner.scan(
+                context: ScanContext(trigger: .userInitiated)
+            )
+            finished.signal()
+        }
+
+        XCTAssertEqual(
+            finished.wait(timeout: .now() + 5), .success,
+            "the scan must RETURN with a FIFO standing at a candidate's name "
+                + "— a blocking open strands the scan session, and with it "
+                + "every later scan and clean, for the life of the process"
+        )
+        let outcome = try XCTUnwrap(box.value)
+        XCTAssertEqual(
+            FileSystemIdentityProvider().kind(of: candidate), .other,
+            "the fixture must still have a special file at the scanned name"
+        )
+        // The KIND GATE's observable. `flock` on a FIFO descriptor answers
+        // ENOTSUP (45), not EWOULDBLOCK (35), so without the gate the probe
+        // reports `.available` and the FIFO is carried into stage-2 SIZING —
+        // which is exactly what `testSpecialFilesAndSymlinksAtRootAreSkipped\
+        // Silently` forbids for a special file that arrives before the scan
+        // rather than during it. No row is emitted either way (a FIFO measures
+        // 0 bytes, below any positive floor), so the sizing call is the fact
+        // that separates the two.
+        XCTAssertEqual(
+            spy.calls.map(\.url.lastPathComponent), ["zz-control"],
+            "a special file is never sized, whenever it arrives"
+        )
+        XCTAssertEqual(
+            outcome.items.map(\.displayName), ["zz-control"],
+            "the FIFO is not a kind this scanner lists, and the scan carries "
+                + "on to the entries after it"
+        )
+        XCTAssertTrue(outcome.errors.isEmpty,
+                      "a special file arriving mid-scan is the same silent "
+                        + "skip the root-level kind filter already applies")
+    }
+
+    /// The socket half of the same window, pinned at its MEASURED behaviour.
+    ///
+    /// A bound, listening AF_UNIX socket does NOT block this open and does not
+    /// reach the kind gate at all: on this platform `open` fails EOPNOTSUPP
+    /// (102, "Operation not supported on socket") immediately. That is a bare
+    /// errno on a raw-errno probe, so it lands in the neutral `.unreadable`
+    /// denial accounting — no item, one visible classified issue. (PR #459
+    /// review r3 predicted ENOENT and a silent skip for this case from a
+    /// standalone C probe; driven through the real scan it is EOPNOTSUPP and a
+    /// denial. The cell records what the product does.)
+    ///
+    /// So this cell does not evidence `O_NONBLOCK` — the FIFO cell above does.
+    /// It exists so the second special kind that can arrive in this window has
+    /// a pinned disposition instead of an assumed one. Device nodes take the
+    /// same path but cannot be staged without root, so they stay untested.
+    func testASocketPlantedInTheSwapWindowIsARefusalNotAnItem() throws {
+        let root = canonical(sharedRootURL)
+        try makeStaleCandidate("swap-me", under: sharedRootURL)
+        try makeStaleCandidate("zz-control", under: sharedRootURL)
+        let candidate = root.appendingPathComponent("swap-me")
+        let away = root.appendingPathComponent("swap-me.away")
+        // `sun_path` is 104 bytes and the fixture base is a long
+        // `/var/folders/…` path, so the socket is bound at a SHORT name and
+        // renamed onto the candidate — the object planted at the scanned name
+        // is a real bound, listening AF_UNIX socket either way.
+        let shortPath = "/private/tmp/co-r3-"
+            + UUID().uuidString.prefix(8).lowercased() + ".sock"
+        defer { unlink(shortPath) }
+
+        let provider = MidWalkSideEffectProvider()
+        provider.trigger = "payload.bin"
+        var listener: Int32 = -1
+        provider.effect = {
+            XCTAssertEqual(rename(candidate.path, away.path), 0)
+            listener = socket(AF_UNIX, SOCK_STREAM, 0)
+            XCTAssertGreaterThanOrEqual(listener, 0)
+            var address = sockaddr_un()
+            address.sun_family = sa_family_t(AF_UNIX)
+            address.sun_len = UInt8(MemoryLayout<sockaddr_un>.size)
+            let path = Array(shortPath.utf8)
+            XCTAssertLessThan(path.count, 104)
+            withUnsafeMutableBytes(of: &address.sun_path) { raw in
+                raw.baseAddress!.copyMemory(from: path, byteCount: path.count)
+            }
+            let bound = withUnsafePointer(to: &address) { pointer in
+                pointer.withMemoryRebound(
+                    to: sockaddr.self, capacity: 1
+                ) {
+                    Darwin.bind(
+                        listener, $0,
+                        socklen_t(MemoryLayout<sockaddr_un>.size)
+                    )
+                }
+            }
+            XCTAssertEqual(bound, 0, "the fixture must bind a real socket")
+            XCTAssertEqual(listen(listener, 1), 0)
+            XCTAssertEqual(rename(shortPath, candidate.path), 0,
+                           "the socket must end up at the scanned name")
+        }
+        defer { if listener >= 0 { close(listener) } }
+
+        let scanner = makeScanner(roots: [sharedRoot()], provider: provider)
+        let box = OutcomeBox()
+        let finished = DispatchSemaphore(value: 0)
+        Task.detached {
+            box.value = await scanner.scan(
+                context: ScanContext(trigger: .userInitiated)
+            )
+            finished.signal()
+        }
+
+        XCTAssertEqual(
+            finished.wait(timeout: .now() + 5), .success,
+            "a bound socket must not stall the open either"
+        )
+        let outcome = try XCTUnwrap(box.value)
+        XCTAssertEqual(
+            outcome.items.map(\.displayName), ["zz-control"],
+            "a socket is never listed, and the scan carries on past it"
+        )
+        let issue = try XCTUnwrap(outcome.errors.first)
+        XCTAssertEqual(outcome.errors.count, 1)
+        XCTAssertEqual(
+            issue.kind, .unreadable,
+            "EOPNOTSUPP is a bare errno: it establishes neither a privacy "
+                + "denial nor a filesystem one"
+        )
+        XCTAssertTrue(issue.detail.contains("in-use check"), issue.detail)
     }
 
     // MARK: - R5: denial classification by operation + provenance
@@ -1800,4 +2009,11 @@ final class EphemeralTempScannerTests: XCTestCase {
 /// after the store, and the reader loads only after a successful wait.
 private final class VerdictBox: @unchecked Sendable {
     var value: PreDeleteVerdict?
+}
+
+/// The same one-slot box for a whole `ScanOutcome` taken on a detached task
+/// and read back after a bounded wait. Sound for the same reason: the
+/// semaphore is the happens-before edge.
+private final class OutcomeBox: @unchecked Sendable {
+    var value: ScanOutcome?
 }

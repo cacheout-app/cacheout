@@ -100,12 +100,15 @@
 /// ## In-use detection: honest scope (epic D2 revised)
 ///
 /// The AGE gate is the primary in-use defense. The cooperative lock probe is a
-/// narrow supplement: `open(O_RDONLY|O_CLOEXEC|O_NOFOLLOW)` + `flock(LOCK_EX|
-/// LOCK_NB)` detects only ADVISORY `flock` holders on the top-level candidate
-/// inode ITSELF. A process holding a DESCENDANT file open for ordinary reading
-/// is NOT detected — v1 has no fd enumeration (deferred: O(pids×fds), partial
-/// without root). EWOULDBLOCK is the ONLY in-use signal; an open FAILURE is
-/// never "in use".
+/// narrow supplement: `open(O_RDONLY|O_CLOEXEC|O_NOFOLLOW|O_NONBLOCK)` + a kind
+/// gate on the descriptor + `flock(LOCK_EX|LOCK_NB)` detects only ADVISORY
+/// `flock` holders on the top-level candidate inode ITSELF. A process holding a
+/// DESCENDANT file open for ordinary reading is NOT detected — v1 has no fd
+/// enumeration (deferred: O(pids×fds), partial without root). EWOULDBLOCK is
+/// the ONLY in-use signal; an open FAILURE is never "in use". `O_NONBLOCK` is
+/// there because this open cannot carry `O_DIRECTORY` (regular-file candidates
+/// must open too), so without it a FIFO planted at a candidate name wedges the
+/// scan forever — see `cooperativeLockProbe`.
 ///
 /// ## Denial classification by OPERATION + PROVENANCE (epic D8 r6)
 ///
@@ -183,8 +186,18 @@ struct EphemeralTempScanner: @unchecked Sendable {
         case available
         /// EWOULDBLOCK — the ONE in-use signal.
         case inUse
-        /// ENOENT/ENOTDIR (gone) or ELOOP (swapped to a symlink after
-        /// dispatch): the documented race skip.
+        /// NOTHING THIS SCANNER LISTS STANDS AT THE NAME ANY MORE — the
+        /// silent-skip disposition, shared by two arms (PR #459 review r3
+        /// widened the second; the doc here previously named only the first).
+        ///
+        /// - The open FAILED benignly: ENOENT/ENOTDIR (gone) or ELOOP
+        ///   (swapped to a symlink after dispatch — `O_NOFOLLOW` refusing to
+        ///   open it is the point).
+        /// - The open SUCCEEDED but `fstat` reports a kind this scanner never
+        ///   lists (FIFO, socket, device node). Root-level `probeKind`
+        ///   already skips `.other` silently, so the same disposition applies
+        ///   to one that arrives in the swap window between that probe and
+        ///   this one.
         case vanished
         /// The `open` failed for another reason — NEVER "in use"; routed to
         /// the same denial accounting as any other raw-errno probe.
@@ -945,11 +958,32 @@ struct EphemeralTempScanner: @unchecked Sendable {
 
     // MARK: - Cooperative lock probe (R6, epic D2 revised)
 
-    /// The PRODUCTION probe: `open(O_RDONLY|O_CLOEXEC|O_NOFOLLOW)` — valid for
-    /// files AND directories on Darwin — then a non-blocking exclusive
-    /// `flock`. EWOULDBLOCK is the only in-use answer; a successful lock is
-    /// dropped immediately (closing the descriptor would drop it anyway, but
-    /// the release is explicit so the scan never holds a lock while it sizes).
+    /// The PRODUCTION probe:
+    /// `open(O_RDONLY|O_CLOEXEC|O_NOFOLLOW|O_NONBLOCK)` — valid for files AND
+    /// directories on Darwin — then a kind gate on the descriptor, then a
+    /// non-blocking exclusive `flock`. EWOULDBLOCK is the only in-use answer;
+    /// a successful lock is dropped immediately (closing the descriptor would
+    /// drop it anyway, but the release is explicit so the scan never holds a
+    /// lock while it sizes).
+    ///
+    /// `O_NONBLOCK` IS AN AVAILABILITY GUARD, NOT A PERFORMANCE HINT
+    /// (PR #459 review r3). This open cannot carry `O_DIRECTORY` — a
+    /// regular-file candidate must open too — so it is the driver's `open`
+    /// that runs, and a FIFO with no writer standing at this name BLOCKS
+    /// FOREVER. Measured on this platform: without `O_NONBLOCK` this exact
+    /// flag set did not return in 3s against `mkfifo`, and a REAL
+    /// `scanner.scan(context:)` driven through it never returned; with the
+    /// flag the open returns immediately and `fstat` reports `S_IFIFO`. The
+    /// scan body runs directly on a Swift cooperative-pool worker with no
+    /// timeout anywhere downstream, so a block here consumes that thread for
+    /// the life of the process and strands the whole scan session (the
+    /// `SpaceScanner` task group never drains, so `CacheoutViewModel`'s
+    /// re-entrancy guard — which gates every later scan AND every `clean()` —
+    /// is never released, and the CLI/MCP consumer hangs identically).
+    /// `/private/tmp` is world-writable: the sticky bit stops another user
+    /// renaming your entry, but once its owner unlinks the name any user may
+    /// `mkfifo` it. This is the scan-time twin of the delete-time re-open in
+    /// `revalidateTempEntry`, which carries the same flag for the same reason.
     ///
     /// An `open` FAILURE is never "in use": ENOENT/ENOTDIR/ELOOP are race
     /// skips (ELOOP means the entry became a symlink after dispatch — the
@@ -959,9 +993,13 @@ struct EphemeralTempScanner: @unchecked Sendable {
     ///
     /// Scope, honestly: this sees advisory `flock` holders on the CANDIDATE
     /// INODE only. It does not and cannot see a process holding a descendant
-    /// file open for ordinary reading.
+    /// file open for ordinary reading. It also cannot bound the time the
+    /// `open` itself takes on a slow or wedged filesystem — `O_NONBLOCK`
+    /// removes the FIFO/device wait, not an unresponsive vnode.
     static func cooperativeLockProbe(_ url: URL) -> LockProbe {
-        let descriptor = open(url.path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+        let descriptor = open(
+            url.path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK
+        )
         guard descriptor >= 0 else {
             let code = errno
             if code == ENOENT || code == ENOTDIR || code == ELOOP {
@@ -970,6 +1008,28 @@ struct EphemeralTempScanner: @unchecked Sendable {
             return .failed(errno: code)
         }
         defer { close(descriptor) }
+
+        // THE KIND GATE ON THE SUCCESSFUL OPEN (PR #459 review r3) — the
+        // scan-time twin of `revalidateTempEntry`'s gate (0). `O_NONBLOCK`
+        // converts "hang" into "opened a FIFO"; without this arm that FIFO
+        // would fall through to the `flock` below, which answers ENOTSUP
+        // (45, MEASURED — not EWOULDBLOCK, 35), so the ternary would report
+        // `.available` and carry a special file on to sizing and emission.
+        // `.vanished` is the right disposition and not a new one: root-level
+        // `probeKind` already skips `.other` silently, and everything this
+        // probe can be asked about arrived through that same filter.
+        var status = stat()
+        guard fstat(descriptor, &status) == 0 else {
+            let code = errno
+            return .failed(errno: code)
+        }
+        switch FileSystemIdentityProvider.fileKind(from: status) {
+        case .regularFile, .directory:
+            break
+        case .symlink, .other:
+            return .vanished
+        }
+
         if flock(descriptor, LOCK_EX | LOCK_NB) == 0 {
             flock(descriptor, LOCK_UN)
             return .available
@@ -1465,8 +1525,16 @@ struct EphemeralTempScanner: @unchecked Sendable {
         // deciding what stands here and taking hold of it. `O_NOFOLLOW` is
         // what makes the answer trustworthy: an entry swapped for a symlink
         // since the scan fails here (ELOOP) instead of being followed. Valid
-        // for directories AND regular files on Darwin — the same open the
-        // scan's own lock probe performs.
+        // for directories AND regular files on Darwin.
+        //
+        // (PR #459 review r3: the sentence that stood here called this "the
+        // same open the scan's own lock probe performs". When it was written
+        // the two flag sets differed by exactly `O_NONBLOCK` — the flag this
+        // very block is about — and the one it named as identical was the one
+        // that could block. `cooperativeLockProbe` now carries `O_NONBLOCK`
+        // too, so the flag sets ARE identical again; naming the relationship
+        // is left to that function's own comment rather than restated here,
+        // where it can drift a second time.)
         //
         // `O_NONBLOCK` IS AN AVAILABILITY GUARD, NOT A PERFORMANCE HINT
         // (PR #459 review r2). This open cannot carry `O_DIRECTORY` — a

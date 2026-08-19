@@ -13,8 +13,10 @@
 /// - **Select Stale**: only where staleness applies to the scanner's
 ///   items (`isStale == nil` = control hidden/inapplicable). The label makes
 ///   NO numeric claim on purpose (PR #459 review r4, codex C2): each scanner
-///   judges staleness by its OWN configurable threshold (build artifacts 30
-///   days, orphaned caches 60-day default, ephemeral temp 7-day default), and
+///   judges staleness by its OWN threshold (build artifacts a fixed 30 days —
+///   `ReclaimableItem.isStale(daysSinceModified:)`, no knob; orphaned caches
+///   a configurable 60-day default; ephemeral temp a configurable 7-day
+///   default), and
 ///   the retired 30-day parenthetical was false in the shipped DEFAULT
 ///   configuration the moment a sub-30-day scanner registered. The per-item
 ///   age is stated where it is true: the row's evidence string and the

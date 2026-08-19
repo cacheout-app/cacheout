@@ -515,7 +515,7 @@ struct ReclaimableItem: Equatable, Sendable {
 | `admission` | `AdmissionDescriptor` | Which PathGuard mode applies at the chokepoint |
 | `defaultSelected` | `Bool` | GUI initial selection — applied ONLY when a key is emitted for the first time |
 | `automaticCleanEligible` | `Bool` | `false` excludes the item from Quick Clean AND CLI smart-clean (every per-item scanner row ships `false` — CLI-visible is not auto-cleanable) |
-| `isStale` | `Bool?` | nil = staleness not applicable OR unknowable ("Select Stale" operates on `isStale == true`); the 30-day threshold is `ReclaimableItem.isStale(daysSinceModified:)` |
+| `isStale` | `Bool?` | nil = staleness not applicable OR unknowable ("Select Stale" operates on `isStale == true`); the threshold is per-scanner — build artifacts use the fixed 30-day `ReclaimableItem.isStale(daysSinceModified:)` helper, orphaned caches a 60-day default, ephemeral temp a 7-day default |
 | `valuablesDisclosure` | `ValuablesDisclosure?` | ADDITIVE. What the release-artifact probe SAW, plus its completeness flag. DISCLOSURE, never consent — acknowledgement lives only in the per-clean authorization context |
 | `requiresPreDeleteRevalidation` | `Bool` | ADDITIVE, scanner-agnostic. `true` means the item MUST be re-inspected immediately before deletion; a cleaner holding no revalidator for its scanner refuses it fail-closed |
 | `artifactProof` | `BuildArtifactProof?` | ADDITIVE. The structural property that made this item a candidate, so the OWNING scanner's revalidator can re-prove it rather than trust the scan. nil for every scanner but `build_artifacts`. Never on any wire |

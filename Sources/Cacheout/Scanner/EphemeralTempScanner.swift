@@ -216,10 +216,11 @@ struct EphemeralTempScanner: @unchecked Sendable {
     /// ~50× the largest observed population. A cap hit is DISCLOSED as a
     /// root-level issue, and it is NOT a deterministic strand: it gates only
     /// the VISIBILITY of never-listed entries (never the deletion of an
-    /// emitted item), and cleaning the listed items itself shrinks the
-    /// population, so repeated scan+clean cycles genuinely converge below
-    /// the cap — unlike the orphaned-caches fixed depth cap, a retry here
-    /// CAN differ.
+    /// emitted item), and cleaning the listed items shrinks the population
+    /// WHEN the listed prefix yields items — if every listed entry is fresh
+    /// or below the size floor, a clean removes nothing and only external
+    /// clearing moves the population. Unlike the orphaned-caches fixed depth
+    /// cap, a retry here CAN differ.
     static let defaultRootEntryLimit = 20_000
 
     // MARK: - Seams

@@ -69,10 +69,15 @@ and docs/v1/CLI-REFERENCE.md) — the pre-release `node_modules` →
   entry's filesystem identity and the re-check compares it, so an entry
   renamed away and replaced under the same name is refused even when the
   replacement is itself old and idle. If the entry has been replaced, written
-  into, locked by a running process, or has changed owner since the scan, the
-  deletion is refused with nothing removed and nothing reported freed —
-  re-scan to see its current state. Anything that is no longer a directory or
-  a regular file at that name is refused outright. The check runs on both
+  into, or locked by a running process since the scan, the deletion is refused
+  with nothing removed and nothing reported freed — re-scan to see its current
+  state. Under the world-writable shared root (`/tmp`) an entry that has
+  changed owner since the scan is refused too; the per-user containers are not
+  owner-checked at delete time, because their `0700` mode leaves no way for
+  another user to place an entry there in the first place. Anything that is no
+  longer a directory or a regular file at that name is refused outright,
+  including a named pipe or socket planted mid-scan — which can no longer stall
+  the scan or the clean either. The check runs on both
   disposals, and on the Move-to-Trash default it refuses before the item is
   moved, so a refusal never disturbs your Trash.
 - **Configurable dev roots.** Settings gains a dev-roots editor and the CLI a

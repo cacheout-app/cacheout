@@ -365,20 +365,32 @@ does **not** de-duplicate findings across scanners: a directory two registered
 scanners both recognise is listed twice — once per scanner, same path and same
 byte figure, different item ids.
 
-Where that can happen: a dev root that IS a temp root, a dev root nested
-inside one (`build_artifacts` and `ephemeral_tmp`), and a dev root in or under
-`~/Library/Caches`, which the orphaned-caches sweep owns (`build_artifacts`
-and `orphaned_caches`). Each root is walked independently in every case; none
-of them is refused.
+Where that can happen: a dev root that IS a temp root (`build_artifacts` and
+`ephemeral_tmp`), and a dev root that IS `~/Library/Caches`, which the
+orphaned-caches sweep owns (`build_artifacts` and `orphaned_caches`). Each root
+is walked independently; neither is refused.
 
-The two sets overlap narrowly, because the directory must satisfy BOTH
-scanners' rules at once. Under a temp root, `build_artifacts` walks to its
-full 8-level depth budget with no age gate and no size floor, while
-`ephemeral_tmp` lists only that root's FIRST-LEVEL entries that are at least
-10 MB and whose own timestamp and newest content are both older than 7 days.
-The one artifact shape that can match a first-level entry without needing a
-sibling marker in the root itself is a Python venv (`pyvenv.cfg` inside), so
-in practice that is what shows up twice.
+A dev root **nested inside** one of those roots does **not** produce a
+duplicate, and that is structural rather than a matter of luck: a
+`build_artifacts` item is always a proper DESCENDANT of its dev root — the
+scanner never emits the root itself — while `ephemeral_tmp` (and likewise
+`orphaned_caches`) emits exactly its root's FIRST-LEVEL entries. At nesting
+depth 1 or more the only object both could claim is the dev root, which one of
+them structurally cannot emit, so the two sets are disjoint. Measured: a dev
+root at `<tempRoot>/outer` yields `ephemeral_tmp` → `<tempRoot>/outer` and
+`build_artifacts` → `<tempRoot>/outer/inner-venv`, different paths in an
+ancestor/descendant relation, which is ordinary nesting and not a repeated row;
+a dev root that is ITSELF a stale venv yields `build_artifacts` → nothing at
+all and `ephemeral_tmp` → one item.
+
+Where the exact-root case does overlap it overlaps narrowly, because the
+directory must satisfy BOTH scanners' rules at once. Under a temp root,
+`build_artifacts` walks to its full 8-level depth budget with no age gate and
+no size floor, while `ephemeral_tmp` lists only that root's FIRST-LEVEL entries
+that are at least 10 MB and whose own timestamp and newest content are both
+older than 7 days. The one artifact shape that can match a first-level entry
+without needing a sibling marker in the root itself is a Python venv
+(`pyvenv.cfg` inside), so in practice that is what shows up twice.
 
 What the duplication does and does not affect:
 
@@ -391,6 +403,8 @@ What the duplication does and does not affect:
   once; the second row is refused by its scanner's delete-time re-check
   (the folder it was bound to is gone) with nothing removed and nothing
   reported freed, and the cleanup report's freed total counts the bytes once.
+  The refusal is **not silent**: the second row appears in the report as a
+  failed item with its own message. This holds in either selection order.
 - **Cleaning by address is unaffected**: `clean build_artifacts:<id>` runs
   only that scanner, so the duplicate pair is reachable on the clean path
   only if you pass both addresses in one invocation.

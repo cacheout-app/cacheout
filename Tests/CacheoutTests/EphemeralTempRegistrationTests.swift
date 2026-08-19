@@ -718,6 +718,40 @@ final class EphemeralTempRegistrationTests: XCTestCase {
         return venv
     }
 
+    /// One validated session's items per scanner, plus the session snapshot —
+    /// which is what `makeCleaner(snapshot:)` requires, so a cell can carry
+    /// the same session's items all the way to a real deletion.
+    private func scanSession(
+        _ runtime: SpaceScannerRuntime
+    ) async -> (items: [String: [ReclaimableItem]],
+                snapshot: ContainerSnapshot) {
+        let everyScanner: Set<String>? = nil
+        let session = runtime.scanValidatedSession(
+            scannerIDs: everyScanner,
+            context: ScanContext(trigger: .userInitiated)
+        )
+        var items: [String: [ReclaimableItem]] = [:]
+        for await event in session.events {
+            switch event {
+            case .outcome(let id, let outcome): items[id] = outcome.items
+            case .malformed(let id, let issue):
+                XCTFail("\(id) malformed: \(issue.detail)")
+            }
+        }
+        await session.untilProducerFinishes()
+        return (items, session.snapshot)
+    }
+
+    /// Every scanner's item paths, so a claim about which SETS overlap can be
+    /// executed instead of reasoned about.
+    private func itemPathsByScanner(
+        _ runtime: SpaceScannerRuntime
+    ) async throws -> [String: Set<String>] {
+        await scanSession(runtime).items.mapValues {
+            Set($0.compactMap { $0.url?.path })
+        }
+    }
+
     private func listedBy(
         _ runtime: SpaceScannerRuntime, path: String
     ) async throws -> (scanners: [String], bytes: Set<Int64>) {
@@ -747,20 +781,35 @@ final class EphemeralTempRegistrationTests: XCTestCase {
     /// scanners over ONE root there is NO cross-scanner dedupe anywhere (D4),
     /// and both derive item identity from the same `resolveTargetKeepingLeaf`
     /// — so the SAME directory is published twice, with the same url and the
-    /// same bytes. The total double-counts, the GUI shows it in two sections,
-    /// and selecting both makes the second deletion a ghost-target error.
-    /// Neither outcome is malformed: uniqueness is checked WITHIN one outcome
-    /// only, so nothing else in the stack notices.
+    /// same bytes. The GUI shows it in two sections, and selecting both makes
+    /// the second deletion a per-item error
+    /// (`testCleaningBothDuplicateRowsFreesOnce…` above). Neither outcome is
+    /// malformed: uniqueness is checked WITHIN one outcome only, so nothing
+    /// else in the stack notices.
+    ///
+    /// WHICH TOTAL DOUBLES (PR #459 review r3 — F8). The SELECTED-SIZE figure
+    /// does, including the one the clean confirmation quotes, because it spans
+    /// scanners. The product's headline RECLAIMABLE figure does not: it is
+    /// category-scoped and counts per-item scanner bytes ZERO times. Round 2
+    /// split those two correctly in `docs/v1/CATEGORIES.md` and in
+    /// `testACrossScannerDuplicateInflatesOnlyTheSelectedScopes`, and left the
+    /// unqualified "the total double-counts" standing here — including in the
+    /// failure message a maintainer reads when this cell breaks.
     ///
     /// This cell does NOT go through `DevRootsStore`, deliberately: it is the
     /// STANDING property, and nothing anywhere narrows it (PR #459 review r2 —
     /// round 1's overlap refusal, which this comment used to point at, is
     /// reverted; it destroyed the whole build-artifacts walk of the colliding
     /// root and aborted the CLI invocation to suppress one duplicated row).
-    /// Every route reaches exactly this state: a dev root that IS a temp root,
-    /// a dev root NESTED inside one (`--dev-root /private/tmp/claude-501`),
-    /// and a dev root inside `~/Library/Caches`. The pre-existing accepted
-    /// class D7 documents, characterized for the caches instance in
+    ///
+    /// WHICH ROUTES REACH IT (PR #459 review r3 — F6). Only the EXACT-root
+    /// ones: a dev root that IS a temp root, and a dev root that IS
+    /// `~/Library/Caches`. A NESTED dev root does not — measured in
+    /// `testANestedDevRootProducesNoSamePathDuplicate` above, where the two
+    /// scanners' item sets are disjoint because `build_artifacts` items are
+    /// proper descendants of its dev root and `ephemeral_tmp` items are the
+    /// temp root's first-level entries. The pre-existing accepted class D7
+    /// documents, characterized for the caches instance in
     /// `testTwoScannersOverOneCachesRootPublishTheSameDirectoryTwice` below
     /// and written up in `docs/v1/CATEGORIES.md`.
     func testTwoScannersOverOneRootPublishTheSameDirectoryTwice() async throws {
@@ -787,8 +836,186 @@ final class EphemeralTempRegistrationTests: XCTestCase {
             "no cross-scanner dedupe exists — the directory is listed twice"
         )
         XCTAssertEqual(found.bytes.count, 1,
-                       "and with the SAME byte figure, so the total is "
-                        + "double-counted: \(found.bytes)")
+                       "and with the SAME byte figure, so the SELECTED-SIZE "
+                        + "figure double-counts these bytes (the "
+                        + "category-scoped Reclaimable figure counts them "
+                        + "zero times): \(found.bytes)")
+    }
+
+    /// "CLEANING IS NOT DOUBLED", EXECUTED (PR #459 review r3 — F9).
+    ///
+    /// `docs/v1/CATEGORIES.md` asserts that selecting both copies of a
+    /// cross-scanner duplicate deletes the directory once, that the second row
+    /// is refused with nothing reported freed, and that the freed total counts
+    /// the bytes once. Round 2 cited a cell that asserts only the four TOTALS
+    /// scopes and never cleans anything, so the claim held by construction
+    /// with no test behind it. This drives the real `CacheCleaner` over both
+    /// rows of the measured exact-root duplicate.
+    ///
+    /// Order matters to the mechanism (whichever row runs second is the one
+    /// refused) but not to the outcome, so both orders are pinned. The doc was
+    /// also silent that the refused row surfaces as a per-item ERROR — the
+    /// user sees a failure line, not a silent no-op — which is asserted here
+    /// and now stated there.
+    func testCleaningBothDuplicateRowsFreesOnceBuildArtifactsFirst()
+        async throws {
+        try await assertDuplicateCleansOnce(buildArtifactsFirst: true)
+    }
+
+    func testCleaningBothDuplicateRowsFreesOnceTempFirst() async throws {
+        try await assertDuplicateCleansOnce(buildArtifactsFirst: false)
+    }
+
+    private func assertDuplicateCleansOnce(
+        buildArtifactsFirst: Bool,
+        file: StaticString = #filePath, line: UInt = #line
+    ) async throws {
+        let venv = try stageFirstLevelVenv()
+        let shared = canonical(tempRoot)
+        let runtime = try makeRuntime([
+            BuildArtifactsScanner(
+                home: fixtureHome,
+                devRoots: DevRootsResolution(keptRoots: [shared], issues: [])
+            ),
+            makeScanner(),
+        ])
+        let scanned = await scanSession(runtime)
+        let path = FileSystemIdentityProvider()
+            .resolveTargetKeepingLeaf(canonical(venv)).path
+        let build = try XCTUnwrap(
+            scanned.items[BuildArtifactsScanner.registeredID]?
+                .first { $0.url?.path == path },
+            file: file, line: line
+        )
+        let temp = try XCTUnwrap(
+            scanned.items[EphemeralTempScanner.registeredID]?
+                .first { $0.url?.path == path },
+            file: file, line: line
+        )
+        XCTAssertEqual(build.exactBytes, temp.exactBytes,
+                       "the two rows quote the SAME bytes — that is the whole "
+                        + "reason the selected-size figure doubles",
+                       file: file, line: line)
+
+        let ordered = buildArtifactsFirst ? [build, temp] : [temp, build]
+        let report = await runtime
+            .makeCleaner(snapshot: scanned.snapshot)
+            .clean(items: ordered, moveToTrash: false)
+
+        XCTAssertEqual(report.entries.count, 1,
+                       "one directory, one deletion", file: file, line: line)
+        XCTAssertEqual(report.entries.first?.scannerID, ordered[0].scannerID,
+                       "the row that ran FIRST is the one that deleted",
+                       file: file, line: line)
+        XCTAssertEqual(report.totalFreedExact, build.exactBytes,
+                       "the freed total counts these bytes ONCE",
+                       file: file, line: line)
+        XCTAssertEqual(report.errors.count, 1,
+                       "the second row is not a silent no-op — it surfaces as "
+                        + "a per-item error", file: file, line: line)
+        XCTAssertEqual(report.errors.first?.key.scannerID,
+                       ordered[1].scannerID, file: file, line: line)
+        XCTAssertFalse(fm.fileExists(atPath: path),
+                       "and the directory really is gone",
+                       file: file, line: line)
+    }
+
+    /// A NESTED DEV ROOT PRODUCES NO SAME-PATH DUPLICATE AT ALL (PR #459
+    /// review r3 — F6). Round 2's characterization, and the doc page it wrote,
+    /// listed "a dev root nested inside one" alongside the exact-root case as
+    /// if the two behaved identically. MEASURED here, they do not, and the
+    /// difference is structural rather than incidental:
+    ///
+    /// - `build_artifacts` items are proper DESCENDANTS of its dev root; it
+    ///   never emits the root itself.
+    /// - `ephemeral_tmp` items are exactly the temp root's FIRST-LEVEL
+    ///   entries.
+    ///
+    /// So at nesting depth >= 1 the two sets are DISJOINT by construction: the
+    /// only shared object is the dev root, which one scanner emits (as a
+    /// first-level temp entry) and the other structurally cannot. What remains
+    /// is an ancestor/descendant relation at DIFFERENT paths — the outer
+    /// directory's bytes contain the inner one's, which is ordinary nesting
+    /// and not a duplicated row. The exact-root case
+    /// (`testTwoScannersOverOneRootPublishTheSameDirectoryTwice` above) is the
+    /// one that duplicates, and it is the only one.
+    func testANestedDevRootProducesNoSamePathDuplicate() async throws {
+        let outer = tempRoot.appendingPathComponent("outer")
+        let inner = outer.appendingPathComponent("inner-venv")
+        try fm.createDirectory(
+            at: inner.appendingPathComponent("lib"),
+            withIntermediateDirectories: true
+        )
+        try Data().write(to: inner.appendingPathComponent("pyvenv.cfg"))
+        try Data(repeating: 0x41, count: 12_000_000).write(
+            to: inner.appendingPathComponent("lib/big.bin")
+        )
+        try backdate(outer, to: clock.addingTimeInterval(-30 * 86_400))
+
+        let devRoot = canonical(outer)
+        let runtime = try makeRuntime([
+            BuildArtifactsScanner(
+                home: fixtureHome,
+                devRoots: DevRootsResolution(keptRoots: [devRoot], issues: [])
+            ),
+            makeScanner(),
+        ])
+        let paths = try await itemPathsByScanner(runtime)
+        let resolve = { (url: URL) in
+            FileSystemIdentityProvider()
+                .resolveTargetKeepingLeaf(url).path
+        }
+
+        XCTAssertEqual(
+            paths[EphemeralTempScanner.registeredID],
+            [resolve(devRoot)],
+            "ephemeral_tmp lists the temp root's first-level entry — the dev "
+                + "root itself"
+        )
+        XCTAssertEqual(
+            paths[BuildArtifactsScanner.registeredID],
+            [resolve(canonical(inner))],
+            "build_artifacts lists a proper descendant of its dev root, never "
+                + "the root"
+        )
+        XCTAssertEqual(
+            paths[EphemeralTempScanner.registeredID]?
+                .intersection(paths[BuildArtifactsScanner.registeredID] ?? []),
+            [],
+            "no path is listed twice, so there is no duplicate to de-duplicate"
+        )
+    }
+
+    /// The other half of F6, and the sharper one: when the nested dev root IS
+    /// itself the artifact — `--dev-root <tempRoot>/venv` on a stale venv —
+    /// `build_artifacts` emits NOTHING, because its own root can never be one
+    /// of its descendants. `ephemeral_tmp` lists it alone. The doc's
+    /// reassurance paragraph about duplicate cleaning has nothing to apply to
+    /// here, which is exactly why the nested case must not be sold as the same
+    /// case.
+    func testADevRootThatIsItselfTheArtifactIsListedOnlyByTheTempScanner()
+        async throws {
+        let venv = try stageFirstLevelVenv("nested-venv")
+        let devRoot = canonical(venv)
+        let runtime = try makeRuntime([
+            BuildArtifactsScanner(
+                home: fixtureHome,
+                devRoots: DevRootsResolution(keptRoots: [devRoot], issues: [])
+            ),
+            makeScanner(),
+        ])
+        let paths = try await itemPathsByScanner(runtime)
+
+        XCTAssertEqual(
+            paths[BuildArtifactsScanner.registeredID], [],
+            "build_artifacts never emits its own dev root as an item"
+        )
+        XCTAssertEqual(
+            paths[EphemeralTempScanner.registeredID],
+            [FileSystemIdentityProvider()
+                .resolveTargetKeepingLeaf(devRoot).path],
+            "so the entry is listed exactly once, by the temp scanner"
+        )
     }
 
     /// A DEV ROOT THAT IS A TEMP ROOT IS ACCEPTED (PR #459 review r2 — this

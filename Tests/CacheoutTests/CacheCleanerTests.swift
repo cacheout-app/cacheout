@@ -3335,7 +3335,11 @@ final class CacheCleanerTests: XCTestCase {
         // dispatch (`CacheCleaner.preDeleteOutcome` keys on `scannerID` and
         // the marker), it is the CLI smart-clean exclusion. Temp items now
         // carry the marker and the scanner declares a revalidator, so they go
-        // THROUGH the seam and the allow carries a descriptor-proven binding.
+        // THROUGH the seam and the allow carries a descriptor-proven binding
+        // for BOTH kinds — `.directory(identity)` here, `.nonDirectoryLeaf`
+        // for a regular-file entry (PR #459 review r5: until the leaf case
+        // existed, the file arm carried no binding and this sentence was
+        // false for it).
         XCTAssertFalse(item.automaticCleanEligible,
                        "the CLI smart-clean exclusion — not a revalidation fact")
         XCTAssertTrue(item.requiresPreDeleteRevalidation)
@@ -4653,5 +4657,279 @@ final class CacheCleanerTests: XCTestCase {
             "no bytes may enter the pipe — got \(max(readCount, 0)) bytes: "
                 + String(decoding: buffer.prefix(max(readCount, 0)), as: UTF8.self)
         )
+    }
+}
+
+// MARK: - The regular-file identity binding, proven at the DISPOSAL itself
+// (PR #459 codex r5, P1).
+//
+// The temp revalidator's file arm verifies the candidate's (device, inode)
+// on a held descriptor; since r5 the `.allow` CARRIES that identity
+// (`.nonDirectoryLeaf`), and these four cells prove the disposal arms refuse
+// a swap that lands PAST every earlier layer: after the revalidator's fd is
+// closed, after the admitted-parent capture, and after the cleaner's final
+// path check. The swap fires inside the disposal's own container proof —
+// the last provider question before the leaf is acted on — so the ONLY
+// thing that can catch it is the leaf binding under the proved parent
+// (`DepthSafeRemoval`'s `ENOTDIR` `fstatat` comparison on the permanent
+// arm, `TrashDisposal.dispose(_:expecting:…)`'s pre-move `boundLeaf`
+// equality on the Trash arm). Before the fix this exact fixture destroyed
+// the never-scanned replacement on both arms with success reported (the
+// r5 investigation's reproduction, run against the unfixed tree).
+extension CacheCleanerTests {
+
+    private final class SwapAtTheDisposalContainerProofProvider:
+        FileSystemIdentityProvider {
+        var target: URL!
+        var stash: URL!
+        /// Creates whatever should stand at the target's name after the move.
+        var plantReplacement: (() -> Void)!
+        private var armed = false
+        private var revalidatorGatesRan = false
+        private var descriptorIdentityCallsAfterGates = 0
+        private(set) var swapped = false
+
+        func arm() {
+            armed = true
+            revalidatorGatesRan = false
+            descriptorIdentityCallsAfterGates = 0
+            swapped = false
+        }
+
+        /// The revalidator's ownership gate — the ONLY production caller of
+        /// this accessor — marks that the file arm's identity comparison has
+        /// already passed on the held descriptor.
+        override func ownerUID(ofDescriptor fd: Int32) -> UInt32? {
+            let real = super.ownerUID(ofDescriptor: fd)
+            if armed { revalidatorGatesRan = true }
+            return real
+        }
+
+        /// Descriptor-identity question #1 after the verdict returns is the
+        /// cleaner's admitted-parent capture; #2 is the DISPOSAL's own
+        /// container proof (`openAdmittedContainer`, reached through
+        /// `DepthSafeRemoval.remove` on the permanent arm and
+        /// `TrashDisposal.boundLeaf` on the Trash arm) — after the final
+        /// path check. The swap lands there, for real; every answer is
+        /// `super`'s real answer (the parent directory's identity is
+        /// unchanged by a leaf swap, so the container proof rightly passes
+        /// and the LEAF binding is the one guard left standing).
+        override func identity(ofDescriptor descriptor: Int32) -> Identity? {
+            if armed, revalidatorGatesRan {
+                descriptorIdentityCallsAfterGates += 1
+                if descriptorIdentityCallsAfterGates == 2, !swapped {
+                    swapped = true
+                    try? FileManager.default.moveItem(at: target, to: stash)
+                    plantReplacement()
+                }
+            }
+            return super.identity(ofDescriptor: descriptor)
+        }
+    }
+
+    /// Shared fixture: one stale top-level regular FILE candidate, scanned by
+    /// the real scanner, cleaned through the runtime-built cleaner, with the
+    /// swap armed to fire at the disposal's container proof.
+    private func runLateFileSwapClean(
+        _ label: String,
+        moveToTrash: Bool,
+        plant: @escaping (URL) -> Void
+    ) async throws -> (
+        report: CleanupReport,
+        target: URL,
+        stash: URL,
+        trash: URL,
+        home: URL,
+        provider: SwapAtTheDisposalContainerProofProvider,
+        recorder: TrashRecorder
+    ) {
+        let world = try makeEphemeralWorld(label)
+        addTeardownBlock {
+            try? FileManager.default.removeItem(at: world.base)
+        }
+        let rawTarget = world.root.appendingPathComponent("old-scratch.tmp")
+        try writeFile(rawTarget, bytes: 8_192)
+        try backdateTree(
+            rawTarget, to: ephemeralClock.addingTimeInterval(-30 * 86_400)
+        )
+        let target = canonical(world.root)
+            .appendingPathComponent("old-scratch.tmp")
+
+        let provider = SwapAtTheDisposalContainerProofProvider()
+        provider.target = target
+        provider.stash = world.base.appendingPathComponent("moved-away.tmp")
+        provider.plantReplacement = { plant(target) }
+
+        let clock = ephemeralClock
+        let scanner = EphemeralTempScanner(
+            roots: [EphemeralTempRoot(
+                url: canonical(world.root),
+                label: "Shared temp",
+                cleanupEvidence: EphemeralTempRoots.sharedTempEvidence,
+                writability: .worldWritable
+            )],
+            home: world.home,
+            thresholds: ephemeralThresholds,
+            provider: provider,
+            now: { clock }
+        )
+        let items = await scannedTempItems(scanner)
+        let item = try XCTUnwrap(
+            items["old-scratch.tmp"],
+            "the stale file must scan as a candidate"
+        )
+        XCTAssertNotNil(item.scannedTargetIdentity,
+                        "the scan records the file's identity")
+
+        let runtime = try SpaceScannerRuntime(
+            scanners: [scanner], categories: [], home: world.home,
+            provider: provider
+        )
+        let recorder = TrashRecorder()
+        let cleaner = runtime.makeCleaner(
+            snapshot: sessionSnapshot(of: runtime.trustedContainerRoots),
+            trashHandler: makeTrashSeam(into: world.trash, recorder: recorder)
+        )
+
+        provider.arm()
+        let report = await cleaner.clean(
+            items: [item], moveToTrash: moveToTrash
+        )
+        XCTAssertTrue(provider.swapped, "the fixture never fired the swap")
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: provider.stash.path),
+            "the SCANNED file sits untouched in the stash — whatever the "
+                + "disposal was asked to take, it was not the scanned object"
+        )
+        return (report, target, provider.stash, world.trash, world.home,
+                provider, recorder)
+    }
+
+    /// The one refusal shape all four cells assert: no entry, one item-keyed
+    /// content-drift error, the replacement SURVIVING at the name, the Trash
+    /// seam never reached.
+    private func assertLateSwapRefused(
+        _ outcome: (
+            report: CleanupReport, target: URL, stash: URL, trash: URL,
+            home: URL, provider: SwapAtTheDisposalContainerProofProvider,
+            recorder: TrashRecorder
+        ),
+        file: StaticString = #filePath, line: UInt = #line
+    ) throws {
+        XCTAssertTrue(outcome.report.entries.isEmpty,
+                      "SUCCESS was reported for an object nobody scanned: "
+                        + "\(outcome.report.entries)", file: file, line: line)
+        XCTAssertEqual(outcome.report.errors.count, 1,
+                       "\(outcome.report.errors)", file: file, line: line)
+        let message = try XCTUnwrap(outcome.report.errors.first?.message,
+                                    file: file, line: line)
+        XCTAssertTrue(message.contains("no longer the one that was inspected"),
+                      message, file: file, line: line)
+        XCTAssertTrue(logContents(home: outcome.home).contains("content-drift"),
+                      "the cleanup log tags the event content-drift",
+                      file: file, line: line)
+        XCTAssertTrue(outcome.recorder.urls.isEmpty,
+                      "the Trash seam was reached: \(outcome.recorder.urls)",
+                      file: file, line: line)
+        XCTAssertNil(try soleTrashedEntry(in: outcome.trash),
+                     file: file, line: line)
+    }
+
+    /// PERMANENT ARM, regular-file replacement: refused by the `ENOTDIR`
+    /// arm's `fstatat`-under-the-proved-parent comparison; the never-scanned
+    /// replacement survives.
+    func testEphemeralTempFileReplacedAtTheDisposalIsRefusedOnThePermanentArm()
+    async throws {
+        let replacementBytes = Data(repeating: 0x5A, count: 6_000)
+        let outcome = try await runLateFileSwapClean(
+            "late-swap-file-permanent", moveToTrash: false
+        ) { target in
+            try? replacementBytes.write(to: target)
+        }
+        try assertLateSwapRefused(outcome)
+        XCTAssertEqual(
+            try Data(contentsOf: outcome.target), replacementBytes,
+            "the never-scanned replacement still stands at the name"
+        )
+    }
+
+    /// TRASH ARM (the GUI default), regular-file replacement: refused by the
+    /// pre-move `boundLeaf` identity comparison, BEFORE the move — the Trash
+    /// is untouched.
+    func testEphemeralTempFileReplacedAtTheDisposalIsRefusedOnTheTrashArm()
+    async throws {
+        let replacementBytes = Data(repeating: 0x5A, count: 6_000)
+        let outcome = try await runLateFileSwapClean(
+            "late-swap-file-trash", moveToTrash: true
+        ) { target in
+            try? replacementBytes.write(to: target)
+        }
+        try assertLateSwapRefused(outcome)
+        XCTAssertEqual(
+            try Data(contentsOf: outcome.target), replacementBytes,
+            "the never-scanned replacement still stands at the name"
+        )
+    }
+
+    /// PERMANENT ARM, symlink planted at the name: the user's link SURVIVES
+    /// (it is not the scanned inode) and its target tree is never entered.
+    func testEphemeralTempSymlinkPlantedAtTheDisposalIsRefusedOnThePermanentArm()
+    async throws {
+        var payload: URL!
+        let outcome = try await runLateFileSwapClean(
+            "late-swap-symlink-permanent", moveToTrash: false
+        ) { target in
+            let base = target.deletingLastPathComponent()
+                .deletingLastPathComponent()
+            let precious = base.appendingPathComponent("precious-docs")
+            payload = precious.appendingPathComponent("thesis.txt")
+            try? FileManager.default.createDirectory(
+                at: precious, withIntermediateDirectories: true
+            )
+            try? Data(repeating: 0x42, count: 1_234).write(to: payload)
+            try? FileManager.default.createSymbolicLink(
+                at: target, withDestinationURL: precious
+            )
+        }
+        try assertLateSwapRefused(outcome)
+        XCTAssertNotNil(
+            try? FileManager.default.destinationOfSymbolicLink(
+                atPath: outcome.target.path
+            ),
+            "the planted link still stands at the name"
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: payload.path),
+                      "and its target tree is untouched")
+    }
+
+    /// TRASH ARM, symlink planted at the name: refused pre-move; the link
+    /// survives, its target tree untouched, the Trash undisturbed.
+    func testEphemeralTempSymlinkPlantedAtTheDisposalIsRefusedOnTheTrashArm()
+    async throws {
+        var payload: URL!
+        let outcome = try await runLateFileSwapClean(
+            "late-swap-symlink-trash", moveToTrash: true
+        ) { target in
+            let base = target.deletingLastPathComponent()
+                .deletingLastPathComponent()
+            let precious = base.appendingPathComponent("precious-docs")
+            payload = precious.appendingPathComponent("thesis.txt")
+            try? FileManager.default.createDirectory(
+                at: precious, withIntermediateDirectories: true
+            )
+            try? Data(repeating: 0x42, count: 1_234).write(to: payload)
+            try? FileManager.default.createSymbolicLink(
+                at: target, withDestinationURL: precious
+            )
+        }
+        try assertLateSwapRefused(outcome)
+        XCTAssertNotNil(
+            try? FileManager.default.destinationOfSymbolicLink(
+                atPath: outcome.target.path
+            ),
+            "the planted link still stands at the name"
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: payload.path),
+                      "and its target tree is untouched")
     }
 }

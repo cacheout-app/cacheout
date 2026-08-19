@@ -515,11 +515,25 @@ enum PreDeleteInspectedObject: Equatable, Sendable {
     /// A real directory was opened and walked; this is the `fstat` identity
     /// of the descriptor the whole walk was anchored to.
     case directory(FileSystemIdentityProvider.Identity)
+    /// A NON-directory leaf (regular file, or a link the producer chose to
+    /// verify) was opened and inspected; this is the `fstat` identity of the
+    /// descriptor the inspection held. The disposal must prove the leaf it
+    /// destroys IS this object — `DepthSafeRemoval`'s `ENOTDIR` arm compares
+    /// an `fstatat` under the proved parent, and `TrashDisposal` binds the
+    /// same facts on both sides of the move (PR #459 review r5: the file arm
+    /// of the temp revalidator verified exactly this identity and then
+    /// discarded it into `.noDirectoryTree`, so a replacement landing after
+    /// the re-check was destroyed on both arms with success reported).
+    case nonDirectoryLeaf(FileSystemIdentityProvider.Identity)
     /// The root open reported `ENOENT`/`ENOTDIR`: there is no directory TREE
     /// of ours at that name — absent, symlink, regular file, special file —
     /// and deletion removes the leaf as-is. The clean verdict is about the
     /// ABSENCE of a tree, so a directory appearing at that name since voids it
-    /// just as surely as a swapped inode.
+    /// just as surely as a swapped inode. A producer that HOLDS the leaf's
+    /// identity must say `.nonDirectoryLeaf` instead; this case is for the
+    /// probe whose root open FAILED and therefore never had an identity to
+    /// carry (`OrphanedCachesScanner`), and it keeps that probe's disclosed
+    /// residual: any non-directory at the name satisfies it.
     case noDirectoryTree
     /// Nothing was established: either the inspection refused before it could
     /// bind anything, or this revalidator has no object binding to offer at

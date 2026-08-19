@@ -1072,6 +1072,15 @@ actor CacheCleaner {
         switch inspected {
         case .directory(let identity):
             return provider.identity(of: target) == identity
+        case .nonDirectoryLeaf(let identity):
+            // Same comparison as the `.directory` arm — `identity(of:)` is
+            // an `lstat`, so a symlink compares as the LINK — and, like the
+            // whole method, this is the cheap early refusal, NOT the proof:
+            // the load-bearing bindings are the removal's `fstatat` under
+            // the proved parent and `TrashDisposal`'s two-sided leaf
+            // binding. `nil` (absent/unreadable) is not a match; the
+            // disposal's own arms produce the item-keyed error.
+            return provider.identity(of: target) == identity
         case .noDirectoryTree:
             // The clean verdict rested on there being no directory TREE of
             // ours at that name (absent, symlink, regular file, special) —

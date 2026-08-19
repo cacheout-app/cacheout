@@ -80,7 +80,13 @@ and docs/v1/CLI-REFERENCE.md) — the pre-release `node_modules` →
   including a named pipe or socket planted mid-scan — which can no longer stall
   the scan or the clean either. The check runs on both
   disposals, and on the Move-to-Trash default it refuses before the item is
-  moved, so a refusal never disturbs your Trash.
+  moved, so a refusal never disturbs your Trash. The proven identity also
+  travels INTO each disposal — for directories and for regular files alike —
+  so a replacement that lands even after the re-check itself is refused at
+  the destructive call: the permanent delete re-proves the object under the
+  folder it verified, and the Trash move proves it on both sides of the move.
+  (Before this, that late window was covered for directories only: a FILE
+  swapped in after the re-check was disposed of with success reported.)
 - **Configurable dev roots.** Settings gains a dev-roots editor and the CLI a
   repeatable `--dev-root PATH` (invocation-scoped, never persisted). The
   filesystem root, any volume root or mount point, and `$HOME` itself are

@@ -328,6 +328,44 @@ enum TrashDisposal {
         containedIn admittedParent: DepthSafeRemoval.AdmittedParent,
         via disposal: (URL) async throws -> URL?
     ) async throws {
+        // A NON-DIRECTORY leaf verdict cannot be proved by `look` — its kind
+        // gate is an `O_DIRECTORY` open, which can only ever IDENTIFY a
+        // directory (ENOTDIR/ELOOP name no inode). The carried identity is
+        // bound the way the no-leaf-verdict arm below binds: one `fstatat`
+        // under the PROVED container, on BOTH sides of the move, required
+        // equal to the identity the revalidator verified (PR #459 review r5
+        // — before this branch, ANY `.noDirectoryTree` sighting satisfied
+        // the file arm's verdict and a swapped-in file was trashed and KEPT
+        // with success reported).
+        if case .nonDirectoryLeaf(let expected) = inspected {
+            let bound = try boundLeaf(
+                of: target, containedIn: admittedParent, provider: provider
+            )
+            guard bound.identity == expected else {
+                // Refused BEFORE the move: the Trash is untouched. The same
+                // cause the permanent arm throws for the same event, so the
+                // cleaner's log tags both `content-drift`.
+                throw DepthSafeRemoval.Failure(
+                    path: target.path, cause: .notTheInspectedObject, depth: 0
+                )
+            }
+            let landed = try await disposal(target)
+            guard let landed else {
+                throw Failure(path: target.path, cause: .destinationUnknown)
+            }
+            let observed = facts(at: landed, provider: provider)
+            guard observed == bound else {
+                throw Failure(
+                    path: target.path,
+                    cause: rollBack(
+                        observed, from: landed, to: target,
+                        containedIn: admittedParent, provider: provider
+                    )
+                )
+            }
+            return
+        }
+
         // (1) The cheap refusal, and the one that keeps the Trash untouched.
         try proveStanding(inspected, at: target, provider: provider)
 
@@ -663,10 +701,16 @@ enum TrashDisposal {
         _ inspected: UserDataProbeResult.InspectedRoot,
         with sighting: Sighting, absenceProves: Bool
     ) -> DepthSafeRemoval.Failure.Cause? {
+        // `.nonDirectoryLeaf` verdicts never take this path in production —
+        // `dispose(_:expecting:…)` binds them by `fstatat` under the proved
+        // container, because a `look` cannot IDENTIFY a non-directory — and
+        // if one arrives anyway, every arm below refuses it (each `guard
+        // case` names a different case), which is the fail-closed default.
         switch sighting {
         case .directory(let seen):
             // Only a `.directory` verdict about THIS inode admits it;
-            // `.noDirectoryTree` and `.unestablished` are refusals.
+            // `.noDirectoryTree`, `.nonDirectoryLeaf` and `.unestablished`
+            // are refusals.
             guard case .directory(let expected) = inspected, seen == expected
             else { return .notTheInspectedObject }
             return nil

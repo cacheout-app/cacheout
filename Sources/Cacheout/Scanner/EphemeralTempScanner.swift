@@ -97,14 +97,21 @@
 ///   both observations with a different tree in between — a MIXED size figure
 ///   on the object stage 1 really did gate. Disclosure, not deletion of an
 ///   unvetted object.
-/// - Deletion destroys only the RECORDED object: admission re-runs no-follow
-///   (`CacheCleaner.removeGuardedItem`'s `admitContainer` +
+/// - Deletion is BOUND to the recorded object for both kinds: admission
+///   re-runs no-follow (`CacheCleaner.removeGuardedItem`'s `admitContainer` +
 ///   `validateRemovableItem` pair), deletion removes the UNRESOLVED leaf
-///   (`removeItemConcurrently`, and `TrashDisposal` on the other arm), and
-///   this scanner's `preDeleteRevalidator` (foot of this file) re-establishes
-///   the entry's own gates from a HELD DESCRIPTOR immediately before the
+///   (`removeItemConcurrently`, and `TrashDisposal` on the other arm), this
+///   scanner's `preDeleteRevalidator` (foot of this file) re-establishes the
+///   entry's own gates from a HELD DESCRIPTOR immediately before the
 ///   destructive call and refuses any object whose identity is not the
-///   scan-recorded one.
+///   scan-recorded one — and the `.allow` CARRIES that identity
+///   (`.directory` / `.nonDirectoryLeaf`) so each disposal arm re-proves the
+///   object it acts on past the revalidator's own window (PR #459 review r5:
+///   before the leaf case carried it, a file swapped in after the re-check
+///   was destroyed on both arms with success reported). What remains is
+///   disclosed where it lives: the permanent leaf arm's one-syscall
+///   `fstatat`→`unlinkat` window (`DepthSafeRemoval`, residual 2's shape)
+///   and the Trash arm's post-move-detected swap, which is rolled back.
 ///
 /// The path-based-substrate residual class exists in every as-built per-item
 /// scanner (`OrphanedCachesScanner.swift:230-233`, the "RESIDUAL, STATED:
@@ -1610,14 +1617,19 @@ struct EphemeralTempScanner: @unchecked Sendable {
     /// it was touched; the boundary can never move the other way. Tests inject
     /// a fixed clock, which is what pins the thresholds side.
     ///
-    /// AND THE ALLOW CARRIES A BINDING. `.directory(identity)` is the `fstat`
-    /// of the descriptor this revalidation held open the whole time — not a
-    /// re-`lstat` of the path, which is exactly what an attacker re-points.
-    /// That is what makes `probedObject` non-nil in the cleaner, which is what
-    /// makes the removal prove the inode it opens and the Trash arm prove the
-    /// object on both sides of the move. A revalidator that refused correctly
-    /// but returned `.unestablished` would bind nothing, and per house
-    /// doctrine that is not a binding at all.
+    /// AND THE ALLOW CARRIES A BINDING — FOR BOTH KINDS (PR #459 review r5:
+    /// this paragraph used to describe only `.directory`, while the file arm
+    /// returned an identity-free `.noDirectoryTree` and neither disposal
+    /// could prove the leaf it destroyed). `.directory(identity)` and
+    /// `.nonDirectoryLeaf(identity)` each carry the `fstat` of the descriptor
+    /// this revalidation held open the whole time — not a re-`lstat` of the
+    /// path, which is exactly what an attacker re-points. That is what makes
+    /// `probedObject` non-nil in the cleaner: the removal then proves the
+    /// object it is about to destroy (the opened inode for a directory, an
+    /// `fstatat` under the proved parent for a leaf) and the Trash arm proves
+    /// the object on both sides of the move. A revalidator that refused
+    /// correctly but returned `.unestablished` would bind nothing, and per
+    /// house doctrine that is not a binding at all.
     var preDeleteRevalidator: PreDeleteRevalidator? {
         Self.preDeleteRevalidator(
             roots: roots, thresholds: thresholds, provider: provider,
@@ -1900,12 +1912,19 @@ struct EphemeralTempScanner: @unchecked Sendable {
                         + "deleted; re-scan required"
                 )
             }
-            // `.noDirectoryTree` is the honest binding for a non-directory
-            // leaf: the deletion's `ENOTDIR` arm proves no directory tree has
-            // appeared at this name since, and the Trash arm's `look` (an
-            // `O_DIRECTORY` open) agrees. It is the SAME verdict the sweep's
-            // probe returns for the same shape.
-            return .allow(inspected: .noDirectoryTree)
+            // THE BINDING, file arm (PR #459 review r5). `identity` is the
+            // `fstat` of the descriptor this whole verdict held, already
+            // proven equal to the scan's record above. Until r5 this arm
+            // returned `.noDirectoryTree` — a verdict any non-directory at
+            // the name satisfies — so every gate above ran and the disposal
+            // then destroyed WHATEVER stood there: measured through the
+            // production cleaner, a swap fired after this verdict returned
+            // permanently unlinked a never-scanned file (and, on the Trash
+            // arm, trashed it) with success reported quoting the scanned
+            // file's bytes. Carrying the identity is what makes the
+            // permanent arm's `ENOTDIR` comparison and the Trash arm's
+            // two-sided leaf binding refuse that replacement.
+            return .allow(inspected: .nonDirectoryLeaf(identity))
         }
 
         var budget = entryLimit

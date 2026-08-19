@@ -1978,11 +1978,15 @@ final class EphemeralTempScannerTests: XCTestCase {
         )
     }
 
-    /// A REGULAR-FILE candidate has no tree to walk, and `.noDirectoryTree` is
-    /// the honest binding for it: the deletion's `ENOTDIR` arm proves no
-    /// directory has appeared at the name since, and the Trash arm's
-    /// `O_DIRECTORY` look agrees.
-    func testRevalidatorBindsARegularFileCandidateAsNoDirectoryTree()
+    /// A REGULAR-FILE candidate has no tree to walk, and its `.allow` carries
+    /// the file's own identity — the `fstat` of the descriptor the
+    /// revalidation held, already proven equal to the scan's record. This is
+    /// what the permanent arm's `ENOTDIR` `fstatat` comparison and the Trash
+    /// arm's two-sided leaf binding prove the disposal against (PR #459
+    /// review r5: this verdict used to be the identity-free
+    /// `.noDirectoryTree`, which any non-directory at the name satisfied, so
+    /// a replacement landing after the re-check was destroyed on both arms).
+    func testRevalidatorBindsARegularFileCandidateToItsInodeIdentity()
         async throws {
         let entry = try writeFile(
             sharedRootURL.appendingPathComponent("old-blob.bin"), bytes: 8_192
@@ -1992,10 +1996,13 @@ final class EphemeralTempScannerTests: XCTestCase {
         let scanned = itemsByName(await scan(scanner))
         let item = try XCTUnwrap(scanned["old-blob.bin"])
 
+        let expected = try XCTUnwrap(
+            FileSystemIdentityProvider().identity(of: canonical(entry))
+        )
         XCTAssertEqual(
             try XCTUnwrap(scanner.preDeleteRevalidator)
                 .revalidate(item: item, authorization: nil),
-            .allow(inspected: .noDirectoryTree)
+            .allow(inspected: .nonDirectoryLeaf(expected))
         )
     }
 

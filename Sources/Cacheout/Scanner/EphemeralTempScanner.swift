@@ -698,17 +698,28 @@ struct EphemeralTempScanner: @unchecked Sendable {
     /// (`DirectorySizer.recordRegularFile` is its ONLY writer; the enumerator's
     /// `.directory` arm records mount boundaries and nothing else).
     ///
-    /// SO THE POST-SIZING CROSS-CHECK IS TWO-SIDED, NOT ONE-DIRECTIONAL
-    /// (PR #459 review r1). The comment that stood here called the asymmetry
-    /// "one-directional by construction" and left it at that, which described
-    /// the mechanism of a gap without owning it: because `newestContentDate`
-    /// is blind to the own mtime, a `mkdir`/`unlink`/`rename`/symlink/socket
-    /// landing in the candidate DURING the sizing walk defeated the stricter
-    /// half entirely. `scan` now re-reads the own mtime after sizing with this
-    /// same `leafDate` and this same cutoff, so both halves are measured as of
-    /// sizing completion. `newestContentDate` stays regular-files-only, and
-    /// that is exactly WHY the separate own-mtime read is required rather than
-    /// optional.
+    /// WHICH HALF IS RE-MEASURED, AND WHEN (PR #459 review r2 — the wording
+    /// here claimed "both halves are measured as of sizing completion", which
+    /// is true of only one of them).
+    ///
+    /// The OWN-MTIME half IS re-measured at sizing completion: `scan` re-reads
+    /// it after the sizing walk with this same `leafDate` and this same
+    /// cutoff. That is what closes the case the previous comment described
+    /// without owning — because `newestContentDate` is blind to the own mtime,
+    /// a `mkdir`/`unlink`/`rename`/symlink/socket landing in the candidate
+    /// DURING sizing used to defeat the stricter half entirely.
+    ///
+    /// The CONTENT half is only as fresh as the walk that collected it.
+    /// `SizeReport.newestContentDate` is accumulated per regular file AS the
+    /// sizing enumerator passes it, and stage 1's `walkForFreshContent` runs
+    /// entirely BEFORE sizing and never re-runs — neither is re-read
+    /// afterwards. So a write to `X/a/b/live.log` after the enumerator has
+    /// left `X/a/b` bumps `b`'s mtime, not `X`'s: the post-sizing own-mtime
+    /// re-probe reads old, `newestContentDate` never saw the file, and the row
+    /// still ships `isStale: true`. Intermediate DIRECTORY mtimes are not
+    /// inputs anywhere in this scanner, which is what leaves that escape open.
+    /// It is narrowed at DELETE time, not here: `preDeleteRevalidator` walks
+    /// the tree again from a held descriptor immediately before removal.
     private func directoryStaleness(
         of entry: URL, cutoff: Date
     ) -> StalenessVerdict {
@@ -1194,10 +1205,16 @@ struct EphemeralTempScanner: @unchecked Sendable {
             // `preDeleteRevalidator` at the foot of this file.
             automaticCleanEligible: false,
             // Every emitted item passed the two-stage staleness rule AND the
-            // post-sizing freshness re-check, both measured at SIZING-
-            // COMPLETION time. They are re-established against the current
-            // filesystem immediately before deletion by `preDeleteRevalidator`
-            // — this flag is a scan-time fact, not a delete-time one.
+            // post-sizing freshness re-check. Their AS-OF times differ and the
+            // comment here used to flatten them (PR #459 review r2): the
+            // entry's OWN mtime is re-read at sizing COMPLETION, while the
+            // content half is only as fresh as the walk that collected it —
+            // `newestContentDate` is accumulated per file DURING sizing and
+            // stage 1's walk ran before it. See `directoryStaleness` for the
+            // escape that leaves open. Both are re-established against the
+            // current filesystem immediately before deletion by
+            // `preDeleteRevalidator` — this flag is a scan-time fact, not a
+            // delete-time one.
             isStale: true,
             // The BRACES half of the belt-and-braces dispatch: this scanner
             // declares a revalidator whose applicability is "every temp item",
@@ -1752,12 +1769,21 @@ struct EphemeralTempScanner: @unchecked Sendable {
         }
 
         for name in pending {
-            let childDescriptor = provider.openChildDirectory(
+            // THE CARRYING FORM (PR #459 review r2). The raw-`Int32`
+            // `openChildDirectory` leaves its code in the GLOBAL `errno`, and
+            // `FileSystemIdentityProvider` documents that twin as existing
+            // precisely because "a test override (or any intervening call) can
+            // clobber" it before the caller reads it — which matters here,
+            // where ENOENT/ENOTDIR is a benign vanished branch and every other
+            // code makes the whole verdict UNPROVABLE, i.e. a refusal.
+            let childDescriptor: Int32
+            switch provider.openChildDirectoryCarryingErrno(
                 inDirectory: descriptor, named: name,
                 logical: directory.appendingPathComponent(name)
-            )
-            guard childDescriptor >= 0 else {
-                let code = errno
+            ) {
+            case .opened(let opened):
+                childDescriptor = opened
+            case .failed(let code):
                 if code == ENOENT || code == ENOTDIR { continue }
                 return .unprovable(String(cString: strerror(code)))
             }

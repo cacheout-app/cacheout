@@ -26,10 +26,18 @@
 /// probe → `.deletionTarget` sizing → freshness re-check → outcome mapping.
 ///
 /// Two orderings inside it are load-bearing: a candidate already known IN USE
-/// is never traversed or sized, and the freshness re-check runs BEFORE the
-/// post-sizing outcome mapping (a fresh tree offers nothing to reclaim, so it
-/// is not listed even when its sizing hit denials — those denials still surface
-/// through the per-root accounting).
+/// is never traversed or sized, and the post-sizing re-checks run BEFORE the
+/// outcome mapping — a tree that is fresh BY EITHER HALF of the staleness rule
+/// offers nothing to reclaim, so it is not listed even when its sizing hit
+/// denials (those denials still surface through the per-root accounting).
+///
+/// BOTH halves are re-checked after sizing (PR #459 review r1): the entry's
+/// OWN mtime, which is a REQUIRED input of the two-stage rule and which the
+/// sizer never reads, and `SizeReport.newestContentDate`, which merges
+/// regular-file mtimes only. Re-checking only the second left the first
+/// decided by timing alone — the same filesystem fact yielding "silently
+/// excluded" or "STALE and bulk-selectable" depending on which side of one
+/// `lstat` the change landed.
 ///
 /// ## Trigger policy (epic D11 r5 — the WHOLE scanner)
 ///
@@ -476,7 +484,6 @@ struct EphemeralTempScanner: @unchecked Sendable {
                 case .symlink, .other:
                     continue // unreachable — filtered above
                 }
-                let ownDate: Date
                 switch verdict {
                 case .notStale, .vanished:
                     continue
@@ -485,8 +492,13 @@ struct EphemeralTempScanner: @unchecked Sendable {
                            "staleness of \(entry.lastPathComponent) could not "
                             + "be established")
                     continue
-                case .stale(let date):
-                    ownDate = date
+                case .stale:
+                    // The payload date is deliberately DROPPED here: stage 1
+                    // read it before the pre-filter walk and before sizing, and
+                    // stage (6a) below re-reads it afterwards. Carrying the
+                    // pre-walk value forward is what made the evidence string
+                    // report an mtime that was already false.
+                    break
                 }
 
                 // (4) COOPERATIVE LOCK PROBE — after the pre-filter, BEFORE
@@ -508,6 +520,67 @@ struct EphemeralTempScanner: @unchecked Sendable {
                 // (5) SIZING — always `.deletionTarget` (see `measure`).
                 let report = measure(entry)
 
+                // (6a) OWN-MTIME RE-PROBE (PR #459 review r1). The stage-1
+                // truth table makes the entry's OWN mtime a REQUIRED input —
+                // "fresh own mtime + all contents old" is NOT stale — and
+                // stage 1 read it ONCE, before the pre-filter walk and before
+                // the entire sizing walk. `SizeReport.newestContentDate`
+                // cannot cover for it: it merges REGULAR-FILE mtimes only
+                // (`DirectorySizer.recordRegularFile` is its sole writer), so
+                // a `mkdir`/`unlink`/`rename`/symlink/socket landing in the
+                // candidate during sizing bumps the entry's own mtime and
+                // contributes NOTHING to `newestContentDate`.
+                //
+                // Without this, the identical filesystem fact yielded opposite
+                // verdicts on timing alone: "not stale, silently excluded" one
+                // microsecond before the stage-1 read, "STALE, badged and
+                // BULK-selectable" one microsecond after. `isStale` is the key
+                // of the section's one-click "Select Stale (30d+)" button, so
+                // its honesty is load-bearing.
+                //
+                // The same no-follow read (`leafDate` → `lstat`) and the SAME
+                // `cutoff`, so the two halves can never disagree on the
+                // boundary. It is placed BEFORE the content check so the cheap
+                // single `lstat` short-circuits and so a suppression names the
+                // right cause.
+                //
+                // CLAIM SCOPE: this NARROWS the window from
+                // "pre-filter → end of sizing" to "end of sizing → emission".
+                // It does not close it — the mtime can change between emission
+                // and the user's click — and like every other read in this
+                // scanner it is path-based (W1/W2/W3).
+                let sizedOwnDate: Date
+                switch leafDate(of: entry) {
+                case .vanished:
+                    // The observable-race contract, unchanged: no item, no
+                    // denial, no issue.
+                    continue
+                case .failed(let cause):
+                    // FAIL CLOSED, matching stage 1's direction exactly: an
+                    // unprovable staleness is "not stale, and VISIBLE". A
+                    // permission change or an out-of-domain metadata read
+                    // mid-scan must not silently downgrade to "still stale".
+                    record(cause, at: entry,
+                           "staleness of \(entry.lastPathComponent) could not "
+                            + "be re-established after sizing")
+                    continue
+                case .dated(let own, _):
+                    guard own < cutoff else {
+                        // Same shape as the content arm below: suppressed as
+                        // fresh, with any sizing denials still surfaced so
+                        // visibility survives without a lying row.
+                        if let ranked = Self.rankedDenial(report.denials) {
+                            record(.sizing(ranked), at: entry,
+                                   "\(entry.lastPathComponent) was excluded "
+                                    + "because it was modified while it was "
+                                    + "being measured, but part of it could "
+                                    + "not be read")
+                        }
+                        continue
+                    }
+                    sizedOwnDate = own
+                }
+
                 // (6) FRESHNESS RE-CHECK, before any outcome mapping. Positive
                 // evidence of freshness disqualifies the candidate REGARDLESS
                 // of report cleanliness: an item exists to offer deletion of
@@ -525,10 +598,14 @@ struct EphemeralTempScanner: @unchecked Sendable {
                     continue
                 }
 
-                // (7) OUTCOME MAPPING (+ the clean-walk floor).
+                // (7) OUTCOME MAPPING (+ the clean-walk floor). `ownDate` is
+                // the RE-READ one: the `newestContentDate == nil` evidence
+                // branch prints "last modified N days ago" from it, and the
+                // pre-filter's value would be a literal false statement about
+                // an entry touched during sizing.
                 if let item = reclaimableItem(
                     entry: entry, identity: identity, root: root,
-                    report: report, ownDate: ownDate, now: now
+                    report: report, ownDate: sizedOwnDate, now: now
                 ) {
                     items.append(item)
                 }
@@ -600,8 +677,20 @@ struct EphemeralTempScanner: @unchecked Sendable {
     /// blind spot the sizer accepts). The entry's OWN mtime IS an input, which
     /// makes this rule STRICTER than `SizeReport.newestContentDate` — that
     /// merges regular-file mtimes only and never reads directory mtimes
-    /// (`DirectorySizer.swift:349-355` vs :282-293) — so the stage-2
-    /// cross-check is one-directional by construction.
+    /// (`DirectorySizer.recordRegularFile` is its ONLY writer; the enumerator's
+    /// `.directory` arm records mount boundaries and nothing else).
+    ///
+    /// SO THE POST-SIZING CROSS-CHECK IS TWO-SIDED, NOT ONE-DIRECTIONAL
+    /// (PR #459 review r1). The comment that stood here called the asymmetry
+    /// "one-directional by construction" and left it at that, which described
+    /// the mechanism of a gap without owning it: because `newestContentDate`
+    /// is blind to the own mtime, a `mkdir`/`unlink`/`rename`/symlink/socket
+    /// landing in the candidate DURING the sizing walk defeated the stricter
+    /// half entirely. `scan` now re-reads the own mtime after sizing with this
+    /// same `leafDate` and this same cutoff, so both halves are measured as of
+    /// sizing completion. `newestContentDate` stays regular-files-only, and
+    /// that is exactly WHY the separate own-mtime read is required rather than
+    /// optional.
     private func directoryStaleness(
         of entry: URL, cutoff: Date
     ) -> StalenessVerdict {

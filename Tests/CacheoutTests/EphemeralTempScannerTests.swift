@@ -268,6 +268,42 @@ final class EphemeralTempScannerTests: XCTestCase {
         }
     }
 
+    /// Lets the first N no-follow metadata reads of a basename succeed and
+    /// fails every later one — the hermetic stand-in for a permission change
+    /// (or an out-of-domain metadata read) landing DURING the sizing walk,
+    /// which a single-uid fixture cannot stage against itself mid-scan.
+    ///
+    /// Both halves are overridden because `leafDate` re-probes on the nil
+    /// path: `leafMetadata` nil alone would be classified `.metadataUnavailable`
+    /// via `probeKind`, and this double is about the errno arm.
+    private final class LateFailingLeafProvider: FileSystemIdentityProvider {
+        /// basename → how many reads succeed before the failure starts.
+        var failAfter: [String: Int] = [:]
+        private var seen: [String: Int] = [:]
+        private var failing: Set<String> = []
+
+        override func leafMetadata(of url: URL) -> LeafMetadata? {
+            let name = url.lastPathComponent
+            guard let limit = failAfter[name] else {
+                return super.leafMetadata(of: url)
+            }
+            let count = (seen[name] ?? 0) + 1
+            seen[name] = count
+            guard count <= limit else {
+                failing.insert(name)
+                return nil
+            }
+            return super.leafMetadata(of: url)
+        }
+
+        override func probeKind(of url: URL) -> KindProbe {
+            if failing.contains(url.lastPathComponent) {
+                return .failed(errno: EIO)
+            }
+            return super.probeKind(of: url)
+        }
+    }
+
     /// Injects mount points by inode (the house hermetic pattern).
     private final class BoundaryInjectingProvider: FileSystemIdentityProvider {
         var mountPointInodes: Set<UInt64> = []
@@ -916,6 +952,173 @@ final class EphemeralTempScannerTests: XCTestCase {
         XCTAssertTrue(outcome.items.isEmpty,
                       "positive evidence of freshness disqualifies it")
         XCTAssertTrue(outcome.errors.isEmpty)
+        _ = entry
+    }
+
+    // MARK: - PR #459 review r1: the OWN-MTIME half, re-checked after sizing
+    //
+    // DISCLOSURE-HONESTY defect, stated exactly: the row asserted a predicate
+    // (`isStale: true`, plus the age evidence) whose own-mtime half had not
+    // been re-verified since before the sizing walk. Nothing is deleted
+    // autonomously — `defaultSelected: false`, `.review` risk, smart-clean
+    // excluded — but `isStale` is the key of the section's one-click
+    // "Select Stale (30d+)" bulk selection, so a false one is one click from
+    // a deletion.
+
+    /// The exact mirror of the fresh-FILE cell above, with a DIRECTORY landing
+    /// instead: `mkdir` bumps the candidate's own mtime and contributes
+    /// NOTHING to `newestContentDate` (the sizer merges regular-file mtimes
+    /// only), so only a re-read of the entry's own mtime can see it.
+    func testOwnMtimeTouchedDuringSizingSuppressesTheCandidate() async throws {
+        try makeStaleCandidate("late-touched", under: sharedRootURL)
+        let spy = SizingSpy()
+        let freshDate = self.freshDate
+        spy.beforeMeasure = { url in
+            // A directory ONLY — no regular file is written, which is the
+            // whole point of the cell: `mkdir` contributes NOTHING to
+            // `newestContentDate` while bumping the entry's own mtime.
+            try? FileManager.default.createDirectory(
+                at: url.appendingPathComponent("late-sub"),
+                withIntermediateDirectories: false
+            )
+            // A real `mkdir` sets the parent's mtime to the WALL CLOCK, which
+            // this suite's injected clock is deliberately far ahead of — so
+            // the resulting mtime is stated explicitly rather than inherited
+            // from a clock the scanner never reads.
+            try? FileManager.default.setAttributes(
+                [.modificationDate: freshDate], ofItemAtPath: url.path
+            )
+        }
+
+        let outcome = await scan(makeScanner(
+            roots: [sharedRoot()],
+            candidateSizer: { [spy] url, mode in spy.measure(url, mode) }
+        ))
+
+        XCTAssertEqual(spy.calls.count, 1, "the candidate was measured")
+        XCTAssertTrue(
+            outcome.items.isEmpty,
+            "a fresh OWN mtime disqualifies it exactly as a fresh own mtime "
+                + "before the pre-filter would have — the verdict may not "
+                + "depend on which side of one `lstat` the change landed"
+        )
+        XCTAssertTrue(outcome.errors.isEmpty, "\(outcome.errors)")
+    }
+
+    /// Symmetry with the pre-filter cell `testFreshOwnMtimeWithAllOldContents…`
+    /// asserted directly: identical filesystem state, staged before vs during
+    /// sizing, must produce the identical verdict.
+    func testOwnMtimeTouchedDuringSizingSurfacesItsSizingDenials() async throws {
+        try makeStaleCandidate("late-touched-denied", under: sharedRootURL)
+        let spy = SizingSpy()
+        let freshDate = self.freshDate
+        spy.beforeMeasure = { url in
+            try? FileManager.default.createDirectory(
+                at: url.appendingPathComponent("late-sub"),
+                withIntermediateDirectories: false
+            )
+            try? FileManager.default.setAttributes(
+                [.modificationDate: freshDate], ofItemAtPath: url.path
+            )
+        }
+        spy.stub = { [self] url in
+            report(
+                exact: 8_192, itemCount: 1,
+                denials: [SizeDenial(
+                    url: url.appendingPathComponent("inner"),
+                    kind: .permission, detail: "permission denied"
+                )]
+            )
+        }
+
+        let outcome = await scan(makeScanner(
+            roots: [sharedRoot()],
+            candidateSizer: { [spy] url, mode in spy.measure(url, mode) }
+        ))
+
+        XCTAssertTrue(outcome.items.isEmpty)
+        XCTAssertEqual(outcome.errors.count, 1,
+                       "visibility survives without a lying row")
+        let issue = try XCTUnwrap(outcome.errors.first)
+        XCTAssertEqual(issue.kind, .permissionDenied)
+        XCTAssertTrue(
+            issue.detail.contains("modified while it was being measured"),
+            "the note names the ACTUAL cause, not 'excluded as fresh': "
+                + issue.detail
+        )
+    }
+
+    /// FAIL CLOSED, matching stage 1's direction: an own mtime that cannot be
+    /// re-established after sizing is "not stale, and VISIBLE".
+    func testPostSizingOwnMtimeReprobeFailureSuppressesAndReports() async throws {
+        try makeStaleCandidate("unreadable-after", under: sharedRootURL)
+        let provider = LateFailingLeafProvider()
+        provider.failAfter = ["unreadable-after": 1]
+
+        let outcome = await scan(makeScanner(
+            roots: [sharedRoot()], provider: provider
+        ))
+
+        XCTAssertTrue(outcome.items.isEmpty,
+                      "an unprovable staleness is never listed")
+        XCTAssertEqual(outcome.errors.count, 1, "\(outcome.errors)")
+        let issue = try XCTUnwrap(outcome.errors.first)
+        XCTAssertEqual(issue.url?.lastPathComponent, "unreadable-after")
+        XCTAssertTrue(
+            issue.detail.contains("could not be re-established after sizing"),
+            issue.detail
+        )
+    }
+
+    /// The ENOENT contract is unchanged by the re-probe: an entry that
+    /// vanishes during sizing is a silent skip — no item, no denial, no issue.
+    func testPostSizingOwnMtimeReprobeTreatsAVanishedEntryAsASilentSkip()
+        async throws {
+        try makeStaleCandidate("vanishing", under: sharedRootURL)
+        let spy = SizingSpy()
+        spy.beforeMeasure = { url in
+            try? FileManager.default.removeItem(at: url)
+        }
+
+        let outcome = await scan(makeScanner(
+            roots: [sharedRoot()],
+            candidateSizer: { [spy] url, mode in spy.measure(url, mode) }
+        ))
+
+        XCTAssertTrue(outcome.items.isEmpty)
+        XCTAssertTrue(outcome.errors.isEmpty,
+                      "no denial, no issue — the observable-race contract: "
+                        + "\(outcome.errors)")
+    }
+
+    /// The evidence string's "last modified N days ago" branch reports the
+    /// RE-READ own mtime, not the pre-filter one.
+    func testNilNewestContentDateEvidenceUsesTheReReadOwnMtime() async throws {
+        let entry = try makeStaleCandidate("re-dated", under: sharedRootURL)
+        let spy = SizingSpy()
+        // Still old — 10 days back rather than the fixture's 30 — so the
+        // candidate survives while the two readings are distinguishable.
+        let touched = clock.addingTimeInterval(-10 * 86_400)
+        spy.beforeMeasure = { url in
+            try? FileManager.default.setAttributes(
+                [.modificationDate: touched], ofItemAtPath: url.path
+            )
+        }
+        spy.stub = { [self] _ in
+            report(exact: 8_192, itemCount: 1, newestContentDate: nil)
+        }
+
+        let scanner = makeScanner(
+            roots: [sharedRoot()],
+            candidateSizer: { [spy] url, mode in spy.measure(url, mode) }
+        )
+        let outcome = await scan(scanner)
+        try assertValidates(outcome, scanner: scanner)
+
+        let item = try XCTUnwrap(outcome.items.first)
+        XCTAssertTrue(item.evidence.contains("last modified 10 days ago"),
+                      "the pre-filter's 30-day reading is stale by the time "
+                        + "the row is built: \(item.evidence)")
         _ = entry
     }
 

@@ -904,6 +904,78 @@ final class EphemeralTempRegistrationTests: XCTestCase {
         )
     }
 
+    /// THE PENDING-STATE HALF, OBSERVED DURING THE SESSION (PR #459 review
+    /// r2) — the half round 1 shipped unevidenced.
+    ///
+    /// `scanningScannerIDs` is cleared UNCONDITIONALLY in `scan`'s epilogue,
+    /// so any assertion made after `scan(trigger:)` returns is vacuously true
+    /// whichever set was assigned at the top. Round 1's cell asserted exactly
+    /// that, and the mutation it was supposed to catch (reverting
+    /// `scanningScannerIDs = participating` while leaving the session's
+    /// subset intact) left the whole suite green.
+    ///
+    /// What is load-bearing: `.remove(scannerID)` fires only on that
+    /// scanner's OWN event, so a scanner that never runs is never removed and
+    /// sits in the set for the ENTIRE session — which `perItemSections`
+    /// renders as `isScanning`, i.e. a section spinning for the whole scan
+    /// while nothing is scanning it. This cell holds the session open at a
+    /// rendezvous inside a participating scanner and reads both the set and
+    /// the rendered section while the session is still live.
+    @MainActor
+    func testADecliningScannerIsNotPendingWhileTheSessionRuns() async throws {
+        let gatedContainer = base.appendingPathComponent("pending-container")
+        try fm.createDirectory(
+            at: gatedContainer, withIntermediateDirectories: true
+        )
+        try Data(repeating: 0x41, count: 4_096).write(
+            to: gatedContainer.appendingPathComponent("gated-row")
+        )
+        let gated = TriggerGatedFixtureScanner(
+            id: "fixture_gated", container: canonical(gatedContainer)
+        )
+        let rendezvous = ScanRendezvous()
+        let holder = RendezvousFixtureScanner(
+            id: "fixture_holder", rendezvous: rendezvous
+        )
+        let runtime = try makeRuntime([gated, holder])
+        let viewModel = CacheoutViewModel(runtime: runtime)
+
+        // A completed user-initiated session first, so the declining scanner
+        // HAS a rendered section for the automatic session to spin.
+        await viewModel.scan(trigger: .userInitiated)
+        XCTAssertEqual(
+            viewModel.perItemSections
+                .first { $0.scannerID == "fixture_gated" }?.items.count,
+            1
+        )
+
+        let session = Task { await viewModel.scan(trigger: .automatic) }
+        await rendezvous.waitUntilStarted()
+
+        // OBSERVED WHILE THE SESSION IS LIVE — the epilogue has not run.
+        XCTAssertTrue(
+            viewModel.scanningScannerIDs.contains("fixture_holder"),
+            "the fixture must actually hold the session open: "
+                + "\(viewModel.scanningScannerIDs)"
+        )
+        XCTAssertFalse(
+            viewModel.scanningScannerIDs.contains("fixture_gated"),
+            "a scanner that declined this trigger is never invoked, so no "
+                + "event will ever remove it — it must never be marked pending"
+        )
+        let during = try XCTUnwrap(viewModel.perItemSections.first {
+            $0.scannerID == "fixture_gated"
+        })
+        XCTAssertFalse(during.isScanning,
+                       "and the section the user is looking at must not spin "
+                        + "for the whole scan while nothing is scanning it")
+        XCTAssertEqual(during.items.count, 1,
+                       "its prior rows stay rendered throughout")
+
+        rendezvous.release()
+        await session.value
+    }
+
     /// The SEAM, not the one scanner: any scanner that declines a trigger is
     /// left out of the session and keeps its prior displayed outcome.
     @MainActor
@@ -1013,5 +1085,79 @@ final class InvocationCounter: @unchecked Sendable {
     func bump() {
         lock.lock(); defer { lock.unlock() }
         value += 1
+    }
+}
+
+/// A two-phase rendezvous so a test can observe view-model state WHILE a scan
+/// session is live. No sleeping and no polling: the scanner signals that it
+/// has been entered, then parks until the test releases it.
+final class ScanRendezvous: @unchecked Sendable {
+    private let lock = NSLock()
+    private var started = false
+    private var startWaiter: CheckedContinuation<Void, Never>?
+    private var released = false
+    private var releaseWaiter: CheckedContinuation<Void, Never>?
+
+    func signalStarted() {
+        lock.lock()
+        started = true
+        let waiter = startWaiter
+        startWaiter = nil
+        lock.unlock()
+        waiter?.resume()
+    }
+
+    func waitUntilStarted() async {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if started {
+                lock.unlock()
+                continuation.resume()
+            } else {
+                startWaiter = continuation
+                lock.unlock()
+            }
+        }
+    }
+
+    func release() {
+        lock.lock()
+        released = true
+        let waiter = releaseWaiter
+        releaseWaiter = nil
+        lock.unlock()
+        waiter?.resume()
+    }
+
+    func waitForRelease() async {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if released {
+                lock.unlock()
+                continuation.resume()
+            } else {
+                releaseWaiter = continuation
+                lock.unlock()
+            }
+        }
+    }
+}
+
+/// Participates in every session and PARKS inside `scan` until released on the
+/// AUTOMATIC trigger only, so the observed session stays open while the
+/// user-initiated session that seeds the fixture still completes normally.
+/// Emits nothing.
+private struct RendezvousFixtureScanner: SpaceScanner {
+    let id: String
+    let rendezvous: ScanRendezvous
+    var displayName: String { "Fixture \(id)" }
+    var trustedContainerRoots: [URL] { [] }
+
+    func scan(context: ScanContext) async -> ScanOutcome {
+        if !context.includeProtectedRoots {
+            rendezvous.signalStarted()
+            await rendezvous.waitForRelease()
+        }
+        return ScanOutcome(items: [], errors: [])
     }
 }

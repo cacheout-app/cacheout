@@ -83,17 +83,32 @@
 /// - **W3** the root-level `probeKind` gate → `contentsOfDirectory` listing —
 ///   the roots themselves are same-user-replaceable.
 ///
-/// A swap landing inside these causes EXTERNAL METADATA ENUMERATION INTO
-/// SIZING at most — never deletion: delete-time admission re-runs no-follow
-/// (`CacheCleaner.removeGuardedItem`'s `admitContainer` +
-/// `validateRemovableItem` pair), deletion removes the UNRESOLVED leaf
-/// (`removeItemConcurrently`, and `TrashDisposal` on the other arm), the
-/// validator binds the deletion target to the scan record, and this scanner's
-/// `preDeleteRevalidator` (foot of this file) re-establishes the entry's own
-/// gates from a HELD DESCRIPTOR immediately before the destructive call.
-/// The identical residual class exists in every as-built per-item scanner
-/// (`OrphanedCachesScanner.swift:334-355`). Descriptor (fd) anchoring is the
-/// recorded deferred alternative — it is shared-substrate surgery on
+/// What a swap landing inside these can and cannot do (PR #459 review r4 —
+/// the previous census said "never deletion" of a same-kind swap, which was
+/// measured false before the identity pin existed):
+///
+/// - A CANDIDATE swapped between stage 1's staleness `lstat` and the
+///   post-sizing re-read is SILENTLY SKIPPED, not emitted: stage 1's
+///   (device, inode) is carried as `gatedIdentity` and the stage-(6a) re-read
+///   must match it, so the scan record can only ever name the object stage 1
+///   gated, the lock probe cleared and the sizer walked.
+/// - What survives inside W1/W2: external metadata ENUMERATION INTO SIZING,
+///   and — for an ABA revert, where the gated inode stands at the name at
+///   both observations with a different tree in between — a MIXED size figure
+///   on the object stage 1 really did gate. Disclosure, not deletion of an
+///   unvetted object.
+/// - Deletion destroys only the RECORDED object: admission re-runs no-follow
+///   (`CacheCleaner.removeGuardedItem`'s `admitContainer` +
+///   `validateRemovableItem` pair), deletion removes the UNRESOLVED leaf
+///   (`removeItemConcurrently`, and `TrashDisposal` on the other arm), and
+///   this scanner's `preDeleteRevalidator` (foot of this file) re-establishes
+///   the entry's own gates from a HELD DESCRIPTOR immediately before the
+///   destructive call and refuses any object whose identity is not the
+///   scan-recorded one.
+///
+/// The path-based-substrate residual class exists in every as-built per-item
+/// scanner (`OrphanedCachesScanner.swift:334-355`). Descriptor (fd) anchoring
+/// is the recorded deferred alternative — it is shared-substrate surgery on
 /// `DirectorySizer` and belongs to a roadmap-level hardening that benefits all
 /// per-item scanners at once. NOTHING here claims a swap is impossible.
 ///
@@ -505,6 +520,12 @@ struct EphemeralTempScanner: @unchecked Sendable {
                 case .symlink, .other:
                     continue // unreachable — filtered above
                 }
+                // The (device, inode) STAGE 1 GATED — what the lock probe
+                // clears and the sizing walk is ABOUT. Stage (6a) proves its
+                // own re-read against this, which is what binds the emitted
+                // report to the object the whole pipeline inspected (PR #459
+                // review r4, codex C1).
+                let gatedIdentity: FileSystemIdentityProvider.Identity
                 switch verdict {
                 case .notStale, .vanished:
                     continue
@@ -513,13 +534,16 @@ struct EphemeralTempScanner: @unchecked Sendable {
                            "staleness of \(entry.lastPathComponent) could not "
                             + "be established")
                     continue
-                case .stale:
+                case .stale(_, let identity):
                     // The payload date is deliberately DROPPED here: stage 1
                     // read it before the pre-filter walk and before sizing, and
                     // stage (6a) below re-reads it afterwards. Carrying the
                     // pre-walk value forward is what made the evidence string
-                    // report an mtime that was already false.
-                    break
+                    // report an mtime that was already false. The IDENTITY is
+                    // the opposite case: it must be the PRE-walk observation,
+                    // because it exists to prove the post-sizing read saw the
+                    // same object stage 1 did.
+                    gatedIdentity = identity
                 }
 
                 // (4) COOPERATIVE LOCK PROBE — after the pre-filter, BEFORE
@@ -571,13 +595,18 @@ struct EphemeralTempScanner: @unchecked Sendable {
                 // and the user's click — and like every other read in this
                 // scanner it is path-based (W1/W2/W3).
                 let sizedOwnDate: Date
-                // THE SCAN'S RECORDED IDENTITY (PR #459 review r2) — read
-                // from the SAME `lstat` as the re-probed mtime, so the two can
-                // never describe different objects, and taken at the LAST
-                // scan-time observation of the entry, so the window it leaves
-                // open is the narrowest this scanner has. It rides the item to
-                // the delete-time re-check, which refuses ANY other object
-                // standing at this name.
+                // THE SCAN'S RECORDED IDENTITY (PR #459 review r2, pinned r4)
+                // — read from the SAME `lstat` as the re-probed mtime, so the
+                // two can never describe different objects, and PROVEN EQUAL
+                // to `gatedIdentity` below, so it is also the object stage 1
+                // gated, the lock probe cleared and the sizer walked. It rides
+                // the item to the delete-time re-check, which refuses any
+                // OTHER object standing at this name. What stays open after
+                // the pin: an ABA revert (the same inode observed here and at
+                // stage 1 with a different tree standing in between — the
+                // accepted path-based W2 interior, whose worst case is a mixed
+                // size figure on the object stage 1 really did gate) and the
+                // emission→click window the delete-time re-check covers.
                 let sizedIdentity: FileSystemIdentityProvider.Identity
                 switch leafDate(of: entry) {
                 case .vanished:
@@ -594,6 +623,19 @@ struct EphemeralTempScanner: @unchecked Sendable {
                             + "be re-established after sizing")
                     continue
                 case .dated(let own, _, let probed):
+                    // THE IDENTITY PIN (PR #459 review r4, codex C1). This
+                    // `lstat` is a fresh resolution of the NAME. Without the
+                    // pin, a same-kind swap landing anywhere from stage 1's
+                    // read through this one bound the REPLACEMENT's identity
+                    // to a report that sized the ORIGINAL (or a mix), and the
+                    // delete-time identity re-check then "proved" exactly the
+                    // wrong object — measured: an old, unlocked, user-owned
+                    // 8 KiB directory renamed onto a sized 64 KiB name was
+                    // emitted with the original's bytes and revalidated
+                    // `.allow` on the replacement's inode. A mismatch is the
+                    // vanished/silent-skip contract: nothing the scan gated
+                    // stands at the name, and a re-scan sees whatever does.
+                    guard probed == gatedIdentity else { continue }
                     guard own < cutoff else {
                         // Same shape as the content arm below: suppressed as
                         // fresh, with any sizing denials still surfaced so
@@ -676,8 +718,11 @@ struct EphemeralTempScanner: @unchecked Sendable {
     /// Stage-1 verdict for one candidate.
     private enum StalenessVerdict {
         /// Both inputs held; the payload carries the entry's own mtime for
-        /// evidence when sizing dates nothing.
-        case stale(ownDate: Date)
+        /// evidence when sizing dates nothing, and the (device, inode) the
+        /// SAME stage-1 `lstat` saw — the identity every later stage is
+        /// pinned to (PR #459 review r4, codex C1). The lstat already
+        /// returned it; before the pin it was read and DISCARDED here.
+        case stale(ownDate: Date, identity: FileSystemIdentityProvider.Identity)
         /// Not listed, silently: a fresh own mtime, a fresh file found inside,
         /// a cap hit without a fresh hit, or a regular file under the floor.
         case notStale
@@ -741,11 +786,13 @@ struct EphemeralTempScanner: @unchecked Sendable {
             return .vanished
         case .failed(let cause):
             return .denied(entry, cause)
-        case .dated(let ownDate, _, _):
+        case .dated(let ownDate, _, let identity):
             // Metadata churn on the entry itself disqualifies it before any
             // walk: the own-mtime input fails, so the contents do not matter.
             guard ownDate < cutoff else { return .notStale }
-            return walkForFreshContent(entry, cutoff: cutoff, ownDate: ownDate)
+            return walkForFreshContent(
+                entry, cutoff: cutoff, ownDate: ownDate, identity: identity
+            )
         }
     }
 
@@ -760,11 +807,11 @@ struct EphemeralTempScanner: @unchecked Sendable {
             return .vanished
         case .failed(let cause):
             return .denied(entry, cause)
-        case .dated(let date, let allocatedBytes, _):
+        case .dated(let date, let allocatedBytes, let identity):
             guard allocatedBytes >= thresholds.sizeFloorBytes,
                   date < cutoff
             else { return .notStale }
-            return .stale(ownDate: date)
+            return .stale(ownDate: date, identity: identity)
         }
     }
 
@@ -777,7 +824,8 @@ struct EphemeralTempScanner: @unchecked Sendable {
     /// returns `.denied` — the staleness of a tree we cannot read is
     /// unprovable, and the denial must be visible.
     private func walkForFreshContent(
-        _ root: URL, cutoff: Date, ownDate: Date
+        _ root: URL, cutoff: Date, ownDate: Date,
+        identity: FileSystemIdentityProvider.Identity
     ) -> StalenessVerdict {
         var visited = 0
         var stack: [URL] = [root]
@@ -838,7 +886,7 @@ struct EphemeralTempScanner: @unchecked Sendable {
                 stack.append(contentsOf: pending.reversed())
             }
         }
-        return .stale(ownDate: ownDate)
+        return .stale(ownDate: ownDate, identity: identity)
     }
 
     /// One no-follow `lstat` read as "when was this last modified, and how
@@ -1282,14 +1330,16 @@ struct EphemeralTempScanner: @unchecked Sendable {
             // `SpaceScanner.revalidationMarkerViolation` malforms the whole
             // outcome.
             requiresPreDeleteRevalidation: true,
-            // THE OBJECT THIS ROW IS ABOUT (PR #459 review r2). Without it
-            // the delete-time re-check re-established four PROPERTIES of
-            // whatever stood at the name and never asked whether it was the
-            // same thing: an old, unlocked, user-owned tree moved onto this
-            // name after the scan passed every gate, and the `.allow` then
-            // bound the REPLACEMENT's inode — so the deletion proved the
-            // wrong object and destroyed it, while the row still quoted the
-            // scanned entry's bytes and age.
+            // THE OBJECT THIS ROW IS ABOUT (PR #459 review r2; r4 closed its
+            // front edge). Without it the delete-time re-check re-established
+            // four PROPERTIES of whatever stood at the name and never asked
+            // whether it was the same thing — a replacement's inode got bound
+            // and destroyed while the row quoted the scanned entry's bytes.
+            // r2's capture point was the POST-sizing lstat, so a swap landing
+            // before it recorded the replacement and the row was a chimera
+            // (the sized object's bytes, the replacement's identity); since
+            // r4 the identity is pinned to STAGE 1's observation, so this
+            // value provably names the object every scan stage inspected.
             scannedTargetIdentity: scannedIdentity
         )
     }
@@ -1480,10 +1530,11 @@ struct EphemeralTempScanner: @unchecked Sendable {
                 }
                 guard let scanned = item.scannedTargetIdentity else {
                     // FAIL CLOSED. Every item this scanner emits records one
-                    // (see `reclaimableItem`), so an item reaching here
-                    // without it was not produced by this scanner's scan —
-                    // and an identity the re-check cannot compare is one it
-                    // cannot prove.
+                    // (see `reclaimableItem` — since r4 pinned to the object
+                    // STAGE 1 gated, not merely the post-sizing lstat's), so
+                    // an item reaching here without it was not produced by
+                    // this scanner's scan — and an identity the re-check
+                    // cannot compare is one it cannot prove.
                     return .refuse(
                         reason: "\(target.path): this temp item carries no "
                             + "record of the object the scan inspected, so "
@@ -1610,7 +1661,11 @@ struct EphemeralTempScanner: @unchecked Sendable {
             )
         }
 
-        // (0b) IS THIS THE OBJECT THE SCAN INSPECTED? (PR #459 review r2.)
+        // (0b) IS THIS THE OBJECT THE SCAN INSPECTED? (PR #459 review r2;
+        // literal since r4 — the recorded identity was previously only the
+        // POST-sizing lstat's observation, which a swap during sizing could
+        // make the replacement's; the scan now pins it to stage 1's, so
+        // "the object the scan inspected" means every stage of it.)
         //
         // Every other gate in this function re-establishes a PROPERTY of
         // whatever stands at the name; none of them asks whether it is the

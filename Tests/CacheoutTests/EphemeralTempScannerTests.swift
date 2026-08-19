@@ -1930,7 +1930,72 @@ final class EphemeralTempScannerTests: XCTestCase {
         XCTAssertEqual(
             item.scannedTargetIdentity,
             FileSystemIdentityProvider().identity(of: canonical(entry)),
-            "the recorded identity is the object the scan inspected"
+            "the recorded identity is the object the scan inspected — pinned "
+                + "to stage 1's observation (r4), not merely the post-sizing "
+                + "lstat's, so a same-kind swap during sizing can never make "
+                + "this value name an object the report did not size"
+        )
+    }
+
+    /// THE IDENTITY PIN (PR #459 review r4, codex C1 — DELETION-SAFETY).
+    /// Before the pin, the recorded identity was the POST-sizing `lstat`'s
+    /// observation: a same-kind swap landing between stage 1 and that read
+    /// emitted an item quoting the SIZED object's bytes while
+    /// `scannedTargetIdentity` named the REPLACEMENT — so the delete-time
+    /// identity re-check passed vacuously and `.allow`ed an object the scan
+    /// never sized. This cell performs exactly that swap (real sizing, then
+    /// two renames putting a different old, unlocked, user-owned directory at
+    /// the name) and requires the SILENT-SKIP contract: no item, no issue —
+    /// nothing the scan gated stands at the name any more.
+    func testASameKindSwapAfterSizingIsSilentlySkippedNotEmitted() async throws {
+        let entry = try makeStaleCandidate(
+            "scratch", under: sharedRootURL, bytes: 65_536
+        )
+        let originalIdentity = try XCTUnwrap(
+            FileSystemIdentityProvider().identity(of: canonical(entry))
+        )
+        // The replacement: old, unlocked, user-owned, 8 KiB — it passes every
+        // PROPERTY gate this scanner has, which is the point: only the
+        // identity pin can tell it apart from the sized object.
+        let replacementSource = base.appendingPathComponent("replacement-src")
+        try mkdir(replacementSource)
+        try writeFile(replacementSource.appendingPathComponent("other.bin"),
+                      bytes: 8_192)
+        try backdate(replacementSource, to: oldDate)
+        let aside = base.appendingPathComponent("swapped-aside")
+
+        let scanner = makeScanner(
+            roots: [sharedRoot()],
+            candidateSizer: { url, mode in
+                let report = DirectorySizer().measure(at: url, mode: mode)
+                if url.lastPathComponent == "scratch" {
+                    // The swap, the instant sizing returns: the original
+                    // aside, the replacement onto the scanned name.
+                    try? FileManager.default.moveItem(at: url, to: aside)
+                    try? FileManager.default.moveItem(
+                        at: replacementSource, to: url
+                    )
+                }
+                return report
+            }
+        )
+
+        let outcome = await scan(scanner)
+        XCTAssertNil(
+            itemsByName(outcome)["scratch"],
+            "a swapped candidate must be silently skipped, never emitted "
+                + "with the sized object's bytes and the replacement's "
+                + "identity: \(outcome.items)"
+        )
+        XCTAssertTrue(outcome.errors.isEmpty,
+                      "the silent-skip contract: no issue either — "
+                          + "\(outcome.errors)")
+        // The fixture really swapped: a DIFFERENT object stands at the name.
+        XCTAssertNotEqual(
+            FileSystemIdentityProvider().identity(of: canonical(entry)),
+            originalIdentity,
+            "the replacement must stand at the scanned name for this cell "
+                + "to prove anything"
         )
     }
 

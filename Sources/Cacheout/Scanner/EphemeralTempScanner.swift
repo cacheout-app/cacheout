@@ -107,7 +107,10 @@
 ///   scan-recorded one.
 ///
 /// The path-based-substrate residual class exists in every as-built per-item
-/// scanner (`OrphanedCachesScanner.swift:334-355`). Descriptor (fd) anchoring
+/// scanner (`OrphanedCachesScanner.swift:230-233`, the "RESIDUAL, STATED:
+/// `DirectorySizer` is still path-based" note — the anchor here previously
+/// pointed at :334-355, which documents the probe-verdict identity binding,
+/// a different subject; PR #459 review r4). Descriptor (fd) anchoring
 /// is the recorded deferred alternative — it is shared-substrate surgery on
 /// `DirectorySizer` and belongs to a roadmap-level hardening that benefits all
 /// per-item scanners at once. NOTHING here claims a swap is impossible.
@@ -130,8 +133,11 @@
 /// A blanket "temp-root EPERM means permission-denied" rewrite is RETRACTED
 /// (it was wrong twice: the residual windows mean traversal can genuinely land
 /// in a TCC-protected tree, and sticky-directory semantics govern
-/// unlink/rename — not lstat traversal). Classification happens at THIS layer;
-/// `DirectorySizer` is untouched. By operation class:
+/// unlink/rename — not lstat traversal). Classification happens at THIS
+/// layer; `DirectorySizer`'s classification is unchanged (r4 extracted its
+/// chain walk as `underlyingPOSIXCode(of:)` for the root-listing catch — a
+/// pure additive refactor; the sentence here used to say "untouched", which
+/// that refactor ended). By operation class:
 ///
 /// - **(a) chain-bearing traversal errors** (this scanner's own Foundation
 ///   throws) apply `DirectorySizer.classifyDenial`'s `NSUnderlyingErrorKey`
@@ -145,10 +151,15 @@
 /// - **(c) post-sizing `SizeDenial`s**: `.permission` ⇒ permission-denied;
 ///   `.tcc` ⇒ NEUTRAL `.other`-kind `ScanError` with the detail preserved,
 ///   because `SizeDenial.Kind.tcc` CONFLATES chain-proven denials
-///   (`DirectorySizer.swift:405-406`) with raw-probe guesses (:427); the only
+///   (`classifyDenial`'s `case .some(Int(EPERM))` arm,
+///   `DirectorySizer.swift:483`) with raw-probe guesses
+///   (`denial(forFailedProbe:errno:)`'s `case EPERM`, :545); the only
 ///   surviving discriminator is a detail STRING, and classification derived
-///   from message text is forbidden house doctrine
-///   (`CacheCleaner.refusalTag` :1014-1016 switches the TYPED error).
+///   from message text is forbidden house doctrine (`CacheCleaner.refusalTag`
+///   :1393 switches the TYPED error). Anchors re-verified r4 — the three
+///   that stood here pointed at a sparse-accounting comment, a hardlink
+///   comment and an unrelated line (R3-V5); re-grep before trusting these
+///   too (SCANNERS-ROADMAP doctrine).
 ///
 /// ENOENT on a child is a purely OBSERVABLE race contract: silently skipped —
 /// no item, no denial, no issue. There is no race counter.

@@ -330,6 +330,47 @@ final class EphemeralTempScannerTests: XCTestCase {
         }
     }
 
+    /// Reports a child-directory open failure BOTH ways at once, and
+    /// disagreeing on purpose: the carrying form returns the real code while
+    /// the GLOBAL `errno` is left saying ENOENT.
+    ///
+    /// That is exactly the hazard `FileSystemIdentityProvider` documents the
+    /// carrying twin for — "a test override (or any intervening call) can
+    /// clobber it" before the caller reads it — staged hermetically because a
+    /// single-uid fixture cannot make a real `openat` fail EACCES against
+    /// itself mid-walk while something else resets `errno`.
+    private final class ErrnoClobberingProvider: FileSystemIdentityProvider {
+        /// Basename of the child directory whose open fails.
+        var failingChild: String = ""
+        /// The code the CARRYING form reports.
+        var carriedCode: Int32 = EACCES
+
+        override func openChildDirectoryCarryingErrno(
+            inDirectory descriptor: Int32, named name: String,
+            logical: @autoclosure () -> URL
+        ) -> DescriptorOpen {
+            guard name == failingChild else {
+                return super.openChildDirectoryCarryingErrno(
+                    inDirectory: descriptor, named: name, logical: logical()
+                )
+            }
+            errno = ENOENT
+            return .failed(errno: carriedCode)
+        }
+
+        override func openChildDirectory(
+            inDirectory parent: Int32, named name: String, logical url: URL
+        ) -> Int32 {
+            guard name == failingChild else {
+                return super.openChildDirectory(
+                    inDirectory: parent, named: name, logical: url
+                )
+            }
+            errno = ENOENT
+            return -1
+        }
+    }
+
     /// Injects mount points by inode (the house hermetic pattern).
     private final class BoundaryInjectingProvider: FileSystemIdentityProvider {
         var mountPointInodes: Set<UInt64> = []
@@ -1984,6 +2025,49 @@ final class EphemeralTempScannerTests: XCTestCase {
             return XCTFail("a special file at a scanned name must be refused")
         }
         XCTAssertTrue(reason.contains("no longer the kind of object"), reason)
+    }
+
+    /// F7 (PR #459 review r3): the delete-time fresh-content walk must judge
+    /// on the errno its OWN open returned, not on whatever the global `errno`
+    /// happens to hold.
+    ///
+    /// 8f513d5 swapped `openChildDirectory` + a read of the global `errno` for
+    /// `openChildDirectoryCarryingErrno` in `freshContentBelow` and shipped
+    /// with nothing behind it — reverting exactly that hunk left
+    /// `EphemeralTemp|CacheCleanerTests` at 194 executed / 0 failures.
+    ///
+    /// What the swap protects is not a message. In THIS walk ENOENT/ENOTDIR is
+    /// a benign vanished branch that is skipped and every other code makes the
+    /// verdict `.unprovable`, i.e. a REFUSAL — so a stale `errno` reading
+    /// ENOENT converts a refusal into an ALLOW, and the removal proceeds over
+    /// a subtree the walk could not read.
+    func testDeleteTimeWalkJudgesOnTheErrnoItsOwnOpenReturned() async throws {
+        let entry = try makeStaleCandidate("errno-walk", under: sharedRootURL)
+        let branch = try mkdir(entry.appendingPathComponent("branch"))
+        try writeFile(branch.appendingPathComponent("old.bin"))
+        try backdate(entry, to: oldDate)
+
+        let provider = ErrnoClobberingProvider()
+        provider.failingChild = "branch"
+        let scanner = makeScanner(roots: [sharedRoot()], provider: provider)
+        let scanned = itemsByName(await scan(scanner))
+        let item = try XCTUnwrap(scanned["errno-walk"])
+
+        let verdict = try XCTUnwrap(scanner.preDeleteRevalidator)
+            .revalidate(item: item, authorization: nil)
+        guard case .refuse(let reason, _, _) = verdict else {
+            return XCTFail(
+                "a subtree whose open failed EACCES cannot be proven old, and "
+                    + "an unprovable walk must refuse — got \(verdict)"
+            )
+        }
+        XCTAssertTrue(reason.contains("could not be fully re-inspected"),
+                      reason)
+        XCTAssertTrue(reason.contains("Permission denied"),
+                      "the reason quotes the code the open ACTUALLY returned, "
+                        + "not the clobbered global one: \(reason)")
+        XCTAssertTrue(fm.fileExists(atPath: entry.path),
+                      "and nothing was deleted")
     }
 
     /// A vanished entry cannot be re-inspected, so it is refused rather than

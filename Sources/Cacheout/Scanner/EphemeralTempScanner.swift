@@ -221,17 +221,28 @@ struct EphemeralTempScanner: @unchecked Sendable {
         /// EWOULDBLOCK — the ONE in-use signal.
         case inUse
         /// NOTHING THIS SCANNER LISTS STANDS AT THE NAME ANY MORE — the
-        /// silent-skip disposition, shared by two arms (PR #459 review r3
-        /// widened the second; the doc here previously named only the first).
+        /// silent-skip disposition, shared by two arms. (PR #459 review r4:
+        /// the r3 doc here claimed all three special kinds arrive through a
+        /// successful open and share this disposition — measured false for
+        /// sockets, twice over. Per kind, under this exact flag set:)
         ///
         /// - The open FAILED benignly: ENOENT/ENOTDIR (gone) or ELOOP
         ///   (swapped to a symlink after dispatch — `O_NOFOLLOW` refusing to
         ///   open it is the point).
         /// - The open SUCCEEDED but `fstat` reports a kind this scanner never
-        ///   lists (FIFO, socket, device node). Root-level `probeKind`
-        ///   already skips `.other` silently, so the same disposition applies
-        ///   to one that arrives in the swap window between that probe and
-        ///   this one.
+        ///   lists. Which kinds actually get here, measured:
+        ///   - a FIFO opens under `O_NONBLOCK` and fstats `S_IFIFO` — skipped;
+        ///   - a device node whose driver admits the open fstats
+        ///     `S_IFCHR`/`S_IFBLK` (measured: `/dev/null`) — skipped; one
+        ///     whose driver refuses (measured: `/dev/tty` with no controlling
+        ///     terminal, ENXIO) is `.failed`, the visible denial accounting;
+        ///   - a bound AF_UNIX SOCKET never reaches this arm at all:
+        ///     `open(2)` fails EOPNOTSUPP (errno 102, measured, with and
+        ///     without `O_NONBLOCK`), so a socket is `.failed` — a VISIBLE
+        ///     refusal, not this silent skip.
+        ///   Root-level `probeKind` already skips `.other` silently, so the
+        ///   kinds that DO open get the same disposition when they arrive in
+        ///   the swap window between that probe and this one.
         case vanished
         /// The `open` failed for another reason — NEVER "in use"; routed to
         /// the same denial accounting as any other raw-errno probe.
@@ -1743,14 +1754,18 @@ struct EphemeralTempScanner: @unchecked Sendable {
         // The comment that stood on the trailing arm called a special file
         // "unreachable, because the scan never emits one" — a scan-time fact
         // asserted inside the one function whose entire premise is that
-        // scan-time facts expire. It is reachable: a FIFO, socket or device
-        // node planted at a scanned name opens successfully (that is what
-        // `O_NONBLOCK` above is for) and `fileKind(from:)` maps every
-        // non-REG/DIR/LNK `S_IFMT` to `.other`. `.symlink` is the one arm the
-        // open really does foreclose — `O_NOFOLLOW` fails ELOOP — but it costs
-        // nothing to refuse both here, and refusing at the top means the
-        // regular-file and directory arms below are reached only by objects
-        // this scanner can actually have listed.
+        // scan-time facts expire. It is reachable: a FIFO opens successfully
+        // under `O_NONBLOCK` (that is what the flag is for), and so does a
+        // device node whose driver admits the open (measured: `/dev/null`);
+        // `fileKind(from:)` maps every non-REG/DIR/LNK `S_IFMT` to `.other`.
+        // (A bound AF_UNIX socket never gets this far — `open(2)` fails
+        // EOPNOTSUPP, errno 102, measured with and without `O_NONBLOCK` — so
+        // it is refused ABOVE at the open, not here; r3's comment claimed it
+        // arrived through a successful open, which was false.) `.symlink` is
+        // the one arm the open really does foreclose — `O_NOFOLLOW` fails
+        // ELOOP — but it costs nothing to refuse both here, and refusing at
+        // the top means the regular-file and directory arms below are
+        // reached only by objects this scanner can actually have listed.
         let kind = FileSystemIdentityProvider.fileKind(from: status)
         switch kind {
         case .regularFile, .directory:

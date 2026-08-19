@@ -71,13 +71,22 @@ struct DevRootsStore {
 
     private let defaults: UserDefaults
     private let provider: FileSystemIdentityProvider
+    /// The ephemeral temp roots this resolution refuses to ALSO register as
+    /// dev roots (PR #459 review r1 — see step 4 of `resolve`). Injectable so
+    /// the rule is exercisable over a FIXTURE root: the default reads the
+    /// machine's real confstr set, which no unit test may.
+    private let ephemeralTempRoots: @Sendable () -> [URL]
 
     init(
         defaults: UserDefaults = .standard,
-        provider: FileSystemIdentityProvider = FileSystemIdentityProvider()
+        provider: FileSystemIdentityProvider = FileSystemIdentityProvider(),
+        ephemeralTempRoots: @escaping @Sendable () -> [URL] = {
+            EphemeralTempRoots.resolve().map(\.url)
+        }
     ) {
         self.defaults = defaults
         self.provider = provider
+        self.ephemeralTempRoots = ephemeralTempRoots
     }
 
     // MARK: - Resolution
@@ -154,6 +163,14 @@ struct DevRootsStore {
     /// call-through: a UI-local re-implementation is exactly what R16
     /// forbids, and routing the editor through the store keeps one provider
     /// and one policy per layer.
+    ///
+    /// NOT COVERED HERE, deliberately: the ephemeral-temp overlap refusal
+    /// (step 4 of `resolve`). This method is the SHARED admission policy and
+    /// nothing else; the overlap rule is a composition fact about two
+    /// registered scanners, so it lives at resolution where its
+    /// `.containerRefused` issue rides every scan outcome. A user who adds a
+    /// temp root in Settings therefore has it persisted and then visibly
+    /// refused on every scan, rather than silently dropped.
     func validateCandidateRoot(_ url: URL, home: URL) throws {
         try PathGuard.validateContainerRoot(url, home: home, provider: provider)
     }
@@ -286,16 +303,64 @@ struct DevRootsStore {
     ///    is the first place every root is known; the two are the same
     ///    doctrine at the two scopes, and neither weakens the walk-time or
     ///    delete-time gates.
+    /// 4. **Ephemeral-temp overlap refusal** (PR #459 review r1): a dev root
+    ///    that IS one of the ephemeral temp roots is refused, VISIBLY, with
+    ///    the same frozen `.containerRefused` issue step 1 uses.
+    ///
+    ///    WHY. `PathGuard.validateContainerRoot` ADMITS `/private/tmp` and
+    ///    `/tmp` — measured on this platform: the same `st_dev` as `/private`,
+    ///    and `statfs` names `/System/Volumes/Data` as the mount, so neither
+    ///    the device check nor `isMountPoint` fires — so
+    ///    `--cli scan --dev-root /private/tmp` (or the same path added in
+    ///    Settings) is a legal invocation. There is NO cross-scanner dedupe
+    ///    anywhere (D4), and `build_artifacts` and `ephemeral_tmp` derive item
+    ///    identity from the SAME `resolveTargetKeepingLeaf`, so one directory
+    ///    is then published TWICE with the same URL and the same bytes: the
+    ///    total double-counts, the GUI shows it in two sections, and selecting
+    ///    both makes the second deletion a ghost-target error. Executed
+    ///    through the real runtime and the real validator before this guard
+    ///    existed — neither outcome was malformed, because uniqueness is
+    ///    checked WITHIN one outcome only.
+    ///
+    ///    SCOPE, stated exactly so the comment claims no more than the code
+    ///    does: this refuses the EXACT collision (a dev root that
+    ///    `sameLocation`s a temp root) and nothing else. A dev root NESTED
+    ///    inside a temp root (`--dev-root /private/tmp/claude-501`) still
+    ///    walks independently and still overlaps — the pre-existing accepted
+    ///    class D7 documents, shared with a dev root inside
+    ///    `~/Library/Caches`, deliberately NOT covered here.
     private func resolve(
         declaredRoots: [URL], home: URL, parseIssues: [ScanIssue]
     ) -> DevRootsResolution {
         var issues = parseIssues
+
+        // (4) The ephemeral-temp root set, canonicalized ONCE for comparison.
+        // fn-6.1 canonicalizes each root exactly once already, so this is a
+        // cheap set membership rather than an N×M `sameLocation` sweep.
+        let temporaryRootKeys = Set(
+            ephemeralTempRoots().map { provider.canonicalize($0).path }
+        )
 
         // (1) Policy — on the CANONICAL root (alias doctrine): a symlink
         // alias of `/`, of a volume root, or of $HOME is caught here because
         // the policy canonicalizes before checking.
         var admissible: [URL] = []
         for declared in declaredRoots {
+            // (4) BEFORE the shared policy, because the policy would ADMIT
+            // this root and the refusal must name the real reason. Compared on
+            // the canonical spelling, so `/tmp` and `/private/tmp` are one
+            // refusal rather than two behaviours.
+            if temporaryRootKeys.contains(provider.canonicalize(declared).path) {
+                issues.append(ScanIssue(
+                    url: declared,
+                    kind: .containerRefused,
+                    detail: "configured dev root refused: this is an ephemeral "
+                        + "temp root, which the temp scanner already lists — "
+                        + "registering it as a dev root too would list and "
+                        + "count the same directories twice"
+                ))
+                continue
+            }
             do {
                 try PathGuard.validateContainerRoot(
                     declared, home: home, provider: provider

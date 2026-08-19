@@ -503,6 +503,18 @@ final class SpaceScannerIntegrationTests: XCTestCase {
     /// system state — neither hermetic nor fast. Its registration is asserted
     /// structurally, and its scan/clean behavior over INJECTED fixture roots
     /// lives in `EphemeralTempRegistrationTests`.
+    ///
+    /// THE SECOND, LOAD-BEARING HALF THE RATIONALE ABOVE OMITTED (PR #459
+    /// review r1): hermeticity is not the only obstacle, and un-excluding the
+    /// temp scanner would NOT restore a registry-wide invariant here. This
+    /// fixture's `base` is `fm.temporaryDirectory` — i.e. INSIDE the `…/T`
+    /// root — while `ephemeral_tmp` emits FIRST-LEVEL entries only and the
+    /// fixture tree sits several levels below; the fixture is also seconds
+    /// old, so the 7-day age gate would emit nothing regardless. The
+    /// cross-scanner listing question is therefore not answerable in this
+    /// file at all, and it is not answered anywhere in this one either:
+    /// `EphemeralTempRegistrationTests`' new
+    /// `testADevRootThatIsATempRootIsRefused…` cell is where it lives.
     private func perItemScannerIDs(_ runtime: SpaceScannerRuntime) -> Set<String> {
         Set(runtime.scanners.map(\.id))
             .subtracting([
@@ -538,10 +550,18 @@ final class SpaceScannerIntegrationTests: XCTestCase {
 
     /// THE SWAP, proven in ONE run: `build_artifacts` is registered and
     /// addressable, `node_modules` is neither, and the one fixture
-    /// node_modules tree is listed EXACTLY once — under `build_artifacts`.
-    /// No commit exists in which both are registered (double-listing, D4) or
-    /// in which the legacy slug can still emit unmarked, non-revalidated
-    /// items for the same trees (an R17 bypass).
+    /// node_modules tree is listed EXACTLY once BY THE SCANNERS THIS FIXTURE
+    /// DRIVES — under `build_artifacts`. No commit exists in which both are
+    /// registered (double-listing, D4) or in which the legacy slug can still
+    /// emit unmarked, non-revalidated items for the same trees (an R17
+    /// bypass).
+    ///
+    /// SCOPE (PR #459 review r1): the exactly-once claim is proven over the
+    /// `build_artifacts`/`orphaned_caches` pair — `perItemScannerIDs`
+    /// subtracts `categories` and `ephemeral_tmp` from the four registered
+    /// scanners this test asserts below. It is NOT a registry-wide invariant,
+    /// and reading it as one is what left the `build_artifacts` ×
+    /// `ephemeral_tmp` collision untested until it was executed by hand.
     func testAtomicSwapRegistersBuildArtifactsAndRetiresTheNodeModulesSlug() async throws {
         let dev = base.appendingPathComponent("dev")
         let nodeModules = try makeMarkerProject(
@@ -578,8 +598,12 @@ final class SpaceScannerIntegrationTests: XCTestCase {
         let listedBy = scanned.outcomes.filter { _, outcome in
             outcome.items.contains { $0.url?.path == identityPath(nodeModules) }
         }.keys.sorted()
-        XCTAssertEqual(listedBy, [BuildArtifactsScanner.registeredID],
-                       "exactly one registered scanner lists the tree")
+        XCTAssertEqual(
+            listedBy, [BuildArtifactsScanner.registeredID],
+            "exactly one of the scanners this fixture DRIVES lists the tree "
+                + "— `categories` and `ephemeral_tmp` are excluded, see "
+                + "`perItemScannerIDs`; this is not a registry-wide claim"
+        )
         let buildItems = try XCTUnwrap(
             scanned.outcomes[BuildArtifactsScanner.registeredID]?.items
         )

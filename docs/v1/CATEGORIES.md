@@ -359,6 +359,19 @@ mount point, and `$HOME` itself are refused as dev roots — in canonical and
 symlink-alias spellings alike; protected children such as `~/Documents`
 remain legal.
 
+An **ephemeral temp root** (`/private/tmp`, or the per-user `…/T` and `…/C`
+containers) is also refused as a dev root, in either spelling, with a visible
+"configured dev root refused" issue. The `ephemeral_tmp` scanner already lists
+first-level entries there; registering the same directory as a dev root too
+would list and count the same directories under two scanners at once.
+
+There is no cross-scanner de-duplication in general, so a dev root configured
+*inside* one of those locations — or inside `~/Library/Caches`, which the
+orphaned-caches sweep owns — still overlaps: the same bytes can appear in two
+sections and be counted twice in the total, and cleaning the outer item first
+makes the inner one report a "no longer there" error. Only the exact-same-root
+case is refused.
+
 ### Scanning Behavior
 
 - Maximum walk depth: 8 levels below each dev root

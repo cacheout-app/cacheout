@@ -637,6 +637,178 @@ final class EphemeralTempRegistrationTests: XCTestCase {
         )
     }
 
+    // MARK: - PR #459 review r1: cross-scanner root overlap (D4)
+
+    /// THE CONFIGURATION THAT MAKES THE COLLISION ONE FLAG AWAY, asserted
+    /// before the fixture that exercises it — otherwise the cell below reads
+    /// as a synthetic arrangement nobody could reach.
+    ///
+    /// `PathGuard.validateContainerRoot` ADMITS `/private/tmp` and `/tmp`
+    /// (measured: same `st_dev` as `/private`, and `statfs` names
+    /// `/System/Volumes/Data` as the mount, so neither the device check nor
+    /// `isMountPoint` fires), and `EphemeralTempRoots.resolve()` declares
+    /// `/private/tmp` unconditionally. One path, legal as a dev root AND
+    /// declared as a temp root — reachable with `--dev-root /private/tmp` or
+    /// one line in the Settings editor.
+    func testPrivateTmpIsBothAnAdmissibleDevRootPathAndADeclaredTempRoot() throws {
+        let provider = FileSystemIdentityProvider()
+        let realHome = FileManager.default.homeDirectoryForCurrentUser
+        for spelling in ["/private/tmp", "/tmp"] {
+            XCTAssertNoThrow(
+                try PathGuard.validateContainerRoot(
+                    URL(fileURLWithPath: spelling), home: realHome,
+                    provider: provider
+                ),
+                "\(spelling) is admissible as a container root — the shared "
+                    + "policy refuses only /, a device change, a mount point "
+                    + "and $HOME"
+            )
+        }
+        XCTAssertTrue(
+            EphemeralTempRoots.resolve().contains {
+                $0.url.path == "/private/tmp"
+            },
+            "and it is a DECLARED temp root, unconditionally"
+        )
+    }
+
+    /// A stale, >floor Python venv as a FIRST-LEVEL entry of the fixture temp
+    /// root — the one shape both scanners claim: `markerInside("pyvenv.cfg")`
+    /// matches the walked directory itself at depth 1, which is exactly the
+    /// depth `ephemeral_tmp` lists.
+    @discardableResult
+    private func stageFirstLevelVenv(_ name: String = "venv") throws -> URL {
+        let venv = tempRoot.appendingPathComponent(name)
+        try fm.createDirectory(
+            at: venv.appendingPathComponent("lib"),
+            withIntermediateDirectories: true
+        )
+        try Data().write(to: venv.appendingPathComponent("pyvenv.cfg"))
+        try Data(repeating: 0x41, count: 12_000_000).write(
+            to: venv.appendingPathComponent("lib/big.bin")
+        )
+        try backdate(venv, to: clock.addingTimeInterval(-30 * 86_400))
+        return venv
+    }
+
+    private func listedBy(
+        _ runtime: SpaceScannerRuntime, path: String
+    ) async throws -> (scanners: [String], bytes: Set<Int64>) {
+        let everyScanner: Set<String>? = nil
+        let session = runtime.scanValidatedSession(
+            scannerIDs: everyScanner,
+            context: ScanContext(trigger: .userInitiated)
+        )
+        var outcomes: [String: ScanOutcome] = [:]
+        for await event in session.events {
+            switch event {
+            case .outcome(let id, let outcome): outcomes[id] = outcome
+            case .malformed(let id, let issue):
+                XCTFail("\(id) malformed: \(issue.detail)")
+            }
+        }
+        let matching = outcomes.filter { _, outcome in
+            outcome.items.contains { $0.url?.path == path }
+        }
+        let bytes = Set(matching.values.flatMap { outcome in
+            outcome.items.filter { $0.url?.path == path }.map(\.exactBytes)
+        })
+        return (matching.keys.sorted(), bytes)
+    }
+
+    /// THE CHARACTERIZATION, executed rather than reasoned about: with two
+    /// scanners over ONE root there is NO cross-scanner dedupe anywhere (D4),
+    /// and both derive item identity from the same `resolveTargetKeepingLeaf`
+    /// — so the SAME directory is published twice, with the same url and the
+    /// same bytes. The total double-counts, the GUI shows it in two sections,
+    /// and selecting both makes the second deletion a ghost-target error.
+    /// Neither outcome is malformed: uniqueness is checked WITHIN one outcome
+    /// only, so nothing else in the stack notices.
+    ///
+    /// This cell does NOT go through `DevRootsStore`, deliberately: it is the
+    /// standing property the overlap refusal below narrows but does not
+    /// remove. A dev root NESTED inside a temp root
+    /// (`--dev-root /private/tmp/claude-501`) still reaches exactly this
+    /// state, as does a dev root inside `~/Library/Caches` — the pre-existing
+    /// accepted class D7 documents, and neither is covered by any rule.
+    func testTwoScannersOverOneRootPublishTheSameDirectoryTwice() async throws {
+        let venv = try stageFirstLevelVenv()
+        let shared = canonical(tempRoot)
+        let runtime = try makeRuntime([
+            BuildArtifactsScanner(
+                home: fixtureHome,
+                devRoots: DevRootsResolution(keptRoots: [shared], issues: [])
+            ),
+            makeScanner(),
+        ])
+
+        let found = try await listedBy(
+            runtime,
+            path: FileSystemIdentityProvider()
+                .resolveTargetKeepingLeaf(canonical(venv)).path
+        )
+
+        XCTAssertEqual(
+            found.scanners,
+            [BuildArtifactsScanner.registeredID,
+             EphemeralTempScanner.registeredID],
+            "no cross-scanner dedupe exists — the directory is listed twice"
+        )
+        XCTAssertEqual(found.bytes.count, 1,
+                       "and with the SAME byte figure, so the total is "
+                        + "double-counted: \(found.bytes)")
+    }
+
+    /// THE REFUSAL. `DevRootsStore` drops a dev root that IS a temp root,
+    /// visibly, so the exact collision above is unreachable through
+    /// configuration — the directory is then listed by `ephemeral_tmp` alone.
+    ///
+    /// Everything is INJECTED: the "temp root" is the fixture directory,
+    /// handed to `DevRootsStore` through its `ephemeralTempRoots` seam, so no
+    /// real temp root is read or walked.
+    func testADevRootThatIsATempRootIsRefusedSoNothingIsListedTwice() async throws {
+        let venv = try stageFirstLevelVenv()
+        let declared = canonical(tempRoot)
+        let suite = try makeSuite()
+        let store = DevRootsStore(
+            defaults: suite,
+            ephemeralTempRoots: { [declared] }
+        )
+
+        let resolution = store.effectiveRoots(
+            replacing: [declared], home: fixtureHome
+        )
+
+        XCTAssertTrue(
+            resolution.keptRoots.isEmpty,
+            "a dev root that IS a temp root is refused: \(resolution.keptRoots)"
+        )
+        XCTAssertEqual(resolution.issues.count, 1, "\(resolution.issues)")
+        XCTAssertEqual(resolution.issues.first?.kind, .containerRefused,
+                       "visible, never a silent drop (R16)")
+        XCTAssertEqual(resolution.issues.first?.url?.path, declared.path)
+        XCTAssertTrue(
+            resolution.issues.first?.detail
+                .contains("ephemeral temp root") == true,
+            "\(resolution.issues.first?.detail ?? "no issue")"
+        )
+
+        // AND THE CONSEQUENCE, through the real runtime and the real
+        // validator: with the refused root the build-artifacts scanner has
+        // nothing to walk, so the venv is listed ONCE.
+        let runtime = try makeRuntime([
+            BuildArtifactsScanner(home: fixtureHome, devRoots: resolution),
+            makeScanner(),
+        ])
+        let found = try await listedBy(
+            runtime,
+            path: FileSystemIdentityProvider()
+                .resolveTargetKeepingLeaf(canonical(venv)).path
+        )
+        XCTAssertEqual(found.scanners, [EphemeralTempScanner.registeredID],
+                       "exactly one scanner lists the directory")
+    }
+
     // MARK: - PR #459 review r1: a deferral must not erase what is displayed
 
     /// A scanner that declines a trigger is NOT IN THE SESSION — and that is

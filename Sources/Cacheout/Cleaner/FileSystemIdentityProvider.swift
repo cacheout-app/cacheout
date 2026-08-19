@@ -460,6 +460,20 @@ class FileSystemIdentityProvider {
         )
     }
 
+    /// `st_uid` of an OPEN descriptor — the descriptor-shaped twin of
+    /// `ownerProbe(of:)`, read from the object the caller is already holding
+    /// rather than from a path that can be re-pointed underneath it.
+    ///
+    /// `nil` when `fstat` fails on a descriptor we hold, which callers MUST
+    /// treat as unprovable (never as "ours"). Override point for the hermetic
+    /// foreign-ownership case: a real cross-uid fixture needs a second user
+    /// account, so injecting here is how that gate is exercised at all.
+    func ownerUID(ofDescriptor fd: Int32) -> UInt32? {
+        var st = stat()
+        guard fstat(fd, &st) == 0 else { return nil }
+        return st.st_uid
+    }
+
     /// `fstatfs`/`fstat` of an OPEN descriptor → its mount identity. `nil`
     /// when either call fails, which callers MUST treat as unvetted.
     ///

@@ -63,7 +63,13 @@ and docs/v1/CLI-REFERENCE.md) — the pre-release `node_modules` →
   `--tmp-age-days` / `--tmp-min-size-mb` overrides on `scan` and `clean`
   (never persisted; refused on every other command, `smart-clean`
   included). No schema change: `schema_version` stays 4 and every addition
-  is additive.
+  is additive. **A temp entry is re-inspected immediately before it is
+  deleted**, from a descriptor held open for the check: if it has been
+  written into, locked by a running process, changed owner, or replaced by a
+  different directory since the scan, the deletion is refused with nothing
+  removed and nothing reported freed — re-scan to see its current state. The
+  check runs on both disposals, and on the Move-to-Trash default it refuses
+  before the item is moved, so a refusal never disturbs your Trash.
 - **Configurable dev roots.** Settings gains a dev-roots editor and the CLI a
   repeatable `--dev-root PATH` (invocation-scoped, never persisted). The
   filesystem root, any volume root or mount point, and `$HOME` itself are

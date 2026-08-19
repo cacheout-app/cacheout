@@ -1257,11 +1257,23 @@ final class EphemeralTempScannerTests: XCTestCase {
         XCTAssertEqual(item.scannerID, "ephemeral_tmp")
         XCTAssertEqual(item.risk, .review)
         XCTAssertFalse(item.defaultSelected)
+        // WHAT THIS FLAG ACTUALLY GOVERNS (PR #459 review r1). The message
+        // that stood here said `false` "routes these items AROUND the
+        // orphaned-caches-keyed pre-delete probe" — a mechanism the cleaner
+        // does not have: `preDeleteOutcome` looks the registry up by
+        // `item.scannerID`, so an `ephemeral_tmp` item could never reach the
+        // `orphaned_caches` predicate whatever this flag said, and the flag is
+        // read by no revalidation path at all. It is the CLI smart-clean
+        // exclusion (`CLIHandler.smartCleanCandidates` is the only consumer
+        // that admits `.review` items) and that is the whole of it.
         XCTAssertFalse(item.automaticCleanEligible,
-                       "load-bearing: false routes these items AROUND the "
-                        + "orphaned-caches-keyed pre-delete probe")
-        XCTAssertFalse(item.requiresPreDeleteRevalidation)
-        XCTAssertNil(scanner.preDeleteRevalidator)
+                       "load-bearing as the CLI smart-clean exclusion — the "
+                        + "one consumer that admits `.review` items")
+        XCTAssertTrue(item.requiresPreDeleteRevalidation,
+                      "the braces half of the belt-and-braces dispatch")
+        XCTAssertNotNil(scanner.preDeleteRevalidator,
+                        "temp items are revalidated from a held descriptor "
+                         + "immediately before deletion")
         XCTAssertEqual(item.isStale, true)
         XCTAssertEqual(item.action, .removeItem)
         XCTAssertNil(item.rebuildNote)
@@ -1320,5 +1332,152 @@ final class EphemeralTempScannerTests: XCTestCase {
 
         XCTAssertEqual(outcome.items.first?.logicalBytes, 64_000,
                        "deletion frees LESS than the apparent size")
+    }
+
+    // MARK: - Delete-time revalidation (PR #459 review r1)
+
+    /// Reports a chosen `st_uid` for every descriptor — the hermetic stand-in
+    /// for a foreign-owned entry, which a single-uid fixture cannot stage.
+    private final class DescriptorOwnerInjectingProvider:
+        FileSystemIdentityProvider {
+        var uid: UInt32?
+
+        override func ownerUID(ofDescriptor fd: Int32) -> UInt32? {
+            uid ?? super.ownerUID(ofDescriptor: fd)
+        }
+    }
+
+    /// THE BINDING, asserted as a value: a directory candidate's `.allow`
+    /// carries the `fstat` identity of the descriptor the revalidation held,
+    /// which is what `DepthSafeRemoval.proveInspectedRoot` and
+    /// `TrashDisposal.dispose(_:expecting:…)` compare the deletion against.
+    /// `.unestablished` here would bind nothing at all.
+    func testRevalidatorAllowsAStillStaleDirectoryBoundToItsInodeIdentity()
+        async throws {
+        let entry = try makeStaleCandidate("still-stale", under: sharedRootURL)
+        let scanner = makeScanner(roots: [sharedRoot()])
+        let scanned = itemsByName(await scan(scanner))
+        let item = try XCTUnwrap(scanned["still-stale"])
+
+        let verdict = try XCTUnwrap(scanner.preDeleteRevalidator)
+            .revalidate(item: item, authorization: nil)
+
+        let expected = try XCTUnwrap(
+            FileSystemIdentityProvider().identity(of: canonical(entry))
+        )
+        XCTAssertEqual(verdict, .allow(inspected: .directory(expected)))
+        XCTAssertTrue(
+            try XCTUnwrap(scanner.preDeleteRevalidator)
+                .requiresRevalidation(item: item),
+            "applicability is EVERY temp item — no flag in the predicate"
+        )
+    }
+
+    /// A REGULAR-FILE candidate has no tree to walk, and `.noDirectoryTree` is
+    /// the honest binding for it: the deletion's `ENOTDIR` arm proves no
+    /// directory has appeared at the name since, and the Trash arm's
+    /// `O_DIRECTORY` look agrees.
+    func testRevalidatorBindsARegularFileCandidateAsNoDirectoryTree()
+        async throws {
+        let entry = try writeFile(
+            sharedRootURL.appendingPathComponent("old-blob.bin"), bytes: 8_192
+        )
+        try setDate(entry, oldDate)
+        let scanner = makeScanner(roots: [sharedRoot()])
+        let scanned = itemsByName(await scan(scanner))
+        let item = try XCTUnwrap(scanned["old-blob.bin"])
+
+        XCTAssertEqual(
+            try XCTUnwrap(scanner.preDeleteRevalidator)
+                .revalidate(item: item, authorization: nil),
+            .allow(inspected: .noDirectoryTree)
+        )
+    }
+
+    /// The cooperative lock probe's DELETE-TIME face, taken on the descriptor
+    /// the revalidation already holds. `flock` is per open-file-description,
+    /// so a second descriptor in this process conflicts exactly as another
+    /// process would.
+    func testRevalidatorRefusesAnEntryThatIsLockedAgainAtDeleteTime()
+        async throws {
+        let entry = try makeStaleCandidate("relocked", under: sharedRootURL)
+        let scanner = makeScanner(roots: [sharedRoot()])
+        let scanned = itemsByName(await scan(scanner))
+        let item = try XCTUnwrap(scanned["relocked"])
+
+        let held = open(canonical(entry).path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+        XCTAssertGreaterThanOrEqual(held, 0)
+        defer { close(held) }
+        XCTAssertEqual(flock(held, LOCK_EX | LOCK_NB), 0,
+                       "the fixture must actually take the advisory lock")
+
+        guard case .refuse(let reason, let valuables, let token) =
+                try XCTUnwrap(scanner.preDeleteRevalidator)
+                    .revalidate(item: item, authorization: nil)
+        else { return XCTFail("a re-locked entry must be refused") }
+        XCTAssertTrue(reason.contains("locked by a running process"), reason)
+        XCTAssertTrue(valuables.isEmpty, "temp has no valuables model")
+        XCTAssertNil(token, "a temp refusal is cleared by re-scanning, never "
+                            + "by acknowledging")
+    }
+
+    /// The ownership gate's delete-time face, read from the HELD DESCRIPTOR's
+    /// `st_uid` (injected — a real foreign-owned entry needs a second uid).
+    /// Scoped by the DECLARED root writability exactly as the scan scopes it:
+    /// gated under the world-writable root, vacuous under the 0700 per-user
+    /// container.
+    func testRevalidatorOwnershipGateFollowsTheDeclaredRootWritability()
+        async throws {
+        let foreign = geteuid() &+ 1
+
+        let shared = try makeStaleCandidate("gated", under: sharedRootURL)
+        let sharedProvider = DescriptorOwnerInjectingProvider()
+        let sharedScanner = makeScanner(
+            roots: [sharedRoot()], provider: sharedProvider
+        )
+        let sharedScanned = itemsByName(await scan(sharedScanner))
+        let sharedItem = try XCTUnwrap(sharedScanned["gated"])
+        sharedProvider.uid = foreign
+        guard case .refuse(let reason, _, _) =
+                try XCTUnwrap(sharedScanner.preDeleteRevalidator)
+                    .revalidate(item: sharedItem, authorization: nil)
+        else {
+            return XCTFail("a foreign-owned entry under a world-writable root "
+                            + "must be refused")
+        }
+        XCTAssertTrue(reason.contains("no longer belongs to you"), reason)
+        _ = shared
+
+        let user = try makeStaleCandidate("ungated", under: userRootURL)
+        let userProvider = DescriptorOwnerInjectingProvider()
+        let userScanner = makeScanner(roots: [userRoot()], provider: userProvider)
+        let userScanned = itemsByName(await scan(userScanner))
+        let userItem = try XCTUnwrap(userScanned["ungated"])
+        userProvider.uid = foreign
+        let expected = try XCTUnwrap(
+            FileSystemIdentityProvider().identity(of: canonical(user))
+        )
+        XCTAssertEqual(
+            try XCTUnwrap(userScanner.preDeleteRevalidator)
+                .revalidate(item: userItem, authorization: nil),
+            .allow(inspected: .directory(expected)),
+            "the per-user container is 0700 by declaration — no gate applies"
+        )
+    }
+
+    /// A vanished entry cannot be re-inspected, so it is refused rather than
+    /// allowed on a verdict about nothing.
+    func testRevalidatorRefusesAnEntryThatVanishedBeforeDeletion() async throws {
+        let entry = try makeStaleCandidate("gone", under: sharedRootURL)
+        let scanner = makeScanner(roots: [sharedRoot()])
+        let scanned = itemsByName(await scan(scanner))
+        let item = try XCTUnwrap(scanned["gone"])
+        try fm.removeItem(at: entry)
+
+        guard case .refuse(let reason, _, _) =
+                try XCTUnwrap(scanner.preDeleteRevalidator)
+                    .revalidate(item: item, authorization: nil)
+        else { return XCTFail("an absent entry must be refused") }
+        XCTAssertTrue(reason.contains("could not be re-opened"), reason)
     }
 }

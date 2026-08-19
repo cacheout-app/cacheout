@@ -66,8 +66,12 @@
 ///
 /// A swap landing inside these causes EXTERNAL METADATA ENUMERATION INTO
 /// SIZING at most — never deletion: delete-time admission re-runs no-follow
-/// (`CacheCleaner.swift:971-972`), deletion removes the UNRESOLVED leaf
-/// (:978-983), and the validator binds the deletion target to the scan record.
+/// (`CacheCleaner.removeGuardedItem`'s `admitContainer` +
+/// `validateRemovableItem` pair), deletion removes the UNRESOLVED leaf
+/// (`removeItemConcurrently`, and `TrashDisposal` on the other arm), the
+/// validator binds the deletion target to the scan record, and this scanner's
+/// `preDeleteRevalidator` (foot of this file) re-establishes the entry's own
+/// gates from a HELD DESCRIPTOR immediately before the destructive call.
 /// The identical residual class exists in every as-built per-item scanner
 /// (`OrphanedCachesScanner.swift:334-355`). Descriptor (fd) anchoring is the
 /// recorded deferred alternative — it is shared-substrate surgery on
@@ -1006,20 +1010,43 @@ struct EphemeralTempScanner: @unchecked Sendable {
             admission: .containerItem(
                 originContainer: root.url, requestedTargetURL: entry
             ),
-            // Never preselected: the user opts in per entry, against the
-            // displayed age evidence.
+            // Never preselected. Note the opt-in is not strictly per entry:
+            // the section ships a "Select Stale (30d+)" button whose handler
+            // selects EVERY `isStale == true` selectable row in one click
+            // (`ScannerItemSection.swift` → `CacheoutViewModel.selectStale`),
+            // so `isStale` is a BULK-SELECTION KEY and its honesty is
+            // load-bearing.
             defaultSelected: false,
-            // LOAD-BEARING INVARIANT (epic D1), not cosmetic: `false` routes
-            // these items AROUND the delete-time revalidator dispatch — this
-            // scanner declares NO `preDeleteRevalidator`, and the cleaner's
-            // orphaned-caches-keyed probe (`CacheCleaner.swift:939-940`) is
-            // not a temp-dir probe. Flipping this to `true` without first
-            // writing a temp-specific revalidation would silently enter the
-            // WRONG probe path.
+            // WHAT THIS FLAG ACTUALLY DOES (PR #459 review r1 — the previous
+            // comment here asserted a mechanism this code does not have).
+            //
+            // It is the CLI SMART-CLEAN EXCLUSION and nothing else: the only
+            // two consumers are `CacheoutViewModel.safeAutoSelectable` (which
+            // also requires `risk == .safe`, so `.review` already excludes
+            // temp items there) and `CLIHandler.smartCleanCandidates`, which
+            // DOES admit `.review` items — so this `false` is the one thing
+            // keeping temp entries out of an unattended smart clean.
+            //
+            // IT HAS NO BEARING ON THE DELETE-TIME REVALIDATOR DISPATCH. That
+            // dispatch (`CacheCleaner.preDeleteOutcome`) reads the scanner-ID
+            // registry and the item's `requiresPreDeleteRevalidation` marker;
+            // it never reads this flag. The ten `build_artifacts` rules ship
+            // `automaticCleanEligible: false` and every one of their items is
+            // revalidated. Temp items are revalidated too — see
+            // `preDeleteRevalidator` at the foot of this file.
             automaticCleanEligible: false,
             // Every emitted item passed the two-stage staleness rule AND the
-            // post-sizing freshness re-check.
-            isStale: true
+            // post-sizing freshness re-check, both measured at SIZING-
+            // COMPLETION time. They are re-established against the current
+            // filesystem immediately before deletion by `preDeleteRevalidator`
+            // — this flag is a scan-time fact, not a delete-time one.
+            isStale: true,
+            // The BRACES half of the belt-and-braces dispatch: this scanner
+            // declares a revalidator whose applicability is "every temp item",
+            // so every emitted item must carry the marker or
+            // `SpaceScanner.revalidationMarkerViolation` malforms the whole
+            // outcome.
+            requiresPreDeleteRevalidation: true
         )
     }
 
@@ -1097,11 +1124,446 @@ struct EphemeralTempScanner: @unchecked Sendable {
         case .other: return "special file"
         }
     }
+
+    // MARK: - Delete-time revalidation (PR #459 review r1)
+
+    /// This scanner's DELETE-TIME revalidator, following the
+    /// `build_artifacts` precedent exactly (`BuildArtifactsScanner.swift`).
+    ///
+    /// WHY IT EXISTS — the decision it replaces. Epic D1 recorded that these
+    /// items "are simply never applicable" to the revalidation seam because
+    /// they set `automaticCleanEligible: false`, carry no marker and declare
+    /// no revalidator. Only the THIRD conjunct did any work: the dispatch
+    /// (`CacheCleaner.preDeleteOutcome`) is keyed by `item.scannerID` and
+    /// reads the marker; it never reads `automaticCleanEligible` (the ten
+    /// `automaticCleanEligible: false` build-artifact rules whose items ALL
+    /// revalidate are the counter-example in this same repo). So the residual
+    /// was accepted on a mechanism the code did not have, and what actually
+    /// routed temp items around the seam was the nil revalidator alone.
+    ///
+    /// WHAT THE NIL COST. With no verdict the cleaner set `probedObject =
+    /// nil`, which (a) skipped the final identity check entirely, (b) made
+    /// `DepthSafeRemoval.proveInspectedRoot` return without comparing an
+    /// inode, and (c) routed the GUI's DEFAULT Trash disposal to the
+    /// identity-blind `TrashDisposal.dispose(_:containedIn:…)` overload, which
+    /// binds whatever stands at the name NOW. Nothing between the scan and the
+    /// destructive call re-read a single fact about the entry's CONTENT: the
+    /// four gates that made deletion acceptable (ownership, the two-stage
+    /// staleness rule, the cooperative lock probe, the freshness re-check) all
+    /// ran at scan time and none of them re-ran.
+    ///
+    /// WHAT THIS DOES. Every temp item is re-inspected from a HELD
+    /// DESCRIPTOR, against the SAME thresholds and the SAME clock the scan
+    /// used (both are construction state, so scan-time and delete-time can
+    /// never disagree on the boundary), in the scan's pinned order: ownership
+    /// → own-mtime staleness → cooperative `flock` → fresh content below.
+    /// Any of them failing is a fail-closed `.refuse` with a CLEARABLE
+    /// sentence — these conditions are non-deterministic, so the "re-scan"
+    /// remedy the UI prints genuinely can differ (unlike a fixed depth cap,
+    /// which a re-scan reproduces identically for ever).
+    ///
+    /// AND THE ALLOW CARRIES A BINDING. `.directory(identity)` is the `fstat`
+    /// of the descriptor this revalidation held open the whole time — not a
+    /// re-`lstat` of the path, which is exactly what an attacker re-points.
+    /// That is what makes `probedObject` non-nil in the cleaner, which is what
+    /// makes the removal prove the inode it opens and the Trash arm prove the
+    /// object on both sides of the move. A revalidator that refused correctly
+    /// but returned `.unestablished` would bind nothing, and per house
+    /// doctrine that is not a binding at all.
+    var preDeleteRevalidator: PreDeleteRevalidator? {
+        Self.preDeleteRevalidator(
+            roots: roots, thresholds: thresholds, provider: provider,
+            prefilterEntryLimit: prefilterEntryLimit, now: now
+        )
+    }
+
+    /// The revalidator VALUE, constructible without a scanner instance so a
+    /// cleaner built directly (tests, headless paths) can register exactly
+    /// what production registers.
+    ///
+    /// APPLICABILITY: `{ _ in true }` — EVERY temp item, no flag anywhere in
+    /// the predicate (the `build_artifacts` rule verbatim). The predicate is
+    /// pure and does no I/O: it is also called during scan-time validation.
+    static func preDeleteRevalidator(
+        roots: [EphemeralTempRoot],
+        thresholds: EphemeralTempSweepConfig.Thresholds,
+        provider: FileSystemIdentityProvider,
+        prefilterEntryLimit: Int =
+            EphemeralTempScanner.defaultPrefilterEntryLimit,
+        now: @escaping @Sendable () -> Date = { Date() }
+    ) -> PreDeleteRevalidator {
+        // The ownership gate is scoped by the DECLARED writability class, the
+        // same way the scan scopes it — captured here as a plain path set so
+        // the closure stays `Sendable` and reads no scanner state.
+        let worldWritableRoots = Set(
+            roots.filter { $0.writability == .worldWritable }.map(\.url.path)
+        )
+        let staleAge = thresholds.staleAge
+        let sizeFloorBytes = thresholds.sizeFloorBytes
+        let entryLimit = prefilterEntryLimit
+        return PreDeleteRevalidator(
+            requiresRevalidation: { _ in true },
+            revalidate: { item, _ in
+                guard case .containerItem(let origin, let target) =
+                        item.admission
+                else {
+                    // Structurally unreachable (the validator and the cleaner
+                    // both refuse a `.removeItem` item without the container
+                    // descriptor) — fail closed rather than assume a target.
+                    return .refuse(
+                        reason: "refused: a temp item without a "
+                            + "container-item target cannot be re-inspected "
+                            + "before deletion",
+                        valuables: [], acknowledgementToken: nil
+                    )
+                }
+                return revalidateTempEntry(
+                    at: target,
+                    ownershipGated: worldWritableRoots.contains(origin.path),
+                    cutoff: now().addingTimeInterval(-staleAge),
+                    sizeFloorBytes: sizeFloorBytes,
+                    entryLimit: entryLimit,
+                    provider: provider
+                )
+            }
+        )
+    }
+
+    /// The delete-time re-inspection of ONE candidate, anchored on a
+    /// descriptor held for the whole verdict.
+    private static func revalidateTempEntry(
+        at target: URL,
+        ownershipGated: Bool,
+        cutoff: Date,
+        sizeFloorBytes: Int64,
+        entryLimit: Int,
+        provider: FileSystemIdentityProvider
+    ) -> PreDeleteVerdict {
+        func refuse(_ reason: String) -> PreDeleteVerdict {
+            .refuse(reason: reason, valuables: [], acknowledgementToken: nil)
+        }
+
+        // THE HELD DESCRIPTOR, AND THE KIND GATE IS THE OPEN. One syscall, so
+        // there is no window between deciding what stands here and taking hold
+        // of it. `O_NOFOLLOW` is what makes the answer trustworthy: an entry
+        // swapped for a symlink since the scan fails here (ELOOP) instead of
+        // being followed. Valid for directories AND regular files on Darwin —
+        // the same open the scan's own lock probe performs.
+        let descriptor = open(target.path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+        guard descriptor >= 0 else {
+            let code = errno
+            return refuse(
+                "\(target.path): this temp entry could not be re-opened for "
+                    + "its delete-time re-check "
+                    + "(\(String(cString: strerror(code)))) — refused, "
+                    + "nothing deleted; re-scan required"
+            )
+        }
+        defer { close(descriptor) }
+
+        var status = stat()
+        guard fstat(descriptor, &status) == 0 else {
+            return refuse(
+                "\(target.path): this temp entry would not describe itself at "
+                    + "delete time — refused, nothing deleted; re-scan required"
+            )
+        }
+        // The IDENTITY that travels in the verdict is read through the
+        // provider, because that is what `DepthSafeRemoval.proveInspectedRoot`
+        // and `TrashDisposal` compare it against — one accessor on both sides,
+        // so a test override can never manufacture a divergence production
+        // cannot produce.
+        guard let identity = provider.identity(ofDescriptor: descriptor) else {
+            return refuse(
+                "\(target.path): this temp entry would not identify itself at "
+                    + "delete time — refused, nothing deleted; re-scan required"
+            )
+        }
+
+        // (1) OWNERSHIP, re-established from the HELD DESCRIPTOR (never a
+        // path `stat`, which is what gets re-pointed). Under a world-writable
+        // root a foreign-owned entry is undeletable by sticky-directory rules
+        // anyway; refusing here names the reason instead of letting the
+        // remover fail with a bare errno. An unreadable uid is unprovable, and
+        // unprovable is not "ours".
+        if ownershipGated {
+            guard let owner = provider.ownerUID(ofDescriptor: descriptor),
+                  owner == geteuid()
+            else {
+                return refuse(
+                    "\(target.path): this temp entry no longer belongs to you "
+                        + "— refused, nothing deleted; re-scan required"
+                )
+            }
+        }
+
+        // (2) OWN-MTIME STALENESS, the required half of the two-stage rule
+        // (see `directoryStaleness`'s truth table: a fresh own mtime
+        // disqualifies an entry whose every regular file is old). Writing a
+        // file into a directory bumps the directory's own mtime, so this alone
+        // catches a reactivated scratch directory.
+        guard let metadata = FileSystemIdentityProvider
+            .leafMetadata(from: status)
+        else {
+            return refuse(
+                "\(target.path): this temp entry's modification time is "
+                    + "outside the readable range, so its staleness cannot be "
+                    + "re-established — refused, nothing deleted"
+            )
+        }
+        let ownDate = modificationDate(of: metadata)
+        guard ownDate < cutoff else {
+            return refuse(
+                "\(target.path): this temp entry was modified again after the "
+                    + "scan — it is newer than the staleness threshold; "
+                    + "refused, nothing deleted. Re-scan to see its current "
+                    + "state"
+            )
+        }
+
+        // (3) THE COOPERATIVE LOCK PROBE, on the descriptor already held —
+        // strictly better than the scan's, which had to re-open by path.
+        // EWOULDBLOCK is still the ONLY in-use signal; any other `flock`
+        // failure proves no advisory holder and is not a refusal.
+        if flock(descriptor, LOCK_EX | LOCK_NB) == 0 {
+            flock(descriptor, LOCK_UN)
+        } else if errno == EWOULDBLOCK {
+            return refuse(
+                "\(target.path): this temp entry is locked by a running "
+                    + "process — it is in use again; refused, nothing deleted. "
+                    + "Re-scan once the process has finished"
+            )
+        }
+
+        switch FileSystemIdentityProvider.fileKind(from: status) {
+        case .regularFile:
+            // A regular-file candidate has no contents to walk; its own
+            // allocation is the floor input stage 1 used.
+            guard metadata.allocatedBytes >= sizeFloorBytes else {
+                return refuse(
+                    "\(target.path): this temp file has shrunk below the size "
+                        + "threshold since the scan — refused, nothing "
+                        + "deleted; re-scan required"
+                )
+            }
+            // `.noDirectoryTree` is the honest binding for a non-directory
+            // leaf: the deletion's `ENOTDIR` arm proves no directory tree has
+            // appeared at this name since, and the Trash arm's `look` (an
+            // `O_DIRECTORY` open) agrees. It is the SAME verdict the sweep's
+            // probe returns for the same shape.
+            return .allow(inspected: .noDirectoryTree)
+
+        case .directory:
+            var budget = entryLimit
+            switch freshContentBelow(
+                descriptor: descriptor, at: target, cutoff: cutoff,
+                budget: &budget, provider: provider
+            ) {
+            case .allOld:
+                // THE BINDING. `fstat` of the descriptor this whole verdict
+                // was taken through — the deletion proves the inode it opens
+                // is this one, on both the permanent and the Trash arm.
+                return .allow(inspected: .directory(identity))
+            case .freshContent(let url):
+                return refuse(
+                    "\(target.path): fresh content (\(url.lastPathComponent)) "
+                        + "was written inside this temp entry since the scan "
+                        + "— refused, nothing deleted. Re-scan to see its "
+                        + "current state"
+                )
+            case .unprovable(let detail):
+                return refuse(
+                    "\(target.path): this temp entry's contents could not be "
+                        + "fully re-inspected at delete time (\(detail)) — "
+                        + "refused, nothing deleted (an inspection that could "
+                        + "not finish is treated like a change since scan); "
+                        + "re-scan required"
+                )
+            }
+
+        case .symlink, .other:
+            // `O_NOFOLLOW` already refuses a symlink leaf, and the scan never
+            // emits a special file — so this is unreachable. Fail closed.
+            return refuse(
+                "\(target.path): this temp entry is no longer the kind of "
+                    + "object that was scanned — refused, nothing deleted; "
+                    + "re-scan required"
+            )
+        }
+    }
+
+    /// The delete-time answer to "is anything below this entry fresh?".
+    private enum DeleteTimeFreshness {
+        /// Every regular file below was proven older than the cutoff.
+        case allOld
+        /// The first at-or-newer regular file, which ends the walk.
+        case freshContent(URL)
+        /// The walk could not be proven exhaustive — a denial, an
+        /// undescribable entry, or the entry budget. NEVER "still stale".
+        case unprovable(String)
+    }
+
+    /// The DESCRIPTOR-RELATIVE twin of `walkForFreshContent`: the same
+    /// early-exit rule (the FIRST regular file at-or-newer than the cutoff
+    /// disqualifies the whole entry) and the same entry budget, but every
+    /// level below the held root is reached by `fstatat`/`openat` on the
+    /// descriptor above it rather than by re-resolving a path. Containment in
+    /// the held parent inode is the proof; nothing here re-reads a path.
+    ///
+    /// Recursion, not an explicit stack, holds exactly one descriptor per
+    /// level of the CURRENT DFS path (closed on the way back out). An
+    /// `openat` that fails for any reason other than a vanished branch —
+    /// including descriptor exhaustion — makes the verdict UNPROVABLE, and
+    /// unprovable refuses.
+    ///
+    /// The budget cannot strand a real offer: an entry whose tree exceeds it
+    /// never passes the SCAN's stage-1 walk in the first place, so it is never
+    /// listed and never reaches this code.
+    ///
+    /// `logical` URLs are composed for the refusal message and for the
+    /// provider's test seam only — they address nothing.
+    private static func freshContentBelow(
+        descriptor: Int32,
+        at directory: URL,
+        cutoff: Date,
+        budget: inout Int,
+        provider: FileSystemIdentityProvider
+    ) -> DeleteTimeFreshness {
+        guard budget > 0 else {
+            return .unprovable("more entries than the inspection budget")
+        }
+        let read = boundedChildNames(
+            ofDescriptor: descriptor, limit: budget, provider: provider
+        )
+        let names: [String]
+        switch read {
+        case .failed(let code):
+            if code == ENOENT || code == ENOTDIR {
+                // The branch vanished mid-walk — the benign race, and there is
+                // nothing fresh in a branch that is not there.
+                return .allOld
+            }
+            return .unprovable(String(cString: strerror(code)))
+        case .names(let read, let truncated):
+            if truncated {
+                return .unprovable("a directory could not be read in full")
+            }
+            names = read
+        }
+
+        var pending: [String] = []
+        for name in names.sorted(by: {
+            $0.utf8.lexicographicallyPrecedes($1.utf8)
+        }) {
+            guard budget > 0 else {
+                return .unprovable("more entries than the inspection budget")
+            }
+            budget -= 1
+            let child = directory.appendingPathComponent(name)
+            switch provider.probeKind(
+                inDirectory: descriptor, named: name, logical: child
+            ) {
+            case .absent:
+                continue
+            case .failed(let code):
+                return .unprovable(String(cString: strerror(code)))
+            case .kind(let kind, _, let metadata):
+                switch kind {
+                case .regularFile:
+                    guard let metadata else {
+                        return .unprovable(
+                            "\(name) would not describe its modification time"
+                        )
+                    }
+                    if modificationDate(of: metadata) >= cutoff {
+                        return .freshContent(child)
+                    }
+                case .directory:
+                    pending.append(name)
+                case .symlink, .other:
+                    // Never followed; neither carries content of its own to
+                    // date (the scan's walk ignores them for the same reason).
+                    continue
+                }
+            }
+        }
+
+        for name in pending {
+            let childDescriptor = provider.openChildDirectory(
+                inDirectory: descriptor, named: name,
+                logical: directory.appendingPathComponent(name)
+            )
+            guard childDescriptor >= 0 else {
+                let code = errno
+                if code == ENOENT || code == ENOTDIR { continue }
+                return .unprovable(String(cString: strerror(code)))
+            }
+            defer { close(childDescriptor) }
+            let below = freshContentBelow(
+                descriptor: childDescriptor,
+                at: directory.appendingPathComponent(name),
+                cutoff: cutoff, budget: &budget, provider: provider
+            )
+            if case .allOld = below { continue }
+            return below
+        }
+        return .allOld
+    }
+
+    /// The BOUNDED read of an already-open directory — `boundedChildNames`'s
+    /// descriptor-relative twin, with the identical three traps handled
+    /// (`readdir` returning nil for both end-of-stream and error; an
+    /// undecodable basename failing CLOSED; `.`/`..` skipped, hidden entries
+    /// kept).
+    ///
+    /// `openSelfForEnumeration` rather than `fdopendir(descriptor)` directly:
+    /// `fdopendir` TAKES OWNERSHIP of the descriptor it is handed and
+    /// `closedir` would close the anchor this walk is standing on.
+    private static func boundedChildNames(
+        ofDescriptor descriptor: Int32, limit: Int,
+        provider: FileSystemIdentityProvider
+    ) -> BoundedRead {
+        let enumeration = provider.openSelfForEnumeration(descriptor)
+        guard enumeration >= 0 else { return .failed(errno: errno) }
+        guard let handle = fdopendir(enumeration) else {
+            let code = errno
+            close(enumeration)
+            return .failed(errno: code)
+        }
+        defer { closedir(handle) }
+        var names: [String] = []
+        var truncated = false
+        while true {
+            errno = 0
+            guard let entry = readdir(handle) else {
+                if errno != 0 { truncated = true }
+                break
+            }
+            let decoded = withUnsafeBytes(of: entry.pointee.d_name) {
+                raw -> String? in
+                guard let base = raw.bindMemory(to: CChar.self).baseAddress
+                else { return nil }
+                return String(validatingCString: base)
+            }
+            guard let name = decoded, !name.isEmpty else {
+                truncated = true
+                break
+            }
+            if name == "." || name == ".." { continue }
+            guard names.count < limit else {
+                truncated = true
+                break
+            }
+            names.append(name)
+        }
+        return .names(names, truncated: truncated)
+    }
 }
 
 // MARK: - SpaceScanner conformance
 
 /// Registration is fn-6.4's (`SpaceScannerRuntime.production`); the witnesses
-/// are the members above. No `preDeleteRevalidator` is declared — the default
-/// nil is the D1 invariant's other half.
+/// are the members above — including `preDeleteRevalidator`, which this
+/// scanner DOES declare (PR #459 review r1). The runtime captures it at
+/// registration into the scanner-ID-keyed registry the cleaner dispatches on.
 extension EphemeralTempScanner: SpaceScanner {}

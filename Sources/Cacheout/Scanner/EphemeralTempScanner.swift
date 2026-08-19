@@ -470,6 +470,26 @@ struct EphemeralTempScanner: @unchecked Sendable {
         let cutoff = now.addingTimeInterval(-thresholds.staleAge)
         let euid = geteuid()
 
+        // THE KERNEL MOUNT TABLE, harvested ONCE per scan (PR #459 review
+        // r5, codex C2 — AVAILABILITY). A candidate that IS a mount point
+        // must be refused BEFORE the stage-(1) `lstat` ever runs: an `lstat`
+        // (or `statfs`) OF a mount point crosses INTO the mounted filesystem
+        // — the getattr is served by the foreign fs — so on a hard-mounted
+        // unresponsive volume that one syscall parks the scan's
+        // cooperative-pool worker forever (no cancellation point can run,
+        // the task group never drains, and the view model's re-entrancy
+        // guard then wedges every later scan AND clean; the lock probe's
+        // comment documents the same wedge shape for a FIFO). Only the
+        // kernel's own table (`getfsstat(MNT_NOWAIT)`,
+        // `FileSystemIdentityProvider.mountPointPaths` — the primitive
+        // `DepthSafeRemoval`'s whole-tree preflight reads) answers without
+        // first contact. Measured before this arm existed: the prefilter
+        // walk descended a mounted volume at 19,545 `lstat`s + 19,500
+        // second `lstat`s under a 22,545-entry mount, and the same mount
+        // was a visible denied row at 303 stale entries but a SILENT skip
+        // at 22,545 — foreign content steering scan output.
+        let mountTable = provider.mountPointPaths()
+
         var items: [ReclaimableItem] = []
         var issues: [ScanIssue] = []
         // One denial per filesystem object per scan — a candidate that failed
@@ -528,6 +548,21 @@ struct EphemeralTempScanner: @unchecked Sendable {
                 ))
                 continue
             }
+
+            // The two per-root mount facts (PR #459 review r5, codex C2).
+            // `mountsUnderRoot` is the stall-free arm: kernel-spelled mount
+            // points strictly under this root (the declared roots are
+            // CANONICAL — fn-6.1 canonicalizes once — and the walk composes
+            // children from them without following links, so the two
+            // spellings agree). `rootDevice` is the racing-mount arm's
+            // baseline: one `lstat` of the ROOT itself, which is never
+            // foreign. A `nil` rootDevice (the root vanished since its gate)
+            // skips only that arm — the table arm still stands, and the
+            // sizer/cleaner mount gates behind it are unchanged.
+            let mountsUnderRoot = Self.mountPoints(
+                in: mountTable, strictlyUnder: root.url
+            )
+            let rootDevice = provider.deviceID(of: root.url)
 
             let listing: (names: [String], truncated: Bool)
             do {
@@ -596,6 +631,33 @@ struct EphemeralTempScanner: @unchecked Sendable {
                 // speak the root spelling this scanner declared.
                 let entry = root.url.appendingPathComponent(name)
 
+                // (0) MOUNT-TABLE REFUSAL — decided from the kernel's table
+                // BEFORE any syscall touches the entry (see the harvest
+                // above for why first contact is the hazard; this is
+                // deliberately ahead of the ownership gate too, because the
+                // gate's own `lstat` would BE that first contact). The row
+                // is PRESENT-BUT-DENIED per R11 — the R12 table already
+                // chose that for mount candidates that reached the sizer;
+                // this makes it deterministic instead of population-
+                // dependent (measured: the same mount was visible-denied or
+                // silently absent depending on the foreign entry count).
+                // NOT a strand (the deterministic-bound rule): unmounting is
+                // a real remedy and the row's message says so.
+                // `resolveTargetKeepingLeaf` resolves only the PARENT chain
+                // — the root, already canonical — so it touches nothing
+                // foreign.
+                if mountsUnderRoot.contains(entry.path) {
+                    let identity = provider.resolveTargetKeepingLeaf(entry)
+                    guard seenIdentities.insert(identity.path).inserted else {
+                        continue
+                    }
+                    items.append(Self.mountRow(
+                        entry: entry, identity: identity, root: root,
+                        boundary: entry
+                    ))
+                    continue
+                }
+
                 // (1) KIND DISPATCH, no-follow.
                 let kind: FileSystemIdentityProvider.FileKind
                 switch provider.probeKind(of: entry) {
@@ -654,8 +716,14 @@ struct EphemeralTempScanner: @unchecked Sendable {
                 let verdict: StalenessVerdict
                 switch kind {
                 case .directory:
-                    verdict = directoryStaleness(of: entry, cutoff: cutoff)
+                    verdict = directoryStaleness(
+                        of: entry, cutoff: cutoff, rootDevice: rootDevice,
+                        mountsUnderRoot: mountsUnderRoot
+                    )
                 case .regularFile:
+                    // No mount arm for files: a mount point is always a
+                    // directory, and a first-level file shares the root's
+                    // device by construction.
                     verdict = fileStaleness(of: entry, cutoff: cutoff)
                 case .symlink, .other:
                     continue // unreachable — filtered above
@@ -668,6 +736,27 @@ struct EphemeralTempScanner: @unchecked Sendable {
                 let gatedIdentity: FileSystemIdentityProvider.Identity
                 switch verdict {
                 case .notStale, .vanished:
+                    continue
+                case .mountPoint:
+                    // The RACING-MOUNT arm's terminal: same row as the
+                    // table arm above (the table missed it — mounted after
+                    // the harvest, or spelled past it), and nothing after
+                    // stage 1's one `lstat` touches the volume: no walk, no
+                    // lock probe, no sizing.
+                    items.append(Self.mountRow(
+                        entry: entry, identity: identity, root: root,
+                        boundary: entry
+                    ))
+                    continue
+                case .mountBoundary(let boundary):
+                    // A volume mounted strictly BELOW the candidate: the
+                    // walk stopped AT the boundary (nothing below it was
+                    // read) and the candidate is the same deterministic
+                    // denied row, never sized.
+                    items.append(Self.mountRow(
+                        entry: entry, identity: identity, root: root,
+                        boundary: boundary
+                    ))
                     continue
                 case .denied(let url, let cause):
                     record(cause, at: url,
@@ -871,6 +960,14 @@ struct EphemeralTempScanner: @unchecked Sendable {
         /// The verdict is UNPROVABLE (a denial mid-probe): not stale, and
         /// visible.
         case denied(URL, DenialCause)
+        /// The candidate ITSELF is on another filesystem (its stage-1 device
+        /// differs from the root's): a mounted volume the kernel-table arm
+        /// missed. Refused visible — never walked, locked or sized.
+        case mountPoint
+        /// A volume is mounted strictly BELOW the candidate, at this path
+        /// (from the kernel table): the walk stopped at the boundary.
+        /// Refused visible — never sized.
+        case mountBoundary(URL)
     }
 
     /// The TWO-stage staleness rule's stage 1 for a DIRECTORY candidate
@@ -919,7 +1016,8 @@ struct EphemeralTempScanner: @unchecked Sendable {
     /// It is narrowed at DELETE time, not here: `preDeleteRevalidator` walks
     /// the tree again from a held descriptor immediately before removal.
     private func directoryStaleness(
-        of entry: URL, cutoff: Date
+        of entry: URL, cutoff: Date, rootDevice: UInt64?,
+        mountsUnderRoot: Set<String>
     ) -> StalenessVerdict {
         switch leafDate(of: entry) {
         case .vanished:
@@ -927,11 +1025,26 @@ struct EphemeralTempScanner: @unchecked Sendable {
         case .failed(let cause):
             return .denied(entry, cause)
         case .dated(let ownDate, _, let identity):
+            // THE RACING-MOUNT ARM (PR #459 review r5, codex C2): a volume
+            // mounted onto the candidate after the table harvest presents
+            // ITS OWN device to stage 1's `lstat` (an lstat of a mount
+            // point describes the mounted root), so comparing a CHILD
+            // against the candidate could never catch it — the baseline
+            // must be the ROOT's device, read outside the volume. Checked
+            // BEFORE the staleness gates so visibility never depends on
+            // the foreign volume's content. Residual at measured scope: a
+            // same-`st_dev` mount (APFS volume-group firmlinks present ONE
+            // device — `DirectorySizer`'s R15 header) is caught only by
+            // the table arm and by the sizer/cleaner gates behind it.
+            if let rootDevice, identity.device != rootDevice {
+                return .mountPoint
+            }
             // Metadata churn on the entry itself disqualifies it before any
             // walk: the own-mtime input fails, so the contents do not matter.
             guard ownDate < cutoff else { return .notStale }
             return walkForFreshContent(
-                entry, cutoff: cutoff, ownDate: ownDate, identity: identity
+                entry, cutoff: cutoff, ownDate: ownDate, identity: identity,
+                mountsUnderRoot: mountsUnderRoot
             )
         }
     }
@@ -965,7 +1078,8 @@ struct EphemeralTempScanner: @unchecked Sendable {
     /// unprovable, and the denial must be visible.
     private func walkForFreshContent(
         _ root: URL, cutoff: Date, ownDate: Date,
-        identity: FileSystemIdentityProvider.Identity
+        identity: FileSystemIdentityProvider.Identity,
+        mountsUnderRoot: Set<String>
     ) -> StalenessVerdict {
         var visited = 0
         var stack: [URL] = [root]
@@ -996,6 +1110,22 @@ struct EphemeralTempScanner: @unchecked Sendable {
                     }
                     visited += 1
                     let child = directory.appendingPathComponent(name)
+                    // THE WALK'S MOUNT ARM (PR #459 review r5, codex C2):
+                    // membership in the kernel table, checked BEFORE the
+                    // per-child `lstat` — zero syscalls, no first contact
+                    // with the volume, and the whole descent it prevents
+                    // was measured at 19,545 + 19,500 foreign `lstat`s on
+                    // one 22,545-entry mount. The verdict short-circuits to
+                    // the deterministic denied row; nothing below the
+                    // boundary is read. A mount RACING in after the harvest
+                    // is not caught here (its subtree is walked; disclosure
+                    // of foreign metadata into a staleness answer, same
+                    // class as the accepted W1/W2 reads) — the sizer's R15
+                    // boundary record and both delete-time mount gates
+                    // still stand behind this arm unchanged.
+                    if mountsUnderRoot.contains(child.path) {
+                        return .mountBoundary(child)
+                    }
                     switch provider.probeKind(of: child) {
                     case .absent:
                         continue
@@ -1344,6 +1474,12 @@ struct EphemeralTempScanner: @unchecked Sendable {
     /// | denial(s), measured nothing     | `.denied`         | ZERO       | `.deniedUnmeasured`| classified denial |
     /// | clean walk                      | `.measured`       | real       | `.measured`       | NONE              |
     ///
+    /// The mount-boundary row's REACH narrowed in PR #459 r5: a mount known
+    /// to the kernel table or visible in the candidate's stage-1 device
+    /// terminates at `mountRow` before the lock probe and the sizer run, so
+    /// this mapping's boundary arm covers only a mount arriving DURING
+    /// sizing. The terminal row is the same either way.
+    ///
     /// The size FLOOR is trusted only on a clean walk: an anomaly row is
     /// emitted regardless of the floor, because an unmeasurable tree cannot be
     /// honestly floor-evaluated. `.empty` is therefore unreachable — a clean
@@ -1494,6 +1630,11 @@ struct EphemeralTempScanner: @unchecked Sendable {
         for report: SizeReport, candidate: URL, hasBoundary: Bool
     ) -> ScanError? {
         if hasBoundary {
+            // Reachable only for a mount that arrives DURING sizing: the
+            // table arm, the candidate-device arm and the walk arm (scan
+            // stages 0/1/3) all terminate earlier with `mountRow`. Same
+            // sentences, same remedy — one event, whichever layer saw it.
+            //
             // `mountBoundaries.first` is empty exactly when the boundary IS
             // the candidate root, so the fallback keeps this total.
             let boundary = report.mountBoundaries.first ?? candidate
@@ -1510,6 +1651,7 @@ struct EphemeralTempScanner: @unchecked Sendable {
                 message += " (\(floor) measured beside the boundary is not "
                     + "reclaimable while the boundary remains)"
             }
+            message += ". \(mountRemedy)"
             return ScanError(kind: .other, message: message)
         }
         guard let ranked = rankedDenial(report.denials) else { return nil }
@@ -1519,6 +1661,93 @@ struct EphemeralTempScanner: @unchecked Sendable {
         return ScanError(
             kind: ranked.kind == .permission ? .permissionDenied : .other,
             message: "\(ranked.url.path): \(ranked.detail)"
+        )
+    }
+
+    /// The mount row's remedy sentence, spelled ONCE (the deterministic-bound
+    /// rule: a refusal's message must say whether a retry can differ, and for
+    /// a mount it genuinely can — unmounting is a user act that clears it;
+    /// nothing here is a permanent strand).
+    static let mountRemedy =
+        "Eject or unmount the volume, then re-scan to see what stands at "
+        + "this name"
+
+    /// The kernel-spelled mount points strictly under `root` — one table
+    /// filter per root, consumed by the three scan-side mount arms.
+    static func mountPoints(
+        in table: [String], strictlyUnder root: URL
+    ) -> Set<String> {
+        let prefix = root.path.hasSuffix("/") ? root.path : root.path + "/"
+        return Set(table.filter { $0.hasPrefix(prefix) })
+    }
+
+    /// One MOUNT row: PRESENT-BUT-DENIED, deterministically (PR #459 review
+    /// r5, codex C2 — the R11 disposition question, answered rather than
+    /// left to the foreign volume's population).
+    ///
+    /// WHY VISIBLE AND NOT A SILENT SKIP: the R12 table already chose
+    /// `.denied` + zero components for a mount candidate that reached the
+    /// sizer, so a mount was ALREADY a visible row — but only when the
+    /// foreign tree happened to be small and all-old enough for the walk to
+    /// finish (measured: 303 stale foreign entries produced the row, 22,545
+    /// — or one fresh file — produced silence). Foreign content must not
+    /// steer scan output. A mounted volume standing where a temp entry was
+    /// expected is a fact the user can act on, and the message names the
+    /// act; `.denied` rows are unselectable in every surface and both
+    /// delete-time mount gates stand behind this row unchanged.
+    ///
+    /// Zero components, `isStale: nil` (no staleness was proven and the row
+    /// must never join Select Stale), `scannedTargetIdentity: nil` (nothing
+    /// was gated for deletion — the row offers none; a forged attempt is
+    /// refused by the cleaner's own mount gate and the revalidator's
+    /// missing-identity refusal, in that order).
+    private static func mountRow(
+        entry: URL, identity: URL, root: EphemeralTempRoot, boundary: URL
+    ) -> ReclaimableItem {
+        let isRootBoundary = boundary.path == entry.path
+        let message = isRootBoundary
+            ? "\(boundary.path): entry is a mount point — not measured; "
+                + "deletion would be refused. \(mountRemedy)"
+            : "mount boundary at \(boundary.path) — subtree not measured; "
+                + "deletion would be refused. \(mountRemedy)"
+        return ReclaimableItem(
+            id: ReclaimableItem.stableID(
+                scannerID: registeredID, canonicalPath: identity.path
+            ),
+            scannerID: registeredID,
+            displayName: entry.lastPathComponent,
+            exactBytes: 0,
+            estimatedUpToBytes: 0,
+            logicalBytes: nil,
+            itemCount: 0,
+            url: identity,
+            declaredDisplayPath: entry.path,
+            rootRecords: [RootScanRecord(
+                requestedURL: entry,
+                resolvedURL: identity,
+                status: .deniedUnmeasured
+            )],
+            state: .denied,
+            scanError: ScanError(kind: .other, message: message),
+            risk: .review,
+            evidence: isRootBoundary
+                ? "a volume is mounted at this entry — its contents belong "
+                    + "to that volume and were not measured"
+                : "a volume is mounted inside this entry — the subtree was "
+                    + "not measured",
+            rebuildNote: nil,
+            action: .removeItem,
+            admission: .containerItem(
+                originContainer: root.url, requestedTargetURL: entry
+            ),
+            defaultSelected: false,
+            automaticCleanEligible: false,
+            isStale: nil,
+            // The marker rides EVERY item of this scanner (the revalidator's
+            // applicability is `{ _ in true }`, and fn-2 validation malforms
+            // an unmarked outcome).
+            requiresPreDeleteRevalidation: true,
+            scannedTargetIdentity: nil
         )
     }
 
@@ -1938,6 +2167,9 @@ struct EphemeralTempScanner: @unchecked Sendable {
         var seenInodes = Set<FileSystemIdentityProvider.Identity>()
         switch freshContentBelow(
             descriptor: descriptor, at: target, cutoff: cutoff,
+            // The held root's own device — the verified identity's, so the
+            // walk refuses to descend onto any other filesystem.
+            rootDevice: identity.device,
             budget: &budget, allocatedBytes: &deleteTimeAllocatedBytes,
             seenInodes: &seenInodes, provider: provider
         ) {
@@ -2035,6 +2267,7 @@ struct EphemeralTempScanner: @unchecked Sendable {
         descriptor: Int32,
         at directory: URL,
         cutoff: Date,
+        rootDevice: UInt64,
         budget: inout Int,
         allocatedBytes: inout Int64,
         seenInodes: inout Set<FileSystemIdentityProvider.Identity>,
@@ -2095,6 +2328,23 @@ struct EphemeralTempScanner: @unchecked Sendable {
                         allocatedBytes += metadata.allocatedBytes
                     }
                 case .directory:
+                    // THE DELETE-TIME MOUNT ARM (PR #459 review r5, codex
+                    // C2): `childIdentity.device` is already in hand from
+                    // the `fstatat` above — zero extra syscalls — and a
+                    // device that differs from the held root's names a
+                    // volume mounted in since `CacheCleaner`'s own sizer
+                    // gate ran. Unprovable ⇒ refused, never descended; the
+                    // refusal CONVERGES (a re-scan emits the entry as a
+                    // denied mount row, so the offer disappears rather than
+                    // re-arming). `DepthSafeRemoval`'s kernel-table
+                    // preflight and per-child mount comparison still stand
+                    // behind this for the permanent arm.
+                    guard childIdentity.device == rootDevice else {
+                        return .unprovable(
+                            "a volume is mounted at \(name) — its contents "
+                                + "are another filesystem's"
+                        )
+                    }
                     pending.append(name)
                 case .symlink, .other:
                     // Never followed; neither carries content of its own to
@@ -2127,7 +2377,7 @@ struct EphemeralTempScanner: @unchecked Sendable {
             let below = freshContentBelow(
                 descriptor: childDescriptor,
                 at: directory.appendingPathComponent(name),
-                cutoff: cutoff, budget: &budget,
+                cutoff: cutoff, rootDevice: rootDevice, budget: &budget,
                 allocatedBytes: &allocatedBytes, seenInodes: &seenInodes,
                 provider: provider
             )

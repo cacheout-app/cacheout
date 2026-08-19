@@ -2433,3 +2433,332 @@ private final class VerdictBox: @unchecked Sendable {
 private final class OutcomeBox: @unchecked Sendable {
     var value: ScanOutcome?
 }
+
+// MARK: - Mount boundaries: refuse WITHOUT descending (PR #459 codex r5, C2)
+//
+// AVAILABILITY class. Before these arms, the prefilter walk descended a
+// mounted volume (measured on a real 22,545-entry `hdiutil` mount: 19,545
+// `probeKind` lstats + 19,500 second lstats strictly below the boundary),
+// the first foreign-touching syscall for a mount-at-candidate was stage 1's
+// own `lstat` — first contact a dead volume turns into a permanent scan
+// wedge — and mount VISIBILITY was population-dependent (visible-denied at
+// 303 stale foreign entries, silently absent at 22,545 or behind one fresh
+// file). The arms decide from the kernel table (`mountPointPaths`, no
+// filesystem contact) and from the stage-1 device already in hand, and the
+// terminal state is ONE deterministic row: `.denied`, zero components, a
+// message that names the unmount remedy (a mount refusal is CLEARABLE —
+// never a deterministic strand).
+extension EphemeralTempScannerTests {
+
+    /// Injects a mount table (or passes the REAL kernel table through) and
+    /// counts every path-based read, so "nothing touched the volume" is an
+    /// assertion rather than a hope.
+    private final class MountTableInjectingProvider: FileSystemIdentityProvider,
+        @unchecked Sendable {
+        private let lock = NSLock()
+        var injectedMountPoints: [String] = []
+        /// `true` = production default (the real `getfsstat` table): the
+        /// integration cell's evidence that the DEFAULT harvest sees a real
+        /// volume — injecting past the seam would not evidence it.
+        var useRealTable = false
+        /// Paths whose leaf metadata reports a FOREIGN device (the racing
+        /// mount the table missed — hermetic stand-in).
+        var foreignDevicePaths: Set<String> = []
+        private(set) var probedPaths: [String] = []
+        private(set) var leafReadPaths: [String] = []
+
+        override func mountPointPaths() -> [String] {
+            useRealTable ? super.mountPointPaths() : injectedMountPoints
+        }
+
+        override func probeKind(of url: URL) -> KindProbe {
+            lock.lock(); probedPaths.append(url.path); lock.unlock()
+            return super.probeKind(of: url)
+        }
+
+        override func leafMetadata(of url: URL) -> LeafMetadata? {
+            lock.lock(); leafReadPaths.append(url.path); lock.unlock()
+            guard let real = super.leafMetadata(of: url) else { return nil }
+            guard foreignDevicePaths.contains(url.path) else { return real }
+            return LeafMetadata(
+                device: real.device &+ 1, inode: real.inode,
+                allocatedBytes: real.allocatedBytes,
+                modifiedSeconds: real.modifiedSeconds,
+                modifiedNanoseconds: real.modifiedNanoseconds
+            )
+        }
+
+        /// Every recorded read at `path` or strictly below it.
+        func reads(atOrBelow path: String) -> [String] {
+            lock.lock(); defer { lock.unlock() }
+            let prefix = path.hasSuffix("/") ? path : path + "/"
+            return (probedPaths + leafReadPaths).filter {
+                $0 == path || $0.hasPrefix(prefix)
+            }
+        }
+    }
+
+    /// Thread-safe record of every lock-probe call — the mount arms must
+    /// refuse BEFORE the candidate is opened for the in-use check.
+    private final class LockProbeRecorder: @unchecked Sendable {
+        private let lock = NSLock()
+        private(set) var urls: [URL] = []
+        func record(_ url: URL) {
+            lock.lock(); urls.append(url); lock.unlock()
+        }
+    }
+
+    private func assertMountRow(
+        _ item: ReclaimableItem, messageContains fragment: String,
+        file: StaticString = #filePath, line: UInt = #line
+    ) {
+        XCTAssertEqual(item.state, .denied, file: file, line: line)
+        XCTAssertEqual(item.exactBytes, 0, file: file, line: line)
+        XCTAssertEqual(item.estimatedUpToBytes, 0, file: file, line: line)
+        XCTAssertEqual(item.itemCount, 0, file: file, line: line)
+        XCTAssertNil(item.isStale,
+                     "a mount row proves no staleness and must never join "
+                        + "Select Stale", file: file, line: line)
+        let message = item.scanError?.message ?? ""
+        XCTAssertTrue(message.contains(fragment), message,
+                      file: file, line: line)
+        // The deterministic-bound rule: the refusal names the act that
+        // clears it, verbatim.
+        XCTAssertTrue(message.contains(EphemeralTempScanner.mountRemedy),
+                      message, file: file, line: line)
+    }
+
+    /// ARM 1 (the kernel-table arm): a first-level candidate the mount table
+    /// names is refused visible with ZERO syscalls at or below it — the
+    /// stall-avoidance property: a dead volume is never contacted at all.
+    func testAMountPointCandidateIsRefusedVisiblyWithoutTouchingIt()
+        async throws {
+        try makeStaleCandidate("volmount", under: sharedRootURL)
+        let candidatePath = entryPath("volmount", under: sharedRootURL)
+
+        let provider = MountTableInjectingProvider()
+        provider.injectedMountPoints = [candidatePath]
+        let locks = LockProbeRecorder()
+        let sizing = SizingSpy(provider: provider)
+        let scanner = makeScanner(
+            roots: [sharedRoot()], provider: provider,
+            lockProbe: { url in
+                locks.record(url)
+                return EphemeralTempScanner.cooperativeLockProbe(url)
+            },
+            candidateSizer: { sizing.measure($0, $1) }
+        )
+
+        let outcome = await scan(scanner)
+        try assertValidates(outcome, scanner: scanner)
+
+        let item = try XCTUnwrap(itemsByName(outcome)["volmount"])
+        assertMountRow(item, messageContains: "entry is a mount point")
+        XCTAssertEqual(
+            provider.reads(atOrBelow: candidatePath), [],
+            "the mount point was contacted — the table arm exists so a dead "
+                + "volume is refused without ONE syscall touching it"
+        )
+        XCTAssertTrue(locks.urls.isEmpty, "\(locks.urls)")
+        XCTAssertTrue(sizing.calls.isEmpty, "\(sizing.calls.map(\.url.path))")
+    }
+
+    /// ARM 2 (the racing-mount arm): a candidate whose stage-1 device is not
+    /// the root's — a mount the table missed — is the same denied row, with
+    /// no walk below it, no lock probe and no sizing.
+    func testACandidateOnAForeignDeviceIsRefusedWithoutWalkLockOrSizing()
+        async throws {
+        try makeStaleCandidate("foreign-dev", under: sharedRootURL)
+        let candidatePath = entryPath("foreign-dev", under: sharedRootURL)
+
+        let provider = MountTableInjectingProvider()
+        provider.foreignDevicePaths = [candidatePath]
+        let locks = LockProbeRecorder()
+        let sizing = SizingSpy(provider: provider)
+        let scanner = makeScanner(
+            roots: [sharedRoot()], provider: provider,
+            lockProbe: { url in
+                locks.record(url)
+                return EphemeralTempScanner.cooperativeLockProbe(url)
+            },
+            candidateSizer: { sizing.measure($0, $1) }
+        )
+
+        let outcome = await scan(scanner)
+        try assertValidates(outcome, scanner: scanner)
+
+        let item = try XCTUnwrap(itemsByName(outcome)["foreign-dev"])
+        assertMountRow(item, messageContains: "entry is a mount point")
+        XCTAssertEqual(provider.reads(atOrBelow: candidatePath + "/"), [],
+                       "the walk descended onto the foreign device")
+        XCTAssertTrue(locks.urls.isEmpty, "\(locks.urls)")
+        XCTAssertTrue(sizing.calls.isEmpty, "\(sizing.calls.map(\.url.path))")
+    }
+
+    /// ARM 3 (the walk arm): a mount strictly BELOW the candidate stops the
+    /// walk AT the boundary — zero reads at or below it, membership decided
+    /// from the table, and the candidate terminates in the visible nested-
+    /// boundary row instead of a population-dependent verdict.
+    func testTheWalkStopsAtAKernelTableMountBoundary() async throws {
+        let candidate = try makeStaleCandidate("scratch", under: sharedRootURL)
+        let mnt = try mkdir(candidate.appendingPathComponent("mnt"))
+        try writeFile(mnt.appendingPathComponent("foreign.bin"))
+        try backdate(candidate, to: oldDate)
+        let mntPath = canonical(sharedRootURL)
+            .appendingPathComponent("scratch/mnt").path
+
+        let provider = MountTableInjectingProvider()
+        provider.injectedMountPoints = [mntPath]
+        let sizing = SizingSpy(provider: provider)
+        let scanner = makeScanner(
+            roots: [sharedRoot()], provider: provider,
+            candidateSizer: { sizing.measure($0, $1) }
+        )
+
+        let outcome = await scan(scanner)
+        try assertValidates(outcome, scanner: scanner)
+
+        let item = try XCTUnwrap(itemsByName(outcome)["scratch"])
+        assertMountRow(item, messageContains: "mount boundary at \(mntPath)")
+        XCTAssertEqual(provider.reads(atOrBelow: mntPath), [],
+                       "the walk crossed the boundary")
+        XCTAssertTrue(sizing.calls.isEmpty,
+                      "a boundary candidate must never be sized: "
+                        + "\(sizing.calls.map(\.url.path))")
+    }
+
+    /// ARM 4 (the delete-time twin): the revalidator's descriptor walk holds
+    /// every child's device already (`fstatat`) and refuses to descend onto
+    /// another filesystem — a volume mounted in after the cleaner's own
+    /// sizer gate. The refusal converges: a re-scan emits the denied mount
+    /// row, so the offer disappears rather than re-arming.
+    func testRevalidatorRefusesToDescendOntoAnotherFilesystem() async throws {
+        let entry = try makeStaleCandidate("remounted", under: sharedRootURL)
+        let nested = try mkdir(entry.appendingPathComponent("mnt"))
+        try writeFile(nested.appendingPathComponent("old.bin"))
+        try backdate(entry, to: oldDate)
+
+        final class ForeignChildDeviceProvider: FileSystemIdentityProvider,
+            @unchecked Sendable {
+            var foreignChildName = ""
+            override func probeKind(
+                inDirectory parent: Int32, named name: String,
+                logical url: URL
+            ) -> DescriptorKindProbe {
+                let real = super.probeKind(
+                    inDirectory: parent, named: name, logical: url
+                )
+                guard name == foreignChildName,
+                      case .kind(let kind, let identity, let metadata) = real
+                else { return real }
+                return .kind(
+                    kind,
+                    identity: Identity(
+                        device: identity.device &+ 1, inode: identity.inode
+                    ),
+                    metadata: metadata
+                )
+            }
+        }
+        let provider = ForeignChildDeviceProvider()
+        provider.foreignChildName = "mnt"
+        let scanner = makeScanner(roots: [sharedRoot()], provider: provider)
+        let scanned = itemsByName(await scan(scanner))
+        let item = try XCTUnwrap(
+            scanned["remounted"],
+            "the scan itself walks by path and lists the entry"
+        )
+
+        let verdict = try XCTUnwrap(scanner.preDeleteRevalidator)
+            .revalidate(item: item, authorization: nil)
+        guard case .refuse(let reason, _, _) = verdict else {
+            return XCTFail("descended onto another filesystem: \(verdict)")
+        }
+        XCTAssertTrue(reason.contains("a volume is mounted at mnt"), reason)
+    }
+
+    /// THE PRODUCTION-DEFAULT CELL: real `hdiutil` volumes, the real kernel
+    /// table (no injection), real lstats — skipped only where `hdiutil`
+    /// cannot attach. One volume BELOW a candidate and one AT a candidate
+    /// holding a FRESH file: before these arms the fresh file made the
+    /// mount-at-candidate SILENTLY absent (stage 1 returned not-stale), and
+    /// the walk read every foreign entry; now both are the deterministic
+    /// denied row with zero reads at or below either mount.
+    func testRealMountsAreRefusedWithoutDescendingIntoThem() async throws {
+        let scratch = try mkdir(sharedRootURL.appendingPathComponent("scratch"))
+        try writeFile(scratch.appendingPathComponent("payload.bin"))
+        let mnt = try mkdir(scratch.appendingPathComponent("mnt"))
+        let volcand = try mkdir(sharedRootURL.appendingPathComponent("volcand"))
+
+        guard try attachDMG(named: "below.dmg", at: mnt),
+              try attachDMG(named: "atcand.dmg", at: volcand) else {
+            throw XCTSkip("hdiutil could not stage the mount fixtures")
+        }
+        // Foreign content: a few entries below the below-candidate mount
+        // (the population a descent would read), and ONE FRESH file on the
+        // at-candidate volume (the previously-silent cell; every other
+        // fixture is stale against this class's future-fixed clock).
+        for index in 0..<3 {
+            try writeFile(mnt.appendingPathComponent("f\(index).bin"),
+                          bytes: 1_024)
+        }
+        let fresh = volcand.appendingPathComponent("fresh.bin")
+        try writeFile(fresh, bytes: 1_024)
+        try setDate(fresh, clock)
+
+        let provider = MountTableInjectingProvider()
+        provider.useRealTable = true
+        let scanner = makeScanner(roots: [sharedRoot()], provider: provider)
+
+        let outcome = await scan(scanner)
+        try assertValidates(outcome, scanner: scanner)
+        let items = itemsByName(outcome)
+
+        let mntPath = canonical(sharedRootURL)
+            .appendingPathComponent("scratch/mnt").path
+        let below = try XCTUnwrap(items["scratch"])
+        assertMountRow(below, messageContains: "mount boundary at \(mntPath)")
+
+        let atCandidate = try XCTUnwrap(
+            items["volcand"],
+            "a mount holding a fresh file used to be SILENTLY absent — it "
+                + "must be a visible denied row"
+        )
+        assertMountRow(atCandidate, messageContains: "entry is a mount point")
+
+        XCTAssertEqual(provider.reads(atOrBelow: mntPath), [])
+        XCTAssertEqual(
+            provider.reads(
+                atOrBelow: entryPath("volcand", under: sharedRootURL)
+            ), []
+        )
+    }
+
+    /// `hdiutil create` + `attach -mountpoint` (nobrowse, quiet); `false`
+    /// (→ XCTSkip) when either step fails. Detach is a teardown block.
+    private func attachDMG(named name: String, at mountpoint: URL) throws -> Bool {
+        let image = base.appendingPathComponent(name)
+        func run(_ arguments: [String]) throws -> Bool {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/hdiutil")
+            process.arguments = arguments
+            process.standardOutput = FileHandle.nullDevice
+            process.standardError = FileHandle.nullDevice
+            try process.run()
+            process.waitUntilExit()
+            return process.terminationStatus == 0
+        }
+        guard try run([
+            "create", "-size", "8m", "-fs", "APFS",
+            "-volname", name, image.path
+        ]) else { return false }
+        guard try run([
+            "attach", image.path, "-mountpoint", mountpoint.path,
+            "-nobrowse", "-quiet"
+        ]) else { return false }
+        addTeardownBlock {
+            _ = try? run(["detach", mountpoint.path, "-force"])
+        }
+        return true
+    }
+}

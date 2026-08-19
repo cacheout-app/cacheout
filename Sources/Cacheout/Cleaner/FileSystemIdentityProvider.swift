@@ -205,6 +205,46 @@ class FileSystemIdentityProvider {
         return mountedOn == url.path
     }
 
+    /// Every mount point on this machine, as the kernel spells it — the ONE
+    /// stall-free mount detector (PR #459 review r5, lifted from
+    /// `DepthSafeRemoval` so the scanner and the removal share a single
+    /// spelling).
+    ///
+    /// `getfsstat(MNT_NOWAIT)` reads the kernel's own mount table and touches
+    /// no filesystem. That property is load-bearing: `lstat(2)` or
+    /// `statfs(2)` OF a mount point cross INTO the mounted filesystem (the
+    /// getattr is served by the foreign fs), so on a hard-mounted
+    /// unresponsive volume they block in the kernel — a detector built on
+    /// them would hang exactly where it is needed. Only the table answers
+    /// without first contact.
+    ///
+    /// A buffer of our own rather than `getmntinfo`, which returns a pointer
+    /// to a STATIC buffer: scans and permanent deletions run concurrently.
+    ///
+    /// An INSTANCE method on purpose: it is the hermetic override point for
+    /// mount fixtures no real `hdiutil` volume backs (the same rule as every
+    /// other probe on this type).
+    func mountPointPaths() -> [String] {
+        let needed = getfsstat(nil, 0, MNT_NOWAIT)
+        guard needed > 0 else { return [] }
+        // Room for filesystems mounted between the two calls; anything past
+        // it is simply not seen by THIS read, and the callers' later guards
+        // still hold (the removal's per-child mount comparison; the
+        // scanner's candidate-device arm).
+        let capacity = Int(needed) + 8
+        let table = UnsafeMutablePointer<statfs>.allocate(capacity: capacity)
+        defer { table.deallocate() }
+        let got = getfsstat(
+            table, Int32(capacity * MemoryLayout<statfs>.stride), MNT_NOWAIT
+        )
+        guard got > 0 else { return [] }
+        return (0..<Int(got)).map { index in
+            withUnsafeBytes(of: &table[index].f_mntonname) { raw in
+                String(cString: raw.bindMemory(to: CChar.self).baseAddress!)
+            }
+        }
+    }
+
     /// Can this directory's ENTRIES be read — i.e. would a walk that reached
     /// it be able to enumerate what is inside?
     ///

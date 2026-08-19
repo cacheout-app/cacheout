@@ -87,6 +87,18 @@ and docs/v1/CLI-REFERENCE.md) — the pre-release `node_modules` →
   folder it verified, and the Trash move proves it on both sides of the move.
   (Before this, that late window was covered for directories only: a FILE
   swapped in after the re-check was disposed of with success reported.)
+  **Mounted volumes inside temp roots are never entered.** The scan decides
+  from the kernel's own mount table before touching the entry at all — so a
+  dead network volume can no longer wedge the whole scan at first contact —
+  stops its content walk at any mounted boundary it knows of, and shows the
+  entry as a visible not-measured row whose message names the remedy: eject
+  or unmount the volume, then re-scan. Previously the staleness walk
+  descended mounted volumes (measured: 19,545 + 19,500 reads below one
+  22,545-entry mount) and whether a mounted entry appeared at all depended
+  on the volume's own contents. The delete-time re-check likewise refuses
+  to descend onto another filesystem. A volume mounted in the instant
+  between the table read and the walk is still read (metadata only) and is
+  refused by the sizing and delete-time mount gates that always stood.
 - **Configurable dev roots.** Settings gains a dev-roots editor and the CLI a
   repeatable `--dev-root PATH` (invocation-scoped, never persisted). The
   filesystem root, any volume root or mount point, and `$HOME` itself are

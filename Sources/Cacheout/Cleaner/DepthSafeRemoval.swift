@@ -715,7 +715,7 @@ enum DepthSafeRemoval {
         // is the same answer for the trees it could NOT measure, which is
         // exactly the population this file exists for.
         try refuseATreeThatAlreadyContainsAMount(
-            root: current, displayPath: displayPath
+            root: current, displayPath: displayPath, provider: provider
         )
 
         /// Subdirectory names not yet descended into, one BOUNDED batch per
@@ -1164,12 +1164,14 @@ enum DepthSafeRemoval {
     /// exactly the over-`PATH_MAX` trees this file exists to delete, with a
     /// re-scan remedy that could never clear it.
     private static func refuseATreeThatAlreadyContainsAMount(
-        root: Int32, displayPath: String
+        root: Int32, displayPath: String,
+        provider: FileSystemIdentityProvider
     ) throws {
         guard let rootPath = canonicalPath(of: root) else { return }
         let prefix = rootPath.hasSuffix("/") ? rootPath : rootPath + "/"
         var shallowest: String?
-        for mountPoint in mountPoints() where mountPoint.hasPrefix(prefix) {
+        for mountPoint in provider.mountPointPaths()
+        where mountPoint.hasPrefix(prefix) {
             if shallowest == nil
                 || mountPoint.utf8.count < shallowest!.utf8.count {
                 shallowest = mountPoint
@@ -1193,30 +1195,10 @@ enum DepthSafeRemoval {
         return String(cString: buffer)
     }
 
-    /// Every mount point on this machine, as the kernel spells it.
-    ///
-    /// `getfsstat` with a buffer of our own rather than `getmntinfo`, which
-    /// returns a pointer to a STATIC buffer: permanent deletions run on a
-    /// background queue and more than one can be in flight.
-    static func mountPoints() -> [String] {
-        let needed = getfsstat(nil, 0, MNT_NOWAIT)
-        guard needed > 0 else { return [] }
-        // Room for filesystems mounted between the two calls; anything past
-        // it is simply not seen by THIS preflight, and the per-child guard
-        // still refuses it.
-        let capacity = Int(needed) + 8
-        let table = UnsafeMutablePointer<statfs>.allocate(capacity: capacity)
-        defer { table.deallocate() }
-        let got = getfsstat(
-            table, Int32(capacity * MemoryLayout<statfs>.stride), MNT_NOWAIT
-        )
-        guard got > 0 else { return [] }
-        return (0..<Int(got)).map { index in
-            withUnsafeBytes(of: &table[index].f_mntonname) { raw in
-                String(cString: raw.bindMemory(to: CChar.self).baseAddress!)
-            }
-        }
-    }
+    // The kernel-mount-table read (`getfsstat(MNT_NOWAIT)`) lives on
+    // `FileSystemIdentityProvider.mountPointPaths()` since PR #459 r5 — the
+    // ephemeral-temp scanner needs the identical stall-free primitive, and
+    // two spellings of one table read is how the two would drift.
 
     /// `.` and `..` by BYTES — the two names the traversal must never take.
     private static func isDotEntry(_ name: RawName, length: Int) -> Bool {

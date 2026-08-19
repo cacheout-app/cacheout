@@ -1274,8 +1274,15 @@ struct CLIHandler {
 
         // Deterministic wire order: registration order across scanners
         // (stream events complete in nondeterministic order), outcome order
-        // within a scanner (CacheScanner.scanAll is size-descending — the
-        // schema-3 scan order, preserved).
+        // within a scanner (`CacheScanner.scanAll` is size-descending, ties
+        // broken by category slug — the schema-3 scan order, preserved).
+        //
+        // The tie-break is load-bearing for this sentence (PR #459 review r3):
+        // until it was added, `scanAll` sorted on size alone over an array
+        // built in task-group COMPLETION order, so equal-size rows — every
+        // missing and every empty category ties at 0 bytes — came out in
+        // whatever order the tasks finished. The word "Deterministic" was not
+        // true of the within-scanner half it claims.
         for scanner in deps.runtime.scanners {
             let scannerID = scanner.id
             if let issue = collected.malformed[scannerID] {

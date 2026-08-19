@@ -703,7 +703,7 @@ Thread-safe scanner that discovers and measures cache categories in parallel.
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| `scanAll` | `func scanAll(_ categories: [CacheCategory]) async -> [ScanResult]` | Scan all categories concurrently. Returns results sorted by size descending. |
+| `scanAll` | `func scanAll(_ categories: [CacheCategory]) async -> [ScanResult]` | Scan all categories concurrently. Returns results sorted by size descending, ties broken by category slug ascending — a TOTAL order, so two scans of the same input never disagree (every missing and every empty category ties at 0 bytes). |
 | `scanCategory` | `func scanCategory(_ category: CacheCategory) async -> ScanResult` | Scan a single category. Admits each resolved root before sizing (refusal = scan error, never a walk); returns state, split components, and count. |
 
 Sizing is delegated to `DirectorySizer` (`Sources/Cacheout/Scanner/DirectorySizer.swift`) —

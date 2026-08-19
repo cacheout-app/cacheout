@@ -61,7 +61,26 @@ actor CacheScanner {
             for await result in group {
                 results.append(result)
             }
-            return results.sorted { $0.sizeBytes > $1.sizeBytes }
+            // A TOTAL order, not a partial one (PR #459 review r3 — F10).
+            // `results` is built in task-group COMPLETION order, which is
+            // nondeterministic, so sorting on `sizeBytes` ALONE left every set
+            // of equal-size categories in whatever order those tasks happened
+            // to finish. Measured on a three-category fixture (one 4 KB, one
+            // empty, one missing): 17 of 2000 scans returned the two 0-byte
+            // rows in the minority order. Every missing and every empty
+            // category ties at 0 bytes, so real installs have several tied
+            // rows and the `categories` array of `--cli scan --format json`
+            // and the app's category list reordered between consecutive scans.
+            // No value was ever wrong — only the order — which is why this is
+            // a disclosure wart and not a correctness one. The slug tie-break
+            // is what makes `CLIHandler`'s "deterministic wire order" note
+            // true, and it is the same shape `BuildArtifactsScanner` already
+            // uses and `docs/v1/CATEGORIES.md` already documents.
+            return results.sorted { left, right in
+                left.sizeBytes == right.sizeBytes
+                    ? left.category.slug < right.category.slug
+                    : left.sizeBytes > right.sizeBytes
+            }
         }
     }
 

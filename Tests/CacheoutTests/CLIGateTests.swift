@@ -655,6 +655,61 @@ final class CLIGateTests: XCTestCase {
 
     // MARK: - Scan envelope (R2, R8)
 
+    /// F10 (PR #459 review r3): `CacheScanner.scanAll` must impose a TOTAL
+    /// order, so two scans of one fixture cannot disagree.
+    ///
+    /// This is the root cause of an observed intermittent failure in
+    /// `testScanEnvelopeCategoriesRowsAreSchema3FieldForField` below —
+    /// reproduced at 3 failures in 220 filtered runs (~1.4%), always an
+    /// ordering difference and never a value one: `empty_cat` and
+    /// `missing_cat`, both 0 bytes, swapped between the two independent scans
+    /// that cell compares. `scanAll` appended results in task-group COMPLETION
+    /// order and then sorted on `sizeBytes` alone, which is only a PARTIAL
+    /// order, so tied rows came out in whatever order the tasks finished — 17
+    /// minority orderings per 2000 scans of this exact fixture (0.85%), which
+    /// predicts the ~1.7% two-scan disagreement rate observed.
+    ///
+    /// Both halves PRE-DATE this PR (the cell and the sorting line are both at
+    /// merge base f7b2087, and `git diff f7b2087..HEAD` touches neither file),
+    /// so this is not a regression introduced here — it is a known flake being
+    /// closed rather than left undescribed.
+    ///
+    /// The fixture is arranged so a single run is usually enough to catch a
+    /// regression rather than needing luck: `empty_cat` sorts BEFORE
+    /// `missing_cat` by slug, while a missing category resolves instantly and
+    /// therefore almost always COMPLETES first. The repetition is belt to that
+    /// braces.
+    func testEqualSizeCategoryRowsComeBackInOneStableOrder() async throws {
+        let measuredRoot = base.appendingPathComponent("stable-measured")
+        try fm.createDirectory(
+            at: measuredRoot, withIntermediateDirectories: true
+        )
+        try Data(repeating: 0xCD, count: 4096).write(
+            to: measuredRoot.appendingPathComponent("f.bin")
+        )
+        let emptyRoot = base.appendingPathComponent("stable-empty")
+        try fm.createDirectory(
+            at: emptyRoot, withIntermediateDirectories: true
+        )
+        // Declared in an order that is neither the expected one nor the
+        // likely completion one.
+        let categories = [
+            makeCategory(name: "missing_cat"),
+            makeCategory(name: "measured_cat", path: measuredRoot.path),
+            makeCategory(name: "empty_cat", path: emptyRoot.path),
+        ]
+
+        let scanner = CacheScanner(home: fixtureHome)
+        for iteration in 1...20 {
+            let slugs = await scanner.scanAll(categories).map(\.category.slug)
+            XCTAssertEqual(
+                slugs, ["measured_cat", "empty_cat", "missing_cat"],
+                "size descending, then slug ascending — every 0-byte row has "
+                    + "a defined place (iteration \(iteration))"
+            )
+        }
+    }
+
     func testScanEnvelopeCategoriesRowsAreSchema3FieldForField() async throws {
         let measuredRoot = base.appendingPathComponent("measured-root")
         try fm.createDirectory(at: measuredRoot, withIntermediateDirectories: true)

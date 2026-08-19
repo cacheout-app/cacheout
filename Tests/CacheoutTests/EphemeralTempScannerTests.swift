@@ -1668,6 +1668,52 @@ final class EphemeralTempScannerTests: XCTestCase {
         )
     }
 
+    /// AVAILABILITY, PROVEN THROUGH PRODUCTION (PR #459 review r2).
+    ///
+    /// The delete-time open cannot carry `O_DIRECTORY` — a regular-file
+    /// candidate must open too — so it is the FIFO driver's `open` that runs
+    /// when a named pipe stands at a scanned name, and without `O_NONBLOCK`
+    /// that call never returns until a writer arrives. `CacheCleaner` is an
+    /// `actor` and calls `revalidate` synchronously, so a block here wedges
+    /// the clean and every later message to that actor, with no timeout
+    /// anywhere. `/private/tmp` is world-writable, so any user can plant one.
+    ///
+    /// The verdict is taken on a DETACHED THREAD behind a bounded wait: a
+    /// regression fails this cell in 5s instead of hanging the whole suite.
+    /// Measured on this platform with the exact flag set: without
+    /// `O_NONBLOCK` the open did not return in 3s; with it, it returns and
+    /// `fstat` reports `S_IFIFO`, which the kind gate refuses.
+    func testRevalidatorReturnsAndRefusesAFIFOStandingAtAScannedName()
+        async throws {
+        let entry = try makeStaleCandidate("fifo-swap", under: sharedRootURL)
+        let scanner = makeScanner(roots: [sharedRoot()])
+        let scanned = itemsByName(await scan(scanner))
+        let item = try XCTUnwrap(scanned["fifo-swap"])
+
+        try fm.removeItem(at: entry)
+        XCTAssertEqual(mkfifo(entry.path, 0o600), 0,
+                       "the fixture must actually stage a named pipe")
+        defer { try? fm.removeItem(at: entry) }
+
+        let revalidator = try XCTUnwrap(scanner.preDeleteRevalidator)
+        let box = VerdictBox()
+        let finished = DispatchSemaphore(value: 0)
+        Thread.detachNewThread {
+            box.value = revalidator.revalidate(item: item, authorization: nil)
+            finished.signal()
+        }
+
+        XCTAssertEqual(
+            finished.wait(timeout: .now() + 5), .success,
+            "the delete-time re-check must RETURN on a FIFO — a blocking open "
+                + "wedges the cleaner actor for the life of the process"
+        )
+        guard case .refuse(let reason, _, _) = try XCTUnwrap(box.value) else {
+            return XCTFail("a special file at a scanned name must be refused")
+        }
+        XCTAssertTrue(reason.contains("no longer the kind of object"), reason)
+    }
+
     /// A vanished entry cannot be re-inspected, so it is refused rather than
     /// allowed on a verdict about nothing.
     func testRevalidatorRefusesAnEntryThatVanishedBeforeDeletion() async throws {
@@ -1683,4 +1729,12 @@ final class EphemeralTempScannerTests: XCTestCase {
         else { return XCTFail("an absent entry must be refused") }
         XCTAssertTrue(reason.contains("could not be re-opened"), reason)
     }
+}
+
+/// A one-slot box so a verdict taken on a detached thread can be read back
+/// after a bounded wait. `@unchecked Sendable` is sound here because the
+/// semaphore establishes the happens-before edge: the writer signals only
+/// after the store, and the reader loads only after a successful wait.
+private final class VerdictBox: @unchecked Sendable {
+    var value: PreDeleteVerdict?
 }

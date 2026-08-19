@@ -1371,13 +1371,33 @@ struct EphemeralTempScanner: @unchecked Sendable {
             .refuse(reason: reason, valuables: [], acknowledgementToken: nil)
         }
 
-        // THE HELD DESCRIPTOR, AND THE KIND GATE IS THE OPEN. One syscall, so
-        // there is no window between deciding what stands here and taking hold
-        // of it. `O_NOFOLLOW` is what makes the answer trustworthy: an entry
-        // swapped for a symlink since the scan fails here (ELOOP) instead of
-        // being followed. Valid for directories AND regular files on Darwin —
-        // the same open the scan's own lock probe performs.
-        let descriptor = open(target.path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+        // THE HELD DESCRIPTOR. One syscall, so there is no window between
+        // deciding what stands here and taking hold of it. `O_NOFOLLOW` is
+        // what makes the answer trustworthy: an entry swapped for a symlink
+        // since the scan fails here (ELOOP) instead of being followed. Valid
+        // for directories AND regular files on Darwin — the same open the
+        // scan's own lock probe performs.
+        //
+        // `O_NONBLOCK` IS AN AVAILABILITY GUARD, NOT A PERFORMANCE HINT
+        // (PR #459 review r2). This open cannot carry `O_DIRECTORY` — a
+        // regular-file candidate must open too — so it is the driver's `open`
+        // that runs, and a FIFO standing at this name BLOCKS FOREVER waiting
+        // for a writer. Measured on this platform: the identical flag set
+        // without `O_NONBLOCK` did not return in 3s against `mkfifo`; with it
+        // the open returns immediately and `fstat` reports `S_IFIFO`.
+        // `/private/tmp` is world-writable (this scanner's own root comment
+        // notes it holds live top-level sockets), so any user can plant one at
+        // a scanned name. There is no timeout anywhere downstream:
+        // `CacheCleaner` is an `actor` and `preDeleteOutcome` calls
+        // `revalidate` synchronously, so a block here wedges the clean and
+        // every later message to that actor for the life of the process.
+        // `O_NONBLOCK` changes nothing for a directory or a regular file; it
+        // only converts "hang" into "opened, and refused below as the wrong
+        // kind of object". `DepthSafeRemoval` documents the `O_DIRECTORY`
+        // half of the same hazard.
+        let descriptor = open(
+            target.path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK
+        )
         guard descriptor >= 0 else {
             let code = errno
             return refuse(
@@ -1396,6 +1416,30 @@ struct EphemeralTempScanner: @unchecked Sendable {
                     + "delete time — refused, nothing deleted; re-scan required"
             )
         }
+        // (0) THE KIND GATE, and it is a DELETE-TIME fact (PR #459 review r2).
+        // The comment that stood on the trailing arm called a special file
+        // "unreachable, because the scan never emits one" — a scan-time fact
+        // asserted inside the one function whose entire premise is that
+        // scan-time facts expire. It is reachable: a FIFO, socket or device
+        // node planted at a scanned name opens successfully (that is what
+        // `O_NONBLOCK` above is for) and `fileKind(from:)` maps every
+        // non-REG/DIR/LNK `S_IFMT` to `.other`. `.symlink` is the one arm the
+        // open really does foreclose — `O_NOFOLLOW` fails ELOOP — but it costs
+        // nothing to refuse both here, and refusing at the top means the
+        // regular-file and directory arms below are reached only by objects
+        // this scanner can actually have listed.
+        let kind = FileSystemIdentityProvider.fileKind(from: status)
+        switch kind {
+        case .regularFile, .directory:
+            break
+        case .symlink, .other:
+            return refuse(
+                "\(target.path): this temp entry is no longer the kind of "
+                    + "object that was scanned — refused, nothing deleted; "
+                    + "re-scan required"
+            )
+        }
+
         // The IDENTITY that travels in the verdict is read through the
         // provider, because that is what `DepthSafeRemoval.proveInspectedRoot`
         // and `TrashDisposal` compare it against — one accessor on both sides,
@@ -1463,10 +1507,10 @@ struct EphemeralTempScanner: @unchecked Sendable {
             )
         }
 
-        switch FileSystemIdentityProvider.fileKind(from: status) {
-        case .regularFile:
-            // A regular-file candidate has no contents to walk; its own
-            // allocation is the floor input stage 1 used.
+        guard kind == .directory else {
+            // A REGULAR FILE — the only other kind gate (0) admits. It has no
+            // contents to walk; its own allocation is the floor input stage 1
+            // used.
             guard metadata.allocatedBytes >= sizeFloorBytes else {
                 return refuse(
                     "\(target.path): this temp file has shrunk below the size "
@@ -1480,41 +1524,31 @@ struct EphemeralTempScanner: @unchecked Sendable {
             // `O_DIRECTORY` open) agrees. It is the SAME verdict the sweep's
             // probe returns for the same shape.
             return .allow(inspected: .noDirectoryTree)
+        }
 
-        case .directory:
-            var budget = entryLimit
-            switch freshContentBelow(
-                descriptor: descriptor, at: target, cutoff: cutoff,
-                budget: &budget, provider: provider
-            ) {
-            case .allOld:
-                // THE BINDING. `fstat` of the descriptor this whole verdict
-                // was taken through — the deletion proves the inode it opens
-                // is this one, on both the permanent and the Trash arm.
-                return .allow(inspected: .directory(identity))
-            case .freshContent(let url):
-                return refuse(
-                    "\(target.path): fresh content (\(url.lastPathComponent)) "
-                        + "was written inside this temp entry since the scan "
-                        + "— refused, nothing deleted. Re-scan to see its "
-                        + "current state"
-                )
-            case .unprovable(let detail):
-                return refuse(
-                    "\(target.path): this temp entry's contents could not be "
-                        + "fully re-inspected at delete time (\(detail)) — "
-                        + "refused, nothing deleted (an inspection that could "
-                        + "not finish is treated like a change since scan); "
-                        + "re-scan required"
-                )
-            }
-
-        case .symlink, .other:
-            // `O_NOFOLLOW` already refuses a symlink leaf, and the scan never
-            // emits a special file — so this is unreachable. Fail closed.
+        var budget = entryLimit
+        switch freshContentBelow(
+            descriptor: descriptor, at: target, cutoff: cutoff,
+            budget: &budget, provider: provider
+        ) {
+        case .allOld:
+            // THE BINDING. `fstat` of the descriptor this whole verdict
+            // was taken through — the deletion proves the inode it opens
+            // is this one, on both the permanent and the Trash arm.
+            return .allow(inspected: .directory(identity))
+        case .freshContent(let url):
             return refuse(
-                "\(target.path): this temp entry is no longer the kind of "
-                    + "object that was scanned — refused, nothing deleted; "
+                "\(target.path): fresh content (\(url.lastPathComponent)) "
+                    + "was written inside this temp entry since the scan "
+                    + "— refused, nothing deleted. Re-scan to see its "
+                    + "current state"
+            )
+        case .unprovable(let detail):
+            return refuse(
+                "\(target.path): this temp entry's contents could not be "
+                    + "fully re-inspected at delete time (\(detail)) — "
+                    + "refused, nothing deleted (an inspection that could "
+                    + "not finish is treated like a change since scan); "
                     + "re-scan required"
             )
         }

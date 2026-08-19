@@ -807,8 +807,17 @@ final class EphemeralTempRegistrationTests: XCTestCase {
     /// checked the first-level venv, which is precisely the entry both
     /// scanners claim — that is why it could stay green while everything
     /// deeper vanished. This cell stages a tree BELOW first level and asserts
-    /// it is still listed, which goes red the moment any root-level refusal
-    /// returns.
+    /// it is still listed by `build_artifacts` and by nobody else, which is
+    /// exactly the coverage a root-level refusal destroys.
+    ///
+    /// WHAT THIS CELL DOES NOT DO, measured rather than assumed: its temp root
+    /// is a FIXTURE directory, so re-landing round 1's refusal verbatim — it
+    /// keys on the machine's real temp-root set — leaves this cell GREEN. The
+    /// cells that go RED on that exact mutation are
+    /// `testTheRealStoreKeepsPrivateTmpAsADeclaredDevRoot` and CLIGateTests'
+    /// `testAnEphemeralTempRootIsALegalDevRootValue`, both of which resolve
+    /// the literal `/private/tmp` through a non-injected store (verified: 2
+    /// cells, 4 assertions red).
     func testADevRootThatIsATempRootIsAcceptedAndItsDeeperTreesStayListed()
         async throws {
         try stageFirstLevelVenv()

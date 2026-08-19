@@ -4562,4 +4562,96 @@ final class CacheCleanerTests: XCTestCase {
         )
         XCTAssertTrue(message.contains(child.path), message)
     }
+
+    // MARK: - The cleanup log's own open must not block (PR #459 review r4)
+
+    /// A zero-record `.removeContents` item whose refusal is LOGGED — the
+    /// cheapest deterministic path into `appendLog` (`clean()`'s step (3)
+    /// "no-root-records" arm). Shared by the two FIFO cells below.
+    private func loggedRefusalItem(under dir: URL) -> ReclaimableItem {
+        makeItem(
+            id: "zero-record-contents",
+            records: [],
+            action: .removeContents,
+            admission: .category(makeCategory(at: dir, name: "log-fifo-cat"))
+        )
+    }
+
+    /// AVAILABILITY (PR #459 review r4, the third blocking-`open` site): the
+    /// cleanup log's `openat` is `O_WRONLY` and cannot carry `O_DIRECTORY`
+    /// (it creates a regular file), so a FIFO planted at
+    /// `~/.cacheout/cleanup.log` blocks the open until a READER appears —
+    /// measured, the pre-fix flag set did not return in 2s. Every admission
+    /// and refusal logs inside the `CacheCleaner` actor, so that block wedges
+    /// the clean and every later message to the actor. `O_NONBLOCK` converts
+    /// the no-reader open into ENXIO, which the best-effort log drops.
+    func testAFIFOPlantedAtTheCleanupLogDoesNotWedgeTheClean() async throws {
+        let home = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let logDir = home.appendingPathComponent(".cacheout")
+        try FileManager.default.createDirectory(
+            at: logDir, withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        let fifoPath = logDir.appendingPathComponent("cleanup.log").path
+        guard mkfifo(fifoPath, 0o600) == 0 else {
+            return XCTFail("mkfifo failed: \(String(cString: strerror(errno)))")
+        }
+
+        let item = loggedRefusalItem(under: home)
+        let done = expectation(description: "clean returned")
+        let cleaner = CacheCleaner(home: home, containerRoots: [])
+        Task {
+            let report = await cleaner.clean(items: [item], moveToTrash: false)
+            XCTAssertEqual(report.errors.count, 1,
+                           "the refusal itself must still surface")
+            done.fulfill()
+        }
+        await fulfillment(of: [done], timeout: 5)
+
+        var status = stat()
+        XCTAssertEqual(lstat(fifoPath, &status), 0)
+        XCTAssertEqual(status.st_mode & S_IFMT, S_IFIFO,
+                       "the planted FIFO still stands — never replaced")
+    }
+
+    /// The kind gate, evidenced separately from the flag: with a READER
+    /// holding the FIFO open, `O_WRONLY|O_NONBLOCK` SUCCEEDS (measured,
+    /// `fstat` reports `S_IFIFO`) — so without the `fstat` regular-file gate
+    /// the refusal line would stream into someone else's pipe. This cell
+    /// holds a non-blocking reader and asserts the pipe stays EMPTY.
+    func testTheCleanupLogNeverWritesIntoAFIFOEvenWithAReaderPresent() async throws {
+        let home = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let logDir = home.appendingPathComponent(".cacheout")
+        try FileManager.default.createDirectory(
+            at: logDir, withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        let fifoPath = logDir.appendingPathComponent("cleanup.log").path
+        guard mkfifo(fifoPath, 0o600) == 0 else {
+            return XCTFail("mkfifo failed: \(String(cString: strerror(errno)))")
+        }
+        let readerFd = open(fifoPath, O_RDONLY | O_NONBLOCK | O_CLOEXEC)
+        guard readerFd >= 0 else {
+            return XCTFail("reader open failed: \(String(cString: strerror(errno)))")
+        }
+        defer { close(readerFd) }
+
+        let item = loggedRefusalItem(under: home)
+        let cleaner = CacheCleaner(home: home, containerRoots: [])
+        let report = await cleaner.clean(items: [item], moveToTrash: false)
+        XCTAssertEqual(report.errors.count, 1)
+
+        // An empty pipe whose write side is closed reads 0 (EOF) — measured;
+        // EAGAIN would need a live writer holding it open. Any positive count
+        // is log text that leaked into the pipe.
+        var buffer = [UInt8](repeating: 0, count: 4096)
+        let readCount = read(readerFd, &buffer, buffer.count)
+        XCTAssertEqual(
+            readCount, 0,
+            "no bytes may enter the pipe — got \(max(readCount, 0)) bytes: "
+                + String(decoding: buffer.prefix(max(readCount, 0)), as: UTF8.self)
+        )
+    }
 }

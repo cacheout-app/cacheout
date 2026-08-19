@@ -69,7 +69,8 @@ and docs/v1/CLI-REFERENCE.md) — the pre-release `node_modules` →
   entry's filesystem identity and the re-check compares it, so an entry
   renamed away and replaced under the same name is refused even when the
   replacement is itself old and idle. If the entry has been replaced, written
-  into, or locked by a running process since the scan, the deletion is refused
+  into, locked by a running process, or has shrunk below the size threshold
+  since the scan, the deletion is refused
   with nothing removed and nothing reported freed — re-scan to see its current
   state. Under the world-writable shared root (`/tmp`) an entry that has
   changed owner since the scan is refused too; the per-user containers are not

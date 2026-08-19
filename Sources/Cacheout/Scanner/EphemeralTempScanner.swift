@@ -1539,10 +1539,14 @@ struct EphemeralTempScanner: @unchecked Sendable {
     /// WHAT THIS DOES. Every temp item is re-inspected from a HELD
     /// DESCRIPTOR, in the scan's pinned order, with the object's own identity
     /// checked first: kind → RECORDED IDENTITY → ownership → own-mtime
-    /// staleness → cooperative `flock` → fresh content below. Any of them
-    /// failing is a fail-closed `.refuse` with a CLEARABLE sentence — these
-    /// conditions are non-deterministic, so the "re-scan" remedy the UI prints
-    /// genuinely can differ (unlike a fixed depth cap, which a re-scan
+    /// staleness → cooperative `flock` → the size-floor qualification →
+    /// fresh content below (for a directory the floor is judged on the walk's
+    /// own deduped allocated sum, so it comes with the content verdict —
+    /// PR #459 review r4, codex C4: the list here used to omit the floor,
+    /// which the file arm re-checked and the directory arm did not). Any of
+    /// them failing is a fail-closed `.refuse` with a CLEARABLE sentence —
+    /// these conditions are non-deterministic, so the "re-scan" remedy the UI
+    /// prints genuinely can differ (unlike a fixed depth cap, which a re-scan
     /// reproduces identically for ever).
     ///
     /// THE IDENTITY CHECK IS WHAT MAKES THE OTHERS MEAN ANYTHING (PR #459
@@ -1858,11 +1862,45 @@ struct EphemeralTempScanner: @unchecked Sendable {
         }
 
         var budget = entryLimit
+        // DELETE-TIME ALLOCATION rides the walk for free (PR #459 review r4,
+        // codex C4): the walk already demands `LeafMetadata` for every
+        // regular file and the probe already returns its identity, so the
+        // sum costs zero extra syscalls and zero budget. Deduped by inode
+        // WITHIN the walk, matching the scan's hardlink accounting
+        // (`DirectorySizer`'s within-walk dedupe).
+        var deleteTimeAllocatedBytes: Int64 = 0
+        var seenInodes = Set<FileSystemIdentityProvider.Identity>()
         switch freshContentBelow(
             descriptor: descriptor, at: target, cutoff: cutoff,
-            budget: &budget, provider: provider
+            budget: &budget, allocatedBytes: &deleteTimeAllocatedBytes,
+            seenInodes: &seenInodes, provider: provider
         ) {
         case .allOld:
+            // THE FLOOR, re-established for the DIRECTORY arm too (r4, codex
+            // C4 — the file arm above refused the identical drift while a
+            // directory whose nested payload vanished after the scan sailed
+            // to `.allow`, executing an offer the scan would refuse to make:
+            // the floor is the entry's QUALIFICATION gate for both kinds,
+            // at the scan's stage 1 for files and its outcome mapping for
+            // directories). Evaluated only on `.allOld`, i.e. a walk
+            // proven exhaustive within budget, and the refusal CONVERGES:
+            // a re-scan measures the shrunk tree below the floor and
+            // declines to list it, so the row disappears instead of
+            // re-offering. A partially-denied item reaches here only once
+            // its denial has cleared, at which point a fresh scan would
+            // also decline a below-floor tree — same semantics. Residual at
+            // measured scope: `st_blocks*512` agreed with
+            // `totalFileAllocatedSize` on 3/3 probes (plain, sparse-zero,
+            // decmpfs-compressed); a filesystem where the two straddle the
+            // exact floor could refuse a boundary-sitting offer until
+            // re-scan.
+            guard deleteTimeAllocatedBytes >= sizeFloorBytes else {
+                return refuse(
+                    "\(target.path): this temp directory has shrunk below "
+                        + "the size threshold since the scan — refused, "
+                        + "nothing deleted; re-scan required"
+                )
+            }
             // THE BINDING. `fstat` of the descriptor this whole verdict
             // was taken through — the deletion proves the inode it opens
             // is this one, on both the permanent and the Trash arm.
@@ -1909,9 +1947,21 @@ struct EphemeralTempScanner: @unchecked Sendable {
     /// including descriptor exhaustion — makes the verdict UNPROVABLE, and
     /// unprovable refuses.
     ///
-    /// The budget cannot strand a real offer: an entry whose tree exceeds it
-    /// never passes the SCAN's stage-1 walk in the first place, so it is never
-    /// listed and never reaches this code.
+    /// The budget cannot STRAND a real offer, but listed entries DO reach it
+    /// (PR #459 review r4 — the sentence here claimed an entry whose tree
+    /// exceeds the budget "is never listed and never reaches this code",
+    /// conflating scan-time with delete-time tree shape, the precise
+    /// conflation the kind gate's own comment condemns): a listed entry's
+    /// tree can GROW past the budget between scan and delete — mkdir spam in
+    /// a nested subdirectory bumps no root mtime and adds no fresh regular
+    /// file — and then arrives here, where the budget refusal takes it. No
+    /// strand: a re-scan's stage-1 walk declines to list the overgrown tree,
+    /// so the refusal converges.
+    ///
+    /// `allocatedBytes` accumulates the walk's DEDUPED regular-file
+    /// allocation (r4, codex C4) so the caller can re-establish the size
+    /// floor: metadata is already mandatory per regular file, and the probe
+    /// already returns identity — zero extra syscalls, zero budget spent.
     ///
     /// `logical` URLs are composed for the refusal message and for the
     /// provider's test seam only — they address nothing.
@@ -1920,6 +1970,8 @@ struct EphemeralTempScanner: @unchecked Sendable {
         at directory: URL,
         cutoff: Date,
         budget: inout Int,
+        allocatedBytes: inout Int64,
+        seenInodes: inout Set<FileSystemIdentityProvider.Identity>,
         provider: FileSystemIdentityProvider
     ) -> DeleteTimeFreshness {
         guard budget > 0 else {
@@ -1960,7 +2012,7 @@ struct EphemeralTempScanner: @unchecked Sendable {
                 continue
             case .failed(let code):
                 return .unprovable(String(cString: strerror(code)))
-            case .kind(let kind, _, let metadata):
+            case .kind(let kind, let childIdentity, let metadata):
                 switch kind {
                 case .regularFile:
                     guard let metadata else {
@@ -1970,6 +2022,11 @@ struct EphemeralTempScanner: @unchecked Sendable {
                     }
                     if modificationDate(of: metadata) >= cutoff {
                         return .freshContent(child)
+                    }
+                    // Two links to one inode count once, exactly as the
+                    // scan's sizer counts them (r4, codex C4).
+                    if seenInodes.insert(childIdentity).inserted {
+                        allocatedBytes += metadata.allocatedBytes
                     }
                 case .directory:
                     pending.append(name)
@@ -2004,7 +2061,9 @@ struct EphemeralTempScanner: @unchecked Sendable {
             let below = freshContentBelow(
                 descriptor: childDescriptor,
                 at: directory.appendingPathComponent(name),
-                cutoff: cutoff, budget: &budget, provider: provider
+                cutoff: cutoff, budget: &budget,
+                allocatedBytes: &allocatedBytes, seenInodes: &seenInodes,
+                provider: provider
             )
             if case .allOld = below { continue }
             return below

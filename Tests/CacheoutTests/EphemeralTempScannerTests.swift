@@ -2241,6 +2241,114 @@ final class EphemeralTempScannerTests: XCTestCase {
         else { return XCTFail("an absent entry must be refused") }
         XCTAssertTrue(reason.contains("could not be re-opened"), reason)
     }
+
+    // MARK: - The size floor is a delete-time fact for BOTH kinds
+    // (PR #459 review r4, codex C4 — DISCLOSURE)
+
+    /// A DIRECTORY whose nested payload vanished after the scan no longer
+    /// QUALIFIES for listing at all, and proceeding would execute an offer
+    /// the scanner would refuse to make — while the row still quoted the
+    /// scanned bytes at the moment of consent. Removing a NESTED file bumps
+    /// only its immediate parent's mtime (measured: unlink of X/a/b/payload
+    /// left X and X/a untouched), so no other gate catches this drift: at
+    /// HEAD before this fix, exactly this fixture revalidated
+    /// `.allow(inspected: .directory(_))` with the tree at 0 payload bytes
+    /// against a 4,096-byte floor.
+    func testRevalidatorRefusesADirectoryShrunkBelowTheFloor() async throws {
+        let entry = try mkdir(sharedRootURL.appendingPathComponent("shrunk"))
+        let nested = try mkdir(
+            entry.appendingPathComponent("a").appendingPathComponent("b")
+        )
+        let payload = try writeFile(
+            nested.appendingPathComponent("payload.bin"), bytes: 65_536
+        )
+        try backdate(entry, to: oldDate)
+
+        let scanner = makeScanner(roots: [sharedRoot()])
+        let scanned = itemsByName(await scan(scanner))
+        let item = try XCTUnwrap(scanned["shrunk"])
+        XCTAssertGreaterThanOrEqual(item.allocatedBytes, 65_536)
+
+        try fm.removeItem(at: payload)
+
+        guard case .refuse(let reason, _, _) =
+                try XCTUnwrap(scanner.preDeleteRevalidator)
+                    .revalidate(item: item, authorization: nil)
+        else {
+            return XCTFail("a below-floor directory must be refused")
+        }
+        XCTAssertTrue(reason.contains("shrunk below the size threshold"),
+                      reason)
+    }
+
+    /// The FILE arm's floor guard, evidenced for the first time (house
+    /// failure mode #1: at HEAD this guard's refusal string appeared nowhere
+    /// under Tests/, and deleting it left every existing cell green). The
+    /// mtime is re-backdated after the truncation so the floor guard — not
+    /// the staleness gate — is what this cell exercises.
+    func testRevalidatorRefusesARegularFileShrunkBelowTheFloor() async throws {
+        let entry = try writeFile(
+            sharedRootURL.appendingPathComponent("shrinking.bin"),
+            bytes: 65_536
+        )
+        try setDate(entry, oldDate)
+        let scanner = makeScanner(roots: [sharedRoot()])
+        let scanned = itemsByName(await scan(scanner))
+        let item = try XCTUnwrap(scanned["shrinking.bin"])
+
+        try Data().write(to: entry)  // truncate to 0 (bumps mtime)
+        try setDate(entry, oldDate)  // isolate the floor from the age gate
+
+        guard case .refuse(let reason, _, _) =
+                try XCTUnwrap(scanner.preDeleteRevalidator)
+                    .revalidate(item: item, authorization: nil)
+        else {
+            return XCTFail("a below-floor file must be refused")
+        }
+        XCTAssertTrue(reason.contains("shrunk below the size threshold"),
+                      reason)
+    }
+
+    /// The delete-time sum counts one inode ONCE, exactly as the scan's
+    /// sizer does: two links to one 4,096-byte inode against an 8,192-byte
+    /// floor are 4,096 deduped (refuse) but 8,192 per-link (allow) — so a
+    /// per-link sum flips this cell's verdict and goes RED.
+    func testRevalidatorFloorDedupesHardlinksInItsDeleteTimeSum() async throws {
+        let floor8k = EphemeralTempSweepConfig.Thresholds(
+            sizeFloorBytes: 8_192, staleAge: 7 * 86_400
+        )
+        let entry = try mkdir(sharedRootURL.appendingPathComponent("linked"))
+        let nested = try mkdir(
+            entry.appendingPathComponent("a").appendingPathComponent("b")
+        )
+        let payload = try writeFile(
+            nested.appendingPathComponent("payload.bin"), bytes: 65_536
+        )
+        let sub = try mkdir(entry.appendingPathComponent("sub"))
+        let linkA = sub.appendingPathComponent("hl-a.bin")
+        try Data(repeating: 0xCD, count: 4_096).write(to: linkA)
+        try fm.linkItem(at: linkA, to: sub.appendingPathComponent("hl-b.bin"))
+        try backdate(entry, to: oldDate)
+
+        let scanner = makeScanner(roots: [sharedRoot()], thresholds: floor8k)
+        let scanned = itemsByName(await scan(scanner))
+        let item = try XCTUnwrap(scanned["linked"])
+
+        // The nested payload goes; only the hardlink pair remains below.
+        try fm.removeItem(at: payload)
+
+        guard case .refuse(let reason, _, _) =
+                try XCTUnwrap(scanner.preDeleteRevalidator)
+                    .revalidate(item: item, authorization: nil)
+        else {
+            return XCTFail(
+                "4,096 deduped bytes are below the 8,192 floor — a per-link "
+                    + "sum (8,192) is the mutation this cell exists to catch"
+            )
+        }
+        XCTAssertTrue(reason.contains("shrunk below the size threshold"),
+                      reason)
+    }
 }
 
 /// A one-slot box so a verdict taken on a detached thread can be read back

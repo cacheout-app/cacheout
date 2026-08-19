@@ -460,7 +460,10 @@ struct EphemeralTempScanner: @unchecked Sendable {
 
             // ROOT GATE, no-follow (R11 + the symlink-root rule). Scan-time
             // ABSENCE is a SILENT skip — including the construction-to-scan
-            // disappearance race: temp roots churn by design, and a spurious
+            // disappearance race AND absence landing in this probe's own
+            // probe-to-list window (r4, codex C5: the listing catch below
+            // holds up the second half — it used to report a vanished root
+            // as `.unreadable`): temp roots churn by design, and a spurious
             // issue for a legitimately vanished root trains users to ignore
             // issues. A PRESENT but unreadable root is the opposite case and
             // must stay visible (a silent zero there is the TCC-silent-zero
@@ -500,10 +503,27 @@ struct EphemeralTempScanner: @unchecked Sendable {
             do {
                 listing = try listDirectory(root.url, rootEntryLimit)
             } catch {
-                // A root that lstats as a directory but refuses enumeration
-                // is a classified, VISIBLE issue — never empty-looking
-                // success. This is the one chain-bearing operation class
-                // (a), so a provenance-backed TCC signal is preserved.
+                // TWO dispositions (PR #459 review r4, codex C5 — this catch
+                // used to make every throw visible, so a root vanishing in
+                // the probe-to-list window produced exactly the spurious
+                // issue R11 exists to prevent):
+                //
+                // 1. ABSENCE — chain-ENOENT/ENOTDIR, the same definition
+                //    `probeKind` uses — is the R11 SILENT skip at ANY
+                //    scan-time instant, matching every other seam in this
+                //    file (kind dispatch, ownership, the pre-filter walk,
+                //    the lock probe, the post-sizing re-read). The code is
+                //    recovered from the error already in hand via the house
+                //    chain walk — never a re-probe (a second racy read that
+                //    misclassifies a recreated name) and never message text.
+                if let code = DirectorySizer.underlyingPOSIXCode(of: error),
+                   code == ENOENT || code == ENOTDIR {
+                    continue
+                }
+                // 2. A root that IS present but refuses enumeration is a
+                //    classified, VISIBLE issue — never empty-looking
+                //    success. This is the one chain-bearing operation class
+                //    (a), so a provenance-backed TCC signal is preserved.
                 record(.cocoaChain(error), at: root.url,
                        "\(root.label) could not be listed")
                 continue

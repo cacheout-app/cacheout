@@ -1631,6 +1631,58 @@ final class EphemeralTempScannerTests: XCTestCase {
         XCTAssertTrue(outcome.errors.isEmpty)
     }
 
+    /// The probe-to-list window (PR #459 review r4, codex C5 — DISCLOSURE):
+    /// the root exists through the kind probe and PathGuard admission, then
+    /// vanishes before the listing's own open. The injected lister removes
+    /// the root and calls the REAL production lister, so the genuine
+    /// Foundation error (Cocoa 260 wrapping POSIX ENOENT, measured) flows
+    /// through the production catch — which must apply R11's silent-absence
+    /// contract at THIS instant too, exactly as every other seam in the file
+    /// does. Before this fix the catch reported it as a visible
+    /// `.unreadable` issue: a benign absence dressed as an impediment.
+    func testRootVanishingInTheProbeToListWindowIsSilent() async throws {
+        let outcome = await scan(makeScanner(
+            roots: [sharedRoot()],
+            listDirectory: { url, limit in
+                try FileManager.default.removeItem(at: url)
+                return try EphemeralTempScanner.boundedFirstLevelNames(
+                    of: url, limit: limit
+                )
+            }
+        ))
+
+        XCTAssertTrue(outcome.items.isEmpty)
+        XCTAssertTrue(outcome.errors.isEmpty,
+                      "absence in the probe-to-list window is the same "
+                        + "benign churn R11 legislates for: \(outcome.errors)")
+    }
+
+    /// ENOTDIR is absence too (the house definition, `probeKind`'s own:
+    /// something that is not a directory tree stands at the name). Injected
+    /// as a chain-bearing throw — Cocoa 256 wrapping POSIX ENOTDIR, the
+    /// shape measured for a name replaced by a regular file — so the
+    /// ENOTDIR arm is evidenced independently of ENOENT.
+    func testChainENOTDIRListingThrowIsSilentlySkipped() async throws {
+        let lister = ListerSpy()
+        lister.stubError = NSError(
+            domain: NSCocoaErrorDomain,
+            code: CocoaError.fileReadUnknown.rawValue,
+            userInfo: [NSUnderlyingErrorKey: NSError(
+                domain: NSPOSIXErrorDomain, code: Int(ENOTDIR)
+            )]
+        )
+
+        let outcome = await scan(makeScanner(
+            roots: [sharedRoot()],
+            listDirectory: { [lister] url, limit in try lister.list(url, limit) }
+        ))
+
+        XCTAssertTrue(outcome.items.isEmpty)
+        XCTAssertTrue(outcome.errors.isEmpty,
+                      "chain-ENOTDIR is absence, not an impediment: "
+                        + "\(outcome.errors)")
+    }
+
     func testPresentButUnreadableRootIsAVisibleIssue() async throws {
         try skipUnderRoot()
         try makeStaleCandidate("hidden", under: sharedRootURL)

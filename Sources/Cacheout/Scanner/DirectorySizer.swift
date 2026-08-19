@@ -454,20 +454,29 @@ struct DirectorySizer {
     /// Classify a walk error by its POSIX root cause: EPERM(1) is TCC, EACCES
     /// (13) is BSD permissions — surfaced via the `NSUnderlyingErrorKey` chain
     /// on Cocoa 257 (`NSFileReadNoPermissionError`).
-    static func classifyDenial(_ error: Error, at url: URL) -> SizeDenial {
-        let nsError = error as NSError
-
-        var posixCode: Int?
-        var cursor: NSError? = nsError
+    /// The house recovery of a POSIX code from a Foundation throw: walk
+    /// `NSUnderlyingErrorKey` <=8 hops to `NSPOSIXErrorDomain` (epic D8 r6 —
+    /// the as-built provenance signal). Extracted from `classifyDenial`
+    /// (PR #459 review r4, codex C5) so `EphemeralTempScanner`'s root-listing
+    /// catch can tell benign absence (ENOENT/ENOTDIR) from a real denial
+    /// without duplicating the walk; `classifyDenial` calls this — a pure
+    /// additive refactor, zero behavior change.
+    static func underlyingPOSIXCode(of error: Error) -> Int32? {
+        var cursor: NSError? = error as NSError
         var hops = 0
         while let current = cursor, hops < 8 {
             if current.domain == NSPOSIXErrorDomain {
-                posixCode = current.code
-                break
+                return Int32(current.code)
             }
             cursor = current.userInfo[NSUnderlyingErrorKey] as? NSError
             hops += 1
         }
+        return nil
+    }
+
+    static func classifyDenial(_ error: Error, at url: URL) -> SizeDenial {
+        let nsError = error as NSError
+        let posixCode = underlyingPOSIXCode(of: error).map(Int.init)
 
         let kind: SizeDenial.Kind
         switch posixCode {

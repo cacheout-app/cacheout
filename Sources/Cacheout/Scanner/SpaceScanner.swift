@@ -385,9 +385,9 @@ struct ReclaimableItem: Equatable, Sendable {
     /// field — inherited VERBATIM from the retired `NodeModulesItem`
     /// (fn-4.7), which was its only home while node_modules was the only
     /// per-item scanner. It is NOT the one threshold behind every `isStale`
-    /// (that sentence stood here and was false: `orphaned_caches` sets the
-    /// field from its own 60-day-default classifier tier and
-    /// `ephemeral_tmp` from its own 7-day-default cutoff — neither calls
+    /// (that sentence stood here and was false: the orphaned-caches scanner
+    /// sets the field from its own 60-day-default classifier tier and the
+    /// ephemeral-temp scanner from its own 7-day-default cutoff — neither calls
     /// this). The GUI's "Select Stale" section action reads the BOOL, never
     /// an age: staleness means "stale by the scanner that judged it", and
     /// the per-item age lives in the row's evidence string. `nil` days

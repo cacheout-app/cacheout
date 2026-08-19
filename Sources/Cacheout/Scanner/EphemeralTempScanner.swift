@@ -291,15 +291,11 @@ struct EphemeralTempScanner: @unchecked Sendable {
     /// all speak ONE spelling.
     var trustedContainerRoots: [URL] { roots.map(\.url) }
 
-    /// One scan: trigger gate → per root (gate, admit, list) → per entry
-    /// (dispatch, ownership, staleness, lock, size, freshness, map).
-    ///
-    /// `context.categoryFilter` is ignored (it scopes `CategoryScanner` only).
-    /// Cancellation is checked between roots and between entries — partial
-    /// results are returned rather than discarded.
     /// THE TRIGGER POLICY, EXPRESSED AS NON-PARTICIPATION (PR #459 review r1).
+    /// A pure predicate: it walks no root, opens nothing and checks no
+    /// cancellation.
     ///
-    /// This is where the `.automatic` deferral lives now. Returning an empty
+    /// This is where the `.automatic` deferral lives. Returning an empty
     /// `ScanOutcome` from `scan` instead is what the scanner used to do, and
     /// it was not a deferral at all: an empty outcome ASSERTS the roots are
     /// empty, and the consumer believed it — `reconcile` replaced the
@@ -311,16 +307,28 @@ struct EphemeralTempScanner: @unchecked Sendable {
         context.includeProtectedRoots
     }
 
+    /// One scan: trigger gate → per root (gate, admit, list) → per entry
+    /// (dispatch, ownership, staleness, lock, size, freshness, map).
+    ///
+    /// `context.categoryFilter` is ignored (it scopes `CategoryScanner` only).
+    /// Cancellation is checked between roots and between entries — partial
+    /// results are returned rather than discarded.
     func scan(context: ScanContext) async -> ScanOutcome {
         // TRIGGER GATE (epic D11 r5) — the WHOLE scanner, all three roots.
         //
-        // DEFENSE IN DEPTH FOR DIRECT INVOCATION ONLY (PR #459 review r1).
-        // The deferral a SESSION sees is `participates(in:)` above; this guard
-        // is what makes the no-enumeration promise hold for a caller that
-        // invokes `scan` directly without consulting it. Note what an empty
-        // outcome does and does not say: it carries no "not inspected"
-        // representation, so it cannot express a deferral to a consumer — the
-        // reason the participation seam exists.
+        // DEFENSE IN DEPTH FOR A CALLER THAT BYPASSES THE RUNTIME (PR #459
+        // review r2). The enforcement point is `SpaceScannerRuntime
+        // .scanValidatedSession`, which filters on `participates(in:)` for
+        // EVERY caller of a session; this guard is what makes the
+        // no-enumeration promise hold for code that constructs a scanner and
+        // calls `scan` directly, which the tests do and which nothing stops a
+        // future call site from doing. Do not delete it on the ground that the
+        // session layer handles it: the session layer handles SESSIONS.
+        //
+        // Note what an empty outcome does and does not say: it carries no "not
+        // inspected" representation, so it cannot express a deferral to a
+        // consumer — which is the reason the participation seam exists and why
+        // this arm is a last resort rather than the policy.
         //
         // The comment that stood here called this "exactly like a skipped
         // TCC-protected search root". Mechanically true, and that is the

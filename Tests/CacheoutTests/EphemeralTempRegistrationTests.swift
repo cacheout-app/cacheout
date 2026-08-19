@@ -904,6 +904,69 @@ final class EphemeralTempRegistrationTests: XCTestCase {
         )
     }
 
+    /// THE ENFORCEMENT POINT IS THE RUNTIME, NOT ONE CONSUMER (PR #459 review
+    /// r2).
+    ///
+    /// The protocol documented non-participation as "the runtime never invokes
+    /// the scanner", but `scanValidatedSession` filtered on `scannerIDs`
+    /// alone: the ONLY place the predicate was consulted was
+    /// `CacheoutViewModel.scan`. `CLIHandler.collectValidatedScan` calls the
+    /// session directly and would have invoked a declining scanner — latent
+    /// only because every CLI `ScanContext` is `.userInitiated` today.
+    ///
+    /// This cell bypasses the ViewModel entirely and drives the session the
+    /// way the CLI does: the declining scanner must not be invoked and must
+    /// yield NO event at all (an `.outcome` would be an empty outcome, which
+    /// asserts "the roots are empty").
+    func testTheSessionItselfNeverInvokesADecliningScanner() async throws {
+        let gatedContainer = base.appendingPathComponent("session-container")
+        try fm.createDirectory(
+            at: gatedContainer, withIntermediateDirectories: true
+        )
+        try Data(repeating: 0x41, count: 4_096).write(
+            to: gatedContainer.appendingPathComponent("gated-row")
+        )
+        let gated = TriggerGatedFixtureScanner(
+            id: "fixture_gated", container: canonical(gatedContainer)
+        )
+        let companion = AlwaysParticipatingFixtureScanner(id: "fixture_other")
+        let runtime = try makeRuntime([gated, companion])
+
+        for trigger in [ScanTrigger.userInitiated, .automatic] {
+            let everyScanner: Set<String>? = nil
+            let session = runtime.scanValidatedSession(
+                scannerIDs: everyScanner,
+                context: ScanContext(trigger: trigger)
+            )
+            var delivered: Set<String> = []
+            for await event in session.events {
+                switch event {
+                case .outcome(let id, _): delivered.insert(id)
+                case .malformed(let id, let issue):
+                    XCTFail("\(id) malformed: \(issue.detail)")
+                }
+            }
+            switch trigger {
+            case .userInitiated:
+                XCTAssertEqual(gated.scanCount.count, 1,
+                               "it runs when it participates")
+                XCTAssertTrue(delivered.contains("fixture_gated"))
+            case .automatic:
+                XCTAssertEqual(gated.scanCount.count, 1,
+                               "the session must not invoke a scanner that "
+                                + "declines the trigger — the ViewModel is "
+                                + "not the only caller")
+                XCTAssertFalse(
+                    delivered.contains("fixture_gated"),
+                    "and it must yield NO event: an empty outcome asserts "
+                        + "the roots are empty"
+                )
+            }
+            XCTAssertTrue(delivered.contains("fixture_other"),
+                          "the rest of the session is unaffected")
+        }
+    }
+
     /// THE PENDING-STATE HALF, OBSERVED DURING THE SESSION (PR #459 review
     /// r2) — the half round 1 shipped unevidenced.
     ///

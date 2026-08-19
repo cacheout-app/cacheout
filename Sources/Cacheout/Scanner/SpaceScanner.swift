@@ -640,12 +640,21 @@ protocol SpaceScanner: Sendable {
     ///
     /// A scanner that declines a trigger must therefore say so HERE rather
     /// than by returning empty from `scan`. Non-participation reuses the
-    /// existing session-subset machinery: the runtime never invokes the
-    /// scanner, `reconcile` never sees an entry for it, its prior outcome and
-    /// the user's selections survive, and the R9 freshness gate
-    /// (`isBlockedFromDestructivePaths`) makes those retained rows
-    /// visible-but-non-cleanable until the scanner succeeds in a later
+    /// existing session-subset machinery: `reconcile` never sees an entry for
+    /// it, its prior outcome and the user's selections survive, and the R9
+    /// freshness gate (`isBlockedFromDestructivePaths`) makes those retained
+    /// rows visible-but-non-cleanable until the scanner succeeds in a later
     /// completed session.
+    ///
+    /// WHERE IT IS ENFORCED, named exactly (PR #459 review r2 — the previous
+    /// wording said "the runtime never invokes the scanner" while the runtime
+    /// did not consult this member at all, and the only enforcement in the
+    /// repo was `CacheoutViewModel.scan`): `scanValidatedSession` filters on
+    /// `scannerIDs` AND on this predicate, so EVERY caller of the session —
+    /// the ViewModel, `CLIHandler.collectValidatedScan`, and any future one —
+    /// gets the deferral without opting in. A scanner may still keep its own
+    /// guard inside `scan` for a caller that bypasses the runtime entirely;
+    /// that is defense in depth, not the enforcement point.
     func participates(in context: ScanContext) -> Bool
     func scan(context: ScanContext) async -> ScanOutcome
 }
@@ -1777,8 +1786,23 @@ struct SpaceScannerRuntime {
         let snapshot = ContainerSnapshot.capture(
             roots: trustedContainerRoots, provider: provider
         )
+        // TWO independent filters, and the second is the PROTOCOL's rather
+        // than the caller's (PR #459 review r2). `scannerIDs` is what the
+        // caller asked for; `participates(in:)` is what the scanner will
+        // answer to. Until this round the participation contract was
+        // documented as "the runtime never invokes the scanner" while the ONLY
+        // enforcement point in the repo was `CacheoutViewModel.scan` — so
+        // `CLIHandler.collectValidatedScan`, which calls this method directly,
+        // WOULD have invoked a declining scanner. Latent only because every
+        // CLI `ScanContext` is `.userInitiated` today; a contract enforced by
+        // one of its two callers is not enforced.
+        //
+        // A declining scanner is simply absent from the session: no task, no
+        // event, and so no `.outcome` a consumer could read as "I looked at
+        // every root and there is nothing there".
         let selected = scanners.filter { scanner in
-            scannerIDs?.contains(scanner.id) ?? true
+            (scannerIDs?.contains(scanner.id) ?? true)
+                && scanner.participates(in: context)
         }
         let registeredCategories = self.registeredCategories
         let declaredContainerRoots = self.declaredContainerRoots

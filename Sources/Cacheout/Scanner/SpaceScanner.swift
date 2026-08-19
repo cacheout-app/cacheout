@@ -604,6 +604,29 @@ protocol SpaceScanner: Sendable {
     /// injected into the cleaner's constructor; never read off items, never
     /// global state.
     var preDeleteRevalidator: PreDeleteRevalidator? { get }
+    /// Does this scanner RUN AT ALL in a session with this context? —
+    /// DEFAULT TRUE, so a scanner that always runs changes zero lines.
+    ///
+    /// LOAD-BEARING DISTINCTION, and the reason this member exists at all
+    /// (PR #459 review r1): returning `false` means THIS SCANNER WAS NOT RUN,
+    /// which is materially different from returning an empty `ScanOutcome`.
+    /// `ScanOutcome` has exactly `items` + `errors`, so an empty one is
+    /// indistinguishable on the wire from "I looked at every root and there
+    /// is nothing there" — and the consumer treats it as exactly that:
+    /// `CacheoutViewModel.reconcile` REPLACES the scanner's whole entry, so
+    /// the prior items vanish, the prior issues vanish with them, and
+    /// `pruneVanishedSelections` then drops the user's ticks because their
+    /// keys are no longer live.
+    ///
+    /// A scanner that declines a trigger must therefore say so HERE rather
+    /// than by returning empty from `scan`. Non-participation reuses the
+    /// existing session-subset machinery: the runtime never invokes the
+    /// scanner, `reconcile` never sees an entry for it, its prior outcome and
+    /// the user's selections survive, and the R9 freshness gate
+    /// (`isBlockedFromDestructivePaths`) makes those retained rows
+    /// visible-but-non-cleanable until the scanner succeeds in a later
+    /// completed session.
+    func participates(in context: ScanContext) -> Bool
     func scan(context: ScanContext) async -> ScanOutcome
 }
 
@@ -611,6 +634,10 @@ extension SpaceScanner {
     /// The default: no delete-time revalidation. Every scanner that existed
     /// before fn-4.8 inherits this unchanged.
     var preDeleteRevalidator: PreDeleteRevalidator? { nil }
+
+    /// The default: every session, every trigger. Every scanner that existed
+    /// before this member inherits it unchanged.
+    func participates(in context: ScanContext) -> Bool { true }
 }
 
 // MARK: - Runtime

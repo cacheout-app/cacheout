@@ -34,11 +34,22 @@
 /// ## Trigger policy (epic D11 r5 — the WHOLE scanner)
 ///
 /// The scanner runs ONLY on `.userInitiated` scans. On `.automatic` it defers
-/// for ALL THREE roots: no enumeration, no sizing, no items, no issues — the
-/// exact silent semantics TCC-protected search roots already have (a deferral
-/// is not an anomaly; the roots are scanned when the user asks). The gate is
-/// the derived `ScanContext.includeProtectedRoots` (`SpaceScanner.swift:75`),
-/// reused deliberately rather than re-derived.
+/// for ALL THREE roots: no enumeration, no sizing, no items, no issues. The
+/// condition is the derived `ScanContext.includeProtectedRoots`, reused
+/// deliberately rather than re-derived.
+///
+/// HOW THE DEFERRAL IS EXPRESSED (PR #459 review r1). By NON-PARTICIPATION
+/// (`participates(in:)`), not by returning an empty outcome. An empty
+/// `ScanOutcome` carries no "not inspected" representation — it is
+/// indistinguishable from "the roots are empty" — and the consumer acted on
+/// that reading: `CacheoutViewModel.reconcile` replaces the scanner's whole
+/// entry, so an automatic refresh erased the previously displayed temp
+/// findings, their issues AND the user's selections while every file was
+/// still on disk. Non-participation reuses the session-subset machinery: the
+/// scanner is not run, the prior outcome and its ticks stay, and the R9
+/// freshness gate keeps those retained rows visible-but-non-cleanable until
+/// the next completed user-initiated session. The `scan` guard remains as
+/// defense-in-depth for direct invocation.
 ///
 /// The temp roots are not themselves TCC-gated, so the reason is different:
 /// TCC authorization is per-PROCESS/code-identity, NOT per-UID. A same-UID
@@ -278,10 +289,38 @@ struct EphemeralTempScanner: @unchecked Sendable {
     /// `context.categoryFilter` is ignored (it scopes `CategoryScanner` only).
     /// Cancellation is checked between roots and between entries — partial
     /// results are returned rather than discarded.
+    /// THE TRIGGER POLICY, EXPRESSED AS NON-PARTICIPATION (PR #459 review r1).
+    ///
+    /// This is where the `.automatic` deferral lives now. Returning an empty
+    /// `ScanOutcome` from `scan` instead is what the scanner used to do, and
+    /// it was not a deferral at all: an empty outcome ASSERTS the roots are
+    /// empty, and the consumer believed it — `reconcile` replaced the
+    /// scanner's whole entry, so a user who scanned, saw the temp findings and
+    /// ticked some watched the section empty itself, the issues disappear and
+    /// the ticks drop at the next automatic refresh, while every file was
+    /// still on disk and no temp root had been opened.
+    func participates(in context: ScanContext) -> Bool {
+        context.includeProtectedRoots
+    }
+
     func scan(context: ScanContext) async -> ScanOutcome {
         // TRIGGER GATE (epic D11 r5) — the WHOLE scanner, all three roots.
-        // A deferral is not an anomaly: no items AND no issues, exactly like
-        // a skipped TCC-protected search root.
+        //
+        // DEFENSE IN DEPTH FOR DIRECT INVOCATION ONLY (PR #459 review r1).
+        // The deferral a SESSION sees is `participates(in:)` above; this guard
+        // is what makes the no-enumeration promise hold for a caller that
+        // invokes `scan` directly without consulting it. Note what an empty
+        // outcome does and does not say: it carries no "not inspected"
+        // representation, so it cannot express a deferral to a consumer — the
+        // reason the participation seam exists.
+        //
+        // The comment that stood here called this "exactly like a skipped
+        // TCC-protected search root". Mechanically true, and that is the
+        // problem rather than the reassurance: the TCC skip
+        // (`ProjectTreeWalker`'s bare `continue`) erases previously displayed
+        // build-artifacts findings and their selections on an automatic
+        // refresh in the same way, measured, whenever a dev root sits under a
+        // protected directory. That is a separate defect, not a precedent.
         guard context.includeProtectedRoots else {
             return ScanOutcome(items: [], errors: [])
         }

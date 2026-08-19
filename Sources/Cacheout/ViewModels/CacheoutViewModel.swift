@@ -1254,7 +1254,9 @@ class CacheoutViewModel: ObservableObject {
     /// parallelism, and validation all live inside the runtime.
     ///
     /// - Parameter scannerIDs: SCANNER SUBSET to run (nil — every existing
-    ///   caller — scans all registered scanners, byte-identical behavior).
+    ///   caller — scans all registered scanners that PARTICIPATE in this
+    ///   context; see `SpaceScanner.participates(in:)`, whose default is
+    ///   true, so this is byte-identical for every scanner that always runs).
     ///   A subset session adopts its snapshot atomically exactly like a
     ///   full one, so scanners OUTSIDE the subset keep their PRIOR session
     ///   provenance: fn-2's retention rules leave their items displayed,
@@ -1287,12 +1289,31 @@ class CacheoutViewModel: ObservableObject {
         // than the one whose scanners this session announced.
         let sessionRuntime = runtime
         let sessionRuntimeGeneration = runtimeGeneration
+        // THE SESSION CONTEXT, HOISTED, and the participating set derived
+        // from it ONCE (PR #459 review r1). The pending state and the session
+        // consume the SAME set, so they cannot disagree — a runtime-side
+        // filter alone would leave `scanningScannerIDs` claiming a scanner is
+        // running that never runs, which `perItemSections` renders as a
+        // permanently spinning section.
+        //
+        // A scanner that declines this trigger (`participates(in:)` false) is
+        // simply NOT IN THE SESSION, so `reconcile` never sees an entry for it
+        // and its prior outcome, its prior issues and the user's ticks all
+        // survive. An empty outcome would instead have asserted "there is
+        // nothing there" and wiped all three.
+        let context = ScanContext(trigger: trigger)
         // Pending state covers exactly the scanners this session RUNS —
         // a subset must not hold the guard hostage to scanners that will
         // never report (the runtime invokes only the named subset).
-        scanningScannerIDs = Set(sessionRuntime.scanners.map(\.id).filter {
-            scannerIDs?.contains($0) ?? true
-        })
+        let participating = Set(
+            sessionRuntime.scanners
+                .filter {
+                    (scannerIDs?.contains($0.id) ?? true)
+                        && $0.participates(in: context)
+                }
+                .map(\.id)
+        )
+        scanningScannerIDs = participating
         // New session: outcomes reconciled from here on carry THIS
         // generation's provenance — they pair only with THIS session's
         // snapshot, adopted below at completion (fn-3.4, R9). The
@@ -1307,8 +1328,8 @@ class CacheoutViewModel: ObservableObject {
         diskInfo = await Task.detached { DiskInfo.current() }.value
 
         let session = sessionRuntime.scanValidatedSession(
-            scannerIDs: scannerIDs,
-            context: ScanContext(trigger: trigger)
+            scannerIDs: participating,
+            context: context
         )
         for await event in session.events {
             handle(event, generation: generation)

@@ -94,9 +94,14 @@ struct MenuBarView: View {
             // scanGeneration increments on each scan, so this re-fires when data changes
         }
         .task {
-            // Auto-scan on popover open if stale (no results or >5 min old).
-            // `.automatic` skips TCC-protected roots — opening the popover
-            // must never fire a macOS privacy prompt (fn-1.4, R9).
+            // Auto-scan on popover open when the last results are stale —
+            // "stale" is `scanIntervalMinutes` old (user-selectable
+            // 15/30/60/120/240, default 30), NOT the flat 5 minutes this
+            // comment used to claim; see `shouldAutoRescan`.
+            // `.automatic` skips TCC-protected roots and excludes scanners
+            // that decline the trigger (`SpaceScanner.participates(in:)`) —
+            // opening the popover must never fire a macOS privacy prompt
+            // (fn-1.4, R9).
             if viewModel.shouldAutoRescan {
                 await viewModel.scan(trigger: .automatic)
             }

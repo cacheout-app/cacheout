@@ -264,7 +264,12 @@ final class EphemeralTempRegistrationTests: XCTestCase {
                        "an automatic scan enumerates no temp root at all")
         XCTAssertEqual(deferred.items.count, 0)
         XCTAssertEqual(deferred.issues.count, 0,
-                       "a deferral is silent — it is not an anomaly")
+                       "a deferral carries no items and no issues. NOTE THE "
+                        + "SCOPE (PR #459 review r1): this cell defers BEFORE "
+                        + "any user-initiated scan, so there is no prior "
+                        + "outcome here to retain — what a deferral does to an "
+                        + "ALREADY DISPLAYED outcome is "
+                        + "`testAutomaticRefreshAfterAUserInitiatedScanRetains…`")
 
         // (2) The user presses Scan: the item rides the GENERIC section —
         // there is no `ephemeral_tmp` view anywhere in the app.
@@ -630,5 +635,211 @@ final class EphemeralTempRegistrationTests: XCTestCase {
             CLIHandler.scannerThresholdFlagFamilies.map(\.acceptingCommands),
             [[.scan, .clean], [.scan, .clean]]
         )
+    }
+
+    // MARK: - PR #459 review r1: a deferral must not erase what is displayed
+
+    /// A scanner that declines a trigger is NOT IN THE SESSION — and that is
+    /// materially different from returning an empty outcome, which asserts
+    /// "the roots are empty" and makes `reconcile` replace the scanner's whole
+    /// entry: the items, the issues AND the user's ticks.
+    ///
+    /// The user-visible sequence this pins: press Scan, see the temp findings,
+    /// tick one, walk away. At the next auto-refresh (every
+    /// `scanIntervalMinutes`, default 30) the section must still be there,
+    /// still ticked, and no temp root may have been opened.
+    ///
+    /// The residual is PINNED here too, with its measured scope rather than
+    /// glossed: the retained rows are excluded from Clean until the next
+    /// completed user-initiated session (the as-built subset semantics — R9
+    /// freshness, fail-closed), and that exclusion is silent in the UI.
+    @MainActor
+    func testAutomaticRefreshAfterAUserInitiatedScanRetainsTempFindingsAndSelections()
+        async throws {
+        let entry = try stageStaleEntry("old-scratch")
+        let counter = ListCounter()
+        // A SECOND scanner so the automatic session still runs something and
+        // still completes and adopts — the temp scanner's absence must be the
+        // only difference.
+        let companion = AlwaysParticipatingFixtureScanner(id: "fixture_other")
+        let runtime = try makeRuntime([makeScanner(counter: counter), companion])
+        let viewModel = CacheoutViewModel(runtime: runtime)
+
+        await viewModel.scan(trigger: .userInitiated)
+        let enumeratedDuringUserScan = counter.count
+        XCTAssertGreaterThan(enumeratedDuringUserScan, 0)
+        let scanned = try XCTUnwrap(viewModel.perItemSections.first {
+            $0.scannerID == EphemeralTempScanner.registeredID
+        })
+        XCTAssertEqual(scanned.items.count, 1)
+        let item = try XCTUnwrap(scanned.items.first)
+        viewModel.toggleSelection(for: item.key)
+        XCTAssertTrue(viewModel.hasCleanableSelection)
+
+        // The timer tick `CacheoutApp` fires — nil `scannerIDs`, exactly as
+        // production calls it.
+        await viewModel.scan(trigger: .automatic)
+
+        let after = try XCTUnwrap(viewModel.perItemSections.first {
+            $0.scannerID == EphemeralTempScanner.registeredID
+        })
+        XCTAssertEqual(after.items.count, 1,
+                       "the prior outcome is RETAINED — a deferral is not a "
+                        + "claim that the roots are empty")
+        XCTAssertEqual(after.items.first?.key, item.key)
+        XCTAssertTrue(viewModel.selectedItemKeys.contains(item.key),
+                      "the user's tick survives an unattended refresh")
+        XCTAssertEqual(counter.count, enumeratedDuringUserScan,
+                       "and the D11 promise still holds: the automatic "
+                        + "session opened no temp root at all")
+        XCTAssertFalse(after.isScanning,
+                       "a scanner that never ran must not be left spinning")
+        // THE MEASURED RESIDUAL, stated rather than assumed: the retained rows
+        // keep their ticks but are display-only until the next completed
+        // user-initiated session.
+        XCTAssertFalse(viewModel.hasCleanableSelection,
+                       "retained rows are visible-but-non-cleanable (R9)")
+        XCTAssertTrue(fm.fileExists(atPath: entry.path))
+    }
+
+    /// THE GUARD THE FIX WOULD OTHERWISE ORPHAN.
+    ///
+    /// Once participation carries the deferral, the D11 cell above drives a
+    /// session that selects NO scanner at all, so its `counter.count == 0`
+    /// passes whether or not `scan`'s own trigger gate exists. This cell
+    /// invokes `scan` DIRECTLY, which is the only place that guard still
+    /// decides anything — delete it and this goes red.
+    func testDirectAutomaticInvocationEnumeratesNothingAndReportsNothing()
+        async throws {
+        try stageStaleEntry("old-scratch")
+        let counter = ListCounter()
+        let scanner = makeScanner(counter: counter)
+
+        let outcome = await scanner.scan(
+            context: ScanContext(trigger: .automatic)
+        )
+
+        XCTAssertTrue(outcome.items.isEmpty)
+        XCTAssertTrue(outcome.errors.isEmpty)
+        XCTAssertEqual(counter.count, 0,
+                       "no temp root is opened on an automatic trigger")
+        XCTAssertFalse(
+            scanner.participates(in: ScanContext(trigger: .automatic)),
+            "and the session-level deferral says so where a consumer can see it"
+        )
+        XCTAssertTrue(
+            scanner.participates(in: ScanContext(trigger: .userInitiated))
+        )
+    }
+
+    /// The SEAM, not the one scanner: any scanner that declines a trigger is
+    /// left out of the session and keeps its prior displayed outcome.
+    @MainActor
+    func testANonParticipatingScannerIsNeverInvokedAndKeepsItsPriorOutcome()
+        async throws {
+        let gatedContainer = base.appendingPathComponent("gated-container")
+        try fm.createDirectory(at: gatedContainer, withIntermediateDirectories: true)
+        try Data(repeating: 0x41, count: 4_096).write(
+            to: gatedContainer.appendingPathComponent("gated-row")
+        )
+        let gated = TriggerGatedFixtureScanner(
+            id: "fixture_gated", container: canonical(gatedContainer)
+        )
+        let companion = AlwaysParticipatingFixtureScanner(id: "fixture_other")
+        let runtime = try makeRuntime([gated, companion])
+        let viewModel = CacheoutViewModel(runtime: runtime)
+
+        await viewModel.scan(trigger: .userInitiated)
+        XCTAssertEqual(gated.scanCount.count, 1)
+        let before = try XCTUnwrap(viewModel.perItemSections.first {
+            $0.scannerID == "fixture_gated"
+        })
+        XCTAssertEqual(before.items.count, 1)
+
+        await viewModel.scan(trigger: .automatic)
+
+        XCTAssertEqual(gated.scanCount.count, 1,
+                       "a non-participating scanner is never invoked")
+        let after = try XCTUnwrap(viewModel.perItemSections.first {
+            $0.scannerID == "fixture_gated"
+        })
+        XCTAssertEqual(after.items.count, 1,
+                       "and its prior outcome survives the session")
+    }
+}
+
+/// Always runs; emits nothing. Exists so an automatic session still has a
+/// participant, completes and adopts a snapshot.
+private struct AlwaysParticipatingFixtureScanner: SpaceScanner {
+    let id: String
+    var displayName: String { "Fixture \(id)" }
+    var trustedContainerRoots: [URL] { [] }
+
+    func scan(context: ScanContext) async -> ScanOutcome {
+        ScanOutcome(items: [], errors: [])
+    }
+}
+
+/// Declines `.automatic` through the PARTICIPATION contract, and would emit a
+/// row if it ever ran — so "was it invoked" and "did its row survive" are two
+/// separate observations.
+private struct TriggerGatedFixtureScanner: SpaceScanner {
+    let id: String
+    let container: URL
+    let scanCount = InvocationCounter()
+    var displayName: String { "Fixture \(id)" }
+    var trustedContainerRoots: [URL] { [container] }
+
+    func participates(in context: ScanContext) -> Bool {
+        context.includeProtectedRoots
+    }
+
+    func scan(context: ScanContext) async -> ScanOutcome {
+        scanCount.bump()
+        let children = ((try? FileManager.default.contentsOfDirectory(
+            at: container, includingPropertiesForKeys: nil, options: []
+        )) ?? []).sorted { $0.lastPathComponent < $1.lastPathComponent }
+        return ScanOutcome(items: children.map { child in
+            ReclaimableItem(
+                id: child.lastPathComponent,
+                scannerID: id,
+                displayName: child.lastPathComponent,
+                exactBytes: 4_096,
+                estimatedUpToBytes: 0,
+                logicalBytes: nil,
+                itemCount: 1,
+                url: child,
+                declaredDisplayPath: child.path,
+                rootRecords: [RootScanRecord(
+                    requestedURL: child, resolvedURL: child, status: .measured
+                )],
+                state: .measured,
+                scanError: nil,
+                risk: .review,
+                evidence: "fixture item \(child.lastPathComponent)",
+                rebuildNote: nil,
+                action: .removeItem,
+                admission: .containerItem(
+                    originContainer: container, requestedTargetURL: child
+                ),
+                defaultSelected: false,
+                automaticCleanEligible: false,
+                isStale: nil
+            )
+        }, errors: [])
+    }
+}
+
+/// A thread-safe invocation counter for the gated fixture scanner.
+final class InvocationCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = 0
+    var count: Int {
+        lock.lock(); defer { lock.unlock() }
+        return value
+    }
+    func bump() {
+        lock.lock(); defer { lock.unlock() }
+        value += 1
     }
 }

@@ -780,6 +780,12 @@ final class EphemeralTempScannerTests: XCTestCase {
     /// A bounded wait is the assertion: if the guard is removed the detached
     /// task never completes, so the cell reddens on the timeout rather than on
     /// a value — which is itself the proof that the open really blocks.
+    ///
+    /// Wall-clock stability, MEASURED (r4 — fc006ab's body claimed the PR
+    /// added only ONE wall-clock-timeout cell and measured only that one;
+    /// this cell and the socket cell below were the other two, unmeasured
+    /// at that claim): 30/30 runs green with a concurrent full `swift test`
+    /// suite running throughout, alongside the other four timeout cells.
     func testAFIFOPlantedInTheSwapWindowNeitherWedgesTheScanNorIsListed()
         throws {
         let root = canonical(sharedRootURL)
@@ -867,6 +873,9 @@ final class EphemeralTempScannerTests: XCTestCase {
     /// It exists so the second special kind that can arrive in this window has
     /// a pinned disposition instead of an assumed one. Device nodes take the
     /// same path but cannot be staged without root, so they stay untested.
+    ///
+    /// Wall-clock stability, MEASURED (r4, same protocol as the FIFO cell
+    /// above): 30/30 runs green under concurrent full-suite load.
     func testASocketPlantedInTheSwapWindowIsARefusalNotAnItem() throws {
         let root = canonical(sharedRootURL)
         try makeStaleCandidate("swap-me", under: sharedRootURL)

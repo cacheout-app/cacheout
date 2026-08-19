@@ -518,6 +518,8 @@ struct ReclaimableItem: Equatable, Sendable {
 | `isStale` | `Bool?` | nil = staleness not applicable OR unknowable ("Select Stale" operates on `isStale == true`); the 30-day threshold is `ReclaimableItem.isStale(daysSinceModified:)` |
 | `valuablesDisclosure` | `ValuablesDisclosure?` | ADDITIVE. What the release-artifact probe SAW, plus its completeness flag. DISCLOSURE, never consent — acknowledgement lives only in the per-clean authorization context |
 | `requiresPreDeleteRevalidation` | `Bool` | ADDITIVE, scanner-agnostic. `true` means the item MUST be re-inspected immediately before deletion; a cleaner holding no revalidator for its scanner refuses it fail-closed |
+| `artifactProof` | `BuildArtifactProof?` | ADDITIVE. The structural property that made this item a candidate, so the OWNING scanner's revalidator can re-prove it rather than trust the scan. nil for every scanner but `build_artifacts`. Never on any wire |
+| `scannedTargetIdentity` | `Identity?` | ADDITIVE. The (device, inode) the SCAN saw at the deletion target, so the owning scanner's revalidator can prove the object it opens IS the one that was scanned rather than whatever now answers to the name. nil for every scanner but `ephemeral_tmp`; a revalidator that requires it fails closed on nil. Never on any wire |
 | `key` | `ItemKey` | Computed composite identity |
 | `allocatedBytes` | `Int64` | COMPUTED component sum — display convenience only, never stored |
 

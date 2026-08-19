@@ -1668,6 +1668,69 @@ final class EphemeralTempScannerTests: XCTestCase {
         )
     }
 
+    /// THE SCAN RECORDS THE OBJECT, NOT ONLY THE NAME (PR #459 review r2) —
+    /// every emitted item carries the (device, inode) the scan's post-sizing
+    /// `lstat` saw, which is what the delete-time re-check proves against.
+    func testEmittedItemsCarryTheScannedTargetIdentity() async throws {
+        let entry = try makeStaleCandidate("identified", under: sharedRootURL)
+        let scanner = makeScanner(roots: [sharedRoot()])
+        let scanned = itemsByName(await scan(scanner))
+        let item = try XCTUnwrap(scanned["identified"])
+
+        XCTAssertEqual(
+            item.scannedTargetIdentity,
+            FileSystemIdentityProvider().identity(of: canonical(entry)),
+            "the recorded identity is the object the scan inspected"
+        )
+    }
+
+    /// FAIL CLOSED on an item that records no identity: an identity the
+    /// re-check cannot compare is one it cannot prove, so it refuses rather
+    /// than falling back to "the four property gates said yes".
+    func testRevalidatorRefusesATempItemThatRecordsNoScannedIdentity() throws {
+        let entry = sharedRootURL.appendingPathComponent("unrecorded")
+        try FileManager.default.createDirectory(
+            at: entry, withIntermediateDirectories: true
+        )
+        let scanner = makeScanner(roots: [sharedRoot()])
+        let item = ReclaimableItem(
+            id: "unrecorded",
+            scannerID: EphemeralTempScanner.registeredID,
+            displayName: "unrecorded",
+            exactBytes: 8_192,
+            estimatedUpToBytes: 0,
+            logicalBytes: nil,
+            itemCount: 1,
+            url: entry,
+            declaredDisplayPath: entry.path,
+            rootRecords: [RootScanRecord(
+                requestedURL: entry, resolvedURL: entry, status: .measured
+            )],
+            state: .measured,
+            scanError: nil,
+            risk: .review,
+            evidence: "fixture",
+            rebuildNote: nil,
+            action: .removeItem,
+            admission: .containerItem(
+                originContainer: canonical(sharedRootURL),
+                requestedTargetURL: entry
+            ),
+            defaultSelected: false,
+            automaticCleanEligible: false,
+            isStale: true,
+            requiresPreDeleteRevalidation: true,
+            scannedTargetIdentity: nil
+        )
+
+        guard case .refuse(let reason, _, _) =
+                try XCTUnwrap(scanner.preDeleteRevalidator)
+                    .revalidate(item: item, authorization: nil)
+        else { return XCTFail("an unrecorded identity must be refused") }
+        XCTAssertTrue(reason.contains("no record of the object the scan "
+                                       + "inspected"), reason)
+    }
+
     /// AVAILABILITY, PROVEN THROUGH PRODUCTION (PR #459 review r2).
     ///
     /// The delete-time open cannot carry `O_DIRECTORY` — a regular-file

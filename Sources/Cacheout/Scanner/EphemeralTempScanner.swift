@@ -550,6 +550,14 @@ struct EphemeralTempScanner: @unchecked Sendable {
                 // and the user's click — and like every other read in this
                 // scanner it is path-based (W1/W2/W3).
                 let sizedOwnDate: Date
+                // THE SCAN'S RECORDED IDENTITY (PR #459 review r2) — read
+                // from the SAME `lstat` as the re-probed mtime, so the two can
+                // never describe different objects, and taken at the LAST
+                // scan-time observation of the entry, so the window it leaves
+                // open is the narrowest this scanner has. It rides the item to
+                // the delete-time re-check, which refuses ANY other object
+                // standing at this name.
+                let sizedIdentity: FileSystemIdentityProvider.Identity
                 switch leafDate(of: entry) {
                 case .vanished:
                     // The observable-race contract, unchanged: no item, no
@@ -564,7 +572,7 @@ struct EphemeralTempScanner: @unchecked Sendable {
                            "staleness of \(entry.lastPathComponent) could not "
                             + "be re-established after sizing")
                     continue
-                case .dated(let own, _):
+                case .dated(let own, _, let probed):
                     guard own < cutoff else {
                         // Same shape as the content arm below: suppressed as
                         // fresh, with any sizing denials still surfaced so
@@ -579,6 +587,7 @@ struct EphemeralTempScanner: @unchecked Sendable {
                         continue
                     }
                     sizedOwnDate = own
+                    sizedIdentity = probed
                 }
 
                 // (6) FRESHNESS RE-CHECK, before any outcome mapping. Positive
@@ -605,7 +614,8 @@ struct EphemeralTempScanner: @unchecked Sendable {
                 // an entry touched during sizing.
                 if let item = reclaimableItem(
                     entry: entry, identity: identity, root: root,
-                    report: report, ownDate: sizedOwnDate, now: now
+                    report: report, ownDate: sizedOwnDate,
+                    scannedIdentity: sizedIdentity, now: now
                 ) {
                     items.append(item)
                 }
@@ -699,7 +709,7 @@ struct EphemeralTempScanner: @unchecked Sendable {
             return .vanished
         case .failed(let cause):
             return .denied(entry, cause)
-        case .dated(let ownDate, _):
+        case .dated(let ownDate, _, _):
             // Metadata churn on the entry itself disqualifies it before any
             // walk: the own-mtime input fails, so the contents do not matter.
             guard ownDate < cutoff else { return .notStale }
@@ -718,7 +728,7 @@ struct EphemeralTempScanner: @unchecked Sendable {
             return .vanished
         case .failed(let cause):
             return .denied(entry, cause)
-        case .dated(let date, let allocatedBytes):
+        case .dated(let date, let allocatedBytes, _):
             guard allocatedBytes >= thresholds.sizeFloorBytes,
                   date < cutoff
             else { return .notStale }
@@ -777,7 +787,7 @@ struct EphemeralTempScanner: @unchecked Sendable {
                             continue
                         case .failed(let cause):
                             return .denied(child, cause)
-                        case .dated(let date, _):
+                        case .dated(let date, _, _):
                             // The newest-content rule: ONE fresh file
                             // anywhere below disqualifies the whole entry.
                             if date >= cutoff { return .notStale }
@@ -802,7 +812,15 @@ struct EphemeralTempScanner: @unchecked Sendable {
     /// One no-follow `lstat` read as "when was this last modified, and how
     /// much does the leaf itself allocate".
     private enum LeafDate {
-        case dated(Date, allocatedBytes: Int64)
+        /// The mtime, the leaf's own allocation, and the (device, inode) the
+        /// SAME `lstat` saw — one read, so the three can never describe
+        /// different objects (PR #459 review r2: the identity is what the
+        /// delete-time re-check proves the entry against).
+        case dated(
+            Date,
+            allocatedBytes: Int64,
+            identity: FileSystemIdentityProvider.Identity
+        )
         case vanished
         case failed(DenialCause)
     }
@@ -814,7 +832,10 @@ struct EphemeralTempScanner: @unchecked Sendable {
         if let metadata = provider.leafMetadata(of: url) {
             return .dated(
                 Self.modificationDate(of: metadata),
-                allocatedBytes: metadata.allocatedBytes
+                allocatedBytes: metadata.allocatedBytes,
+                identity: FileSystemIdentityProvider.Identity(
+                    device: metadata.device, inode: metadata.inode
+                )
             )
         }
         switch provider.probeKind(of: url) {
@@ -1067,6 +1088,7 @@ struct EphemeralTempScanner: @unchecked Sendable {
         root: EphemeralTempRoot,
         report: SizeReport,
         ownDate: Date,
+        scannedIdentity: FileSystemIdentityProvider.Identity,
         now: Date
     ) -> ReclaimableItem? {
         let hasBoundary = report.rootMountBoundary
@@ -1174,7 +1196,16 @@ struct EphemeralTempScanner: @unchecked Sendable {
             // so every emitted item must carry the marker or
             // `SpaceScanner.revalidationMarkerViolation` malforms the whole
             // outcome.
-            requiresPreDeleteRevalidation: true
+            requiresPreDeleteRevalidation: true,
+            // THE OBJECT THIS ROW IS ABOUT (PR #459 review r2). Without it
+            // the delete-time re-check re-established four PROPERTIES of
+            // whatever stood at the name and never asked whether it was the
+            // same thing: an old, unlocked, user-owned tree moved onto this
+            // name after the scan passed every gate, and the `.allow` then
+            // bound the REPLACEMENT's inode — so the deletion proved the
+            // wrong object and destroyed it, while the row still quoted the
+            // scanned entry's bytes and age.
+            scannedTargetIdentity: scannedIdentity
         )
     }
 
@@ -1281,14 +1312,31 @@ struct EphemeralTempScanner: @unchecked Sendable {
     /// ran at scan time and none of them re-ran.
     ///
     /// WHAT THIS DOES. Every temp item is re-inspected from a HELD
-    /// DESCRIPTOR, against the SAME thresholds and the SAME clock the scan
-    /// used (both are construction state, so scan-time and delete-time can
-    /// never disagree on the boundary), in the scan's pinned order: ownership
-    /// → own-mtime staleness → cooperative `flock` → fresh content below.
-    /// Any of them failing is a fail-closed `.refuse` with a CLEARABLE
-    /// sentence — these conditions are non-deterministic, so the "re-scan"
-    /// remedy the UI prints genuinely can differ (unlike a fixed depth cap,
-    /// which a re-scan reproduces identically for ever).
+    /// DESCRIPTOR, in the scan's pinned order, with the object's own identity
+    /// checked first: kind → RECORDED IDENTITY → ownership → own-mtime
+    /// staleness → cooperative `flock` → fresh content below. Any of them
+    /// failing is a fail-closed `.refuse` with a CLEARABLE sentence — these
+    /// conditions are non-deterministic, so the "re-scan" remedy the UI prints
+    /// genuinely can differ (unlike a fixed depth cap, which a re-scan
+    /// reproduces identically for ever).
+    ///
+    /// THE IDENTITY CHECK IS WHAT MAKES THE OTHERS MEAN ANYTHING (PR #459
+    /// review r2). Ownership, staleness, the lock probe and the content walk
+    /// each re-establish a PROPERTY of whatever now answers to the name; only
+    /// `item.scannedTargetIdentity` says it is the same OBJECT. Without it an
+    /// old, unlocked, user-owned tree moved onto the name after the scan
+    /// passed all four gates and was deleted in the scanned entry's place.
+    ///
+    /// WHAT IS ACTUALLY CONSTRUCTION STATE, stated exactly (the comment here
+    /// used to claim "the SAME clock … so scan-time and delete-time can never
+    /// disagree on the boundary"): the THRESHOLDS and the CLOCK SOURCE are
+    /// construction state; the BOUNDARY IS NOT. Production injects
+    /// `now: { Date() }`, so `cutoff = now() - staleAge` is re-evaluated on
+    /// every verdict and ADVANCES between scan and delete — in the PERMISSIVE
+    /// direction, since a later cutoff makes more things count as stale. An
+    /// entry that was stale at scan time is therefore still stale here unless
+    /// it was touched; the boundary can never move the other way. Tests inject
+    /// a fixed clock, which is what pins the thresholds side.
     ///
     /// AND THE ALLOW CARRIES A BINDING. `.directory(identity)` is the `fstat`
     /// of the descriptor this revalidation held open the whole time — not a
@@ -1345,8 +1393,24 @@ struct EphemeralTempScanner: @unchecked Sendable {
                         valuables: [], acknowledgementToken: nil
                     )
                 }
+                guard let scanned = item.scannedTargetIdentity else {
+                    // FAIL CLOSED. Every item this scanner emits records one
+                    // (see `reclaimableItem`), so an item reaching here
+                    // without it was not produced by this scanner's scan —
+                    // and an identity the re-check cannot compare is one it
+                    // cannot prove.
+                    return .refuse(
+                        reason: "\(target.path): this temp item carries no "
+                            + "record of the object the scan inspected, so "
+                            + "the delete-time re-check cannot prove it is "
+                            + "still the same one — refused, nothing deleted; "
+                            + "re-scan required",
+                        valuables: [], acknowledgementToken: nil
+                    )
+                }
                 return revalidateTempEntry(
                     at: target,
+                    scanned: scanned,
                     ownershipGated: worldWritableRoots.contains(origin.path),
                     cutoff: now().addingTimeInterval(-staleAge),
                     sizeFloorBytes: sizeFloorBytes,
@@ -1361,6 +1425,7 @@ struct EphemeralTempScanner: @unchecked Sendable {
     /// descriptor held for the whole verdict.
     private static func revalidateTempEntry(
         at target: URL,
+        scanned: FileSystemIdentityProvider.Identity,
         ownershipGated: Bool,
         cutoff: Date,
         sizeFloorBytes: Int64,
@@ -1449,6 +1514,34 @@ struct EphemeralTempScanner: @unchecked Sendable {
             return refuse(
                 "\(target.path): this temp entry would not identify itself at "
                     + "delete time — refused, nothing deleted; re-scan required"
+            )
+        }
+
+        // (0b) IS THIS THE OBJECT THE SCAN INSPECTED? (PR #459 review r2.)
+        //
+        // Every other gate in this function re-establishes a PROPERTY of
+        // whatever stands at the name; none of them asks whether it is the
+        // same THING. Without this comparison a replacement was caught only
+        // EMERGENTLY — when it happened to be fresh, locked or foreign-owned.
+        // `mv /some/old/tree /private/tmp/old-scratch` (old, unlocked,
+        // user-owned) passed all four, and the `.allow` below then bound the
+        // REPLACEMENT's inode, so the deletion proved the wrong object and
+        // destroyed it while the row still quoted the scanned entry's bytes
+        // and age.
+        //
+        // Compared against the (device, inode) the SCAN recorded on the item,
+        // read from the descriptor this verdict holds — not a path `lstat`,
+        // which is what a replacement re-points. A directory that was never
+        // replaced keeps its inode, so this refuses only genuine replacement;
+        // a legitimately re-created entry IS a different object and refusing
+        // it is the point. The refusal is CLEARABLE by re-scanning, like every
+        // other refusal here.
+        guard identity == scanned else {
+            return refuse(
+                "\(target.path): a different \(describe(kind)) now stands at "
+                    + "this temp entry's name — it is not the one that was "
+                    + "scanned; refused, nothing deleted. Re-scan to see what "
+                    + "is there now"
             )
         }
 

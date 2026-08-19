@@ -3481,6 +3481,16 @@ final class CacheCleanerTests: XCTestCase {
     /// name, holding a tree the app never inspected. Both disposal arms must
     /// refuse, and the Trash arm must refuse BEFORE the mover is touched —
     /// `recorder.urls.isEmpty` is the load-bearing assertion for that.
+    ///
+    /// THE REPLACEMENT IS DELIBERATELY STALE, UNLOCKED AND OURS (PR #459
+    /// review r2). Round 1's fixture backdated nothing — it stamped the
+    /// stranger's tree with `ephemeralFreshDate`, so the OWN-MTIME gate
+    /// refused it and this cell passed while the revalidator compared no
+    /// identity at all: the test NAME claimed more than the code did. Staged
+    /// old, all four property gates (ownership, own-mtime staleness, `flock`,
+    /// fresh content below) PASS on the replacement, so only the
+    /// recorded-identity comparison can refuse it — which is what makes this
+    /// cell measure the property it is named for.
     func testEphemeralTempEntryReplacedAfterTheScanIsRefusedOnBothArms()
         async throws {
         for moveToTrash in [false, true] {
@@ -3505,8 +3515,10 @@ final class CacheCleanerTests: XCTestCase {
             )
             let stranger = target.appendingPathComponent("stranger.bin")
             try Data(repeating: 0x7E, count: 4_096).write(to: stranger)
-            try setModified(stranger, ephemeralFreshDate)
-            try setModified(target, ephemeralFreshDate)
+            // OLD, not fresh: the replacement satisfies every property gate.
+            let old = ephemeralClock.addingTimeInterval(-30 * 86_400)
+            try setModified(stranger, old)
+            try setModified(target, old)
 
             let runtime = try makeEphemeralRuntime(scanner, home: world.home)
             let recorder = TrashRecorder()
@@ -3521,6 +3533,13 @@ final class CacheCleanerTests: XCTestCase {
 
             XCTAssertEqual(report.errors.count, 1,
                            "moveToTrash=\(moveToTrash): \(report.errors)")
+            let message = try XCTUnwrap(report.errors.first?.message)
+            XCTAssertTrue(
+                message.contains("a different directory now stands at this "
+                                 + "temp entry's name"),
+                "the refusal must name the IDENTITY mismatch — every other "
+                    + "gate passes on this fixture: \(message)"
+            )
             XCTAssertTrue(report.entries.isEmpty,
                           "moveToTrash=\(moveToTrash): \(report.entries)")
             XCTAssertTrue(

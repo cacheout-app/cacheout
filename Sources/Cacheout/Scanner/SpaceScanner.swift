@@ -283,6 +283,24 @@ struct ReclaimableItem: Equatable, Sendable {
     /// travel on the item itself.
     let artifactProof: BuildArtifactProof?
 
+    /// ADDITIVE (PR #459 review r2) — the (device, inode) the SCAN saw at this
+    /// item's deletion target, so the owning scanner's delete-time revalidator
+    /// can prove the object it opens is THE OBJECT THAT WAS SCANNED rather
+    /// than whatever now answers to the same name.
+    ///
+    /// `nil` for every scanner that records none (every scanner but
+    /// `ephemeral_tmp` today) — absent, never a fake "same object". A
+    /// revalidator that treats it as REQUIRED must fail closed on `nil`; one
+    /// that ignores it is unaffected.
+    ///
+    /// The `artifactProof` precedent, one field-set later, and it rides the
+    /// ITEM for the same reason: a revalidator is a `Sendable` VALUE captured
+    /// at REGISTRATION, before any scan runs, so it can hold no per-item scan
+    /// state. Re-deriving it from the path at delete time is not a substitute
+    /// — the path is exactly what a replacement keeps. Not an authorization,
+    /// not a display surface, never on any wire.
+    let scannedTargetIdentity: FileSystemIdentityProvider.Identity?
+
     /// EXPLICIT memberwise initializer (fn-4.4): the additive fields above
     /// default, so no existing construction site changes — the
     /// `logicalBytes` additive precedent, one field-set later. Every stored
@@ -311,7 +329,8 @@ struct ReclaimableItem: Equatable, Sendable {
         isStale: Bool?,
         valuablesDisclosure: ValuablesDisclosure? = nil,
         requiresPreDeleteRevalidation: Bool = false,
-        artifactProof: BuildArtifactProof? = nil
+        artifactProof: BuildArtifactProof? = nil,
+        scannedTargetIdentity: FileSystemIdentityProvider.Identity? = nil
     ) {
         self.id = id
         self.scannerID = scannerID
@@ -336,6 +355,7 @@ struct ReclaimableItem: Equatable, Sendable {
         self.valuablesDisclosure = valuablesDisclosure
         self.requiresPreDeleteRevalidation = requiresPreDeleteRevalidation
         self.artifactProof = artifactProof
+        self.scannedTargetIdentity = scannedTargetIdentity
     }
 
     /// The composite cross-scanner identity.

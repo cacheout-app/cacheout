@@ -64,12 +64,17 @@ and docs/v1/CLI-REFERENCE.md) — the pre-release `node_modules` →
   (never persisted; refused on every other command, `smart-clean`
   included). No schema change: `schema_version` stays 4 and every addition
   is additive. **A temp entry is re-inspected immediately before it is
-  deleted**, from a descriptor held open for the check: if it has been
-  written into, locked by a running process, changed owner, or replaced by a
-  different directory since the scan, the deletion is refused with nothing
-  removed and nothing reported freed — re-scan to see its current state. The
-  check runs on both disposals, and on the Move-to-Trash default it refuses
-  before the item is moved, so a refusal never disturbs your Trash.
+  deleted**, from a descriptor held open for the check, and the check begins
+  by proving the object IS the one the scan inspected: the scan records the
+  entry's filesystem identity and the re-check compares it, so an entry
+  renamed away and replaced under the same name is refused even when the
+  replacement is itself old and idle. If the entry has been replaced, written
+  into, locked by a running process, or has changed owner since the scan, the
+  deletion is refused with nothing removed and nothing reported freed —
+  re-scan to see its current state. Anything that is no longer a directory or
+  a regular file at that name is refused outright. The check runs on both
+  disposals, and on the Move-to-Trash default it refuses before the item is
+  moved, so a refusal never disturbs your Trash.
 - **Configurable dev roots.** Settings gains a dev-roots editor and the CLI a
   repeatable `--dev-root PATH` (invocation-scoped, never persisted). The
   filesystem root, any volume root or mount point, and `$HOME` itself are

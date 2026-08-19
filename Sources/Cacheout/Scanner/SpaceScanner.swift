@@ -266,8 +266,25 @@ struct ReclaimableItem: Equatable, Sendable {
     /// the registry refuses marked items of ANY scanner.
     let requiresPreDeleteRevalidation: Bool
 
-    /// EXPLICIT memberwise initializer (fn-4.4): the two additive fields
-    /// above default, so no existing construction site changes — the
+    /// ADDITIVE (PR #457 review r3) — the STRUCTURAL PROPERTY that made this
+    /// item a candidate, preserved verbatim so its scanner's delete-time
+    /// revalidator can RE-PROVE it rather than trust the scan.
+    ///
+    /// `nil` for every scanner with no such property (every scanner but
+    /// `build_artifacts` today) — absent, never a fake "still proven". The
+    /// `valuablesDisclosure` precedent, one field-set later: a typed
+    /// structural record the OWNING scanner's revalidator interprets, and
+    /// which nothing else reads. It is not an authorization and not a
+    /// display surface; it never reaches any wire.
+    ///
+    /// Why it must ride the ITEM: a revalidator is a `Sendable` VALUE
+    /// captured at REGISTRATION, before any scan runs — it cannot hold
+    /// per-item scan state, so anything delete time must re-check has to
+    /// travel on the item itself.
+    let artifactProof: BuildArtifactProof?
+
+    /// EXPLICIT memberwise initializer (fn-4.4): the additive fields above
+    /// default, so no existing construction site changes — the
     /// `logicalBytes` additive precedent, one field-set later. Every stored
     /// property stays `let` (a synthesized memberwise init cannot default a
     /// `let`, which is the only reason this is written out).
@@ -293,7 +310,8 @@ struct ReclaimableItem: Equatable, Sendable {
         automaticCleanEligible: Bool,
         isStale: Bool?,
         valuablesDisclosure: ValuablesDisclosure? = nil,
-        requiresPreDeleteRevalidation: Bool = false
+        requiresPreDeleteRevalidation: Bool = false,
+        artifactProof: BuildArtifactProof? = nil
     ) {
         self.id = id
         self.scannerID = scannerID
@@ -317,6 +335,7 @@ struct ReclaimableItem: Equatable, Sendable {
         self.isStale = isStale
         self.valuablesDisclosure = valuablesDisclosure
         self.requiresPreDeleteRevalidation = requiresPreDeleteRevalidation
+        self.artifactProof = artifactProof
     }
 
     /// The composite cross-scanner identity.
@@ -429,6 +448,50 @@ struct ScanOutcome: Sendable {
 
 // MARK: - Pre-delete revalidator seam (fn-4.8, R17/D8)
 
+/// WHAT AN ALLOW VERDICT IS ABOUT (PR #458 review r7 — the swap DUAL).
+///
+/// A revalidator's inspection is anchored to a HELD DESCRIPTOR, which is what
+/// stops it FOLLOWING a swap — and, by exactly the same mechanism, PINS it to
+/// the old inode when one happens. That is the dual of the ancestor-swap bug
+/// the descriptor family closed: inspect the right object and then DELETE A
+/// DIFFERENT ONE at the same name. A verdict is therefore not a fact about a
+/// PATH; it is a fact about an OBJECT, and it must travel with enough identity
+/// for the deletion to prove the path still names that object
+/// (`CacheCleaner.removeGuardedItem` → `DepthSafeRemoval.proveInspectedRoot`
+/// and `TrashDisposal.dispose(_:expecting:…)`).
+///
+/// It lives HERE, on the scanner-agnostic seam, rather than inside one
+/// scanner's probe result, because `PreDeleteVerdict.allow` carries it and
+/// every revalidator has to name it. `OrphanedCachesScanner` keeps
+/// `UserDataProbeResult.InspectedRoot` as an alias for it.
+///
+/// IT IS NOT THE ONLY BINDING, AND A SCANNER WITH NO REVALIDATOR IS NOT AN
+/// UNBOUND DELETION. The cleaner additionally binds the folder that HOLDS the
+/// target (`DepthSafeRemoval.admittedParent`) and proves it on BOTH disposal
+/// arms — the permanent one at its parent open, the Trash one through
+/// `TrashDisposal.dispose(_:containedIn:…)`, which also binds the leaf under
+/// that proved container. That pair is what covers the `.unestablished`
+/// population the third case below describes, and it is worth naming here
+/// because "no verdict" was read as "nothing to bind" at two Trash call sites
+/// for three review rounds.
+enum PreDeleteInspectedObject: Equatable, Sendable {
+    /// A real directory was opened and walked; this is the `fstat` identity
+    /// of the descriptor the whole walk was anchored to.
+    case directory(FileSystemIdentityProvider.Identity)
+    /// The root open reported `ENOENT`/`ENOTDIR`: there is no directory TREE
+    /// of ours at that name — absent, symlink, regular file, special file —
+    /// and deletion removes the leaf as-is. The clean verdict is about the
+    /// ABSENCE of a tree, so a directory appearing at that name since voids it
+    /// just as surely as a swapped inode.
+    case noDirectoryTree
+    /// Nothing was established: either the inspection refused before it could
+    /// bind anything, or this revalidator has no object binding to offer at
+    /// all. NEVER a licence to delete — the cleaner treats it as "no binding",
+    /// which leaves the deletion resting on the gates it always rested on and
+    /// can never widen anything.
+    case unestablished
+}
+
 /// One revalidator's answer for ONE item, immediately before its deletion.
 ///
 /// A revalidation can only ever REFUSE — it NEVER widens admission (the
@@ -439,7 +502,14 @@ enum PreDeleteVerdict: Equatable, Sendable {
     /// Nothing the delete-time inspection saw stands in the way. The
     /// deletion still faces every other gate (admission, snapshot identity,
     /// containment, mount boundaries).
-    case allow
+    ///
+    /// `inspected` is the OBJECT the inspection bound to, carried into the
+    /// disposal itself so the removal (and the Trash arm) can prove the path
+    /// still names it. IT HAS NO DEFAULT ON PURPOSE (PR #458 review): a
+    /// revalidator with nothing to bind must SAY `.unestablished` rather than
+    /// let an implicit value fall through to a destructive call having stated
+    /// nothing at all.
+    case allow(inspected: PreDeleteInspectedObject)
     /// FAIL-CLOSED refusal. `reason` is the item-keyed human detail (the
     /// error surface + the REFUSED log line); `valuables` is the CURRENT
     /// probe's set in the ONE canonical order (empty for revalidators with
@@ -610,7 +680,11 @@ struct SpaceScannerRuntime {
 
     let scanners: [any SpaceScanner]
     /// UNION of every scanner's declared `trustedContainerRoots`, in
-    /// registration order, deduplicated by path.
+    /// registration order, deduplicated by path — and with SHADOWING
+    /// ALIASES suppressed (`suppressingAliasShadows`): at most one spelling
+    /// per canonical location survives whenever any of them is a real
+    /// directory, so first-match root matching can never return an unusable
+    /// spelling of a location another scanner registered usably.
     let trustedContainerRoots: [URL]
 
     /// PER-SCANNER declared container roots, captured at registration
@@ -681,7 +755,7 @@ struct SpaceScannerRuntime {
             registered[category.slug] = category
         }
 
-        var union: [URL] = []
+        var declaredUnion: [URL] = []
         var seenRoots = Set<String>()
         var declared: [String: [URL]] = [:]
         var revalidators: [String: PreDeleteRevalidator] = [:]
@@ -693,9 +767,14 @@ struct SpaceScannerRuntime {
             revalidators[scanner.id] = scanner.preDeleteRevalidator
             for root in scanner.trustedContainerRoots
             where seenRoots.insert(root.path).inserted {
-                union.append(root)
+                declaredUnion.append(root)
             }
         }
+        // The union is the LAST place a shadowing alias can be caught — and
+        // the FIRST place that knows every registered root (below).
+        let union = Self.suppressingAliasShadows(
+            in: declaredUnion, provider: provider
+        )
 
         self.scanners = scanners
         self.registeredCategories = registered
@@ -704,6 +783,80 @@ struct SpaceScannerRuntime {
         self.preDeleteRevalidators = revalidators
         self.home = home
         self.provider = provider
+    }
+
+    /// CROSS-SCANNER alias suppression over the FINAL union (fn-4.5 review,
+    /// the sharper half of the dev-root-only case `DevRootsStore.resolve`
+    /// already suppresses).
+    ///
+    /// `PathGuard.matchConfiguredRoot` resolves every configured root and
+    /// returns the FIRST one that matches; `admitContainer` then applies its
+    /// no-follow reality gate to THAT spelling and refuses without trying the
+    /// next match. So an UNUSABLE spelling (symlink leaf, non-directory,
+    /// absent) sitting ahead of a real directory it resolves onto does not
+    /// merely fail for itself — it breaks the root it shadows. Registration
+    /// order decides which comes first, and the roots come from DIFFERENT
+    /// scanners: a symlink-leaf dev root pointing at `~/Library/Caches`
+    /// enters the union from the build-artifacts scanner, which the
+    /// production registry places BEFORE the orphaned-caches sweep, so every
+    /// sweep item's origin claim matched the alias and failed
+    /// `containerUnavailable`.
+    ///
+    /// This is the ONLY place that can see it. `DevRootsStore` (and CLI
+    /// `--dev-root`, and Settings) resolve dev roots BEFORE any runtime
+    /// exists, so their suppression can only ever cover the dev-root list;
+    /// the union is where every registered root is finally known. The
+    /// alternative remedy — making root matching CONTINUE past an unusable
+    /// match — was rejected: it would loosen the shared reality gate for
+    /// EVERY scanner (a genuinely swapped-out root could be masked by a
+    /// second spelling) and leave "the matched root" ambiguous for the
+    /// snapshot identity binding that keys off it.
+    ///
+    /// Strictly fail-CLOSED — it only ever REMOVES roots, and only ones that
+    /// could never have admitted anything themselves:
+    ///
+    /// - a dropped spelling is never a real directory, so `admitContainer`'s
+    ///   gate (2) refused it, and the walker refuses it as a root;
+    /// - it is dropped ONLY when a real-directory spelling of the SAME
+    ///   canonical location survives — and root matching is by canonical
+    ///   identity, so every claim the alias could have matched still matches
+    ///   the covering root, which additionally passes the gate;
+    /// - a claim spelled AS the alias stays refused: gate (2) checks the
+    ///   caller's own spelling too.
+    ///
+    /// The `resolveTargetKeepingLeaf` doctrine is preserved exactly as
+    /// `DevRootsStore` preserves it: the leaf-resolving canonical path is a
+    /// comparison KEY only and never reaches the returned union — every
+    /// surviving entry is the verbatim spelling its scanner declared.
+    ///
+    /// Nothing is silently lost: a dropped root is unusable in its own right,
+    /// and the scanner that declared it still declares it
+    /// (`declaredContainerRoots`) and still reports it at scan time through
+    /// its own root gate (`ProjectTreeWalker`'s `.symlinkRoot` issue for a
+    /// symlink-leaf dev root, `DevRootsStore`'s classified issue when the
+    /// covering root is a dev root as well).
+    private static func suppressingAliasShadows(
+        in roots: [URL], provider: FileSystemIdentityProvider
+    ) -> [URL] {
+        // Probed ONCE per root: the canonical comparison KEY, and whether the
+        // DECLARED spelling is itself a real directory (leaf lstat no-follow)
+        // — the same probe pair, with the same meaning, as fn-4.1's dev-root
+        // resolution.
+        let probed = roots.map { root in
+            (declared: root,
+             key: provider.canonicalize(root).path,
+             isDirectory: provider.probeKind(of: root) == .kind(.directory))
+        }
+        let coveredByRealDirectory = Set(
+            probed.lazy.filter(\.isDirectory).map(\.key)
+        )
+        // Two real-directory spellings of one location are NOT touched: both
+        // pass the reality gate, so neither shadows the other, and dropping
+        // either would change which declared spelling the identity binding
+        // keys off for no safety gain.
+        return probed
+            .filter { $0.isDirectory || !coveredByRealDirectory.contains($0.key) }
+            .map(\.declared)
     }
 
     /// The production registry — the single place scanners are registered.

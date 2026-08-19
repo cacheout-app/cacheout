@@ -114,11 +114,14 @@ struct SweptCacheEntry: Equatable {
     /// caution evidence).
     let userDataShapeMatches: [String]
     /// FAIL-CLOSED completeness (epic rule): absence of matches is only
-    /// meaningful when the probe COMPLETED. False when the entry cap was
-    /// hit before exhausting, when any directory at the depth boundary was
-    /// left unexpanded, or when any branch was unreadable — fn-3.2 treats
-    /// an incomplete probe like a caution (review risk, no default or
-    /// automatic selection).
+    /// meaningful when the probe COMPLETED. False when the entry budget was
+    /// exhausted before the tree was, when any branch was unreadable, or
+    /// when a child's kind could not be established — fn-3.2 treats an
+    /// incomplete probe like a caution (review risk, no default or
+    /// automatic selection). Deliberately NOT false for a tree that is
+    /// merely deep: the budget is the one bound, and manufacturing doubt
+    /// the walk could have resolved is what stranded ordinary caches
+    /// permanently (see `boundedUserDataShapeWalk`).
     let userDataProbeComplete: Bool
 
     /// The two split components summed — COMPUTED, never stored (byte-model
@@ -161,6 +164,219 @@ struct UserDataShapePattern: Equatable {
     let glob: String
 }
 
+// MARK: - Probe obstructions (PR #458 review)
+
+/// ONE reason a bounded user-data probe could not prove the absence of user
+/// data — carrying the single fact any remediation guidance turns on:
+/// **whether trying again can change it**.
+///
+/// The probe used to report incompleteness as a bare `Bool`, which forced
+/// every surface downstream to FLATTEN causes that genuinely differ. Both
+/// flattened messages this scanner has shipped were wrong in mirror-image
+/// ways: "re-scan required" prescribed a retry for a bound that reproduces
+/// exactly, and its replacement asserted "re-scanning will not clear this"
+/// over a set that includes a mid-walk race and transient I/O — which a
+/// re-scan clears routinely. Steering a user toward the riskier
+/// explicit-confirmation path on a merely transient failure is the harm; so
+/// the walk now DISTINGUISHES its causes rather than the message guessing.
+///
+/// Declaration order is the guidance order (`Comparable` is synthesized from
+/// it), so a multi-cause message is deterministic.
+enum UserDataProbeObstruction: CaseIterable, Comparable, Sendable {
+    /// The entry budget ran out before the tree did. DETERMINISTIC for a
+    /// static tree — an orphaned cache is by definition abandoned, so the
+    /// next walk spends the same budget on the same entries and stops in the
+    /// same place. Nothing but a policy change or an explicit per-item
+    /// confirmation clears it.
+    ///
+    /// RECORDED ONLY ONCE A REAL ENTRY BEYOND THE BUDGET HAS BEEN SEEN (PR
+    /// #458 review r9). It is the single IRREDUCIBLE class, so claiming it
+    /// on a spent budget alone — without ever meeting the entry that would
+    /// prove it — permanently excluded trees that actually fit. A spent
+    /// budget is a capacity of zero: the walk still reads at that capacity,
+    /// which admits no entry and yet tells EOF from an over-budget sentinel.
+    case budgetExhausted
+    /// A basename that is not valid UTF-8, so the walk cannot address the
+    /// entry safely (a repairing decode would name a DIFFERENT path). A
+    /// property of the tree: it reproduces until the entry is renamed.
+    case undecodableName
+    /// A path this walk cannot address — `ENAMETOOLONG` or `ELOOP`. A
+    /// property of the PATH, so it reproduces exactly until the tree is
+    /// restructured.
+    ///
+    /// ROOT-ONLY since the walk went descriptor-relative (PR #458 review,
+    /// ancestor swap): below its root the walk never spells a path at all,
+    /// so neither cause can arise there. Measured: a 500-deep tree whose
+    /// absolute path is 14,628 bytes reads fine through descriptors while
+    /// `open` on that path returns `ENAMETOOLONG`.
+    ///
+    /// THE CLAIM THAT USED TO STAND HERE — that descriptor-relative walking
+    /// "RETIRES a whole stranding class rather than merely reclassifying it"
+    /// — WAS FALSE WHEN IT WAS WRITTEN, and this file has now been bitten
+    /// twice by a comment asserting a property the code did not have. Only
+    /// the PROBE went descriptor-relative. `FileManager.removeItem` and
+    /// `DirectorySizer` still composed absolute paths, so the class did not
+    /// retire: it MOVED, from inspection to removal, and got worse on the
+    /// way. Measured at depths 446 / 600 / 2000 / 4000 (threshold exactly
+    /// `PATH_MAX`): probe `complete=true, obstructions=[]`; sizer
+    /// `denials=1`, "the file name "d" is invalid"; `removeItem`
+    /// NSCocoaErrorDomain 514 / ENAMETOOLONG, in 0.03 s, every time. The
+    /// item was pronounced clean, forced off `.safe` by the sizer denial,
+    /// and then refused by the only remaining route — deterministic,
+    /// unclearable, and blaming a basename that was never the problem.
+    ///
+    /// What retires the class is `DepthSafeRemoval`: the deletion traverses
+    /// by descriptor too, so it addresses exactly what the probe addresses.
+    /// RESIDUAL, STATED: `DirectorySizer` is still path-based, so such a
+    /// tree is still unmeasurable and still lands at review risk — with a
+    /// `.unaddressablePath` denial that now names the real cause, and a
+    /// deletion that works when the user confirms it.
+    case unaddressablePath
+    /// A mount boundary the walk refuses to cross (either signal: a device-id
+    /// change against the walk root, or the `statfs` mount-root check).
+    /// CLEARABLE in the way a bound never is — unmount and the next walk
+    /// reads the tree whole.
+    case mountBoundary
+    /// `EACCES`/`EPERM` on a directory or a child — TCC or POSIX
+    /// permissions. A bare retry reproduces it; GRANTING access clears it.
+    case accessDenied
+    /// An I/O error, a resource shortage, an unreachable network volume, or
+    /// the tree changing under the walk (a directory removed between being
+    /// pushed and being popped). The genuinely RETRYABLE class: once the
+    /// race or the obstruction is gone, a re-scan completes.
+    case transientFailure
+    /// An errno the router does not recognize. Claims NEITHER retryability
+    /// nor permanence — see `OrphanedCachesScanner.obstruction(forErrno:)`
+    /// for why an unknown cause gets its own class rather than falling into
+    /// either default.
+    case unclassifiedFailure
+
+    /// What can actually change this — the whole point of distinguishing.
+    ///
+    /// Ordered LEAST → MOST demanding, with `Comparable` synthesized off
+    /// that order so a mixed set can take the most demanding remedy
+    /// present. Causes are CONJUNCTIVE — the user must clear every one of
+    /// them — so "best available" is the wrong operator: it closes a
+    /// budget-plus-transient set with "re-scan and try again" and sends the
+    /// user around a loop that can never succeed.
+    enum Remedy: Comparable, Sendable {
+        /// A re-scan alone can succeed.
+        case retryAlone
+        /// A user action first (unmount, grant access, rename), then a
+        /// re-scan.
+        case userActionThenRetry
+        /// Unknown: neither promise can be made honestly.
+        case unknown
+        /// Nothing available: it reproduces exactly until policy or an
+        /// explicit per-item confirmation changes the outcome. (Spelled out
+        /// rather than `none`, which reads as `Optional.none` at a glance.)
+        case irreducible
+    }
+
+    var remedy: Remedy {
+        switch self {
+        case .budgetExhausted: return .irreducible
+        case .undecodableName, .unaddressablePath, .mountBoundary,
+             .accessDenied:
+            return .userActionThenRetry
+        case .transientFailure: return .retryAlone
+        case .unclassifiedFailure: return .unknown
+        }
+    }
+
+    /// The cause clause — what happened, and what would clear it. One
+    /// sentence, composed by `OrphanedCachesScanner.remediationGuidance`.
+    var guidance: String {
+        switch self {
+        case .budgetExhausted:
+            return "This folder holds more entries than the inspection "
+                + "budget allows, so part of it was never looked at."
+        case .undecodableName:
+            return "An entry here has a name that is not valid text, which "
+                + "the inspection will not address; renaming it allows a "
+                + "full inspection."
+        case .unaddressablePath:
+            return "Part of this folder sits at a path the inspection "
+                + "cannot address — it is too long, or it resolves through "
+                + "too many links; shortening or renaming it allows a full "
+                + "inspection."
+        case .mountBoundary:
+            return "A volume is mounted inside this folder and the "
+                + "inspection never crosses a mount boundary; unmounting it "
+                + "allows a full inspection."
+        case .accessDenied:
+            return "Part of this folder could not be read; granting access "
+                + "to it (Full Disk Access, or its permissions) allows a "
+                + "full inspection."
+        case .transientFailure:
+            return "The inspection hit a temporary error, or the folder "
+                + "changed while it was being read."
+        case .unclassifiedFailure:
+            return "The inspection failed for a reason it could not "
+                + "classify."
+        }
+    }
+}
+
+/// One bounded user-data probe's verdict: what it matched, and — when it
+/// could not finish — exactly WHY, so guidance never has to guess.
+///
+/// `complete` is DERIVED, never stored: absence of matches is meaningful iff
+/// nothing obstructed the walk, which is the fail-closed rule the classifier
+/// (R4) and the delete-time revalidation both read.
+struct UserDataProbeResult: Equatable {
+
+    /// WHAT THIS VERDICT IS ABOUT (PR #458 review r7 — the swap DUAL).
+    ///
+    /// The walk is anchored to a HELD DESCRIPTOR, which is what stops it
+    /// FOLLOWING a swap — and, by exactly the same mechanism, PINS it to the
+    /// old inode when one happens. That is the dual of the ancestor-swap
+    /// bug this file already closed: inspect the right object and then
+    /// DELETE A DIFFERENT ONE at the same name. A probe verdict is therefore
+    /// not a fact about a PATH; it is a fact about an OBJECT, and it has to
+    /// travel with enough identity for the deletion to prove the path still
+    /// names that object (`CacheCleaner.removeGuardedItem`).
+    ///
+    /// THE TYPE ITSELF NOW LIVES ON THE GENERAL SEAM (merge of #457/#458):
+    /// `PreDeleteInspectedObject` in `SpaceScanner.swift`, because the
+    /// binding travels on `PreDeleteVerdict.allow` — the scanner-agnostic
+    /// chokepoint #457 generalized — and a type that every revalidator has
+    /// to name cannot live inside one scanner's result. The spelling here is
+    /// kept so this file (and its tests) read exactly as before.
+    typealias InspectedRoot = PreDeleteInspectedObject
+
+    /// Matched pattern NAMES in table order, deduplicated.
+    let matches: [String]
+    /// Deduplicated and sorted in declaration order — deterministic output
+    /// for a deterministic message. Empty iff the walk finished.
+    let obstructions: [UserDataProbeObstruction]
+    /// The object the verdict describes. Defaulted so every construction
+    /// site that has proven nothing says so without having to remember to.
+    let inspected: InspectedRoot
+
+    init(
+        matches: [String],
+        obstructions: [UserDataProbeObstruction],
+        inspected: InspectedRoot = .unestablished
+    ) {
+        self.matches = matches
+        self.obstructions = obstructions
+        self.inspected = inspected
+    }
+
+    /// FAIL-CLOSED completeness (epic rule).
+    var complete: Bool { obstructions.isEmpty }
+
+    /// The clean, finished verdict.
+    static func complete(
+        matches: [String] = [], inspected: InspectedRoot = .unestablished
+    ) -> UserDataProbeResult {
+        UserDataProbeResult(
+            matches: matches, obstructions: [], inspected: inspected
+        )
+    }
+}
+
 // MARK: - OrphanedCachesScanner (enumeration core)
 
 /// `@unchecked Sendable` under the same discipline as the other scanners
@@ -188,12 +404,36 @@ struct OrphanedCachesScanner: @unchecked Sendable {
         UserDataShapePattern(name: "pictures-directory", glob: "Pictures"),
     ]
 
-    /// PRODUCTION probe caps — one definition shared by the init defaults
+    /// The PRODUCTION probe cap — ONE definition shared by the init default
     /// and the delete-time revalidation entry point
     /// (`preDeleteUserDataProbe`), so scan-time and delete-time inspection
     /// bounds can never drift apart.
-    static let defaultProbeDepthLimit = 3
-    static let defaultProbeEntryLimit = 512
+    ///
+    /// This is the walk's ONLY bound and the sole guarantee that it
+    /// terminates (see `boundedUserDataShapeWalk`'s doc for the argument and
+    /// for why a second, depth-shaped bound was removed).
+    ///
+    /// **Why 20,000, measured.** Driven through this very probe over the
+    /// field machine's real `~/Library/Caches` (179 first-level
+    /// directories), the retired depth-3/512-entry pair reported 53
+    /// (29.6%) INCOMPLETE — 44 of them with nothing whatsoever obstructing
+    /// the walk. The entry budget ALONE reports 21 at 512, 11 at 20,000,
+    /// 10 at 50,000; the irreducible 9 are genuinely unreadable (TCC), so
+    /// 20,000 leaves exactly 2 bound-truncated (1.1%). 512 was far too
+    /// small for real caches, and it is just as deterministic as the depth
+    /// cap was, so it stranded too.
+    ///
+    /// Cost is not the binding constraint: `DirectorySizer.measure`
+    /// already performs an UNBOUNDED full enumeration of the very same
+    /// entry at scan time, so this probe can never cost more than work
+    /// being done unconditionally anyway (measured over those 179 trees:
+    /// 158,597 entries for the sizing walk against 72,549 for a
+    /// 20,000-budget probe) — and at DELETE time it runs for ONE item, not
+    /// the whole sweep. 20,000 is also `ValuablesDetector`'s budget in the
+    /// sibling scanner: one number, one doctrine. The two trees that still
+    /// exceed it here (26,248 and 99,800 entries) stay honestly unproven —
+    /// genuine "we could not afford to look", not manufactured doubt.
+    static let defaultProbeEntryLimit = 20_000
 
     /// The sweep root this instance enumerates (injectable for tests; no
     /// test touches the real `$HOME` or the real `~/Library/Caches`).
@@ -209,10 +449,11 @@ struct OrphanedCachesScanner: @unchecked Sendable {
     private let provider: FileSystemIdentityProvider
     private let sizer: DirectorySizer
     private let fileManager = FileManager.default
-    /// User-data probe caps — the probe is BOUNDED (only the sizing walk is
-    /// complete). Injectable so tests can prove the fail-closed cap
-    /// behavior without thousand-file fixtures.
-    private let probeDepthLimit: Int
+    /// The user-data probe's cap — the probe is BOUNDED (only the sizing
+    /// walk is complete). Injectable so tests can prove the fail-closed cap
+    /// behavior without thousand-file fixtures; the DEFAULT is the shared
+    /// production constant the delete-time entry point uses, so scan-time
+    /// and delete-time bounds cannot drift.
     private let probeEntryLimit: Int
 
     /// Classification thresholds (R8) — scanner-CONSTRUCTION state by
@@ -252,7 +493,6 @@ struct OrphanedCachesScanner: @unchecked Sendable {
         cachesRoot: URL? = nil,
         categories: [CacheCategory] = CacheCategory.allCategories,
         provider: FileSystemIdentityProvider = FileSystemIdentityProvider(),
-        probeDepthLimit: Int = OrphanedCachesScanner.defaultProbeDepthLimit,
         probeEntryLimit: Int = OrphanedCachesScanner.defaultProbeEntryLimit,
         thresholds: OrphanedCacheClassifier.Thresholds =
             OrphanedCachesSweepConfig.defaultThresholds,
@@ -268,7 +508,6 @@ struct OrphanedCachesScanner: @unchecked Sendable {
         self.categories = categories
         self.provider = provider
         self.sizer = DirectorySizer(provider: provider)
-        self.probeDepthLimit = probeDepthLimit
         self.probeEntryLimit = probeEntryLimit
         self.thresholds = thresholds
         self.installedAppStatus = installedAppStatus
@@ -324,27 +563,26 @@ struct OrphanedCachesScanner: @unchecked Sendable {
             // sweep output"; no double listing or double counting).
             if isCategoryOwned(child, keptRoots: exclusionRoots) { continue }
 
-            let matches: [String]
-            let probeComplete: Bool
+            let probe: UserDataProbeResult
             switch provider.probeKind(of: child) {
             case .absent:
                 // Deleted between enumeration and probe — a benign mid-scan
                 // race, not a denial.
                 continue
             case .kind(.directory):
-                (matches, probeComplete) = probeUserDataShapes(at: child)
+                probe = probeUserDataShapes(at: child)
             case .kind:
                 // Symlink / regular file / special: no contents of their
                 // own to probe — complete by construction. A symlink is
                 // NEVER followed: deleting the entry removes the link, not
                 // its target, so nothing deletable went uninspected.
-                matches = []
-                probeComplete = true
-            case .failed:
+                probe = .complete()
+            case .failed(let code):
                 // Cannot even establish the kind — fail closed; the sizing
                 // pass below records the classified denial for the facts.
-                matches = []
-                probeComplete = false
+                probe = UserDataProbeResult(
+                    matches: [], obstructions: [Self.obstruction(forErrno: code)]
+                )
             }
 
             // `.deletionTarget`, not `.scanRoot`: lstat-dispatches the leaf
@@ -365,8 +603,8 @@ struct OrphanedCachesScanner: @unchecked Sendable {
                 denials: report.denials,
                 mountBoundaries: report.mountBoundaries,
                 rootMountBoundary: report.rootMountBoundary,
-                userDataShapeMatches: matches,
-                userDataProbeComplete: probeComplete
+                userDataShapeMatches: probe.matches,
+                userDataProbeComplete: probe.complete
             ))
         }
 
@@ -540,13 +778,12 @@ struct OrphanedCachesScanner: @unchecked Sendable {
 
     // MARK: - User-data-shape probe (R4 input)
 
-    /// Bounded shallow walk of one REAL-DIRECTORY entry — the instance
-    /// (scan-time) face of the shared static core below, using the
-    /// injectable per-instance caps.
-    private func probeUserDataShapes(at entryURL: URL) -> (matches: [String], complete: Bool) {
+    /// Bounded walk of one REAL-DIRECTORY entry — the instance (scan-time)
+    /// face of the shared static core below, using the injectable
+    /// per-instance cap.
+    private func probeUserDataShapes(at entryURL: URL) -> UserDataProbeResult {
         Self.boundedUserDataShapeWalk(
-            at: entryURL, provider: provider,
-            depthLimit: probeDepthLimit, entryLimit: probeEntryLimit
+            at: entryURL, provider: provider, entryLimit: probeEntryLimit
         )
     }
 
@@ -561,123 +798,1715 @@ struct OrphanedCachesScanner: @unchecked Sendable {
     /// re-establishes the clean promise (no matches AND complete) — the
     /// same fail-closed doctrine as scan time.
     ///
-    /// Kind gating mirrors the scan path exactly:
-    /// - real directory → the bounded no-follow walk (PRODUCTION caps);
-    /// - symlink / regular file / special → no contents of their own —
-    ///   clean and complete by construction (deletion removes the leaf
-    ///   as-is, never a target's tree);
-    /// - absent → clean and complete: the deletion path surfaces its own
-    ///   ENOENT (frozen ghost asymmetry) — the probe must not preempt it;
-    /// - unprobeable → fail closed (incomplete).
+    /// Kind gating is FUSED INTO THE ROOT OPEN (PR #458 review, ancestor
+    /// swap) and reads identically to the switch it replaces:
+    /// - real directory → the bounded no-follow walk (the PRODUCTION cap);
+    /// - symlink / regular file / special → `O_DIRECTORY|O_NOFOLLOW` fails
+    ///   `ENOTDIR`, which is clean and complete by construction (deletion
+    ///   removes the leaf as-is, never a target's tree);
+    /// - absent → `ENOENT`, clean and complete: the deletion path surfaces
+    ///   its own ENOENT (frozen ghost asymmetry) — the probe must not
+    ///   preempt it;
+    /// - unopenable → fail closed (incomplete), attributed by errno so the
+    ///   guidance can say whether a retry helps.
+    ///
+    /// A separate `lstat` gate BESIDE the open is a swap window by
+    /// construction; the open answers both questions at once, and it is the
+    /// answer the walk then holds.
     static func preDeleteUserDataProbe(
         at target: URL, provider: FileSystemIdentityProvider
-    ) -> (matches: [String], complete: Bool) {
-        switch provider.probeKind(of: target) {
-        case .kind(.directory):
-            return boundedUserDataShapeWalk(
-                at: target, provider: provider,
-                depthLimit: defaultProbeDepthLimit,
-                entryLimit: defaultProbeEntryLimit
-            )
-        case .kind:
-            return ([], true)
-        case .absent:
-            return ([], true)
-        case .failed:
-            return ([], false)
+    ) -> UserDataProbeResult {
+        boundedUserDataShapeWalk(
+            at: target, provider: provider, entryLimit: defaultProbeEntryLimit
+        )
+    }
+
+    /// errno → obstruction, in ONE place, so scan time and delete time
+    /// classify identically.
+    ///
+    /// Every class is decided on the SAME question the guidance turns on —
+    /// can a retry, unaided, change this? — rather than on how the failure
+    /// felt. The previous shape answered it for `EACCES`/`EPERM` and then
+    /// swept everything else into "transient", which is the fail-open
+    /// pattern this codebase keeps getting bitten by: one genuinely benign
+    /// cause (the mid-walk race) justifying a catch-all that then absorbs
+    /// every class nobody enumerated. `ENAMETOOLONG` was the live example —
+    /// reachable at all only because the depth cap is gone (e9de405) — and
+    /// an unchanged tree reproduces it exactly, so "re-scan and try again"
+    /// was a loop that could never terminate.
+    ///
+    /// ## `ELOOP` vs `ENOTDIR`, measured (PR #458 review, ancestor swap)
+    /// A previous round added an `openObstruction` router that ran one
+    /// extra `lstat` to tell "the leaf is a symlink RIGHT NOW" (a swap)
+    /// from "path resolution ran out of link depth" (structural), because
+    /// `O_NOFOLLOW` was believed to report `ELOOP` for both. It does not:
+    /// with `O_DIRECTORY` also set, a symlink leaf fails **ENOTDIR (20)**,
+    /// never `ELOOP` — so that branch never fired in production and the
+    /// leaf-swap test passed by a route nobody had written down. It is
+    /// deleted; `ENOTDIR` already routes to `.transientFailure` below,
+    /// which is the correct class for a swap.
+    ///
+    /// `ELOOP` does survive `O_DIRECTORY` for a genuine symlink CYCLE in an
+    /// ancestor (measured: errno 62). Since this walk resolves no
+    /// multi-component path below its root, `ELOOP` is now reachable ONLY
+    /// from the root open, and `.unaddressablePath` is narrowed to that.
+    ///
+    /// ONE CONFLATION IS ACCEPTED AND STATED: `ENOTDIR` no longer
+    /// distinguishes "swapped to a symlink" from "swapped to a file" from
+    /// "raced to a non-directory". All three are the same event — the tree
+    /// changed under the walk — with the same remedy.
+    static func obstruction(forErrno code: Int32) -> UserDataProbeObstruction {
+        switch code {
+        // GRANTABLE — a retry reproduces it, a grant clears it. `EPERM` is
+        // what TCC returns; `EACCES` is POSIX permissions.
+        case EACCES, EPERM:
+            return .accessDenied
+
+        // STRUCTURAL — a property of the PATH, reproduced by every re-scan
+        // of an unchanged tree. `ENAMETOOLONG`: an absolute path past
+        // `PATH_MAX`, which only relative creation (`mkdirat`) can build.
+        // `ELOOP`: symlink resolution depth, reachable here only through an
+        // ancestor, since this walk itself never follows a link. Clearable
+        // by restructuring, never by a retry.
+        case ENAMETOOLONG, ELOOP:
+            return .unaddressablePath
+
+        // GENUINELY RETRYABLE — the mid-walk race (the tree changed under
+        // the walk: `ENOENT`/`ENOTDIR`, still fail-closed because a rename
+        // can move content past a parent already read), I/O and media
+        // errors, resource shortages, and the network/removable-volume
+        // family. A later scan can find every one of these gone.
+        case ENOENT, ENOTDIR, EIO, EINTR, EAGAIN, EMFILE, ENFILE, ENOMEM,
+             ENODEV, ENXIO, EBUSY, ESTALE, ETIMEDOUT, ENOTCONN, ECONNRESET,
+             ENETDOWN, ENETUNREACH, EHOSTDOWN, EHOSTUNREACH:
+            return .transientFailure
+
+        // EVERYTHING ELSE CLAIMS NEITHER. Defaulting the unknown to
+        // "transient" is what this comment opened with. Defaulting it to
+        // "permanent" would be just as unearned, and that direction costs
+        // more: it steers the user to explicit per-item confirmation — the
+        // RISKIER path — on a guess. So an unrecognized errno (`EINVAL`,
+        // `EOVERFLOW`, anything a future OS adds) says exactly what is
+        // true: we do not know whether this repeats. The refusal itself is
+        // identical either way — only the advice differs, and unearned
+        // advice is what the whole review thread is about.
+        default:
+            return .unclassifiedFailure
         }
     }
 
     /// The ONE bounded user-data-shape walk, shared by the scan-time probe
     /// and the delete-time revalidation so the two can never drift. Matches
     /// basenames against `userDataShapePatterns`, returning the matched
-    /// pattern NAMES (in table order, deduplicated) and the fail-closed
-    /// completeness flag.
+    /// pattern NAMES (in table order, deduplicated) and — when the walk
+    /// could not finish — the ATTRIBUTED obstructions behind the
+    /// fail-closed verdict.
     ///
-    /// NO-FOLLOW rule (safety — mirrors `.deletionTarget` sizing): the
-    /// caller lstat-gates the probe root, and every descent below is
-    /// lstat-gated here; a nested symlink is matched by NAME only and never
-    /// traversed. Without this, `contentsOfDirectory` on a symlink would
-    /// inspect data outside ~/Library/Caches and undo the safety the sizing
-    /// mode bought. An unexpanded symlink does NOT mark the probe
-    /// incomplete: deleting the entry removes the link, never its target,
-    /// so no deletable content went uninspected.
-    private static func boundedUserDataShapeWalk(
+    /// Internal rather than private ONLY so tests can drive it at a small
+    /// budget; both PRODUCTION callers (`probeUserDataShapes` and
+    /// `preDeleteUserDataProbe`) read `defaultProbeEntryLimit`, so the
+    /// scan-time and delete-time bounds still cannot drift.
+    ///
+    /// ## The budget bounds what is MATERIALIZED, not just what is INSPECTED
+    /// (PR #458 review)
+    /// Every directory is read through `boundedChildNames`, which stops
+    /// after the REMAINING budget's worth of `readdir` entries. The previous
+    /// `contentsOfDirectory(at:).sorted` read and sorted every child of a
+    /// directory BEFORE the per-entry guard could fire, so one cache
+    /// directory with millions of entries could spike memory and stall the
+    /// scan even though only `entryLimit` entries were ever inspected — the
+    /// budget was a bound on ATTENTION, not on WORK. The retired depth cap
+    /// had been hiding that for anything below its boundary.
+    ///
+    /// A SPENT BUDGET IS A CAPACITY OF ZERO, NOT A REFUSAL TO LOOK (PR #458
+    /// review r9). A directory discovered by a read has already been PAID
+    /// FOR; what the budget cannot afford is its CHILDREN, and a `limit: 0`
+    /// read admits none of them while still distinguishing the two answers
+    /// that matter — immediate EOF (nothing beyond the budget exists, so the
+    /// walk is COMPLETE) from one real entry (`.budgetExhausted`, proven).
+    /// The gate that refused the descent outright bought no budget and threw
+    /// away that distinction, manufacturing the one irreducible obstruction
+    /// for trees that fit.
+    ///
+    /// Under truncation, WHICH entries were read is deliberately
+    /// UNSPECIFIED: a directory bigger than the remaining budget is read in
+    /// filesystem `readdir` order, because selecting the byte-wise smallest
+    /// N would require the whole enumeration the budget exists to prevent.
+    /// Nothing may depend on that membership — a truncated probe is
+    /// fail-closed on every surface. Within a directory the budget could
+    /// read WHOLE, order is byte-wise ascending (children first, then
+    /// subdirectories descended in that same order), so a complete walk is
+    /// fully deterministic.
+    ///
+    /// ## THE DOCTRINE (PR #458 review, ancestor swap)
+    /// **Below the walk root, no filesystem operation takes a path.** Every
+    /// child is discovered and opened relative to an OPEN, VETTED parent
+    /// descriptor, by single-component basename. A child's safety is
+    /// established by CONTAINMENT IN A HELD PARENT INODE, never by comparing
+    /// a recorded identity.
+    ///
+    /// The distinction is the whole fix. The previous round opened each
+    /// directory `O_NOFOLLOW` and re-proved the descriptor against the
+    /// identity its discovery `lstat` had recorded — sound against a LEAF
+    /// swap, useless against an ANCESTOR swap: if the ancestor is
+    /// re-pointed BEFORE the child's `lstat`, the "vetted" identity is
+    /// already the FOREIGN object's, so the re-proof compares foreign
+    /// against foreign, passes, and the probe enumerates up to its full
+    /// budget outside the cache tree. `O_NOFOLLOW` guards only the final
+    /// component, so it cannot see this either. Only holding the parent
+    /// open can: a descriptor names an INODE, and no rename or symlink can
+    /// re-point one.
+    ///
+    /// Descriptor cost is a function of DEPTH, not of pending siblings (see
+    /// `Frame`), and is capped by a window with a `..` re-anchor, so the
+    /// bound never becomes a refusal.
+    ///
+    /// ## WHAT THIS DOES NOT CLOSE — read before trusting it further
+    /// 1. **The root open is still path-resolved.** `open(entryURL.path, …)`
+    ///    traverses the root's ancestors, so an attacker who can already
+    ///    write to `~/Library` can redirect the whole walk. Not closable at
+    ///    this layer: `O_NOFOLLOW_ANY` would close it but refuses ANY
+    ///    symlink in the path, breaking legitimate aliased roots (`/tmp` →
+    ///    `/private/tmp`, a symlinked `$HOME`) this codebase supports. The
+    ///    clean follow-on, which this frame structure makes small: open the
+    ///    SWEEP ROOT once and derive every entry descriptor-relative from
+    ///    it, shrinking the trusted prefix from once-per-entry to
+    ///    once-per-sweep.
+    /// 2. **A vetted subtree relocated mid-walk.** Held descriptors keep
+    ///    reading the same inodes at their new location — no foreign
+    ///    disclosure, but "these shapes are INSIDE this entry" goes stale.
+    ///    Delete time re-proves separately (`PathGuard` plus this probe
+    ///    again), so this is scan-time staleness, not an authorisation hole.
+    /// 3. **Contents changing below an already-read directory.** Unclosable
+    ///    by construction: a probe describes a moment. The delete-time
+    ///    re-probe is the compensating control.
+    /// 4. **Inode reuse** within one walk would defeat the corroborator and
+    ///    the `..` identity checks. APFS object ids are 64-bit and issued
+    ///    monotonically; HFS+ can reuse CNIDs. The same assumption the
+    ///    previous round already shipped, and the mount rule already refuses
+    ///    to descend onto a foreign volume.
+    /// 5. **An overmount at the root AFTER the root open** pins the
+    ///    pre-mount object, so the boundary surfaces on the NEXT scan, not
+    ///    this one. Correct — we keep reading what we vetted — but worth
+    ///    knowing.
+    /// 6. **~~New scan/delete drift.~~ CLOSED.** This walk was made free of
+    ///    `PATH_MAX` while `FileManager.removeItem` was not, so the probe
+    ///    could certify a tree the deleter could not address. Both disposal
+    ///    arms now handle such trees: permanent deletion goes through
+    ///    `DepthSafeRemoval` (descriptor-relative, measured at depths
+    ///    446/600/2000/4000), and a Trash move is a `rename(2)` of the top
+    ///    directory (measured on a real over-limit tree). What is left is a
+    ///    MEASUREMENT gap, not a deletion one: `DirectorySizer` is still
+    ///    path-based, so such an entry's size is a floor.
+    /// 7. **The DISCOVERY race is CLOSED, and the asymmetry that used to be
+    ///    defended here is retired** (PR #458 review r11, thread
+    ///    `PRRT_kwDORmg6_86ZmmYY`). A name that vanishes between `readdir`
+    ///    and its `fstatat` now records `.transientFailure`, exactly as the
+    ///    same disappearance one step later at the `openat` already did.
+    ///    The defence that stood here — "at the `fstatat` nothing is known,
+    ///    the name may have been a file" — answered the wrong question. The
+    ///    question is not what KIND vanished, it is whether the content can
+    ///    still be inside the tree the deletion is about to remove, and
+    ///    `rename(2)` says yes: absence of a NAME is not absence of CONTENT.
+    ///    Its companion claim — that cache FILES are evicted constantly, so
+    ///    obstructing would make almost every probe incomplete — was never
+    ///    measured. It has been now: six full sweeps of the field machine's
+    ///    `~/Library/Caches` (185 entries, 445,938 child probes) produced
+    ///    ZERO `.absent` results, and the complete/incomplete split was
+    ///    174/11 both before and after. The window is one `fstatat` wide per
+    ///    name.
+    ///    WHAT REMAINS, precisely and separately: content CREATED in a
+    ///    directory after that directory was enumerated. No name vanished, no
+    ///    identity changed, and the closing root re-bind cannot see it —
+    ///    inode identity is not content identity. The delete-time re-probe
+    ///    re-reads every directory from scratch, which is why an insertion
+    ///    before it is caught; an insertion INSIDE its own window is not.
+    ///    That is an ACCEPTED RESIDUAL with its window measured and its
+    ///    preconditions named, written up in full at the closing root re-bind
+    ///    in `userDataProbe` — read it before acting on this line.
+    /// 8. **`DirectorySizer` (called from `sweepFacts`) is still a
+    ///    path-based `FileManager.enumerator` walk.** An ancestor swapped
+    ///    for a different REAL directory between this probe and the sizing
+    ///    pass makes it attribute foreign bytes, dates and denials to the
+    ///    cache entry. No user-data DISCLOSURE and no deletion
+    ///    AUTHORISATION flows from it — the shapes verdict, which is what
+    ///    gates automatic cleaning, comes from this descriptor-anchored walk
+    ///    — so what an attacker gains is a wrong SIZE, a wrong newest-date,
+    ///    and possibly a spurious denial on one row. Converting the sizer to
+    ///    the same discipline is the follow-on that this walk's
+    ///    `SecureDirectory`/`Frame` shape exists to make small.
+    /// 9. **At SCAN time the walk root arrives already canonical.**
+    ///    `sweepFacts` enumerates with `contentsOfDirectory(at:)`, whose
+    ///    children are returned FULLY RESOLVED (measured), so `entryURL` —
+    ///    and therefore `SweptCacheEntry.url` and every spelling composed
+    ///    below it — carries a canonical prefix rather than the unresolved
+    ///    one the project's rule (`resolveTargetKeepingLeaf`) calls for.
+    ///    Pre-existing and unchanged by this commit. It is a DISPLAY and
+    ///    ADDRESSING divergence (under a symlinked `~/Library/Caches`, rows
+    ///    are shown and addressed by their resolved path); the deletion path
+    ///    re-derives its own target and re-probes, so no authorisation
+    ///    decision is taken on this spelling.
+    ///
+    /// NO-CROSS rule (safety — PR #458 review, matching the sizer's own
+    /// root check at `DirectorySizer.swift:205` and its within-walk check at
+    /// `DirectorySizer.swift:289`): mount boundaries are never crossed, at
+    /// the root or anywhere beneath it, and an uncrossed boundary makes the
+    /// probe INCOMPLETE. Both signals are now read from DESCRIPTORS —
+    /// `f_fsid` plus `st_dev` (see `crossesMountBoundary`) — which is
+    /// strictly stronger than the path form it replaces and no third notion
+    /// of "mount boundary" is invented here. Enforced INSIDE this shared core,
+    /// not at a call site: at scan time the probe runs BEFORE the sizing
+    /// pass that would mark the item review-only, and at delete time
+    /// `preDeleteUserDataProbe` is handed a bare URL with no size report to
+    /// consult, with a volume mountable between the scan and the clean.
+    /// What crossing costs is real and buys nothing: up to `entryLimit`
+    /// reads on network/removable/FUSE storage the user never pointed this
+    /// scanner at, on an item a boundary already makes uncleanable
+    /// (`CacheCleaner.swift:911`). UNCROSSED ⇒ INCOMPLETE, never "clean" —
+    /// and unlike a depth cap it is CLEARABLE: unmount, and the next walk
+    /// reads the tree whole.
+    ///
+    /// NO-FOLLOW rule (safety — mirrors `.deletionTarget` sizing): the root
+    /// open is `O_NOFOLLOW` and every descent below it is a no-follow
+    /// `openat` on a single component classified by one `fstatat`; a nested
+    /// symlink is matched by NAME only and never traversed. An unexpanded
+    /// symlink does NOT mark the probe incomplete: deleting the entry
+    /// removes the link, never its target, so no deletable content went
+    /// uninspected.
+    ///
+    /// UNRESOLVED SPELLING, unchanged and now stronger: the walk's spelling
+    /// is composed exactly as before (the walk's own root plus
+    /// `appendingPathComponent` per level) and is used for DISPLAY and
+    /// IDENTITY only. Below the root it is not merely "the path we lstat" —
+    /// it is not a path anything is reached by at all. No `realpath` /
+    /// `canonicalize` output may ever be substituted for it, and it may
+    /// never be handed to `open`, `opendir`, `stat` or `FileManager`.
+    /// It is now also never MATERIALISED unless an observer asks for it:
+    /// the stack keeps one basename per level (`pathComponents`), and a URL
+    /// is composed on demand from the root. See `logicalURL(atDepth:)`.
+    ///
+    /// ## ONE budget, and NO depth cap (PR #456 follow-up)
+    /// The ENTRY budget is this walk's only bound, and it alone guarantees
+    /// termination: a directory is pushed ONLY from inside the child loop,
+    /// immediately after `visited += 1` — every descent cost one entry to
+    /// DISCOVER — so at most `entryLimit` directories are ever pushed and
+    /// at most `entryLimit + 1` are ever popped. That holds however deep
+    /// the tree runs, and even of a hypothetical directory cycle (a symlink
+    /// is `lstat`-classified and never descended, so no cycle can form
+    /// through one anyway).
+    ///
+    /// A fixed depth cap therefore bounded NOTHING the budget did not.
+    /// What it did do was manufacture INCOMPLETE verdicts on ordinary cache
+    /// trees, and those verdicts were inescapable: a depth boundary is
+    /// DETERMINISTIC, so every re-scan and every delete-time re-probe
+    /// reproduced it. Downstream that is permanent — the classifier forces
+    /// such an entry off `.safe` and sets `automaticCleanEligible = false`,
+    /// which removes it from Quick Clean, `selectAllSafe` and CLI
+    /// smart-clean FOREVER, over evidence claiming the contents could not
+    /// be inspected when nothing had obstructed the walk. Worse for safety
+    /// than for reclaim: user data BELOW the boundary was never looked at,
+    /// so a buried `Photos Library.photoslibrary` produced "no matches"
+    /// rather than a match. Real caches cross three levels constantly (the
+    /// field machine's own `~/Library/Caches` nests fourteen deep, and 42
+    /// of its 179 entries pass depth 3) — including, on that machine, a
+    /// live `com.apple.SwiftUI.Drag-<UUID>` leak of just 52 entries whose
+    /// only sin was reaching depth 4: the exact class this scanner exists
+    /// to reclaim, held off the automatic path forever by a bound that
+    /// bought nothing. Depth is now spent FROM the one budget: a tree the
+    /// budget can afford is PROVEN, and only a tree it genuinely cannot
+    /// afford stays unproven.
+    ///
+    /// THE DESCRIPTOR WINDOW DOES NOT BRING IT BACK. `descriptorWindow` is
+    /// a performance knob: exceeding it releases a frame and the `..`
+    /// re-anchor restores it, which costs syscalls and NOTHING else — no
+    /// obstruction, no budget spend, no verdict change. The walk completes
+    /// correctly at a window of 2, so there is no depth and no descriptor
+    /// pressure at which it refuses something it would accept at depth 1.
+    /// Re-anchor steps are deliberately NOT charged to the entry budget:
+    /// charging them would let a deep tree flip from complete to
+    /// `.budgetExhausted`, a depth-correlated behaviour change on exactly
+    /// the trees e9de405 rescued.
+    // MARK: - The descriptor-anchored walk (PR #458 review, ancestor swap)
+
+    /// An open, no-follow-vetted directory. OWNS its descriptor; ARC closes
+    /// it on EVERY exit path — normal completion, `break walk`, an early
+    /// refusal, or a thrown-away frame stack.
+    ///
+    /// Never store a bare `Int32` for a directory anywhere in this walk. The
+    /// number-one hazard of a descriptor-anchored traversal is a leaked
+    /// descriptor on a refusal path, and `deinit` is a mechanism where
+    /// review vigilance is not (test T10 enforces the balance on every exit
+    /// path there is).
+    final class SecureDirectory {
+        let fd: Int32
+        /// `fstat(fd)` at open time — proof of WHAT is held, not of what a
+        /// path once resolved to.
+        let identity: FileSystemIdentityProvider.Identity
+        /// `fstatfs(fd).f_fsid` + `st_dev` at open time.
+        let mount: FileSystemIdentityProvider.MountIdentity
+
+        /// Takes ownership of `fd`. Returns nil — CLOSING `fd` first — when
+        /// the descriptor cannot be vetted at all.
+        init?(fd: Int32, provider: FileSystemIdentityProvider) {
+            guard fd >= 0 else { return nil }
+            guard let identity = provider.identity(ofDescriptor: fd),
+                  let mount = provider.mountIdentity(ofDescriptor: fd)
+            else {
+                close(fd)
+                return nil
+            }
+            self.fd = fd
+            self.identity = identity
+            self.mount = mount
+        }
+
+        deinit { close(fd) }
+    }
+
+    /// One level of the CURRENT DFS PATH.
+    ///
+    /// The retired shape stacked flat sibling URLs, which is why holding a
+    /// descriptor per stacked entry looked like `entryLimit` (20,000) live
+    /// descriptors. That was a fact about the stack's ELEMENT TYPE, never
+    /// about traversal order: the walk was already depth-first pre-order
+    /// with byte-ascending siblings, so a per-LEVEL frame makes live
+    /// descriptors a function of DEPTH — and, with the window below, of a
+    /// constant.
+    /// How many times the walk read a frame's TRAVERSAL STATE.
+    ///
+    /// THE POINT IS THAT NOBODY UPDATES IT (PR #458 review, the pop-path
+    /// mutation). The accounting the walk used to emit was hand-maintained —
+    /// `var popInspected = 1`, incremented where the author remembered to —
+    /// so a regressor that reintroduced the O(depth) prefix scan and left
+    /// the literal alone was invisible to every test that read it. Measured:
+    /// swapping `unexhausted.last` for
+    /// `frames[..<depth].lastIndex(where: { $0.cursor < $0.pending.count })`
+    /// with `popInspected = 1` untouched left the whole suite green. A
+    /// number a walk reports about itself is not evidence about the work it
+    /// does.
+    ///
+    /// This one is incremented BY THE ACCESS, inside `Frame.dir`,
+    /// `Frame.cursor` and `Frame.pending` — the only three fields a scan of
+    /// the frame stack can possibly consult, whether it is looking for the
+    /// next frame with work or for a descriptor to release. A prefix scan
+    /// therefore cannot be written without paying for it, and cannot forget
+    /// to. (`cursor`/`pending` alone were NOT enough: a sweep that
+    /// short-circuits on `dir != nil` never reaches them on a chain, where
+    /// eager tail release has already emptied almost every frame. Measured:
+    /// that mutation left the suite green until `dir` was counted too.)
+    ///
+    /// The live-descriptor list is deliberately NOT counted: `liveBelowRoot`
+    /// holds at most `window - 1` indices by I4, so scanning it is bounded
+    /// by a constant no matter how it is written — and the descriptor-census
+    /// tests pin that length independently.
+    private final class FrameStateReads {
+        var count = 0
+    }
+
+    private struct Frame {
+        /// `nil` ⇒ released to stay inside the window; re-acquirable in ONE
+        /// `..` step from the frame below it.
+        ///
+        /// COUNTED TOO, and that is not belt-and-braces: the first version
+        /// of this instrumentation charged only `cursor`/`pending`, and a
+        /// mutation that swept the WHOLE frame stack while short-circuiting
+        /// on `dir != nil` first went undetected — on a chain with eager
+        /// tail release almost every frame is released, so the counted
+        /// fields were never reached. Any prefix scan must look at one of
+        /// these three; all three charge.
+        var dir: SecureDirectory? {
+            get { reads.count += 1; return storedDir }
+            set { storedDir = newValue }
+        }
+        private var storedDir: SecureDirectory?
+        /// Proven when this frame's descriptor was first opened; what a
+        /// re-acquisition must match.
+        let identity: FileSystemIdentityProvider.Identity
+        /// Shared with every other frame of the same walk — see the type.
+        let reads: FrameStateReads
+        /// NO PATH IS STORED HERE. A `URL` per frame made the walk's own
+        /// bookkeeping QUADRATIC in depth: level `k` retained a private copy
+        /// of the whole prefix above it, so a 20,000-level chain of long
+        /// legal basenames retained tens of gigabytes of duplicated
+        /// prefixes, and the entry budget did not bound it — the budget
+        /// bounds ATTENTION (how many entries are inspected), never
+        /// RESOURCES. That distinction has now cost this walk three times:
+        /// the flat sibling stack's descriptor bill, `contentsOfDirectory`
+        /// materialising a whole directory before any cap could apply, and
+        /// this. The spelling lives once, as one basename per level, in the
+        /// walk's `pathComponents`, and is composed into a URL only when an
+        /// observer asks (`logicalURL(atDepth:)`).
+        /// Subdirectory basenames, byte-wise ASCENDING — as VALIDATED
+        /// components, so the descent below has nothing left to check.
+        ///
+        /// COMPUTED SO THE READ IS COUNTED (see `FrameStateReads`). The
+        /// storage is private to the frame; the only way to ask a frame
+        /// whether it still has work goes through here or through `cursor`,
+        /// and both charge for it.
+        var pending: [SafeComponent] {
+            get { reads.count += 1; return storedPending }
+            set { storedPending = newValue }
+        }
+        var cursor: Int {
+            get { reads.count += 1; return storedCursor }
+            set { storedCursor = newValue }
+        }
+        private var storedPending: [SafeComponent] = []
+        private var storedCursor: Int = 0
+        /// The `fstatat` identity of each pending name, for the descent's
+        /// cheap corroborator.
+        var vetted: [String: FileSystemIdentityProvider.Identity] = [:]
+
+        init(
+            dir: SecureDirectory?,
+            identity: FileSystemIdentityProvider.Identity,
+            reads: FrameStateReads
+        ) {
+            self.storedDir = dir
+            self.identity = identity
+            self.reads = reads
+        }
+    }
+
+    /// Test-only observation points, passed as a PARAMETER rather than
+    /// parked in a mutable global: a test can perform a real `rename` or
+    /// `symlink` INSIDE the exact instant a race lives in, single-threaded,
+    /// with no sleeps and no threads, and the real kernel decides what the
+    /// walk sees next.
+    enum WalkEvent {
+        case didEnumerate(logical: URL, names: [String])
+        case willDescend(name: String, from: URL)
+        case willPop(depth: Int)
+        /// A released frame was restored with one `openat(child, "..")` —
+        /// the ONLY cost of exceeding the descriptor window.
+        case didReanchor(depth: Int)
+        /// Every descriptor this walk holds AT THIS INSTANT, split into the
+        /// `live` frame-stack anchors (what the window bounds) and the
+        /// `transient` handles held outside the stack: the enumeration
+        /// handle, the in-flight child, and the `..` descriptors of a climb.
+        ///
+        /// EMITTED AT THE PEAKS, not between them (PR #458 review, axis 7).
+        /// A single census taken after the child frame was appended and
+        /// before `enumerate` ran sampled the one instant of the loop when
+        /// NO transient exists, so the margin the test asserted could never
+        /// be approached and a regression in it could not fail the test.
+        /// `live + transient` is the count an external observer of this
+        /// process sees, and tests assert that equality.
+        case descriptorCensus(live: Int, transient: Int, depth: Int)
+        /// Which of the walk's two frame-stack passes an accounting sample
+        /// is about.
+        ///
+        /// THE DISCRIMINATOR IS THE FIX, not decoration (PR #458 review r8,
+        /// thread `PRRT_kwDORmg6_86ZkfDO`). The metric was emitted from
+        /// `makeRoom` alone, so the test that asserts it pinned its sample
+        /// set to DESCENTS — and the pop path, which carried an untouched
+        /// O(depth) prefix scan, was structurally invisible to it. A metric
+        /// that cannot see half the loop cannot fail on half the loop.
+        enum BookkeepingPass: Equatable {
+            /// `makeRoom`, once per descent.
+            case descent
+            /// The unwind, once per popped frame.
+            case pop
+        }
+        /// How many frame-state fields ONE pass actually READ — a MEASURED
+        /// difference of `FrameStateReads`, never a hand-kept tally.
+        ///
+        /// The walk's own bookkeeping is a RESOURCE, and the entry budget
+        /// bounds ATTENTION, not resources — the distinction that has now
+        /// cost this walk four times. Wall-clock cannot pin an asymptote
+        /// deterministically; this can, so a test asserts the accounting is
+        /// bounded by a CONSTANT rather than by DEPTH — for BOTH passes.
+        ///
+        /// THE LABEL CHANGED BECAUSE THE MEANING DID. `inspected` was a
+        /// literal the author maintained, and a pop path that went back to
+        /// scanning the whole frame prefix while leaving `popInspected = 1`
+        /// alone passed every test that read it. `stateReads` is charged
+        /// inside `Frame.cursor`/`Frame.pending`, so the same regression now
+        /// reports ~2 × depth and the test fails on the work, not on the
+        /// claim.
+        case frameBookkeeping(stateReads: Int, depth: Int, pass: BookkeepingPass)
+    }
+
+    /// A basename PROVEN safe to hand to `openat`/`fstatat`.
+    ///
+    /// MANDATORY, not belt-and-braces. `openat` accepts a MULTI-COMPONENT
+    /// relative path and `O_NOFOLLOW` then guards only its LAST component —
+    /// measured on this platform: `openat(base, "cache/mid/secret.bin",
+    /// O_NOFOLLOW)` opened a foreign file through a symlinked `mid`. APFS
+    /// and HFS+ will not create such a basename, but `d_name` is whatever
+    /// the filesystem driver puts there, and a userland one (FUSE, SMB) is
+    /// not the kernel.
+    ///
+    /// A TYPE, NOT TWO CALLS (PR #458 review r7). The predicate used to be
+    /// invoked at two sites — once before the discovery `fstatat`, once
+    /// before the descent `openat` — and DELETING EITHER LEFT THE SUITE
+    /// GREEN, because the other caught the name first. Two mutually masking
+    /// copies of one rule are one refactor from both being dropped as dead.
+    /// There is now a single construction point and no way to spell a
+    /// component that has not been through it: `Frame.pending` holds these
+    /// rather than strings, so "an unvalidated name reached a syscall" is
+    /// not a bug this walk can have.
+    struct SafeComponent {
+        let name: String
+
+        init?(_ name: String) {
+            guard OrphanedCachesScanner.isSafeComponent(name) else {
+                return nil
+            }
+            self.name = name
+        }
+    }
+
+    /// The predicate itself, kept separately addressable so its truth table
+    /// is testable without a hostile volume.
+    static func isSafeComponent(_ name: String) -> Bool {
+        !name.isEmpty && name != "." && name != ".."
+            && !name.utf8.contains(UInt8(ascii: "/"))
+    }
+
+    /// The live-descriptor window `W`, derived ONCE per probe from the
+    /// process's own soft descriptor limit.
+    ///
+    /// `W = clamp((rlim_cur - 64) / 4, 4, 64)`. A genuinely launchd-spawned
+    /// process on this platform sees `rlim_cur = 256` (measured via
+    /// `launchctl submit`; `launchctl limit maxfiles` and a dev shell both
+    /// report something else entirely), which gives `W = 48` and a peak of
+    /// 50 descriptors in the shipped app; a dev shell hits the ceiling at
+    /// 64, peak 66.
+    ///
+    /// The scanner NEVER calls `setrlimit`: a library must not mutate a
+    /// process-global limit it shares with AppKit, `DirectorySizer` and the
+    /// helper.
+    ///
+    /// `W` IS A PERFORMANCE KNOB, NOT A POLICY. Because a released frame is
+    /// restored in one `..` step, the walk completes correctly at `W = 2`.
+    /// There is therefore no tree depth and no descriptor-pressure
+    /// condition at which this walk produces an obstruction it would not
+    /// produce at depth 1 — which is the whole reason a descriptor bound
+    /// does not resurrect the depth cap e9de405 removed.
+    static func defaultDescriptorWindow() -> Int {
+        var limits = rlimit()
+        guard getrlimit(RLIMIT_NOFILE, &limits) == 0 else { return 4 }
+        let soft = Int(clamping: limits.rlim_cur)
+        return min(64, max(4, (soft - 64) / 4))
+    }
+
+    static func boundedUserDataShapeWalk(
         at entryURL: URL,
         provider: FileSystemIdentityProvider,
-        depthLimit: Int,
-        entryLimit: Int
-    ) -> (matches: [String], complete: Bool) {
-        let fileManager = FileManager.default
+        entryLimit: Int,
+        descriptorWindow: Int = OrphanedCachesScanner.defaultDescriptorWindow(),
+        decode: (UnsafePointer<CChar>) -> String? = decodedBasename(fromCString:),
+        onEvent: ((WalkEvent) -> Void)? = nil
+    ) -> UserDataProbeResult {
         var matched = Set<String>()
-        var complete = true
+        var obstructions = Set<UserDataProbeObstruction>()
         var visited = 0
-        // Depth-first with sorted children — deterministic order; the entry
-        // itself sits at depth 0, its children at depth 1.
-        var stack: [(url: URL, depth: Int)] = [(entryURL, 0)]
+        // Two is the floor the `..` re-anchor needs (one live parent to
+        // climb from, one live child to climb with) and the root is never
+        // released, so this can never strand a walk.
+        let window = max(2, descriptorWindow)
 
-        walk: while let (dir, depth) = stack.popLast() {
-            let children: [URL]
-            do {
-                // Hidden entries included, same stance as the enumeration.
-                children = try fileManager.contentsOfDirectory(
-                    at: dir, includingPropertiesForKeys: nil, options: []
-                ).sorted { $0.lastPathComponent < $1.lastPathComponent }
-            } catch {
-                // Unreadable branch: absence of matches is unproven.
-                complete = false
-                continue
+        func refuse(_ cause: UserDataProbeObstruction) -> UserDataProbeResult {
+            UserDataProbeResult(matches: [], obstructions: [cause])
+        }
+
+        // ROOT OPEN — the ONLY path-based open in the walk, and the root
+        // KIND GATE at the same time (a gate BESIDE the open is a swap
+        // window by construction). `ENOENT`/`ENOTDIR` mean there is no
+        // directory tree of our own to inspect — absent, symlink, regular
+        // file, special file — which is clean and complete exactly as the
+        // separate `lstat` gate used to say. Everything else fails closed.
+        let rootDescriptor = open(
+            entryURL.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW
+        )
+        guard rootDescriptor >= 0 else {
+            let code = errno
+            if code == ENOENT || code == ENOTDIR {
+                // Clean AND complete — and the verdict says WHAT it is
+                // about, so the deletion can prove no directory tree has
+                // appeared at that name since.
+                return .complete(inspected: .noDirectoryTree)
             }
-            for child in children {
-                guard visited < entryLimit else {
-                    // Entry cap hit before exhausting the tree.
-                    complete = false
-                    break walk
-                }
-                visited += 1
+            return refuse(obstruction(forErrno: code))
+        }
+        guard let root = SecureDirectory(fd: rootDescriptor, provider: provider)
+        else {
+            // `fstat`/`fstatfs` failed on a descriptor we hold: an I/O-class
+            // failure, and an unvettable root is never walked.
+            return refuse(.transientFailure)
+        }
 
-                let name = child.lastPathComponent
-                // FNM_CASEFOLD (PR #456 review): the guard protects user
-                // content in ANY casing (`Photos Library.PHOTOSLIBRARY`,
-                // `pictures`, `DOCUMENTS`) — the stored spelling is
-                // arbitrary, and flags 0 compared it case-sensitively even
-                // on the case-insensitive default filesystem. Fail-safe by
-                // direction: casefolding here can only ADD matches, which
-                // only forces review / refuses deletion. Deliberately NOT
-                // mirrored by the classifier's known-leak glob (see the
-                // pattern-table doc above).
-                for pattern in userDataShapePatterns
-                where fnmatch(pattern.glob, name, FNM_CASEFOLD) == 0 {
-                    matched.insert(pattern.name)
-                }
+        // MOUNT BOUNDARY AT THE ROOT, before anything below it is read —
+        // the same stance `DirectorySizer.swift:205` takes on its own root.
+        // An entry that IS a mount is not enumerated at all: not one entry
+        // of the foreign filesystem is read, and the verdict is INCOMPLETE
+        // precisely because we did not look.
+        switch rootMountCheck(root, provider: provider) {
+        case .mountRoot: return refuse(.mountBoundary)
+        case .unprovable(let cause): return refuse(cause)
+        case .inside: break
+        }
 
-                switch provider.probeKind(of: child) {
-                case .kind(.directory):
-                    let childDepth = depth + 1
-                    if childDepth < depthLimit {
-                        stack.append((child, childDepth))
-                    } else {
-                        // A directory at the depth boundary left unexpanded:
-                        // a match could hide just past it (fail closed).
-                        complete = false
-                    }
-                case .kind:
-                    // Symlink / regular file / special: matched by name
-                    // above, never descended (see the no-follow rule).
-                    break
-                case .absent:
-                    // Vanished mid-probe — benign race.
-                    break
-                case .failed:
-                    // Could not establish the kind — fail closed.
-                    complete = false
-                }
+        // ACCUMULATE, NEVER PREEMPT (PR #458 review r3). Every stop below
+        // records what it proved into `obstructions` and then `break`s or
+        // `continue`s; the ONLY `return` past this point is the single exit
+        // at the end, which carries the whole set. The root checks above
+        // may return early only because nothing is established yet there.
+        /// Charged by every read of a frame's `cursor`/`pending` — see
+        /// `FrameStateReads`. Shared by every frame of this walk.
+        let stateReads = FrameStateReads()
+
+        var frames: [Frame] = [
+            Frame(dir: root, identity: root.identity, reads: stateReads)
+        ]
+
+        /// The walk's UNRESOLVED spelling of the CURRENT DFS PATH: ONE
+        /// basename per level below the root, pushed on descent and popped
+        /// on pop. `pathComponents.count == frames.count - 1` always.
+        ///
+        /// This is the whole path bookkeeping the walk retains — the bytes
+        /// of the path it is standing on, once, rather than a full prefix
+        /// copy per level.
+        var pathComponents: [String] = []
+
+        /// Compose the spelling of the frame at `depth`, root-first, exactly
+        /// as the per-frame URL was composed before.
+        ///
+        /// LAZY BY CONTRACT: production never calls this — no path below the
+        /// root reaches a syscall — so the O(depth) composition is paid only
+        /// when a `WalkEvent` observer or a test double actually wants a
+        /// URL. Every provider argument below is an `@autoclosure` for the
+        /// same reason: passing one costs nothing until someone evaluates it.
+        ///
+        /// `isDirectory:` IS SPELLED OUT, and that is a fix, not a detail.
+        /// The bare `appendingPathComponent(_:)` decides its trailing slash
+        /// by STATTING THE COMPOSED PATH — a path-based filesystem access
+        /// below the walk root, performed once per entry, whose answer
+        /// depends on whether an attacker's rename has already landed. Every
+        /// frame is a directory (it was opened `O_DIRECTORY`), so the answer
+        /// is known without asking anyone.
+        func logicalURL(atDepth depth: Int) -> URL {
+            var url = entryURL
+            for component in pathComponents.prefix(depth) {
+                url = url.appendingPathComponent(component, isDirectory: true)
+            }
+            return url
+        }
+
+        /// The frame indices BELOW THE ROOT that currently hold a
+        /// descriptor. `frames[0]` is excluded because I3 never releases it,
+        /// so this list holds AT MOST `window - 1` entries — bounded by the
+        /// WINDOW, never by DEPTH.
+        ///
+        /// IT EXISTS BECAUSE THE BUDGET BOUNDS ATTENTION, NOT RESOURCES, AND
+        /// CPU IS A RESOURCE (PR #458 review r7 — the third time that
+        /// distinction has cost this walk something, after
+        /// `contentsOfDirectory` materialising a whole directory before any
+        /// cap could apply and the per-frame `URL` prefix). Every descent
+        /// used to rescan the WHOLE frame stack three times — the
+        /// eager-tail-release loop, `liveCount()`'s reduce, and the
+        /// shallowest-live search — so a single-child chain approaching the
+        /// 20,000-entry budget performed on the order of 10⁹ frame
+        /// inspections before it even began to unwind: quadratic CPU inside
+        /// a walk whose only bound is an ENTRY count, on exactly the deep
+        /// trees e9de405 rescued. Kept incrementally, all three answers cost
+        /// `O(window)`.
+        ///
+        /// THIS LIST ALONE DOES NOT MAKE THE WALK LINEAR, and the comment
+        /// that claimed it did outlived its own truth by a review round (r8,
+        /// thread `PRRT_kwDORmg6_86ZkfDO`). The DESCENT was linear; the POP
+        /// path still scanned the whole frame prefix looking for the next
+        /// frame with work. `unexhausted` below is the other half.
+        var liveBelowRoot: [Int] = []
+
+        /// The frame indices whose `cursor` has NOT yet reached the end of
+        /// their `pending` list, ASCENDING — i.e. every frame the unwind
+        /// could still have to come back to.
+        ///
+        /// IT EXISTS FOR THE SAME REASON `liveBelowRoot` DOES, ON THE OTHER
+        /// PASS. The pop path asked `frames[..<depth].lastIndex(where: {
+        /// $0.cursor < $0.pending.count })`, and on a single-child chain —
+        /// the exact shape a deep leaked cache directory has, and the exact
+        /// shape the bookkeeping test builds — that predicate matches
+        /// NOTHING, so every pop scanned the entire prefix: d²/2 inspections
+        /// over the unwind. Measured with an explicit counting loop on
+        /// scratch builds of both shapes, at depths 200 / 400 / 800 / 1600 /
+        /// 3200 — prefix scan: 20,101 / 80,201 / 320,401 / 1,280,801 /
+        /// 5,121,601; this list: 202 / 402 / 802 / 1,602 / 3,202. That is
+        /// ~2.0 × 10⁸ against 2 × 10⁴ at the 20,000-entry budget, the same
+        /// order as the ~10⁹ the descent-side scan cost.
+        ///
+        /// WALL CLOCK IS NOT THE EVIDENCE, and is not offered as any: this
+        /// walk is syscall-bound at these depths, and best-of-5 release
+        /// timings over a pure chain (1.97 s → 1.90 s at 3200; a wash at 800
+        /// and 1600, where the run-to-run spread exceeds the difference)
+        /// cannot separate an asymptote from filesystem-cache weather. The
+        /// counted inspections can, deterministically, and a test asserts
+        /// them.
+        ///
+        /// THE STACK DISCIPLINE IS WHAT MAKES IT O(1), not a sorted search.
+        /// Only the DEEPEST frame's cursor ever advances (a frame's cursor
+        /// moves only while it is the frame the walk is standing on), and a
+        /// newly pushed frame's index exceeds every index already here, so
+        /// pushes and pops both happen at the END. At a pop, `frames[depth]`
+        /// is exhausted BY DEFINITION (that is why it is being popped) and
+        /// `depth` is the largest index there is, so `unexhausted.last` IS
+        /// `frames[..<depth].lastIndex(where:)` — in one array read.
+        var unexhausted: [Int] = []
+
+        /// Record whether `index` still has pending work, at the two — and
+        /// only two — instants its answer can change: when its `pending` is
+        /// first set (`enumerate`) and when its `cursor` advances.
+        ///
+        /// `index` is always the deepest frame at both, so this only ever
+        /// appends or removes at the end.
+        func noteWorkChanged(at index: Int) {
+            let hasWork = frames[index].cursor < frames[index].pending.count
+            if hasWork {
+                if unexhausted.last != index { unexhausted.append(index) }
+            } else if unexhausted.last == index {
+                unexhausted.removeLast()
             }
         }
 
-        // Table order, deduplicated — deterministic output for fn-3.2.
-        let names = userDataShapePatterns.map(\.name).filter(matched.contains)
-        return (names, complete)
+        /// Live descriptors held by the frame stack (transients excluded).
+        /// `+ 1` is the root, which is always live (I3).
+        func liveCount() -> Int { liveBelowRoot.count + 1 }
+
+        /// Drop `index` from the live list. `O(window)`.
+        func forgetLive(_ index: Int) {
+            if let slot = liveBelowRoot.firstIndex(of: index) {
+                liveBelowRoot.remove(at: slot)
+            }
+        }
+
+        /// INVARIANT I3: `frames[0]` is NEVER released — the continuously
+        /// held anchor the whole bound's safety argument rests on (a
+        /// descriptor-relative reopen is only as safe as the descriptor it
+        /// is relative to, so at least one must be held continuously).
+        /// INVARIANT I4: `liveCount() <= window` after this returns and the
+        /// caller appends one frame.
+        ///
+        /// `depth` is the frame the walk is descending FROM.
+        func makeRoom(after depth: Int) {
+            // MEASURED, NOT CLAIMED: whatever this pass reads off the frame
+            // stack charges `stateReads`, so the number below is the work,
+            // not a literal somebody remembered to bump.
+            let readsBefore = stateReads.count
+            // EAGER TAIL RELEASE, and it is FREE: a frame with nothing left
+            // to descend into is never climbed back to, so releasing it
+            // costs no `..` at all. On a pure deep chain this fires at every
+            // level, which is why a 500-deep chain holds two descriptors and
+            // performs ZERO re-anchors.
+            //
+            // ONLY `frames[depth]` CAN HAVE NEWLY BECOME EXHAUSTED, so the
+            // old sweep over every frame was pure re-inspection: a frame's
+            // cursor advances only while it is the deepest, and this runs at
+            // the instant it stops being so; a frame left exhausted by a
+            // `continue` (a failed open, a refused corroboration) is popped
+            // on the very next iteration rather than descended past; and
+            // `climb` only ever restores frames that still have pending
+            // work, so a re-anchored frame is never exhausted.
+            if depth >= 1, frames[depth].dir != nil,
+               frames[depth].cursor == frames[depth].pending.count {
+                frames[depth].dir = nil
+                forgetLive(depth)
+            }
+            if liveCount() >= window, !liveBelowRoot.isEmpty {
+                // Window pressure: give up the SHALLOWEST live frame, the
+                // one the walk will need again last. Cost: `..` steps on the
+                // way back up — never a refusal.
+                var slot = liveBelowRoot.startIndex
+                for index in liveBelowRoot.indices
+                where liveBelowRoot[index] < liveBelowRoot[slot] {
+                    slot = index
+                }
+                frames[liveBelowRoot[slot]].dir = nil
+                liveBelowRoot.remove(at: slot)
+            }
+            if let emit = onEvent {
+                emit(.frameBookkeeping(
+                    stateReads: stateReads.count - readsBefore,
+                    depth: depth, pass: .descent
+                ))
+            }
+        }
+
+        /// Restore frame `target` by climbing `..` from the deepest live
+        /// frame, verifying EVERY level against the identity that frame was
+        /// opened with.
+        ///
+        /// `..` is never a symlink, so `O_NOFOLLOW` buys nothing here; the
+        /// identity checks are what prove we landed where we left. A
+        /// directory MOVED under the walk lands somewhere else — measured:
+        /// `..` then names the NEW parent — so the comparison detects the
+        /// relocation and the walk stops.
+        ///
+        /// Only frames that still have pending work are ever restored, so
+        /// the exhausted levels in between are skipped entirely: the climb
+        /// is one step in the comb case and does not happen at all in the
+        /// chain case. Total climb steps across a walk are bounded by the
+        /// number of frames popped, which is bounded by `entryLimit`.
+        func climb(to target: Int, from deepest: SecureDirectory,
+                   at depth: Int) -> Bool {
+            var current = deepest
+            var level = depth
+            // `deepest` is still frames[depth]'s, so the first iteration
+            // holds nothing outside the stack; from the second on, `current`
+            // is a climb-owned handle.
+            var transient = 0
+            while level > target {
+                let up = openat(
+                    current.fd, "..", O_RDONLY | O_DIRECTORY | O_CLOEXEC
+                )
+                guard up >= 0 else {
+                    obstructions.insert(obstruction(forErrno: errno))
+                    return false
+                }
+                guard let parent = SecureDirectory(fd: up, provider: provider)
+                else {
+                    obstructions.insert(.transientFailure)
+                    return false
+                }
+                // THE CLIMB'S PEAK: the stack, plus `current`, plus `parent`.
+                onEvent?(.descriptorCensus(
+                    live: liveCount(), transient: transient + 1, depth: level
+                ))
+                level -= 1
+                guard parent.identity == frames[level].identity else {
+                    obstructions.insert(.transientFailure)
+                    return false
+                }
+                // The previous `current` is released here by ARC unless it is
+                // still the frame's own anchor: at most two climb-owned
+                // descriptors exist at once.
+                current = parent
+                transient = 1
+            }
+            frames[target].dir = current
+            liveBelowRoot.append(target)   // `target >= 1`: I3 keeps 0 live
+            onEvent?(.didReanchor(depth: target))
+            return true
+        }
+
+        /// Read one frame's children, bounded by the REMAINING budget, and
+        /// record its pending subdirectories. `false` ⇒ stop the walk.
+        func enumerate(_ index: Int) -> Bool {
+            let remaining = entryLimit - visited
+            // ZERO IS A LEGAL CAPACITY, NOT A REFUSAL (PR #458 review r9,
+            // thread `PRRT_kwDORmg6_86ZlKD0`). A spent budget is not proof
+            // that anything exists beyond it, and `boundedChildNames` at
+            // `limit: 0` tells the two apart in ONE `readdir`: immediate EOF
+            // ⇒ this directory is empty and the walk is COMPLETE; any real
+            // entry ⇒ `.budgetExhausted`, exactly as before. Refusing to look
+            // manufactured the irreducible class for trees that fit.
+            //
+            // A negative remainder is an invariant violation (`visited` only
+            // ever advances while it is strictly below `entryLimit`) — the
+            // budget really would be overspent, so say so and stop.
+            guard remaining >= 0 else {
+                obstructions.insert(.budgetExhausted)
+                return false
+            }
+            guard let dir = frames[index].dir else {
+                // I1 violated — unreachable; fail closed rather than assume.
+                obstructions.insert(.transientFailure)
+                return false
+            }
+            let names: [String]
+            let census: (() -> Void)? = onEvent.map { emit in
+                {
+                    // THE READ'S PEAK: the stack plus the fresh description
+                    // `fdopendir` consumes — the "+1 enumeration handle" the
+                    // bound's formula names, sampled WHILE it is open.
+                    emit(.descriptorCensus(
+                        live: liveCount(), transient: 1, depth: index
+                    ))
+                }
+            }
+            switch boundedChildNames(
+                inDirectory: dir.fd, limit: remaining, whileReading: census,
+                decode: decode
+            ) {
+            case .unreadable(let cause):
+                // Unreadable branch: absence of matches is unproven, and the
+                // walk continues elsewhere.
+                obstructions.insert(cause)
+                return true
+            case .read(let read, let causes):
+                // EVERY cause the read established, never just the first.
+                obstructions.formUnion(causes)
+                names = read.sorted {
+                    $0.utf8.lexicographicallyPrecedes($1.utf8)
+                }
+            }
+            // Composed ONLY for an observer that exists (`if let`, not
+            // optional chaining, so the laziness is on the page rather than
+            // in a language rule a reader has to recall).
+            if let emit = onEvent {
+                emit(.didEnumerate(
+                    logical: logicalURL(atDepth: index), names: names
+                ))
+            }
+
+            var pending: [SafeComponent] = []
+            var vetted: [String: FileSystemIdentityProvider.Identity] = [:]
+            var continues = true
+
+            for name in names {
+                guard visited < entryLimit else {
+                    // Defense in depth: the read above is already bounded by
+                    // the REMAINING budget, so this cannot fire today.
+                    //
+                    // UNEVIDENCED ON ITS OWN, AND THAT IS STATED RATHER THAN
+                    // IMPLIED (PR #458 review r9): deleting this guard alone
+                    // leaves the whole suite green — measured. It is LAYER
+                    // TWO. Breaking the read's own capacity check alone is
+                    // caught by
+                    // `testAZeroCapacityReadStillTellsEOFFromAnOverBudgetEntry`;
+                    // only breaking BOTH lets a name past a spent budget
+                    // reach the matcher, which
+                    // `testTheExactBudgetReadAdmitsNoNames` then catches.
+                    obstructions.insert(.budgetExhausted)
+                    continues = false
+                    break
+                }
+                visited += 1
+                // THE ONE VALIDATION POINT. Everything downstream — the
+                // discovery `fstatat` here and the descent `openat` in the
+                // walk loop — takes `component.name`, which cannot exist
+                // without having passed it.
+                guard let component = SafeComponent(name) else {
+                    obstructions.insert(.transientFailure)
+                    continue
+                }
+                // FNM_CASEFOLD (PR #456 review): the guard protects user
+                // content in ANY casing. Fail-safe by direction —
+                // casefolding can only ADD matches, which only forces
+                // review / refuses deletion.
+                for pattern in userDataShapePatterns
+                where fnmatch(pattern.glob, component.name, FNM_CASEFOLD) == 0 {
+                    matched.insert(pattern.name)
+                }
+                // ONE `fstatat` against the HELD parent: kind and identity
+                // from a single atomic resolution that no path swap can
+                // re-point. `logical` is the walk's OWN spelling — composed,
+                // never resolved, display and identity only; nothing below
+                // the root is ever reached BY it — and it is an
+                // `@autoclosure`, so production, which ignores it, composes
+                // nothing at all.
+                switch provider.probeChild(
+                    inDirectory: dir.fd, named: component.name,
+                    // `isDirectory: false`: this child's kind is what the
+                    // probe is about to establish, so the spelling claims
+                    // nothing about it (and never stats to find out).
+                    logical: logicalURL(atDepth: index)
+                        .appendingPathComponent(
+                            component.name, isDirectory: false
+                        )
+                ) {
+                case .facts(let facts) where facts.kind == .directory:
+                    // ALWAYS descended: discovering this directory already
+                    // cost an entry, and the budget bounds everything that
+                    // follows. Refusing to look past some fixed level is
+                    // what stranded ordinary caches.
+                    pending.append(component)
+                    vetted[component.name] = facts.identity
+                case .facts:
+                    // Symlink / regular file / special: matched by NAME
+                    // above, never descended (the no-follow rule).
+                    break
+                case .absent:
+                    // ABSENCE OF A NAME IS NOT ABSENCE OF CONTENT (PR #458
+                    // review r11, thread `PRRT_kwDORmg6_86ZmmYY`).
+                    //
+                    // This arm used to say "it holds nothing deletable any
+                    // more" and break. That is the SAME sentence the descent's
+                    // `openat` arm below already refutes at length — written
+                    // twice, 180 lines apart, in opposite directions.
+                    // `rename(2)` destroys nothing: the subtree can still be
+                    // inside this very tree under a name the captured `names`
+                    // array never held, past this byte-ascending read's
+                    // cursor, so the walk never visits it and reports
+                    // `complete, matches: []` about a tree it has not seen the
+                    // whole of. Measured with a real `rename(2)` fired at
+                    // `didEnumerate` — the one instant between the read and
+                    // this `fstatat`: `complete=true obstructions=[]
+                    // matches=[]` while `<entry>/renamed/Documents` was still
+                    // on disk. That verdict sets `automaticCleanEligible`, so
+                    // Quick Clean deletes it with no confirmation.
+                    //
+                    // ROUTED THROUGH THE SAME CLASSIFIER AS ITS PARTNER rather
+                    // than through a second literal: `probeChild` reports
+                    // `.absent` for exactly `ENOENT`/`ENOTDIR`, and the
+                    // descent's failure arm hands its errno to
+                    // `obstruction(forErrno:)`. One router, one rule, and no
+                    // way for the two sites to disagree again.
+                    //
+                    // WHAT IT COSTS, MEASURED RATHER THAN GUESSED. The retired
+                    // asymmetry rested on "cache FILES are evicted under a
+                    // running scan constantly, so obstructing here would make
+                    // almost every probe of a live cache incomplete". Six full
+                    // sweeps of the field machine's own `~/Library/Caches`
+                    // (185 entries) issued 445,938 child probes and produced
+                    // ZERO `.absent` results: this window is one `fstatat`
+                    // wide per name, not a scan wide. The complete/incomplete
+                    // split was 174/11 before the change and 174/11 after it.
+                    // And unlike `.budgetExhausted` the class is CLEARABLE —
+                    // `.transientFailure`'s remedy is `retryAlone` — so a
+                    // directory that really is churning costs one deferred
+                    // sweep, never permanent exclusion.
+                    obstructions.insert(obstruction(forErrno: ENOENT))
+                case .failed(let code):
+                    obstructions.insert(obstruction(forErrno: code))
+                }
+            }
+            frames[index].pending = pending
+            frames[index].vetted = vetted
+            return continues
+        }
+
+        guard enumerate(0) else {
+            return finishedWalk(
+                matched: matched, obstructions: obstructions,
+                inspected: .directory(root.identity)
+            )
+        }
+        noteWorkChanged(at: 0)
+
+        walk: while !frames.isEmpty {
+            let depth = frames.count - 1
+            // The pop pass's accounting starts BEFORE its own branch test:
+            // the two reads that decide "is this frame exhausted?" are part
+            // of the pass, and a regression that answered that question by
+            // scanning the stack would otherwise hide in the gap.
+            let readsAtPassStart = stateReads.count
+
+            // POP — nothing left to descend into at this level.
+            if frames[depth].cursor == frames[depth].pending.count {
+                onEvent?(.willPop(depth: depth))
+                // The deepest frame BELOW this one that still has work is
+                // the only one that will ever be needed again; everything
+                // between is popped without a descriptor. If it is
+                // released, it must be restored NOW, while this frame's
+                // descriptor — the only handle the climb can start from —
+                // still exists.
+                // ONE ARRAY READ, not a prefix scan. `frames[depth]` is
+                // exhausted — that is the branch we are in — and `depth` is
+                // the top of the stack, so anything still holding work is
+                // strictly below it and `unexhausted.last` is the DEEPEST
+                // such frame, which is precisely what the retired
+                // `frames[..<depth].lastIndex(where:)` computed.
+                let target = unexhausted.last
+                // I5, CHECKED: every index in `unexhausted` is strictly
+                // below the frame being popped. Unreachable — `frames[depth]`
+                // is exhausted by the branch condition, so it is not in the
+                // list, and nothing above it exists — but an incremental
+                // structure that has silently desynchronised would otherwise
+                // index a frame that is no longer there. Fail closed and say
+                // so, rather than trust it or trap: an INCOMPLETE verdict is
+                // never a deletion.
+                if let target, target >= depth {
+                    obstructions.insert(.transientFailure)
+                    break walk
+                }
+                if let target, frames[target].dir == nil {
+                    guard let deepest = frames[depth].dir else {
+                        obstructions.insert(.transientFailure)
+                        break walk
+                    }
+                    // A failed climb ENDS the walk: we can never get back
+                    // above that level, and continuing would be a silent
+                    // truncation. Fail closed.
+                    guard climb(to: target, from: deepest, at: depth) else {
+                        break walk
+                    }
+                }
+                if frames[depth].dir != nil {
+                    forgetLive(depth)
+                }
+                if let emit = onEvent {
+                    emit(.frameBookkeeping(
+                        stateReads: stateReads.count - readsAtPassStart,
+                        depth: depth, pass: .pop
+                    ))
+                }
+                frames.removeLast()   // `deinit` closes the descriptor
+                if !pathComponents.isEmpty { pathComponents.removeLast() }
+                continue
+            }
+
+            let name = frames[depth].pending[frames[depth].cursor].name
+            frames[depth].cursor += 1
+            // One of the two instants a frame's "still has work" answer can
+            // change, and it is recorded HERE rather than recomputed at the
+            // pop — including on every `continue` below, which leaves the
+            // cursor advanced.
+            noteWorkChanged(at: depth)
+
+            // NO BUDGET GATE HERE, AND THAT IS THE NARROWING (PR #458 review
+            // r9, thread `PRRT_kwDORmg6_86ZlKD0`).
+            //
+            // This gate refused to open a child once `visited == entryLimit`,
+            // on the rule that "a directory the budget cannot afford must not
+            // be touched at all". THE PREMISE IS FALSE FOR THIS DIRECTORY:
+            // it was ALREADY PAID FOR — one entry was spent on it when its
+            // parent's read discovered it — and what is unaffordable is its
+            // CHILDREN, of which the descent below now admits exactly zero
+            // (`enumerate` reads at `remaining == 0`). So the gate bought no
+            // budget; it only threw away the one fact still missing, namely
+            // whether any child exists at all. When none does, the tree fits
+            // and the walk is complete; the gate called that `.budgetExhausted`
+            // — the single IRREDUCIBLE class — and so excluded an unchanged,
+            // budget-sized tree from automatic cleaning permanently, on
+            // nothing but the KIND of its last budgeted entry.
+            //
+            // WHAT THE GATE ACTUALLY PROTECTED IS UNCHANGED: no name is
+            // admitted past a spent budget (the read's own capacity check
+            // yields none at `limit: 0`, pinned by
+            // `testAZeroCapacityReadStillTellsEOFFromAnOverBudgetEntry`, and
+            // the per-name guard is the second layer behind it), and nothing
+            // is attributed to a directory that was never read — an open
+            // that FAILS at zero budget records ITS OWN errno now, which is
+            // the honest cause and a better remedy than a budget claim the
+            // walk never proved.
+            //
+            // TERMINATION IS UNAFFECTED. Every pending entry was counted when
+            // it was discovered, so at most `entryLimit` zero-capacity
+            // descents can follow, each costing a constant number of
+            // syscalls and producing no new pending work (a zero-capacity
+            // read returns no names).
+            guard frames[depth].dir != nil else {
+                obstructions.insert(.transientFailure)
+                break walk
+            }
+            if let emit = onEvent {
+                emit(.willDescend(name: name, from: logicalURL(atDepth: depth)))
+            }
+
+            // NO COMPONENT CHECK HERE, and that is the fix rather than an
+            // omission: `pending` holds `SafeComponent`s, so this name has
+            // already been through the one validation point there is. The
+            // second call that used to sit here was invisible to any test
+            // that deleted it — the first one caught every name first.
+
+            // THE PARENT REFERENCE IS SCOPED ON PURPOSE. A `let parent =
+            // frames[depth].dir` held across the rest of this iteration
+            // outlives `makeRoom`'s release of that very frame and keeps its
+            // descriptor OPEN — so the process held one more anchor than the
+            // window accounted for, for the whole tail of every iteration
+            // (measured against `fcntl`: census W, kernel W + 1). Inside the
+            // documented `+2`, but unaccounted, and an unaccounted
+            // descriptor is how a window stops being a bound.
+            let opened: FileSystemIdentityProvider.DescriptorOpen
+            do {
+                guard let parent = frames[depth].dir else {
+                    obstructions.insert(.transientFailure)
+                    break walk
+                }
+                opened = provider.openChildDirectoryCarryingErrno(
+                    inDirectory: parent.fd, named: name,
+                    // A vetted directory: `isDirectory: true` states what
+                    // the discovery `fstatat` already proved.
+                    logical: logicalURL(atDepth: depth)
+                        .appendingPathComponent(name, isDirectory: true)
+                )
+            }
+            let childDescriptor: Int32
+            switch opened {
+            case .opened(let fd):
+                childDescriptor = fd
+            case .failed(let code):
+                // EVERY failure here is recorded, ENOENT INCLUDED.
+                //
+                // This site is NOT the discovery race, and treating it like
+                // one was a fail-open regression (measured with a real
+                // `rename(2)` fired at this exact instant: `matches=[]
+                // obstructions=[] complete=true` while the subtree was still
+                // on disk under its new name). The difference is what has
+                // already been PROVEN: this name reached `pending` only
+                // because an `fstatat` against THIS held parent said
+                // `directory`, so a subtree is known to exist. "It vanished,
+                // so it holds nothing deletable any more" is simply FALSE
+                // for a rename — the bytes are still there, under a name
+                // this walk's bounded, byte-ascending read has already gone
+                // past, and `openat` cannot tell a rename from an unlink.
+                //
+                // Uninspected is not clean. `complete` feeds
+                // `automaticCleanEligible`, which deletes a known-leak entry
+                // whole with no per-item confirmation, so the only sound
+                // classification is the one that makes the verdict
+                // INCOMPLETE. `.transientFailure` is both honest and
+                // CLEARABLE: a re-scan finds the subtree under its new name
+                // (or genuinely absent) and completes.
+                obstructions.insert(obstruction(forErrno: code))
+                continue
+            }
+            guard let child = SecureDirectory(
+                fd: childDescriptor, provider: provider
+            ) else {
+                obstructions.insert(.transientFailure)
+                continue
+            }
+            // THE DESCENT'S PEAK: the whole stack is still held and the
+            // child is open but not yet framed, so `makeRoom` has not run.
+            // Every refusal below this line — identity mismatch, mount
+            // boundary — is sampled here too.
+            onEvent?(.descriptorCensus(
+                live: liveCount(), transient: 1, depth: depth + 1
+            ))
+            // The corroborator, now SOUND: the vetted value came from an
+            // `fstatat` on THIS same held parent, so it cannot already
+            // belong to a foreign object the way a path `lstat`'s could.
+            // Containment is the guarantee; this is the cheap check beside
+            // it that still catches a leaf re-bound to another directory.
+            guard child.identity == frames[depth].vetted[name] else {
+                obstructions.insert(.transientFailure)
+                continue
+            }
+            guard !crossesMountBoundary(child, root: root) else {
+                // We did not look past it: unproven, exactly like an
+                // unreadable branch.
+                obstructions.insert(.mountBoundary)
+                continue
+            }
+
+            makeRoom(after: depth)   // never a refusal, never a budget spend
+            // The two stacks move together: one basename pushed per frame,
+            // popped with it. (`pathComponents.count == frames.count - 1`.)
+            frames.append(Frame(
+                dir: child, identity: child.identity, reads: stateReads
+            ))
+            liveBelowRoot.append(frames.count - 1)
+            pathComponents.append(name)
+            onEvent?(.descriptorCensus(
+                live: liveCount(), transient: 0, depth: frames.count - 1
+            ))
+            guard enumerate(frames.count - 1) else { break walk }
+            // The other instant: `pending` has just been set for the first
+            // time. The new index is greater than every index already in
+            // `unexhausted`, so this is a push.
+            noteWorkChanged(at: frames.count - 1)
+        }
+
+        // THE HELD ROOT, REVALIDATED AGAINST THE NAME (PR #458 review r7 —
+        // the DUAL of the ancestor swap).
+        //
+        // Holding a descriptor is what stops this walk FOLLOWING a swap; it
+        // is also what PINS it to the old inode when one happens. If the
+        // target is renamed away mid-walk and a replacement directory is
+        // created at the same name, every descriptor-relative step below
+        // stays perfectly correct — about the RELOCATED tree — and the walk
+        // would otherwise report `complete` for a path that now names
+        // something nobody has looked at. `automaticCleanEligible` reads
+        // exactly that verdict, and the deletion takes a PATH.
+        //
+        // One `lstat` of the walk root — the same single path-based access
+        // the root open already is, and the last honest place to ask. A
+        // rename is retryable, so it is `.transientFailure`: a re-scan finds
+        // whatever is really there now and completes. The comparison runs
+        // unconditionally so there is still exactly ONE exit.
+        //
+        // AND IT KEEPS ITS ERRNO (PR #458 review r9, thread
+        // `PRRT_kwDORmg6_86ZlKDx`). `identity(of:)` collapses EVERY failure
+        // onto `nil` — that is precisely the flattening `obstruction(forErrno:)`
+        // exists to retire, and the first version of this check walked
+        // straight past the classifier and called all of them
+        // `.transientFailure`. An ancestor that has become unsearchable
+        // (`EACCES`/`EPERM`) or been replaced by a symlink CYCLE (`ELOOP`)
+        // both fail this `lstat`, and neither is cleared by the "re-scan and
+        // try again" that class prescribes: one needs a GRANT, the other a
+        // restructured path. Measured on this platform with a real
+        // `chmod(2)`/`symlink(2)` fired inside the walk: errno 13 and errno
+        // 62 respectively, both previously reported as merely transient.
+        //
+        // THE SECOND CALL IS ON THE FAILURE PATH ONLY, and its window costs
+        // nothing. `probeKind` is asked only once `identity(of:)` has
+        // already failed, so the common path is still exactly one `lstat`;
+        // and every arm below inserts SOME obstruction, so the verdict is
+        // INCOMPLETE however the second look answers. A second resolution
+        // can therefore refine the REMEDY and can never widen admission —
+        // the reason this is acceptable here and is not below the root,
+        // where a two-`lstat` kind+identity pair really could admit a
+        // swapped object (`probeChild` exists for exactly that).
+        // ═════════════════════════════════════════════════════════════════
+        // ACCEPTED RESIDUAL — THE INSERTION RACE (PR #458 review, thread
+        // `PRRT_kwDORmg6_86ZoCCT`). Accepted by the maintainer as a known
+        // residual and recorded here rather than fixed. It is NOT closed by
+        // anything below, and every identity binding in this file passes
+        // CORRECTLY while it is happening — which is the reason it needs
+        // writing down.
+        //
+        // WHAT IT IS. An INSERTION, not a swap. An app creates user-data-
+        // shaped content — say a `Documents` directory — in a directory that
+        // this walk has ALREADY enumerated. The walk root is never renamed,
+        // never replaced; the directory keeps the same inode. So the check
+        // immediately below compares the root's identity with itself, finds
+        // it unchanged, inserts no obstruction, and the probe returns with no
+        // match and no incompleteness. That verdict is what
+        // `automaticCleanEligible` reads, and the item can then be moved to
+        // the Trash or permanently deleted although the probe never looked at
+        // the new content.
+        //
+        // WHY NO CHECK HERE CATCHES IT, stated precisely so nobody reaches for
+        // a stronger identity proof as the fix: IDENTITY ANSWERS "WHICH
+        // OBJECT", NOT "WHAT IS INSIDE IT". The `fstat`/`lstat` pair below,
+        // the held parent descriptors, the `..` re-anchors and the child
+        // `fstatat`s all bind objects, and every one of them is telling the
+        // truth here — the object IS the one that was inspected. Contents
+        // changed underneath a correct answer to a different question.
+        // (Cf. the `WHAT THIS DOES NOT CLOSE` list, items 3 and 7.)
+        //
+        // RETIRING THE DEPTH CAP WIDENED IT, and that is this branch's own
+        // doing rather than an inherited condition. A tree past the old
+        // depth-3 cap used to yield an INCOMPLETE verdict, and an incomplete
+        // verdict is unauthorizable: no automatic clean, no token, refused at
+        // delete time. Those trees now yield CLEAN verdicts — which is the
+        // point of the retirement, and it is also what newly exposes them to
+        // this race. On the field machine that was ~20% of cache directories.
+        //
+        // PRECONDITIONS, all of which must hold together: a writer into
+        // `~/Library/Caches` (or into the entry being cleaned); its write
+        // landing inside the window between the delete-time probe reading the
+        // directory it writes into and the disposal; and an item the
+        // classifier already made `automaticCleanEligible`. An entry the user
+        // must select by hand narrows the last one but does not remove it.
+        //
+        // THE WINDOW, MEASURED rather than called narrow — through the
+        // production runtime and the production cleaner (`ProbeClock` harness
+        // over `probeChild`, timestamped against the disposal seam; the
+        // fixture is a `~/Library/Caches` entry of uniform breadth and depth):
+        //
+        //     entries read   last read → disposal      first read → disposal
+        //     84             502–588 µs (5 runs)       2.46–3.68 ms
+        //     840            523–588 µs (3 runs)       19.7–20.1 ms
+        //
+        // Two facts fall out. The TAIL — probe exit to destructive call — is
+        // ~0.5 ms and does not grow with the tree. The window for the
+        // directory read FIRST grows linearly with the entry count, at
+        // ~23 µs per entry, because it includes the rest of the walk; a
+        // 20,000-entry cache entry projects to ~0.46 s of exposure for its
+        // earliest-read directory. So this is not a syscall-width race.
+        //
+        // WHAT MITIGATES IT TODAY: the GUI's default disposal is Move to
+        // Trash (`CacheoutViewModel.moveToTrash = true`), which destroys
+        // nothing — wrongly-swept content is recoverable in one drag. The
+        // permanent arm has no such consolation, and the CLI's `--confirm`
+        // runs choose it explicitly.
+        //
+        // WHAT WOULD ACTUALLY CLOSE IT, so the next reader does not spend the
+        // effort on a stronger identity: BIND THE CONTENT CHECK TO THE
+        // DISPOSAL, not the identity. The deletion already holds the tree by
+        // descriptor (`DepthSafeRemoval`), and it is that traversal — the one
+        // that is about to unlink each directory — that is in a position to
+        // refuse when it meets a user-data shape. Re-probing a second time
+        // before the disposal only moves the window; checking during the
+        // removal removes it. That is a follow-up, not a rider on this PR.
+        // ═════════════════════════════════════════════════════════════════
+        if let current = provider.identity(of: entryURL) {
+            if current != root.identity { obstructions.insert(.transientFailure) }
+        } else {
+            switch provider.probeKind(of: entryURL) {
+            case .failed(let code):
+                obstructions.insert(obstruction(forErrno: code))
+            case .absent:
+                // Renamed or unlinked away: retryable, exactly as before.
+                obstructions.insert(.transientFailure)
+            case .kind:
+                // Unreadable a moment ago and readable now: the name changed
+                // under the walk, which is the retryable class by definition.
+                obstructions.insert(.transientFailure)
+            }
+        }
+
+        // Teardown: dropping `frames` releases every descriptor on EVERY
+        // exit path, including this one.
+        return finishedWalk(
+            matched: matched, obstructions: obstructions,
+            inspected: .directory(root.identity)
+        )
+    }
+
+    /// Table order, deduplicated — deterministic output for fn-3.2, and
+    /// obstructions in declaration order for a deterministic message.
+    private static func finishedWalk(
+        matched: Set<String>, obstructions: Set<UserDataProbeObstruction>,
+        inspected: UserDataProbeResult.InspectedRoot
+    ) -> UserDataProbeResult {
+        UserDataProbeResult(
+            matches: userDataShapePatterns.map(\.name).filter(matched.contains),
+            obstructions: obstructions.sorted(),
+            inspected: inspected
+        )
+    }
+
+    /// Does descending into an OPEN child cross a mount boundary?
+    ///
+    /// Both arms, read from DESCRIPTORS rather than paths: `f_fsid` (the
+    /// discriminator that actually works — every path on this machine
+    /// shares one `st_dev`, including `/` and `/System/Volumes/Data`, so
+    /// the device arm is blind to the APFS firmlink split it was partly
+    /// meant to catch) and `st_dev` (which still catches ordinary external
+    /// volumes, and is the arm hermetic tests inject).
+    ///
+    /// This DELETES `canonicalize` + `isMountPoint` from the walk, and with
+    /// them the failure mode their doc apologised for at length: an aliased
+    /// spelling never equalled `f_mntonname`, so arm (b) silently answered
+    /// `false` for a real mount, and on a firmlink-shaped mount both arms
+    /// went silent together. A descriptor has no spelling, so that class of
+    /// false negative cannot exist here.
+    ///
+    /// TWO DECLARED SHIFTS. (1) The path form asked "is the child a mount
+    /// ROOT"; the fsid form asks "is the child on a different MOUNT than the
+    /// walk root". For this walk they coincide, and the fsid form fails
+    /// safe where they diverge. (2) The check now happens AFTER the child is
+    /// opened, so under truncation a mount below the cut is no longer in the
+    /// obstruction set — truncation membership is already documented as
+    /// unspecified, and `.budgetExhausted` makes the verdict incomplete
+    /// regardless.
+    private static func crossesMountBoundary(
+        _ child: SecureDirectory, root: SecureDirectory
+    ) -> Bool {
+        child.mount != root.mount
+    }
+
+    private enum RootMountCheck {
+        case inside
+        case mountRoot
+        case unprovable(UserDataProbeObstruction)
+    }
+
+    /// Is the walk root itself the root of a mounted filesystem?
+    ///
+    /// Asked of the descriptor we already hold: open `..` and compare. `/`'s
+    /// own `..` is itself, which no fsid comparison could report, so the
+    /// identity equality is checked first.
+    private static func rootMountCheck(
+        _ root: SecureDirectory, provider: FileSystemIdentityProvider
+    ) -> RootMountCheck {
+        let up = openat(root.fd, "..", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+        guard up >= 0 else { return .unprovable(obstruction(forErrno: errno)) }
+        guard let parent = SecureDirectory(fd: up, provider: provider) else {
+            return .unprovable(.transientFailure)
+        }
+        if parent.identity == root.identity { return .mountRoot }
+        return parent.mount == root.mount ? .inside : .mountRoot
+    }
+
+    /// The outcome of ONE bounded directory read.
+    enum BoundedDirectoryRead: Equatable {
+        /// The basenames read — at most `limit` of them — and EVERY reason
+        /// the rest of the directory is unproven, deduplicated and in
+        /// declaration order. Empty iff the directory was PROVEN exhausted.
+        ///
+        /// A list rather than one slot (PR #458 review r3): a single read
+        /// can establish more than one cause at once — the sentinel entry
+        /// that proves the directory is over budget can ALSO be the one
+        /// whose name will not decode — and a single slot silently kept
+        /// whichever the control flow reached first.
+        case read([String], truncatedBy: [UserDataProbeObstruction])
+        /// The directory could not be opened at all.
+        case unreadable(UserDataProbeObstruction)
+    }
+
+    /// BOUNDED directory read: at most `limit` basenames, plus whether the
+    /// enumeration was PROVEN exhausted.
+    ///
+    /// `opendir`/`readdir` rather than `FileManager` on purpose — both
+    /// `contentsOfDirectory` overloads materialize the WHOLE directory
+    /// before any cap can apply, which is exactly the unbounded read this
+    /// probe's contract forbids (PR #458 review): a cache directory with
+    /// millions of entries would spike memory and stall the scan inside a
+    /// walk that only ever inspects `entryLimit` of them. Reading BASENAMES
+    /// also keeps the walk's own spelling: the caller appends them to ITS
+    /// OWN directory URL, so a no-follow `lstat` lands on the path the
+    /// deletion would remove rather than a resolved one. `.` and `..` are
+    /// skipped; hidden entries are INCLUDED (user data in a dot-directory is
+    /// still user data), matching the enumeration's `options: []` stance.
+    ///
+    /// Internal for the bound test — nothing outside this file calls it.
+    ///
+    /// UNDECODABLE NAMES FAIL CLOSED: `String(validatingCString:)`, never
+    /// `String(cString:)`. A repairing decode substitutes U+FFFD, and the
+    /// URL rebuilt from that lie names a DIFFERENT path — `probeKind` would
+    /// report it absent and the probe could return "complete, nothing found"
+    /// while the real entry (a `Photos Library.photoslibrary`, say) was
+    /// never inspected. APFS and HFS+ reject non-UTF-8 basenames outright
+    /// (EILSEQ), but a mounted exFAT/SMB/FUSE volume can deliver them. The
+    /// read STOPS at the first undecodable entry: the directory is already
+    /// unproven, and continuing would let a directory full of such names
+    /// spend the budget for nothing.
+    ///
+    /// THE READ IS DESCRIPTOR-RELATIVE (PR #458 review, ancestor swap).
+    /// The caller hands over a parent descriptor it already holds and has
+    /// already vetted; NO PATH IS RESOLVED HERE AT ALL, so there is no
+    /// window between vetting and reading for anything to be swapped into.
+    ///
+    /// `whileReading` is called ONCE, with the enumeration handle open, so a
+    /// descriptor census can be taken at the instant this read is holding
+    /// its extra descriptor rather than after it has given it back.
+    ///
+    /// `limit: 0` IS A SUPPORTED CAPACITY and carries the walk's
+    /// exact-budget proof (PR #458 review r9): no name is admitted, and the
+    /// two outcomes are still distinguished — an empty directory reaches EOF
+    /// and reports NOTHING truncated, while the first real entry reports
+    /// `.budgetExhausted`. That is the whole difference between "this tree
+    /// fits" and "this tree is bigger than we can afford".
+    static func boundedChildNames(
+        inDirectory parentDescriptor: Int32,
+        limit: Int,
+        whileReading: (() -> Void)? = nil,
+        decode: (UnsafePointer<CChar>) -> String? = decodedBasename(fromCString:)
+    ) -> BoundedDirectoryRead {
+        // A FRESH DESCRIPTION of the SAME directory, for `fdopendir` to
+        // consume. Measured, and neither alternative is correct:
+        //   - `dup(fd)` SHARES the file offset, so a second enumeration
+        //     returns 0 entries, and it CLEARS `FD_CLOEXEC`, leaking a
+        //     directory descriptor into every `posix_spawn` (this process
+        //     spawns `CacheoutHelper`).
+        //   - `fcntl(F_DUPFD_CLOEXEC)` fixes the leak but still shares the
+        //     offset.
+        //   - `openat(fd, ".", O_CLOEXEC)` gives a fresh description at
+        //     offset 0 AND honours close-on-exec.
+        // `closedir` then closes only this handle; the caller's anchor
+        // descriptor survives untouched, which is what lets the walk keep
+        // holding it.
+        let enumerationDescriptor = openat(
+            parentDescriptor, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC
+        )
+        guard enumerationDescriptor >= 0 else {
+            return .unreadable(obstruction(forErrno: errno))
+        }
+        guard let handle = fdopendir(enumerationDescriptor) else {
+            let code = errno
+            close(enumerationDescriptor)
+            return .unreadable(obstruction(forErrno: code))
+        }
+        // `closedir` closes the descriptor `fdopendir` took ownership of.
+        defer { closedir(handle) }
+        whileReading?()
+        var names: [String] = []
+        var truncated: Set<UserDataProbeObstruction> = []
+
+        read: while true {
+            // `readdir` returns nil for BOTH end-of-stream and error; errno
+            // is the only discriminator, so it is cleared before each call.
+            errno = 0
+            guard let entry = readdir(handle) else {
+                if errno != 0 {
+                    // A failed read mid-directory: the rest is unproven, and
+                    // an I/O error is honestly retryable. Deliberately NOT
+                    // also budget exhaustion, even at a full `names` — the
+                    // read FAILED, so no further entry was ever proven to
+                    // exist. Only claim what was actually established.
+                    truncated.insert(obstruction(forErrno: errno))
+                }
+                break read
+            }
+            let decoded = withUnsafeBytes(of: entry.pointee.d_name) {
+                raw -> String? in
+                guard let base = raw.bindMemory(to: CChar.self).baseAddress
+                else { return nil }
+                return decode(base)
+            }
+            guard let name = decoded, !name.isEmpty else {
+                truncated.insert(.undecodableName)
+                // AND the budget, when this entry is the SENTINEL (PR #458
+                // review r3). `.` and `..` both decode, so an undecodable
+                // entry is always a REAL one: meeting it on a full `names`
+                // proves the directory holds more than the budget allows,
+                // exactly as a decodable entry there would. Losing that
+                // proof to the decode guard left the walk reporting only
+                // "rename it and re-inspect" — while the unchanged entry
+                // count still exceeds the budget, so the next scan refuses
+                // again and the irreducible remedy is never offered. The
+                // causes are CONJUNCTIVE and both survive clearing the
+                // other (raise the budget and this name still stops the
+                // walk; rename it and the count still does), so both are
+                // recorded and the remedy ordering picks the closing.
+                if names.count >= limit { truncated.insert(.budgetExhausted) }
+                break read
+            }
+            if name == "." || name == ".." { continue }
+            guard names.count < limit else {
+                // A real entry existed beyond the budget — the ONLY way this
+                // read reports budget exhaustion, and it costs one `readdir`
+                // rather than the whole directory.
+                truncated.insert(.budgetExhausted)
+                break read
+            }
+            names.append(name)
+        }
+        // ONE exit, carrying everything proven — no guard can preempt the
+        // bookkeeping by returning ahead of it.
+        return .read(names, truncatedBy: truncated.sorted())
+    }
+
+    /// The VALIDATING basename decode, factored out so the fail-closed
+    /// policy is testable without a non-UTF-8-capable volume (APFS/HFS+
+    /// refuse to create such names at all). `nil` for ANY byte sequence that
+    /// is not valid UTF-8 — never a U+FFFD-repaired string, which would name
+    /// a different path than the entry it came from.
+    static func decodedBasename(
+        fromCString pointer: UnsafePointer<CChar>
+    ) -> String? {
+        String(validatingCString: pointer)
+    }
+
+    // MARK: - Remediation guidance (PR #458 review)
+
+    /// The delete-time remediation guidance for an incomplete probe:
+    /// what actually obstructed it, and what — honestly — would clear it.
+    ///
+    /// The rule is one sentence long: NEVER claim a verdict is permanent
+    /// unless every cause behind it really is. A mid-walk race and a
+    /// transient I/O or permission error clear on retry; a mount boundary
+    /// clears on unmount; an exhausted budget on a static tree clears on
+    /// neither, and only THAT case may steer a user toward the riskier
+    /// explicit-confirmation path. The previous message asserted permanence
+    /// for the whole set, which is how a disk hiccup came to read as "this
+    /// will never work, confirm it manually".
+    static func remediationGuidance(
+        for obstructions: [UserDataProbeObstruction]
+    ) -> String {
+        // Deduplicated and ordered, so a caller that hands over a repeated
+        // cause still gets each one stated once, in declaration order.
+        let causes = Set(obstructions).sorted()
+        // CONJUNCTIVE, not best-of: the user has to clear EVERY cause, so
+        // the closing advice is the MOST DEMANDING remedy present, never
+        // the easiest. Best-of closed a budget-plus-transient set with
+        // "re-scan and try again" — the transient clears, the over-budget
+        // folder does not, the probe refuses again, and no remedy is ever
+        // offered: the exact stranding loop this work exists to remove.
+        // Every cause is still described above the closing, so the easier
+        // remedies are not lost — only the promise that they suffice.
+        guard let binding = causes.map(\.remedy).max() else { return "" }
+        var sentences = causes.map(\.guidance)
+
+        switch binding {
+        case .retryAlone:
+            sentences.append("Re-scan and try again.")
+        case .userActionThenRetry:
+            sentences.append(causes.count == 1
+                ? "Clear that, then re-scan."
+                : "Clear all of the above, then re-scan.")
+        case .unknown:
+            sentences.append(
+                "Re-scanning may or may not clear this; if it repeats, "
+                + "remove this item by explicit per-item confirmation once a "
+                + "re-scan lists it at review risk."
+            )
+        case .irreducible:
+            sentences.append(
+                "Re-scanning will not clear this — an unchanged folder is "
+                + "inspected the same way and reports the same thing every "
+                + "time, whatever else is fixed first; remove this item by "
+                + "explicit per-item confirmation once a re-scan lists it at "
+                + "review risk."
+            )
+        }
+        return sentences.joined(separator: " ")
     }
 }
 
@@ -852,15 +2681,38 @@ extension OrphanedCachesScanner: SpaceScanner {
                     )
                 }
                 if !probe.complete {
+                    // GUIDANCE KEYED TO THE ACTUAL CAUSE (PR #458 review) —
+                    // restored here through #457's generalized seam, which
+                    // was written against the flat sentence this replaced.
+                    //
+                    // That sentence has now been wrong in both directions: it
+                    // first prescribed "re-scan required" for causes a re-scan
+                    // reproduces exactly, then — over-correcting — asserted
+                    // the opposite for a set that includes a mid-walk race and
+                    // transient I/O, which a re-scan clears routinely. Both
+                    // FLATTENED causes that genuinely differ, and the second
+                    // is the more dangerous: it steers a user toward the
+                    // riskier explicit-confirmation path over a disk hiccup.
+                    // The walk distinguishes its causes
+                    // (`UserDataProbeObstruction`), so the message says which
+                    // one happened and what actually clears it.
                     return .refuse(
-                        reason: "\(target.path): couldn't fully re-inspect "
+                        reason: "\(target.path): couldn't fully inspect "
                             + "contents at delete time — refused (an "
                             + "inspection that could not finish is treated "
-                            + "like a change since scan); re-scan required",
+                            + "like a change since scan). "
+                            + remediationGuidance(for: probe.obstructions),
                         valuables: [], acknowledgementToken: nil
                     )
                 }
-                return .allow
+                // THE BINDING TRAVELS WITH THE ALLOW (PR #458 review r7).
+                // The probe held a DESCRIPTOR, so its verdict is a fact about
+                // an OBJECT; every gate the cleaner has run so far — container
+                // admission, containment, deny list, mount — is a fact about a
+                // PATH, which a replacement directory at the same name
+                // satisfies. `probe.inspected` is what the deletion proves the
+                // path still names, on BOTH the permanent and the Trash arm.
+                return .allow(inspected: probe.inspected)
             }
         )
     }
@@ -908,10 +2760,12 @@ extension OrphanedCachesScanner: SpaceScanner {
 
     /// One sweep entry's classification → one `ReclaimableItem`.
     ///
-    /// State mapping (mount-boundary doctrine per the as-merged
-    /// `NodeModulesScanner.reclaimableItem` — delete refuses a
+    /// State mapping (mount-boundary doctrine per
+    /// `BuildArtifactsScanner.reclaimableItem` — delete refuses a
     /// boundary-bearing target ENTIRELY, so `.partiallyDenied` is reserved
-    /// for walk-denial impediments, where deletion partially succeeds):
+    /// for walk-denial impediments, where deletion partially succeeds).
+    /// The rule was written for `NodeModulesScanner`, which PR #457
+    /// replaced; only its home moved, not the rule:
     ///
     /// - ANY mount boundary (root or nested, measured content or not) →
     ///   `.denied`, ZERO components (components mean "deletion frees
@@ -1055,8 +2909,9 @@ extension OrphanedCachesScanner: SpaceScanner {
         return mountBoundaryScanError(for: entry)
     }
 
-    /// The boundary-naming error, mirroring the as-merged
-    /// `NodeModulesScanner` doctrine: `.other` (a boundary is neither TCC
+    /// The boundary-naming error, mirroring the `BuildArtifactsScanner`
+    /// doctrine (written for `NodeModulesScanner`, which PR #457 replaced —
+    /// the rule is unchanged): `.other` (a boundary is neither TCC
     /// nor BSD permissions, and no grant would lift it), the message naming
     /// the boundary — and carrying the measured floor when the walk
     /// measured readable content beside it, because the item's byte
@@ -1090,7 +2945,7 @@ extension OrphanedCachesScanner: SpaceScanner {
         switch kind {
         case .tcc: return .tccDenied
         case .permission: return .permissionDenied
-        case .metadata, .other: return .unreadable
+        case .metadata, .other, .unaddressablePath: return .unreadable
         }
     }
 

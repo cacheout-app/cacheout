@@ -660,6 +660,21 @@ class CacheoutViewModel: ObservableObject {
         + ".pkg, .app, …), so it can't be cleaned yet — scan again and "
         + "retry. It will be SKIPPED by this cleanup."
 
+    /// The same row, blocked because the inspection ran out of its ENTRY
+    /// BUDGET rather than because something obstructed it. The budget starts
+    /// at the folder's own count and DOUBLES until the inspection finishes
+    /// (`ValuablesProbeBudget`), so surviving all of it means the folder is
+    /// CHANGING while it is read — which a retry genuinely can clear, and a
+    /// permissions fix cannot. Two causes, two remedies: telling a user to
+    /// "scan again" for an impediment no scan can move is what the retired
+    /// fixed budget did, and telling one to wait for a build that is not
+    /// running is what a bound derived from a truncated count did (review r8).
+    nonisolated static let growingFolderSheetGuidance =
+        "This folder is changing faster than it can be inspected for release "
+        + "artifacts (.dmg, .pkg, .app, …), so it can't be cleaned yet — let "
+        + "the build finish, then scan again. It will be SKIPPED by this "
+        + "cleanup."
+
     /// The item's DISCLOSED valuables as sheet rows — read DIRECTLY off
     /// fn-4.4's structured field in its STORED canonical order (R3): no
     /// re-probe, no filesystem read, no evidence-string parsing, no re-sort.
@@ -711,7 +726,9 @@ class CacheoutViewModel: ObservableObject {
     ) -> String? {
         guard let disclosure = item.valuablesDisclosure,
               !disclosure.probeComplete else { return nil }
-        return incompleteProbeSheetGuidance
+        return disclosure.incompleteness == .entryBudget
+            ? growingFolderSheetGuidance
+            : incompleteProbeSheetGuidance
     }
 
     /// The keys the confirm action must filter out of BOTH the authorization

@@ -69,7 +69,7 @@
 ///   invocation shape is already targets-first)
 /// - Clean targets are positional arguments after the command. A target is
 ///   one of `<category-slug>` (a category aggregate), `<scanner-slug>` (ALL
-///   items of a per-item scanner, e.g. `node_modules`), or
+///   items of a per-item scanner, e.g. `build_artifacts`), or
 ///   `<scanner-slug>:<item-id>` (one item — the opaque id echoed from
 ///   `scan`'s `scanner_items`). The frozen aggregate scanner id
 ///   `categories` is NOT a valid target; address aggregates by their
@@ -95,8 +95,8 @@
 /// ```bash
 /// Cacheout --cli scan
 /// Cacheout --cli clean xcode_derived_data npm_cache --confirm
-/// Cacheout --cli clean node_modules --confirm
-/// Cacheout --cli clean node_modules:3f0c…e1 --confirm
+/// Cacheout --cli clean build_artifacts --confirm
+/// Cacheout --cli clean build_artifacts:3f0c…e1 --confirm
 /// Cacheout --cli clean xcode_derived_data --dry-run
 /// Cacheout --cli smart-clean 10.0 --confirm
 /// Cacheout --cli smart-clean 10.0 --dry-run
@@ -1644,7 +1644,7 @@ struct CLIHandler {
     /// construction — any target referencing one fails with the same
     /// unknown/invalid-target message, and nothing is selected, addressed,
     /// or deleted. Items dedupe by `ItemKey` in first-appearance order
-    /// (`clean node_modules node_modules:<id>` names the item once).
+    /// (`clean build_artifacts build_artifacts:<id>` names the item once).
     static func resolveCleanTargets(
         _ targets: [CleanTarget],
         outcomes: [String: ScanOutcome],
@@ -1825,11 +1825,33 @@ struct CLIHandler {
                     row["acknowledgement_token"] = token
                 }
             } else {
-                row["acknowledgement_note"] = incompleteProbePlanNote
+                row["acknowledgement_note"] = incompleteProbeNote(
+                    for: disclosure.incompleteness
+                )
             }
         }
         return row
     }
+
+    /// The plan/dry-run note for THIS item's incompleteness CAUSE. The two
+    /// causes end differently, so they may not print one remedy: an
+    /// obstruction is cleared by fixing it and re-scanning, while an entry
+    /// budget that starts at the tree's own census and DOUBLES until the
+    /// inspection finishes is only reached by a tree that is still changing —
+    /// and "re-scan" is the advice that cannot work for it.
+    static func incompleteProbeNote(
+        for cause: ValuablesDisclosure.ProbeIncompleteness?
+    ) -> String {
+        cause == .entryBudget ? growingTreePlanNote : incompleteProbePlanNote
+    }
+
+    /// The note for a tree that outgrew its own census mid-inspection.
+    static let growingTreePlanNote =
+        "the release-artifact inspection ran out of its entry budget at scan "
+        + "time — this directory is changing faster than it can be read — so "
+        + "no acknowledgement token exists for this item; a confirmed run "
+        + "re-inspects it immediately before deletion and refuses until an "
+        + "inspection completes; retry when it settles"
 
     /// The plan/dry-run note for an item whose scan-time valuables probe
     /// could not finish: no token exists for it on ANY surface, and a
@@ -2231,7 +2253,8 @@ struct CLIHandler {
     /// items are excluded entirely. Safe before review, larger first
     /// within a tier. Exactly ONE addition (epic contract):
     /// `automaticCleanEligible == false` items are excluded — in practice
-    /// only node_modules, which becoming CLI-visible must not silently
+    /// every per-item scanner row (no `build_artifacts` row is ever
+    /// auto-eligible), which becoming CLI-visible must not silently
     /// enroll in any automatic destructive path. (Vacuously true today:
     /// smart-clean scans the `categories` scanner only, whose aggregates
     /// are all eligible — the filter is the model-encoded guarantee, not a
@@ -2312,7 +2335,7 @@ struct CLIHandler {
     /// The whole `smart-clean` decision pipeline, injected and exit-free
     /// (test seam parity with `cleanCLIOutcome`). Scope is policy (c)'s:
     /// the aggregate `categories` scanner ONLY — no per-item scanner is
-    /// ever invoked (round 10), so node_modules can never enter the
+    /// ever invoked (round 10), so per-item scanners can never enter the
     /// automatic path. Decision logic byte-identical to schema 3; target
     /// math untouched.
     static func smartCleanCLIOutcome(

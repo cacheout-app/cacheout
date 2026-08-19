@@ -32,6 +32,20 @@
 ///   `.regularFile`) but its children are never visited.
 ///
 /// ## Safety (epic R11/R12)
+/// - **BELOW A ROOT, NOTHING TAKES A PATH (PR #457 review r5).** Each root is
+///   opened ONCE with `O_NOFOLLOW | O_DIRECTORY`; from there children are
+///   enumerated through the held descriptor (`openat(fd, ".")` + `fdopendir`),
+///   vetted with `fstatat`, and descended with `openat` by single-component
+///   basename. `FileManager.contentsOfDirectory` is gone: Foundation has NO
+///   no-follow option, and it returns fully RESOLVED child URLs which every
+///   downstream per-child check then re-resolved by path — so replacing a
+///   directory the walk had already passed through with a symlink redirected
+///   the walk, and neither `O_NOFOLLOW` (last component only) nor an inode
+///   re-proof (whose vetted value was itself read through the swapped
+///   ancestor) could see it. A held descriptor is inode-pinned and cannot be
+///   redirected. Live descriptors are exactly the current path's, so the
+///   depth budget bounds them at `maxDepth + 1` anchors plus two transients.
+///   RESIDUAL: the root open still resolves the root's own ancestors.
 /// - Per root, `PathGuard.admitSearchRoot` runs BEFORE any traversal
 ///   (scan-time, read-only, snapshot-free); refusal is a classified per-root
 ///   issue and the root is never walked.
@@ -113,7 +127,6 @@ struct ProjectTreeWalker {
     private let home: URL
     private let pathGuard: PathGuard
     private let provider: FileSystemIdentityProvider
-    private let fileManager: FileManager
 
     /// - Parameters:
     ///   - home: home the TCC-protected ancestors resolve against
@@ -122,18 +135,19 @@ struct ProjectTreeWalker {
     ///     `containerRoots` == its declared `trustedContainerRoots` (each
     ///     scanner constructs its own — epic D2).
     ///   - provider: identity provider shared with the guard and the sizer
-    ///     (tests subclass to inject devices/mount points/probe failures).
-    ///   - fileManager: directory enumeration source.
+    ///     (tests subclass to inject devices/mount points/probe failures) —
+    ///     and, since PR #457 review r5, the source of every descriptor-
+    ///     relative primitive this walk uses. There is no `FileManager`
+    ///     parameter any more: Foundation offers no no-follow directory read,
+    ///     so enumeration is `openat`/`fdopendir` through the provider.
     init(
         home: URL,
         pathGuard: PathGuard,
-        provider: FileSystemIdentityProvider = FileSystemIdentityProvider(),
-        fileManager: FileManager = .default
+        provider: FileSystemIdentityProvider = FileSystemIdentityProvider()
     ) {
         self.home = home
         self.pathGuard = pathGuard
         self.provider = provider
-        self.fileManager = fileManager
     }
 
     // MARK: - TCC-protected-root determination (R12)
@@ -181,11 +195,23 @@ struct ProjectTreeWalker {
     ///   - consumers: verdict-returning event receivers (see
     ///     `ProjectTreeConsumer`). All of them see every event of every
     ///     kept root — ONE walk, N consumers.
+    ///   - didAnchorRoot: handed the ADMITTED, VETTED, still-OPEN anchor of
+    ///     every root this walk actually traverses, at the instant it is
+    ///     opened. A caller that RETAINS the `SecureDirectory` keeps the walk
+    ///     root inode-pinned past the walk, which is the only way a POST-WALK
+    ///     pass can re-establish CONTAINMENT for something the walk found:
+    ///     re-opening the root by path afterwards would re-resolve the root's
+    ///     own name and could anchor a foreign directory (`BuildArtifactsScanner`
+    ///     phase 3 does exactly this re-descent). Default nil — nothing is
+    ///     retained, the anchor dies with its recursion, and the walk's
+    ///     descriptor profile is unchanged. RETENTION COST, on the caller:
+    ///     one descriptor per admitted root, live until the caller drops it.
     func walk(
         roots: [URL],
         maxDepth: Int = ProjectTreeWalker.defaultMaxDepth,
         includeProtectedRoots: Bool = true,
-        consumers: [ProjectTreeConsumer]
+        consumers: [ProjectTreeConsumer],
+        didAnchorRoot: ((URL, SecureDirectory) -> Void)? = nil
     ) -> [ScanIssue] {
         var issues: [ScanIssue] = []
 
@@ -237,15 +263,48 @@ struct ProjectTreeWalker {
                 continue
             }
 
+            // THE ROOT OPEN — the ONE path-based open of this walk, and the
+            // gate that ENFORCES the lstat decision above. The gate and the
+            // open are two separate resolutions of the same path, so a root
+            // swapped for a symlink between them passes the gate; only
+            // `O_NOFOLLOW | O_DIRECTORY` on the open refuses it.
+            //
+            // Below this point NOTHING is reached by path: children are
+            // enumerated through the held descriptor, probed with `fstatat`,
+            // and descended with `openat` by single-component basename. That
+            // is what closes the ancestor-swap race that
+            // `FileManager.contentsOfDirectory` could not — it has no
+            // no-follow option at all, and it hands back fully RESOLVED child
+            // URLs, so every subsequent per-child check re-resolved a path an
+            // attacker could have re-pointed in between.
+            let rootFD = provider.openDirectoryNoFollow(at: root)
+            guard rootFD >= 0 else {
+                // Captured BEFORE anything else can clobber `errno`.
+                issues.append(Self.issue(forFailedOpen: root, errno: errno))
+                continue
+            }
+            guard let anchor = SecureDirectory(fd: rootFD, provider: provider)
+            else {
+                issues.append(Self.issue(forFailedOpen: root, errno: EIO))
+                continue
+            }
+
+            // The vetted anchor, offered to the caller BEFORE the traversal
+            // that consumes it. A retaining caller now holds the same
+            // inode-pinned handle this walk descends from, so anything it
+            // discovers can be re-reached later by CONTAINMENT rather than by
+            // re-resolving a path an attacker may have re-pointed.
+            didAnchorRoot?(root, anchor)
+
             // Boundary reference: children on a DIFFERENT device than the
             // root never descend. The root itself may be a mount point
             // (external-volume dev roots are legal).
             let rootDevice = provider.deviceID(of: root)
 
             visit(
-                directory: root, depth: 0, originRoot: root,
-                rootDevice: rootDevice, maxDepth: maxDepth,
-                consumers: consumers, issues: &issues
+                anchor: anchor, directory: root, depth: 0, originRoot: root,
+                rootDevice: rootDevice, rootMount: anchor.mount,
+                maxDepth: maxDepth, consumers: consumers, issues: &issues
             )
         }
 
@@ -254,11 +313,29 @@ struct ProjectTreeWalker {
 
     // MARK: - Per-directory visit (DFS pre-order)
 
+    /// - Parameters:
+    ///   - anchor: the OPEN, vetted descriptor for `directory`. Every child is
+    ///     discovered and opened relative to it, by single-component basename
+    ///     — never by path.
+    ///   - directory: the UNRESOLVED spelling of the same directory. Display
+    ///     and provenance ONLY (it is what `originRoot`-derived event URLs and
+    ///     the deletion target are keyed on); it is never opened or resolved.
+    ///
+    /// DESCRIPTOR BOUND: this is a plain recursion, so the live descriptors
+    /// are exactly the CURRENT PATH's — never one per pending sibling. With
+    /// the per-root depth budget (`defaultMaxDepth` = 8) the chain is at most
+    /// `maxDepth + 1` anchors plus two transients (the enumeration handle,
+    /// and a child descriptor between its open and its recursion): 11 for the
+    /// default budget. The Swift call stack enforces the frame discipline for
+    /// free, which is why this walk needs no descriptor window and no `..`
+    /// re-anchoring.
     private func visit(
+        anchor: SecureDirectory,
         directory: URL,
         depth: Int,
         originRoot: URL,
         rootDevice: UInt64?,
+        rootMount: FileSystemIdentityProvider.MountIdentity,
         maxDepth: Int,
         consumers: [ProjectTreeConsumer],
         issues: inout [ScanIssue]
@@ -271,35 +348,33 @@ struct ProjectTreeWalker {
         // already appended — failure of the CURRENT enumerated directory is
         // never a silent skip, R12) or the walk was cancelled mid-probe
         // (prompt partial return; a half-built event is never emitted).
+        //
+        // `vetted` carries each listed child's `fstatat` identity forward to
+        // its descent, where the OPENED descriptor must reproduce it.
+        var vetted: [String: FileSystemIdentityProvider.Identity] = [:]
         let enumerated: [ProjectTreeEvent.Entry]? = autoreleasepool {
-            let children: [URL]
-            do {
-                children = try fileManager.contentsOfDirectory(
-                    at: directory,
-                    includingPropertiesForKeys: [],
-                    // Deliberately NOT .skipsHiddenFiles /
-                    // .skipsPackageDescendants (R2).
-                    options: []
-                )
-            } catch {
+            guard let names = Self.childNames(
+                inDirectory: anchor.fd, provider: provider
+            ) else {
                 issues.append(Self.issue(
-                    from: DirectorySizer.classifyDenial(error, at: directory)
+                    forFailedOpen: directory, errno: errno
                 ))
                 return nil
             }
 
             // Byte-wise name sort: deterministic entries and descent order,
             // never filesystem order.
-            let sorted = children.sorted {
-                $0.lastPathComponent.utf8
-                    .lexicographicallyPrecedes($1.lastPathComponent.utf8)
-            }
+            let sorted = names
+                .sorted { $0.utf8.lexicographicallyPrecedes($1.utf8) }
 
             var entries: [ProjectTreeEvent.Entry] = []
             entries.reserveCapacity(sorted.count)
-            for child in sorted {
+            for name in sorted {
                 if Task.isCancelled { return nil }
-                switch provider.probeKind(of: child) {
+                let child = directory.appendingPathComponent(name)
+                switch provider.probeKind(
+                    inDirectory: anchor.fd, named: name, logical: child
+                ) {
                 case .absent:
                     // Vanished between enumeration and probe — a benign
                     // mid-walk deletion race, quiet by contract.
@@ -309,9 +384,10 @@ struct ProjectTreeWalker {
                     // permission) — never a silent zero (R12). No kind was
                     // proven, so the child is not listed.
                     issues.append(Self.issue(forFailedProbe: child, errno: code))
-                case .kind(let kind):
+                case .kind(let kind, let identity, _):
+                    vetted[name] = identity
                     entries.append(ProjectTreeEvent.Entry(
-                        name: child.lastPathComponent, kind: kind
+                        name: name, kind: kind
                     ))
                 }
             }
@@ -351,21 +427,44 @@ struct ProjectTreeWalker {
 
             let child = directory.appendingPathComponent(entry.name)
 
-            // lstat gate on EVERY descent — consumers ran between the
-            // entries probe and this one, and the filesystem is live.
-            switch provider.probeKind(of: child) {
-            case .kind(.directory):
-                break
-            case .absent:
-                // Vanished between enumeration and descent — the benign
-                // race arm of the absence boundary. Quiet.
+            // THE DESCENT GATE, descriptor-relative. Consumers ran between
+            // the entries probe and this point and the filesystem is live, so
+            // the child is opened — not re-stat'd — from the SAME held parent
+            // descriptor, with `O_NOFOLLOW | O_DIRECTORY`.
+            let childFD = provider.openChildDirectory(
+                inDirectory: anchor.fd, named: entry.name, logical: child
+            )
+            guard childFD >= 0 else {
+                let code = errno
+                // ENOENT is the benign race arm of the absence boundary:
+                // the entry vanished between enumeration and descent. Quiet.
+                if code == ENOENT { continue }
+                // ENOTDIR means the name is no longer a directory — swapped
+                // for a symlink, swapped for a file, or raced. All three are
+                // one event with one remedy, and none of them may be a
+                // SILENT skip: this walk already EMITTED an event listing
+                // this child as a directory, so a consumer has seen it.
+                issues.append(Self.issue(forFailedOpen: child, errno: code))
                 continue
-            case .failed(let code):
-                issues.append(Self.issue(forFailedProbe: child, errno: code))
+            }
+            guard let childAnchor = SecureDirectory(
+                fd: childFD, provider: provider
+            ) else {
+                issues.append(Self.issue(forFailedOpen: child, errno: EIO))
                 continue
-            case .kind:
-                // Became a non-directory since the entries probe; never
-                // descended (the entries already reported honestly).
+            }
+            // The corroborator: what we OPENED must BE what we LISTED. This
+            // is the one swap `O_NOFOLLOW` cannot see — a directory re-bound
+            // to a DIFFERENT real directory, which passes every no-follow
+            // check there is.
+            guard let expected = vetted[entry.name],
+                  childAnchor.identity == expected
+            else {
+                issues.append(ScanIssue(
+                    url: child, kind: .unreadable,
+                    detail: "directory changed identity between listing and "
+                        + "descent — not traversed"
+                ))
                 continue
             }
 
@@ -373,19 +472,115 @@ struct ProjectTreeWalker {
             // the sizer: device change against the WALK ROOT, and the
             // statfs mount-root check that catches same-st_dev firmlink
             // mounts.
+            //
+            // CANONICAL INPUT for the statfs arm (PR #457 review r4).
+            // `isMountPoint` compares `f_mntonname` — always canonical —
+            // against the path it is handed, and requires canonical input
+            // (`FileSystemIdentityProvider.swift:143`). This walk canonicalizes
+            // ONLY to compare a root against the TCC-protected ancestors
+            // (`isProtectedRoot`) and then descends from the ORIGINAL root
+            // spelling, deliberately: `originRoot` and every event carry the
+            // DECLARED spelling verbatim, which is what the guard, the
+            // snapshot, and the deletion target are all keyed on. So every
+            // child inherits the root's aliasing — a dev root declared as
+            // `/tmp/work`, or any home reached through a symlink — and this
+            // arm silently answered `false` for a real mount. It is not
+            // defense-in-depth behind the device arm: on a firmlink-shaped
+            // mount that SHARES the root's `st_dev` the device arm cannot
+            // fire at all, which is the very case this arm exists for, so
+            // both go silent together and the walk descends into the mounted
+            // volume.
+            //
+            // The canonical value is an ARGUMENT and is discarded — `child`
+            // is what descends, what consumers see, and what items derive
+            // from. Safe here because the lstat gate directly above already
+            // proved `child` a REAL directory (`canonicalize` resolves the
+            // leaf too, so a symlink child must never reach this call — and
+            // never does), and a real directory's own name is its canonical
+            // name.
+            // …and, since PR #457 review r5, the arm that actually carries
+            // the check: `f_fsid` of the CHILD'S OWN DESCRIPTOR against the
+            // root's. `st_dev` is identical for every path on an APFS volume
+            // group (measured: `/` and `/System/Volumes/Data` both report
+            // 16777230), so the device arm is blind to exactly the firmlink
+            // split it was meant to catch, and the path arms are blind to an
+            // aliased spelling. The descriptor arm has neither blind spot.
+            // The two PATH arms are RETAINED: they are the seam hermetic
+            // tests inject synthetic devices and mount points through, and
+            // they can only ever push the answer toward NOT descending.
+            if childAnchor.mount.fsidMajor != rootMount.fsidMajor
+                || childAnchor.mount.fsidMinor != rootMount.fsidMinor
+                || childAnchor.mount.device != rootMount.device {
+                continue
+            }
             let childDevice = provider.deviceID(of: child)
             if (rootDevice != nil && childDevice != nil
                     && childDevice != rootDevice)
-                || provider.isMountPoint(child) {
+                || provider.isMountPoint(provider.canonicalize(child)) {
                 continue
             }
 
             visit(
-                directory: child, depth: childDepth, originRoot: originRoot,
-                rootDevice: rootDevice, maxDepth: maxDepth,
+                anchor: childAnchor, directory: child, depth: childDepth,
+                originRoot: originRoot, rootDevice: rootDevice,
+                rootMount: rootMount, maxDepth: maxDepth,
                 consumers: consumers, issues: &issues
             )
         }
+    }
+
+    // MARK: - Descriptor-relative enumeration
+
+    /// Every immediate child basename of an OPEN directory.
+    ///
+    /// `FileManager.contentsOfDirectory` cannot be used here: Foundation
+    /// offers NO no-follow option, and it returns fully RESOLVED child URLs,
+    /// which every downstream per-child check then re-resolved by path — the
+    /// exact re-resolution an attacker swapping an ancestor exploits. The
+    /// enumeration handle comes from `openat(fd, ".")`, never `dup` (which
+    /// clears `FD_CLOEXEC` and shares the file offset) and never a path.
+    ///
+    /// DELIBERATELY UNBOUNDED per directory, matching the previous behaviour:
+    /// adding an entry budget to this walker is a separate decision, not a
+    /// rider on a security fix. `nil` on failure with `errno` set; `.`/`..`
+    /// are skipped and hidden entries are included (R2 bans name-based
+    /// skipping). An undecodable basename ABORTS the directory rather than
+    /// substituting U+FFFD, which would name a different path than the entry.
+    private static func childNames(
+        inDirectory fd: Int32, provider: FileSystemIdentityProvider
+    ) -> [String]? {
+        let enumerationFD = provider.openSelfForEnumeration(fd)
+        guard enumerationFD >= 0 else { return nil }
+        guard let handle = fdopendir(enumerationFD) else {
+            let code = errno
+            close(enumerationFD)
+            errno = code
+            return nil
+        }
+        defer { closedir(handle) }
+        var names: [String] = []
+        while true {
+            // `readdir` returns nil for BOTH end-of-stream and error; errno
+            // is the only discriminator, so it is cleared before each call.
+            errno = 0
+            guard let entry = readdir(handle) else {
+                if errno != 0 { return nil }
+                break
+            }
+            let decoded = withUnsafeBytes(of: entry.pointee.d_name) {
+                raw -> String? in
+                guard let base = raw.bindMemory(to: CChar.self).baseAddress
+                else { return nil }
+                return ValuablesDetector.decodedBasename(fromCString: base)
+            }
+            guard let name = decoded, !name.isEmpty else {
+                errno = EILSEQ
+                return nil
+            }
+            if name == "." || name == ".." { continue }
+            names.append(name)
+        }
+        return names
     }
 
     // MARK: - Denial classification (frozen taxonomy, R12)
@@ -398,7 +593,26 @@ struct ProjectTreeWalker {
         switch denial.kind {
         case .tcc: kind = .tccDenied
         case .permission: kind = .permissionDenied
-        case .metadata, .other: kind = .unreadable
+        // `.unaddressablePath` (PR #458) is grouped here EXPLICITLY, never
+        // through a `default:` — this switch stays exhaustive so a future
+        // kind cannot slip past a reviewer. `ScanIssue.Kind`'s wire strings
+        // are FROZEN, so there is no honest new kind to map it to, and
+        // `.unreadable` is the same landing the other two classifiers on
+        // this taxonomy chose (`OrphanedCachesScanner.rootIssueKind`;
+        // `DirectorySizer.scanErrorKind` → `.other`).
+        //
+        // This is NOT treating it as benign. The issue is still RECORDED,
+        // it still makes its root's outcome non-clean, and the `detail` it
+        // carries is the sizer's own sentence naming the PATH-LENGTH cause
+        // and the `PATH_MAX` limit — not the "file name is invalid" lie the
+        // Cocoa error told. Nor does anything here authorize a deletion: a
+        // walk denial only ever produces a visible issue. Nor does the
+        // build-artifacts DELETION decision hang on it: an over-long tree is
+        // deleted whole by both disposal arms (`DepthSafeRemoval`; the Trash
+        // arm's top-level `rename(2)`), and the descriptor-anchored probe's
+        // `overlongDescendantPathBytes` now feeds the row's SIZE CAVEAT only
+        // — the refusal it used to drive was retired with its premise.
+        case .metadata, .other, .unaddressablePath: kind = .unreadable
         }
         return ScanIssue(url: denial.url, kind: kind, detail: denial.detail)
     }
@@ -409,5 +623,25 @@ struct ProjectTreeWalker {
         forFailedProbe url: URL, errno code: Int32
     ) -> ScanIssue {
         issue(from: DirectorySizer.denial(forFailedProbe: url, errno: code))
+    }
+
+    /// Classify a failed directory OPEN by errno, on the SAME frozen
+    /// taxonomy: EPERM → `.tccDenied`, EACCES → `.permissionDenied`,
+    /// everything else (notably ENOTDIR — a name that is no longer a
+    /// directory) → `.unreadable`.
+    private static func issue(
+        forFailedOpen url: URL, errno code: Int32
+    ) -> ScanIssue {
+        let kind: ScanIssue.Kind
+        switch code {
+        case EPERM: kind = .tccDenied
+        case EACCES: kind = .permissionDenied
+        default: kind = .unreadable
+        }
+        return ScanIssue(
+            url: url, kind: kind,
+            detail: "directory open failed: "
+                + String(cString: strerror(code))
+        )
     }
 }

@@ -2823,13 +2823,15 @@ final class CLIAcknowledgementTests: XCTestCase {
 
     private func makeRuntime(
         devRoots roots: [URL],
-        probeEntryLimit: Int = ValuablesDetector.defaultProbeEntryLimit
+        probeBudget: ValuablesProbeBudget = .censusProportionate(
+            floor: ValuablesDetector.defaultProbeEntryLimit
+        )
     ) throws -> SpaceScannerRuntime {
         let scanner = BuildArtifactsScanner(
             home: fixtureHome,
             devRoots: DevRootsStore(defaults: defaults)
                 .effectiveRoots(replacing: roots, home: fixtureHome),
-            valuablesProbeEntryLimit: probeEntryLimit
+            valuablesProbeBudget: probeBudget
         )
         return try SpaceScannerRuntime(
             scanners: [scanner], categories: [], home: fixtureHome,
@@ -3004,7 +3006,7 @@ final class CLIAcknowledgementTests: XCTestCase {
             "rust-a", in: dev, valuables: ["App.dmg"]
         )
         let deps = makeDeps(
-            try makeRuntime(devRoots: [dev], probeEntryLimit: 1)
+            try makeRuntime(devRoots: [dev], probeBudget: .fixed(1))
         )
 
         let dryRun = try successPayload(await clean(
@@ -3014,8 +3016,16 @@ final class CLIAcknowledgementTests: XCTestCase {
 
         XCTAssertFalse(planned.keys.contains("acknowledgement_token"),
                        "an incomplete probe is tokenless on EVERY surface")
+        // …and the note names THIS cause's remedy. A pinned bound that ran
+        // out is the budget cause, whose remedy is a retry once the tree
+        // settles — never the obstruction's "re-scan", which cannot move a
+        // bound. The two notes are separate strings on purpose.
         XCTAssertEqual(planned["acknowledgement_note"] as? String,
+                       CLIHandler.growingTreePlanNote)
+        XCTAssertEqual(CLIHandler.incompleteProbeNote(for: .obstruction),
                        CLIHandler.incompleteProbePlanNote)
+        XCTAssertNotEqual(CLIHandler.growingTreePlanNote,
+                          CLIHandler.incompleteProbePlanNote)
         XCTAssertTrue(fm.fileExists(atPath: valuable.path))
     }
 

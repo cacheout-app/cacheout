@@ -87,6 +87,64 @@ final class OrphanedCacheClassifierTests: XCTestCase {
         SizeDenial(url: URL(fileURLWithPath: path), kind: .permission, detail: "EACCES")
     }
 
+    private func unaddressableDenial(
+        _ path: String = "/fixture/deep"
+    ) -> SizeDenial {
+        SizeDenial(
+            url: URL(fileURLWithPath: path), kind: .unaddressablePath,
+            detail: "this folder runs deeper than an absolute path can address"
+        )
+    }
+
+    // MARK: - Evidence names the real cause (PR #458 review)
+
+    /// "Couldn't fully scan: some content was unreadable" was FALSE for a
+    /// tree past `PATH_MAX`: every byte is readable by anything that walks
+    /// with descriptors, which the probe and the deletion both now do. Only
+    /// the SIZING failed. The evidence has to say which, or the user goes
+    /// looking for a permission that was never missing — and, worse, assumes
+    /// the item cannot be deleted, which is the state this whole review
+    /// round is about.
+    func testUnaddressablePathEvidenceNamesSizingNotReadability() throws {
+        let lines = OrphanedCacheClassifier.denialEvidence(
+            [unaddressableDenial()]
+        )
+        XCTAssertEqual(lines.count, 1, "\(lines)")
+        let line = try XCTUnwrap(lines.first)
+        XCTAssertTrue(line.contains("couldn't measure its size"), line)
+        XCTAssertFalse(
+            line.contains("unreadable"),
+            "nothing here is unreadable — the sizer just cannot spell it: "
+                + line
+        )
+        // BOTH CAUSES, because one KIND carries both (PR #458 review r11,
+        // thread `PRRT_kwDORmg6_86Zn1Ph`). Naming only the length sends a
+        // user to shorten a path that was never long, when the real cause
+        // was a symlink cycle.
+        XCTAssertTrue(line.contains("too long"), line)
+        XCTAssertTrue(line.contains("too many symbolic links"), line)
+        // The intent this line was added for survives: not a permission.
+        XCTAssertTrue(line.contains("not a permission problem"), line)
+        // And the deletion promise is NOT made from a kind that cannot tell
+        // a path-length overflow from a cycle ABOVE the deletion target —
+        // the second defeats `DepthSafeRemoval`'s one resolved path
+        // (measured in `DirectorySizerTests`).
+        XCTAssertFalse(line.contains("deleting it still works"), line)
+    }
+
+    /// It is still fail-closed: an unmeasurable entry is never auto-clean
+    /// eligible, whatever the message says.
+    func testUnaddressablePathStillForcesTheEntryOffSafe() {
+        let classifier = makeClassifier(installedAppStatus: { _ in .unknown })
+        let entry = makeEntry(
+            name: "com.apple.SwiftUI.Drag.\(UUID().uuidString)",
+            denials: [unaddressableDenial()]
+        )
+        let classification = classifier.classify(entry)
+        XCTAssertNotEqual(classification.risk, .safe)
+        XCTAssertFalse(classification.automaticCleanEligible)
+    }
+
     // MARK: - R1: leak glob
 
     func testDragUUIDNamesAreKnownLeakSafeWithExactEvidence() {

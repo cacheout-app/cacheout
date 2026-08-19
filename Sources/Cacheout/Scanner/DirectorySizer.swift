@@ -54,6 +54,31 @@
 ///   symlink → 0 bytes, never walked (deleting it removes the link only);
 ///   regular file → its own allocated size; directory → enumerated;
 ///   fifo/socket/device → 0 bytes plus a recorded skip.
+///
+/// ## RESIDUAL: this walk is still PATH-BASED (PR #457 review r6)
+///
+/// Unlike `ProjectTreeWalker` and `ValuablesDetector`, this type has not been
+/// converted to the descriptor-anchored doctrine ("below a walk root, no
+/// filesystem operation takes a path"): `FileManager.enumerator` yields
+/// resolved child URLs and every per-entry check here re-`lstat`s one. An
+/// attacker who can replace an ANCESTOR of the measured root between the
+/// caller's own checks and this walk therefore redirects the MEASUREMENT.
+///
+/// What that buys, stated precisely so nobody has to re-derive it: BYTES,
+/// DATES, and DENIAL CLASSIFICATIONS — the figures an item displays. It buys
+/// NO acknowledgement token (`ValuablesDetector`'s descriptor-anchored probe
+/// is that token's only preimage), NO deletion authorization, and NO change of
+/// deletion target (the target is the caller's unresolved spelling, re-admitted
+/// by `PathGuard` and re-proven by the item's pre-delete revalidator at delete
+/// time). A boundary HIDDEN from this walk is likewise re-checked by the
+/// cleaner, which refuses any tree containing one whole.
+///
+/// Converting it is a larger change than the security value justifies right
+/// now: this is the shared sizer for every scanner and for delete-time
+/// claim-based accounting, and a rewrite must reproduce
+/// `totalFileAllocatedSize` sparse semantics, hardlink claims, and Cocoa error
+/// classification exactly. Tracked separately, deliberately not smuggled into
+/// a security fix.
 
 import Foundation
 
@@ -70,6 +95,27 @@ struct SizeDenial: Equatable {
         case permission
         /// Metadata unavailable (lstat/resourceValues failed mid-walk).
         case metadata
+        /// ENAMETOOLONG(63)/ELOOP(62): this walk composes an ABSOLUTE PATH per
+        /// entry, and something about that path defeats resolution — either
+        /// its LENGTH or its SYMLINKS. ONE KIND, TWO CAUSES, and the two are
+        /// distinguished in the `detail` rather than folded into a single
+        /// sentence about `PATH_MAX` (PR #458 review r11): the remedy class is
+        /// genuinely shared — restructure the path, which no re-scan does —
+        /// but the sentence a user acts on is not, and only the LENGTH cause
+        /// may promise that deletion still works. See `classifyDenial`.
+        ///
+        /// ITS OWN KIND BECAUSE THE MESSAGE WAS A LIE (PR #458 review). The
+        /// Cocoa error Foundation raises here reads "The item couldn't be
+        /// opened because the file name "d" is invalid" — measured, on a
+        /// chain of perfectly valid single-letter names whose only sin is
+        /// being 446 levels down. Folded into `.other`, that sentence was
+        /// what the sweep showed a user as the reason their cache could not
+        /// be measured, and it names a cause that does not exist: no rename
+        /// of "d" would ever help. The remedy that would — restructuring or
+        /// shortening the tree — is only sayable once the class is
+        /// distinguished. What it is NOT any more is a reason the item
+        /// cannot be DELETED: `DepthSafeRemoval` addresses this tree.
+        case unaddressablePath
         /// Anything else — recorded, never swallowed.
         case other
     }
@@ -102,6 +148,25 @@ struct SizeReport {
     var logicalBytes: Int64 = 0
     /// Regular-file directory entries encountered (links, not inodes).
     var itemCount: Int = 0
+    /// EVERY directory entry this walk enumerated — files, directories,
+    /// symlinks, specials, and entries that raced away mid-walk — excluding
+    /// the root itself. `itemCount` counts regular files ONLY, so it is not
+    /// a census; this is.
+    ///
+    /// It exists because it is the closest count of the same subject the
+    /// bounded valuables probe walks that this pass can take for free: the
+    /// probe's STARTING entry budget is derived from it
+    /// (`ValuablesProbeBudget`), which is what stops a fixed constant from
+    /// deterministically stranding the largest real artifact trees.
+    ///
+    /// A FLOOR, never a bound (PR #457 review r8). THIS walk is path-based and
+    /// the probe's is descriptor-anchored, so they truncate in different
+    /// places: a walk that hit denials, a mount boundary, or a path past
+    /// `PATH_MAX` (ENAMETOOLONG — measured: 44 entries counted of a 151-entry
+    /// tree) counted nothing past them, while the probe keeps walking. Nothing
+    /// may treat this number as an upper bound on the probe's work; the
+    /// probe's own doubling is what guarantees it finishes.
+    var enumeratedEntries: Int = 0
     var denials: [SizeDenial] = []
     /// Directories recorded as mount boundaries; their subtrees are uncounted.
     var mountBoundaries: [URL] = []
@@ -257,6 +322,10 @@ struct DirectorySizer {
 
         while let next = enumerator.nextObject() {
             guard let itemURL = next as? URL else { continue }
+            // The CENSUS, counted before any classification: every entry the
+            // enumerator yielded, whatever it turns out to be and whether or
+            // not it survives to contribute bytes.
+            report.enumeratedEntries += 1
             let kind: FileSystemIdentityProvider.FileKind
             switch provider.probeKind(of: itemURL) {
             case .kind(let probed):
@@ -406,6 +475,46 @@ struct DirectorySizer {
             kind = .tcc
         case .some(Int(EACCES)):
             kind = .permission
+        // The one class whose Cocoa message names the WRONG cause, so the
+        // detail is replaced rather than passed through: Foundation blames
+        // the basename, and the basename is innocent.
+        //
+        // TWO ERRNOS, TWO CAUSES, TWO SENTENCES (PR #458 review r11, thread
+        // `PRRT_kwDORmg6_86Zn1Ph`). Both share the KIND — the shared taxonomy
+        // already words this class for both causes: see
+        // `UserDataProbeObstruction.unaddressablePath.guidance`, "it is too
+        // long, or it resolves through too many links". What was wrong was
+        // that the sizer told a SECOND, narrower story on top of it, so an
+        // `ELOOP` came out as a claim about `PATH_MAX`. Measured with a real
+        // `rename(2)`+`symlink(2)` swapping a directory for a
+        // self-referential link mid-walk: errno 62 at a 60-byte path,
+        // reported as "runs deeper than an absolute path can address
+        // (1024-byte limit)". Every clause of that is false.
+        case .some(Int(ENAMETOOLONG)):
+            return SizeDenial(
+                url: url, kind: .unaddressablePath,
+                detail: "this folder runs deeper than an absolute path can "
+                    + "address (\(PATH_MAX)-byte limit), so its size could "
+                    + "not be measured — deletion is unaffected"
+            )
+        case .some(Int(ELOOP)):
+            // AND IT PROMISES NOTHING ABOUT DELETION, because that depends on
+            // WHERE the cycle is and this errno does not say. Measured, both
+            // directions: a self-referential symlink INSIDE the tree is
+            // removed cleanly by `DepthSafeRemoval` (it never follows a link,
+            // it unlinks it), while a cycle in an ANCESTOR fails the one path
+            // the removal does resolve — `open(url.deletingLastPathComponent())`
+            // returned errno 62 and `remove` threw `posix(62)`. The
+            // path-length sentence's "deletion is unaffected" is earned;
+            // repeating it here would not be.
+            return SizeDenial(
+                url: url, kind: .unaddressablePath,
+                detail: "a symbolic link in this folder's path resolves "
+                    + "through too many links to follow (a cycle, or a chain "
+                    + "past the system limit), so its size could not be "
+                    + "measured — removing or re-pointing that link allows a "
+                    + "full measurement"
+            )
         default:
             // A bare Cocoa "read no permission" without a POSIX underlying
             // error is still a permission denial, not "other".
@@ -443,7 +552,7 @@ extension SizeDenial.Kind {
         switch self {
         case .tcc: return .tccDenied
         case .permission: return .permissionDenied
-        case .metadata, .other: return .other
+        case .metadata, .other, .unaddressablePath: return .other
         }
     }
 }

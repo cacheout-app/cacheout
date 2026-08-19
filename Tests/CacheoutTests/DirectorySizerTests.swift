@@ -389,6 +389,179 @@ final class DirectorySizerTests: XCTestCase {
         }
     }
 
+    // MARK: - A path the sizer cannot address is its OWN denial kind
+
+    /// The sizer walks by ABSOLUTE PATH, so a tree past `PATH_MAX` cannot be
+    /// measured — and Foundation's error for it says "the file name "d" is
+    /// invalid", which is false in a way that costs the user real time. The
+    /// names are ordinary; the DEPTH is the problem, and no rename of "d"
+    /// would ever help. Folded into `.other`, that sentence was what the
+    /// sweep displayed as the reason. It is now its own class, with a detail
+    /// that names the real cause and says what still works.
+    func testAPathPastPathMaxDeniesWithItsRealCauseNotAnInvalidFileName() throws {
+        let root = base.appendingPathComponent("past-path-max")
+        try mkdir(root)
+        // `FileManager` cannot address this tree either, so teardown needs
+        // the relative-traversal tool.
+        defer {
+            let rm = Process()
+            rm.executableURL = URL(fileURLWithPath: "/bin/rm")
+            rm.arguments = ["-rf", root.path]
+            try? rm.run()
+            rm.waitUntilExit()
+        }
+        var current = root.withUnsafeFileSystemRepresentation { path -> Int32 in
+            guard let path else { return -1 }
+            return open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+        }
+        guard current >= 0 else { throw XCTSkip("open failed: \(errno)") }
+        for _ in 0..<600 {
+            guard mkdirat(current, "d", 0o755) == 0 else {
+                close(current)
+                throw XCTSkip("mkdirat failed: \(errno)")
+            }
+            let next = openat(current, "d", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+            close(current)
+            guard next >= 0 else { throw XCTSkip("openat failed: \(errno)") }
+            current = next
+        }
+        close(current)
+
+        let report = DirectorySizer().measure(at: root, mode: .deletionTarget)
+        XCTAssertEqual(report.denials.count, 1)
+        let denial: SizeDenial = try XCTUnwrap(report.denials.first)
+        XCTAssertEqual(denial.kind, SizeDenial.Kind.unaddressablePath)
+        XCTAssertFalse(
+            denial.detail.contains("invalid"),
+            "the basename is innocent; blaming it sends the user after a "
+                + "rename that cannot help: \(denial.detail)"
+        )
+        XCTAssertTrue(denial.detail.contains("deeper than an absolute path"),
+                      denial.detail)
+        // And the honest half: this is a SIZING limit only.
+        XCTAssertTrue(denial.detail.contains("deletion is unaffected"),
+                      denial.detail)
+    }
+
+    /// Replaces a named directory with a REAL self-referential symlink at the
+    /// one instant the enumerator has yielded it and not yet opened it to
+    /// descend — a `rename(2)` plus a `symlink(2)`, single-threaded, fired
+    /// from the production sizer's own per-entry `probeKind`. No sleeps, no
+    /// threads: the kernel decides what the enumerator sees next.
+    private final class SwapDirectoryForASymlinkCycleProvider:
+        FileSystemIdentityProvider {
+        var trigger = ""
+        private(set) var fired = false
+        override func probeKind(of url: URL) -> KindProbe {
+            let answer = super.probeKind(of: url)
+            guard !fired, url.lastPathComponent == trigger else { return answer }
+            fired = true
+            let path = url.path
+            _ = rename(path, path + ".moved")
+            _ = symlink(url.lastPathComponent, path)
+            return answer
+        }
+    }
+
+    /// `ELOOP` IS NOT `ENAMETOOLONG` (PR #458 review r11, thread
+    /// `PRRT_kwDORmg6_86Zn1Ph`).
+    ///
+    /// One `SizeDenial.Kind` covers both — the remedy class really is shared,
+    /// restructure the path — but the SENTENCE was written for one of them.
+    /// Measured before the split: a symlink cycle 60 bytes deep was reported
+    /// as "this folder runs deeper than an absolute path can address
+    /// (1024-byte limit) … deletion is unaffected". The length claim is false,
+    /// the `PATH_MAX` number is irrelevant, and the deletion promise is
+    /// unearned — `DepthSafeRemoval` resolves exactly one path, the target's
+    /// parent, and a cycle ABOVE the target fails it with the same errno 62
+    /// (measured: `remove` threw `posix(62)`).
+    func testASymlinkCycleIsNotReportedAsAPathLengthOverflow() throws {
+        let root = base.appendingPathComponent("cycle-root")
+        let victim = root.appendingPathComponent("A")
+        try mkdir(victim)
+        try writeFile(victim.appendingPathComponent("payload.bin"))
+
+        let provider = SwapDirectoryForASymlinkCycleProvider()
+        provider.trigger = "A"
+        let report = DirectorySizer(provider: provider)
+            .measure(at: root, mode: .deletionTarget)
+
+        XCTAssertTrue(provider.fired, "the fixture never armed the swap")
+        // The fixture really does produce ELOOP, at a SHORT path.
+        var st = stat()
+        XCTAssertEqual(stat(victim.path, &st), -1)
+        XCTAssertEqual(errno, ELOOP,
+                       "the fixture must really produce ELOOP on this platform")
+        XCTAssertLessThan(victim.path.utf8.count, Int(PATH_MAX),
+                          "the fixture's path must be nowhere near PATH_MAX")
+
+        let denial: SizeDenial = try XCTUnwrap(report.denials.first)
+        XCTAssertEqual(report.denials.count, 1)
+        XCTAssertEqual(denial.kind, SizeDenial.Kind.unaddressablePath,
+                       "the remedy class is shared — restructure the path")
+        XCTAssertTrue(
+            denial.detail.contains("too many links"),
+            "the detail must name symbolic-link resolution: \(denial.detail)"
+        )
+        XCTAssertFalse(
+            denial.detail.contains("absolute path can address"),
+            "blaming path LENGTH for a symlink cycle sends the user after a "
+                + "shortening that cannot help: \(denial.detail)"
+        )
+        XCTAssertFalse(
+            denial.detail.contains("\(PATH_MAX)"),
+            "a byte limit is not what was hit: \(denial.detail)"
+        )
+        XCTAssertFalse(
+            denial.detail.contains("deletion is unaffected"),
+            "this errno does not say WHERE the cycle is, and a cycle above "
+                + "the target defeats the one path the removal resolves: "
+                + "\(denial.detail)"
+        )
+    }
+
+    /// The measured half of that last claim, so the refusal to promise is
+    /// evidenced rather than asserted: a cycle in an ANCESTOR really does
+    /// defeat `DepthSafeRemoval`, which resolves the target's parent by path.
+    func testACycleAboveTheTargetDefeatsTheRemovalsOneResolvedPath() throws {
+        let anchor = base.appendingPathComponent("anchor")
+        let target = anchor.appendingPathComponent("entry")
+        try mkdir(target)
+        try writeFile(target.appendingPathComponent("payload.bin"))
+        // m0 -> m1 -> … -> m39 -> anchor: past SYMLOOP_MAX, no cycle needed.
+        XCTAssertEqual(
+            symlink("anchor", base.appendingPathComponent("m39").path), 0
+        )
+        for index in stride(from: 38, through: 0, by: -1) {
+            XCTAssertEqual(
+                symlink("m\(index + 1)",
+                        base.appendingPathComponent("m\(index)").path), 0
+            )
+        }
+        let spelled = base.appendingPathComponent("m0/entry")
+
+        var st = stat()
+        XCTAssertEqual(stat(spelled.path, &st), -1)
+        XCTAssertEqual(errno, ELOOP)
+
+        XCTAssertThrowsError(
+            try DepthSafeRemoval.remove(
+                at: spelled, expecting: nil,
+                provider: FileSystemIdentityProvider(),
+                containedIn: .unbound
+            )
+        ) { error in
+            guard let failure = error as? DepthSafeRemoval.Failure else {
+                return XCTFail("unexpected error: \(error)")
+            }
+            XCTAssertEqual(failure.cause, .posix(ELOOP),
+                           "the removal's one resolved path is the target's "
+                               + "PARENT, and the cycle is above it")
+        }
+        XCTAssertTrue(fm.fileExists(atPath: target.path),
+                      "nothing may be destroyed on a refused removal")
+    }
+
     /// Marks chosen inodes as mount points while keeping real devices —
     /// hermetic stand-in for the same-st_dev APFS firmlink mount.
     private final class MountPointInjectingProvider: FileSystemIdentityProvider {
@@ -484,6 +657,67 @@ final class DirectorySizerTests: XCTestCase {
         XCTAssertTrue(report.rootMountBoundary)
         XCTAssertEqual(report.measuredBytes, 0)
         XCTAssertEqual(report.itemCount, 0)
+    }
+
+    /// Mirrors the PRODUCTION `isMountPoint` contract — true only for the
+    /// CANONICAL spelling, exactly as `statfs` compares `f_mntonname` — and
+    /// records every spelling the sizer hands it.
+    private final class CanonicalSpellingMountProvider:
+        FileSystemIdentityProvider
+    {
+        var canonicalMountPaths: Set<String> = []
+        private(set) var mountCheckedPaths: [String] = []
+
+        override func isMountPoint(_ url: URL) -> Bool {
+            mountCheckedPaths.append(url.path)
+            if canonicalMountPaths.contains(url.path) { return true }
+            return super.isMountPoint(url)
+        }
+    }
+
+    func testSizerAlwaysHandsTheMountCheckACanonicalSpelling() throws {
+        // The AUDIT cell for PR #457 review r4, which fixed three callers that
+        // handed `isMountPoint` an aliased spelling. The sizer was judged
+        // correct BY READING (`.scanRoot` canonicalizes, `.deletionTarget`
+        // target-resolves, and the enumerator's children are rooted at that
+        // resolved root) — this proves it instead, in both modes, through a
+        // request whose ancestor really is a symlink.
+        let real = base.appendingPathComponent("real")
+        try mkdir(real.appendingPathComponent("tree/sub"))
+        let alias = base.appendingPathComponent("aliaslink")
+        try fm.createSymbolicLink(at: alias, withDestinationURL: real)
+        let requested = alias.appendingPathComponent("tree")
+        try writeFile(requested.appendingPathComponent("sub/payload.bin"),
+                      bytes: 4_096)
+        // The BOUNDARY is declared by its canonical spelling only — the shape
+        // the three fixed callers were blind to.
+        let canonicalSub = FileSystemIdentityProvider()
+            .canonicalize(requested.appendingPathComponent("sub")).path
+        XCTAssertNotEqual(canonicalSub,
+                          requested.appendingPathComponent("sub").path,
+                          "the fixture must really be aliased")
+
+        for mode in [DirectorySizer.Mode.scanRoot, .deletionTarget] {
+            let provider = CanonicalSpellingMountProvider()
+            provider.canonicalMountPaths = [canonicalSub]
+
+            let report = makeSizer(provider: provider)
+                .measure(at: requested, mode: mode)
+
+            XCTAssertEqual(
+                report.mountBoundaries.map(\.lastPathComponent), ["sub"],
+                "\(mode): the boundary is seen through the alias, so every "
+                    + "path this walk hands the check is already canonical"
+            )
+            XCTAssertEqual(report.itemCount, 0, "\(mode): subtree not counted")
+            XCTAssertFalse(
+                provider.mountCheckedPaths.contains {
+                    $0 == requested.path || $0.hasPrefix(requested.path + "/")
+                },
+                "\(mode): not one ALIASED spelling reaches the check: "
+                    + "\(provider.mountCheckedPaths)"
+            )
+        }
     }
 }
 

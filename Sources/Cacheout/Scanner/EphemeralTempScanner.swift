@@ -857,7 +857,13 @@ struct EphemeralTempScanner: @unchecked Sendable {
                 return (.tccDenied, "\(url.path): \(denial.detail)")
             case .permission:
                 return (.permissionDenied, "\(url.path): \(denial.detail)")
-            case .metadata, .other:
+            // `.unaddressablePath` joins the neutral arm (PR #458 added the
+            // case; this scanner predates it). It means the tree is nested
+            // deeper than an absolute path can address, so the SIZER could
+            // not read it — `.unreadable` is the honest kind, and the detail
+            // carries the real cause. Deletion is unaffected: the remover is
+            // descriptor-relative and handles such trees whole.
+            case .metadata, .other, .unaddressablePath:
                 return (.unreadable, "\(url.path): \(denial.detail)")
             }
         case .metadataUnavailable:
@@ -871,7 +877,7 @@ struct EphemeralTempScanner: @unchecked Sendable {
             case .permission:
                 return (.permissionDenied,
                         "\(denial.url.path): \(denial.detail)")
-            case .tcc, .metadata, .other:
+            case .tcc, .metadata, .other, .unaddressablePath:
                 return (.unreadable, "\(denial.url.path): \(denial.detail)")
             }
         }

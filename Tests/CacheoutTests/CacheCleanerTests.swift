@@ -215,12 +215,11 @@ final class CacheCleanerTests: XCTestCase {
                 ])
             }
             recorder.record(url)
-            try FileManager.default.moveItem(
-                at: url,
-                to: trashDir.appendingPathComponent(
-                    "\(UUID().uuidString)-\(url.lastPathComponent)"
-                )
+            let landed = trashDir.appendingPathComponent(
+                "\(UUID().uuidString)-\(url.lastPathComponent)"
             )
+            try FileManager.default.moveItem(at: url, to: landed)
+            return landed
         }
     }
 
@@ -2060,19 +2059,30 @@ final class CacheCleanerTests: XCTestCase {
     }
 
     func testAutoEligibleSweepItemProbeIncompleteAtDeleteTimeIsRefused() async throws {
+        try XCTSkipIf(geteuid() == 0, "root ignores permission bits")
         let (home, caches, entry, snapshot) = try makeSweepFixture()
         defer { try? FileManager.default.removeItem(at: home) }
 
-        // Recreate the entry with a directory sitting AT the probe's depth
-        // boundary (entry/a/b/c — c is a directory at depth 3, left
-        // unexpanded): the pre-delete probe cannot prove the absence of
-        // user data, and an inspection that could not finish is treated
-        // like a change (fail closed).
+        // Recreate the entry around a branch the probe cannot READ. Depth
+        // no longer truncates anything (the entry budget is the one bound,
+        // and it is deterministic — a bound-shaped refusal no retry could
+        // ever clear is exactly what was removed), so the remaining
+        // fail-closed causes are genuine obstructions like this one: the
+        // pre-delete probe cannot prove the absence of user data, and an
+        // inspection that could not finish is treated like a change.
         try FileManager.default.removeItem(at: entry)
-        let deep = entry.appendingPathComponent("a/b/c")
-        try FileManager.default.createDirectory(at: deep, withIntermediateDirectories: true)
-        let survivor = deep.appendingPathComponent("hidden.bin")
+        let locked = entry.appendingPathComponent("locked-sub")
+        try FileManager.default.createDirectory(at: locked, withIntermediateDirectories: true)
+        let survivor = locked.appendingPathComponent("hidden.bin")
         try writeFile(survivor, bytes: 1024)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o000], ofItemAtPath: locked.path
+        )
+        defer {
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o755], ofItemAtPath: locked.path
+            )
+        }
 
         let item = makeRemoveItem(
             scannerID: OrphanedCachesScanner.registeredID,
@@ -2089,10 +2099,236 @@ final class CacheCleanerTests: XCTestCase {
         XCTAssertTrue(report.entries.isEmpty)
         XCTAssertEqual(report.errors.count, 1)
         let message = try XCTUnwrap(report.errors.first?.message)
-        XCTAssertTrue(message.contains("couldn't fully re-inspect"), message)
+        XCTAssertTrue(message.contains("couldn't fully inspect"), message)
+        XCTAssertFalse(
+            message.contains("re-scan required"),
+            "a bare retry does not clear a permission obstruction, so "
+                + "prescribing one alone is misleading: \(message)"
+        )
+        // Cause-specific guidance (PR #458 review): this obstruction is
+        // clearable by a GRANT, so the message must say so and must not
+        // claim the verdict is permanent.
+        XCTAssertTrue(message.contains("granting access"), message)
+        XCTAssertFalse(message.contains("will not clear"), message)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755], ofItemAtPath: locked.path
+        )
         XCTAssertTrue(FileManager.default.fileExists(atPath: survivor.path),
-                      "content behind the uninspectable boundary survives")
+                      "content behind the uninspectable branch survives")
         XCTAssertTrue(logContents(home: home).contains("REFUSED [content-drift]"))
+    }
+
+    /// The mirror-image harm the PR #458 review named: a TRANSIENT
+    /// obstruction — a mid-walk race, an I/O error — must not be reported as
+    /// a deterministic verdict. Telling a user "re-scanning reports the same
+    /// thing every time" over a disk hiccup steers them onto the riskier
+    /// explicit-per-item-confirmation path for no reason.
+    func testTransientProbeFailureAtDeleteTimeKeepsRetryGuidance() async throws {
+        let (home, caches, entry, snapshot) = try makeSweepFixture()
+        defer { try? FileManager.default.removeItem(at: home) }
+
+        let child = entry.appendingPathComponent("sub")
+        try FileManager.default.createDirectory(
+            at: child, withIntermediateDirectories: true
+        )
+        // The child's kind probe fails with EIO — the hermetic stand-in for
+        // a transient failure or a directory that changed under the walk.
+        let provider = FailingChildKindProvider()
+        provider.failures[child.standardizedFileURL.path] = EIO
+
+        let item = makeRemoveItem(
+            scannerID: OrphanedCachesScanner.registeredID,
+            displayName: entry.lastPathComponent,
+            origin: caches, target: entry,
+            requiresRevalidation: true
+        )
+        // The revalidator is registered with the SAME injected provider the
+        // cleaner holds (fn-4.8 seam): the probe now belongs to the scanner's
+        // declared revalidator rather than to a scanner-id branch inside the
+        // cleaner, so a hermetic probe failure has to be injected where the
+        // probe actually runs.
+        let cleaner = CacheCleaner(
+            home: home, containerRoots: [caches], containerSnapshot: snapshot,
+            preDeleteRevalidators: [
+                OrphanedCachesScanner.registeredID:
+                    OrphanedCachesScanner.preDeleteRevalidator(
+                        provider: provider
+                    )
+            ],
+            provider: provider
+        )
+        let report = await cleaner.clean(items: [item], moveToTrash: false)
+
+        XCTAssertTrue(report.entries.isEmpty, "fail-closed is untouched")
+        XCTAssertEqual(report.errors.count, 1)
+        let message = try XCTUnwrap(report.errors.first?.message)
+        XCTAssertTrue(message.contains("couldn't fully inspect"), message)
+        XCTAssertTrue(message.contains("temporary error"), message)
+        XCTAssertTrue(message.contains("Re-scan and try again."), message)
+        XCTAssertFalse(
+            message.contains("will not clear"),
+            "a transient failure is cleared by a re-scan — calling it "
+                + "deterministic is exactly backwards: \(message)"
+        )
+        XCTAssertFalse(
+            message.contains("explicit per-item confirmation"),
+            "and it must not steer the user to the riskier path: \(message)"
+        )
+    }
+
+    /// Fails a chosen path's kind probe with a chosen errno.
+    private final class FailingChildKindProvider: FileSystemIdentityProvider {
+        var failures: [String: Int32] = [:]
+
+        override func probeKind(of url: URL) -> KindProbe {
+            if let code = failures[url.standardizedFileURL.path] {
+                return .failed(errno: code)
+            }
+            return super.probeKind(of: url)
+        }
+
+        /// The probe's per-entry syscall is DESCRIPTOR-RELATIVE now (PR #458
+        /// review, ancestor swap): `logical` is the spelling the walk
+        /// believes it is at, which production ignores and a test injects
+        /// on.
+        override func probeChild(
+            inDirectory descriptor: Int32, named name: String,
+            logical: @autoclosure () -> URL
+        ) -> ChildProbe {
+            // Evaluated ONCE, here: the walk composes no path below its root
+            // (hence the autoclosure), so a double that keys on the spelling
+            // is the one that pays for composing it.
+            let logical = logical()
+            if let code = failures[logical.standardizedFileURL.path] {
+                return .failed(errno: code)
+            }
+            return super.probeChild(
+                inDirectory: descriptor, named: name, logical: logical
+            )
+        }
+    }
+
+    // MARK: - The stranding class that moved to the deletion (PR #458 review)
+
+    /// A chain of `levels` directories built with `mkdirat` — the ONLY way
+    /// one past `PATH_MAX` can exist. Holds two descriptors at a time.
+    private func makeDeepChain(
+        under root: URL, name: String, levels: Int
+    ) throws -> Int32 {
+        var current = root.withUnsafeFileSystemRepresentation { path -> Int32 in
+            guard let path else { return -1 }
+            return open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+        }
+        guard current >= 0 else { throw XCTSkip("open failed: \(errno)") }
+        for _ in 0..<levels {
+            guard mkdirat(current, name, 0o755) == 0 else {
+                close(current)
+                throw XCTSkip("mkdirat failed: \(errno)")
+            }
+            let next = openat(current, name, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+            close(current)
+            guard next >= 0 else { throw XCTSkip("openat failed: \(errno)") }
+            current = next
+        }
+        return current
+    }
+
+    /// THE defect, end to end, through the production cleaner.
+    ///
+    /// Making the probe descriptor-relative let INSPECTION read past
+    /// `PATH_MAX` while the deletion stayed on `FileManager.removeItem`, so
+    /// the app began manufacturing items that were provably clean and
+    /// permanently undeletable. Measured on this exact fixture shape at
+    /// depths 446 / 600 / 2000 / 4000 (threshold exactly `PATH_MAX`):
+    ///
+    /// - probe `complete=true, obstructions=[]`;
+    /// - sizer `itemCount=0, exact=0, denials=1`;
+    /// - `removeItem` NSCocoaErrorDomain 514 / ENAMETOOLONG in 0.03 s.
+    ///
+    /// The sizer denial forces the item off `.safe`, so
+    /// `automaticCleanEligible` is false and the ONLY remaining route is
+    /// explicit per-item confirmation — which re-enters `removeGuardedItem`
+    /// and fails identically, forever, blaming a file name that was never
+    /// the problem. BOTH routes are asserted here, because the auto route is
+    /// what a leak-tier entry takes and the confirmation route is what this
+    /// one is actually forced onto.
+    func testSweepItemPastPathMaxIsDeletedByBothRoutes() async throws {
+        for autoEligible in [false, true] {
+            let (home, caches, entry, snapshot) =
+                try makeSweepFixture("pastPathMax-\(autoEligible)")
+            defer {
+                let rm = Process()
+                rm.executableURL = URL(fileURLWithPath: "/bin/rm")
+                rm.arguments = ["-rf", home.path]
+                try? rm.run()
+                rm.waitUntilExit()
+            }
+
+            let levels = 600
+            let deepest = try makeDeepChain(
+                under: entry, name: "d", levels: levels
+            )
+            let leaf = openat(deepest, "payload.bin", O_CREAT | O_WRONLY, 0o644)
+            XCTAssertGreaterThanOrEqual(leaf, 0)
+            if leaf >= 0 {
+                var bytes = [UInt8](repeating: 0xAB, count: 8192)
+                XCTAssertEqual(write(leaf, &bytes, 8192), 8192)
+                close(leaf)
+            }
+            close(deepest)
+
+            // The fixture's own precondition: this tree is genuinely past
+            // what an absolute path can address.
+            var spelled = entry.path
+            for _ in 0..<levels { spelled += "/d" }
+            let byPath = spelled.withCString { open($0, O_RDONLY | O_DIRECTORY) }
+            if byPath >= 0 { close(byPath) }
+            XCTAssertEqual(byPath, -1, "fixture is not actually past PATH_MAX")
+
+            // What the two halves of the core say about it, INDEPENDENTLY
+            // measured — the probe reaches it, the sizer does not, and that
+            // asymmetry is exactly what stranded the item.
+            let probe = OrphanedCachesScanner.boundedUserDataShapeWalk(
+                at: entry, provider: FileSystemIdentityProvider(),
+                entryLimit: OrphanedCachesScanner.defaultProbeEntryLimit,
+                descriptorWindow: OrphanedCachesScanner.defaultDescriptorWindow()
+            )
+            XCTAssertTrue(probe.complete, "\(probe.obstructions)")
+            XCTAssertEqual(probe.obstructions, [])
+            let sized = DirectorySizer().measure(at: entry, mode: .deletionTarget)
+            XCTAssertEqual(sized.denials.map(\.kind), [.unaddressablePath],
+                           "the sizer still cannot measure it — stated residual")
+
+            let item = makeRemoveItem(
+                scannerID: OrphanedCachesScanner.registeredID,
+                displayName: entry.lastPathComponent,
+                origin: caches, target: entry, autoEligible: autoEligible
+            )
+            let cleaner = CacheCleaner(
+                home: home, containerRoots: [caches],
+                containerSnapshot: snapshot
+            )
+            let report = await cleaner.clean(items: [item], moveToTrash: false)
+
+            XCTAssertEqual(
+                report.errors.map(\.message), [],
+                "a tree `rm -rf` removes in under a second must not be "
+                    + "refused forever with a message about an invalid file "
+                    + "name (autoEligible: \(autoEligible))"
+            )
+            XCTAssertEqual(report.entries.count, 1)
+            XCTAssertFalse(
+                FileManager.default.fileExists(atPath: entry.path),
+                "the entry must be gone (autoEligible: \(autoEligible))"
+            )
+            // RESIDUAL, ASSERTED SO IT CANNOT BE FORGOTTEN: `DirectorySizer`
+            // is still path-based, so it counts only what it can reach —
+            // here the 4 KiB `payload.bin` at the top and NOT the 8 KiB one
+            // 600 levels down. The deletion is honest; the accounting
+            // under-reports, and the item carries a denial saying so.
+            XCTAssertEqual(report.entries.first?.exactBytes, 4096,
+                           "the deep payload's 8 KiB is not counted")
+        }
     }
 
     func testAutoEligibleSweepItemUnchangedStillDeletes() async throws {
@@ -3305,13 +3541,30 @@ final class CacheCleanerTests: XCTestCase {
         XCTAssertEqual(report.errors.count, 1,
                        "exactly one error for the undeletable entry: \(report.errors)")
         XCTAssertEqual(report.errors.first?.key, lockedItem.key)
-        // The item error carries the PERMISSION-CLASSIFIED failure verbatim —
-        // byte-identical to the independently classified NSError above, which
-        // pins domain/code/underlying-errno without depending on the locale
-        // any localized description is rendered in. A generic deletion error
-        // (or an admission refusal) would not match.
+        // The item error carries the PERMISSION-CLASSIFIED failure, in the
+        // DESCRIPTOR-RELATIVE remover's own words (PR #458 replaced
+        // `FileManager.removeItem` here, so the text is no longer Cocoa's
+        // localized sentence but `DepthSafeRemoval`'s `"<place>: <strerror>"`).
+        //
+        // Still locale-independent, and still the same three things pinned:
+        // the errno is EACCES SPECIFICALLY — corroborated by both the raw
+        // `unlink` probe and the independently classified NSError above, which
+        // agree on the provenance — the failing object is NAMED, and the
+        // rendering carries no depth suffix, so the failure is reported AT the
+        // target rather than somewhere below it. A generic deletion error, a
+        // different errno, or an admission refusal all produce different text.
+        XCTAssertEqual(
+            (classified.userInfo[NSUnderlyingErrorKey] as? NSError)?.code,
+            Int(EACCES),
+            "the independent classification still agrees the cause is EACCES"
+        )
+        // Spelled the way the SCANNER was fed the root — the canonical
+        // `/private/var/…` form fn-6.1 hands production, not the `/var/…`
+        // alias `makeTempDir` happens to return.
+        let lockedCanonical = FileSystemIdentityProvider().canonicalize(locked)
         XCTAssertEqual(report.errors.first?.message,
-                       classified.localizedDescription,
+                       "\(lockedCanonical.path): "
+                           + "\(String(cString: strerror(EACCES)))",
                        "the error text is the permission-classified deletion failure")
         XCTAssertEqual(report.entries.count, 2, "N−1 entries still deleted")
         for entry in report.entries {
@@ -3396,5 +3649,606 @@ final class CacheCleanerTests: XCTestCase {
         XCTAssertTrue(
             logContents(home: world.home).contains("REFUSED [container-unavailable]")
         )
+    }
+
+    // MARK: - The folder that HOLDS the target (PR #458 review — the P1)
+
+    /// Swaps a directory the cleaner never binds — the target's PARENT — at
+    /// the one instant that matters: after the cleaner has read that folder's
+    /// identity from a descriptor and before `removeItemConcurrently`'s queue
+    /// hop hands a PATH to the deletion.
+    ///
+    /// The seam is the cleaner's own final container re-admission
+    /// (`admitContainer` → `probeKind` of the container root, the third such
+    /// question in the item pipeline — the first two belong to the admission
+    /// above the sizer). Every mutation is a real `rename(2)`; the fixture is
+    /// never more capable than a shell in the developer's projects folder.
+    private final class SwapTheItemsParentAtTheHopProvider:
+        FileSystemIdentityProvider, @unchecked Sendable {
+        /// The container root the item was admitted under — the spelling this
+        /// fixture COUNTS questions about, and deliberately does not touch.
+        var container: URL!
+        /// The directory that HOLDS the target. Nothing in the cleaner binds
+        /// it: the snapshot binds `container`, and the target is a strict
+        /// DESCENDANT of it.
+        var parent: URL!
+        /// Where that directory is renamed to.
+        var parentMovedAway: URL!
+        /// A stranger's directory, holding a tree with the target's own name.
+        var stranger: URL!
+        private var seen = 0
+        private(set) var swapped = false
+
+        override func probeKind(of url: URL) -> KindProbe {
+            let answer = super.probeKind(of: url)
+            guard url.standardizedFileURL.path
+                    == container.standardizedFileURL.path else { return answer }
+            seen += 1
+            guard seen == 3, !swapped else { return answer }
+            swapped = true
+            XCTAssertEqual(rename(parent.path, parentMovedAway.path), 0,
+                           "fixture: the target's parent is renamed away")
+            XCTAssertEqual(rename(stranger.path, parent.path), 0,
+                           "fixture: a stranger's directory takes its place")
+            return answer
+        }
+    }
+
+    /// A BINDING THAT DOES NOT REACH THE DESTRUCTIVE CALL IS NOT A BINDING.
+    ///
+    /// `DepthSafeRemoval` resolves exactly one path — the target's parent —
+    /// and it resolves it on the far side of a queue hop measured at 0.095 /
+    /// 0.097 / 0.126 ms. Nothing else in item mode binds that folder:
+    /// `admitContainer` binds the container ROOT to the scan-session
+    /// snapshot, and a target is a strict DESCENDANT, so for the ordinary
+    /// `<container>/proj/artifacts` shape the directory the deletion actually
+    /// opens (`proj`) was bound by NOTHING. This item also has no leaf
+    /// binding — its scanner declares no `PreDeleteRevalidator`, so
+    /// `preDeleteOutcome` yields `.unestablished` and `expecting:` is `nil`,
+    /// which is the exact population residual #3 of `DepthSafeRemoval` named.
+    ///
+    /// Measured through this cleaner before the wiring: two real `rename(2)`s
+    /// at the seam and the deletion emptied the STRANGER's `artifacts` —
+    /// `precious.bin` gone, `entries=1`, `errors=[]`, SUCCESS reported for a
+    /// tree the app had never looked at.
+    func testAnItemWhoseParentIsSwappedAtTheQueueHopIsRefused() async throws {
+        let home = try makeTempDir("home")
+        let base = try makeTempDir()
+        defer {
+            try? FileManager.default.removeItem(at: home)
+            try? FileManager.default.removeItem(at: base)
+        }
+        let container = base.appendingPathComponent("projects")
+        let parent = container.appendingPathComponent("proj")
+        let target = parent.appendingPathComponent("artifacts")
+        try FileManager.default.createDirectory(
+            at: target, withIntermediateDirectories: true
+        )
+        try writeFile(target.appendingPathComponent("ours.bin"))
+
+        // The stranger: same-named tree, real content, one rename away from
+        // standing exactly where the deletion is about to look.
+        let stranger = base.appendingPathComponent("stranger")
+        let precious = stranger
+            .appendingPathComponent("artifacts/precious.bin")
+        try FileManager.default.createDirectory(
+            at: precious.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try writeFile(precious, bytes: 4096)
+
+        let provider = SwapTheItemsParentAtTheHopProvider()
+        provider.container = provider.canonicalize(container)
+        provider.parent = parent
+        provider.parentMovedAway = base.appendingPathComponent("proj-gone")
+        provider.stranger = stranger
+
+        let cleaner = CacheCleaner(
+            home: home,
+            containerRoots: [container],
+            containerSnapshot: sessionSnapshot(of: [container]),
+            provider: provider
+        )
+        let report = await cleaner.clean(
+            items: [removableItem(
+                at: target, originContainer: container, provider: provider
+            )],
+            moveToTrash: false
+        )
+
+        XCTAssertTrue(provider.swapped, "the fixture never performed the swap")
+        // The stranger now answers to the target's parent path, which is
+        // exactly why the deletion would have walked into it.
+        let preciousAfterSwap = parent
+            .appendingPathComponent("artifacts/precious.bin")
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: preciousAfterSwap.path),
+            "the STRANGER's tree was deleted — the deletion opened a path "
+                + "nobody had bound and every descriptor-relative proof "
+                + "below it then agreed, inside somebody else's folder"
+        )
+        XCTAssertTrue(
+            report.entries.isEmpty,
+            "reported SUCCESS for a tree it never admitted: \(report.entries)"
+        )
+        XCTAssertEqual(report.errors.count, 1)
+        let message = try XCTUnwrap(report.errors.first?.message)
+        XCTAssertTrue(
+            message.contains(
+                "the folder that holds this item is no longer the one the "
+                    + "safety check admitted"
+            ),
+            message
+        )
+        XCTAssertTrue(
+            logContents(home: home).contains("REFUSED [container-drift]"),
+            "a container swap is a different event from a content swap and "
+                + "the cleanup log must not blur them"
+        )
+    }
+
+    /// Swaps a CATEGORY ROOT after its children have been enumerated, at the
+    /// first question the per-child pipeline asks about a child — which is
+    /// after the root's identity has been captured and before the queue hop.
+    private final class SwapTheCategoryRootMidLoopProvider:
+        FileSystemIdentityProvider, @unchecked Sendable {
+        var child: URL!
+        var root: URL!
+        var rootMovedAway: URL!
+        var stranger: URL!
+        private(set) var swapped = false
+
+        override func probeKind(of url: URL) -> KindProbe {
+            guard !swapped,
+                  url.standardizedFileURL.path
+                      == child.standardizedFileURL.path
+            else { return super.probeKind(of: url) }
+            swapped = true
+            XCTAssertEqual(rename(root.path, rootMovedAway.path), 0,
+                           "fixture: the enumerated root is renamed away")
+            XCTAssertEqual(rename(stranger.path, root.path), 0,
+                           "fixture: a stranger's directory takes its place")
+            return super.probeKind(of: url)
+        }
+    }
+
+    /// CONTENTS MODE HAS NO LEAF BINDING AT ALL, SO THE CONTAINER BINDING IS
+    /// THE ONLY ONE IT HAS.
+    ///
+    /// The per-child loop enumerates names out of one directory and then
+    /// unlinks them out of whatever that directory's PATH leads to when the
+    /// removal opens it, a queue hop later. `expecting:` is `nil` here by
+    /// construction — contents mode runs no user-data probe — so before the
+    /// wiring nothing whatsoever could notice the root being swapped: the
+    /// stranger's identically-named child was deleted and its bytes reported
+    /// as freed.
+    func testContentsModeRefusesARootSwappedAfterItsChildrenWereEnumerated()
+        async throws {
+        let home = try makeTempDir("home")
+        let base = try makeTempDir()
+        defer {
+            try? FileManager.default.removeItem(at: home)
+            try? FileManager.default.removeItem(at: base)
+        }
+        let root = base.appendingPathComponent("cache-root")
+        let child = root.appendingPathComponent("entry")
+        try FileManager.default.createDirectory(
+            at: child, withIntermediateDirectories: true
+        )
+        try writeFile(child.appendingPathComponent("ours.bin"))
+
+        let stranger = base.appendingPathComponent("stranger")
+        let precious = stranger.appendingPathComponent("entry/precious.bin")
+        try FileManager.default.createDirectory(
+            at: precious.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try writeFile(precious, bytes: 4096)
+
+        let provider = SwapTheCategoryRootMidLoopProvider()
+        provider.child = child
+        provider.root = root
+        provider.rootMovedAway = base.appendingPathComponent("cache-root-gone")
+        provider.stranger = stranger
+
+        let category = makeCategory(at: root)
+        let cleaner = CacheCleaner(
+            home: home, containerRoots: [], provider: provider
+        )
+        let report = await cleaner.clean(
+            items: categoryItems(
+                [makeScanResult(category: category)],
+                home: home, provider: provider
+            ),
+            moveToTrash: false
+        )
+
+        XCTAssertTrue(provider.swapped, "the fixture never performed the swap")
+        // The stranger now answers to the category root's path.
+        let preciousAfterSwap = root
+            .appendingPathComponent("entry/precious.bin")
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: preciousAfterSwap.path),
+            "the STRANGER's child was deleted — a contents-mode deletion has "
+                + "no leaf binding, so the container binding is the only "
+                + "thing that can refuse here"
+        )
+        XCTAssertTrue(
+            report.entries.isEmpty,
+            "reported freed bytes for a stranger's tree: \(report.entries)"
+        )
+        XCTAssertEqual(report.errors.count, 1)
+        let message = try XCTUnwrap(report.errors.first?.message)
+        XCTAssertTrue(
+            message.contains(
+                "the folder that holds this item is no longer the one the "
+                    + "safety check admitted"
+            ),
+            message
+        )
+        XCTAssertTrue(
+            logContents(home: home).contains("REFUSED [container-drift]"),
+            "one word for one event, whichever mode caught it"
+        )
+    }
+
+    // MARK: - The SAME folder, on the disposal the GUI actually uses
+
+    /// THE CONTAINER BINDING ON THE ARM MOST USERS TAKE (PR #458 review — the
+    /// P1 three rounds of permanent-delete fixes left open).
+    ///
+    /// `CacheoutViewModel.moveToTrash` is `true` out of the box, so the two
+    /// tests above bound the disposal MOST DELETIONS DO NOT USE. This is the
+    /// item-mode twin of `testAnItemWhoseParentIsSwappedAtTheQueueHopIsRefused`
+    /// — identical fixture, identical two real `rename(2)`s, one flag flipped
+    /// — and before the fix the identical outcome the permanent arm used to
+    /// produce: the STRANGER's `artifacts` moved to the Trash, `entries=1`
+    /// carrying the byte count of the tree the app had actually measured, and
+    /// `errors=[]`.
+    ///
+    /// The item carries NO leaf binding (`fixture_scanner` declares no
+    /// `PreDeleteRevalidator`, so `preDeleteOutcome` yields `.unestablished`),
+    /// which is exactly the population the container binding exists for.
+    func testTrashModeRefusesAnItemWhoseParentIsSwappedBeforeTheDisposal()
+        async throws {
+        let home = try makeTempDir("home")
+        let base = try makeTempDir()
+        let trashDir = try makeTempDir("fake-trash")
+        defer {
+            try? FileManager.default.removeItem(at: home)
+            try? FileManager.default.removeItem(at: base)
+            try? FileManager.default.removeItem(at: trashDir)
+        }
+        let container = base.appendingPathComponent("projects")
+        let parent = container.appendingPathComponent("proj")
+        let target = parent.appendingPathComponent("artifacts")
+        try FileManager.default.createDirectory(
+            at: target, withIntermediateDirectories: true
+        )
+        try writeFile(target.appendingPathComponent("ours.bin"))
+
+        let stranger = base.appendingPathComponent("stranger")
+        let precious = stranger
+            .appendingPathComponent("artifacts/precious.bin")
+        try FileManager.default.createDirectory(
+            at: precious.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try writeFile(precious, bytes: 4096)
+
+        let provider = SwapTheItemsParentAtTheHopProvider()
+        provider.container = provider.canonicalize(container)
+        provider.parent = parent
+        provider.parentMovedAway = base.appendingPathComponent("proj-gone")
+        provider.stranger = stranger
+
+        let recorder = TrashRecorder()
+        let cleaner = CacheCleaner(
+            home: home,
+            containerRoots: [container],
+            containerSnapshot: sessionSnapshot(of: [container]),
+            provider: provider,
+            trashHandler: makeTrashSeam(into: trashDir, recorder: recorder)
+        )
+        let report = await cleaner.clean(
+            items: [removableItem(
+                at: target, originContainer: container, provider: provider
+            )],
+            moveToTrash: true
+        )
+
+        XCTAssertTrue(provider.swapped, "the fixture never performed the swap")
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: parent.appendingPathComponent(
+                    "artifacts/precious.bin"
+                ).path
+            ),
+            "the STRANGER's tree was moved to the TRASH — the disposal acted "
+                + "on whatever answered to the path, with no binding at all"
+        )
+        XCTAssertTrue(
+            recorder.urls.isEmpty,
+            "the disposal ran: a container proof that cannot reach the mover "
+                + "must refuse BEFORE anything reaches the Trash, got "
+                + "\(recorder.urls)"
+        )
+        XCTAssertTrue(
+            report.entries.isEmpty,
+            "reported freed bytes for a stranger's tree: \(report.entries)"
+        )
+        XCTAssertEqual(report.errors.count, 1)
+        let message = try XCTUnwrap(report.errors.first?.message)
+        XCTAssertTrue(
+            message.contains(
+                "the folder that holds this item is no longer the one the "
+                    + "safety check admitted"
+            ),
+            message
+        )
+        XCTAssertTrue(
+            logContents(home: home).contains("REFUSED [container-drift]"),
+            "one word for one event, whichever DISPOSAL caught it"
+        )
+    }
+
+    /// CONTENTS MODE ON THE TRASH ARM HAS NO BINDING WHATSOEVER — the twin of
+    /// `testContentsModeRefusesARootSwappedAfterItsChildrenWereEnumerated`,
+    /// with `moveToTrash: true`.
+    ///
+    /// Contents mode runs no user-data probe, so `expecting:` is `nil` by
+    /// construction; before the fix the Trash arm additionally ignored the
+    /// container binding the permanent arm had just been given, so NOTHING
+    /// could notice the enumerated root being swapped: the stranger's
+    /// identically-named child went to the Trash and its bytes were reported
+    /// as freed.
+    func testTrashModeContentsRefusesARootSwappedAfterEnumeration()
+        async throws {
+        let home = try makeTempDir("home")
+        let base = try makeTempDir()
+        let trashDir = try makeTempDir("fake-trash")
+        defer {
+            try? FileManager.default.removeItem(at: home)
+            try? FileManager.default.removeItem(at: base)
+            try? FileManager.default.removeItem(at: trashDir)
+        }
+        let root = base.appendingPathComponent("cache-root")
+        let child = root.appendingPathComponent("entry")
+        try FileManager.default.createDirectory(
+            at: child, withIntermediateDirectories: true
+        )
+        try writeFile(child.appendingPathComponent("ours.bin"))
+
+        let stranger = base.appendingPathComponent("stranger")
+        let precious = stranger.appendingPathComponent("entry/precious.bin")
+        try FileManager.default.createDirectory(
+            at: precious.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try writeFile(precious, bytes: 4096)
+
+        let provider = SwapTheCategoryRootMidLoopProvider()
+        provider.child = child
+        provider.root = root
+        provider.rootMovedAway = base.appendingPathComponent("cache-root-gone")
+        provider.stranger = stranger
+
+        let recorder = TrashRecorder()
+        let cleaner = CacheCleaner(
+            home: home, containerRoots: [], provider: provider,
+            trashHandler: makeTrashSeam(into: trashDir, recorder: recorder)
+        )
+        let report = await cleaner.clean(
+            items: categoryItems(
+                [makeScanResult(category: makeCategory(at: root))],
+                home: home, provider: provider
+            ),
+            moveToTrash: true
+        )
+
+        XCTAssertTrue(provider.swapped, "the fixture never performed the swap")
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: root.appendingPathComponent("entry/precious.bin").path
+            ),
+            "the STRANGER's child was moved to the Trash — a contents-mode "
+                + "disposal has no leaf binding, so the container binding is "
+                + "the only thing that can refuse here, on EITHER arm"
+        )
+        XCTAssertTrue(
+            recorder.urls.isEmpty,
+            "the disposal ran: nothing may reach the Trash, got \(recorder.urls)"
+        )
+        XCTAssertTrue(
+            report.entries.isEmpty,
+            "reported freed bytes for a stranger's tree: \(report.entries)"
+        )
+        XCTAssertEqual(report.errors.count, 1)
+        let message = try XCTUnwrap(report.errors.first?.message)
+        XCTAssertTrue(
+            message.contains(
+                "the folder that holds this item is no longer the one the "
+                    + "safety check admitted"
+            ),
+            message
+        )
+        XCTAssertTrue(
+            logContents(home: home).contains("REFUSED [container-drift]"),
+            "one word for one event, whichever DISPOSAL caught it"
+        )
+    }
+
+    /// THE WINDOW NO PRE-CALL PROOF CAN REACH, ON THE UNBOUND POPULATION.
+    ///
+    /// `FileManager.trashItem(at:)` takes a URL and resolves it INSIDE itself,
+    /// so the swap performed here — inside the disposal seam, which is exactly
+    /// where production's own resolution happens — beats every proof taken
+    /// before the call. The Trash is reversible by construction, so what
+    /// closes the OUTCOME is the proof taken AFTER: what landed is compared
+    /// with the leaf the cleaner bound UNDER the admitted container, and a
+    /// mismatch is PUT BACK and refused.
+    ///
+    /// Before the fix this arm had no binding on either side: the stranger's
+    /// tree stayed in the Trash and its bytes were reported as freed.
+    func testTrashModeContentsPutsBackAChildTheDisposalTookWrongly()
+        async throws {
+        let home = try makeTempDir("home")
+        let base = try makeTempDir()
+        let trashDir = try makeTempDir("fake-trash")
+        defer {
+            try? FileManager.default.removeItem(at: home)
+            try? FileManager.default.removeItem(at: base)
+            try? FileManager.default.removeItem(at: trashDir)
+        }
+        let root = base.appendingPathComponent("cache-root")
+        let child = root.appendingPathComponent("entry")
+        try FileManager.default.createDirectory(
+            at: child, withIntermediateDirectories: true
+        )
+        try writeFile(child.appendingPathComponent("ours.bin"))
+        let ourChildMovedAway = base.appendingPathComponent("entry-moved-away")
+        // The stranger's tree, one rename away from standing at the child's
+        // own name INSIDE the admitted (and still correct) container.
+        let stranger = base.appendingPathComponent("stranger-entry")
+        try FileManager.default.createDirectory(
+            at: stranger, withIntermediateDirectories: true
+        )
+        try writeFile(
+            stranger.appendingPathComponent("precious.bin"), bytes: 4096
+        )
+
+        let recorder = TrashRecorder()
+        let cleaner = CacheCleaner(
+            home: home, containerRoots: [],
+            trashHandler: { url in
+                // Real syscalls at the one instant no pre-call proof reaches:
+                // after the binding, inside the disposal.
+                try FileManager.default.moveItem(at: child, to: ourChildMovedAway)
+                try FileManager.default.moveItem(at: stranger, to: child)
+                recorder.record(url)
+                let landed = trashDir
+                    .appendingPathComponent(url.lastPathComponent)
+                try FileManager.default.moveItem(at: url, to: landed)
+                return landed
+            }
+        )
+        let report = await cleaner.clean(
+            items: categoryItems(
+                [makeScanResult(category: makeCategory(at: root))], home: home
+            ),
+            moveToTrash: true
+        )
+
+        XCTAssertEqual(recorder.urls.count, 1,
+                       "the fixture never reached the disposal")
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: child.appendingPathComponent("precious.bin").path
+            ),
+            "the wrongly-taken tree was left in the Trash — a disposal that "
+                + "cannot be proved must be UNDONE, not merely reported"
+        )
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: trashDir.appendingPathComponent("entry").path
+            ),
+            "and nothing of it may remain in the Trash"
+        )
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: ourChildMovedAway.path),
+            "our own child is untouched wherever the fixture put it"
+        )
+        XCTAssertTrue(
+            report.entries.isEmpty,
+            "reported freed bytes for a tree it never bound: \(report.entries)"
+        )
+        XCTAssertEqual(report.errors.count, 1)
+        let message = try XCTUnwrap(report.errors.first?.message)
+        XCTAssertTrue(message.contains("PUT BACK"), message)
+        XCTAssertTrue(message.contains("nothing was freed"), message)
+    }
+
+    /// Removes the child inside the ONE window between the container proof
+    /// and the leaf bind — the `probeChild` that reads the leaf under the
+    /// held container descriptor. A real `removeItem`, no sleeps.
+    private final class VanishTheChildAtTheBindProvider:
+        FileSystemIdentityProvider, @unchecked Sendable {
+        var child: URL!
+        private(set) var vanished = false
+
+        override func probeChild(
+            inDirectory descriptor: Int32, named name: String,
+            logical: @autoclosure () -> URL
+        ) -> ChildProbe {
+            let url = logical()
+            if !vanished,
+               url.standardizedFileURL.path
+                   == child.standardizedFileURL.path {
+                vanished = true
+                try? FileManager.default.removeItem(at: child)
+            }
+            return super.probeChild(
+                inDirectory: descriptor, named: name, logical: url
+            )
+        }
+    }
+
+    /// A LEAF THAT IS NOT THERE IS NOTHING TO BIND, AND UNBOUND IS REFUSED.
+    ///
+    /// The binding is taken under the proved container, so a child that
+    /// vanishes in that window yields `.absent` — and the disposal must NOT
+    /// go ahead unbound, because whatever answers to the name a moment later
+    /// is precisely what the Trash would then take with nothing to prove it
+    /// against. The refusal is the item-keyed `ENOENT` the disposal would
+    /// have produced anyway; what it adds is that the Trash is never touched.
+    func testTrashModeRefusesAChildThatVanishedBeforeItCouldBeBound()
+        async throws {
+        let home = try makeTempDir("home")
+        let base = try makeTempDir()
+        let trashDir = try makeTempDir("fake-trash")
+        defer {
+            try? FileManager.default.removeItem(at: home)
+            try? FileManager.default.removeItem(at: base)
+            try? FileManager.default.removeItem(at: trashDir)
+        }
+        let root = base.appendingPathComponent("cache-root")
+        let child = root.appendingPathComponent("entry")
+        try FileManager.default.createDirectory(
+            at: child, withIntermediateDirectories: true
+        )
+        try writeFile(child.appendingPathComponent("ours.bin"), bytes: 4096)
+
+        let provider = VanishTheChildAtTheBindProvider()
+        provider.child = child
+
+        let recorder = TrashRecorder()
+        let cleaner = CacheCleaner(
+            home: home, containerRoots: [], provider: provider,
+            trashHandler: makeTrashSeam(into: trashDir, recorder: recorder)
+        )
+        let report = await cleaner.clean(
+            items: categoryItems(
+                [makeScanResult(category: makeCategory(at: root))],
+                home: home, provider: provider
+            ),
+            moveToTrash: true
+        )
+
+        XCTAssertTrue(provider.vanished, "the fixture never removed the child")
+        XCTAssertTrue(
+            recorder.urls.isEmpty,
+            "a disposal with nothing to prove itself against must not run at "
+                + "all, got \(recorder.urls)"
+        )
+        XCTAssertTrue(
+            report.entries.isEmpty,
+            "nothing may be reported freed: \(report.entries)"
+        )
+        XCTAssertEqual(report.errors.count, 1)
+        let message = try XCTUnwrap(report.errors.first?.message)
+        XCTAssertTrue(
+            message.contains("No such file or directory"), message
+        )
+        XCTAssertTrue(message.contains(child.path), message)
     }
 }

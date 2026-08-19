@@ -105,12 +105,13 @@ and docs/v1/CLI-REFERENCE.md) — the pre-release `node_modules` →
   blind to exactly the firmlink split it was meant to catch. The descriptor's
   own `f_fsid` is now the primary signal; the previous path-based signals are
   kept as an additional, refusal-only backstop.
-- **Known consequence.** The probe is now free of `PATH_MAX`: it can inspect
-  and certify a tree whose absolute paths exceed the limit, while
-  `FileManager.removeItem` — which the cleaner still uses — cannot address
-  one. Such a deletion fails with its own error rather than being silently
-  skipped; giving the deleter the same descriptor-relative treatment is
-  tracked separately.
+- **Resolved consequence.** The probe was made free of `PATH_MAX` — it can
+  inspect and certify a tree whose absolute paths exceed the limit — before
+  the deleter was, and while that gap existed the build-artifacts scanner
+  refused such trees outright so it could not offer a row that only
+  half-deleted. Both deletion routes now handle them (see "Build folders
+  nested deeper than the system path limit" under Fixed), and that refusal is
+  retired.
 - **Known residual.** `DirectorySizer` is still a path-based
   `FileManager.enumerator` walk, so an ancestor swap landing after the
   containment descent above can still redirect the SIZING of a build-artifact
@@ -120,6 +121,32 @@ and docs/v1/CLI-REFERENCE.md) — the pre-release `node_modules` →
   and cannot move the deletion target, which stays the unresolved spelling the
   cleaner re-admits and the revalidator re-proves. Converting the sizer is
   tracked separately.
+- **Known residual: content created in a folder Cacheout has already looked
+  inside can still be swept.** Every safety check that binds an OBJECT —
+  the held directory handles, the `..` re-anchors, the final identity
+  re-check — answers "is this the same folder?", and when an app ADDS
+  something (a `Documents` folder, say) to a folder that was already read,
+  the answer is correctly YES: nothing was renamed, nothing was replaced,
+  the folder has the same identity it always had. Identity says which object;
+  it says nothing about what is now inside it. So the inspection reports no
+  user data and no obstruction, and the entry can be moved to the Trash or
+  deleted permanently even though the new content was never looked at.
+  Retiring the depth cap WIDENED this: folders past the old limit used to
+  come back "couldn't finish inspecting" and were therefore never cleanable
+  automatically; they now come back clean, which is the point of the fix and
+  is also what exposes them. It needs a writer into `~/Library/Caches` whose
+  write lands between the pre-delete inspection reading that folder and the
+  deletion itself, on an entry already eligible for automatic cleaning. The
+  window is measured, not assumed: the tail from inspection to deletion is
+  ~0.5 ms and does not grow, but the folder read FIRST stays exposed for the
+  rest of the walk — ~23 µs per entry inspected, so ~20 ms on an 840-entry
+  tree and ~0.46 s projected on a 20,000-entry one. What limits the damage
+  today is that the app's default is Move to Trash, which destroys nothing
+  and is undone with one drag; a permanent delete has no such consolation.
+  Closing it properly means checking for user data DURING the removal — the
+  deletion already walks the tree by open handle and is the only step in a
+  position to refuse what it is about to unlink — and that is tracked
+  separately.
 
 ### Changed
 
@@ -169,6 +196,132 @@ and docs/v1/CLI-REFERENCE.md) — the pre-release `node_modules` →
   reachable. `-I` and `--exclude-dir` keep it scoped to source: a stale or
   freshly written `__pycache__/*.pyc` would otherwise let the gate report on
   build artifacts instead of on the code.
+
+### Fixed
+
+- **Deleting a folder nested deeper than the system path limit now works.**
+  Inspection had been made descriptor-relative and could read such trees;
+  permanent deletion still went through `FileManager.removeItem`, which
+  builds an absolute path per entry and cannot. The result was a cache
+  folder reported as inspected and clean that no route in the app could ever
+  remove: it failed instantly, every time, with "the file name is invalid" —
+  a message naming a cause that did not exist, since the names were fine and
+  the DEPTH was the problem. `rm -rf` removed the identical folder in under a
+  second, so the refusal was the app's own. Permanent deletion now traverses
+  by open directory handle the same way, with the same no-follow and
+  mount-boundary rules as the inspection, and a constant number of open
+  handles at any depth. Moving to the Trash was never affected (it is a
+  rename). REMAINING, and now said honestly instead of being blamed on a
+  file name: the SIZE of such a folder still cannot be measured, so it is
+  listed at review risk with "couldn't measure its size: part of it sits
+  deeper than an absolute path can address — deleting it still works", and
+  the bytes it frees are under-reported.
+- **Build folders nested deeper than the system path limit are listed again.**
+  They were withheld on purpose: while permanent deletion went through
+  `FileManager.removeItem`, such a folder could only ever be HALF deleted —
+  the removal unlinked what it reached and then failed (measured: 202 → 181
+  entries, and "0 bytes freed" reported to you) — so offering the row would
+  have offered something no route could finish. Deletion no longer works that
+  way. The permanent route traverses by open directory handle, and Move to
+  Trash — the default — is a rename of the top folder, measured on a real
+  over-limit tree: every entry arrived, nothing was left behind, nothing was
+  half-moved. Both routes remove it whole, so the row is offered again. What
+  is left is a MEASUREMENT limit, not a deletion one, and it is all the row
+  now claims: the size shown is a FLOOR, the row is listed at review risk and
+  never selected automatically, and it says so — "SIZE IS A FLOOR … deleting
+  it still removes it whole; shorten or move the tree … to see its full
+  size". Shorten the tree and it becomes an ordinary fully measured row.
+- **Orphaned-caches delete: a folder replaced after it was inspected is no
+  longer deleted.** The pre-delete safety inspection holds the folder open,
+  which is what stops it following a swap — and also what pins it to the
+  folder it opened. If that folder was renamed away and a NEW one created
+  under the same name, the inspection reported "clean" about the folder it
+  held while the deletion, which works by path, removed the replacement.
+  Every other check in the path (container admission, containment, deny
+  list, mount boundary) is satisfied by the replacement. The inspection now
+  re-checks its own root before accepting a result, and reports WHICH object
+  its verdict is about so the deletion refuses unless that object is still
+  the one at the path. Refusals are clearable by re-scanning.
+- **Orphaned-caches "Move to Trash": the same replaced folder is no longer
+  trashed either.** Move to Trash is ON by default, and it did not go
+  through the deletion that was hardened above — it handed the folder's path
+  to the system Trash, behind nothing but a check that a swap timed one
+  syscall earlier defeats. A folder replaced in that instant was moved to
+  the Trash whole, and the app reported success with the byte count of the
+  folder it had actually inspected. The system Trash takes a path and
+  resolves it itself, so the check cannot be handed the open folder the way
+  the permanent deletion now can; what makes this safe instead is that
+  moving to the Trash destroys nothing. The app now checks the folder it
+  holds open before the move, checks WHAT THE TRASH ACTUALLY TOOK
+  afterwards, and PUTS BACK anything that turns out not to be the inspected
+  folder — reporting zero bytes freed either way. REMAINING: if the put-back
+  cannot be performed because something else has taken the original name,
+  the item stays in the Trash and the error names its path so it can be
+  restored in one drag; and a Trash that will not say where it put an item
+  is refused rather than counted, leaving that item in the Trash too.
+- **Deletes now check the FOLDER THAT HOLDS the item, not only the item.**
+  Every check above the deletion is about the item itself or about the
+  container root you configured; the folder in between — `proj` in
+  `~/Projects/proj/node_modules`, or the cache folder a category's contents
+  are cleaned out of — was checked by nothing. Deletion runs on a background
+  queue and the folder's path is resolved on the far side of that hop, so a
+  folder renamed away and replaced in that window (an app reinstalling its
+  cache directory does exactly this) sent the whole deletion into the
+  replacement: a same-named folder inside it was deleted and the app reported
+  success with the replacement's byte count. Cacheout now reads the holding
+  folder's identity from an open handle BEFORE handing the deletion a path,
+  and the deletion refuses unless the folder it opens is that same one —
+  "the folder that holds this item is no longer the one the safety check
+  admitted", clearable by re-scanning. This covers permanent deletes, category
+  contents cleans, and — see the next entry — Move to Trash. REMAINING: a swap
+  that happens BEFORE that reading is invisible, because both sides then see
+  the replacement and agree about it.
+- **"Move to Trash" now gets that same folder check — including for the items
+  that have no content check of their own.** Move to Trash is ON by default, so
+  it is the disposal most deletions use, and the folder check above landed on
+  permanent deletes only. Two paths still handed the system Trash a bare path:
+  EVERY category contents clean (those run no content inspection at all), and
+  every item from a scanner that does not offer one. For those, a folder
+  renamed away and replaced in that window sent the disposal into the
+  replacement — a same-named folder inside it went to the Trash, and the app
+  reported success with the byte count of the folder it had actually measured.
+  Cacheout now checks the holding folder from an open handle and identifies the
+  item under it immediately before the disposal, then checks what the Trash
+  actually took afterwards; anything it cannot prove is PUT BACK and reported
+  as a refusal, with nothing counted as freed. If the put-back cannot be
+  performed the item stays in the Trash and the error names its path, so it is
+  recoverable in one drag.
+- **"Move to Trash" undo: a put-back will not restore into a folder it cannot
+  prove.** When the Trash turns out to have taken the wrong folder, Cacheout
+  puts it back. That undo held its destination folder open but never checked
+  WHICH folder it was, and the check it ran afterwards went through the same
+  unchecked handle — so it confirmed itself. A folder swap in that window
+  moved your tree out of the Trash and into a stranger's folder while the app
+  reported the item had been PUT BACK. The destination is now checked against
+  the identity taken before the disposal, and when it disagrees nothing is
+  moved at all: the item stays in the Trash, and the error names both the
+  Trash path it is at and the fact that the destination folder changed.
+- **Orphaned-caches probe: deep folders no longer burn CPU quadratically.**
+  The walk re-scanned its whole open-folder stack on every level it
+  descended, so a deeply nested cache close to the inspection budget could
+  stall for a long time even though the number of entries inspected was
+  capped. The accounting is now incremental and bounded by the number of
+  folders held open, never by depth.
+- **Orphaned-caches probe: ancestor-swap disclosure.** The bounded
+  user-data probe resolved each child by absolute path, so a directory
+  replaced by a symlink after its parent had been read (but before the
+  child was vetted) redirected the walk outside `~/Library/Caches` — up to
+  the full 20,000-entry budget — and attributed what it found there to the
+  cache entry. `O_NOFOLLOW` guards only the final component, and the
+  identity re-proof could not help because the identity it compared was
+  already the foreign object's. The probe now holds each parent open and
+  discovers, stats and descends every child relative to that descriptor by
+  single-component basename, at a bounded number of live descriptors. Two
+  side effects are user-visible: trees whose absolute paths exceed
+  `PATH_MAX` are now inspected instead of being refused forever, and mount
+  boundaries are detected by filesystem id rather than by path spelling, so
+  an aliased path can no longer hide one.
+
 
 ## [2.2.0] - 2026-08-06
 

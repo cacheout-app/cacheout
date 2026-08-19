@@ -448,6 +448,50 @@ struct ScanOutcome: Sendable {
 
 // MARK: - Pre-delete revalidator seam (fn-4.8, R17/D8)
 
+/// WHAT AN ALLOW VERDICT IS ABOUT (PR #458 review r7 — the swap DUAL).
+///
+/// A revalidator's inspection is anchored to a HELD DESCRIPTOR, which is what
+/// stops it FOLLOWING a swap — and, by exactly the same mechanism, PINS it to
+/// the old inode when one happens. That is the dual of the ancestor-swap bug
+/// the descriptor family closed: inspect the right object and then DELETE A
+/// DIFFERENT ONE at the same name. A verdict is therefore not a fact about a
+/// PATH; it is a fact about an OBJECT, and it must travel with enough identity
+/// for the deletion to prove the path still names that object
+/// (`CacheCleaner.removeGuardedItem` → `DepthSafeRemoval.proveInspectedRoot`
+/// and `TrashDisposal.dispose(_:expecting:…)`).
+///
+/// It lives HERE, on the scanner-agnostic seam, rather than inside one
+/// scanner's probe result, because `PreDeleteVerdict.allow` carries it and
+/// every revalidator has to name it. `OrphanedCachesScanner` keeps
+/// `UserDataProbeResult.InspectedRoot` as an alias for it.
+///
+/// IT IS NOT THE ONLY BINDING, AND A SCANNER WITH NO REVALIDATOR IS NOT AN
+/// UNBOUND DELETION. The cleaner additionally binds the folder that HOLDS the
+/// target (`DepthSafeRemoval.admittedParent`) and proves it on BOTH disposal
+/// arms — the permanent one at its parent open, the Trash one through
+/// `TrashDisposal.dispose(_:containedIn:…)`, which also binds the leaf under
+/// that proved container. That pair is what covers the `.unestablished`
+/// population the third case below describes, and it is worth naming here
+/// because "no verdict" was read as "nothing to bind" at two Trash call sites
+/// for three review rounds.
+enum PreDeleteInspectedObject: Equatable, Sendable {
+    /// A real directory was opened and walked; this is the `fstat` identity
+    /// of the descriptor the whole walk was anchored to.
+    case directory(FileSystemIdentityProvider.Identity)
+    /// The root open reported `ENOENT`/`ENOTDIR`: there is no directory TREE
+    /// of ours at that name — absent, symlink, regular file, special file —
+    /// and deletion removes the leaf as-is. The clean verdict is about the
+    /// ABSENCE of a tree, so a directory appearing at that name since voids it
+    /// just as surely as a swapped inode.
+    case noDirectoryTree
+    /// Nothing was established: either the inspection refused before it could
+    /// bind anything, or this revalidator has no object binding to offer at
+    /// all. NEVER a licence to delete — the cleaner treats it as "no binding",
+    /// which leaves the deletion resting on the gates it always rested on and
+    /// can never widen anything.
+    case unestablished
+}
+
 /// One revalidator's answer for ONE item, immediately before its deletion.
 ///
 /// A revalidation can only ever REFUSE — it NEVER widens admission (the
@@ -458,7 +502,14 @@ enum PreDeleteVerdict: Equatable, Sendable {
     /// Nothing the delete-time inspection saw stands in the way. The
     /// deletion still faces every other gate (admission, snapshot identity,
     /// containment, mount boundaries).
-    case allow
+    ///
+    /// `inspected` is the OBJECT the inspection bound to, carried into the
+    /// disposal itself so the removal (and the Trash arm) can prove the path
+    /// still names it. IT HAS NO DEFAULT ON PURPOSE (PR #458 review): a
+    /// revalidator with nothing to bind must SAY `.unestablished` rather than
+    /// let an implicit value fall through to a destructive call having stated
+    /// nothing at all.
+    case allow(inspected: PreDeleteInspectedObject)
     /// FAIL-CLOSED refusal. `reason` is the item-keyed human detail (the
     /// error surface + the REFUSED log line); `valuables` is the CURRENT
     /// probe's set in the ONE canonical order (empty for revalidators with

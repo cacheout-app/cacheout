@@ -60,7 +60,10 @@ class FileSystemIdentityProvider {
 
     /// Inode identity: device + inode number, from `lstat` (never follows a
     /// symlink leaf — a link's identity is the link itself).
-    struct Identity: Hashable {
+    /// `Sendable` because it is two immutable integers: it travels inside
+    /// `PreDeleteInspectedObject`, which rides the `Sendable`
+    /// `PreDeleteVerdict` from a scanner's revalidator to the cleaner.
+    struct Identity: Hashable, Sendable {
         let device: UInt64
         let inode: UInt64
     }
@@ -292,6 +295,16 @@ class FileSystemIdentityProvider {
     /// catch; `f_fsid` separates them (`{16777235,26}` vs `{16777230,26}`).
     /// `st_dev` is kept because it still catches ordinary external volumes and
     /// is the value hermetic tests inject.
+    ///
+    /// Read from a DESCRIPTOR, never a path (PR #458): the path form
+    /// (`isMountPoint`) compares `f_mntonname` against the SPELLING it was
+    /// handed, so an aliased spelling silently answered `false` — a whole
+    /// failure class that dies with the descriptor family.
+    ///
+    /// ONE shape for both branches' walks (merge of #457/#458): #458 modelled
+    /// the same two facts as a `(Int32, Int32)` tuple plus a hand-written
+    /// `==`. Named fields are the same information with a synthesized
+    /// `Equatable`, and every consumer on both sides compares whole values.
     struct MountIdentity: Equatable {
         let fsidMajor: Int32
         let fsidMinor: Int32
@@ -390,6 +403,17 @@ class FileSystemIdentityProvider {
     /// opened must BE what the parent-relative `fstatat` vetted. Sound now in
     /// a way the path version never was, because the vetted value came from
     /// `fstatat` on the SAME held parent descriptor.
+    ///
+    /// It is also the only way to catch a leaf swapped for a DIFFERENT
+    /// DIRECTORY (PR #458): `O_NOFOLLOW` refuses a leaf swapped for a
+    /// symlink at the open itself, but a directory-for-directory swap passes
+    /// every path check there is, and only this comparison sees it.
+    ///
+    /// PAIRING RULE for tests: production reads both sides from the same
+    /// object (`fstatat` then `fstat`), so they always agree. A test that
+    /// overrides `identity(of:)` for a directory the walk actually OPENS
+    /// must override this in step, or the re-proof sees a divergence
+    /// production cannot produce and refuses.
     func identity(ofDescriptor fd: Int32) -> Identity? {
         var st = stat()
         guard fstat(fd, &st) == 0 else { return nil }
@@ -399,7 +423,13 @@ class FileSystemIdentityProvider {
         )
     }
 
-    /// `fstatfs`/`fstat` of an OPEN descriptor → its mount identity.
+    /// `fstatfs`/`fstat` of an OPEN descriptor → its mount identity. `nil`
+    /// when either call fails, which callers MUST treat as unvetted.
+    ///
+    /// Override point for hermetic mount tests: injecting a foreign
+    /// `fsidMajor`/`fsidMinor` (or `device`) here is the descriptor-shaped
+    /// equivalent of the retired `isMountPoint` inode injection, and it
+    /// cannot be defeated by path spelling.
     func mountIdentity(ofDescriptor fd: Int32) -> MountIdentity? {
         var fs = statfs()
         guard fstatfs(fd, &fs) == 0 else { return nil }
@@ -410,6 +440,121 @@ class FileSystemIdentityProvider {
             fsidMinor: fs.f_fsid.val.1,
             device: UInt64(bitPattern: Int64(st.st_dev))
         )
+    }
+
+    // MARK: - Descriptor-relative traversal, LAZY-SPELLING variant (PR #458)
+    //
+    // The sweep's walk (`OrphanedCachesScanner`) and the depth-safe removal
+    // reach the same syscalls through their OWN seams. The two families are
+    // NOT redundant and neither may be deleted in favour of the other:
+    //
+    //  * the `probeKind(inDirectory:named:logical:)` family above carries an
+    //    EAGER `logical: URL` and returns `LeafMetadata` — the valuables
+    //    identity path needs the metadata, and its walkers already hold the
+    //    composed URL;
+    //  * the `probeChild` family below takes `logical` as an `@autoclosure`
+    //    and returns no metadata — the sweep keeps its spelling as one
+    //    basename per level precisely so the per-entry
+    //    `appendingPathComponent` (O(depth) work per entry, O(depth²)
+    //    retained bytes down a deep chain) is never performed in production,
+    //    and its bounded frame bookkeeping is measured against exactly that.
+    //
+    // They are also two independent TEST SEAMS: every hermetic swap/denial
+    // fixture on either branch overrides one of them by name.
+
+    /// Kind AND identity of one child, from ONE atomic `fstatat`.
+    ///
+    /// Two separate path `lstat`s of the same name (one for the kind, one
+    /// for the identity) are two independent resolutions with a window
+    /// between them; one `fstatat` against a HELD parent descriptor is a
+    /// single resolution that cannot be re-pointed, because the parent is
+    /// an inode we already hold rather than a path anyone can swap.
+    struct ChildFacts: Equatable {
+        let kind: FileKind
+        let identity: Identity
+    }
+
+    /// Errno-aware descriptor-relative probe result — the `KindProbe`
+    /// shape, carrying the identity the same stat established.
+    enum ChildProbe: Equatable {
+        case facts(ChildFacts)
+        /// ENOENT/ENOTDIR — the entry simply is not there any more.
+        case absent
+        /// `fstatat` failed for another reason (EACCES, EIO, …).
+        case failed(errno: Int32)
+    }
+
+    /// `fstatat(descriptor, name, AT_SYMLINK_NOFOLLOW)` — the sweep walk's
+    /// ONE per-entry syscall below its root.
+    ///
+    /// `logical` is the walk's UNRESOLVED spelling of the child. Production
+    /// IGNORES it completely (no path ever reaches a syscall here); it is
+    /// carried solely so tests can key overrides and touch-recording on the
+    /// path the walk believes it is at.
+    ///
+    /// IT IS AN `@autoclosure` PRECISELY BECAUSE PRODUCTION IGNORES IT (see
+    /// the family note above). Overrides evaluate `logical()` once and pass
+    /// the value on.
+    ///
+    /// `name` MUST be a single safe component — callers validate with
+    /// `isSafeComponent` before calling, because `openat`/`fstatat` happily
+    /// accept a MULTI-COMPONENT relative path and `O_NOFOLLOW` then guards
+    /// only its last component (measured: `openat(base,
+    /// "cache/mid/secret.bin", O_NOFOLLOW)` opens a foreign file through a
+    /// symlinked `mid`).
+    func probeChild(
+        inDirectory descriptor: Int32, named name: String,
+        logical: @autoclosure () -> URL
+    ) -> ChildProbe {
+        var st = stat()
+        guard fstatat(descriptor, name, &st, AT_SYMLINK_NOFOLLOW) == 0 else {
+            let code = errno
+            return (code == ENOENT || code == ENOTDIR)
+                ? .absent
+                : .failed(errno: code)
+        }
+        return .facts(ChildFacts(
+            kind: Self.fileKind(from: st),
+            identity: Identity(
+                device: UInt64(bitPattern: Int64(st.st_dev)),
+                inode: UInt64(st.st_ino)
+            )
+        ))
+    }
+
+    /// The outcome of a descriptor-relative directory open — errno carried
+    /// rather than left in the global, which an override could clobber.
+    enum DescriptorOpen: Equatable {
+        case opened(Int32)
+        case failed(errno: Int32)
+    }
+
+    /// `openat(descriptor, name, O_RDONLY|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW)`,
+    /// CARRYING ITS ERRNO in the result.
+    ///
+    /// Distinct from `openChildDirectory(inDirectory:named:logical:)` above
+    /// in exactly that: the raw-`Int32` form leaves the code in the global
+    /// `errno`, which a test override (or any intervening call) can clobber
+    /// before the caller reads it, and the sweep's obstruction taxonomy is
+    /// keyed on the ACTUAL cause. Named apart rather than overloaded because
+    /// the two differ only in return type and in `logical`'s
+    /// eager/`@autoclosure` spelling, which makes a same-named pair
+    /// ambiguous at every call site.
+    ///
+    /// Single component only (see `probeChild`). The descent's safety comes
+    /// from CONTAINMENT — the child is resolved inside an inode we hold —
+    /// not from re-checking a recorded identity, which an ancestor swap
+    /// makes meaningless (the recorded value is then already the foreign
+    /// object's). `logical` is lazy for the same reason as `probeChild`'s:
+    /// production never composes it.
+    func openChildDirectoryCarryingErrno(
+        inDirectory descriptor: Int32, named name: String,
+        logical: @autoclosure () -> URL
+    ) -> DescriptorOpen {
+        let fd = openat(
+            descriptor, name, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW
+        )
+        return fd >= 0 ? .opened(fd) : .failed(errno: errno)
     }
 
     // MARK: - Canonicalization

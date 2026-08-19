@@ -593,7 +593,26 @@ struct ProjectTreeWalker {
         switch denial.kind {
         case .tcc: kind = .tccDenied
         case .permission: kind = .permissionDenied
-        case .metadata, .other: kind = .unreadable
+        // `.unaddressablePath` (PR #458) is grouped here EXPLICITLY, never
+        // through a `default:` — this switch stays exhaustive so a future
+        // kind cannot slip past a reviewer. `ScanIssue.Kind`'s wire strings
+        // are FROZEN, so there is no honest new kind to map it to, and
+        // `.unreadable` is the same landing the other two classifiers on
+        // this taxonomy chose (`OrphanedCachesScanner.rootIssueKind`;
+        // `DirectorySizer.scanErrorKind` → `.other`).
+        //
+        // This is NOT treating it as benign. The issue is still RECORDED,
+        // it still makes its root's outcome non-clean, and the `detail` it
+        // carries is the sizer's own sentence naming the PATH-LENGTH cause
+        // and the `PATH_MAX` limit — not the "file name is invalid" lie the
+        // Cocoa error told. Nor does anything here authorize a deletion: a
+        // walk denial only ever produces a visible issue. Nor does the
+        // build-artifacts DELETION decision hang on it: an over-long tree is
+        // deleted whole by both disposal arms (`DepthSafeRemoval`; the Trash
+        // arm's top-level `rename(2)`), and the descriptor-anchored probe's
+        // `overlongDescendantPathBytes` now feeds the row's SIZE CAVEAT only
+        // — the refusal it used to drive was retired with its premise.
+        case .metadata, .other, .unaddressablePath: kind = .unreadable
         }
         return ScanIssue(url: denial.url, kind: kind, detail: denial.detail)
     }

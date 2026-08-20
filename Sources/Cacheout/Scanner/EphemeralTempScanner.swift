@@ -596,13 +596,16 @@ struct EphemeralTempScanner: @unchecked Sendable {
             // candidate arms accept, except here the consequence is the
             // hang, not only disclosure); a root over-mounted BEFORE app
             // launch hangs construction's one-time realpath
-            // (`EphemeralTempRoots.resolve`); and delete-time PATH LOOKUPS
-            // BELOW a root over-mounted between scan and clean (the
-            // revalidator's `open`, target validation) still traverse the
-            // volume — deletion SAFETY holds there (admission refuses the
-            // exact root stall-free from the same table, and the
-            // capture-time table skip leaves nothing under it admissible),
-            // but those child lookups can block.
+            // (`EphemeralTempRoots.resolve`); and at DELETE time the same
+            // racing window recurs, one table later: admission re-reads the
+            // kernel table first (`admitContainer`'s opening act is
+            // `matchConfiguredRoot`, whose preflight throws
+            // `.deniedVolumeRoot` for a table-mounted origin root ahead of
+            // its own realpath — and target validation, the sizer, and the
+            // revalidator's `open` never run once admission throws), so a
+            // mount landing between scan and clean is refused stall-free,
+            // and only one landing between THAT table read and the child
+            // lookups behind it can still block them.
             if mountTable.contains(root.url.path) {
                 issues.append(ScanIssue(
                     url: root.url, kind: .containerRefused,

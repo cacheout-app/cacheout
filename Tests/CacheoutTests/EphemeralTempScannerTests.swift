@@ -2789,6 +2789,148 @@ extension EphemeralTempScannerTests {
         XCTAssertTrue(reason.contains("a volume is mounted at mnt"), reason)
     }
 
+    /// A provider that FAILS THE TEST on any call naming the over-mounted
+    /// root or anything below it while armed — "zero first contact" as an
+    /// assertion on every override point rather than a hope. (`deviceID`
+    /// and `kind` are final and derive from `identity`/`probeKind`, so the
+    /// overrides cover them too. Arming is explicit because scanner
+    /// CONSTRUCTION canonicalizes the fixture home — a recorded residual of
+    /// its own, not this cell's subject.)
+    private final class OverMountedRootForbiddingProvider:
+        FileSystemIdentityProvider, @unchecked Sendable {
+        var mountedRootPath = ""
+        var armed = false
+
+        private func forbid(_ method: String, _ url: URL) {
+            guard armed else { return }
+            if url.path == mountedRootPath
+                || url.path.hasPrefix(mountedRootPath + "/") {
+                XCTFail("\(method) made first contact with the over-mounted "
+                        + "root: \(url.path)")
+            }
+        }
+
+        override func mountPointPaths() -> [String] { [mountedRootPath] }
+        override func probeKind(of url: URL) -> KindProbe {
+            forbid("probeKind", url)
+            return super.probeKind(of: url)
+        }
+        override func identity(of url: URL) -> Identity? {
+            forbid("identity", url)
+            return super.identity(of: url)
+        }
+        override func leafMetadata(of url: URL) -> LeafMetadata? {
+            forbid("leafMetadata", url)
+            return super.leafMetadata(of: url)
+        }
+        override func isMountPoint(_ url: URL) -> Bool {
+            forbid("isMountPoint", url)
+            return super.isMountPoint(url)
+        }
+        override func canonicalize(_ url: URL) -> URL {
+            forbid("canonicalize", url)
+            return super.canonicalize(url)
+        }
+        override func resolveTargetKeepingLeaf(_ url: URL) -> URL {
+            forbid("resolveTargetKeepingLeaf", url)
+            return super.resolveTargetKeepingLeaf(url)
+        }
+        override func ownerProbe(of url: URL) -> OwnerProbe {
+            forbid("ownerProbe", url)
+            return super.ownerProbe(of: url)
+        }
+    }
+
+    /// THE OVER-MOUNTED-ROOT ARM, hermetic (PR #459 review r6, codex C2):
+    /// a root the mount table names EXACTLY is refused as ONE visible issue
+    /// naming the unmount remedy, with ZERO provider calls touching the root
+    /// — before this arm, the root gate's own `lstat` was the scan's first
+    /// contact with the mounted filesystem, made with the root's mount entry
+    /// already sitting unread in the snapshot in hand. The table is injected
+    /// here; the production-default table over a real volume is evidenced by
+    /// the real-mount cell below.
+    func testAnOverMountedRootIsRefusedVisiblyWithZeroContact() async throws {
+        try makeStaleCandidate("survivor", under: userRootURL)
+
+        let provider = OverMountedRootForbiddingProvider()
+        provider.mountedRootPath = canonical(sharedRootURL).path
+        let scanner = makeScanner(
+            roots: [sharedRoot(), userRoot()], provider: provider
+        )
+
+        provider.armed = true
+        let outcome = await scan(scanner)
+        provider.armed = false
+        try assertValidates(outcome, scanner: scanner)
+
+        let refusals = outcome.errors.filter { $0.kind == .containerRefused }
+        XCTAssertEqual(refusals.count, 1, "\(outcome.errors)")
+        let issue = try XCTUnwrap(refusals.first)
+        XCTAssertEqual(issue.url?.path, canonical(sharedRootURL).path)
+        XCTAssertTrue(issue.detail.contains("is a mounted volume"),
+                      issue.detail)
+        // The deterministic-bound rule: unmounting genuinely clears this
+        // refusal, and the message says so, verbatim.
+        XCTAssertTrue(issue.detail.contains(EphemeralTempScanner.mountRemedy),
+                      issue.detail)
+
+        // The arm refuses ONE root, never the scan: the sibling root's
+        // candidate is still emitted.
+        XCTAssertNotNil(itemsByName(outcome)["survivor"])
+    }
+
+    /// THE OVER-MOUNTED ROOT, production default end-to-end (PR #459 review
+    /// r6, codex C2): a real volume attached EXACTLY at a declared root is
+    /// refused from the real kernel table with zero reads at or below the
+    /// root and nothing on the volume emitted. This is the cell that
+    /// evidences the injected table's production default (real `getfsstat`)
+    /// AND the kernel's canonical `f_mntonname` spelling agreeing with the
+    /// fn-6.1 declared spelling.
+    func testARealVolumeMountedExactlyAtARootIsRefusedWithoutFirstContact()
+        async throws {
+        let overRoot = try mkdir(base.appendingPathComponent("over-root"))
+        let rootPath = canonical(overRoot).path
+        guard try attachDMG(
+            named: "overroot.dmg", at: URL(fileURLWithPath: rootPath)
+        ) else {
+            throw XCTSkip("hdiutil could not stage the mount fixture")
+        }
+        guard FileSystemIdentityProvider().mountPointPaths()
+            .contains(rootPath) else {
+            throw XCTSkip(
+                "kernel table does not spell the mount as \(rootPath)"
+            )
+        }
+        // Foreign payload inside the volume: "nothing emitted" is not
+        // vacuous.
+        try writeFile(overRoot.appendingPathComponent("foreign.bin"),
+                      bytes: 1_024)
+
+        let provider = MountTableInjectingProvider()
+        provider.useRealTable = true
+        let root = makeRoot(overRoot, label: "Over-mounted root",
+                            writability: .perUser)
+        let scanner = makeScanner(roots: [root], provider: provider)
+
+        let outcome = await scan(scanner)
+        try assertValidates(outcome, scanner: scanner)
+
+        XCTAssertTrue(outcome.items.isEmpty,
+                      "nothing on the volume may be emitted: "
+                        + "\(outcome.items.map(\.displayName))")
+        XCTAssertEqual(outcome.errors.count, 1, "\(outcome.errors)")
+        let issue = try XCTUnwrap(outcome.errors.first)
+        XCTAssertEqual(issue.kind, .containerRefused)
+        XCTAssertEqual(issue.url?.path, rootPath)
+        XCTAssertTrue(issue.detail.contains("is a mounted volume"),
+                      issue.detail)
+        XCTAssertTrue(issue.detail.contains(EphemeralTempScanner.mountRemedy),
+                      issue.detail)
+        XCTAssertEqual(provider.reads(atOrBelow: rootPath), [],
+                       "the scan made first contact with the mounted "
+                        + "filesystem")
+    }
+
     /// THE PRODUCTION-DEFAULT CELL: real `hdiutil` volumes, the real kernel
     /// table (no injection), real lstats — skipped only where `hdiutil`
     /// cannot attach. One volume BELOW a candidate and one AT a candidate

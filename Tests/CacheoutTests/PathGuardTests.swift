@@ -490,6 +490,60 @@ final class PathGuardTests: XCTestCase {
         )
     }
 
+    /// An OVER-MOUNTED registered root is omitted from the session snapshot
+    /// WITHOUT the identity `lstat` (PR #459 review r6, codex C2 —
+    /// AVAILABILITY): that lstat is served by the mounted filesystem — first
+    /// contact — so on an unresponsive hard mount it would park EVERY
+    /// session at capture, before any scanner task launches and on every
+    /// trigger, including ones the mounted root's scanner does not even
+    /// participate in. Omission is fail-closed by the same rule as absence:
+    /// delete-time container admission refuses a root the snapshot does not
+    /// carry.
+    func testCaptureSkipsATableMountedRootWithoutTouchingIt() throws {
+        let mountedRoot = fixtureHome.appendingPathComponent("over-mounted")
+        let plainRoot = fixtureHome.appendingPathComponent("plain")
+        try mkdir(mountedRoot)
+        try mkdir(plainRoot)
+
+        final class TableMountedRootForbiddingProvider:
+            FileSystemIdentityProvider, @unchecked Sendable {
+            var mountedRootPath = ""
+            override func mountPointPaths() -> [String] { [mountedRootPath] }
+            override func identity(of url: URL) -> Identity? {
+                if url.path == mountedRootPath {
+                    XCTFail("capture lstat'ed the over-mounted root — first "
+                            + "contact with the mounted filesystem")
+                }
+                return super.identity(of: url)
+            }
+        }
+        let provider = TableMountedRootForbiddingProvider()
+        provider.mountedRootPath = mountedRoot.path
+
+        let sessionSnapshot = ContainerSnapshot.capture(
+            roots: [mountedRoot, plainRoot], provider: provider
+        )
+
+        // The mounted root is omitted; the sibling is captured normally.
+        XCTAssertNil(sessionSnapshot.identity(forRootPath: mountedRoot.path))
+        XCTAssertNotNil(sessionSnapshot.identity(forRootPath: plainRoot.path))
+
+        // Fail-closed: delete-time admission refuses the omitted root and
+        // still admits the captured sibling.
+        let pathGuard = makeGuard(containers: [mountedRoot, plainRoot])
+        XCTAssertThrowsError(
+            try pathGuard.admitContainer(mountedRoot, snapshot: sessionSnapshot)
+        ) { error in
+            XCTAssertEqual(
+                error as? PathGuardError,
+                .containerUnavailable(path: mountedRoot.path)
+            )
+        }
+        XCTAssertNoThrow(
+            try pathGuard.admitContainer(plainRoot, snapshot: sessionSnapshot)
+        )
+    }
+
     // MARK: - Device rules (injected provider, R15)
 
     /// Provider that reports a fake device id for every path at/under a

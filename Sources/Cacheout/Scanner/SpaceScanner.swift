@@ -1811,9 +1811,14 @@ struct SpaceScannerRuntime {
         // a consumer cannot misorder it): every REGISTERED root, before
         // any scanner task launches, so a container swapped mid-scan
         // mismatches at delete time. ALL registered roots on purpose, even
-        // under a scanner subset — capture is cheap (one lstat per root)
-        // and a subset-blind snapshot can never pair a root with the wrong
-        // session.
+        // under a scanner subset — capture is cheap (one kernel-table read,
+        // then at most one lstat per root; a root the table names as a
+        // mount point is skipped WITHOUT the lstat, PR #459 review r6
+        // codex C2 — that lstat is first contact with the mounted
+        // filesystem, and an unresponsive hard mount at a registered root
+        // would otherwise wedge every session at this line, on every
+        // trigger) and a subset-blind snapshot can never pair a root with
+        // the wrong session.
         let snapshot = ContainerSnapshot.capture(
             roots: trustedContainerRoots, provider: provider
         )

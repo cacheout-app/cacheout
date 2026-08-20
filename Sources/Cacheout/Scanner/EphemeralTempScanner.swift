@@ -549,7 +549,10 @@ struct EphemeralTempScanner: @unchecked Sendable {
         // walk descended a mounted volume at 19,545 `lstat`s + 19,500
         // second `lstat`s under a 22,545-entry mount, and the same mount
         // was a visible denied row at 303 stale entries but a SILENT skip
-        // at 22,545 — foreign content steering scan output.
+        // at 22,545 — foreign content steering scan output. The same
+        // snapshot answers for the ROOTS themselves (r6, codex C2): the
+        // over-mounted-root arm at the head of the loop below refuses a
+        // root the table names before ANY syscall touches it.
         let mountTable = provider.mountPointPaths()
 
         var items: [ReclaimableItem] = []
@@ -569,6 +572,46 @@ struct EphemeralTempScanner: @unchecked Sendable {
 
         for root in roots {
             if Task.isCancelled { break }
+
+            // THE OVER-MOUNTED-ROOT ARM (PR #459 review r6, codex C2 —
+            // AVAILABILITY): a volume mounted EXACTLY at this root, answered
+            // from the table snapshot above by pure string membership (the
+            // kernel spells `f_mntonname` canonically — the same spelling
+            // fn-6.1 declares roots in). Every root-touching syscall below
+            // this line — the kind gate's `lstat`, `admitSearchRoot`'s
+            // realpath/lstat/statfs, `rootDevice`, the listing — is served
+            // BY the mounted filesystem when the root IS a mount point, so
+            // on an unresponsive hard mount the FIRST of them parks the
+            // scan's cooperative-pool worker forever (the harvest comment
+            // above documents the wedge shape). Before this arm the refusal
+            // itself already happened — PathGuard's volume-root deny fired
+            // inside `admitSearchRoot` — but only AFTER five foreign-fs
+            // contacts, and its generic wording never said unmounting clears
+            // it. Roots get ISSUES, not rows (the symlink-root precedent);
+            // the message names the same remedy as the candidate mount rows.
+            //
+            // Residuals, at measured scope: a mount landing AFTER the
+            // harvest above makes first contact at the kind gate below (no
+            // table re-read can close that race — the same racing class the
+            // candidate arms accept, except here the consequence is the
+            // hang, not only disclosure); a root over-mounted BEFORE app
+            // launch hangs construction's one-time realpath
+            // (`EphemeralTempRoots.resolve`); and delete-time PATH LOOKUPS
+            // BELOW a root over-mounted between scan and clean (the
+            // revalidator's `open`, target validation) still traverse the
+            // volume — deletion SAFETY holds there (admission refuses the
+            // exact root stall-free from the same table, and the
+            // capture-time table skip leaves nothing under it admissible),
+            // but those child lookups can block.
+            if mountTable.contains(root.url.path) {
+                issues.append(ScanIssue(
+                    url: root.url, kind: .containerRefused,
+                    detail: "\(root.label) is a mounted volume — not "
+                        + "scanned; its contents belong to that volume. "
+                        + Self.mountRemedy
+                ))
+                continue
+            }
 
             // ROOT GATE, no-follow (R11 + the symlink-root rule). Scan-time
             // ABSENCE is a SILENT skip — including the construction-to-scan
@@ -617,8 +660,14 @@ struct EphemeralTempScanner: @unchecked Sendable {
             // CANONICAL — fn-6.1 canonicalizes once — and the walk composes
             // children from them without following links, so the two
             // spellings agree). `rootDevice` is the racing-mount arm's
-            // baseline: one `lstat` of the ROOT itself, which is never
-            // foreign. A `nil` rootDevice (the root vanished since its gate)
+            // baseline: one `lstat` of the ROOT itself — foreign only when
+            // a mount lands on the root AFTER the over-mounted-root arm's
+            // table check above (r6, codex C2: in that racing window this
+            // lstat is also the scan's first, possibly hanging, contact,
+            // and the foreign baseline blinds the racing-device arm for
+            // this root's candidates, whose entries share the foreign
+            // device — disclosure-class; the delete-time gates behind it
+            // hold). A `nil` rootDevice (the root vanished since its gate)
             // skips only that arm — the table arm still stands, and the
             // sizer/cleaner mount gates behind it are unchanged.
             let mountsUnderRoot = Self.mountPoints(
@@ -1735,7 +1784,11 @@ struct EphemeralTempScanner: @unchecked Sendable {
         + "this name"
 
     /// The kernel-spelled mount points strictly under `root` — one table
-    /// filter per root, consumed by the three scan-side mount arms.
+    /// filter per root, consumed by the three candidate-side mount arms.
+    /// The EXACT root is excluded DELIBERATELY: the over-mounted-root arm
+    /// at the head of the root loop refuses a table-mounted root from the
+    /// same snapshot before any syscall touches it, so by the time this set
+    /// is consulted the root is known not to be in the table (r6, codex C2).
     static func mountPoints(
         in table: [String], strictlyUnder root: URL
     ) -> Set<String> {

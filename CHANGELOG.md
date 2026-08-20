@@ -99,6 +99,17 @@ and docs/v1/CLI-REFERENCE.md) — the pre-release `node_modules` →
   to descend onto another filesystem. A volume mounted in the instant
   between the table read and the walk is still read (metadata only) and is
   refused by the sizing and delete-time mount gates that always stood.
+  **A volume mounted exactly AT a temp root is refused the same way**: the
+  scan answers from the mount table before any syscall touches the root and
+  reports it as a visible refusal whose message says unmounting clears it
+  (previously the refusal happened only after several syscalls served by
+  the mounted volume — a hang on an unresponsive hard mount — and never
+  named the remedy). The same table read now guards the scan session's
+  container-identity capture and container admission, so a mounted
+  registered root no longer has its identity read at session start or its
+  path resolved when a healthy sibling root is admitted; a root skipped
+  this way stays fail-closed at delete time. A mount landing in the
+  instant between the table read and those steps can still be touched.
   **The root listing's entry cap now holds on every path.** When the
   bounded directory read fails, it is retried once (a transiently cleared
   failure recovers through the same capped read), and the Foundation

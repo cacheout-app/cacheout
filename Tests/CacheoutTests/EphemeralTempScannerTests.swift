@@ -1773,6 +1773,118 @@ final class EphemeralTempScannerTests: XCTestCase {
         }
     }
 
+    /// The FAILURE arm's BOUNDED RETRY (PR #459 review r6, codex C1 —
+    /// AVAILABILITY): a listing failure that clears between the two bounded
+    /// reads recovers through the SAME `readdir` loop, and the Foundation
+    /// chain harvest never runs. The ordering is driven through the seam
+    /// because the natural window is the handful of instructions between two
+    /// consecutive `opendir` calls — an adversarial chmod flipper won it
+    /// once in ~65k iterations (measured r6), far too rare to stage green;
+    /// the seam's production defaults are evidenced by the surrounding
+    /// cells — the success path by the bounded-listing cells above, the
+    /// double-failure path by the chmod-000 chain-error cell.
+    func testAClearedListingFailureRecoversBoundedThroughTheRetry() throws {
+        let dir = try mkdir(base.appendingPathComponent("retry-root"))
+        for name in ["a", "b", "c", "d", ".hidden"] {
+            try writeFile(dir.appendingPathComponent(name), bytes: 8)
+        }
+
+        var boundedCalls = 0
+        let result = try EphemeralTempScanner.boundedFirstLevelNames(
+            of: dir, limit: 3,
+            boundedRead: { url, limit in
+                boundedCalls += 1
+                if boundedCalls == 1 { return .failed(errno: EACCES) }
+                return EphemeralTempScanner.boundedChildNames(
+                    of: url, limit: limit
+                )
+            },
+            chainHarvest: { _, _ in
+                XCTFail("the Foundation harvest ran though the bounded retry "
+                        + "succeeded — the r4 C3 bound is only owed by the "
+                        + "readdir loop")
+                return ([], false)
+            }
+        )
+
+        XCTAssertEqual(boundedCalls, 2, "exactly one retry, never a loop")
+        XCTAssertEqual(result.names.count, 3)
+        XCTAssertTrue(result.truncated)
+    }
+
+    /// The chain harvest's SUCCESS path (the double-race residual) is capped
+    /// at `limit` and keeps hidden entries — the retired eager fallback's
+    /// `options: []` semantics, without its materialization.
+    func testTheChainHarvestSuccessPathIsCappedAndKeepsHiddenEntries() throws {
+        let dir = try mkdir(base.appendingPathComponent("harvest-root"))
+        for name in ["e1", "e2", "e3", "e4", "e5", ".dot-scratch"] {
+            try writeFile(dir.appendingPathComponent(name), bytes: 8)
+        }
+
+        let capped = try EphemeralTempScanner.lazyChainHarvest(
+            of: dir, limit: 4
+        )
+        XCTAssertEqual(capped.names.count, 4)
+        XCTAssertTrue(capped.truncated)
+
+        let all = try EphemeralTempScanner.lazyChainHarvest(of: dir, limit: 100)
+        XCTAssertEqual(all.names.count, 6)
+        XCTAssertFalse(all.truncated)
+        XCTAssertTrue(all.names.contains(".dot-scratch"),
+                      "dotfile scratch directories are real payload")
+    }
+
+    /// THE BOUND ITSELF, on the harvest's success path (PR #459 review r6,
+    /// codex C1 — AVAILABILITY): the harvest must read LAZILY, never
+    /// materialize the population. Asserted as an RSS ceiling because the
+    /// return value cannot distinguish lazy from eager (`prefix(limit)` of an
+    /// eager list returns the same names): take-5 of a 60,000-entry
+    /// directory measured +0.0 MB RSS lazily vs +42.5 MB through the eager
+    /// `contentsOfDirectory` this replaced, so the 20 MB ceiling separates
+    /// the two by a wide margin in both directions.
+    func testTheChainHarvestNeverMaterializesTheWholePopulation() throws {
+        let dir = try mkdir(base.appendingPathComponent("big-harvest-root"))
+        let fd = open(dir.path, O_RDONLY | O_DIRECTORY)
+        XCTAssertGreaterThanOrEqual(fd, 0)
+        defer { close(fd) }
+        for index in 0..<60_000 {
+            let file = openat(fd, "e\(index)", O_CREAT | O_WRONLY, 0o644)
+            XCTAssertGreaterThanOrEqual(file, 0)
+            close(file)
+        }
+
+        func residentBytes() -> UInt64 {
+            var info = mach_task_basic_info()
+            var count = mach_msg_type_number_t(
+                MemoryLayout<mach_task_basic_info>.size
+                    / MemoryLayout<natural_t>.size
+            )
+            let result = withUnsafeMutablePointer(to: &info) {
+                $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                    task_info(
+                        mach_task_self_,
+                        task_flavor_t(MACH_TASK_BASIC_INFO), $0, &count
+                    )
+                }
+            }
+            XCTAssertEqual(result, KERN_SUCCESS)
+            return info.resident_size
+        }
+
+        let before = residentBytes()
+        let result = try EphemeralTempScanner.lazyChainHarvest(of: dir, limit: 5)
+        let after = residentBytes()
+
+        XCTAssertEqual(result.names.count, 5)
+        XCTAssertTrue(result.truncated)
+        let delta = after > before ? after - before : 0
+        XCTAssertLessThan(
+            delta, 20 * 1_048_576,
+            "the harvest materialized the population: RSS grew "
+                + "\(delta / 1_048_576) MB across a take-5 of 60k entries"
+        )
+    }
+
     /// The boundary is honest in the other direction: a population AT the cap
     /// is fully inspected and reports nothing.
     func testRootListingAtExactlyTheCapIsNotTruncated() async throws {

@@ -215,8 +215,8 @@ struct EphemeralTempScanner: @unchecked Sendable {
     /// local user controls this population, and the eager
     /// `contentsOfDirectory` listing plus the per-name sort ran as ONE
     /// uninterruptible synchronous stretch on the scan's cooperative-pool
-    /// worker — measured on a staged ~494k-entry root this session: 6.8 s
-    /// list + 16.4 s sort, transient RSS 5.7 MB → 8.24 GB, with no
+    /// worker — measured on a staged ~494k-entry root in the r4 session:
+    /// 6.8 s list + 16.4 s sort, transient RSS 5.7 MB → 8.24 GB, with no
     /// cancellation point anywhere inside. The bounded `readdir` read at
     /// this cap on the SAME root: 99 ms, +2 MB. Real machines measured
     /// 14/213/401 first-level entries across the three roots, so the cap is
@@ -358,46 +358,108 @@ struct EphemeralTempScanner: @unchecked Sendable {
         self.candidateSizer = candidateSizer
     }
 
-    /// The PRODUCTION first-level listing — BOUNDED (PR #459 review r4, codex
-    /// C3): a `readdir` loop that stops at `limit`, never the eager
+    /// The PRODUCTION first-level listing — BOUNDED ON EVERY PATH (PR #459
+    /// review r4 codex C3; the failure arm's eager fallback was closed r6,
+    /// codex C1): a `readdir` loop that stops at `limit`, never the eager
     /// `contentsOfDirectory` (both of its overloads materialize the WHOLE
     /// directory before any cap can apply — `boundedChildNames`'s own trap
-    /// note; measured this session on a staged ~494k-entry root, the eager
-    /// list + sort ran 6.8 s + 16.4 s uninterruptible with an 8.24 GB
-    /// transient RSS, while this read at the 20,000 cap returned in 99 ms
-    /// holding +2 MB). `readdir` skips nothing, preserving the retired
-    /// listing's `options: []` semantics — dotfile scratch directories are
-    /// real payload (the sweep-scanner lesson: a hidden-file skip hid a 23G
+    /// note; measured r4 on a staged ~494k-entry root, the eager list + sort
+    /// ran 6.8 s + 16.4 s uninterruptible with an 8.24 GB transient RSS,
+    /// while this read at the 20,000 cap returned in 99 ms holding +2 MB).
+    /// `readdir` skips nothing, preserving the retired listing's
+    /// `options: []` semantics — dotfile scratch directories are real
+    /// payload (the sweep-scanner lesson: a hidden-file skip hid a 23G
     /// class).
     ///
-    /// The FAILURE arm re-asks through `firstLevelEntries` to harvest the
-    /// chain-bearing Cocoa error the class-(a) denial classification needs —
-    /// a raw `opendir` errno is class (b) and may not claim TCC. That call
-    /// fails AT OPEN, before materializing anything, so the eager path stays
-    /// unreachable on the success path; the one way through it is the
-    /// open-failed-then-cleared race, where success means the materialization
-    /// already happened and the cap is applied to what it returned.
+    /// The FAILURE arm retries the SAME bounded read once — a failure that
+    /// clears between the two calls (the open-failed-then-cleared race)
+    /// recovers here, still through the `readdir` loop — and only a second
+    /// consecutive failure falls through to `lazyChainHarvest`, which exists
+    /// to produce the chain-bearing Cocoa error the class-(a) denial
+    /// classification needs (a raw `opendir` errno is class (b) and may not
+    /// claim TCC). The harvest reads LAZILY and stops at `limit` too, so
+    /// even a failure that clears again mid-harvest cannot reopen the bound
+    /// (r6, codex C1 — the eager `contentsOfDirectory` fallback that stood
+    /// here materialized the whole directory whenever the race was won).
     static func boundedFirstLevelNames(
         of root: URL, limit: Int
     ) throws -> (names: [String], truncated: Bool) {
-        switch boundedChildNames(of: root, limit: limit) {
-        case .names(let names, let truncated):
+        try boundedFirstLevelNames(
+            of: root, limit: limit,
+            boundedRead: { boundedChildNames(of: $0, limit: $1) },
+            chainHarvest: { try lazyChainHarvest(of: $0, limit: $1) }
+        )
+    }
+
+    /// The seam-parameterized core of `boundedFirstLevelNames`. The closures
+    /// exist so the failed-then-cleared ordering is testable at all (the
+    /// natural race window is the handful of instructions between two
+    /// consecutive `opendir` calls); the production defaults above are
+    /// evidenced separately — the success path by the bounded-listing cells,
+    /// the double-failure path by the chmod-000 chain-error cell.
+    static func boundedFirstLevelNames(
+        of root: URL, limit: Int,
+        boundedRead: (URL, Int) -> BoundedRead,
+        chainHarvest: (URL, Int) throws -> (names: [String], truncated: Bool)
+    ) throws -> (names: [String], truncated: Bool) {
+        if case .names(let names, let truncated) = boundedRead(root, limit) {
             return (names, truncated)
-        case .failed:
-            let children = try firstLevelEntries(of: root)
-            let names = children.map(\.lastPathComponent)
-            guard names.count > limit else { return (names, false) }
-            return (Array(names.prefix(limit)), true)
         }
+        // The BOUNDED RETRY (r6, codex C1): the common recovery from a
+        // transient open failure stays inside the readdir loop and never
+        // touches Foundation.
+        if case .names(let names, let truncated) = boundedRead(root, limit) {
+            return (names, truncated)
+        }
+        return try chainHarvest(root, limit)
     }
 
     /// The CHAIN-ERROR HARVEST arm of `boundedFirstLevelNames`, and nothing
-    /// else (PR #459 review r4 — this WAS the production listing, and its
-    /// unbounded eager materialization is why it no longer is).
-    static func firstLevelEntries(of root: URL) throws -> [URL] {
-        try FileManager.default.contentsOfDirectory(
-            at: root, includingPropertiesForKeys: nil, options: []
-        )
+    /// else — reached only after TWO consecutive bounded-read failures. It
+    /// re-asks through Foundation because denial classification is licensed
+    /// by Foundation PROVENANCE, and it asks through `FileManager.enumerator`
+    /// rather than `contentsOfDirectory` (PR #459 review r6, codex C1): the
+    /// enumerator surfaces the SAME chain-bearing error for an unreadable
+    /// directory (measured this round: NSCocoaErrorDomain 257 wrapping
+    /// NSPOSIXErrorDomain/EACCES from both APIs on a mode-000 fixture) while
+    /// reading lazily, so when the failure has cleared and the read SUCCEEDS
+    /// this loop consumes at most `limit + 1` entries (measured this round:
+    /// take-5 of a staged 60,000-entry directory ran 0.4 ms at +0.0 MB RSS
+    /// where the eager list it replaces materialized all 60,000 at
+    /// +42.5 MB). A mid-iteration failure throws rather than returning a
+    /// partial listing as complete — fail-visible, matching the "could not
+    /// be listed" disposition of the caller's catch.
+    static func lazyChainHarvest(
+        of root: URL, limit: Int
+    ) throws -> (names: [String], truncated: Bool) {
+        var harvested: Error?
+        guard let enumerator = FileManager.default.enumerator(
+            at: root, includingPropertiesForKeys: nil,
+            options: [.skipsSubdirectoryDescendants],
+            errorHandler: { _, error in
+                harvested = error
+                return false
+            }
+        ) else {
+            // Foundation would not even construct the enumerator and gave no
+            // error to harvest. Never ENOENT-shaped (an invented absence
+            // would be a SILENT skip at the caller); `.fileReadUnknown`
+            // classifies as a neutral visible denial.
+            throw CocoaError(
+                .fileReadUnknown, userInfo: [NSFilePathErrorKey: root.path]
+            )
+        }
+        var names: [String] = []
+        var truncated = false
+        for case let entry as URL in enumerator {
+            if names.count >= limit {
+                truncated = true
+                break
+            }
+            names.append(entry.lastPathComponent)
+        }
+        if let harvested { throw harvested }
+        return (names, truncated)
     }
 
     // MARK: - Protocol surface (the conformance sits at the foot of this file)
@@ -1231,12 +1293,12 @@ struct EphemeralTempScanner: @unchecked Sendable {
     /// DIFFERENT path, and an `lstat` of that lie would report "absent",
     /// letting the walk call a tree all-old while a fresh file went
     /// uninspected); and `.`/`..` are skipped while hidden entries are kept.
-    private enum BoundedRead {
+    enum BoundedRead {
         case names([String], truncated: Bool)
         case failed(errno: Int32)
     }
 
-    private static func boundedChildNames(
+    static func boundedChildNames(
         of directory: URL, limit: Int
     ) -> BoundedRead {
         guard let handle = opendir(directory.path) else {

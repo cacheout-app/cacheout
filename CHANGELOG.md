@@ -99,6 +99,12 @@ and docs/v1/CLI-REFERENCE.md) — the pre-release `node_modules` →
   to descend onto another filesystem. A volume mounted in the instant
   between the table read and the walk is still read (metadata only) and is
   refused by the sizing and delete-time mount gates that always stood.
+  **The root listing's entry cap now holds on every path.** When the
+  bounded directory read fails, it is retried once (a transiently cleared
+  failure recovers through the same capped read), and the Foundation
+  fallback that classifies a persistent failure now reads lazily and stops
+  at the cap — previously that fallback materialized the entire directory
+  whenever the failure cleared between the two reads.
 - **Configurable dev roots.** Settings gains a dev-roots editor and the CLI a
   repeatable `--dev-root PATH` (invocation-scoped, never persisted). The
   filesystem root, any volume root or mount point, and `$HOME` itself are

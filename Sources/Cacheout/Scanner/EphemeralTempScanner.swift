@@ -392,9 +392,13 @@ struct EphemeralTempScanner: @unchecked Sendable {
     }
 
     /// The seam-parameterized core of `boundedFirstLevelNames`. The closures
-    /// exist so the failed-then-cleared ordering is testable at all (the
-    /// natural race window is the handful of instructions between two
-    /// consecutive `opendir` calls); the production defaults above are
+    /// exist so the failed-then-cleared ordering is drivable
+    /// DETERMINISTICALLY — the natural race window is the handful of
+    /// instructions between two consecutive `opendir` calls, so a real
+    /// staging is probabilistic per attempt, though not rare: a chmod-000/755
+    /// flipper racing the REAL reads staged it in 200 of 1,223 attempts
+    /// (~16% per attempt, measured for PR #459 r6 verify; the flipper cell
+    /// keeps that staging green). The production defaults above are
     /// evidenced separately — the success path by the bounded-listing cells,
     /// the double-failure path by the chmod-000 chain-error cell.
     static func boundedFirstLevelNames(

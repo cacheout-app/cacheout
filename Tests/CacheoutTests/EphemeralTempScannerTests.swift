@@ -1776,13 +1776,17 @@ final class EphemeralTempScannerTests: XCTestCase {
     /// The FAILURE arm's BOUNDED RETRY (PR #459 review r6, codex C1 —
     /// AVAILABILITY): a listing failure that clears between the two bounded
     /// reads recovers through the SAME `readdir` loop, and the Foundation
-    /// chain harvest never runs. The ordering is driven through the seam
-    /// because the natural window is the handful of instructions between two
-    /// consecutive `opendir` calls — an adversarial chmod flipper won it
-    /// once in ~65k iterations (measured r6), far too rare to stage green;
-    /// the seam's production defaults are evidenced by the surrounding
-    /// cells — the success path by the bounded-listing cells above, the
-    /// double-failure path by the chmod-000 chain-error cell.
+    /// chain harvest never runs. This cell drives the ordering through the
+    /// seam because that is DETERMINISTIC — a real staging is probabilistic
+    /// per attempt (the natural window is the handful of instructions
+    /// between two consecutive `opendir` calls), though not rare: a
+    /// chmod-000/755 flipper racing the real reads staged it in 200 of
+    /// 1,223 attempts (~16% per attempt, measured for PR #459 r6 verify),
+    /// and the flipper cell below keeps that staging green. The seam's
+    /// production defaults are evidenced by the surrounding cells — the
+    /// success path by the bounded-listing cells above, the double-failure
+    /// path by the chmod-000 chain-error cell, the fail-then-cleared pair
+    /// by the flipper cell.
     func testAClearedListingFailureRecoversBoundedThroughTheRetry() throws {
         let dir = try mkdir(base.appendingPathComponent("retry-root"))
         for name in ["a", "b", "c", "d", ".hidden"] {
@@ -1810,6 +1814,92 @@ final class EphemeralTempScannerTests: XCTestCase {
         XCTAssertEqual(boundedCalls, 2, "exactly one retry, never a loop")
         XCTAssertEqual(result.names.count, 3)
         XCTAssertTrue(result.truncated)
+    }
+
+    /// THE SAME ORDERING, STAGED AGAINST THE REAL READS (PR #459 r6 verify):
+    /// a chmod-000/755 flipper races the PRODUCTION `boundedChildNames`
+    /// pair — the seam carries only counting pass-throughs — until an
+    /// attempt's first real `opendir` is denied and its immediate retry
+    /// succeeds. Measured while writing this cell: 200 stagings in 1,223
+    /// attempts (~16% per attempt, 35 ms, every staging returning the
+    /// bounded truncated listing), so the first staging typically lands
+    /// within a handful of attempts and the 200,000-attempt cap is a
+    /// scheduler-pathology bound, not a hope. A successful return whose
+    /// attempt made only ONE bounded read is the no-retry signature (a
+    /// single cleared failure falling through to Foundation) and fails
+    /// immediately.
+    func testTheRetryRecoversARealClearedDenialUnderAChmodFlipper() throws {
+        try skipUnderRoot()
+        let dir = try mkdir(base.appendingPathComponent("flipper-root"))
+        for name in ["a", "b", "c", "d", ".hidden"] {
+            try writeFile(dir.appendingPathComponent(name), bytes: 8)
+        }
+
+        final class StopFlag: @unchecked Sendable {
+            private let lock = NSLock()
+            private var value = false
+            var stopped: Bool {
+                lock.lock(); defer { lock.unlock() }; return value
+            }
+            func stop() { lock.lock(); value = true; lock.unlock() }
+        }
+        let flag = StopFlag()
+        let flipperDone = DispatchSemaphore(value: 0)
+        let cPath = dir.path
+        Thread.detachNewThread {
+            while !flag.stopped {
+                chmod(cPath, 0o000)
+                chmod(cPath, 0o755)
+            }
+            chmod(cPath, 0o755)
+            flipperDone.signal()
+        }
+        defer {
+            flag.stop()
+            flipperDone.wait()
+        }
+
+        var attempts = 0
+        while attempts < 200_000 {
+            attempts += 1
+            var reads: [Bool] = []   // per bounded read: true = .names
+            let result: (names: [String], truncated: Bool)
+            do {
+                result = try EphemeralTempScanner.boundedFirstLevelNames(
+                    of: dir, limit: 3,
+                    boundedRead: { url, limit in
+                        let read = EphemeralTempScanner.boundedChildNames(
+                            of: url, limit: limit
+                        )
+                        if case .names = read { reads.append(true) }
+                        else { reads.append(false) }
+                        return read
+                    },
+                    chainHarvest: { url, limit in
+                        try EphemeralTempScanner.lazyChainHarvest(
+                            of: url, limit: limit
+                        )
+                    }
+                )
+            } catch {
+                // Double failure with the harvest denied too — not this
+                // cell's ordering; race again.
+                continue
+            }
+            if reads == [false] {
+                return XCTFail(
+                    "a single cleared failure reached the Foundation "
+                        + "harvest — the bounded retry is gone"
+                )
+            }
+            guard reads == [false, true] else { continue }
+            // Staged: the retry recovered a REAL cleared EACCES, bounded.
+            XCTAssertEqual(result.names.count, 3)
+            XCTAssertTrue(result.truncated)
+            return
+        }
+        XCTFail("the fail-then-cleared ordering never staged in "
+                + "\(attempts) attempts")
     }
 
     /// The chain harvest's SUCCESS path (the double-race residual) is capped

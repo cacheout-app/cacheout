@@ -544,6 +544,68 @@ final class PathGuardTests: XCTestCase {
         )
     }
 
+    /// THE TABLE PREFLIGHT'S REFUSAL ARM, hermetic (PR #459 review r6,
+    /// codex C2; this cell added in the r6 verify pass — deleting the arm
+    /// had left the full suite green): a url the mount table names is
+    /// refused `.deniedVolumeRoot` by BOTH admission modes BEFORE
+    /// `canonicalize` (realpath) makes first contact with the mounted
+    /// filesystem. Without the arm the refusal still happens — the match
+    /// loop skips the table-mounted CONFIGURED root, so the url falls out
+    /// as `.notAConfiguredContainer` — but only AFTER a realpath of the
+    /// mounted url, which is exactly the stall the arm exists to prevent,
+    /// and under a classification whose message never names the unmount
+    /// remedy.
+    func testATableMountedURLIsRefusedDeniedVolumeRootBeforeRealpath() throws {
+        let mountedRoot = fixtureHome.appendingPathComponent("table-mounted")
+        try mkdir(mountedRoot)
+
+        final class CanonicalizeForbiddingTableProvider:
+            FileSystemIdentityProvider, @unchecked Sendable {
+            var mountedRootPath = ""
+            override func mountPointPaths() -> [String] { [mountedRootPath] }
+            override func canonicalize(_ url: URL) -> URL {
+                if url.path == mountedRootPath
+                    || url.path.hasPrefix(mountedRootPath + "/") {
+                    XCTFail("canonicalize (realpath) made first contact "
+                            + "with the table-mounted url: \(url.path)")
+                }
+                return super.canonicalize(url)
+            }
+        }
+        let provider = CanonicalizeForbiddingTableProvider()
+        provider.mountedRootPath = mountedRoot.path
+
+        // The url is itself a CONFIGURED root: the match loop would find it
+        // if the preflight did not throw first.
+        let pathGuard = makeGuard(
+            containers: [mountedRoot], provider: provider
+        )
+
+        XCTAssertThrowsError(
+            try pathGuard.admitSearchRoot(mountedRoot)
+        ) { error in
+            XCTAssertEqual(
+                error as? PathGuardError,
+                .deniedVolumeRoot(path: mountedRoot.path)
+            )
+        }
+
+        // Delete time, in the scan-to-clean mount race's exact shape: the
+        // snapshot was captured BEFORE the mount (default provider — the
+        // root's identity IS in it), so it is THIS preflight, not any
+        // capture-time skip, that refuses the root stall-free.
+        let sessionSnapshot = snapshot(of: [mountedRoot])
+        XCTAssertNotNil(sessionSnapshot.identity(forRootPath: mountedRoot.path))
+        XCTAssertThrowsError(
+            try pathGuard.admitContainer(mountedRoot, snapshot: sessionSnapshot)
+        ) { error in
+            XCTAssertEqual(
+                error as? PathGuardError,
+                .deniedVolumeRoot(path: mountedRoot.path)
+            )
+        }
+    }
+
     // MARK: - Device rules (injected provider, R15)
 
     /// Provider that reports a fake device id for every path at/under a

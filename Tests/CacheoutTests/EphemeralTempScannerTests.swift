@@ -161,6 +161,7 @@ final class EphemeralTempScannerTests: XCTestCase {
         rootEntryLimit: Int = EphemeralTempScanner.defaultRootEntryLimit,
         lockProbe: EphemeralTempScanner.LockProber? = nil,
         listDirectory: EphemeralTempScanner.DirectoryLister? = nil,
+        readChildNames: EphemeralTempScanner.BoundedChildReader? = nil,
         candidateSizer: EphemeralTempScanner.CandidateSizer? = nil
     ) -> EphemeralTempScanner {
         let clock = self.clock
@@ -177,6 +178,9 @@ final class EphemeralTempScannerTests: XCTestCase {
                 try EphemeralTempScanner.boundedFirstLevelNames(
                     of: $0, limit: $1
                 )
+            },
+            readChildNames: readChildNames ?? {
+                EphemeralTempScanner.boundedChildNames(of: $0, limit: $1)
             },
             candidateSizer: candidateSizer
         )
@@ -247,7 +251,8 @@ final class EphemeralTempScannerTests: XCTestCase {
 
         func list(
             _ url: URL, _ limit: Int
-        ) throws -> (names: [String], truncated: Bool) {
+        ) throws -> (names: [String], truncation:
+            EphemeralTempScanner.BoundedRead.Truncation?) {
             listed.append(url)
             if let stubError { throw stubError }
             return try EphemeralTempScanner.boundedFirstLevelNames(
@@ -540,10 +545,123 @@ final class EphemeralTempScannerTests: XCTestCase {
         ))
 
         XCTAssertTrue(outcome.items.isEmpty)
-        XCTAssertTrue(outcome.errors.isEmpty,
-                      "a cap hit is not an anomaly — nothing was denied")
+        XCTAssertTrue(
+            outcome.errors.isEmpty,
+            "the BUDGET truncation cause is not an anomaly — nothing was "
+                + "denied. This cell pins the cap-hit arm ONLY; it has never "
+                + "exercised a failed `readdir`, which takes the visible "
+                + "`.denied` route (see "
+                + "testWalkDisclosesAReadFailureAndStaysSilentOnAVanishedBranch)"
+        )
         XCTAssertTrue(spy.calls.isEmpty,
                       "a cap-hit candidate never reaches sizing")
+    }
+
+    /// THE r7 CODEX C2 DEFECT, at the walk's disposition.
+    ///
+    /// A `readdir` that FAILS mid-directory used to be folded into the same
+    /// `truncated: Bool` a benign cap hit sets, so the candidate was dropped
+    /// with NO item and NO issue — a refusal the user is never told about,
+    /// which the GUI then renders as the "Nothing found" empty state (D6).
+    /// An `opendir` failure on the very same subdirectory one entry earlier
+    /// was already visible; this closes the asymmetry.
+    ///
+    /// Driven through the `readChildNames` seam because a real mid-`readdir`
+    /// failure cannot be staged deterministically. That production actually
+    /// produces `.readFailed` is pinned separately and without any seam by
+    /// `testProductionBoundedReadCarriesTheReaddirErrno`.
+    func testWalkDisclosesAReadFailureAndStaysSilentOnAVanishedBranch() async throws {
+        try makeStaleCandidate("old-scratch", under: sharedRootURL)
+        // The walk composes children under the root's DECLARED (canonical)
+        // spelling, so the seam must match that, not the `/var/…` fixture URL.
+        let subtree = entryPath("old-scratch", under: sharedRootURL)
+
+        // (1) EIO mid-read — the tree could not be read, so the denial is
+        //     VISIBLE and the candidate is not listed.
+        let denied = await scan(makeScanner(
+            roots: [sharedRoot()],
+            readChildNames: { url, limit in
+                url.path == subtree
+                    ? .names([], truncation: .readFailed(errno: EIO))
+                    : EphemeralTempScanner.boundedChildNames(of: url, limit: limit)
+            }
+        ))
+
+        XCTAssertTrue(denied.items.isEmpty,
+                      "a tree we could not read is never proven stale")
+        XCTAssertEqual(denied.errors.count, 1,
+                       "a failed readdir must be disclosed: \(denied.errors)")
+        XCTAssertEqual(denied.errors.first?.kind, .unreadable)
+        XCTAssertEqual(denied.errors.first?.url?.path, subtree)
+
+        // (2) ENOENT mid-read — the branch vanished under the walk. Absence
+        //     is a silent skip at ANY instant (R11), exactly as the
+        //     `opendir` ENOENT arm treats it.
+        let vanished = await scan(makeScanner(
+            roots: [sharedRoot()],
+            readChildNames: { url, limit in
+                url.path == subtree
+                    ? .names([], truncation: .readFailed(errno: ENOENT))
+                    : EphemeralTempScanner.boundedChildNames(of: url, limit: limit)
+            }
+        ))
+
+        XCTAssertTrue(vanished.errors.isEmpty,
+                      "a vanished branch is not an impediment: "
+                        + "\(vanished.errors)")
+    }
+
+    /// THE PRODUCTION HALF that IS provable: a clean read is never misread
+    /// as a failed one.
+    ///
+    /// `readdir` returns nil for BOTH end-of-stream and error, and a cleared
+    /// `errno` is the only discriminator. Without the `errno = 0` that
+    /// precedes every call, a stale errno left by ANY earlier syscall in the
+    /// process would fabricate a `.readFailed` on a perfectly exhaustive
+    /// directory — turning a normal scan into a denial row. The stale value
+    /// is planted deliberately, because that is exactly what a long-lived
+    /// process hands this function.
+    ///
+    /// HONEST SCOPE — the opposite direction is NOT pinned by this suite.
+    /// `.readFailed` itself has no cell, because on this platform a real
+    /// mid-loop `readdir` failure could not be staged against the production
+    /// function. Measured while writing this cell: a standalone probe holding
+    /// a `DIR` handle open and IDLE across `hdiutil detach -force` of an
+    /// HFS+ RAM disk DOES get one ("NULL after 256 entries: errno=22
+    /// (Invalid argument)"), but eight threads hot-looping the read across
+    /// the same teardown produced 1,602 COMPLETE reads, zero interrupted,
+    /// and then 55,447 `opendir` failures — the unmount lands between reads,
+    /// never inside one, and `boundedChildNames` never leaves a handle idle.
+    /// So the disposition of a `.readFailed` is evidenced through the
+    /// `readChildNames` seam
+    /// (`testWalkDisclosesAReadFailureAndStaysSilentOnAVanishedBranch`) and
+    /// the errno carry itself is evidenced only by that direct syscall
+    /// measurement. Do not describe this arm as suite-covered.
+    func testACleanReadIsNeverMisreadAsAFailedOne() throws {
+        let directory = try mkdir(base.appendingPathComponent("clean-read"))
+        for index in 0..<5 {
+            try writeFile(
+                directory.appendingPathComponent("f\(index)"), bytes: 8
+            )
+        }
+
+        // A stale errno from an unrelated failed syscall, exactly as a
+        // long-lived process would carry into this call.
+        XCTAssertLessThan(open("/nonexistent-cacheout-probe", O_RDONLY), 0)
+        XCTAssertEqual(errno, ENOENT, "the fixture failed to plant a stale errno")
+
+        guard case .names(let names, let truncation) = EphemeralTempScanner
+            .boundedChildNames(of: directory, limit: 100)
+        else { return XCTFail("the clean read failed outright") }
+
+        XCTAssertEqual(names.count, 5)
+        XCTAssertNil(
+            truncation,
+            "an EXHAUSTIVE read reported truncation — errno is the only "
+                + "discriminator between end-of-stream and error, so it must "
+                + "be cleared before every readdir or a stale value from any "
+                + "earlier syscall fabricates a denial"
+        )
     }
 
     func testRegularFileCandidacyNeedsBothFloorAndAge() async throws {
@@ -1748,6 +1866,56 @@ final class EphemeralTempScannerTests: XCTestCase {
         )
     }
 
+    /// The ROOT arm's sentence and KIND follow the CAUSE, never the entry
+    /// count (r7, codex C2).
+    ///
+    /// The count heuristic that stood here was a guess: a `readdir` failure
+    /// landing exactly at the cap printed "holds more than N first-level
+    /// entries" though nothing beyond N was ever proven to exist — the
+    /// inference `OrphanedCachesScanner.obstruction(forErrno:)` refuses in
+    /// writing. Worse, `.enumerationTruncated`'s single GUI label is the
+    /// fixed sentence "too many entries — partially inspected"
+    /// (`ScannerItemSection.label(for:)`), which is simply false for a read
+    /// that FAILED. So a read failure now takes `.unreadable`, and
+    /// `.enumerationTruncated` means a cap hit and nothing else.
+    func testRootReadFailureIsNotReportedAsTooManyEntries() async throws {
+        for name in ["cap-a", "cap-b", "cap-c"] {
+            try makeStaleCandidate(name, under: sharedRootURL)
+        }
+
+        // Exactly `rootEntryLimit` names AND a failed read — the ambiguous
+        // shape the count heuristic got wrong.
+        let outcome = await scan(makeScanner(
+            roots: [sharedRoot()], rootEntryLimit: 3,
+            listDirectory: { url, limit in
+                let read = try EphemeralTempScanner.boundedFirstLevelNames(
+                    of: url, limit: limit
+                )
+                return (read.names, .readFailed(errno: EIO))
+            }
+        ))
+
+        let issue = try XCTUnwrap(outcome.errors.first)
+        XCTAssertEqual(
+            outcome.errors.count, 1, "\(outcome.errors)"
+        )
+        XCTAssertEqual(
+            issue.kind, .unreadable,
+            "a listing that FAILED is a denial — `.enumerationTruncated` "
+                + "renders as \"too many entries — partially inspected\", "
+                + "which would be a false claim about the cause"
+        )
+        XCTAssertFalse(
+            issue.detail.contains("holds more than"),
+            "nothing beyond the entries actually read was proven to exist: "
+                + "\(issue.detail)"
+        )
+        XCTAssertTrue(
+            issue.detail.contains("could not be enumerated completely"),
+            issue.detail
+        )
+    }
+
     /// The FAILURE arm of the production lister throws the CHAIN-BEARING
     /// Cocoa error, never the raw `opendir` errno (PR #459 review r4, codex
     /// C3). The distinction is doctrinal, not cosmetic: class-(a)
@@ -1809,13 +1977,14 @@ final class EphemeralTempScannerTests: XCTestCase {
                 XCTFail("the Foundation harvest ran though the bounded retry "
                         + "succeeded — the r4 C3 bound is only owed by the "
                         + "readdir loop")
-                return ([], false)
+                return ([], nil)
             }
         )
 
         XCTAssertEqual(boundedCalls, 2, "exactly one retry, never a loop")
         XCTAssertEqual(result.names.count, 3)
-        XCTAssertTrue(result.truncated)
+        XCTAssertEqual(result.truncation, .budget,
+                       "the retry hit the entry cap — nothing was denied")
     }
 
     /// THE SAME ORDERING, STAGED AGAINST THE REAL READS (PR #459 r6 verify):
@@ -1865,7 +2034,8 @@ final class EphemeralTempScannerTests: XCTestCase {
         while attempts < 200_000 {
             attempts += 1
             var reads: [Bool] = []   // per bounded read: true = .names
-            let result: (names: [String], truncated: Bool)
+            let result: (names: [String],
+                         truncation: EphemeralTempScanner.BoundedRead.Truncation?)
             do {
                 result = try EphemeralTempScanner.boundedFirstLevelNames(
                     of: dir, limit: 3,
@@ -1897,7 +2067,8 @@ final class EphemeralTempScannerTests: XCTestCase {
             guard reads == [false, true] else { continue }
             // Staged: the retry recovered a REAL cleared EACCES, bounded.
             XCTAssertEqual(result.names.count, 3)
-            XCTAssertTrue(result.truncated)
+            XCTAssertEqual(result.truncation, .budget,
+                           "the recovered read hit the cap, not a denial")
             return
         }
         XCTFail("the fail-then-cleared ordering never staged in "
@@ -1917,11 +2088,12 @@ final class EphemeralTempScannerTests: XCTestCase {
             of: dir, limit: 4
         )
         XCTAssertEqual(capped.names.count, 4)
-        XCTAssertTrue(capped.truncated)
+        XCTAssertEqual(capped.truncation, .budget,
+                       "the harvest's only truncation cause is the cap")
 
         let all = try EphemeralTempScanner.lazyChainHarvest(of: dir, limit: 100)
         XCTAssertEqual(all.names.count, 6)
-        XCTAssertFalse(all.truncated)
+        XCTAssertNil(all.truncation, "an exhaustive harvest truncates nothing")
         XCTAssertTrue(all.names.contains(".dot-scratch"),
                       "dotfile scratch directories are real payload")
     }
@@ -1968,7 +2140,7 @@ final class EphemeralTempScannerTests: XCTestCase {
         let after = residentBytes()
 
         XCTAssertEqual(result.names.count, 5)
-        XCTAssertTrue(result.truncated)
+        XCTAssertEqual(result.truncation, .budget)
         let delta = after > before ? after - before : 0
         XCTAssertLessThan(
             delta, 20 * 1_048_576,

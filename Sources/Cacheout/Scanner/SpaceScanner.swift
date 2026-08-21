@@ -427,11 +427,16 @@ struct ScanIssue: Equatable, Sendable {
         case permissionDenied
         /// Enumeration or metadata failure that is not a permission problem.
         case unreadable
-        /// A root listing hit its entry cap (or could not be proven
-        /// exhaustive): everything listed is real, but MORE remained
-        /// uninspected (PR #459 review r4, codex C3 — the bound that keeps a
-        /// world-writable root's population from stalling the scan). A
-        /// FILESYSTEM kind: `url` names the truncated root.
+        /// A root listing hit its ENTRY CAP: everything listed is real, but
+        /// MORE remained uninspected (PR #459 review r4, codex C3 — the bound
+        /// that keeps a world-writable root's population from stalling the
+        /// scan). A FILESYSTEM kind: `url` names the truncated root.
+        ///
+        /// A cap hit ONLY (narrowed in PR #459 review r7, codex C2). A
+        /// listing that stopped because the READ failed is a denial and
+        /// carries `.unreadable` instead — this kind's single GUI label is
+        /// the fixed sentence "too many entries — partially inspected", so
+        /// admitting any other cause here would make that label a lie.
         case enumerationTruncated
         /// A PERSISTED configuration value this build cannot parse (fn-4,
         /// R8/R16 — e.g. a `devRoots` array whose shape is invalid). The

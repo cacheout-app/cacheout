@@ -281,16 +281,40 @@ struct EphemeralTempScanner: @unchecked Sendable {
     /// the previous `(URL) throws -> [URL]` return type forced every
     /// implementation — injected or production — to materialize the full
     /// array before the scanner saw one entry. Basenames and a truncation
-    /// flag, never URLs: the scan rebuilds each entry under the DECLARED
-    /// canonical root spelling anyway.
-    typealias DirectoryLister =
-        @Sendable (URL, Int) throws -> (names: [String], truncated: Bool)
+    /// CAUSE, never URLs: the scan rebuilds each entry under the DECLARED
+    /// canonical root spelling anyway. The cause (rather than the `Bool` that
+    /// stood here until r7, codex C2) is what lets the root arm say WHY the
+    /// listing stopped instead of inferring it from the entry count.
+    typealias DirectoryLister = @Sendable (URL, Int) throws
+        -> (names: [String], truncation: BoundedRead.Truncation?)
 
     /// Injection seam for stage-2 sizing. Carries the MODE so a test can
     /// assert what production passes (`.deletionTarget`), and gives the
     /// between-stages fixtures (symlink swap, late-arriving fresh file, the
     /// post-sizing outcome rows) their staging point.
     typealias CandidateSizer = @Sendable (URL, DirectorySizer.Mode) -> SizeReport
+
+    /// Injection seam for the pre-filter walk's SUBTREE reads (r7, codex C2).
+    /// Production is `boundedChildNames(of:limit:)` verbatim; it exists so
+    /// the walk's per-CAUSE disposition — a failed `readdir` disclosed, a
+    /// vanished branch skipped silently, a cap hit dropped silently — is
+    /// drivable DETERMINISTICALLY, which a real mid-`readdir` failure is not
+    /// (staging one needs a volume yanked inside the read).
+    ///
+    /// The double is strictly LESS capable than production: it can only
+    /// return values `boundedChildNames` itself returns.
+    ///
+    /// EVIDENCE STATUS, stated honestly. The DISPOSITION of each cause is
+    /// suite-covered through this seam. That production actually EMITS
+    /// `.readFailed` is NOT: measured for r7, a `DIR` handle held open and
+    /// idle across a force-detached HFS+ RAM disk yields errno 22 (EINVAL)
+    /// mid-directory, but eight threads hot-looping the real read across the
+    /// same teardown produced 1,602 complete reads and ZERO interrupted ones
+    /// — the unmount lands between reads, and this function never leaves a
+    /// handle idle. `testACleanReadIsNeverMisreadAsAFailedOne` pins the other
+    /// direction (a stale errno must not fabricate a failure). Do not call
+    /// the errno carry suite-covered.
+    typealias BoundedChildReader = @Sendable (URL, Int) -> BoundedRead
 
     // MARK: - Stored state (all construction state — never `ScanContext`)
 
@@ -318,6 +342,8 @@ struct EphemeralTempScanner: @unchecked Sendable {
     private let now: @Sendable () -> Date
     private let lockProbe: LockProber
     private let listDirectory: DirectoryLister
+    /// The pre-filter walk's subtree reader (production default).
+    private let readChildNames: BoundedChildReader
     /// `nil` in production — the real `DirectorySizer` is called directly.
     private let candidateSizer: CandidateSizer?
 
@@ -340,6 +366,9 @@ struct EphemeralTempScanner: @unchecked Sendable {
         listDirectory: @escaping DirectoryLister = {
             try EphemeralTempScanner.boundedFirstLevelNames(of: $0, limit: $1)
         },
+        readChildNames: @escaping BoundedChildReader = {
+            EphemeralTempScanner.boundedChildNames(of: $0, limit: $1)
+        },
         candidateSizer: CandidateSizer? = nil
     ) {
         self.roots = roots
@@ -355,6 +384,7 @@ struct EphemeralTempScanner: @unchecked Sendable {
         self.now = now
         self.lockProbe = lockProbe
         self.listDirectory = listDirectory
+        self.readChildNames = readChildNames
         self.candidateSizer = candidateSizer
     }
 
@@ -383,7 +413,7 @@ struct EphemeralTempScanner: @unchecked Sendable {
     /// here materialized the whole directory whenever the race was won).
     static func boundedFirstLevelNames(
         of root: URL, limit: Int
-    ) throws -> (names: [String], truncated: Bool) {
+    ) throws -> (names: [String], truncation: BoundedRead.Truncation?) {
         try boundedFirstLevelNames(
             of: root, limit: limit,
             boundedRead: { boundedChildNames(of: $0, limit: $1) },
@@ -404,16 +434,17 @@ struct EphemeralTempScanner: @unchecked Sendable {
     static func boundedFirstLevelNames(
         of root: URL, limit: Int,
         boundedRead: (URL, Int) -> BoundedRead,
-        chainHarvest: (URL, Int) throws -> (names: [String], truncated: Bool)
-    ) throws -> (names: [String], truncated: Bool) {
-        if case .names(let names, let truncated) = boundedRead(root, limit) {
-            return (names, truncated)
+        chainHarvest: (URL, Int) throws
+            -> (names: [String], truncation: BoundedRead.Truncation?)
+    ) throws -> (names: [String], truncation: BoundedRead.Truncation?) {
+        if case .names(let names, let truncation) = boundedRead(root, limit) {
+            return (names, truncation)
         }
         // The BOUNDED RETRY (r6, codex C1): the common recovery from a
         // transient open failure stays inside the readdir loop and never
         // touches Foundation.
-        if case .names(let names, let truncated) = boundedRead(root, limit) {
-            return (names, truncated)
+        if case .names(let names, let truncation) = boundedRead(root, limit) {
+            return (names, truncation)
         }
         return try chainHarvest(root, limit)
     }
@@ -433,9 +464,13 @@ struct EphemeralTempScanner: @unchecked Sendable {
     /// +42.5 MB). A mid-iteration failure throws rather than returning a
     /// partial listing as complete — fail-visible, matching the "could not
     /// be listed" disposition of the caller's catch.
+    ///
+    /// Its ONLY truncation cause is `.budget`: the loop stops at `limit` and
+    /// a mid-iteration failure THROWS rather than returning a short listing,
+    /// so a partial harvest is never reported as a cap hit.
     static func lazyChainHarvest(
         of root: URL, limit: Int
-    ) throws -> (names: [String], truncated: Bool) {
+    ) throws -> (names: [String], truncation: BoundedRead.Truncation?) {
         var harvested: Error?
         guard let enumerator = FileManager.default.enumerator(
             at: root, includingPropertiesForKeys: nil,
@@ -454,16 +489,16 @@ struct EphemeralTempScanner: @unchecked Sendable {
             )
         }
         var names: [String] = []
-        var truncated = false
+        var truncation: BoundedRead.Truncation?
         for case let entry as URL in enumerator {
             if names.count >= limit {
-                truncated = true
+                truncation = .budget
                 break
             }
             names.append(entry.lastPathComponent)
         }
         if let harvested { throw harvested }
-        return (names, truncated)
+        return (names, truncation)
     }
 
     // MARK: - Protocol surface (the conformance sits at the foot of this file)
@@ -685,7 +720,7 @@ struct EphemeralTempScanner: @unchecked Sendable {
             )
             let rootDevice = provider.deviceID(of: root.url)
 
-            let listing: (names: [String], truncated: Bool)
+            let listing: (names: [String], truncation: BoundedRead.Truncation?)
             do {
                 listing = try listDirectory(root.url, rootEntryLimit)
             } catch {
@@ -724,20 +759,43 @@ struct EphemeralTempScanner: @unchecked Sendable {
             // FACT and never promises a bare "re-scan and retry" (the
             // deterministic-bound lesson: promise a retry only where a retry
             // can differ, and say WHY it can).
-            if listing.truncated {
-                let detail = listing.names.count == rootEntryLimit
-                    ? "\(root.label) holds more than \(rootEntryLimit) "
+            //
+            // The KIND and the sentence follow the CAUSE, never the entry
+            // count (r7, codex C2). The count heuristic that stood here was a
+            // guess: a `readdir` failure landing exactly at the cap printed
+            // "holds more than N first-level entries" though nothing beyond N
+            // was ever proven to exist — and `.enumerationTruncated`'s only
+            // GUI label is the fixed sentence "too many entries — partially
+            // inspected", which is simply false for a failed read. So a read
+            // failure takes the same `.unreadable` denial route the per-entry
+            // arms use, and `.enumerationTruncated` now means a cap hit and
+            // nothing else.
+            switch listing.truncation {
+            case .budget:
+                issues.append(ScanIssue(
+                    url: root.url, kind: .enumerationTruncated,
+                    detail: "\(root.label) holds more than \(rootEntryLimit) "
                         + "first-level entries — only the first "
                         + "\(rootEntryLimit) the directory returned were "
                         + "inspected; clearing entries, including cleaning "
                         + "the items listed here, lets a later scan see the "
                         + "rest"
-                    : "\(root.label) could not be enumerated completely — "
-                        + "only \(listing.names.count) first-level entries "
-                        + "were readable; what follows covers those"
-                issues.append(ScanIssue(
-                    url: root.url, kind: .enumerationTruncated, detail: detail
                 ))
+            case .readFailed(let code):
+                record(.rawErrno(code), at: root.url,
+                       "\(root.label) could not be enumerated completely — "
+                        + "only \(listing.names.count) first-level entries "
+                        + "were read; what follows covers those")
+            case .undecodableName:
+                issues.append(ScanIssue(
+                    url: root.url, kind: .unreadable,
+                    detail: "\(root.label) could not be enumerated completely "
+                        + "— an entry name is not valid text, so only the "
+                        + "\(listing.names.count) first-level entries read "
+                        + "before it were inspected"
+                ))
+            case .none:
+                break
             }
 
             // utf8-lexicographic, the same comparator the pre-filter walk
@@ -1073,8 +1131,11 @@ struct EphemeralTempScanner: @unchecked Sendable {
         /// pinned to (PR #459 review r4, codex C1). The lstat already
         /// returned it; before the pin it was read and DISCARDED here.
         case stale(ownDate: Date, identity: FileSystemIdentityProvider.Identity)
-        /// Not listed, silently: a fresh own mtime, a fresh file found inside,
-        /// a cap hit without a fresh hit, or a regular file under the floor.
+        /// Not listed, silently. The full cause list: a fresh own mtime, a
+        /// fresh file found inside, a cap hit without a fresh hit, an
+        /// undecodable basename mid-read, or a regular file under the floor.
+        /// A FAILED read is deliberately NOT here — it takes `.denied`
+        /// (r7, codex C2).
         case notStale
         /// ENOENT on the candidate itself — the observable race contract.
         case vanished
@@ -1101,7 +1162,13 @@ struct EphemeralTempScanner: @unchecked Sendable {
     /// | fresh           | all old                      | NOT stale        |
     /// | old             | none (empty tree)            | vacuously stale  |
     /// | any             | cap hit, no fresh hit        | NOT stale        |
+    /// | any             | undecodable basename         | NOT stale        |
+    /// | any             | branch vanished (ENOENT)     | skipped, silent  |
     /// | any             | denial mid-probe             | NOT stale + issue|
+    ///
+    /// "Denial mid-probe" covers an `opendir` failure AND a `readdir` failure
+    /// alike (r7, codex C2: the readdir half used to fall into the cap-hit
+    /// row and be dropped silently).
     ///
     /// The empty-old-directory cell reaches stage 2 and is then never listed:
     /// zero allocated bytes cannot meet a positive size floor on a clean walk.
@@ -1193,10 +1260,19 @@ struct EphemeralTempScanner: @unchecked Sendable {
     /// it stops at the FIRST regular file at-or-newer than the cutoff. Nothing
     /// here sizes anything — the one sizing walk is stage 2's.
     ///
-    /// Every not-proven-exhaustive outcome (cap hit, truncated read) returns
-    /// NOT stale: refusing to list is the safe direction. A denial mid-probe
-    /// returns `.denied` — the staleness of a tree we cannot read is
-    /// unprovable, and the denial must be visible.
+    /// Every not-proven-exhaustive outcome returns NOT stale: refusing to
+    /// list is the safe direction. What differs is DISCLOSURE, and it turns
+    /// on the CAUSE, not on the fact of truncation (r7, codex C2 — these two
+    /// sentences used to contradict each other for a failed `readdir`, and
+    /// the first one silently swallowed what the second promised):
+    ///
+    /// - budget cap, undecodable basename → NOT stale, SILENT. Nothing was
+    ///   denied, and nothing beyond the cap was proven to exist.
+    /// - `opendir`/`readdir` failure that is not ENOENT/ENOTDIR → `.denied`,
+    ///   VISIBLE. The staleness of a tree we cannot read is unprovable, and
+    ///   the denial must be surfaced.
+    /// - ENOENT/ENOTDIR at either point → silent skip: the branch vanished
+    ///   under the walk (R11), which is not an impediment.
     private func walkForFreshContent(
         _ root: URL, cutoff: Date, ownDate: Date,
         identity: FileSystemIdentityProvider.Identity,
@@ -1209,7 +1285,7 @@ struct EphemeralTempScanner: @unchecked Sendable {
             let remaining = prefilterEntryLimit - visited
             guard remaining > 0 else { return .notStale }
 
-            switch Self.boundedChildNames(of: directory, limit: remaining) {
+            switch readChildNames(directory, remaining) {
             case .failed(let code):
                 if code == ENOENT || code == ENOTDIR {
                     // The branch vanished mid-walk — the benign race, skipped
@@ -1217,11 +1293,34 @@ struct EphemeralTempScanner: @unchecked Sendable {
                     continue
                 }
                 return .denied(directory, .rawErrno(code))
-            case .names(let names, let truncated):
-                // More entries remained than the budget could read (or the
-                // read could not be proven exhaustive): "every file is old"
-                // is unproven, so the safe direction wins.
-                if truncated { return .notStale }
+            case .names(let names, let truncation):
+                // Dispose PER CAUSE, never on a blanket flag (r7, codex C2).
+                // Both directions are "not stale" — the difference is whether
+                // the user is TOLD, and a refusal nobody is told about reads
+                // as "nothing there" (D6).
+                switch truncation {
+                case .readFailed(let code):
+                    // ENOENT/ENOTDIR mid-read is the branch vanishing under
+                    // the walk: the SAME silent disposition the `opendir` arm
+                    // six lines up gives it, and R11's "absence is a silent
+                    // skip at any instant". Everything else — EACCES, EPERM,
+                    // EIO, the measured EINVAL of a yanked volume, the whole
+                    // network/removable family — is a tree we could not read,
+                    // and the denial must be VISIBLE.
+                    if code == ENOENT || code == ENOTDIR { continue }
+                    return .denied(directory, .rawErrno(code))
+                case .budget, .undecodableName:
+                    // A cap hit denied nothing, and an undecodable basename
+                    // is a property of the tree rather than an impediment:
+                    // both leave "every file is old" unproven, so the safe
+                    // direction wins SILENTLY. Turning the cap hit into a
+                    // denial row is the false-denial defect r5 codex C5
+                    // fixed; `testPrefilterCapHitWithoutFreshHitIsNotListed`
+                    // pins it.
+                    return .notStale
+                case .none:
+                    break
+                }
                 var pending: [URL] = []
                 for name in names.sorted(by: {
                     $0.utf8.lexicographicallyPrecedes($1.utf8)
@@ -1347,14 +1446,40 @@ struct EphemeralTempScanner: @unchecked Sendable {
     ///
     /// Three traps this must not fall into: `readdir` returns nil for BOTH
     /// end-of-stream and error (errno is the only discriminator, so it is
-    /// cleared before every call); an undecodable basename fails CLOSED
+    /// cleared before every call, and the CAUSE it discriminates is carried
+    /// out — see `Truncation`); an undecodable basename fails CLOSED
     /// (`String(validatingCString:)` — a U+FFFD-repaired name would address a
     /// DIFFERENT path, and an `lstat` of that lie would report "absent",
     /// letting the walk call a tree all-old while a fresh file went
     /// uninspected); and `.`/`..` are skipped while hidden entries are kept.
     enum BoundedRead {
-        case names([String], truncated: Bool)
+        /// `truncation` is nil when the read was PROVEN exhaustive.
+        case names([String], truncation: Truncation?)
+        /// `opendir`/`fdopendir` itself failed — nothing was read at all.
         case failed(errno: Int32)
+
+        /// WHY a bounded read stopped short.
+        ///
+        /// The causes are NOT interchangeable and a single `truncated: Bool`
+        /// was a defect (PR #459 review r7, codex C2): a budget cap denied
+        /// NOTHING and must stay silent, while a failed `readdir` is a
+        /// denial mid-probe that the caller has to disclose — collapsing
+        /// them made an EIO/EINVAL mid-walk indistinguishable from a benign
+        /// cap hit, and the candidate was dropped with no item and no issue.
+        /// Both sibling implementations of this primitive already keep the
+        /// two apart (`ValuablesDetector.swift:1752` vs `:1767`;
+        /// `OrphanedCachesScanner.swift:2397-2403`).
+        enum Truncation: Equatable {
+            /// The entry budget ended the read. Nothing was denied — and
+            /// nothing beyond it was PROVEN to exist either, so a caller may
+            /// not infer "there are more entries" from this alone.
+            case budget
+            /// A basename that is not valid UTF-8 — fails closed.
+            case undecodableName
+            /// `readdir` ITSELF failed mid-directory. `errno` is cleared
+            /// before every call, so this is the error, never end-of-stream.
+            case readFailed(errno: Int32)
+        }
     }
 
     static func boundedChildNames(
@@ -1365,11 +1490,14 @@ struct EphemeralTempScanner: @unchecked Sendable {
         }
         defer { closedir(handle) }
         var names: [String] = []
-        var truncated = false
+        var truncation: BoundedRead.Truncation?
         while true {
             errno = 0
             guard let entry = readdir(handle) else {
-                if errno != 0 { truncated = true }
+                // nil means end-of-stream OR error; a cleared errno is the
+                // ONLY discriminator, and the cause is carried out rather
+                // than folded into a bare flag (r7, codex C2).
+                if errno != 0 { truncation = .readFailed(errno: errno) }
                 break
             }
             let decoded = withUnsafeBytes(of: entry.pointee.d_name) {
@@ -1382,17 +1510,17 @@ struct EphemeralTempScanner: @unchecked Sendable {
                 // Undecodable: the directory is already unproven, and reading
                 // on would let a directory full of such names spend the whole
                 // budget.
-                truncated = true
+                truncation = .undecodableName
                 break
             }
             if name == "." || name == ".." { continue }
             guard names.count < limit else {
-                truncated = true
+                truncation = .budget
                 break
             }
             names.append(name)
         }
-        return .names(names, truncated: truncated)
+        return .names(names, truncation: truncation)
     }
 
     // MARK: - Cooperative lock probe (R6, epic D2 revised)
@@ -2413,9 +2541,24 @@ struct EphemeralTempScanner: @unchecked Sendable {
                 return .allOld
             }
             return .unprovable(String(cString: strerror(code)))
-        case .names(let read, let truncated):
-            if truncated {
-                return .unprovable("a directory could not be read in full")
+        case .names(let read, let truncation):
+            // EVERY cause refuses here, and every refusal is visible — the
+            // delete-time disposition is unchanged by r7 codex C2. Only the
+            // wording gained the cause it always had in hand.
+            switch truncation {
+            case .budget:
+                return .unprovable("more entries than the inspection budget")
+            case .undecodableName:
+                return .unprovable(
+                    "a directory holds an entry name that is not valid text"
+                )
+            case .readFailed(let code):
+                return .unprovable(
+                    "a directory could not be read in full: "
+                        + String(cString: strerror(code))
+                )
+            case .none:
+                break
             }
             names = read
         }
@@ -2534,11 +2677,11 @@ struct EphemeralTempScanner: @unchecked Sendable {
         }
         defer { closedir(handle) }
         var names: [String] = []
-        var truncated = false
+        var truncation: BoundedRead.Truncation?
         while true {
             errno = 0
             guard let entry = readdir(handle) else {
-                if errno != 0 { truncated = true }
+                if errno != 0 { truncation = .readFailed(errno: errno) }
                 break
             }
             let decoded = withUnsafeBytes(of: entry.pointee.d_name) {
@@ -2548,17 +2691,17 @@ struct EphemeralTempScanner: @unchecked Sendable {
                 return String(validatingCString: base)
             }
             guard let name = decoded, !name.isEmpty else {
-                truncated = true
+                truncation = .undecodableName
                 break
             }
             if name == "." || name == ".." { continue }
             guard names.count < limit else {
-                truncated = true
+                truncation = .budget
                 break
             }
             names.append(name)
         }
-        return .names(names, truncated: truncated)
+        return .names(names, truncation: truncation)
     }
 }
 

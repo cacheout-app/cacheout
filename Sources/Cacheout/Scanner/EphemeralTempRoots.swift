@@ -560,7 +560,7 @@ enum EphemeralTempRoots {
         // `SpaceScannerRuntime.production`
         // (`SpaceScanner.swift:1146-1149`), which
         // the GUI calls from `CacheoutViewModel.production`
-        // (`CacheoutViewModel.swift:533-553`) at the `@MainActor` view
+        // (`CacheoutViewModel.swift:533-552`) at the `@MainActor` view
         // model's construction (`CacheoutApp.swift:58`), so the block lands
         // on the main thread before any window, trigger gate or scan exists.
         // Measured through the shipped `??` arm with a table-injected

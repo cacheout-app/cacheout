@@ -682,7 +682,7 @@ first-level entry, `risk: .review`, `defaultSelected: false`,
 | Member | Description |
 |--------|-------------|
 | `registeredID` (static) | The scanner slug `ephemeral_tmp` — the CLI address prefix and the GUI section key |
-| `trustedContainerRoots` | The resolved roots in their ONE canonical spelling — what registration hands delete-time admission |
+| `trustedContainerRoots` | The declared root spellings, fixed at REGISTRATION — what registration hands delete-time admission. One spelling per root, resolved once by `EphemeralTempRoots.resolve`: canonical parent chain, leaf left UNRESOLVED, so a root whose own leaf is a symlink is NOT canonical |
 | `participates(in:)` | Where the trigger policy lives: `true` only for `.userInitiated`. On `.automatic` the runtime leaves the scanner OUT of the session entirely — no task, no event, so previously displayed temp rows, their issues and the user's ticks all survive the refresh |
 | `scan(context:)` | Ignores `categoryFilter`. Repeats the trigger gate as defense in depth for a caller that constructs a scanner and bypasses the runtime; that arm returns an empty outcome, which is why it is a last resort and not the policy |
 | `preDeleteRevalidator` | Declared for EVERY temp item. Re-inspects the entry from one held descriptor immediately before deletion: it proves the object is the one the scan inspected (device+inode), refuses anything that is no longer a directory or regular file, re-checks staleness and the advisory lock, and re-checks ownership only under a `.worldWritable` root |

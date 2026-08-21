@@ -4782,19 +4782,23 @@ extension EphemeralTempScannerTests {
         )
     }
 
-    /// CANCELLATION INSIDE THE WALK, at the directory the stack pops. The
-    /// scan loop's own check runs once per candidate, so a deep candidate used
-    /// to run to completion after the consumer had given up.
+    /// CANCELLATION INSIDE THE WALK, at the directory the stack pops.
+    ///
+    /// STAGED SO ONLY THAT CHECK CAN ANSWER: every subdirectory is EMPTY, so
+    /// the per-name check below it never executes its body and the stack
+    /// drains through the pop alone. A first attempt at this cell used a deep
+    /// CHAIN instead, and removing the pop check left the whole suite green —
+    /// the per-name check was catching it. (`readChildNames` is the seam
+    /// because it is called exactly once per popped directory.)
     func testCancellationStopsAWalkBetweenItsDirectories() async throws {
-        let chainDepth = 30
-        var leaf = try mkdir(sharedRootURL.appendingPathComponent("chain"))
-        for level in 0..<chainDepth {
-            try writeFile(
-                leaf.appendingPathComponent("payload.bin"), bytes: 4_096
-            )
-            leaf = try mkdir(leaf.appendingPathComponent("level-\(level)"))
+        let breadth = 20
+        let candidate = try mkdir(
+            sharedRootURL.appendingPathComponent("wide-empty")
+        )
+        for index in 0..<breadth {
+            try mkdir(candidate.appendingPathComponent("sub-\(index)"))
         }
-        try backdate(sharedRootURL.appendingPathComponent("chain"), to: oldDate)
+        try backdate(candidate, to: oldDate)
 
         let controlCalls = WalkSeamCallCounter()
         _ = await scan(makeScanner(
@@ -4807,8 +4811,9 @@ extension EphemeralTempScannerTests {
             }
         ))
         XCTAssertEqual(
-            controlCalls.count, chainDepth + 1,
-            "control: an uncancelled walk reads every directory in the chain"
+            controlCalls.count, breadth + 1,
+            "control: an uncancelled walk reads the candidate and every one "
+                + "of its subdirectories"
         )
 
         let canceller = TaskCanceller()
@@ -4817,8 +4822,9 @@ extension EphemeralTempScannerTests {
             roots: [sharedRoot()],
             readChildNames: { [calls, canceller] url, limit in
                 calls.bump()
-                // Cancel from INSIDE the walk, on the walk's own task: the
-                // flag is set while the stack still holds 29 directories.
+                // Cancel from INSIDE the walk, on the walk's own task, at the
+                // FIRST subdirectory — the candidate's own names are already
+                // on the stack, and every one of them is empty.
                 if calls.count == 2 { canceller.fire() }
                 return EphemeralTempScanner.boundedChildNames(
                     of: url, limit: limit
@@ -4838,8 +4844,8 @@ extension EphemeralTempScannerTests {
 
         XCTAssertLessThanOrEqual(
             calls.count, 3,
-            "a cancelled walk must stop at the next directory, not read all "
-                + "\(chainDepth + 1) of them"
+            "a cancelled walk must stop at the next directory it pops, not "
+                + "drain all \(breadth + 1) of them"
         )
     }
 

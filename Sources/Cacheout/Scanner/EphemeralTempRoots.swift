@@ -139,6 +139,23 @@
 /// every root including non-directory ones, at the same construction time.
 /// Neither has been changed here.
 ///
+/// ### RESIDUAL, at measured scope: the SECTION TITLE is about THIS FILE
+///
+/// It is not a claim about `production()` as a whole, and the difference is
+/// measured. A symlink root this resolution cannot place is KEPT, so it
+/// reaches the runtime's cross-scanner union and
+/// `SpaceScanner.swift:953` canonicalizes it there — one leaf-following
+/// `realpath(3)` on the destination, still during construction. Measured
+/// through the shipped `??` arm with the same fixture, before and after this
+/// change: leaf-following canonicalizations of a symlinked `C` went 2 → 1,
+/// and `production()` under a 0.75 s stall on calls naming the destination
+/// went 3.02 s → 0.76 s. Replacing that one line's `provider.canonicalize(
+/// root).path` with `root.path` takes both to 0 and 0.0026 s, which is how
+/// the surviving contact was attributed — NOT a proposed fix: that key is
+/// what suppresses a shadowing alias ACROSS scanners
+/// (`SpaceScanner.swift:899-909`), and weakening it trades one hazard for
+/// another. Closing it needs its own change, on fn-4.5's contract.
+///
 /// ## De-dupe and alias suppression — two halves, cited one at a time
 ///
 /// One value is probed per declared root: whether the DECLARED spelling is

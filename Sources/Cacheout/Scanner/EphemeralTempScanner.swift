@@ -1437,8 +1437,8 @@ struct EphemeralTempScanner: @unchecked Sendable {
     /// - the shared ROOT budget running out, and CANCELLATION → NOT stale,
     ///   SILENT, for the same reason as the per-candidate cap: nothing was
     ///   denied. The root budget's exhaustion is disclosed ONCE by the root
-    ///   (`budget.wasCutShort`), never per candidate; a cancelled session is
-    ///   discarded by both consumers, so a per-candidate row would be noise.
+    ///   (`budget.wasCutShort`), never per candidate. Cancellation discloses
+    ///   nothing at all: it is not a property of the tree.
     ///
     /// TWO BOUNDS, ONE CLAMP (PR #459 codex r16). `visited` is this
     /// candidate's own cap; `budget` is the allowance every candidate under

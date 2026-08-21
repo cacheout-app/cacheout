@@ -20,7 +20,7 @@ Built for developers on space-constrained Macs (especially the 256GB M4 Mac Mini
 - **Sparse file awareness** — Reports allocated (on-disk) usage everywhere, so sparse files — Docker's disk image, simulator disk images, and anything else logically larger than it really is — show what they actually consume, not inflated logical sizes
 - **Move to Trash option** — Recoverable deletion instead of permanent removal
 - **Cleanup logging** — All actions logged to `~/.cacheout/cleanup.log`
-- **No admin privileges** — Runs entirely as you: user-space caches (`~/Library/`, `~/.`), your dev roots, and the ephemeral temp locations (`/private/tmp` and your own per-user temp/cache containers); another user's temp files are never listed
+- **No admin privileges** — Runs entirely as you: user-space caches (`~/Library/`, `~/.`), your dev roots, and the ephemeral temp locations (`/private/tmp` and your own per-user temp/cache containers); another user's ordinary temp files are skipped rather than listed (a mounted volume is the one exception — it is refused without being entered, and reported as a not-measured row whoever owns it)
 - **No network access** — No analytics, no telemetry, no update checks
 - **Native SwiftUI** — Lightweight, fast, feels like a first-party macOS app
 

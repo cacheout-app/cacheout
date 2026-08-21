@@ -447,9 +447,12 @@ to defer update checks until a signed appcast URL is configured in Info.plist.
   caches (`~/Library/`, `~/.`), the configured dev roots, and — since the
   ephemeral temp scanner — the world-writable `/private/tmp` plus this
   user's own `…/T` and `…/C` containers under `/private/var/folders`. Those
-  temp roots are read only on user-initiated scans, and an entry another
-  user owns is never listed (sticky-directory rules make it undeletable, so
-  claiming its bytes would be a lie)
+  temp roots are read only on user-initiated scans, and an ORDINARY entry
+  another user owns is skipped rather than listed (sticky-directory rules
+  make it undeletable, so claiming its bytes would be a lie). The one
+  exception is a mounted volume: that arm runs ahead of the ownership probe
+  by design — so the volume is refused WITHOUT being entered — and the entry
+  is reported as a visible not-measured row whoever owns it
 - **No network access**: No analytics, telemetry, or phoning home
 - **PathGuard admission on every destructive path**: category roots, contained
   children, per-item scanner targets, and cleanCommands roots are admitted against

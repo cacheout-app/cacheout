@@ -3753,9 +3753,171 @@ final class EphemeralTempScannerTests: XCTestCase {
         )
     }
 
-    /// Descriptors are not a function of depth either — the twin of
+    /// COUNTS the descriptors the process holds, once per descent, so `peak`
+    /// ends up the walk's own high-water mark.
+    ///
+    /// `openChildDirectoryCarryingErrno` is the walk's ONLY descent, so
+    /// `descents` is also an honest count of levels actually entered: a
+    /// regression that stopped early would post a small delta for the wrong
+    /// reason, and the cells below pin the count to rule that out.
+    private final class DescriptorFrontierProbe: FileSystemIdentityProvider,
+        @unchecked Sendable {
+        var sampling = false
+        private(set) var peak = -1
+        private(set) var descents = 0
+        private(set) var overflowed = false
+
+        /// COUNTING, not the lowest-free-descriptor trick that reads like the
+        /// cheap way to do this. `open("/dev/null")` hands back the lowest
+        /// FREE number, which is a HOLE whenever the process has closed
+        /// something below its high-water mark — so the difference of two such
+        /// probes reports the hole, not the walk. Measured: that spelling read
+        /// a cost of 38 for this walk in a full suite and 2 alone, and the
+        /// walk was identical in both. Counting is immune to holes because it
+        /// counts what is actually held.
+        ///
+        /// `nil` rather than a short count if anything sits at the top of the
+        /// window, so the measurement can never silently under-report. The
+        /// window is ~10x the most this process is known to hold (~104 at rest
+        /// plus the walk's own), and 4096 `fcntl`s take tens of microseconds.
+        static let window: Int32 = 4096
+        static func heldDescriptors() -> Int? {
+            var count = 0
+            var highest: Int32 = -1
+            for fd in Int32(0)..<window where fcntl(fd, F_GETFD) != -1 {
+                count += 1
+                highest = fd
+            }
+            return highest >= window - 1 ? nil : count
+        }
+
+        /// The HIGHEST number in use. `RLIMIT_NOFILE` caps the fd NUMBER the
+        /// kernel will hand out, not the count, so a limit derived from a
+        /// count would be below descriptors the process already holds the
+        /// moment there is a hole. `nil` on the same overflow guard.
+        static func highestDescriptor() -> Int32? {
+            var highest: Int32 = -1
+            for fd in Int32(0)..<window where fcntl(fd, F_GETFD) != -1 {
+                highest = fd
+            }
+            return highest >= window - 1 ? nil : highest
+        }
+
+        override func openChildDirectoryCarryingErrno(
+            inDirectory descriptor: Int32, named name: String,
+            logical: @autoclosure () -> URL
+        ) -> DescriptorOpen {
+            if sampling {
+                descents += 1
+                if let held = DescriptorFrontierProbe.heldDescriptors() {
+                    peak = max(peak, held)
+                } else {
+                    overflowed = true
+                }
+            }
+            return super.openChildDirectoryCarryingErrno(
+                inDirectory: descriptor, named: name, logical: logical()
+            )
+        }
+    }
+
+    /// THE PROPERTY, MEASURED DIRECTLY: the walk's descriptor cost is CONSTANT
+    /// IN DEPTH. Forty times the depth must not buy a single extra descriptor.
+    ///
+    /// Measured through this exact production path, peak minus baseline:
+    ///
+    ///     levels:            8      320
+    ///     iterative (here):  2        2
+    ///     recursive (HEAD):  8      200 (at 320 it dies on the guard page)
+    ///
+    /// Under the recursion the delta WAS the depth, exactly. Under the climb
+    /// it is 2 at both — the level the walk stands on, plus the one the probe
+    /// itself holds for the instant it counts.
+    ///
+    /// WHY THIS CANNOT GO LOAD-SENSITIVE, which the `rlim_cur = 96` spelling
+    /// it replaces could and did (PR #459 codex r14): the number asserted on
+    /// is a DELTA between two counts of THIS process's own held descriptors,
+    /// so whatever the rest of the suite is holding cancels. Measured both
+    /// ways on the same build:
+    ///
+    ///     alone:       baseline   3, peak   5, delta 2 (both depths)
+    ///     full suite:  baseline 105, peak 107, delta 2 (both depths)
+    ///
+    /// A baseline 102 higher, the same answer. The spelling this replaces
+    /// compared the walk against an ABSOLUTE process-wide `rlim_cur` of 96,
+    /// and by the time this class runs in a full suite the process already
+    /// holds ~104 descriptors (104/110/104 across three runs) — MORE than the
+    /// limit it set, so the walk's very first `openat` took EMFILE. It passed
+    /// alone and failed in the suite.
+    ///
+    /// The bound is slack by 8x over the measured cost and still an order of
+    /// magnitude under the recursion's. It catches any RETENTION PER LEVEL
+    /// from about one descriptor per 40 levels upward; it would not catch a
+    /// constant-factor rise below that, which is not the defect this closes.
+    func testDeleteTimeWalkDescriptorCostDoesNotGrowWithDepth() async throws {
+        func peakDescriptorsHeld(
+            _ name: String, levels: Int
+        ) async throws -> Int {
+            try makeDeepStaleChain(name, under: sharedRootURL, levels: levels)
+            let probe = DescriptorFrontierProbe()
+            let scanner = makeScanner(roots: [sharedRoot()], provider: probe)
+            let outcome = await scan(scanner)
+            let item = try XCTUnwrap(
+                itemsByName(outcome)[name],
+                "fixture precondition: the SCAN must list this tree. errors="
+                    + "\(outcome.errors.map(\.detail))"
+            )
+            let baseline = try XCTUnwrap(
+                DescriptorFrontierProbe.heldDescriptors(),
+                "the process holds descriptors past the probe's window"
+            )
+
+            probe.sampling = true
+            let verdict = try XCTUnwrap(scanner.preDeleteRevalidator)
+                .revalidate(item: item, authorization: nil)
+            probe.sampling = false
+            XCTAssertFalse(
+                probe.overflowed,
+                "a sample ran past the probe's window and was discarded"
+            )
+
+            guard case .allow = verdict else {
+                XCTFail("\(levels) levels must stay provable — got \(verdict)")
+                return -1
+            }
+            XCTAssertEqual(
+                probe.descents, levels,
+                "the walk must actually have entered every level — a delta "
+                    + "measured over a walk that stopped early proves nothing"
+            )
+            return probe.peak - baseline
+        }
+
+        let shallowLevels = 8
+        let deepLevels = 320
+        let shallow = try await peakDescriptorsHeld(
+            "fd-shallow", levels: shallowLevels
+        )
+        let deep = try await peakDescriptorsHeld(
+            "fd-deep", levels: deepLevels
+        )
+
+        XCTAssertLessThanOrEqual(
+            deep, shallow + 8,
+            "descriptor cost must not grow with depth: \(shallowLevels) "
+                + "levels cost \(shallow), \(deepLevels) levels cost \(deep)"
+        )
+        XCTAssertLessThanOrEqual(
+            deep, 16,
+            "\(deepLevels) levels must cost a constant number of "
+                + "descriptors, not \(deep)"
+        )
+    }
+
+    /// The same bound end-to-end, through the refusal a user would actually
+    /// have seen — the twin of
     /// `DepthSafeRemovalTests.testRemovesADeepTreeUnderALoweredDescriptorLimit`
-    /// on the INSPECTION side, at the same lowered `rlim_cur` of 96.
+    /// on the INSPECTION side.
     ///
     /// Measured at HEAD before this fix, through this production path: depth
     /// 88 allowed and depth 96 refused "…could not be fully re-inspected at
@@ -3764,7 +3926,15 @@ final class EphemeralTempScannerTests: XCTestCase {
     /// the identical refusal follows, for ever. A launchd-spawned app on this
     /// platform sees `rlim_cur = 256`, which moves that wall without removing
     /// it.
-    func testRevalidatorAllowsADeepStaleTreeUnderALoweredDescriptorLimit()
+    ///
+    /// THE BUDGET IS DERIVED, NEVER ABSOLUTE. `rlim_cur` is process-wide and
+    /// this suite shares one process, so a hardcoded number is a number
+    /// relative to whatever the preceding thousand cells happen to be holding
+    /// — which is how the r14 spelling of this cell passed alone and failed in
+    /// the suite. Anchoring to the live frontier grants the walk exactly 64
+    /// descriptors of headroom no matter what else is open: 16x the 4 it
+    /// needs, and a fifth of the 320 the recursion needed.
+    func testRevalidatorAllowsADeepStaleTreeUnderAConstrainedDescriptorLimit()
         async throws {
         try makeDeepStaleChain("fd-bound", under: sharedRootURL, levels: 320)
         let scanner = makeScanner(roots: [sharedRoot()])
@@ -3779,20 +3949,31 @@ final class EphemeralTempScannerTests: XCTestCase {
         guard getrlimit(RLIMIT_NOFILE, &original) == 0 else {
             throw XCTSkip("getrlimit failed")
         }
+        let highest = try XCTUnwrap(
+            DescriptorFrontierProbe.highestDescriptor(),
+            "the process holds descriptors past the probe's window"
+        )
         var lowered = original
-        lowered.rlim_cur = 96
+        // Anchored ABOVE every number already in use, so this never lowers the
+        // limit under the process's own live usage — it only bounds what the
+        // walk may add.
+        lowered.rlim_cur = rlim_t(highest + 1) + 64
+        guard lowered.rlim_cur < original.rlim_cur else {
+            throw XCTSkip("ambient limit already tighter than the probe")
+        }
         guard setrlimit(RLIMIT_NOFILE, &lowered) == 0 else {
             throw XCTSkip("setrlimit failed: \(errno)")
         }
-        let verdict: PreDeleteVerdict
-        do {
-            verdict = try XCTUnwrap(scanner.preDeleteRevalidator)
-                .revalidate(item: item, authorization: nil)
-            setrlimit(RLIMIT_NOFILE, &original)
-        }
+        // `defer`, not a trailing call: an `XCTUnwrap` that throws past a
+        // trailing restore would leave the WHOLE REMAINING SUITE running at
+        // the lowered limit. The r14 spelling of this cell had that hazard.
+        defer { setrlimit(RLIMIT_NOFILE, &original) }
+
+        let verdict = try XCTUnwrap(scanner.preDeleteRevalidator)
+            .revalidate(item: item, authorization: nil)
         guard case .allow = verdict else {
             return XCTFail(
-                "320 levels under a 96-descriptor limit must still be "
+                "320 levels with 64 descriptors of headroom must still be "
                     + "provable — got \(verdict)"
             )
         }

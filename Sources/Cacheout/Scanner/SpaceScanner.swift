@@ -1006,23 +1006,47 @@ struct SpaceScannerRuntime {
     ///   inspecting scan's outcome, so a spelling resolution DROPPED stays
     ///   visible without being registered or walked.
     ///
-    ///   The parameter shape is copied from `devRoots:` above (declared
-    ///   `:1024`, consumed `:1035-1037`) — an optional whole resolution,
-    ///   defaulted `nil`, `??`-resolved at this site. Two differences, both
-    ///   real: `devRoots` has production callers passing non-nil (the CLI's
-    ///   `--dev-root`, `CLIHandler.swift:427/433`) whereas nothing outside
-    ///   the test suite passes this one — confstr(3) is the only production
-    ///   source, there is no persisted store and no CLI flag behind it; and
-    ///   `DevRootsResolution` carries bare `[URL]` roots while this carries
-    ///   `[EphemeralTempRoot]` records. It exists so a cell can hold the
-    ///   `issues` wire: resolved internally, no test could compose a
-    ///   production runtime whose resolution carries any.
+    ///   The parameter shape is copied from `devRoots:` above — an optional
+    ///   whole resolution, defaulted `nil`, `??`-resolved at this site. Two
+    ///   differences, both real, and each anchor below was re-opened in PR
+    ///   #459 codex r10 (the previous wording cited the FORWARDER'S OWN
+    ///   parameter and its pass-through as if they were callers, and omitted
+    ///   the GUI entirely). First: `devRoots` is passed NON-NIL by both
+    ///   shipped surfaces — the GUI unconditionally
+    ///   (`CacheoutViewModel.swift:489`, a non-optional `DevRootsResolution`)
+    ///   and the CLI whenever `--dev-root` is given
+    ///   (`CLIHandler.swift:206` and `:220`, through the forwarder whose own
+    ///   parameter is declared at `:427` and passed through at `:433`) —
+    ///   whereas nothing outside the test suite passes `ephemeralTempRoots:`:
+    ///   confstr(3) is the only production source, and there is no persisted
+    ///   store and no CLI flag behind it. Second: `DevRootsResolution`
+    ///   carries bare `[URL]` roots while this carries `[EphemeralTempRoot]`
+    ///   records.
+    /// - Parameter ephemeralTempConfstrPath: the `confstr(3)` seam the `nil`
+    ///   arm of `ephemeralTempRoots:` resolves THROUGH (fn-6.1). Defaulted to
+    ///   the real `confstr(3)`, so every shipped caller is unchanged.
+    ///
+    ///   It exists because of D4 (PR #459 codex r10): the `nil` arm is the
+    ///   one BOTH shipped compositions take — neither
+    ///   `CacheoutViewModel.production` (`CacheoutViewModel.swift:483-499`)
+    ///   nor `CLIHandler.CLIRuntimeDependencies.production`
+    ///   (`CLIHandler.swift:426-438`) passes `ephemeralTempRoots:` — and its
+    ///   `issues` half was UNEVIDENCED: replacing this site with a version
+    ///   that kept `roots` and dropped `issues` left the whole suite green at
+    ///   1172/2/0, because the live `resolve()` on the test host produces
+    ///   `issues == []` and the `ephemeralTempRoots:` seam bypasses this arm
+    ///   entirely. Stubbing confstr(3) — and NOTHING else; the symlink, the
+    ///   probing and the drop are all real — is what lets a cell drive the
+    ///   production arm into producing a `.symlinkRoot` drop and assert it
+    ///   arrives.
     static func production(
         home: URL = FileManager.default.homeDirectoryForCurrentUser,
         provider: FileSystemIdentityProvider = FileSystemIdentityProvider(),
         orphanedCachesThresholds: OrphanedCacheClassifier.Thresholds? = nil,
         devRoots: DevRootsResolution? = nil,
         ephemeralTempRoots: EphemeralTempRootsResolution? = nil,
+        ephemeralTempConfstrPath: EphemeralTempRoots.ConfstrResolver =
+            EphemeralTempRoots.confstrPath(_:),
         ephemeralTempThresholds: EphemeralTempSweepConfig.Thresholds? = nil
     ) -> SpaceScannerRuntime {
         let categories = CacheCategory.allCategories
@@ -1056,7 +1080,9 @@ struct SpaceScannerRuntime {
         // `.automatic` triggers, so registering it costs a background scan
         // nothing.
         let resolvedTempRoots = ephemeralTempRoots
-            ?? EphemeralTempRoots.resolve(provider: provider)
+            ?? EphemeralTempRoots.resolve(
+                provider: provider, confstrPath: ephemeralTempConfstrPath
+            )
         let ephemeralTempScanner = EphemeralTempScanner(
             roots: resolvedTempRoots.roots,
             resolutionIssues: resolvedTempRoots.issues,

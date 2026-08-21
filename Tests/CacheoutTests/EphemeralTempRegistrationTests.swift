@@ -250,6 +250,71 @@ final class EphemeralTempRegistrationTests: XCTestCase {
                        resolved.roots.map(\.url.path))
     }
 
+    /// D4 (PR #459 codex r10) — the same wire on the arm the SHIPPED
+    /// compositions actually take.
+    ///
+    /// The cell above hands `production` a pre-built resolution through the
+    /// `ephemeralTempRoots:` seam, which BYPASSES the `??` arm entirely.
+    /// Neither shipped surface uses that seam: `CacheoutViewModel.production`
+    /// (`CacheoutViewModel.swift:483-499`) and
+    /// `CLIHandler.CLIRuntimeDependencies.production`
+    /// (`CLIHandler.swift:426-438`) both leave it `nil`, so both go through
+    /// `EphemeralTempRoots.resolve(provider:confstrPath:)` inside the
+    /// factory. Measured at the r9 tip: replacing that arm with one that kept
+    /// `roots` and dropped `issues` left the FULL suite green at 1172/2/0 —
+    /// the live `confstr(3)` on this host resolves two real directories, so
+    /// `resolve().issues` is `[]` and nothing could ever notice.
+    ///
+    /// This cell stubs `confstr(3)` and NOTHING else — the alias symlink, the
+    /// `lstat` probing, the covered-by-a-real-directory comparison and the
+    /// drop are all the production code — so the `nil` arm really does
+    /// produce a `.symlinkRoot` issue, and the assertion below is what a
+    /// future refactor drops the argument against.
+    func testProductionsOwnResolutionArmCarriesItsIssuesToo() throws {
+        let realTemp = base.appendingPathComponent("real-T")
+        try fm.createDirectory(at: realTemp, withIntermediateDirectories: true)
+        let aliasCache = base.appendingPathComponent("alias-C")
+        try fm.createSymbolicLink(at: aliasCache, withDestinationURL: realTemp)
+
+        let suite = try makeSuite()
+        let runtime = SpaceScannerRuntime.production(
+            home: fixtureHome,
+            devRoots: DevRootsStore(defaults: suite).effectiveRoots(home: fixtureHome),
+            // `ephemeralTempRoots:` is deliberately NOT passed: this cell
+            // exists to drive the `??` arm those two shipped call sites take.
+            ephemeralTempConfstrPath: { name in
+                switch name {
+                case _CS_DARWIN_USER_CACHE_DIR: return aliasCache.path
+                case _CS_DARWIN_USER_TEMP_DIR: return realTemp.path
+                default: return nil
+                }
+            }
+        )
+        let scanner = try XCTUnwrap(
+            runtime.scanners.compactMap { $0 as? EphemeralTempScanner }.first
+        )
+
+        XCTAssertEqual(
+            scanner.resolutionIssues.map(\.kind), [.symlinkRoot],
+            "the factory's OWN resolution must hand its drops to the scanner "
+                + "it registers: \(scanner.resolutionIssues)"
+        )
+        XCTAssertEqual(
+            scanner.resolutionIssues.first?.url?.path,
+            canonical(base).appendingPathComponent("alias-C").path,
+            "and name the DECLARED spelling — canonical parent chain, leaf "
+                + "UNRESOLVED — not the link's destination"
+        )
+        // The roots half of the same hand-off, so a swap is not a pass. The
+        // alias is gone; the real container and the unconditional shared root
+        // remain.
+        XCTAssertEqual(
+            scanner.trustedContainerRoots.map(\.path),
+            ["/private/tmp", canonical(realTemp).path],
+            "the ALIAS is dropped, never the real root"
+        )
+    }
+
     /// Thresholds are CONSTRUCTION state, threaded through the factory: a
     /// non-nil value reaches the scanner unchanged (the CLI's
     /// invocation-scoped path), and `nil` — the GUI's bare composition —

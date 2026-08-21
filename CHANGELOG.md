@@ -170,6 +170,25 @@ and docs/v1/CLI-REFERENCE.md) — the pre-release `node_modules` →
   path resolved when a healthy sibling root is admitted; a root skipped
   this way stays fail-closed at delete time. A mount landing in the
   instant between the table read and those steps can still be touched.
+  **A volume already mounted at a temp root when Cacheout STARTS is now
+  refused before the app finishes launching.** Which temp roots exist is
+  decided once, while the app builds itself, on the main thread — and that
+  step used to `lstat` each declared root, a call the mounted volume itself
+  serves, so an unresponsive hard mount could freeze the window before it
+  ever appeared. The same kernel mount table is read first now, and such a
+  root is not registered at all: nothing under it is scanned and no item can
+  claim it. The refusal is a visible row of its own kind,
+  `scanner_errors[].kind == "mounted_volume_root_at_registration"`, reading
+  "mounted volume at launch; unmount it, then relaunch". It is a separate
+  kind from `"mounted_volume_root"` only because the remedy differs: that
+  one is re-decided from a fresh table read on every scan, so unmounting and
+  re-scanning clears it, while this one is decided once per launch and
+  clears only when Cacheout is started again. Another ADDITION to the same
+  extensible enumeration (`schema_version` stays 4). Measured with a
+  table-injected fixture: calls naming the mounted root across app
+  construction went from 5 to 0. Still touched: a volume mounted at a temp
+  root's PARENT directory, and a temp root that is a symlink pointing at a
+  mounted volume.
   **Two more temp-root refusals get their own classifications** — the same
   defect shape as `"mounted_volume_root"` above, swept in PR #459 codex r13:
   the app's visible row label is derived from the kind alone, so a kind

@@ -650,13 +650,19 @@ struct EphemeralTempScanner: @unchecked Sendable {
             // it. Roots get ISSUES, not rows (the symlink-root precedent);
             // the message names the same remedy as the candidate mount rows.
             //
+            // What reaches this arm is a mount that landed AFTER the runtime
+            // was built (PR #459 codex r15). One already standing at
+            // construction never becomes a root of this scanner at all:
+            // fn-6.1 reads the same table before its own first probe and
+            // drops the root with `.mountedVolumeRootAtRegistration`, whose
+            // remedy is a relaunch rather than the re-scan this arm's kind
+            // promises.
+            //
             // Residuals, at measured scope: a mount landing AFTER the
             // harvest above makes first contact at the kind gate below (no
             // table re-read can close that race — the same racing class the
             // candidate arms accept, except here the consequence is the
-            // hang, not only disclosure); a root over-mounted BEFORE app
-            // launch hangs construction's one-time realpath
-            // (`EphemeralTempRoots.resolve`); and at DELETE time the same
+            // hang, not only disclosure); and at DELETE time the same
             // racing window recurs, one table later: admission re-reads the
             // kernel table first (`admitContainer`'s opening act is
             // `matchConfiguredRoot`, whose preflight throws

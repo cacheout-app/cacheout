@@ -291,7 +291,7 @@ refreshes.
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `scanner_id` | string | yes | Which scanner reported (or failed validation) |
-| `kind` | string | yes | One of: `"container_refused"`, `"mounted_volume_root"`, `"policy_refused_root"`, `"symlink_root"`, `"non_directory_root"`, `"tcc_denied"`, `"permission_denied"`, `"unreadable"`, `"enumeration_truncated"`, `"config_invalid"`, `"malformed_outcome"`. The list is EXTENSIBLE — consumers must tolerate unknown kinds |
+| `kind` | string | yes | One of: `"container_refused"`, `"mounted_volume_root"`, `"mounted_volume_root_at_registration"`, `"policy_refused_root"`, `"symlink_root"`, `"non_directory_root"`, `"tcc_denied"`, `"permission_denied"`, `"unreadable"`, `"enumeration_truncated"`, `"config_invalid"`, `"malformed_outcome"`. The list is EXTENSIBLE — consumers must tolerate unknown kinds |
 | `detail` | string | yes | Human-readable description |
 | `path` | string | conditional | Present for the FILESYSTEM kinds; ABSENT for the NON-FILESYSTEM kinds — `"malformed_outcome"` and `"config_invalid"` — where no filesystem location exists and a fake path is therefore never invented |
 | `grant_hint` | string | no | Present only when `kind == "tcc_denied"` — the same user-side remedy (Full Disk Access) as category and `scanner_items` rows, since macOS denies CLI processes silently |
@@ -318,6 +318,16 @@ root is configured and admissible, nothing rejected it, and the condition is
 one the user clears — eject or unmount the volume, then re-scan. Emitted
 today by `ephemeral_tmp`, which answers from the kernel's mount table before
 any syscall touches the root.
+
+A `mounted_volume_root_at_registration` row means the same condition was
+already true when the runtime was CONSTRUCTED, so that root was never
+registered: nothing under it is scanned and no item can claim it as an
+origin container. It is a separate kind from `mounted_volume_root` only
+because the remedy differs. `mounted_volume_root` is re-derived from a fresh
+table read on every scan, so unmounting and re-scanning clears it; this
+verdict is made once per runtime and replayed on every later outcome, so it
+clears only when construction runs again — relaunch the app, or start a new
+CLI invocation. Emitted today by `ephemeral_tmp`.
 
 A `policy_refused_root` row means a REGISTERED root failed the search-root
 safety policy — it resolves to `/`, to a volume root, or to `$HOME`. It is

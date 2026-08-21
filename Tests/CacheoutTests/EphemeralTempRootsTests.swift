@@ -572,6 +572,261 @@ final class EphemeralTempRootsTests: XCTestCase {
         XCTAssertNil(fold("/.."), "a target that walks off the root is refused")
     }
 
+    // MARK: - PR #459 codex r15: the construction-time mount preflight
+
+    /// FAILS THE TEST on any call naming the over-mounted root or anything
+    /// below it, and answers `mountPointPaths()` from an injected table.
+    ///
+    /// Every filesystem access `EphemeralTempRoots.resolve` and
+    /// `SpaceScannerRuntime.production` make on a declared root goes through
+    /// one of these overrides, so a call recorded here IS the syscall that
+    /// would block. (`deviceID`, `kind` and `sameLocation` are final and
+    /// derive from `identity`/`probeKind`/`canonicalize`, so the overrides
+    /// cover them too.)
+    private final class MountedRootForbiddingProvider:
+        FileSystemIdentityProvider, @unchecked Sendable {
+        var mountedRootPath = ""
+        /// The real table as well, when a real volume backs the fixture.
+        var alsoRealTable = false
+        private let fail: (String) -> Void
+
+        init(fail: @escaping (String) -> Void) {
+            self.fail = fail
+            super.init()
+        }
+
+        override func mountPointPaths() -> [String] {
+            alsoRealTable
+                ? super.mountPointPaths()
+                : [mountedRootPath]
+        }
+
+        private func forbid(_ method: String, _ path: String) {
+            guard !mountedRootPath.isEmpty,
+                  path == mountedRootPath
+                    || path.hasPrefix(mountedRootPath + "/")
+            else { return }
+            fail("\(method) made first contact with the over-mounted root: "
+                    + path)
+        }
+
+        override func realPath(of path: String) -> String? {
+            forbid("realPath", path)
+            let out = super.realPath(of: path)
+            if let out { forbid("realPath output", out) }
+            return out
+        }
+        override func canonicalize(_ url: URL) -> URL {
+            forbid("canonicalize", url.path)
+            return super.canonicalize(url)
+        }
+        override func probeKind(of url: URL) -> KindProbe {
+            forbid("probeKind", url.path)
+            return super.probeKind(of: url)
+        }
+        override func identity(of url: URL) -> Identity? {
+            forbid("identity", url.path)
+            return super.identity(of: url)
+        }
+        override func symlinkTarget(of url: URL) -> String? {
+            forbid("symlinkTarget", url.path)
+            return super.symlinkTarget(of: url)
+        }
+        override func isMountPoint(_ url: URL) -> Bool {
+            forbid("isMountPoint", url.path)
+            return super.isMountPoint(url)
+        }
+        override func canEnumerateDirectory(_ url: URL) -> Bool {
+            forbid("canEnumerateDirectory", url.path)
+            return super.canEnumerateDirectory(url)
+        }
+        override func ownerProbe(of url: URL) -> OwnerProbe {
+            forbid("ownerProbe", url.path)
+            return super.ownerProbe(of: url)
+        }
+        override func leafMetadata(of url: URL) -> LeafMetadata? {
+            forbid("leafMetadata", url.path)
+            return super.leafMetadata(of: url)
+        }
+        override func linkCount(of url: URL) -> UInt64? {
+            forbid("linkCount", url.path)
+            return super.linkCount(of: url)
+        }
+    }
+
+    /// THE r15 FINDING: the probe that decides `isDirectory` is an `lstat`
+    /// of the DECLARED root, and `lstat` OF a mount point is served by the
+    /// mounted filesystem — so a declared root that is itself an
+    /// unresponsive hard mount blocked app construction, on the main thread,
+    /// before any window or trigger gate existed.
+    ///
+    /// Refused from the kernel table instead, with ZERO calls naming the
+    /// root. Measured against this same fixture before the preflight
+    /// existed: `resolve` made 3 (`probeKind`, then `identity` twice from
+    /// the de-dupe's `sameLocation`).
+    func testAnOverMountedDeclaredRootIsRefusedBeforeAnythingProbesIt() throws {
+        let mounted = try mkdir(base.appendingPathComponent("mounted-C"))
+        let realTemp = try mkdir(base.appendingPathComponent("real-T"))
+        let stub = ConfstrStub([
+            _CS_DARWIN_USER_CACHE_DIR: mounted.path,
+            _CS_DARWIN_USER_TEMP_DIR: realTemp.path,
+        ])
+        let provider = MountedRootForbiddingProvider(fail: { XCTFail($0) })
+        provider.mountedRootPath = declaredPath(mounted)
+
+        let resolved = EphemeralTempRoots.resolve(
+            provider: provider, confstrPath: stub.resolve(_:)
+        )
+
+        XCTAssertNil(
+            root(resolved.roots, labelled: EphemeralTempRoots.userCache),
+            "the over-mounted root is not registered: "
+                + "\(resolved.roots.map(\.url.path))"
+        )
+        // One root refused, never the resolution: the siblings survive.
+        XCTAssertEqual(
+            resolved.roots.map(\.url.path),
+            ["/private/tmp", declaredPath(realTemp)]
+        )
+
+        XCTAssertEqual(resolved.issues.count, 1, "\(resolved.issues)")
+        let issue = try XCTUnwrap(resolved.issues.first)
+        XCTAssertEqual(issue.kind, .mountedVolumeRootAtRegistration)
+        XCTAssertEqual(issue.url?.path, declaredPath(mounted))
+        XCTAssertTrue(issue.detail.contains("is a mounted volume"),
+                      issue.detail)
+        // The deterministic-bound rule: this verdict is stored and replayed,
+        // so the remedy it names must be the one that actually clears it.
+        XCTAssertTrue(
+            issue.detail.contains(EphemeralTempRoots.registrationMountRemedy),
+            issue.detail
+        )
+        XCTAssertTrue(issue.detail.contains("relaunch"), issue.detail)
+        XCTAssertFalse(
+            issue.detail.contains("re-scan"),
+            "a re-scan cannot clear a verdict made once per runtime: "
+                + issue.detail
+        )
+        // …and the KIND is what the GUI turns into the visible row label.
+        // `.mountedVolumeRoot`'s label ends "then re-scan" and would send the
+        // user round a loop that never clears the row.
+        XCTAssertEqual(
+            ScanIssueRowPresentation(issue: issue, home: base).label,
+            "mounted volume at launch; unmount it, then relaunch"
+        )
+    }
+
+    /// THE FIX AT `production()` SCOPE — the half a drop-vs-keep decision
+    /// turns on. A root KEPT here would reach the runtime's cross-scanner
+    /// union, where `SpaceScannerRuntime.suppressingAliasShadows`
+    /// (`SpaceScanner.swift:1001-1004`) canonicalizes and probes every root
+    /// it is given, still during construction — so the block would simply
+    /// move one function along. Measured against this fixture before the
+    /// preflight existed: `production()` made 5 calls naming the mounted
+    /// root, 3 from `resolve` and 2 from that pair.
+    ///
+    /// Driven through the SHIPPED `??` arm (no `ephemeralTempRoots:`), which
+    /// is the arm both the GUI and the CLI take.
+    func testTheOverMountedRootNeverReachesTheCrossScannerUnion() throws {
+        let mounted = try mkdir(base.appendingPathComponent("mounted-C"))
+        let stub = ConfstrStub([_CS_DARWIN_USER_CACHE_DIR: mounted.path])
+        let provider = MountedRootForbiddingProvider(fail: { XCTFail($0) })
+        provider.mountedRootPath = declaredPath(mounted)
+
+        let runtime = SpaceScannerRuntime.production(
+            home: base,
+            provider: provider,
+            devRoots: DevRootsResolution(keptRoots: [], issues: []),
+            ephemeralTempConfstrPath: stub.resolve(_:)
+        )
+
+        XCTAssertFalse(
+            runtime.trustedContainerRoots.contains {
+                $0.path == declaredPath(mounted)
+            },
+            "the over-mounted root reached delete-time admission: "
+                + "\(runtime.trustedContainerRoots.map(\.path))"
+        )
+        let tempScanner = try XCTUnwrap(
+            runtime.scanners.first { $0.id == "ephemeral_tmp" }
+        )
+        XCTAssertFalse(
+            tempScanner.trustedContainerRoots.contains {
+                $0.path == declaredPath(mounted)
+            },
+            "\(tempScanner.trustedContainerRoots.map(\.path))"
+        )
+    }
+
+    /// THE PRODUCTION-DEFAULT CELL: a REAL volume attached exactly at a
+    /// declared root, refused from the REAL kernel table (`getfsstat`, no
+    /// injected table) with nothing contacting it. This is what evidences
+    /// that the kernel's canonical `f_mntonname` spelling is the same string
+    /// fn-6.1 declares — the assumption the string membership above rests
+    /// on. Skipped, never silently passed, where `hdiutil` cannot stage it.
+    func testARealVolumeAtADeclaredRootIsRefusedAtRegistration() throws {
+        let mounted = try mkdir(base.appendingPathComponent("mounted-C"))
+        let rootPath = declaredPath(mounted)
+        guard try attachDMG(named: "regroot.dmg",
+                            at: URL(fileURLWithPath: rootPath)) else {
+            throw XCTSkip("hdiutil could not stage the mount fixture")
+        }
+        guard FileSystemIdentityProvider().mountPointPaths()
+            .contains(rootPath) else {
+            throw XCTSkip(
+                "kernel table does not spell the mount as \(rootPath)"
+            )
+        }
+
+        let stub = ConfstrStub([_CS_DARWIN_USER_CACHE_DIR: mounted.path])
+        let provider = MountedRootForbiddingProvider(fail: { XCTFail($0) })
+        provider.mountedRootPath = rootPath
+        provider.alsoRealTable = true
+
+        let resolved = EphemeralTempRoots.resolve(
+            provider: provider, confstrPath: stub.resolve(_:)
+        )
+
+        XCTAssertNil(
+            root(resolved.roots, labelled: EphemeralTempRoots.userCache),
+            "\(resolved.roots.map(\.url.path))"
+        )
+        XCTAssertEqual(resolved.issues.map(\.kind),
+                       [.mountedVolumeRootAtRegistration])
+        XCTAssertEqual(resolved.issues.first?.url?.path, rootPath)
+    }
+
+    /// `hdiutil`-staged APFS volume at `mountpoint`, detached at teardown.
+    /// `false` when the tool is unavailable or refuses — the callers SKIP
+    /// rather than pass vacuously.
+    private func attachDMG(
+        named name: String, at mountpoint: URL
+    ) throws -> Bool {
+        let image = base.appendingPathComponent(name)
+        func run(_ arguments: [String]) throws -> Bool {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/hdiutil")
+            process.arguments = arguments
+            process.standardOutput = FileHandle.nullDevice
+            process.standardError = FileHandle.nullDevice
+            try process.run()
+            process.waitUntilExit()
+            return process.terminationStatus == 0
+        }
+        guard try run([
+            "create", "-size", "8m", "-fs", "APFS",
+            "-volname", name, image.path,
+        ]) else { return false }
+        guard try run([
+            "attach", image.path, "-mountpoint", mountpoint.path,
+            "-nobrowse", "-quiet",
+        ]) else { return false }
+        addTeardownBlock {
+            _ = try? run(["detach", mountpoint.path, "-force"])
+        }
+        return true
+    }
+
     // MARK: - R2: live-Mac integration (conditionally skipped)
 
     func testLiveConfstrResolvesPerUserContainersUnderPrivateVarFolders() throws {

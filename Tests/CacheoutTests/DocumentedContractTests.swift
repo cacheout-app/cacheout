@@ -439,7 +439,8 @@ final class DocumentedContractTests: XCTestCase {
         // CONSUMERS tolerating unknown kinds, not about this list being
         // allowed to lag.
         let allKinds: [ScanIssue.Kind] = [
-            .containerRefused, .mountedVolumeRoot, .policyRefusedRoot,
+            .containerRefused, .mountedVolumeRoot,
+            .mountedVolumeRootAtRegistration, .policyRefusedRoot,
             .symlinkRoot, .nonDirectoryRoot, .tccDenied,
             .permissionDenied,
             .unreadable, .enumerationTruncated, .configInvalid,

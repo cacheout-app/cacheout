@@ -432,6 +432,22 @@ struct ScanIssue: Equatable, Sendable {
         /// (PR #459 codex r11, DISCLOSURE). A FILESYSTEM kind: `url` names
         /// the over-mounted root.
         case mountedVolumeRoot
+        /// A DECLARED root the kernel's mount table already named when the
+        /// runtime was CONSTRUCTED, so the root was never registered at all
+        /// (`EphemeralTempRoots.resolve`). Nothing under it is scanned, and
+        /// no item can claim it as an origin container.
+        ///
+        /// Its own kind, and not `.mountedVolumeRoot`, because the two
+        /// differ in the one thing a kind-derived label must get right — the
+        /// REMEDY (PR #459 codex r15, DISCLOSURE). `.mountedVolumeRoot` is
+        /// re-derived from a fresh table read on every scan, so its label's
+        /// "then re-scan" is true. This one is decided ONCE per runtime and
+        /// then replayed onto every inspecting outcome from stored
+        /// `resolutionIssues`, so a re-scan can never clear it however many
+        /// times the user unmounts and retries; only re-running construction
+        /// can (relaunching the app, or a fresh CLI invocation). A
+        /// FILESYSTEM kind: `url` names the over-mounted root.
+        case mountedVolumeRootAtRegistration
         /// A REGISTERED search root that this scanner's own `PathGuard`
         /// refused as a search root — `/`, a volume root, or `$HOME` in any
         /// spelling. The root IS one of the guard's `containerRoots` (a
@@ -506,6 +522,8 @@ struct ScanIssue: Equatable, Sendable {
             switch self {
             case .containerRefused: return "container_refused"
             case .mountedVolumeRoot: return "mounted_volume_root"
+            case .mountedVolumeRootAtRegistration:
+                return "mounted_volume_root_at_registration"
             case .policyRefusedRoot: return "policy_refused_root"
             case .symlinkRoot: return "symlink_root"
             case .nonDirectoryRoot: return "non_directory_root"

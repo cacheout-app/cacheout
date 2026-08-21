@@ -300,6 +300,12 @@ struct ScanIssueRowPresentation: Equatable {
         // only as a hover tooltip.
         case .mountedVolumeRoot:
             return "mounted volume; eject or unmount it, then re-scan"
+        // The SAME condition, decided at construction and replayed from
+        // stored resolution issues, so "re-scan" would be a remedy the user
+        // can perform forever without the row ever clearing (PR #459 codex
+        // r15). Only re-running construction re-reads the table.
+        case .mountedVolumeRootAtRegistration:
+            return "mounted volume at launch; unmount it, then relaunch"
         // The root IS registered — the policy refused to SEARCH it (PR #459
         // codex r13). No remedy is named because the clauses that reach here
         // (`/`, a volume root, `$HOME`) do not share one; `detail` carries

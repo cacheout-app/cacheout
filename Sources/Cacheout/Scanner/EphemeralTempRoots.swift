@@ -109,7 +109,7 @@
 /// which is ordinary app construction: the GUI evaluates it on the main
 /// thread while building its `@StateObject`
 /// (`CacheoutApp.swift:58` → `CacheoutViewModel.production()` →
-/// `CacheoutViewModel.swift:541` → `SpaceScanner.swift:1096-1099`), long
+/// `CacheoutViewModel.swift:541` → `SpaceScanner.swift:1146-1149`), long
 /// before any trigger or `participates(in:)` gate exists to consult. The main
 /// thread is not an inference: `CacheoutViewModel` is `@MainActor`
 /// (`CacheoutViewModel.swift:264`), so its `production()` factory cannot be
@@ -134,7 +134,7 @@
 /// weaker than an inode comparison, and the residual is recorded below.
 ///
 /// This is where the file DIVERGES from the two dev-root precedents it
-/// otherwise follows: `DevRootsStore.swift:322` and `SpaceScanner.swift:953`
+/// otherwise follows: `DevRootsStore.swift:322` and `SpaceScanner.swift:1003`
 /// both still build their comparison key with `provider.canonicalize`, on
 /// every root including non-directory ones, at the same construction time.
 /// Neither has been changed here.
@@ -144,7 +144,7 @@
 /// It is not a claim about `production()` as a whole, and the difference is
 /// measured. A symlink root this resolution cannot place is KEPT, so it
 /// reaches the runtime's cross-scanner union and
-/// `SpaceScanner.swift:953` canonicalizes it there — one leaf-following
+/// `SpaceScanner.swift:1003` canonicalizes it there — one leaf-following
 /// `realpath(3)` on the destination, still during construction. Measured
 /// through the shipped `??` arm with the same fixture, before and after this
 /// change: leaf-following canonicalizations of a symlinked `C` went 2 → 1,
@@ -153,15 +153,65 @@
 /// root).path` with `root.path` takes both to 0 and 0.0026 s, which is how
 /// the surviving contact was attributed — NOT a proposed fix: that key is
 /// what suppresses a shadowing alias ACROSS scanners
-/// (`SpaceScanner.swift:899-909`), and weakening it trades one hazard for
+/// (`SpaceScanner.swift:948-959`), and weakening it trades one hazard for
 /// another. Closing it needs its own change, on fn-4.5's contract.
+///
+/// ## Nor is a root that IS a mount contacted (PR #459 codex r15)
+///
+/// The section above is about a root's DESTINATION. This one is about the
+/// root itself: `C`, `T` and `/private/tmp` are all ordinary directories
+/// anyone can mount a volume onto, and `lstat(2)` OF a mount point is served
+/// by the mounted filesystem — the same mechanism fn-6.2's scan-time arm
+/// exists for, one layer earlier and on the main thread. So the `lstat`
+/// `probeKind` that decides `isDirectory` was the app's first contact with
+/// that volume, and on an unresponsive hard mount it blocks construction
+/// before any window exists.
+///
+/// `resolve` therefore reads the kernel mount table
+/// (`FileSystemIdentityProvider.mountPointPaths`, :208-246 — `getfsstat(
+/// MNT_NOWAIT)`, which touches no filesystem) before its first probe, and
+/// DROPS a root the table names, disclosing it as
+/// `.mountedVolumeRootAtRegistration`. Measured through the shipped `??` arm
+/// with a table-injected fixture, before and after: calls naming the mounted
+/// root went 3 → 0 in `resolve` (`probeKind`, then `identity` twice from the
+/// de-dupe's `sameLocation`) and 5 → 0 across `production()`. Under a 0.75 s
+/// stall injected on every such call — a MODEL of an unresponsive mount, not
+/// a real dead one; a dead NFS mount cannot be staged on this machine —
+/// `production()` went 3.79 s → 0.00023 s.
+///
+/// DROPPED, not kept-and-skipped, and that is the whole difference between a
+/// fix and a relocation: the 2 of those 5 that `resolve` never made were
+/// `suppressingAliasShadows` canonicalizing and probing the same root in the
+/// cross-scanner union (`SpaceScanner.swift:1001-1004`), which every KEPT
+/// root reaches.
+///
+/// ### RESIDUAL, at measured scope: three cases this does not cover
+///
+/// - A mount landing AFTER the table read. Unclosable by any re-read; the
+///   same racing class fn-6.2's arm records, and its arm is what catches a
+///   mount that lands after construction.
+/// - A volume mounted at an ANCESTOR of a declared root — the bucket
+///   directory, say. The parent-chain `realpath(3)` that PRODUCES the
+///   spelling runs before a table lookup for that spelling is possible, and
+///   the table's canonical entries cannot be prefix-matched against a raw
+///   confstr spelling like `/var/folders/<bucket>/C`. Not the case in the
+///   finding, and not half-guarded here.
+/// - A declared root that is a SYMLINK to a mounted volume. The table names
+///   the mount, not the link, so the link is kept — and the r12 residual
+///   above is then the contact: `suppressingAliasShadows` canonicalizes it,
+///   naming the destination. Re-measured at this tip: `production()` makes
+///   exactly 1 call naming the destination and takes 0.76 s under the same
+///   injected 0.75 s stall. Same out-of-scope line, same fn-4.5 contract.
+///
+/// `confstr(3)` itself is upstream of all of this by necessity — it is what
+/// produces the path, so no table check can precede it.
 ///
 /// ## De-dupe and alias suppression — two halves, cited one at a time
 ///
 /// One value is probed per declared root: whether the DECLARED spelling is
 /// itself a real directory (`lstat` leaf, no follow), which is the
 /// `isDirectory` half of the probe pair at `DevRootsStore.swift:320-324` and
-/// `SpaceScanner.swift:951-955`. The `key:` half of that pair is deliberately
+/// `SpaceScanner.swift:1001-1005`. The `key:` half of that pair is deliberately
 /// NOT taken (see above). The two halves that consume the probe have
 /// different precedents — do not read this as one pattern copied whole from
 /// either:
@@ -170,13 +220,12 @@
 ///   location already kept is dropped. Precedent is `DevRootsStore.swift`
 ///   alone (:361-364, `seenCanonicalKeys.insert`).
 ///   `SpaceScannerRuntime.suppressingAliasShadows` does NOT do this half — it
-///   deliberately DECLINES it, and `SpaceScanner.swift:959-962` says so:
+///   deliberately DECLINES it, and `SpaceScanner.swift:1009-1012` says so:
 ///   "Two real-directory spellings of one location are NOT touched: both pass
 ///   the reality gate, so neither shadows the other, and dropping either would
 ///   change which declared spelling the identity binding keys off for no
 ///   safety gain." A maintainer reconciling the two files must not add
-///   de-duping there; `SpaceScanner.swift:899-909` records the
-///   identity-binding breakage that choice exists to avoid.
+///   de-duping there.
 ///
 ///   The comparison here is INODE identity (`sameLocation`) of the declared
 ///   spellings, where that precedent compares canonical paths as STRINGS
@@ -207,13 +256,13 @@
 ///   returns the FIRST configured root that matches and `admitContainer`
 ///   refuses THAT spelling without trying the real one behind it.
 ///   `DevRootsStore.swift:326-332` names that shape "ACTIVELY HARMFUL";
-///   `SpaceScanner.swift:899-909` records the breakage it caused when the
+///   `SpaceScanner.swift:948-959` records the breakage it caused when the
 ///   shadowed root came from another scanner.
 ///
 ///   BOTH files do this half — `DevRootsStore.swift:333-335` + :341-357 and
-///   `SpaceScanner.swift:956-965` — but only `DevRootsStore` classifies the
-///   drop. `suppressingAliasShadows` returns a bare `[URL]` (:944-946) with
-///   no issue channel of its own; `SpaceScanner.swift:938-943` records what
+///   `SpaceScanner.swift:1001-1015` — but only `DevRootsStore` classifies the
+///   drop. `suppressingAliasShadows` returns a bare `[URL]` (:994-996) with
+///   no issue channel of its own; `SpaceScanner.swift:988-993` records what
 ///   reports its drops instead. The `.symlinkRoot` issue raised here follows
 ///   `DevRootsStore.swift:349-355`, not that function.
 ///
@@ -426,14 +475,27 @@ enum EphemeralTempRoots {
 
     // MARK: Resolution
 
+    /// The remedy sentence for a root the kernel table named at CONSTRUCTION,
+    /// spelled ONCE (the deterministic-bound rule: a refusal's message must
+    /// say whether a retry can differ). It says relaunch, not re-scan,
+    /// because this verdict is stored and replayed — see
+    /// `ScanIssue.Kind.mountedVolumeRootAtRegistration`. Deliberately not
+    /// `EphemeralTempScanner.mountRemedy`: that sentence ends "then re-scan",
+    /// which is the remedy for the arm that re-reads the table per scan.
+    static let registrationMountRemedy =
+        "Eject or unmount the volume, then relaunch Cacheout to see what "
+        + "stands at this name"
+
     /// Resolve the declared roots, in declaration order.
     ///
     /// Per definition: obtain the raw path (constant, or confstr) → drop it
     /// silently if the lookup failed or produced a non-absolute / bare-`/`
     /// value → normalize the trailing slash → resolve ONCE, parent chain
-    /// only. The surviving spellings then go through the two halves
-    /// documented at the head of this file: real-directory de-dupe by inode
-    /// identity, then alias suppression with a classified issue.
+    /// only → drop it, with a classified issue, if the kernel mount table
+    /// already names that spelling. The surviving spellings then go through
+    /// the two halves documented at the head of this file: real-directory
+    /// de-dupe by inode identity, then alias suppression with a classified
+    /// issue.
     ///
     /// Existence and permissions are still not this layer's business (R11 —
     /// that is scan time, fn-6.2's contract). The probes here are the `lstat`
@@ -445,33 +507,114 @@ enum EphemeralTempRoots {
     ///
     /// NOTHING a declared leaf points AT is touched (PR #459 codex r12) —
     /// see the file header's "Nothing a symlink leaf points at is contacted".
+    ///
+    /// The ONE case where a declared root is refused here is a volume mounted
+    /// exactly at it (PR #459 codex r15) — refused from the kernel table,
+    /// before either probe above runs, because both of them block on an
+    /// unresponsive hard mount and this is app-construction time.
     static func resolve(
         provider: FileSystemIdentityProvider = FileSystemIdentityProvider(),
         confstrPath: ConfstrResolver = EphemeralTempRoots.confstrPath(_:)
     ) -> EphemeralTempRootsResolution {
-        // Probed ONCE per declared root: whether the DECLARED spelling is
-        // itself a real directory (`lstat` leaf, no follow). NOTHING here
-        // resolves a leaf the probe says is not a real directory — that is
-        // the whole no-destination-contact rule, and the two spellings each
-        // root is compared BY are the two it already came with.
-        let probed = definitions.compactMap {
+        // THE KERNEL MOUNT TABLE, read FIRST — before this function names any
+        // declared root to the kernel at all (PR #459 codex r15,
+        // AVAILABILITY). `getfsstat(MNT_NOWAIT)` reads the kernel's own table
+        // and touches no filesystem; `FileSystemIdentityProvider.
+        // mountPointPaths` (:208-246) is the one detector, shared with
+        // `DepthSafeRemoval`'s whole-tree preflight, `PathGuard`, and
+        // fn-6.2's scan-time arms. Reading it here rather than after the
+        // spelling stage below is what makes the ordering claim checkable:
+        // the snapshot predates every filesystem call this resolution makes.
+        let mountTable = Set(provider.mountPointPaths())
+
+        // The declared SPELLINGS, before anything probes them. Nothing in
+        // this stage names a declared LEAF to the kernel:
+        // `resolveTargetKeepingLeaf` canonicalizes the PARENT and appends the
+        // leaf as a string, so a volume mounted AT a root is not contacted by
+        // it (a volume mounted at an ANCESTOR is — see the residual in the
+        // file header).
+        let declaredRoots = definitions.compactMap {
             definition -> (definition: Definition, rawPath: String,
-                           declared: URL, isDirectory: Bool)? in
+                           declared: URL)? in
             guard let raw = rawPath(for: definition.source, confstrPath: confstrPath),
                   let usable = usableRawPath(raw),
                   let declared = resolvedRoot(fromRawPath: usable, provider: provider)
             else { return nil }
-            return (definition: definition,
-                    rawPath: usable,
-                    declared: declared,
-                    isDirectory: provider.probeKind(of: declared)
-                        == .kind(.directory))
+            return (definition: definition, rawPath: usable, declared: declared)
+        }
+
+        var issues: [ScanIssue] = []
+        // THE OVER-MOUNTED-ROOT PREFLIGHT (PR #459 codex r15, AVAILABILITY).
+        // A volume mounted EXACTLY at a declared root, answered from the
+        // snapshot above by pure string membership — the kernel spells
+        // `f_mntonname` canonically, which is the spelling above whenever the
+        // root's own leaf is a real directory, and that is the only case
+        // where a mount AT the root exists (mounting resolves its
+        // mountpoint, so no mount is ever spelled AS a symlink).
+        //
+        // It must run BEFORE the probe below, because `lstat(2)` OF a mount
+        // point crosses INTO the mounted filesystem — the getattr is served
+        // by the foreign fs — so on an unresponsive hard mount that one
+        // syscall blocks. And this is CONSTRUCTION, not scan time:
+        // `EphemeralTempRoots.resolve` runs inside
+        // `SpaceScannerRuntime.production`
+        // (`SpaceScanner.swift:1146-1149`), which
+        // the GUI calls from `CacheoutViewModel.production`
+        // (`CacheoutViewModel.swift:533-553`) at the `@MainActor` view
+        // model's construction (`CacheoutApp.swift:58`), so the block lands
+        // on the main thread before any window, trigger gate or scan exists.
+        // Measured through the shipped `??` arm with a table-injected
+        // fixture: `resolve` made 3 calls naming the mounted root
+        // (`probeKind` at the head of the probe below, then `identity` twice
+        // from the de-dupe's `sameLocation`), and `production()` as a whole
+        // made 5.
+        //
+        // The root is DROPPED, not kept-and-skipped, and that difference is
+        // the fix: a kept root reaches the runtime's cross-scanner union,
+        // where `SpaceScanner.swift:1001-1004` canonicalizes and probes it —
+        // the remaining 2 of those 5 — still during construction. Dropping
+        // is also fail-CLOSED in the same shape as alias suppression: the
+        // root could not have been scanned (fn-6.2's own arm refuses it) and
+        // nothing under it can be admitted for deletion.
+        //
+        // Never silent: a classified issue rides every inspecting outcome.
+        // `.mountedVolumeRootAtRegistration`, NOT fn-6.2's
+        // `.mountedVolumeRoot` — the GUI derives the visible row label from
+        // the kind alone, and that kind's label ends "then re-scan", which is
+        // a remedy the user could perform forever here. This verdict is made
+        // once per runtime and replayed from stored `resolutionIssues`; only
+        // re-running construction re-reads the table, so the label and the
+        // remedy sentence both say relaunch.
+        let unmounted = declaredRoots.filter { root in
+            guard mountTable.contains(root.declared.path) else { return true }
+            issues.append(ScanIssue(
+                url: root.declared,
+                kind: .mountedVolumeRootAtRegistration,
+                detail: "\(root.definition.label) is a mounted volume — the "
+                    + "root was not registered, so nothing under it is "
+                    + "scanned; its contents belong to that volume. "
+                    + registrationMountRemedy
+            ))
+            return false
+        }
+
+        // Probed ONCE per SURVIVING declared root: whether the DECLARED
+        // spelling is itself a real directory (`lstat` leaf, no follow).
+        // NOTHING here resolves a leaf the probe says is not a real directory
+        // — that is the whole no-destination-contact rule, and the two
+        // spellings each root is compared BY are the two it already came
+        // with.
+        let probed = unmounted.map { root in
+            (definition: root.definition,
+             rawPath: root.rawPath,
+             declared: root.declared,
+             isDirectory: provider.probeKind(of: root.declared)
+                 == .kind(.directory))
         }
         // The REAL-DIRECTORY roots an alias can collapse onto.
         let realDirectories = probed.filter(\.isDirectory)
 
         var kept: [EphemeralTempRoot] = []
-        var issues: [ScanIssue] = []
         // The real directories kept so far, parallel to `kept` — compared by
         // inode identity, never string equality.
         var seenRealRoots: [URL] = []

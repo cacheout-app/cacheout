@@ -524,9 +524,10 @@ directory deeper down is not.
 That is a claim about the TIMESTAMP, not about the operations that move one.
 A nested change can still trip a gate that is not a timestamp: unlinking a
 file inside a nested directory can take the entry below the **size floor**
-below, and creating enough subdirectories inside one can push its contents
-past the **inspection budget** the staleness walk and the delete-time re-check
-are both bounded by. Either of those both keeps the entry off the list — the
+described below, and creating enough subdirectories inside one can push its
+contents past the **inspection budget** the staleness walk and the
+delete-time re-check are both bounded by. Either of those both keeps the
+entry off the list — the
 budget arm silently, since a cap denied nothing — and refuses it at delete
 time, where the refusal names the budget rather than any timestamp.
 

@@ -503,7 +503,8 @@ final class EphemeralTempRegistrationTests: XCTestCase {
         XCTAssertFalse(
             scanned.isDisplayed,
             "an inspected-and-empty section stays hidden, unchanged by this "
-                + "round — silence now means exactly one thing"
+                + "round — so an ABSENT section means inspected-and-empty "
+                + "and nothing else"
         )
     }
 

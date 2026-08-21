@@ -183,8 +183,12 @@ struct ScannerItemSection: View {
             // no section at all. Two different facts, one silence.
             //
             // `isDisplayed` now admits the never-inspected case and this
-            // block says so, so silence again means one thing only. A
-            // scanner that ran and found nothing is still hidden.
+            // block says so. A scanner that ran and found nothing is still
+            // hidden, so an ABSENT section means that and nothing else.
+            // (Scoped to the results list: when nothing at all has results
+            // `ContentView` renders its window-level empty state instead,
+            // and no section of any kind appears — a different surface,
+            // which says in so many words that no scan has run.)
             if isExpanded && section.isAwaitingFirstScan {
                 VStack(spacing: 8) {
                     Image(systemName: "magnifyingglass")

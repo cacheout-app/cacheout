@@ -47,9 +47,12 @@ and docs/v1/CLI-REFERENCE.md) — the pre-release `node_modules` →
   temp (`…/T`) and cache (`…/C`) containers, resolved from the OS rather
   than hardcoded. An entry qualifies when its NEWEST content is older than
   the age threshold (default 7 days) and it meets the size floor (default
-  10 MB) — a directory holding one fresh file deep inside is not stale, so
-  live workspaces (including the running session's own scratch directory)
-  stay put. Findings are Review risk, never default-selected, and never part
+  10 MB) — a directory holding one fresh file deep inside is not stale, so a
+  workspace still being WRITTEN to, including the running session's own
+  scratch directory, is not listed. An entry a process merely holds open for
+  reading is NOT detected: age is the protection, and every gate is
+  re-established from a held descriptor immediately before deletion.
+  Findings are Review risk, never default-selected, and never part
   of Quick Clean or `smart-clean`. Entries another user owns are never
   listed — sticky-directory rules make them undeletable, so claiming their
   bytes would be false; anything unreadable is reported instead of silently

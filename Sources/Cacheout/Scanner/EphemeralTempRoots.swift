@@ -372,7 +372,10 @@ enum EphemeralTempSweepConfig {
     static let minSizeMBKey = "cacheout.ephemeralTmp.minSizeMB"
 
     /// 7 days: longer than any OS reaper's own clock for these locations,
-    /// and long enough that a paused-but-live workspace stays untouched.
+    /// and long enough that a workspace paused for LESS THAN A WEEK stays
+    /// untouched. Not an unbounded promise — a workspace nothing has written
+    /// to for seven days is exactly what this scanner exists to list, however
+    /// live the process holding it still is.
     static let defaultAgeDays: Int64 = 7
     /// 10 MB: small enough to surface real scratchpads, large enough that
     /// ordinary temp files never appear.

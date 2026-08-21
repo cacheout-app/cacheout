@@ -809,6 +809,81 @@ final class EphemeralTempScannerTests: XCTestCase {
         XCTAssertTrue(outcome.errors.isEmpty)
     }
 
+    /// THE ACCEPTED RESIDUAL BEHIND THE README'S WORDING (r7, codex C3) —
+    /// a CHARACTERISATION cell, not an endorsement.
+    ///
+    /// README.md's temp bullet used to promise "aged by their newest content
+    /// so anything in use stays put". The in-use probe cannot establish that:
+    /// it takes one `flock(LOCK_EX|LOCK_NB)` on the CANDIDATE INODE, so a
+    /// process that merely holds a descendant file OPEN — an mmap'd dataset,
+    /// a binary executing out of an unpacked bundle, an idle sqlite handle —
+    /// is invisible, and so is an advisory lock one level down. The scanner's
+    /// own source says exactly this
+    /// (`EphemeralTempScanner.cooperativeLockProbe`'s "Scope, honestly"
+    /// note); the README now says it too.
+    ///
+    /// If this cell ever goes RED because open-file detection was added, the
+    /// README and CHANGELOG sentences it quotes must be re-read in the SAME
+    /// change — that is what it is here for.
+    func testADescendantHeldOpenForReadingIsStillListedAndStillDeletable() async throws {
+        let reading = try makeStaleCandidate("reader-held", under: sharedRootURL)
+        let locked = try makeStaleCandidate("descendant-locked", under: sharedRootURL)
+
+        // (1) A descendant held open for ordinary reading.
+        let payload = reading.appendingPathComponent("payload.bin")
+        let readerFD = open(payload.path, O_RDONLY | O_CLOEXEC)
+        try XCTSkipIf(readerFD < 0, "could not open the fixture payload")
+        defer { close(readerFD) }
+        var byte: UInt8 = 0
+        XCTAssertEqual(read(readerFD, &byte, 1), 1, "the fd is genuinely live")
+
+        // (2) A real advisory lock on a DESCENDANT, not on the candidate.
+        let innerFD = open(
+            locked.appendingPathComponent("payload.bin").path,
+            O_RDONLY | O_CLOEXEC
+        )
+        try XCTSkipIf(innerFD < 0, "could not open the fixture payload")
+        defer { flock(innerFD, LOCK_UN); close(innerFD) }
+        try XCTSkipIf(flock(innerFD, LOCK_EX | LOCK_NB) != 0,
+                      "the platform refused an advisory lock on the file")
+
+        // PRODUCTION lock probe and PRODUCTION lister — no double.
+        XCTAssertEqual(
+            EphemeralTempScanner.cooperativeLockProbe(canonical(reading)),
+            .available,
+            "the probe cannot see a descendant held open for reading"
+        )
+        XCTAssertEqual(
+            EphemeralTempScanner.cooperativeLockProbe(canonical(locked)),
+            .available,
+            "the probe cannot see an advisory lock one level down"
+        )
+
+        let scanner = makeScanner(roots: [sharedRoot()])
+        let scanned = itemsByName(await scan(scanner))
+        let item = try XCTUnwrap(
+            scanned["reader-held"],
+            "the README says age is the protection — a week-idle workspace "
+                + "IS listed even while something reads from it"
+        )
+        XCTAssertNotNil(scanned["descendant-locked"])
+        XCTAssertEqual(item.isStale, true,
+                       "and it enters the one-click Select Stale set")
+
+        // Delete time refuses nothing either: the re-check re-establishes
+        // age, identity and the top-level lock, none of which a reader moves.
+        let verdict = try XCTUnwrap(scanner.preDeleteRevalidator)
+            .revalidate(item: item, authorization: nil)
+        guard case .allow = verdict else {
+            return XCTFail(
+                "the delete-time re-check refused a merely-read entry — "
+                    + "if that is now the contract, README.md's \"it cannot "
+                    + "see a program that merely holds a file inside it open "
+                    + "for reading\" is out of date"
+            )
+        }
+    }
+
     func testUnlockedCandidateProceedsThroughTheProductionProbe() async throws {
         try makeStaleCandidate("free", under: sharedRootURL)
         // No lock held; the PRODUCTION probe takes and drops one.

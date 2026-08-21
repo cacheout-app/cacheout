@@ -370,6 +370,17 @@ and docs/v1/CLI-REFERENCE.md) — the pre-release `node_modules` →
 
 ### Fixed
 
+- **A background refresh no longer reads the folders it has already decided
+  to skip.** The ephemeral-temp scanner runs only when you ask for a scan, but
+  before each scan Cacheout records the identity of every folder it might
+  later delete from — and it did that for EVERY registered scanner, including
+  ones the refresh had just excluded. So an automatic refresh still made
+  filesystem contact with `/private/tmp` and both per-user temp containers,
+  where a stalled network or disk-image mount can park the call. It now
+  records only the folders belonging to the scanners that session actually
+  runs, which also means a scan narrowed to one scanner touches nothing
+  outside it. Nothing you can clean is affected: a scanner that did not run in
+  the latest scan already could not be cleaned until it runs again.
 - **Deleting a folder nested deeper than the system path limit now works.**
   Inspection had been made descriptor-relative and could read such trees;
   permanent deletion still went through `FileManager.removeItem`, which

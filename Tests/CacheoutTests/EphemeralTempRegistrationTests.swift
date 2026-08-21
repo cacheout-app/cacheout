@@ -124,11 +124,12 @@ final class EphemeralTempRegistrationTests: XCTestCase {
     /// A runtime around the fixture scanner — registration is what puts the
     /// fixture root into delete-time admission, exactly as in production.
     private func makeRuntime(
-        _ scanners: [any SpaceScanner]
+        _ scanners: [any SpaceScanner],
+        provider: FileSystemIdentityProvider = FileSystemIdentityProvider()
     ) throws -> SpaceScannerRuntime {
         try SpaceScannerRuntime(
             scanners: scanners, categories: [], home: fixtureHome,
-            provider: FileSystemIdentityProvider()
+            provider: provider
         )
     }
 
@@ -1650,17 +1651,207 @@ final class EphemeralTempRegistrationTests: XCTestCase {
         XCTAssertEqual(after.items.count, 1,
                        "and its prior outcome survives the session")
     }
+
+    // MARK: - Snapshot capture set (PR #459 codex r16, AVAILABILITY)
+
+    /// A deferred scanner's roots must not be `lstat`ed either. Before this
+    /// round `ContainerSnapshot.capture` ran over EVERY registered root
+    /// BEFORE the participation filter, so an `.automatic` refresh made
+    /// filesystem contact with the roots of a scanner the same session had
+    /// already decided not to run — the explicit-only contract stopped the
+    /// task, the event and the item, and left the access.
+    func testAnAutomaticSessionNeverIdentityProbesADeferredScannersRoots()
+        async throws {
+        let gatedContainer = base.appendingPathComponent("gated-container")
+        let liveContainer = base.appendingPathComponent("live-container")
+        for url in [gatedContainer, liveContainer] {
+            try fm.createDirectory(at: url, withIntermediateDirectories: true)
+        }
+        let provider = IdentityRecordingProvider()
+        let gated = TriggerGatedFixtureScanner(
+            id: "fixture_gated", container: canonical(gatedContainer)
+        )
+        let companion = AlwaysParticipatingFixtureScanner(
+            id: "fixture_other", containers: [canonical(liveContainer)]
+        )
+        let runtime = try makeRuntime([gated, companion], provider: provider)
+
+        provider.arm()
+        let deferredSession = runtime.scanValidatedSession(
+            context: ScanContext(trigger: .automatic)
+        )
+        for await _ in deferredSession.events {}
+        provider.disarm()
+        let deferredProbes = provider.recorded
+
+        XCTAssertTrue(
+            deferredProbes.contains(canonical(liveContainer).path),
+            "the participating scanner's root is still captured: "
+                + "\(deferredProbes)"
+        )
+        XCTAssertFalse(
+            deferredProbes.contains(canonical(gatedContainer).path),
+            "a scanner that declined this trigger must not have its roots "
+                + "touched by the capture either: \(deferredProbes)"
+        )
+
+        provider.arm()
+        let liveSession = runtime.scanValidatedSession(
+            context: ScanContext(trigger: .userInitiated)
+        )
+        for await _ in liveSession.events {}
+        provider.disarm()
+        XCTAssertTrue(
+            provider.recorded.contains(canonical(gatedContainer).path),
+            "and the SAME root is captured when the scanner does run — the "
+                + "filter is participation, not a permanent exclusion: "
+                + "\(provider.recorded)"
+        )
+    }
+
+    /// The same narrowing for a caller-chosen SUBSET: a session that never
+    /// asked for a scanner must not touch its roots.
+    func testAScannerSubsetSessionCapturesOnlyTheSubsetsRoots() async throws {
+        let outsideContainer = base.appendingPathComponent("outside-container")
+        let insideContainer = base.appendingPathComponent("inside-container")
+        for url in [outsideContainer, insideContainer] {
+            try fm.createDirectory(at: url, withIntermediateDirectories: true)
+        }
+        let provider = IdentityRecordingProvider()
+        let outside = AlwaysParticipatingFixtureScanner(
+            id: "fixture_outside", containers: [canonical(outsideContainer)]
+        )
+        let inside = AlwaysParticipatingFixtureScanner(
+            id: "fixture_inside", containers: [canonical(insideContainer)]
+        )
+        let runtime = try makeRuntime([outside, inside], provider: provider)
+
+        provider.arm()
+        let session = runtime.scanValidatedSession(
+            scannerIDs: ["fixture_inside"],
+            context: ScanContext(trigger: .userInitiated)
+        )
+        for await _ in session.events {}
+        provider.disarm()
+
+        XCTAssertTrue(
+            provider.recorded.contains(canonical(insideContainer).path),
+            "the requested scanner's root is captured: \(provider.recorded)"
+        )
+        XCTAssertFalse(
+            provider.recorded.contains(canonical(outsideContainer).path),
+            "a scanner nobody asked for must not have its roots probed: "
+                + "\(provider.recorded)"
+        )
+    }
+
+    /// THE ANTI-STRAND CELL for the narrowing above. Delete-time root matching
+    /// is by canonical identity over the whole union and returns the FIRST
+    /// match, and the snapshot is keyed by THAT entry's declared spelling — so
+    /// a PARTICIPATING scanner's origin claim can legitimately key off a union
+    /// entry only a NON-participating scanner declared. Filtering the capture
+    /// set by declared path alone would turn that admission into
+    /// `containerUnavailable`: a clean the user is entitled to, refused.
+    ///
+    /// Staged exactly: `real/x` (declared by the deferred scanner, registered
+    /// FIRST so it wins the union's first-match) and `link/x` (declared by the
+    /// participating one, a real directory reached through a symlinked
+    /// ANCESTOR, so alias suppression drops neither).
+    func testAParticipatingScannersAliasedRootIsStillCaptured() async throws {
+        let real = base.appendingPathComponent("real")
+        let realX = real.appendingPathComponent("x")
+        try fm.createDirectory(at: realX, withIntermediateDirectories: true)
+        let link = base.appendingPathComponent("link")
+        try fm.createSymbolicLink(at: link, withDestinationURL: real)
+        let linkX = link.appendingPathComponent("x")
+
+        let provider = FileSystemIdentityProvider()
+        XCTAssertEqual(
+            provider.probeKind(of: linkX), .kind(.directory),
+            "the alias spelling must lstat as a real directory, or "
+                + "suppressingAliasShadows would drop it and the cell would "
+                + "prove nothing"
+        )
+
+        let deferred = TriggerGatedFixtureScanner(
+            id: "fixture_gated", container: realX
+        )
+        let participant = AlwaysParticipatingFixtureScanner(
+            id: "fixture_other", containers: [linkX]
+        )
+        let runtime = try makeRuntime([deferred, participant], provider: provider)
+        XCTAssertEqual(
+            runtime.trustedContainerRoots.map(\.path),
+            [realX.path, linkX.path],
+            "both spellings must survive into the union, in this order"
+        )
+
+        let session = runtime.scanValidatedSession(
+            context: ScanContext(trigger: .automatic)
+        )
+        for await _ in session.events {}
+
+        let pathGuard = PathGuard(
+            home: fixtureHome,
+            containerRoots: runtime.trustedContainerRoots,
+            provider: provider
+        )
+        XCTAssertNoThrow(
+            try pathGuard.admitContainer(linkX, snapshot: session.snapshot),
+            "the participating scanner's own container must still admit — "
+                + "its claim matches the deferred scanner's spelling, which "
+                + "the capture set has to carry for exactly that reason"
+        )
+    }
 }
 
 /// Always runs; emits nothing. Exists so an automatic session still has a
-/// participant, completes and adopts a snapshot.
+/// participant, completes and adopts a snapshot. `containers` defaults to
+/// EMPTY — the cells that only need a participant pass nothing; the snapshot
+/// cells give it a root so "the participant's root WAS captured" is a
+/// positive observation beside the deferred scanner's negative one.
 private struct AlwaysParticipatingFixtureScanner: SpaceScanner {
     let id: String
+    var containers: [URL] = []
     var displayName: String { "Fixture \(id)" }
-    var trustedContainerRoots: [URL] { [] }
+    var trustedContainerRoots: [URL] { containers }
 
     func scan(context: ScanContext) async -> ScanOutcome {
         ScanOutcome(items: [], errors: [])
+    }
+}
+
+/// Records every `identity(of:)` the runtime asks for, while recording is
+/// ARMED. Capture is the only caller during a session whose scanners touch
+/// nothing, so an armed window around `scanValidatedSession` observes exactly
+/// the snapshot's capture set.
+final class IdentityRecordingProvider: FileSystemIdentityProvider,
+    @unchecked Sendable {
+    private let lock = NSLock()
+    private var armed = false
+    private var paths: [String] = []
+
+    func arm() {
+        lock.lock(); defer { lock.unlock() }
+        armed = true
+        paths = []
+    }
+
+    func disarm() {
+        lock.lock(); defer { lock.unlock() }
+        armed = false
+    }
+
+    var recorded: [String] {
+        lock.lock(); defer { lock.unlock() }
+        return paths
+    }
+
+    override func identity(of url: URL) -> Identity? {
+        lock.lock()
+        if armed { paths.append(url.path) }
+        lock.unlock()
+        return super.identity(of: url)
     }
 }
 

@@ -111,13 +111,19 @@ struct CategoryAdmissionPolicy {
 
 // MARK: - Scan-session container snapshot (fn-3.4, R9)
 
-/// The no-follow `(device, inode)` identity of every REGISTERED container
-/// root, captured by the runtime's validated-scan entry point BEFORE any
+/// The no-follow `(device, inode)` identity of each container root the
+/// runtime's validated-scan entry point hands `capture`, taken BEFORE any
 /// scanner task launches. Delete-time container admission is IDENTITY-BOUND
 /// to this snapshot: cleaning a set of items must use the snapshot of the
 /// session that PRODUCED them, so a container replaced between scan and
 /// clean — symlink swap, rm+mkdir inode replacement, or an ancestor swap
 /// redirecting the resolved location — mismatches and is refused.
+///
+/// WHICH roots those are is the caller's decision, and it is not every
+/// registered one: `SpaceScannerRuntime.sessionContainerRoots` passes only
+/// the roots the session's PARTICIPATING scanners can reach (PR #459 codex
+/// r16), so a deferred or out-of-subset scanner's roots are never lstat'ed.
+/// That function owns the argument that this cannot strand a clean.
 ///
 /// Absent roots are OMITTED at capture: a root that did not exist when the
 /// session started can never have produced items in it, and a root created

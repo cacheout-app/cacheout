@@ -786,13 +786,15 @@ enum ValidatedScannerEvent: Sendable {
 /// The producer is private — a consumer can WAIT for it, never steer it
 /// (stream termination remains the one cancellation path).
 struct ValidatedScanSession {
-    /// The session's container-identity snapshot (fn-3.4, R9): every
-    /// REGISTERED container root's no-follow (device, inode), captured
-    /// BEFORE any scanner task launched — so anything swapped DURING the
-    /// scan already mismatches at delete time. Cleaning this session's
-    /// items must go through `makeCleaner(snapshot:)` with THIS snapshot;
-    /// capture is part of the session on purpose (a consumer cannot
-    /// misorder it), and absent roots are omitted (fail-closed downstream).
+    /// The session's container-identity snapshot (fn-3.4, R9): the no-follow
+    /// (device, inode) of each container root this session's PARTICIPATING
+    /// scanners can reach (`sessionContainerRoots`, PR #459 codex r16 —
+    /// before that it was every registered root), captured BEFORE any
+    /// scanner task launched — so anything swapped DURING the scan already
+    /// mismatches at delete time. Cleaning this session's items must go
+    /// through `makeCleaner(snapshot:)` with THIS snapshot; capture is part
+    /// of the session on purpose (a consumer cannot misorder it), and absent
+    /// roots are omitted (fail-closed downstream).
     let snapshot: ContainerSnapshot
     /// Progressive validated events — the identical frozen contract
     /// `scanValidated` returns (that API is now a thin wrapper over this).
@@ -851,6 +853,13 @@ struct SpaceScannerRuntime {
     /// PRODUCING scanner's own declaration through this map, never the
     /// union.
     private let declaredContainerRoots: [String: [URL]]
+
+    /// DECLARED path -> canonical path, for every root any scanner declared
+    /// (union survivors and alias-suppressed drops alike), captured at
+    /// registration from `suppressingAliasShadows`' single probe pass.
+    /// Read ONLY by `sessionContainerRoots`, which uses it to decide the
+    /// snapshot's capture set without a session-time realpath.
+    private let containerRootCanonicalKeys: [String: String]
 
     /// The AUTHORITATIVE category registry, keyed by slug — registered at
     /// composition time alongside the scanners. Category-backed items are
@@ -934,8 +943,9 @@ struct SpaceScannerRuntime {
 
         self.scanners = scanners
         self.registeredCategories = registered
-        self.trustedContainerRoots = union
+        self.trustedContainerRoots = union.roots
         self.declaredContainerRoots = declared
+        self.containerRootCanonicalKeys = union.canonicalKeys
         self.preDeleteRevalidators = revalidators
         self.home = home
         self.provider = provider
@@ -993,7 +1003,7 @@ struct SpaceScannerRuntime {
     /// covering root is a dev root as well).
     private static func suppressingAliasShadows(
         in roots: [URL], provider: FileSystemIdentityProvider
-    ) -> [URL] {
+    ) -> (roots: [URL], canonicalKeys: [String: String]) {
         // Probed ONCE per root: the canonical comparison KEY, and whether the
         // DECLARED spelling is itself a real directory (leaf lstat no-follow)
         // — the same probe pair, with the same meaning, as fn-4.1's dev-root
@@ -1010,9 +1020,27 @@ struct SpaceScannerRuntime {
         // pass the reality gate, so neither shadows the other, and dropping
         // either would change which declared spelling the identity binding
         // keys off for no safety gain.
-        return probed
-            .filter { $0.isDirectory || !coveredByRealDirectory.contains($0.key) }
-            .map(\.declared)
+        return (
+            roots: probed
+                .filter { $0.isDirectory || !coveredByRealDirectory.contains($0.key) }
+                .map(\.declared),
+            // THE SAME PROBE'S KEYS, carried out rather than recomputed (PR
+            // #459 codex r16). `sessionContainerRoots` needs to know which
+            // union entries a participating scanner's declared root can
+            // MATCH, and matching is by canonical identity
+            // (`PathGuard.matchConfiguredRoot`, PathGuard.swift:462-469), not
+            // by spelling. Re-canonicalizing at session time would pay this
+            // construction's realpath bill again — per session, per trigger,
+            // on exactly the roots the participation gate exists to leave
+            // alone. Keyed by DECLARED path and kept for every declared root
+            // including the ones dropped above: a participating scanner whose
+            // own spelling was suppressed still reaches the covering entry
+            // through this map.
+            canonicalKeys: Dictionary(
+                probed.map { ($0.declared.path, $0.key) },
+                uniquingKeysWith: { first, _ in first }
+            )
+        )
     }
 
     /// The production registry — the single place scanners are registered.
@@ -1887,6 +1915,75 @@ struct SpaceScannerRuntime {
 
     // MARK: Validated-scan entry point
 
+    /// The union roots a session whose participating scanners are `selected`
+    /// must snapshot — the capture set of `ContainerSnapshot.capture` (PR
+    /// #459 codex r16, AVAILABILITY).
+    ///
+    /// WHY IT IS NOT THE WHOLE UNION. Capture costs one `lstat` per captured
+    /// root, and an `lstat` OF a root is first contact with whatever is
+    /// mounted there. Capturing every REGISTERED root meant an `.automatic`
+    /// refresh still touched `/private/tmp` and both per-user temp roots
+    /// after `participates(in:)` had already decided the temp scanner would
+    /// not run — the scanner's explicit-only contract stopped the task, the
+    /// event and the item, and left the filesystem access. A scanner-subset
+    /// session touched roots the caller never asked about the same way. The
+    /// mount-table preflight inside `capture` skips a root the table NAMES,
+    /// so what remains is the racing case (a mount landing after that read)
+    /// — small, but paid on every trigger for a scanner that will not run.
+    ///
+    /// WHY IT CANNOT STRAND A LATER CLEAN. Omission from the snapshot is
+    /// fail-closed: `PathGuard.admitContainer` refuses a root it cannot find
+    /// there (PathGuard.swift:400-403). Both consumers already refuse the
+    /// same items for an independent reason:
+    ///
+    /// - the ViewModel gates every destructive path on the scanner's
+    ///   outcome generation equalling the ADOPTED one
+    ///   (`isBlockedFromDestructivePaths`, CacheoutViewModel.swift:588-592).
+    ///   A non-participating scanner delivers no event, so its retained rows
+    ///   keep the older generation while adoption moves on
+    ///   (CacheoutViewModel.swift:1465-1466) — they are already
+    ///   visible-but-non-cleanable before this filter sees them;
+    /// - the CLI resolves the items it cleans FROM the same collected
+    ///   session (CLIHandler.swift:2123 and :2442 pass that session's
+    ///   snapshot), so it can only ever hold items a participating scanner
+    ///   produced.
+    ///
+    /// And a participating scanner's own items are covered exactly, because
+    /// scan-time validation binds every container item's origin claim to the
+    /// PRODUCING scanner's declared roots (`structuralViolation`'s ORIGIN
+    /// BINDING arm, in this file).
+    ///
+    /// WHY CANONICAL KEYS AND NOT JUST PATHS. Delete-time root matching is by
+    /// canonical identity over the whole union, returning the FIRST match
+    /// (PathGuard.swift:462-469), and the snapshot is keyed by THAT root's
+    /// declared spelling. So a participating scanner's claim can legitimately
+    /// key off a union entry only a NON-participating scanner declared — an
+    /// alias spelling of the same location, including the case where the
+    /// participating scanner's own spelling was dropped by
+    /// `suppressingAliasShadows`. Filtering by declared path alone would have
+    /// turned those admissions into `containerUnavailable`; the registration
+    /// -captured `containerRootCanonicalKeys` pull the covering entry in
+    /// without a session-time realpath.
+    private func sessionContainerRoots(
+        for selected: [any SpaceScanner]
+    ) -> [URL] {
+        let declaredPaths = Set(
+            selected
+                .flatMap { declaredContainerRoots[$0.id] ?? [] }
+                .map(\.path)
+        )
+        let reachableKeys = Set(
+            declaredPaths.compactMap { containerRootCanonicalKeys[$0] }
+        )
+        return trustedContainerRoots.filter { root in
+            if declaredPaths.contains(root.path) { return true }
+            guard let key = containerRootCanonicalKeys[root.path] else {
+                return false
+            }
+            return reachableKeys.contains(key)
+        }
+    }
+
     /// The ONE scan-and-validate API (epic rounds 8-10, FROZEN shape): a
     /// progressive validated EVENT STREAM — each event is one scanner's
     /// validated outcome or its synthesized `malformedOutcome` issue. The
@@ -1921,21 +2018,6 @@ struct SpaceScannerRuntime {
         scannerIDs: Set<String>? = nil,
         context: ScanContext
     ) -> ValidatedScanSession {
-        // Container-identity capture is PART OF the session (fn-3.4, R9 —
-        // a consumer cannot misorder it): every REGISTERED root, before
-        // any scanner task launches, so a container swapped mid-scan
-        // mismatches at delete time. ALL registered roots on purpose, even
-        // under a scanner subset — capture is cheap (one kernel-table read,
-        // then at most one lstat per root; a root the table names as a
-        // mount point is skipped WITHOUT the lstat, PR #459 review r6
-        // codex C2 — that lstat is first contact with the mounted
-        // filesystem, and an unresponsive hard mount at a registered root
-        // would otherwise wedge every session at this line, on every
-        // trigger) and a subset-blind snapshot can never pair a root with
-        // the wrong session.
-        let snapshot = ContainerSnapshot.capture(
-            roots: trustedContainerRoots, provider: provider
-        )
         // TWO independent filters, and the second is the PROTOCOL's rather
         // than the caller's (PR #459 review r2). `scannerIDs` is what the
         // caller asked for; `participates(in:)` is what the scanner will
@@ -1950,10 +2032,22 @@ struct SpaceScannerRuntime {
         // A declining scanner is simply absent from the session: no task, no
         // event, and so no `.outcome` a consumer could read as "I looked at
         // every root and there is nothing there".
+        //
+        // DERIVED BEFORE THE CAPTURE BELOW, and that ordering is the point
+        // (PR #459 codex r16, AVAILABILITY) — see `sessionContainerRoots`.
         let selected = scanners.filter { scanner in
             (scannerIDs?.contains(scanner.id) ?? true)
                 && scanner.participates(in: context)
         }
+        // Container-identity capture is PART OF the session (fn-3.4, R9 —
+        // a consumer cannot misorder it): before any scanner task launches,
+        // so a container swapped mid-scan mismatches at delete time. A root
+        // the kernel table names as a mount point is skipped WITHOUT the
+        // lstat (PR #459 review r6 codex C2 — that lstat is first contact
+        // with the mounted filesystem).
+        let snapshot = ContainerSnapshot.capture(
+            roots: sessionContainerRoots(for: selected), provider: provider
+        )
         let registeredCategories = self.registeredCategories
         let declaredContainerRoots = self.declaredContainerRoots
         let preDeleteRevalidators = self.preDeleteRevalidators

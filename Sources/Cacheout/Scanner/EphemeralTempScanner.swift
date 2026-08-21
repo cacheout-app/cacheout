@@ -2542,11 +2542,62 @@ struct EphemeralTempScanner: @unchecked Sendable {
     /// descriptor above it rather than by re-resolving a path. Containment in
     /// the held parent inode is the proof; nothing here re-reads a path.
     ///
-    /// Recursion, not an explicit stack, holds exactly one descriptor per
-    /// level of the CURRENT DFS path (closed on the way back out). An
-    /// `openat` that fails for any reason other than a vanished branch —
-    /// including descriptor exhaustion — makes the verdict UNPROVABLE, and
-    /// unprovable refuses.
+    /// ITERATIVE, AND THE DESCRIPTOR BILL IS A CONSTANT (PR #459 codex r14,
+    /// AVAILABILITY). This walk used to recurse, holding one descriptor per
+    /// level of the current DFS path until the deeper call returned, and the
+    /// comment here presented that as a bound ("An `openat` that fails …
+    /// including descriptor exhaustion — makes the verdict UNPROVABLE") when
+    /// it was the hazard. Both halves of that bill were measured on a chain
+    /// of single-component directories staged with `mkdirat`, driven through
+    /// the production revalidator, on the cooperative executor
+    /// `CacheCleaner`'s actor runs on:
+    ///
+    /// - DESCRIPTORS. With `rlim_cur` lowered to 96 (`setrlimit`), depth 88
+    ///   allowed and depth 96 refused with "Too many open files … re-scan
+    ///   required". A launchd-spawned app on this platform sees
+    ///   `rlim_cur = 256` (`OrphanedCachesScanner.defaultDescriptorWindow`'s
+    ///   own measurement), which puts the same wall a little further down.
+    /// - STACK. At the ambient limit, depth 240 allowed and depth 260 died
+    ///   `EXC_BAD_ACCESS (code=2, address=0x16fe8fe50)` with `sp` at
+    ///   `0x16fe8fe70` — a guard-page hit 32 bytes below the stack pointer,
+    ///   the backtrace 250-odd frames of this function at its recursive call.
+    ///   A crash, not a refusal.
+    ///
+    /// AND THE SCAN ACCEPTS EXACTLY THOSE TREES. Stage 1's
+    /// `walkForFreshContent` above is iterative over a `[URL]` stack and
+    /// holds NO descriptor across levels, and its budget charges one entry
+    /// per directory — a 20,000-level chain costs 20,000 of 20,000. Measured
+    /// on the same fixtures: the scan listed the entry at every depth from 8
+    /// to 400. So the scan offered a row the deletion could not take, and the
+    /// refusal it printed said "re-scan required" — a remedy a retry can
+    /// never satisfy, because depth is deterministic. That is the class this
+    /// project already has a lesson for, and this walk was the last instance.
+    ///
+    /// THE SHAPE IS `DepthSafeRemoval.removeTree`'s
+    /// (`DepthSafeRemoval.swift:641-878`): descend by `openat`, CLOSE the
+    /// parent, and climb back with `openat(current, "..")`, proving at every
+    /// step that `..` landed on the identity the walk recorded when it left.
+    /// Peak descriptors: the caller's root, the level the walk stands on, and
+    /// one transient (the enumeration handle, or the child/`..` in flight) —
+    /// four, at any depth. `OrphanedCachesScanner`'s scan-time walk
+    /// (`OrphanedCachesScanner.swift:1387-1691`) is the other in-house
+    /// instance and keeps a WINDOW of live frames rather than one, which buys
+    /// it fewer `..` climbs on wide-and-deep trees; it is not adopted here
+    /// because it costs a frame stack, a live-index list and an unexhausted-
+    /// index list this walk has no width to amortise them over, and because
+    /// the constant form is what makes the peak statable as a number.
+    ///
+    /// WHAT THE CLIMB COSTS IN SAFETY, stated rather than implied. The
+    /// recursion held the parent open, so a `rename(2)` of the level the walk
+    /// stood in could not redirect the rest of that level; here `..` names
+    /// the NEW parent and the identity comparison refuses `.unprovable`
+    /// instead. That is strictly more conservative — a refusal, never a
+    /// wrong answer — and it is CLEARABLE: a rename is a race, so a re-scan
+    /// genuinely can differ.
+    ///
+    /// An `openat` that fails for any reason other than a vanished branch
+    /// still makes the verdict UNPROVABLE, and unprovable refuses. What
+    /// changed is that depth is no longer one of the reasons.
     ///
     /// The budget cannot STRAND a real offer, but listed entries DO reach it
     /// (PR #459 review r4 — the sentence here claimed an entry whose tree
@@ -2576,8 +2627,146 @@ struct EphemeralTempScanner: @unchecked Sendable {
         seenInodes: inout Set<FileSystemIdentityProvider.Identity>,
         provider: FileSystemIdentityProvider
     ) -> DeleteTimeFreshness {
+        // `current` is the level the walk stands on. At depth 0 it IS the
+        // caller's descriptor, which the caller closes; every level below is
+        // this walk's own and is closed here — including the re-opened root
+        // a full unwind climbs back to, which is a DIFFERENT description of
+        // the same inode and would otherwise leak once per walk.
+        var current = descriptor
+        var currentIsOwned = false
+        defer { if currentIsOwned { close(current) } }
+
+        /// Subdirectory names each level of the CURRENT DFS path still owes a
+        /// descent, DESCENDING so `popLast()` drains them in the ascending
+        /// order they were sorted into — the recursion's `for name in pending`
+        /// order, unchanged. Every name here was already charged against
+        /// `budget`, so the whole stack is bounded by the entry limit.
+        var pending: [[String]] = []
+        /// One entry per level BELOW the root: the basename the walk descended
+        /// through, and the identity its parent must still have when `..`
+        /// lands there.
+        var ascent: [(name: String, parent: FileSystemIdentityProvider.Identity)] = []
+        /// The spelling of the level the walk stands on — ONE URL, pushed and
+        /// popped a component at a time rather than a copy per level.
+        var logical = directory
+
+        switch inspectOneLevel(
+            descriptor: current, at: logical, cutoff: cutoff,
+            rootDevice: rootDevice, budget: &budget,
+            allocatedBytes: &allocatedBytes, seenInodes: &seenInodes,
+            provider: provider
+        ) {
+        case .stop(let verdict): return verdict
+        case .subdirectories(let names): pending.append(names.reversed())
+        }
+
+        while true {
+            if let name = pending[pending.count - 1].popLast() {
+                // Read BEFORE the descent: this is the identity the climb back
+                // out must find, and reading it afterwards would ask the
+                // question of whatever the name resolves to by then.
+                guard let identity = provider.identity(ofDescriptor: current)
+                else {
+                    return .unprovable(
+                        "a directory would not identify itself"
+                    )
+                }
+                let child: Int32
+                // THE CARRYING FORM (PR #459 review r2). The raw-`Int32`
+                // `openChildDirectory` leaves its code in the GLOBAL `errno`,
+                // and `FileSystemIdentityProvider` documents that twin as
+                // existing precisely because "a test override (or any
+                // intervening call) can clobber" it before the caller reads it
+                // — which matters here, where ENOENT/ENOTDIR is a benign
+                // vanished branch and every other code makes the whole verdict
+                // UNPROVABLE, i.e. a refusal.
+                switch provider.openChildDirectoryCarryingErrno(
+                    inDirectory: current, named: name,
+                    logical: logical.appendingPathComponent(name)
+                ) {
+                case .opened(let opened):
+                    child = opened
+                case .failed(let code):
+                    if code == ENOENT || code == ENOTDIR { continue }
+                    return .unprovable(String(cString: strerror(code)))
+                }
+                if currentIsOwned { close(current) }
+                current = child
+                currentIsOwned = true
+                ascent.append((name: name, parent: identity))
+                logical.appendPathComponent(name)
+                switch inspectOneLevel(
+                    descriptor: current, at: logical, cutoff: cutoff,
+                    rootDevice: rootDevice, budget: &budget,
+                    allocatedBytes: &allocatedBytes, seenInodes: &seenInodes,
+                    provider: provider
+                ) {
+                case .stop(let verdict): return verdict
+                case .subdirectories(let names):
+                    pending.append(names.reversed())
+                }
+                continue
+            }
+
+            // This level owes no more descents.
+            pending.removeLast()
+            guard let step = ascent.last else {
+                // Back at the root, every level below it proven old.
+                return .allOld
+            }
+            // `..` IS NOT A PROOF, it is a lookup — the sentence
+            // `DepthSafeRemoval.removeTree` carries at its own climb. A
+            // directory renamed into a foreign parent while the walk stood
+            // inside it makes `..` name THAT parent, and the rest of this
+            // level's names would then be read out of somebody else's tree.
+            // `..` is never a symlink, so `O_NOFOLLOW` buys nothing; the
+            // identity comparison is the whole proof.
+            let up = openat(current, "..", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+            guard up >= 0 else {
+                return .unprovable(String(cString: strerror(errno)))
+            }
+            if currentIsOwned { close(current) }
+            current = up
+            currentIsOwned = true
+            ascent.removeLast()
+            logical.deleteLastPathComponent()
+            guard provider.identity(ofDescriptor: current) == step.parent
+            else {
+                return .unprovable(
+                    "\(step.name) was moved while its contents were being "
+                        + "re-inspected"
+                )
+            }
+        }
+    }
+
+    /// What ONE level's own entries prove: either the walk stops here with a
+    /// verdict, or these are the subdirectories still owed a descent.
+    private enum LevelInspection {
+        case subdirectories([String])
+        case stop(DeleteTimeFreshness)
+    }
+
+    /// Read one already-open directory: date every regular file against the
+    /// cutoff, refuse a child on another filesystem, and collect the
+    /// subdirectory names — descending into none of them.
+    ///
+    /// Takes no ownership of `descriptor` and opens nothing that outlives the
+    /// call, so the caller's peak is its own plus one.
+    private static func inspectOneLevel(
+        descriptor: Int32,
+        at directory: URL,
+        cutoff: Date,
+        rootDevice: UInt64,
+        budget: inout Int,
+        allocatedBytes: inout Int64,
+        seenInodes: inout Set<FileSystemIdentityProvider.Identity>,
+        provider: FileSystemIdentityProvider
+    ) -> LevelInspection {
         guard budget > 0 else {
-            return .unprovable("more entries than the inspection budget")
+            return .stop(
+                .unprovable("more entries than the inspection budget")
+            )
         }
         let read = boundedChildNames(
             ofDescriptor: descriptor, limit: budget, provider: provider
@@ -2587,26 +2776,29 @@ struct EphemeralTempScanner: @unchecked Sendable {
         case .failed(let code):
             if code == ENOENT || code == ENOTDIR {
                 // The branch vanished mid-walk — the benign race, and there is
-                // nothing fresh in a branch that is not there.
-                return .allOld
+                // nothing fresh in a branch that is not there. No descents are
+                // owed from a level that is not there either.
+                return .subdirectories([])
             }
-            return .unprovable(String(cString: strerror(code)))
+            return .stop(.unprovable(String(cString: strerror(code))))
         case .names(let read, let truncation):
             // EVERY cause refuses here, and every refusal is visible — the
             // delete-time disposition is unchanged by r7 codex C2. Only the
             // wording gained the cause it always had in hand.
             switch truncation {
             case .budget:
-                return .unprovable("more entries than the inspection budget")
-            case .undecodableName:
-                return .unprovable(
-                    "a directory holds an entry name that is not valid text"
+                return .stop(
+                    .unprovable("more entries than the inspection budget")
                 )
+            case .undecodableName:
+                return .stop(.unprovable(
+                    "a directory holds an entry name that is not valid text"
+                ))
             case .readFailed(let code):
-                return .unprovable(
+                return .stop(.unprovable(
                     "a directory could not be read in full: "
                         + String(cString: strerror(code))
-                )
+                ))
             case .none:
                 break
             }
@@ -2618,7 +2810,9 @@ struct EphemeralTempScanner: @unchecked Sendable {
             $0.utf8.lexicographicallyPrecedes($1.utf8)
         }) {
             guard budget > 0 else {
-                return .unprovable("more entries than the inspection budget")
+                return .stop(
+                    .unprovable("more entries than the inspection budget")
+                )
             }
             budget -= 1
             let child = directory.appendingPathComponent(name)
@@ -2628,17 +2822,17 @@ struct EphemeralTempScanner: @unchecked Sendable {
             case .absent:
                 continue
             case .failed(let code):
-                return .unprovable(String(cString: strerror(code)))
+                return .stop(.unprovable(String(cString: strerror(code))))
             case .kind(let kind, let childIdentity, let metadata):
                 switch kind {
                 case .regularFile:
                     guard let metadata else {
-                        return .unprovable(
+                        return .stop(.unprovable(
                             "\(name) would not describe its modification time"
-                        )
+                        ))
                     }
                     if modificationDate(of: metadata) >= cutoff {
-                        return .freshContent(child)
+                        return .stop(.freshContent(child))
                     }
                     // Two links to one inode count once, exactly as the
                     // scan's sizer counts them (r4, codex C4).
@@ -2658,10 +2852,10 @@ struct EphemeralTempScanner: @unchecked Sendable {
                     // preflight and per-child mount comparison still stand
                     // behind this for the permanent arm.
                     guard childIdentity.device == rootDevice else {
-                        return .unprovable(
+                        return .stop(.unprovable(
                             "a volume is mounted at \(name) — its contents "
                                 + "are another filesystem's"
-                        )
+                        ))
                     }
                     pending.append(name)
                 case .symlink, .other:
@@ -2671,38 +2865,7 @@ struct EphemeralTempScanner: @unchecked Sendable {
                 }
             }
         }
-
-        for name in pending {
-            // THE CARRYING FORM (PR #459 review r2). The raw-`Int32`
-            // `openChildDirectory` leaves its code in the GLOBAL `errno`, and
-            // `FileSystemIdentityProvider` documents that twin as existing
-            // precisely because "a test override (or any intervening call) can
-            // clobber" it before the caller reads it — which matters here,
-            // where ENOENT/ENOTDIR is a benign vanished branch and every other
-            // code makes the whole verdict UNPROVABLE, i.e. a refusal.
-            let childDescriptor: Int32
-            switch provider.openChildDirectoryCarryingErrno(
-                inDirectory: descriptor, named: name,
-                logical: directory.appendingPathComponent(name)
-            ) {
-            case .opened(let opened):
-                childDescriptor = opened
-            case .failed(let code):
-                if code == ENOENT || code == ENOTDIR { continue }
-                return .unprovable(String(cString: strerror(code)))
-            }
-            defer { close(childDescriptor) }
-            let below = freshContentBelow(
-                descriptor: childDescriptor,
-                at: directory.appendingPathComponent(name),
-                cutoff: cutoff, rootDevice: rootDevice, budget: &budget,
-                allocatedBytes: &allocatedBytes, seenInodes: &seenInodes,
-                provider: provider
-            )
-            if case .allOld = below { continue }
-            return below
-        }
-        return .allOld
+        return .subdirectories(pending)
     }
 
     /// The BOUNDED read of an already-open directory — `boundedChildNames`'s

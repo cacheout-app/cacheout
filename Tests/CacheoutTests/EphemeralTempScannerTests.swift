@@ -3668,6 +3668,207 @@ final class EphemeralTempScannerTests: XCTestCase {
         XCTAssertTrue(reason.contains("could not be re-opened"), reason)
     }
 
+    // MARK: - Depth is not a resource in the delete-time walk
+    // (PR #459 codex r14 — AVAILABILITY)
+
+    /// A chain of `levels` directories built with `mkdirat` against a held
+    /// descriptor, two descriptors at a time, then dated deepest-first by
+    /// `futimens` on the descriptors it already holds. `backdate` cannot do
+    /// this job: it recurses once per level through `contentsOfDirectory`,
+    /// and the whole point of these fixtures is depth.
+    private func makeDeepStaleChain(
+        _ name: String, under root: URL, levels: Int
+    ) throws -> URL {
+        let entry = try mkdir(root.appendingPathComponent(name))
+        try writeFile(entry.appendingPathComponent("payload.bin"))
+
+        var open: [Int32] = []
+        defer { for fd in open { close(fd) } }
+        var current = entry.withUnsafeFileSystemRepresentation { path -> Int32 in
+            guard let path else { return -1 }
+            return Darwin.open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+        }
+        guard current >= 0 else { throw XCTSkip("open: \(errno)") }
+        open.append(current)
+        for _ in 0..<levels {
+            guard mkdirat(current, "d", 0o755) == 0 else {
+                throw XCTSkip("mkdirat: \(errno)")
+            }
+            let next = openat(current, "d", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+            guard next >= 0 else { throw XCTSkip("openat: \(errno)") }
+            open.append(next)
+            current = next
+        }
+        let stamp = timespec(
+            tv_sec: Int(oldDate.timeIntervalSince1970), tv_nsec: 0
+        )
+        var times = [stamp, stamp]
+        guard utimensat(open[0], "payload.bin", &times, 0) == 0 else {
+            throw XCTSkip("utimensat: \(errno)")
+        }
+        for fd in open.reversed() {
+            guard futimens(fd, &times) == 0 else {
+                throw XCTSkip("futimens: \(errno)")
+            }
+        }
+        return entry
+    }
+
+    /// THE ASYMMETRY, both halves in one cell: the scan LISTS a deep-but-valid
+    /// stale tree, and the delete-time re-inspection of the very same tree
+    /// must then be able to take it.
+    ///
+    /// Before the iterative rewrite this walk recursed, one stack frame and
+    /// one open descriptor per level. Measured through this exact production
+    /// path on the cooperative executor `CacheCleaner`'s actor runs on: depth
+    /// 240 allowed, depth 260 died `EXC_BAD_ACCESS (code=2, address=
+    /// 0x16fe8fe50)` with `sp` at `0x16fe8fe70` — a guard-page hit 32 bytes
+    /// below the stack pointer, ~250 frames of `freshContentBelow` deep. Not
+    /// a refusal the user could act on; a crash.
+    ///
+    /// The scan side has no such wall: `walkForFreshContent` is iterative over
+    /// a `[URL]` stack and charges one entry of 20,000 per directory.
+    func testRevalidatorAllowsADeepStaleTreeTheScanListed() async throws {
+        let entry = try makeDeepStaleChain(
+            "deep-stale", under: sharedRootURL, levels: 320
+        )
+        let scanner = makeScanner(roots: [sharedRoot()])
+        let outcome = await scan(scanner)
+        let item = try XCTUnwrap(
+            itemsByName(outcome)["deep-stale"],
+            "fixture precondition: the SCAN must list this tree — without "
+                + "that there is no asymmetry to close. errors="
+                + "\(outcome.errors.map(\.detail))"
+        )
+
+        let expected = try XCTUnwrap(
+            FileSystemIdentityProvider().identity(of: canonical(entry))
+        )
+        XCTAssertEqual(
+            try XCTUnwrap(scanner.preDeleteRevalidator)
+                .revalidate(item: item, authorization: nil),
+            .allow(inspected: .directory(expected)),
+            "a deep tree the scan offered must be cleanable, not permanently "
+                + "refused"
+        )
+    }
+
+    /// Descriptors are not a function of depth either — the twin of
+    /// `DepthSafeRemovalTests.testRemovesADeepTreeUnderALoweredDescriptorLimit`
+    /// on the INSPECTION side, at the same lowered `rlim_cur` of 96.
+    ///
+    /// Measured at HEAD before this fix, through this production path: depth
+    /// 88 allowed and depth 96 refused "…could not be fully re-inspected at
+    /// delete time (Too many open files) … re-scan required". Deterministic —
+    /// the re-scan the sentence prescribes re-offers the identical tree and
+    /// the identical refusal follows, for ever. A launchd-spawned app on this
+    /// platform sees `rlim_cur = 256`, which moves that wall without removing
+    /// it.
+    func testRevalidatorAllowsADeepStaleTreeUnderALoweredDescriptorLimit()
+        async throws {
+        try makeDeepStaleChain("fd-bound", under: sharedRootURL, levels: 320)
+        let scanner = makeScanner(roots: [sharedRoot()])
+        let outcome = await scan(scanner)
+        let item = try XCTUnwrap(
+            itemsByName(outcome)["fd-bound"],
+            "fixture precondition: the scan must list this tree. errors="
+                + "\(outcome.errors.map(\.detail))"
+        )
+
+        var original = rlimit()
+        guard getrlimit(RLIMIT_NOFILE, &original) == 0 else {
+            throw XCTSkip("getrlimit failed")
+        }
+        var lowered = original
+        lowered.rlim_cur = 96
+        guard setrlimit(RLIMIT_NOFILE, &lowered) == 0 else {
+            throw XCTSkip("setrlimit failed: \(errno)")
+        }
+        let verdict: PreDeleteVerdict
+        do {
+            verdict = try XCTUnwrap(scanner.preDeleteRevalidator)
+                .revalidate(item: item, authorization: nil)
+            setrlimit(RLIMIT_NOFILE, &original)
+        }
+        guard case .allow = verdict else {
+            return XCTFail(
+                "320 levels under a 96-descriptor limit must still be "
+                    + "provable — got \(verdict)"
+            )
+        }
+    }
+
+    /// THE PROOF THE CLIMB BUYS ITS BOUND WITH. Closing the parent on the way
+    /// down means the way back up is an `openat(current, "..")` — a LOOKUP,
+    /// not a proof. A directory renamed into a foreign parent while the walk
+    /// stood inside it makes `..` name THAT parent, and the rest of the
+    /// level's names would be read out of somebody else's tree; the identity
+    /// the walk recorded before it descended is what refuses instead.
+    ///
+    /// The rename is REAL, fired by the kernel at the exact instant the walk
+    /// is standing in the moved directory (the last probe it makes before it
+    /// climbs), single-threaded, with no sleeps. The refusal is CLEARABLE: a
+    /// rename is a race, so the re-scan the sentence prescribes genuinely can
+    /// differ.
+    func testDeleteTimeWalkRefusesWhenTheLevelItStandsInIsMovedAway()
+        async throws {
+        let entry = try mkdir(sharedRootURL.appendingPathComponent("moved"))
+        let inner = try mkdir(entry.appendingPathComponent("a"))
+        try writeFile(inner.appendingPathComponent("old.bin"))
+        // Sorts after "a", so the walk descends into "a" first and this is
+        // still an unvisited sibling when the refusal lands.
+        try mkdir(entry.appendingPathComponent("elsewhere"))
+        try backdate(entry, to: oldDate)
+
+        /// Renames `from` into `into` the first time the walk probes `trigger`.
+        final class RenamingProvider: FileSystemIdentityProvider,
+            @unchecked Sendable {
+            var trigger = ""
+            var from: URL?
+            var into: URL?
+            private(set) var fired = false
+
+            override func probeKind(
+                inDirectory parent: Int32, named name: String, logical url: URL
+            ) -> DescriptorKindProbe {
+                if name == trigger, !fired, let from, let into {
+                    fired = true
+                    _ = rename(from.path, into.path)
+                }
+                return super.probeKind(
+                    inDirectory: parent, named: name, logical: url
+                )
+            }
+        }
+        let provider = RenamingProvider()
+        let scanner = makeScanner(roots: [sharedRoot()], provider: provider)
+        let scanned = itemsByName(await scan(scanner))
+        let item = try XCTUnwrap(scanned["moved"])
+
+        // Armed only for the DELETE-time walk: the scan above must see the
+        // tree in one piece.
+        provider.trigger = "old.bin"
+        provider.from = canonical(entry).appendingPathComponent("a")
+        provider.into = canonical(entry)
+            .appendingPathComponent("elsewhere")
+            .appendingPathComponent("a")
+
+        let verdict = try XCTUnwrap(scanner.preDeleteRevalidator)
+            .revalidate(item: item, authorization: nil)
+        XCTAssertTrue(provider.fired, "the fixture never fired its rename")
+        guard case .refuse(let reason, _, _) = verdict else {
+            return XCTFail(
+                "a level whose `..` no longer names the parent it was entered "
+                    + "from cannot be proven old — got \(verdict)"
+            )
+        }
+        XCTAssertTrue(
+            reason.contains("a was moved while its contents were being "
+                            + "re-inspected"),
+            reason
+        )
+    }
+
     // MARK: - The size floor is a delete-time fact for BOTH kinds
     // (PR #459 review r4, codex C4 — DISCLOSURE)
 

@@ -119,6 +119,20 @@ and docs/v1/CLI-REFERENCE.md) — the pre-release `node_modules` →
   folder it verified, and the Trash move proves it on both sides of the move.
   (Before this, that late window was covered for directories only: a FILE
   swapped in after the re-check was disposed of with success reported.)
+  **How DEEP a temp entry is costs the re-inspection nothing.** It walks by
+  descriptor, one level at a time, climbing back with `..` and proving at
+  every step that it landed where it left — so its descriptor and stack cost
+  are the same at 320 levels as at one. Before this, the walk recursed and
+  held one open descriptor and one stack frame per level: measured through
+  this path, a valid stale tree 96 levels deep was refused "Too many open
+  files … re-scan required" under a 96-descriptor limit (the kind of limit a
+  launchd-started app runs with), and one 260 levels deep crashed the
+  process outright. The first was worse than it looked — depth does not
+  change between scans, so the re-scan that refusal prescribed produced the
+  identical refusal, for ever, while the scan kept offering the row.
+  A directory MOVED to a different parent while its contents are being
+  re-inspected is now refused (nothing deleted, re-scan to see where it
+  went) instead of having the rest of its level read out of its new home.
   **Mounted volumes inside temp roots are never entered.** The scan decides
   from the kernel's own mount table before touching the entry at all — so a
   dead network volume can no longer wedge the whole scan at first contact —

@@ -553,7 +553,8 @@ Two-surface rule: impediments attributable to an emitted item ride the item's
 `state`/`scanError`; only root/scanner-level problems with no recognized
 candidate land in `ScanOutcome.errors`. `Kind` is EXTENSIBLE — never write
 consumers that assume the case list is closed. Wire strings (frozen):
-`container_refused`, `mounted_volume_root`, `symlink_root`, `tcc_denied`,
+`container_refused`, `mounted_volume_root`, `policy_refused_root`,
+`symlink_root`, `non_directory_root`, `tcc_denied`,
 `permission_denied`,
 `unreadable`, `enumeration_truncated`, `config_invalid`, `malformed_outcome`. `.malformedOutcome` is
 synthesized ONLY by the runtime's validation, never by scanners.
@@ -562,6 +563,12 @@ it — NOT a refusal of the root, and clearable by unmounting (added PR #459
 review r11; the GUI's visible row label is derived from the kind alone, so
 reporting it as `container_refused` printed "not a configured search root"
 for a root that IS configured).
+`policy_refused_root` and `non_directory_root` (added PR #459 codex r13)
+close the two siblings of that same defect on `ephemeral_tmp`: a scanner
+builds its `PathGuard` from its own roots, so a root the policy refuses was
+configured and `container_refused`'s label was false for every firing; and
+`symlink_root`'s label ("symlinked — not searched") was false for a root
+replaced by a regular file, FIFO, socket or device.
 `config_invalid` was missing from this list while the binary could emit it
 (fixed in PR #459 review r2; `DocumentedContractTests` only reads
 PROTOCOL.md, which did list it, so nothing caught the drift).

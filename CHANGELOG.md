@@ -151,6 +151,23 @@ and docs/v1/CLI-REFERENCE.md) — the pre-release `node_modules` →
   path resolved when a healthy sibling root is admitted; a root skipped
   this way stays fail-closed at delete time. A mount landing in the
   instant between the table read and those steps can still be touched.
+  **Two more temp-root refusals get their own classifications** — the same
+  defect shape as `"mounted_volume_root"` above, swept in PR #459 codex r13:
+  the app's visible row label is derived from the kind alone, so a kind
+  shared with a different condition prints a false diagnosis. A temp root
+  the search-root safety policy refuses (`/`, a volume root, or `$HOME`) is
+  now `scanner_errors[].kind == "policy_refused_root"` and reads "refused by
+  the search-root safety policy"; it was `"container_refused"`, whose label
+  "not a configured search root" was false for every firing, since a scanner
+  builds its guard from its own roots. A temp root replaced by a regular
+  file, FIFO, socket or device is now `"non_directory_root"` and reads "not
+  a directory — not searched"; it was `"symlink_root"`, whose label
+  "symlinked — not searched" sent the user hunting for a link that was not
+  there. Both are ADDITIONS to the same extensible enumeration
+  (`schema_version` stays 4). Consumers keying on `"container_refused"` or
+  `"symlink_root"` for these `ephemeral_tmp` cases must add the new strings;
+  a temp root that really IS a symlink still reports `"symlink_root"`, and
+  every producer in every other scanner is unchanged.
   **The root listing's entry cap now holds on every path.** When the
   bounded directory read fails, it is retried once (a transiently cleared
   failure recovers through the same capped read), and the Foundation

@@ -704,8 +704,16 @@ struct EphemeralTempScanner: @unchecked Sendable {
             case .kind(.directory):
                 break
             case .kind(let kind):
+                // TWO kinds, by what is actually standing there (PR #459
+                // codex r13, DISCLOSURE). `.symlinkRoot`'s single GUI label
+                // is the fixed sentence "symlinked — not searched", so a
+                // root replaced by a regular file, FIFO, socket or device
+                // was given a false diagnosis in the ordinary results row
+                // while its real kind — already in `detail` below — reached
+                // the user only by hovering.
                 issues.append(ScanIssue(
-                    url: root.url, kind: .symlinkRoot,
+                    url: root.url,
+                    kind: kind == .symlink ? .symlinkRoot : .nonDirectoryRoot,
                     detail: "\(root.label) is not a real directory "
                         + "(\(Self.describe(kind))) — never traversed"
                 ))
@@ -718,8 +726,18 @@ struct EphemeralTempScanner: @unchecked Sendable {
             do {
                 _ = try pathGuard.admitSearchRoot(root.url)
             } catch {
+                // `.policyRefusedRoot`, NOT `.containerRefused` (PR #459
+                // codex r13, DISCLOSURE — the sibling of r11's mount case).
+                // This scanner builds its guard with
+                // `containerRoots: roots.map(\.url)` (the initializer
+                // above), and this loop iterates THOSE roots, so the root
+                // reaching this catch is always one of the guard's own
+                // configured roots. `.containerRefused`'s fixed GUI label —
+                // "not a configured search root" — is therefore false for
+                // every firing here; the truth is that the safety policy
+                // refuses to search it. WHICH clause refused rides `detail`.
                 issues.append(ScanIssue(
-                    url: root.url, kind: .containerRefused,
+                    url: root.url, kind: .policyRefusedRoot,
                     detail: error.localizedDescription
                 ))
                 continue

@@ -1045,10 +1045,11 @@ final class CLIGateTests: XCTestCase {
                            "argv arrays never appear in any row")
         }
 
-        // ALL NINE ScanIssue.Kind wire strings through the scanner_errors
+        // ALL ELEVEN ScanIssue.Kind wire strings through the scanner_errors
         // row builder (the count was stale at "seven" before PR #459 codex
         // r11 — `enumeration_truncated` and `config_invalid` had already
-        // landed) — exact rows: the six non-TCC filesystem kinds below carry
+        // landed; codex r13 added two more) — exact rows: the eight non-TCC
+        // filesystem kinds below carry
         // their real `path`; `tcc_denied` carries its path AND, ALONE, a
         // `grant_hint` (macOS denies CLI processes silently, so the row must
         // say what to do about it); the two non-filesystem kinds
@@ -1060,7 +1061,12 @@ final class CLIGateTests: XCTestCase {
             // this release already breaks; consumers tolerate unknown kinds
             // by contract.
             (.mountedVolumeRoot, "mounted_volume_root"),
+            // ADDED PR #459 codex r13 — two more WIRE ADDITIONS on schema 4,
+            // splitting the two conditions `container_refused` and
+            // `symlink_root` were mis-labelling on `ephemeral_tmp`.
+            (.policyRefusedRoot, "policy_refused_root"),
             (.symlinkRoot, "symlink_root"),
+            (.nonDirectoryRoot, "non_directory_root"),
             (.permissionDenied, "permission_denied"),
             (.unreadable, "unreadable"),
             (.enumerationTruncated, "enumeration_truncated"),

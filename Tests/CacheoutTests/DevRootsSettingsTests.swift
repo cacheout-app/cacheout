@@ -445,9 +445,11 @@ final class DevRootsSettingsTests: XCTestCase {
     /// The two kinds are asserted TOGETHER and must differ in both halves:
     /// the mounted row states the condition AND its remedy, and the refusal
     /// row is left exactly as it was, because `DevRootsStore` (a
-    /// policy-rejected persisted root), `ProjectTreeWalker` (a scan-time
-    /// admission refusal) and `EphemeralTempScanner`'s own
-    /// `admitSearchRoot` catch all still render through it.
+    /// policy-rejected persisted root) and `ProjectTreeWalker` (a scan-time
+    /// admission refusal) still render through it. `EphemeralTempScanner`'s
+    /// own `admitSearchRoot` catch was the THIRD such producer until PR #459
+    /// codex r13 moved it to `.policyRefusedRoot`; the cell below is that
+    /// half.
     func testAMountedRootRowStatesTheConditionAndTheRemedyRefusalRowUnchanged() throws {
         let root = URL(fileURLWithPath: "/private/tmp")
         let mounted = ScanIssueRowPresentation(
@@ -486,6 +488,98 @@ final class DevRootsSettingsTests: XCTestCase {
         )
         XCTAssertEqual(refusal.label, "not a configured search root")
         XCTAssertNotEqual(refusal.label, mounted.label,
+                          "two conditions, two sentences")
+    }
+
+    /// THE SIBLINGS OF THAT SAME DEFECT (PR #459 codex r13, P2 DISCLOSURE) —
+    /// asserted on the SAME derivation, `ScanIssueRowPresentation`, which is
+    /// the whole visible diagnosis because `ScanIssuesBlock` renders
+    /// `row.text` and hangs `issue.detail` off `.help(…)`.
+    ///
+    /// Two kinds whose fixed label was untrue for a producer:
+    ///
+    /// - `.symlinkRoot` reads "symlinked — not searched", but
+    ///   `EphemeralTempScanner`'s no-follow root gate emitted it for EVERY
+    ///   non-directory — a regular file, FIFO, socket or device sent the
+    ///   user hunting for a link that is not there. Now `.nonDirectoryRoot`.
+    /// - `.containerRefused` reads "not a configured search root", but that
+    ///   scanner constructs its `PathGuard` with
+    ///   `containerRoots: roots.map(\.url)` and then iterates those same
+    ///   roots, so the root reaching its `admitSearchRoot` catch is ALWAYS
+    ///   configured. Now `.policyRefusedRoot`.
+    ///
+    /// Both halves are pinned in both directions: the new labels are exact,
+    /// and the two OLD kinds still render exactly what they rendered before
+    /// — `.symlinkRoot` is still produced by four other call sites
+    /// (`EphemeralTempRoots`, `DevRootsStore`, `ProjectTreeWalker`,
+    /// `OrphanedCachesScanner`) and `.containerRefused` by two
+    /// (`DevRootsStore`, `ProjectTreeWalker`).
+    func testNonDirectoryAndPolicyRefusedRootsGetTheirOwnVisibleSentences() throws {
+        let root = URL(fileURLWithPath: "/private/tmp")
+
+        let nonDirectory = ScanIssueRowPresentation(
+            issue: ScanIssue(
+                url: root, kind: .nonDirectoryRoot,
+                detail: "Shared temp is not a real directory (special file) "
+                    + "— never traversed"
+            ),
+            home: fixtureHome
+        )
+        XCTAssertEqual(nonDirectory.location, "/private/tmp",
+                       "the row NAMES the root")
+        XCTAssertEqual(nonDirectory.label, "not a directory — not searched")
+        XCTAssertEqual(
+            nonDirectory.text, "/private/tmp — not a directory — not searched"
+        )
+        XCTAssertFalse(
+            nonDirectory.label.contains("symlink"),
+            "a FIFO/socket/device/regular file is not a symlink — asserting "
+                + "one was the defect"
+        )
+        XCTAssertFalse(nonDirectory.showsSettingsLink,
+                       "Full Disk Access cannot turn a FIFO into a directory")
+
+        let policyRefused = ScanIssueRowPresentation(
+            issue: ScanIssue(
+                url: root, kind: .policyRefusedRoot,
+                detail: "Refusing to touch the home directory: /private/tmp"
+            ),
+            home: fixtureHome
+        )
+        XCTAssertEqual(policyRefused.location, "/private/tmp")
+        XCTAssertEqual(policyRefused.label,
+                       "refused by the search-root safety policy")
+        XCTAssertEqual(
+            policyRefused.text,
+            "/private/tmp — refused by the search-root safety policy"
+        )
+        XCTAssertFalse(
+            policyRefused.label.contains("not a configured search root"),
+            "the root IS configured — that sentence was the defect"
+        )
+        XCTAssertFalse(policyRefused.showsSettingsLink,
+                       "no settings link that cannot help")
+
+        // THE OTHER PRODUCERS ARE UNCHANGED: same kind, same fixed label as
+        // before this split, and each label distinct from its new sibling.
+        let symlink = ScanIssueRowPresentation(
+            issue: ScanIssue(
+                url: root, kind: .symlinkRoot, detail: "is a symlink"
+            ),
+            home: fixtureHome
+        )
+        XCTAssertEqual(symlink.label, "symlinked — not searched")
+        XCTAssertNotEqual(symlink.label, nonDirectory.label,
+                          "two conditions, two sentences")
+
+        let refused = ScanIssueRowPresentation(
+            issue: ScanIssue(
+                url: root, kind: .containerRefused, detail: "refused: …"
+            ),
+            home: fixtureHome
+        )
+        XCTAssertEqual(refused.label, "not a configured search root")
+        XCTAssertNotEqual(refused.label, policyRefused.label,
                           "two conditions, two sentences")
     }
 

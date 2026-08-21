@@ -432,8 +432,38 @@ struct ScanIssue: Equatable, Sendable {
         /// (PR #459 codex r11, DISCLOSURE). A FILESYSTEM kind: `url` names
         /// the over-mounted root.
         case mountedVolumeRoot
-        /// The search root is a symlink (or not a real directory).
+        /// A REGISTERED search root that this scanner's own `PathGuard`
+        /// refused as a search root — `/`, a volume root, or `$HOME` in any
+        /// spelling. The root IS one of the guard's `containerRoots` (a
+        /// scanner constructs its guard FROM its own roots), so the refusal
+        /// is a POLICY verdict, never a "you did not configure this".
+        ///
+        /// Its own kind for the same reason `.mountedVolumeRoot` is
+        /// (PR #459 codex r13, DISCLOSURE): the GUI's visible row label is
+        /// derived from the kind alone, and `.containerRefused`'s label —
+        /// "not a configured search root" — is false for every firing of
+        /// this arm. WHICH policy clause refused it rides `detail`; no
+        /// remedy is claimed in the label because the causes do not share
+        /// one. A FILESYSTEM kind: `url` names the refused root.
+        case policyRefusedRoot
+        /// The search root is a SYMLINK — and only a symlink. Its target may
+        /// sit anywhere, so the no-follow root gate never traverses it.
+        ///
+        /// NARROWED in PR #459 codex r13 (DISCLOSURE): this kind's single GUI
+        /// label is the fixed sentence "symlinked — not searched", so a root
+        /// that is a regular file, FIFO, socket or device must NOT arrive
+        /// here — it carries `.nonDirectoryRoot` instead.
         case symlinkRoot
+        /// The search root exists and is NOT a symlink, but is not a
+        /// directory either: a regular file, FIFO, socket or device stands
+        /// where a directory is required, so nothing is traversed.
+        ///
+        /// Split out of `.symlinkRoot` in PR #459 codex r13 (DISCLOSURE):
+        /// the visible row is derived from the kind alone, so these objects
+        /// were all being diagnosed as "symlinked" while the object's real
+        /// kind reached the user only through `detail`'s hover tooltip. A
+        /// FILESYSTEM kind: `url` names the root.
+        case nonDirectoryRoot
         /// macOS TCC (privacy) denial — EPERM under the Cocoa error.
         case tccDenied
         /// BSD permission denial — EACCES.
@@ -476,7 +506,9 @@ struct ScanIssue: Equatable, Sendable {
             switch self {
             case .containerRefused: return "container_refused"
             case .mountedVolumeRoot: return "mounted_volume_root"
+            case .policyRefusedRoot: return "policy_refused_root"
             case .symlinkRoot: return "symlink_root"
+            case .nonDirectoryRoot: return "non_directory_root"
             case .tccDenied: return "tcc_denied"
             case .permissionDenied: return "permission_denied"
             case .unreadable: return "unreadable"

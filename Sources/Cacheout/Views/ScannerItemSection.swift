@@ -293,7 +293,18 @@ struct ScanIssueRowPresentation: Equatable {
         // only as a hover tooltip.
         case .mountedVolumeRoot:
             return "mounted volume; eject or unmount it, then re-scan"
+        // The root IS registered — the policy refused to SEARCH it (PR #459
+        // codex r13). No remedy is named because the clauses that reach here
+        // (`/`, a volume root, `$HOME`) do not share one; `detail` carries
+        // which clause fired, in the tooltip.
+        case .policyRefusedRoot:
+            return "refused by the search-root safety policy"
         case .symlinkRoot: return "symlinked — not searched"
+        // Not a symlink and not a directory (PR #459 codex r13): a regular
+        // file, FIFO, socket or device stands there. Under `.symlinkRoot`
+        // this row asserted a symlink the user would never find, while
+        // `detail` — the tooltip — named the real kind.
+        case .nonDirectoryRoot: return "not a directory — not searched"
         case .tccDenied: return "access denied by macOS privacy settings"
         case .permissionDenied: return "permission denied"
         case .unreadable: return "unreadable"

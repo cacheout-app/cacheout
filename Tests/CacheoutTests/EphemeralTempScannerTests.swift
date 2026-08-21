@@ -2907,6 +2907,114 @@ final class EphemeralTempScannerTests: XCTestCase {
         XCTAssertEqual(outcome.errors.first?.kind, .symlinkRoot)
     }
 
+    /// A NON-SYMLINK NON-DIRECTORY ROOT IS NOT DIAGNOSED AS A SYMLINK
+    /// (PR #459 codex r13, P2 DISCLOSURE).
+    ///
+    /// Safety was never in question — the no-follow root gate refuses every
+    /// one of these. The VISIBLE row was: `ScanIssuesBlock` renders
+    /// `ScanIssueRowPresentation.text`, whose sentence is derived from the
+    /// KIND alone, and `.symlinkRoot`'s sentence is the fixed "symlinked —
+    /// not searched". A per-user `C`/`T` root replaced by a regular file, a
+    /// FIFO, a socket or a device therefore told the user to go find a
+    /// symlink that does not exist; the object's real kind was already in
+    /// `detail`, which that block shows only as a hover tooltip.
+    ///
+    /// Three roots in ONE scan so the split is asserted against its own
+    /// control: the regular file and the FIFO take `.nonDirectoryRoot`, the
+    /// symlink KEEPS `.symlinkRoot`. Each row's rendered sentence is
+    /// asserted too — the kind is a means, the sentence is the fix.
+    func testANonSymlinkNonDirectoryRootSaysSoInsteadOfClaimingASymlink()
+        async throws
+    {
+        let file = try writeFile(base.appendingPathComponent("file-root"))
+        let fifo = base.appendingPathComponent("fifo-root")
+        XCTAssertEqual(mkfifo(fifo.path, 0o600), 0,
+                       "mkfifo: \(String(cString: strerror(errno)))")
+        let target = try mkdir(base.appendingPathComponent("link-target"))
+        let link = base.appendingPathComponent("link-root")
+        try fm.createSymbolicLink(at: link, withDestinationURL: target)
+
+        let outcome = await scan(makeScanner(roots: [
+            makeRoot(file, label: "File", writability: .perUser),
+            makeRoot(fifo, label: "Fifo", writability: .perUser),
+            // The link is declared UNCANONICALIZED so the root stays the
+            // link itself — canonicalizing it would resolve the leaf away.
+            makeRoot(link, label: "Link", writability: .perUser,
+                     canonicalize: false),
+        ]))
+
+        XCTAssertTrue(outcome.items.isEmpty,
+                      "nothing behind any of these roots is listed: "
+                        + "\(outcome.items.map(\.displayName))")
+        XCTAssertEqual(
+            outcome.errors.map(\.kind),
+            [.nonDirectoryRoot, .nonDirectoryRoot, .symlinkRoot],
+            "a regular file and a FIFO are NOT symlinks; a symlink still is: "
+                + "\(outcome.errors)"
+        )
+        XCTAssertEqual(
+            outcome.errors.map {
+                ScanIssueRowPresentation(issue: $0, home: home).label
+            },
+            ["not a directory — not searched",
+             "not a directory — not searched",
+             "symlinked — not searched"],
+            "the VISIBLE sentence, not just the kind"
+        )
+        // The tooltip still names WHICH object it is — that half was never
+        // the defect and must not regress.
+        XCTAssertTrue(
+            outcome.errors[0].detail.contains("(regular file)"),
+            "detail names the real kind: \(outcome.errors[0].detail)"
+        )
+        XCTAssertTrue(
+            outcome.errors[1].detail.contains("(special file)"),
+            "detail names the real kind: \(outcome.errors[1].detail)"
+        )
+    }
+
+    /// A POLICY-REFUSED ROOT IS NOT DIAGNOSED AS UNCONFIGURED (PR #459 codex
+    /// r13, P2 DISCLOSURE — the sibling of r11's mounted-root case).
+    ///
+    /// `EphemeralTempScanner` builds its `PathGuard` with
+    /// `containerRoots: roots.map(\.url)` and then iterates those same
+    /// roots, so a root reaching the `admitSearchRoot` catch is ALWAYS one
+    /// of the guard's own configured roots. `.containerRefused`'s fixed
+    /// sentence — "not a configured search root" — was therefore false for
+    /// every firing of that arm, and it invites an action (configure the
+    /// root) that is impossible here: these roots are `/private/tmp` and two
+    /// `confstr` containers, not user settings.
+    ///
+    /// `$HOME` as a root is the cheapest reachable refusal (`coreDenyCheck`
+    /// throws `deniedHomeDirectory`); the arm is shared with the `/` and
+    /// volume-root clauses.
+    func testAPolicyRefusedRootSaysThePolicyRefusedItNotThatItIsUnconfigured()
+        async throws
+    {
+        let outcome = await scan(makeScanner(roots: [
+            makeRoot(home, label: "Shared temp", writability: .perUser),
+        ]))
+
+        XCTAssertTrue(outcome.items.isEmpty,
+                      "a refused root is never walked: "
+                        + "\(outcome.items.map(\.displayName))")
+        XCTAssertEqual(outcome.errors.map(\.kind), [.policyRefusedRoot],
+                       "\(outcome.errors)")
+        let row = ScanIssueRowPresentation(
+            issue: try XCTUnwrap(outcome.errors.first), home: home
+        )
+        XCTAssertEqual(row.label, "refused by the search-root safety policy")
+        XCTAssertFalse(
+            row.label.contains("not a configured search root"),
+            "the root IS configured — this scanner's guard is built FROM it"
+        )
+        // The clause that fired stays in the tooltip, where it always was.
+        XCTAssertTrue(
+            outcome.errors[0].detail.contains("home directory"),
+            "detail names the clause: \(outcome.errors[0].detail)"
+        )
+    }
+
     /// PRODUCTION-PATH symlink root: resolution → scan → deletion, end to end.
     ///
     /// The round-7 defect this pins: fn-6.1 resolved each declared root with

@@ -375,9 +375,15 @@ on the shipped chains is root-owned `drwxr-xr-x root:wheel` (`/`, `/private`,
 prefix directory). The per-user bucket directory below those is user-owned,
 but it is the parent of the *leaf* — the component the leaf rule already
 protects. So the residual needs root, or a relocated container whose chain
-has a user-writable intermediate parent. Leaving the parent chain unresolved
-as well is not available: one container would then have two registered
-spellings, which the one-spelling rule forbids.
+has a user-writable intermediate parent. No rationale is recorded here for the
+alternative — leaving the parent chain unresolved as well — because the one
+this section used to give was false: it said one container would then have two
+*registered* spellings, and resolution appends exactly one URL per declared
+root, so that state cannot arise. Measured instead, with a root declared
+unresolved end to end: one registered root, the entry listed, the outcome
+validated, and the permanent arm deleted it — while the item carried a
+canonical `/private/var/…` identity beside a declared `/var/…` origin. What
+that split costs has not been measured.
 
 Deletion-target *leaves* follow the same rule and for the same reason:
 deletion uses the unresolved URL, so removing a symlink child deletes the

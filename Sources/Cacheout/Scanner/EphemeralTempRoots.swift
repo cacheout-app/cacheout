@@ -90,25 +90,51 @@
 ///
 /// So the residual needs root, or a machine where confstr returns a
 /// RELOCATED container whose chain has a user-writable intermediate parent.
-/// Closing it would mean not resolving the parent chain either, which the
-/// R3 one-spelling discipline above forbids: `/var/folders/…` and
-/// `/private/var/folders/…` would then be two registered spellings of one
-/// container.
 ///
-/// ## De-dupe and alias suppression — the complete house pattern
+/// NO RATIONALE IS RECORDED for the obvious alternative — leaving the parent
+/// chain unresolved as well — because the one this file used to give was
+/// false. It said `/var/folders/…` and `/private/var/folders/…` would then be
+/// two REGISTERED spellings of one container; `resolve` appends exactly one
+/// URL per declared definition, so that state cannot arise. What was measured
+/// instead (r9), with a root declared unresolved end to end: ONE registered
+/// root, the stale entry listed, the outcome validated, and the
+/// permanent-disposal arm deleted it — while the item carried the canonical
+/// identity `/private/var/…/<entry>` beside a declared `originContainer` of
+/// `/var/…`. What that two-spelling split inside each item costs is NOT
+/// measured, so this file claims nothing about it either way.
+///
+/// ## De-dupe and alias suppression — two halves, cited one at a time
 ///
 /// Two values are probed ONCE per declared root: a fully canonical (LEAF
 /// RESOLVED) comparison KEY, and whether the DECLARED spelling is itself a
 /// real directory (`lstat` leaf, no follow). The key is a comparison value
 /// only and never reaches the kept set, so the leaf-preserving discipline
-/// above is untouched. This mirrors `DevRootsStore.swift:315-365` and
-/// `SpaceScannerRuntime.suppressingAliasShadows`
-/// (`SpaceScanner.swift:930-952`) in BOTH halves:
+/// above is untouched. The probe PAIR is the one at
+/// `DevRootsStore.swift:320-324` and `SpaceScanner.swift:937-941`. The two
+/// halves that consume it have different precedents — do not read this as
+/// one pattern copied whole from either:
 ///
-/// - **De-dupe** — real directories only. `$TMPDIR`, `NSTemporaryDirectory()`
-///   and confstr `T` are one directory under three spellings, and a string
-///   compare would keep both, so the comparison is INODE identity
-///   (`sameLocation`) of the key.
+/// - **De-dupe** — real directories only: a real-directory spelling of a
+///   location already kept is dropped. Precedent is `DevRootsStore.swift`
+///   alone (:361-364, `seenCanonicalKeys.insert`).
+///   `SpaceScannerRuntime.suppressingAliasShadows` does NOT do this half — it
+///   deliberately DECLINES it, and `SpaceScanner.swift:945-948` says so:
+///   "Two real-directory spellings of one location are NOT touched: both pass
+///   the reality gate, so neither shadows the other, and dropping either would
+///   change which declared spelling the identity binding keys off for no
+///   safety gain." A maintainer reconciling the two files must not add
+///   de-duping there; `SpaceScanner.swift:884-895` records the
+///   identity-binding breakage that choice exists to avoid.
+///
+///   The comparison here is INODE identity (`sameLocation`) of the key, where
+///   that precedent compares the key as a STRING
+///   (`DevRootsStore.swift:322` builds `.path`). Not because a string compare
+///   would fail on these spellings: measured, `$TMPDIR`,
+///   `NSTemporaryDirectory()` and confstr `T` all realpath to the ONE string
+///   `/private/var/folders/<bucket>/T`, so a string compare of the keys
+///   collapses them too. No case is recorded here where the two verdicts
+///   differ — inode identity is used because it is the stronger of the two,
+///   and that is the whole reason.
 /// - **Alias suppression** — a declared spelling that is NOT a real directory
 ///   but resolves onto a spelling that IS one is DROPPED, and the drop is
 ///   disclosed as a `.symlinkRoot` issue naming the root that covers it. The
@@ -122,6 +148,13 @@
 ///   `DevRootsStore.swift:326-332` names that shape "ACTIVELY HARMFUL";
 ///   `SpaceScanner.swift:884-895` records the breakage it caused when the
 ///   shadowed root came from another scanner.
+///
+///   BOTH files do this half — `DevRootsStore.swift:333-335` + :341-357 and
+///   `SpaceScanner.swift:942-951` — but only `DevRootsStore` classifies the
+///   drop. `suppressingAliasShadows` returns a bare `[URL]` (:930-932) with
+///   no issue channel of its own; `SpaceScanner.swift:924-929` records what
+///   reports its drops instead. The `.symlinkRoot` issue raised here follows
+///   `DevRootsStore.swift:349-355`, not that function.
 ///
 /// A non-directory spelling that NOTHING else covers passes through verbatim:
 /// scan time is where absence and denial are told apart, and the no-follow

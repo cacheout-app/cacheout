@@ -841,7 +841,7 @@ final class CategoryScannerTests: XCTestCase {
         // machine's REAL confstr-resolved temp containers — resolved here
         // through the same declaration the factory uses so the expectation
         // stays a property of the composition, not of this machine.
-        let tempRoots = EphemeralTempRoots.resolve().map(\.url.path)
+        let tempRoots = EphemeralTempRoots.resolve().roots.map(\.url.path)
         XCTAssertEqual(
             runtime.trustedContainerRoots.map(\.path),
             devRoots.keptRoots.map(\.path)

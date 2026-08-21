@@ -175,7 +175,7 @@ final class EphemeralTempRegistrationTests: XCTestCase {
         // The declared roots are the confstr set — resolved through the SAME
         // declaration, so this is a property of the composition rather than
         // of this machine's answers.
-        let declared = EphemeralTempRoots.resolve()
+        let declared = EphemeralTempRoots.resolve().roots
         XCTAssertEqual(scanner.trustedContainerRoots.map(\.path),
                        declared.map(\.url.path))
         XCTAssertFalse(declared.isEmpty,
@@ -727,7 +727,7 @@ final class EphemeralTempRegistrationTests: XCTestCase {
             )
         }
         XCTAssertTrue(
-            EphemeralTempRoots.resolve().contains {
+            EphemeralTempRoots.resolve().roots.contains {
                 $0.url.path == "/private/tmp"
             },
             "and it is a DECLARED temp root, unconditionally"

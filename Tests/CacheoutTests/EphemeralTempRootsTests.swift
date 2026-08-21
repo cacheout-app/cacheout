@@ -69,6 +69,15 @@ final class EphemeralTempRootsTests: XCTestCase {
         FileSystemIdentityProvider().canonicalize(url).path
     }
 
+    /// The spelling resolution emits for a root: canonical PARENT chain plus
+    /// the leaf UNRESOLVED. For a symlink leaf this is deliberately NOT
+    /// `canonicalPath` — that would resolve the link away, which is the very
+    /// thing this layer refuses to do.
+    private func declaredPath(_ url: URL) -> String {
+        canonicalPath(url.deletingLastPathComponent())
+            + "/" + url.lastPathComponent
+    }
+
     // MARK: - R2: the closed root set
 
     func testDeclaredRootsAreExactlyPrivateTmpPlusTheTwoConfstrContainers() {
@@ -103,7 +112,7 @@ final class EphemeralTempRootsTests: XCTestCase {
             _CS_DARWIN_USER_DIR: zero.path,
         ])
 
-        let roots = EphemeralTempRoots.resolve(confstrPath: stub.resolve(_:))
+        let roots = EphemeralTempRoots.resolve(confstrPath: stub.resolve(_:)).roots
 
         XCTAssertFalse(stub.requestedNames.contains(_CS_DARWIN_USER_DIR),
                        "…/0 is never even asked for")
@@ -118,7 +127,7 @@ final class EphemeralTempRootsTests: XCTestCase {
         // Both lookups fail (confstr returned 0 / truncated).
         let stub = ConfstrStub([:])
 
-        let roots = EphemeralTempRoots.resolve(confstrPath: stub.resolve(_:))
+        let roots = EphemeralTempRoots.resolve(confstrPath: stub.resolve(_:)).roots
 
         XCTAssertEqual(roots.map(\.url.path), ["/private/tmp"],
                        "a failed lookup drops the root — never a guessed "
@@ -135,7 +144,7 @@ final class EphemeralTempRootsTests: XCTestCase {
                 _CS_DARWIN_USER_TEMP_DIR: unusable,
                 _CS_DARWIN_USER_CACHE_DIR: unusable,
             ])
-            let roots = EphemeralTempRoots.resolve(confstrPath: stub.resolve(_:))
+            let roots = EphemeralTempRoots.resolve(confstrPath: stub.resolve(_:)).roots
             XCTAssertEqual(roots.map(\.url.path), ["/private/tmp"],
                            "unusable confstr output \"\(unusable)\" is dropped")
         }
@@ -182,21 +191,82 @@ final class EphemeralTempRootsTests: XCTestCase {
         let alias = base.appendingPathComponent("alias-container")
         try fm.createSymbolicLink(at: alias, withDestinationURL: real)
 
-        // C is declared before T: the alias spelling (with the live trailing
-        // slash) must collapse onto the already-kept root by INODE identity.
+        // The REAL directory is declared first here (as C) and the alias
+        // second (as T, with the live trailing slash): the alias must
+        // collapse onto it by INODE identity. The reversed order — alias
+        // first — is the sibling cell below, and the outcome is the same,
+        // because the choice is made on which spelling is a real directory
+        // and never on declaration order.
         let stub = ConfstrStub([
             _CS_DARWIN_USER_CACHE_DIR: real.path,
             _CS_DARWIN_USER_TEMP_DIR: alias.path + "/",
         ])
 
-        let roots = EphemeralTempRoots.resolve(confstrPath: stub.resolve(_:))
+        let resolved = EphemeralTempRoots.resolve(confstrPath: stub.resolve(_:))
+        let roots = resolved.roots
 
         XCTAssertEqual(roots.count, 2, "two spellings of one directory ⇒ one root")
         XCTAssertEqual(roots.map(\.url.path),
                        ["/private/tmp", canonicalPath(real)])
         XCTAssertEqual(roots.last?.label, EphemeralTempRoots.userCache.label,
-                       "first declaration wins the de-dupe")
+                       "the real-directory spelling is the one kept")
         XCTAssertNil(root(roots, labelled: EphemeralTempRoots.userTemp))
+        XCTAssertEqual(resolved.issues.map(\.kind), [.symlinkRoot],
+                       "the dropped alias is DISCLOSED, never silent")
+        XCTAssertEqual(resolved.issues.first?.url?.path, declaredPath(alias),
+                       "the disclosed spelling keeps the LINK's own name")
+    }
+
+    /// D1 (PR #459 codex r8) — the ALIAS is dropped, never the real root.
+    ///
+    /// The regression this pins was introduced by the round-7 commit that
+    /// added canonical-key de-dupe (b4c84d8): it kept the FIRST declaration
+    /// unconditionally, with no check that the kept spelling was a real
+    /// directory. `C` is declared BEFORE `T`, so a symlink standing at `C`
+    /// and pointing at the genuine `T` directory kept the LINK and dropped
+    /// `T` outright — `T` never reached the scanner, its stale entries were
+    /// never listed, and nothing anywhere named it as dropped. (Before that
+    /// commit the same layout scanned `T` normally, so it was a behavioural
+    /// loss, not merely a missing disclosure.)
+    ///
+    /// `SpaceScannerRuntime.suppressingAliasShadows` cannot repair it: the
+    /// dropped root never reaches the runtime to be repaired.
+    func testAliasDeclaredFirstIsDroppedAndTheRealRootSurvives() throws {
+        let realTemp = try mkdir(base.appendingPathComponent("real-T"))
+        // `C` is a symlink ONTO the real `T` directory, and C is declared
+        // first (`EphemeralTempRoots.definitions` order).
+        let aliasCache = base.appendingPathComponent("alias-C")
+        try fm.createSymbolicLink(at: aliasCache, withDestinationURL: realTemp)
+
+        let stub = ConfstrStub([
+            _CS_DARWIN_USER_CACHE_DIR: aliasCache.path + "/",
+            _CS_DARWIN_USER_TEMP_DIR: realTemp.path,
+        ])
+
+        let resolved = EphemeralTempRoots.resolve(confstrPath: stub.resolve(_:))
+
+        let temp = try XCTUnwrap(
+            root(resolved.roots, labelled: EphemeralTempRoots.userTemp),
+            "the REAL root must survive — it is the only spelling anything "
+                + "under it can be scanned or cleaned through"
+        )
+        XCTAssertEqual(temp.url.path, canonicalPath(realTemp))
+        XCTAssertNil(
+            root(resolved.roots, labelled: EphemeralTempRoots.userCache),
+            "the ALIAS must be the one dropped"
+        )
+        XCTAssertEqual(resolved.roots.map(\.url.path),
+                       ["/private/tmp", canonicalPath(realTemp)])
+
+        let issue = try XCTUnwrap(resolved.issues.first)
+        XCTAssertEqual(resolved.issues.count, 1)
+        XCTAssertEqual(issue.kind, .symlinkRoot)
+        XCTAssertEqual(issue.url?.path, declaredPath(aliasCache),
+                       "the issue names the DROPPED spelling")
+        XCTAssertTrue(
+            issue.detail.contains(canonicalPath(realTemp)),
+            "the disclosure names the root that covers it: \(issue.detail)"
+        )
     }
 
     func testVarAndPrivateVarSpellingsCollapseToThePrivateCanonicalRoot() throws {
@@ -212,7 +282,7 @@ final class EphemeralTempRootsTests: XCTestCase {
             _CS_DARWIN_USER_TEMP_DIR: privateSpelling,
         ])
 
-        let roots = EphemeralTempRoots.resolve(confstrPath: stub.resolve(_:))
+        let roots = EphemeralTempRoots.resolve(confstrPath: stub.resolve(_:)).roots
 
         XCTAssertEqual(roots.count, 2)
         XCTAssertEqual(roots.last?.url.path, privateSpelling,
@@ -237,7 +307,7 @@ final class EphemeralTempRootsTests: XCTestCase {
         try fm.createSymbolicLink(at: container, withDestinationURL: destination)
 
         let stub = ConfstrStub([_CS_DARWIN_USER_CACHE_DIR: container.path + "/"])
-        let roots = EphemeralTempRoots.resolve(confstrPath: stub.resolve(_:))
+        let roots = EphemeralTempRoots.resolve(confstrPath: stub.resolve(_:)).roots
 
         let cache = try XCTUnwrap(root(roots, labelled: EphemeralTempRoots.userCache))
         XCTAssertEqual(
@@ -259,7 +329,7 @@ final class EphemeralTempRootsTests: XCTestCase {
 
     func testResolvedRootsAreCanonicalIdempotentAndDistinct() {
         let provider = FileSystemIdentityProvider()
-        let roots = EphemeralTempRoots.resolve(provider: provider)
+        let roots = EphemeralTempRoots.resolve(provider: provider).roots
 
         XCTAssertFalse(roots.isEmpty)
         for root in roots {
@@ -285,7 +355,7 @@ final class EphemeralTempRootsTests: XCTestCase {
     // MARK: - R2: live-Mac integration (conditionally skipped)
 
     func testLiveConfstrResolvesPerUserContainersUnderPrivateVarFolders() throws {
-        let roots = EphemeralTempRoots.resolve()
+        let roots = EphemeralTempRoots.resolve().roots
         XCTAssertEqual(roots.first?.url.path, "/private/tmp")
 
         guard let temp = root(roots, labelled: EphemeralTempRoots.userTemp),
@@ -381,7 +451,7 @@ final class EphemeralTempRootsTests: XCTestCase {
             _CS_DARWIN_USER_CACHE_DIR: cache.path,
         ])
 
-        let roots = EphemeralTempRoots.resolve(confstrPath: stub.resolve(_:))
+        let roots = EphemeralTempRoots.resolve(confstrPath: stub.resolve(_:)).roots
 
         XCTAssertEqual(roots.map(\.cleanupEvidence), [
             EphemeralTempRoots.sharedTempEvidence,
@@ -400,7 +470,7 @@ final class EphemeralTempRootsTests: XCTestCase {
             _CS_DARWIN_USER_CACHE_DIR: cache.path,
         ])
 
-        let roots = EphemeralTempRoots.resolve(confstrPath: stub.resolve(_:))
+        let roots = EphemeralTempRoots.resolve(confstrPath: stub.resolve(_:)).roots
 
         let shared = try XCTUnwrap(root(roots, labelled: EphemeralTempRoots.sharedTemp))
         XCTAssertEqual(shared.url.path, "/private/tmp")

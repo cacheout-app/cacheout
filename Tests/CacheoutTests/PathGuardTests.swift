@@ -1055,7 +1055,7 @@ final class PathGuardTests: XCTestCase {
         // The temp roots are counted through their own declaration, so the
         // expectation stays a property of the composition rather than of this
         // machine's confstr answers.
-        let tempRoots = EphemeralTempRoots.resolve(provider: provider)
+        let tempRoots = EphemeralTempRoots.resolve(provider: provider).roots
         XCTAssertEqual(
             roots.count,
             DevRootsStore.seedRootNames.count + 1 + tempRoots.count

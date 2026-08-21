@@ -1039,8 +1039,10 @@ struct SpaceScannerRuntime {
         // hardcoded `/var/folders` guess), and the scanner defers entirely on
         // `.automatic` triggers, so registering it costs a background scan
         // nothing.
+        let ephemeralTempRoots = EphemeralTempRoots.resolve(provider: provider)
         let ephemeralTempScanner = EphemeralTempScanner(
-            roots: EphemeralTempRoots.resolve(provider: provider),
+            roots: ephemeralTempRoots.roots,
+            resolutionIssues: ephemeralTempRoots.issues,
             home: home,
             thresholds: ephemeralTempThresholds
                 ?? EphemeralTempSweepConfig.resolvedThresholds(),

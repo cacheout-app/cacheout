@@ -154,6 +154,7 @@ final class EphemeralTempScannerTests: XCTestCase {
 
     private func makeScanner(
         roots: [EphemeralTempRoot],
+        resolutionIssues: [ScanIssue] = [],
         provider: FileSystemIdentityProvider = FileSystemIdentityProvider(),
         thresholds: EphemeralTempSweepConfig.Thresholds? = nil,
         prefilterEntryLimit: Int =
@@ -167,6 +168,7 @@ final class EphemeralTempScannerTests: XCTestCase {
         let clock = self.clock
         return EphemeralTempScanner(
             roots: roots,
+            resolutionIssues: resolutionIssues,
             home: home,
             thresholds: thresholds ?? self.thresholds,
             provider: provider,
@@ -2294,8 +2296,13 @@ final class EphemeralTempScannerTests: XCTestCase {
             }
         )
         let cacheRoot = try XCTUnwrap(
-            resolved.first { $0.label == EphemeralTempRoots.userCache.label }
+            resolved.roots.first { $0.label == EphemeralTempRoots.userCache.label }
         )
+        // NOT an alias of anything else declared, so it survives resolution
+        // verbatim and the SCAN-time gate is what refuses it — resolution
+        // drops a non-directory spelling only when a real-directory spelling
+        // of the same location is declared too.
+        XCTAssertTrue(resolved.issues.isEmpty, "\(resolved.issues)")
         XCTAssertNotEqual(
             cacheRoot.url.path, canonical(victim).path,
             "resolution must not hand the scanner the symlink's destination"
@@ -2337,6 +2344,70 @@ final class EphemeralTempScannerTests: XCTestCase {
             fm.fileExists(atPath: payload.path),
             "the symlink's destination was DELETED — \(report.entries.count) "
                 + "entries removed, errors: \(report.errors)"
+        )
+    }
+
+    /// D1 (PR #459 codex r8), the END-TO-END half: an alias standing at `C`
+    /// must not cost the real `T` root its scan.
+    ///
+    /// Round 7's canonical-key de-dupe kept the FIRST declaration whatever it
+    /// was, so with `C` a symlink onto the genuine `T` directory the resolved
+    /// set held the LINK and no longer held `T` at all. The scan then refused
+    /// the link with `.symlinkRoot` and inspected nothing: `T`'s stale entry
+    /// was never listed, so it could never be cleaned, and no issue named
+    /// `T`. Round 6 and earlier scanned that same layout normally.
+    ///
+    /// The whole path runs for real — production `EphemeralTempRoots.resolve`
+    /// (only confstr(3) is stubbed), the production scanner, and the runtime
+    /// session that carries the registration.
+    func testAliasAtOneContainerDoesNotCostTheOtherContainerItsScan() async throws {
+        let realTemp = try mkdir(base.appendingPathComponent("real-T"))
+        let stale = try makeStaleCandidate("old-scratch", under: realTemp)
+        let aliasCache = base.appendingPathComponent("alias-C")
+        try fm.createSymbolicLink(at: aliasCache, withDestinationURL: realTemp)
+
+        let resolved = EphemeralTempRoots.resolve(
+            confstrPath: { name in
+                switch name {
+                case _CS_DARWIN_USER_CACHE_DIR: return aliasCache.path + "/"
+                case _CS_DARWIN_USER_TEMP_DIR: return realTemp.path
+                default: return nil
+                }
+            }
+        )
+        // The shared `/private/tmp` root is dropped so no test reads a real
+        // temp root; everything else is exactly what production resolved.
+        let scannerRoots = resolved.roots.filter { $0.url.path != "/private/tmp" }
+        XCTAssertEqual(
+            scannerRoots.map(\.url.path), [canonical(realTemp).path],
+            "the REAL root must be the survivor: \(resolved.roots.map(\.url.path))"
+        )
+
+        let scanner = makeScanner(
+            roots: scannerRoots, resolutionIssues: resolved.issues
+        )
+        let outcome = await scan(scanner)
+        try assertValidates(outcome, scanner: scanner)
+
+        XCTAssertEqual(
+            outcome.items.map(\.displayName), ["old-scratch"],
+            "the surviving root's stale entry must still be listed: "
+                + "\(outcome.items.map(\.displayName))"
+        )
+        XCTAssertEqual(
+            outcome.items.first?.rootRecords.first?.requestedURL.path,
+            canonical(stale).path
+        )
+        XCTAssertEqual(
+            outcome.errors.map(\.kind), [.symlinkRoot],
+            "the dropped alias rides the outcome — dropping it is not a "
+                + "silent loss: \(outcome.errors)"
+        )
+        // The DECLARED spelling — canonical parent chain, leaf UNRESOLVED —
+        // never the link's destination.
+        XCTAssertEqual(
+            outcome.errors.first?.url?.path,
+            canonical(base).appendingPathComponent("alias-C").path
         )
     }
 

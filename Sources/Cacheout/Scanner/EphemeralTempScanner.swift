@@ -321,6 +321,14 @@ struct EphemeralTempScanner: @unchecked Sendable {
     /// The resolved roots, canonical spellings verbatim (fn-6.1). Injectable:
     /// no unit test ever reads a real temp root.
     let roots: [EphemeralTempRoot]
+    /// Classified issues fn-6.1's resolution produced for the spellings it
+    /// DROPPED — today exactly one shape, an alias of a root declared
+    /// separately as a real directory. They ride every INSPECTING scan's
+    /// outcome (the `DevRootsResolution` data path,
+    /// `BuildArtifactsScanner.swift:378-382`), so a dropped spelling stays
+    /// visible while never being registered or walked. The deferral arm
+    /// emits nothing at all, by the trigger contract below.
+    let resolutionIssues: [ScanIssue]
     /// Anchor for this scanner's own `PathGuard` (injectable — zero real
     /// `$HOME` reads in tests).
     let home: URL
@@ -349,6 +357,7 @@ struct EphemeralTempScanner: @unchecked Sendable {
 
     init(
         roots: [EphemeralTempRoot],
+        resolutionIssues: [ScanIssue] = [],
         home: URL = FileManager.default.homeDirectoryForCurrentUser,
         thresholds: EphemeralTempSweepConfig.Thresholds =
             EphemeralTempSweepConfig.defaultThresholds,
@@ -372,6 +381,7 @@ struct EphemeralTempScanner: @unchecked Sendable {
         candidateSizer: CandidateSizer? = nil
     ) {
         self.roots = roots
+        self.resolutionIssues = resolutionIssues
         self.home = home
         self.thresholds = thresholds
         self.provider = provider
@@ -597,7 +607,11 @@ struct EphemeralTempScanner: @unchecked Sendable {
         let mountTable = provider.mountPointPaths()
 
         var items: [ReclaimableItem] = []
-        var issues: [ScanIssue] = []
+        // Resolution's own classified drops lead EVERY inspecting outcome
+        // (fn-6.1's alias suppression). Placed after the trigger gate on
+        // purpose: a deferred scan reports nothing at all, and these are
+        // registration facts, not findings about what this scan saw.
+        var issues: [ScanIssue] = resolutionIssues
         // One denial per filesystem object per scan — a candidate that failed
         // at the ownership gate must not be counted again by a later stage.
         var deniedPaths = Set<String>()

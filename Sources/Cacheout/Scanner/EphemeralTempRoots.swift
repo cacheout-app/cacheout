@@ -65,12 +65,37 @@
 /// resolves; `/private/tmp` is declared canonically for the same reason. Both
 /// live-Mac cells below assert the resulting spellings.
 ///
-/// Roots are de-duped by INODE identity (`sameLocation`) of a fully canonical
-/// comparison KEY — never string equality, and the key never reaches the kept
-/// set (the `DevRootsStore.swift:315-324` pattern). `$TMPDIR`,
-/// `NSTemporaryDirectory()` and confstr `T` are one directory under three
-/// spellings; because `sameLocation` is `lstat`-based, an alias spelling only
-/// collapses onto its target through the leaf-resolving key.
+/// ## De-dupe and alias suppression — the complete house pattern
+///
+/// Two values are probed ONCE per declared root: a fully canonical (LEAF
+/// RESOLVED) comparison KEY, and whether the DECLARED spelling is itself a
+/// real directory (`lstat` leaf, no follow). The key is a comparison value
+/// only and never reaches the kept set, so the leaf-preserving discipline
+/// above is untouched. This mirrors `DevRootsStore.swift:315-365` and
+/// `SpaceScannerRuntime.suppressingAliasShadows`
+/// (`SpaceScanner.swift:930-952`) in BOTH halves:
+///
+/// - **De-dupe** — real directories only. `$TMPDIR`, `NSTemporaryDirectory()`
+///   and confstr `T` are one directory under three spellings, and a string
+///   compare would keep both, so the comparison is INODE identity
+///   (`sameLocation`) of the key.
+/// - **Alias suppression** — a declared spelling that is NOT a real directory
+///   but resolves onto a spelling that IS one is DROPPED, and the drop is
+///   disclosed as a `.symlinkRoot` issue naming the root that covers it. The
+///   ALIAS goes, never the real directory: dropping the real root instead
+///   loses the only spelling anything can be scanned or cleaned through,
+///   while the alias could never be walked (fn-6.2's no-follow root gate
+///   refuses it) nor admitted as a container. Keeping the alias AHEAD of the
+///   real root is worse than useless — `PathGuard.matchConfiguredRoot`
+///   returns the FIRST configured root that matches and `admitContainer`
+///   refuses THAT spelling without trying the real one behind it.
+///   `DevRootsStore.swift:326-332` names that shape "ACTIVELY HARMFUL";
+///   `SpaceScanner.swift:884-895` records the breakage it caused when the
+///   shadowed root came from another scanner.
+///
+/// A non-directory spelling that NOTHING else covers passes through verbatim:
+/// scan time is where absence and denial are told apart, and the no-follow
+/// root gate classifies it there.
 ///
 /// ## Resolution time vs SCAN time — two distinct layers, deliberately
 ///
@@ -116,6 +141,26 @@
 /// session writes is fresh by construction.
 
 import Foundation
+
+// MARK: - Resolution result
+
+/// What temp-root resolution produced: the roots fn-6.2 registers, plus the
+/// classified issues for the spellings resolution DROPPED.
+///
+/// The issue list exists so alias suppression is never a silent drop — the
+/// `DevRootsResolution { keptRoots, issues }` contract at the same layer
+/// (`DevRootsStore.swift:28-38`). fn-6.2 stores these at construction and
+/// appends them to every outcome of a scan that actually inspects, so a
+/// dropped spelling stays visible while never registering or being walked.
+struct EphemeralTempRootsResolution: Equatable, Sendable {
+    /// The roots that survived, in declaration order, each carrying the ONE
+    /// spelling fn-6.2 declares, stamps and derives identity from.
+    let roots: [EphemeralTempRoot]
+    /// Classified drops. Today exactly one shape: an alias spelling of a
+    /// root that is declared separately as a real directory
+    /// (`.symlinkRoot`).
+    let issues: [ScanIssue]
+}
 
 // MARK: - Root model (R2/R3/R14)
 
@@ -235,49 +280,96 @@ enum EphemeralTempRoots {
 
     // MARK: Resolution
 
-    /// Resolve the declared roots to canonical URLs, in declaration order.
+    /// Resolve the declared roots, in declaration order.
     ///
     /// Per definition: obtain the raw path (constant, or confstr) → drop it
     /// silently if the lookup failed or produced a non-absolute / bare-`/`
-    /// value → normalize the trailing slash → resolve ONCE, parent chain only
-    /// → drop it if it is the same filesystem object as an already-kept root
-    /// (inode identity of a fully canonical comparison KEY, first declaration
-    /// wins). Nothing probes existence or permissions: that is scan time, and
-    /// fn-6.2's contract (R11).
+    /// value → normalize the trailing slash → resolve ONCE, parent chain
+    /// only. The surviving spellings then go through the two-half house
+    /// pattern documented at the head of this file: real-directory de-dupe by
+    /// inode identity, then alias suppression with a classified issue.
+    ///
+    /// Existence and permissions are still not this layer's business (R11 —
+    /// that is scan time, fn-6.2's contract). The ONE probe here is the
+    /// `lstat` kind of each declared LEAF, and it decides only which of two
+    /// spellings of the SAME directory to keep: it never admits or refuses a
+    /// root on its own, and a root that no other spelling covers survives
+    /// whatever the probe says (including `.absent` and `.failed`).
     static func resolve(
         provider: FileSystemIdentityProvider = FileSystemIdentityProvider(),
         confstrPath: ConfstrResolver = EphemeralTempRoots.confstrPath(_:)
-    ) -> [EphemeralTempRoot] {
-        var kept: [EphemeralTempRoot] = []
-        // Fully canonical (LEAF RESOLVED) de-dupe keys, parallel to `kept`.
-        // Comparison values ONLY: a key never reaches the kept set, so the
-        // leaf-preserving discipline above is untouched (this is verbatim the
-        // `DevRootsStore.swift:315-324` pattern). The leaf MUST be resolved
-        // here or an alias spelling stops collapsing onto its target —
-        // `sameLocation` is `lstat`-based, so a symlink and its destination
-        // are two different inodes.
-        var keys: [URL] = []
-        for definition in definitions {
+    ) -> EphemeralTempRootsResolution {
+        // Probed ONCE per declared root — the same probe pair, with the same
+        // meaning, as `DevRootsStore.swift:315-324` and
+        // `SpaceScanner.swift:933-941`: the fully canonical (LEAF RESOLVED)
+        // comparison KEY, and whether the DECLARED spelling is itself a real
+        // directory. The key is a comparison value ONLY and never reaches the
+        // kept set, so the leaf-preserving discipline is untouched; the leaf
+        // MUST be resolved in the KEY or an alias spelling stops collapsing
+        // onto its target, because `sameLocation` is `lstat`-based and a
+        // symlink and its destination are two different inodes.
+        let probed = definitions.compactMap {
+            definition -> (definition: Definition, declared: URL,
+                           key: URL, isDirectory: Bool)? in
             guard let raw = rawPath(for: definition.source, confstrPath: confstrPath),
                   let declared = canonicalRoot(fromRawPath: raw, provider: provider)
-            else { continue }
-            let key = provider.canonicalize(declared)
-            // Inode-identity de-dupe: $TMPDIR / NSTemporaryDirectory() /
-            // confstr T are one directory under several spellings, and a
-            // string compare would keep both.
-            guard !keys.contains(where: { provider.sameLocation($0, key) })
-            else { continue }
-            keys.append(key)
-            kept.append(
-                EphemeralTempRoot(
-                    url: declared,
-                    label: definition.label,
-                    cleanupEvidence: definition.cleanupEvidence,
-                    writability: definition.writability
-                )
-            )
+            else { return nil }
+            return (definition: definition,
+                    declared: declared,
+                    key: provider.canonicalize(declared),
+                    isDirectory: provider.probeKind(of: declared)
+                        == .kind(.directory))
         }
-        return kept
+        // The canonical locations a REAL-DIRECTORY spelling already covers
+        // (`DevRootsStore.swift:325-335`, `SpaceScanner.swift:942-944`).
+        let coveredByRealDirectory = probed.filter(\.isDirectory).map(\.key)
+
+        var kept: [EphemeralTempRoot] = []
+        var issues: [ScanIssue] = []
+        // De-dupe keys of the real directories kept so far, parallel to
+        // `kept` — inode identity, never string equality.
+        var seenRealKeys: [URL] = []
+        for root in probed {
+            let root0 = EphemeralTempRoot(
+                url: root.declared,
+                label: root.definition.label,
+                cleanupEvidence: root.definition.cleanupEvidence,
+                writability: root.definition.writability
+            )
+            guard root.isDirectory else {
+                // Alias suppression (`DevRootsStore.swift:341-357`). Strictly
+                // fail-CLOSED: the alias could never be walked nor admitted
+                // as a container, and it is dropped ONLY when a
+                // real-directory spelling of the SAME location survives — so
+                // every entry it could have covered is still scanned, through
+                // the spelling that also passes the gates. Never silent: the
+                // same `.symlinkRoot` kind the walk-time gate would have
+                // produced, naming the root that covers it.
+                if coveredByRealDirectory.contains(
+                    where: { provider.sameLocation($0, root.key) }
+                ) {
+                    issues.append(ScanIssue(
+                        url: root.declared,
+                        kind: .symlinkRoot,
+                        detail: "\(root.definition.label) is not a real "
+                            + "directory and aliases \(root.key.path), which "
+                            + "is declared separately — the alias was "
+                            + "dropped and that root is scanned instead"
+                    ))
+                    continue
+                }
+                // Covered by nothing: passes through verbatim, and fn-6.2's
+                // no-follow root gate classifies it at scan time.
+                kept.append(root0)
+                continue
+            }
+            guard !seenRealKeys.contains(
+                where: { provider.sameLocation($0, root.key) }
+            ) else { continue } // exact duplicate of an earlier real root
+            seenRealKeys.append(root.key)
+            kept.append(root0)
+        }
+        return EphemeralTempRootsResolution(roots: kept, issues: issues)
     }
 
     /// The raw, un-normalized path for a source — `nil` when a confstr

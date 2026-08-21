@@ -201,14 +201,59 @@ struct EphemeralTempScanner: @unchecked Sendable {
     /// root). Named once so no call site can drift.
     static let candidateSizingMode: DirectorySizer.Mode = .deletionTarget
 
-    /// PRODUCTION cap on the staleness pre-filter's inspected entries. It
-    /// bounds worst-case work on a hostile or enormous tree; it is NOT a
-    /// sample. A cap hit means NOT stale (refusing to list is the safe
-    /// direction), so the value has to be comfortably above real field
+    /// PRODUCTION cap on the staleness pre-filter's inspected entries, PER
+    /// CANDIDATE. It bounds worst-case work on a hostile or enormous tree; it
+    /// is NOT a sample. A cap hit means NOT stale (refusing to list is the
+    /// safe direction), so the value has to be comfortably above real field
     /// payloads — a month-old multi-GB scratchpad holds thousands of files,
     /// and calling it "not stale" because the walk gave up would make the
     /// scanner useless exactly where it exists to help.
+    ///
+    /// PER CANDIDATE IS NOT A SCAN BOUND, which is why
+    /// `defaultPrefilterRootBudget` exists beside it (PR #459 codex r16).
     static let defaultPrefilterEntryLimit = 20_000
+
+    /// PRODUCTION cap on the pre-filter work ONE ROOT may spend across ALL of
+    /// its candidates (PR #459 codex r16 — AVAILABILITY). The two caps above
+    /// and below this one did not compose: the root listing admits up to
+    /// `defaultRootEntryLimit` first-level entries and each one that reaches
+    /// the pre-filter received a FRESH `defaultPrefilterEntryLimit` budget, so
+    /// one root's advertised bounds multiplied to 20,000 x 20,000 = 400
+    /// million subtree probes — and `/private/tmp` is world-writable, so any
+    /// local process can stage that population.
+    ///
+    /// MEASURED (PR #459 codex r16, this machine, through the shipped walk):
+    /// 0.64 us per probe on a warm 205k-file staging (200,000 probes in
+    /// 0.129 s; 100,000 in 0.063 s — linear), 0.78 us when every budgeted
+    /// entry is a directory, and 2.3 us on a 601k-file staging where the
+    /// cache no longer holds the tree (30 candidates x 20,000 = 1.389 s).
+    /// EXTRAPOLATED from the 2.3 us figure, 400 million probes is ~15 minutes
+    /// for ONE root; at this cap it is ~4.6 s.
+    ///
+    /// 2,000,000 = 100x the per-candidate cap. The per-candidate cap's own
+    /// reasoning applies to the product: real machines measured 14/213/401
+    /// first-level entries across the three roots, so a legitimate population
+    /// would have to average 5,000 walked entries in EVERY one of 400
+    /// candidates to reach it.
+    ///
+    /// PER ROOT, NOT PER SCAN, deliberately. A scan-wide budget would let the
+    /// world-writable shared root consume the whole allowance before the
+    /// per-user roots — where the user's own reclaimable payload lives — were
+    /// looked at, which hands an attacker-controlled directory a way to
+    /// silence the rest of the scanner. Three roots therefore bound the scan
+    /// at 3x this value.
+    ///
+    /// NOT A DETERMINISTIC STRAND, by the same argument
+    /// `defaultRootEntryLimit` makes: exhaustion gates only the VISIBILITY of
+    /// candidates the walk never reached, never the deletion of an emitted
+    /// item, and it is consumed by entries that EXIST — cleaning the listed
+    /// items removes entries that were charged to it, so a later scan reaches
+    /// further. The honest caveat is the same one too: if the budget was
+    /// consumed entirely by candidates that hit the per-candidate cap (none
+    /// of which are listed), a clean removes nothing and only external
+    /// clearing moves the population. A retry CAN differ; it is not
+    /// guaranteed to.
+    static let defaultPrefilterRootBudget = 2_000_000
 
     /// PRODUCTION cap on the first-level ROOT listing (PR #459 review r4,
     /// codex C3 — AVAILABILITY). `/private/tmp` is world-writable, so any
@@ -346,6 +391,9 @@ struct EphemeralTempScanner: @unchecked Sendable {
     private let prefilterEntryLimit: Int
     /// Cap on the first-level root listing (see `defaultRootEntryLimit`).
     private let rootEntryLimit: Int
+    /// Pre-filter work one ROOT may spend across all its candidates (see
+    /// `defaultPrefilterRootBudget`).
+    private let prefilterRootBudget: Int
     /// Injected clock — a PROVIDER, not a `Date`: the scanner is long-lived
     /// and each scan dates content against its own "now".
     private let now: @Sendable () -> Date
@@ -366,6 +414,8 @@ struct EphemeralTempScanner: @unchecked Sendable {
         prefilterEntryLimit: Int =
             EphemeralTempScanner.defaultPrefilterEntryLimit,
         rootEntryLimit: Int = EphemeralTempScanner.defaultRootEntryLimit,
+        prefilterRootBudget: Int =
+            EphemeralTempScanner.defaultPrefilterRootBudget,
         now: @escaping @Sendable () -> Date = { Date() },
         // Closure literals, not bare static-function references: a static
         // `func` value is not inferred `@Sendable`, and the warning it raises
@@ -392,6 +442,7 @@ struct EphemeralTempScanner: @unchecked Sendable {
         self.sizer = DirectorySizer(provider: provider)
         self.prefilterEntryLimit = prefilterEntryLimit
         self.rootEntryLimit = rootEntryLimit
+        self.prefilterRootBudget = prefilterRootBudget
         self.now = now
         self.lockProbe = lockProbe
         self.listDirectory = listDirectory
@@ -853,6 +904,13 @@ struct EphemeralTempScanner: @unchecked Sendable {
                 break
             }
 
+            // THE PRE-FILTER ALLOWANCE THIS ROOT'S CANDIDATES SHARE (PR #459
+            // codex r16 — AVAILABILITY). Declared HERE, once per root, which
+            // is the whole fix: it used to be re-created per candidate, so
+            // the root-listing cap and the per-candidate cap multiplied
+            // instead of composing. See `defaultPrefilterRootBudget`.
+            var budget = PrefilterBudget(remaining: prefilterRootBudget)
+
             // utf8-lexicographic, the same comparator the pre-filter walk
             // uses — never the locale-collating String `<`, whose cost on an
             // adversarial population was the measured 16 s sort tail.
@@ -953,7 +1011,7 @@ struct EphemeralTempScanner: @unchecked Sendable {
                 case .directory:
                     verdict = directoryStaleness(
                         of: entry, cutoff: cutoff, rootDevice: rootDevice,
-                        mountsUnderRoot: mountsUnderRoot
+                        mountsUnderRoot: mountsUnderRoot, budget: &budget
                     )
                 case .regularFile:
                     // No mount arm for files: a mount point is always a
@@ -1147,6 +1205,26 @@ struct EphemeralTempScanner: @unchecked Sendable {
                     items.append(item)
                 }
             }
+
+            // THE SHARED ALLOWANCE'S ONE DISCLOSURE (PR #459 codex r16),
+            // emitted per ROOT after its candidates, never per candidate — a
+            // hostile population would otherwise produce one row per
+            // un-inspected directory. Same kind as the root-listing cap, whose
+            // fixed GUI label ("too many entries — partially inspected") is
+            // true of this too, and the same honest remedy: cleaning what IS
+            // listed frees allowance a later scan spends further along, and
+            // when nothing is listed only external clearing moves it.
+            if budget.wasCutShort {
+                issues.append(ScanIssue(
+                    url: root.url, kind: .enumerationTruncated,
+                    detail: "\(root.label) needed more than "
+                        + "\(prefilterRootBudget) entries of staleness "
+                        + "checking — the directories after that point were "
+                        + "left un-inspected and are not listed; clearing "
+                        + "entries, including cleaning the items listed here, "
+                        + "lets a later scan reach further"
+                ))
+            }
         }
 
         return ScanOutcome(items: items, errors: issues)
@@ -1178,6 +1256,32 @@ struct EphemeralTempScanner: @unchecked Sendable {
     }
 
     // MARK: - Staleness pre-filter (stage 1, R1)
+
+    /// The pre-filter allowance ONE ROOT's candidates SHARE (PR #459 codex
+    /// r16). Passed `inout` down the one call chain that spends it
+    /// (`directoryStaleness` -> `walkForFreshContent`), so the composition of
+    /// the two independent caps is a single number rather than a product.
+    private struct PrefilterBudget {
+        /// Entries this root may still charge to the pre-filter.
+        var remaining: Int
+        /// True once a walk was CUT SHORT by `remaining` hitting zero with
+        /// work still in hand — never merely because the last entry it was
+        /// entitled to happened to be its last. The disclosure the root
+        /// emits is keyed off this, so an exact-fit scan makes no claim of
+        /// partial inspection.
+        private(set) var wasCutShort = false
+
+        /// Charges `count` entries, floored at zero so an over-charge from a
+        /// read the walk did not finish inspecting cannot make `remaining`
+        /// negative (which `min` would then propagate as a negative read
+        /// limit).
+        mutating func charge(_ count: Int) {
+            remaining = max(0, remaining - count)
+        }
+
+        /// Records that the caller had more to inspect and no allowance left.
+        mutating func cutShort() { wasCutShort = true }
+    }
 
     /// Stage-1 verdict for one candidate.
     private enum StalenessVerdict {
@@ -1261,7 +1365,8 @@ struct EphemeralTempScanner: @unchecked Sendable {
     /// the tree again from a held descriptor immediately before removal.
     private func directoryStaleness(
         of entry: URL, cutoff: Date, rootDevice: UInt64?,
-        mountsUnderRoot: Set<String>
+        mountsUnderRoot: Set<String>,
+        budget: inout PrefilterBudget
     ) -> StalenessVerdict {
         switch leafDate(of: entry) {
         case .vanished:
@@ -1288,7 +1393,7 @@ struct EphemeralTempScanner: @unchecked Sendable {
             guard ownDate < cutoff else { return .notStale }
             return walkForFreshContent(
                 entry, cutoff: cutoff, ownDate: ownDate, identity: identity,
-                mountsUnderRoot: mountsUnderRoot
+                mountsUnderRoot: mountsUnderRoot, budget: &budget
             )
         }
     }
@@ -1329,17 +1434,44 @@ struct EphemeralTempScanner: @unchecked Sendable {
     ///   the denial must be surfaced.
     /// - ENOENT/ENOTDIR at either point → silent skip: the branch vanished
     ///   under the walk (R11), which is not an impediment.
+    /// - the shared ROOT budget running out, and CANCELLATION → NOT stale,
+    ///   SILENT, for the same reason as the per-candidate cap: nothing was
+    ///   denied. The root budget's exhaustion is disclosed ONCE by the root
+    ///   (`budget.wasCutShort`), never per candidate; a cancelled session is
+    ///   discarded by both consumers, so a per-candidate row would be noise.
+    ///
+    /// TWO BOUNDS, ONE CLAMP (PR #459 codex r16). `visited` is this
+    /// candidate's own cap; `budget` is the allowance every candidate under
+    /// one root shares. Both are enforced in the SAME place — the `remaining`
+    /// each read is clamped to is the smaller of the two — so the read itself
+    /// can never hand back more than either permits, and the walk charges the
+    /// shared allowance once per read for exactly what it got.
+    ///
+    /// CANCELLATION IS CHECKED HERE, not only between candidates. The scan
+    /// loop's `Task.isCancelled` runs once per candidate, and one candidate
+    /// is up to `prefilterEntryLimit` entries: measured at the production
+    /// 20,000 on a 601k-file staging, that is 46 ms of unabortable work per
+    /// candidate (PR #459 codex r16). The check below is per popped directory
+    /// and per name.
     private func walkForFreshContent(
         _ root: URL, cutoff: Date, ownDate: Date,
         identity: FileSystemIdentityProvider.Identity,
-        mountsUnderRoot: Set<String>
+        mountsUnderRoot: Set<String>,
+        budget: inout PrefilterBudget
     ) -> StalenessVerdict {
         var visited = 0
         var stack: [URL] = [root]
 
         while let directory = stack.popLast() {
-            let remaining = prefilterEntryLimit - visited
-            guard remaining > 0 else { return .notStale }
+            if Task.isCancelled { return .notStale }
+            let remaining = min(prefilterEntryLimit - visited, budget.remaining)
+            guard remaining > 0 else {
+                // A directory was popped and never read: there WAS more to
+                // inspect. Attribute it — only the shared allowance is
+                // disclosed, and only when it is the binding one.
+                if budget.remaining <= 0 { budget.cutShort() }
+                return .notStale
+            }
 
             switch readChildNames(directory, remaining) {
             case .failed(let code):
@@ -1350,6 +1482,17 @@ struct EphemeralTempScanner: @unchecked Sendable {
                 }
                 return .denied(directory, .rawErrno(code))
             case .names(let names, let truncation):
+                // CHARGED HERE, ONCE, for everything the read handed back —
+                // before the disposition below, which has arms that return
+                // (PR #459 codex r16: charging inside the per-name loop left
+                // the `.budget` arm consuming allowance it never paid for, so
+                // the shared bound could never be reached at all and never
+                // disclosed). Deliberately charges names an early return does
+                // not go on to inspect: over-charging can only tighten the
+                // bound, and it keeps the unit "entries this walk asked the
+                // filesystem for".
+                let boundByAllowance = remaining == budget.remaining
+                budget.charge(names.count)
                 // Dispose PER CAUSE, never on a blanket flag (r7, codex C2).
                 // Both directions are "not stale" — the difference is whether
                 // the user is TOLD, and a refusal nobody is told about reads
@@ -1365,14 +1508,23 @@ struct EphemeralTempScanner: @unchecked Sendable {
                     // and the denial must be VISIBLE.
                     if code == ENOENT || code == ENOTDIR { continue }
                     return .denied(directory, .rawErrno(code))
-                case .budget, .undecodableName:
-                    // A cap hit denied nothing, and an undecodable basename
-                    // is a property of the tree rather than an impediment:
-                    // both leave "every file is old" unproven, so the safe
-                    // direction wins SILENTLY. Turning the cap hit into a
-                    // denial row is the false-denial defect r5 codex C5
-                    // fixed; `testPrefilterCapHitWithoutFreshHitIsNotListed`
-                    // pins it.
+                case .budget:
+                    // A cap hit denied nothing: it leaves "every file is old"
+                    // unproven, so the safe direction wins SILENTLY. Turning
+                    // the cap hit into a denial row is the false-denial defect
+                    // r5 codex C5 fixed;
+                    // `testPrefilterCapHitWithoutFreshHitIsNotListed` pins it.
+                    //
+                    // WHICH cap it was decides the ROOT's disclosure (PR #459
+                    // codex r16). The read was clamped to `remaining`, the
+                    // smaller of the per-candidate cap and the shared
+                    // allowance; only when the allowance was the binding one
+                    // does the root say it was cut short.
+                    if boundByAllowance { budget.cutShort() }
+                    return .notStale
+                case .undecodableName:
+                    // A property of the tree rather than an impediment, and
+                    // silent for the same reason.
                     return .notStale
                 case .none:
                     break
@@ -1381,6 +1533,10 @@ struct EphemeralTempScanner: @unchecked Sendable {
                 for name in names.sorted(by: {
                     $0.utf8.lexicographicallyPrecedes($1.utf8)
                 }) {
+                    if Task.isCancelled { return .notStale }
+                    // Redundant with the read's own clamp above (which cannot
+                    // hand back more than `prefilterEntryLimit - visited`
+                    // names), kept as the cap's local invariant.
                     guard visited < prefilterEntryLimit else {
                         return .notStale
                     }

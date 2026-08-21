@@ -160,6 +160,8 @@ final class EphemeralTempScannerTests: XCTestCase {
         prefilterEntryLimit: Int =
             EphemeralTempScanner.defaultPrefilterEntryLimit,
         rootEntryLimit: Int = EphemeralTempScanner.defaultRootEntryLimit,
+        prefilterRootBudget: Int =
+            EphemeralTempScanner.defaultPrefilterRootBudget,
         lockProbe: EphemeralTempScanner.LockProber? = nil,
         listDirectory: EphemeralTempScanner.DirectoryLister? = nil,
         readChildNames: EphemeralTempScanner.BoundedChildReader? = nil,
@@ -174,6 +176,7 @@ final class EphemeralTempScannerTests: XCTestCase {
             provider: provider,
             prefilterEntryLimit: prefilterEntryLimit,
             rootEntryLimit: rootEntryLimit,
+            prefilterRootBudget: prefilterRootBudget,
             now: { clock },
             lockProbe: lockProbe ?? { EphemeralTempScanner.cooperativeLockProbe($0) },
             listDirectory: listDirectory ?? {
@@ -958,8 +961,8 @@ final class EphemeralTempScannerTests: XCTestCase {
     /// The sibling cell below measures nested DIRECTORY mtimes. This one
     /// measures the other non-input: a nested node that is neither a
     /// directory nor a regular file. `walkForFreshContent`
-    /// (`EphemeralTempScanner.swift:1391-1395`) and `freshContentBelow`
-    /// (`:2641-2644`) both `continue` past `.symlink` and `.other` without
+    /// (`EphemeralTempScanner.swift:1579-1583`) and `freshContentBelow`
+    /// (`:3023-3026`) both `continue` past `.symlink` and `.other` without
     /// dating them, so a FIFO, socket or symlink nested below an entry has
     /// no effect on staleness however fresh its OWN timestamp is — at scan
     /// time or at delete time.
@@ -3026,7 +3029,7 @@ final class EphemeralTempScannerTests: XCTestCase {
     /// payload; the delete-time revalidator allowed them; and the cleaner
     /// deleted them. No later gate refused, because the container-root policy
     /// refuses only `/`, volume roots and `$HOME` itself — `~/Documents` is a
-    /// legal container by design (`PathGuard.swift:344-355`).
+    /// legal container by design (`PathGuard.swift:350-361`).
     ///
     /// The victim is deliberately `<home>/Documents`, the production shape,
     /// and the disposal is the PERMANENT arm so the assertion observes a real
@@ -4649,5 +4652,307 @@ extension EphemeralTempScannerTests {
             _ = try? run(["detach", mountpoint.path, "-force"])
         }
         return true
+    }
+}
+
+// MARK: - The SHARED pre-filter allowance (PR #459 codex r16)
+//
+// AVAILABILITY class. The root-listing cap (`defaultRootEntryLimit`) and the
+// per-candidate pre-filter cap (`defaultPrefilterEntryLimit`) are each 20,000
+// and did not compose: every listed entry reaching the pre-filter received a
+// FRESH per-candidate budget, so one root's two advertised bounds multiplied
+// to 400 million subtree probes. Measured on this machine through the shipped
+// walk: 0.64 us/probe warm (200,000 probes in 0.129 s), 2.3 us/probe on a
+// 601k-file staging that no longer fits the cache — so the product is
+// ~15 minutes for ONE root, EXTRAPOLATED from the second figure. Cancellation
+// was checked once per CANDIDATE, measured at 46 ms of unabortable work per
+// candidate at the production cap.
+extension EphemeralTempScannerTests {
+
+    /// `count` sibling candidates, each holding `entries` old payload files.
+    @discardableResult
+    private func stageCandidates(
+        _ names: [String], entries: Int
+    ) throws -> [URL] {
+        try names.map { name in
+            let dir = try mkdir(sharedRootURL.appendingPathComponent(name))
+            for index in 0..<entries {
+                try writeFile(
+                    dir.appendingPathComponent("payload-\(index).bin"),
+                    bytes: 4_096
+                )
+            }
+            try backdate(dir, to: oldDate)
+            return dir
+        }
+    }
+
+    /// THE COMPOSITION. With the allowance shared, the candidates after it
+    /// runs out are left un-inspected — and the root says so ONCE.
+    func testTheSharedRootBudgetStopsLaterCandidatesAndIsDisclosedOnce()
+        async throws {
+        try stageCandidates(["a-first", "b-second", "c-third"], entries: 4)
+
+        let unbounded = await scan(makeScanner(roots: [sharedRoot()]))
+        XCTAssertEqual(
+            itemsByName(unbounded).keys.sorted(),
+            ["a-first", "b-second", "c-third"],
+            "control: at the shipped allowance all three are listed"
+        )
+        XCTAssertTrue(
+            unbounded.errors.isEmpty, "control: and nothing is disclosed"
+        )
+
+        // 6 entries of allowance against 12 entries of work: the first
+        // candidate's four exhaust two thirds of it.
+        let outcome = await scan(makeScanner(
+            roots: [sharedRoot()], prefilterRootBudget: 6
+        ))
+
+        XCTAssertEqual(
+            itemsByName(outcome).keys.sorted(), ["a-first"],
+            "only the candidates the allowance actually paid for are listed"
+        )
+        let truncations = outcome.errors.filter {
+            $0.kind == .enumerationTruncated
+        }
+        XCTAssertEqual(
+            truncations.count, 1,
+            "ONE root-level disclosure, never one per un-inspected candidate: "
+                + "\(outcome.errors.map(\.detail))"
+        )
+        let disclosure = try XCTUnwrap(truncations.first)
+        XCTAssertEqual(disclosure.url?.path, canonical(sharedRootURL).path)
+        XCTAssertTrue(
+            disclosure.detail.contains("6 entries of staleness checking"),
+            disclosure.detail
+        )
+        XCTAssertTrue(
+            disclosure.detail.contains("lets a later scan reach further"),
+            "the remedy must be the one that can actually differ — clearing "
+                + "entries — not a bare re-scan: \(disclosure.detail)"
+        )
+    }
+
+    /// THE OTHER ADMISSION POINT: a candidate whose walk never gets to read
+    /// anything at all. With the allowance an exact multiple of the first
+    /// candidate's payload, the read that would have exhausted it never
+    /// happens — the second candidate is refused when its directory is popped,
+    /// and only that arm can produce the disclosure.
+    func testACandidateRefusedBeforeItsFirstReadStillDisclosesTheAllowance()
+        async throws {
+        try stageCandidates(["a-first", "b-second"], entries: 4)
+
+        let outcome = await scan(makeScanner(
+            roots: [sharedRoot()], prefilterRootBudget: 4
+        ))
+
+        XCTAssertEqual(
+            itemsByName(outcome).keys.sorted(), ["a-first"],
+            "the first candidate spends the whole allowance and is listed"
+        )
+        XCTAssertEqual(
+            outcome.errors.filter { $0.kind == .enumerationTruncated }.count, 1,
+            "and the candidate that was never read is disclosed: "
+                + "\(outcome.errors.map(\.detail))"
+        )
+    }
+
+    /// The disclosure is keyed on being CUT SHORT, not on landing on zero. An
+    /// allowance that exactly fits must make no partial-inspection claim —
+    /// the GUI label for that kind is the fixed sentence "too many entries —
+    /// partially inspected", which would be a lie here.
+    func testAnAllowanceThatExactlyFitsMakesNoPartialInspectionClaim()
+        async throws {
+        try stageCandidates(["a-first", "b-second", "c-third"], entries: 4)
+
+        let outcome = await scan(makeScanner(
+            roots: [sharedRoot()], prefilterRootBudget: 12
+        ))
+
+        XCTAssertEqual(
+            itemsByName(outcome).keys.sorted(),
+            ["a-first", "b-second", "c-third"],
+            "every candidate was inspected within the allowance"
+        )
+        XCTAssertEqual(
+            outcome.errors.filter { $0.kind == .enumerationTruncated }.count, 0,
+            "so nothing may claim the root was only partially inspected: "
+                + "\(outcome.errors.map(\.detail))"
+        )
+    }
+
+    /// CANCELLATION INSIDE THE WALK, at the directory the stack pops. The
+    /// scan loop's own check runs once per candidate, so a deep candidate used
+    /// to run to completion after the consumer had given up.
+    func testCancellationStopsAWalkBetweenItsDirectories() async throws {
+        let chainDepth = 30
+        var leaf = try mkdir(sharedRootURL.appendingPathComponent("chain"))
+        for level in 0..<chainDepth {
+            try writeFile(
+                leaf.appendingPathComponent("payload.bin"), bytes: 4_096
+            )
+            leaf = try mkdir(leaf.appendingPathComponent("level-\(level)"))
+        }
+        try backdate(sharedRootURL.appendingPathComponent("chain"), to: oldDate)
+
+        let controlCalls = WalkSeamCallCounter()
+        _ = await scan(makeScanner(
+            roots: [sharedRoot()],
+            readChildNames: { [controlCalls] url, limit in
+                controlCalls.bump()
+                return EphemeralTempScanner.boundedChildNames(
+                    of: url, limit: limit
+                )
+            }
+        ))
+        XCTAssertEqual(
+            controlCalls.count, chainDepth + 1,
+            "control: an uncancelled walk reads every directory in the chain"
+        )
+
+        let canceller = TaskCanceller()
+        let calls = WalkSeamCallCounter()
+        let scanner = makeScanner(
+            roots: [sharedRoot()],
+            readChildNames: { [calls, canceller] url, limit in
+                calls.bump()
+                // Cancel from INSIDE the walk, on the walk's own task: the
+                // flag is set while the stack still holds 29 directories.
+                if calls.count == 2 { canceller.fire() }
+                return EphemeralTempScanner.boundedChildNames(
+                    of: url, limit: limit
+                )
+            }
+        )
+        let gate = ScanRendezvous()
+        let task = Task {
+            await gate.waitForRelease()
+            return await scanner.scan(
+                context: ScanContext(trigger: .userInitiated)
+            )
+        }
+        canceller.hold { task.cancel() }
+        gate.release()
+        _ = await task.value
+
+        XCTAssertLessThanOrEqual(
+            calls.count, 3,
+            "a cancelled walk must stop at the next directory, not read all "
+                + "\(chainDepth + 1) of them"
+        )
+    }
+
+    /// CANCELLATION INSIDE THE WALK, between the NAMES of one directory —
+    /// the other admission point. One `readChildNames` call can hand back a
+    /// whole per-candidate budget's worth of names, so a per-directory check
+    /// alone leaves that batch unabortable.
+    func testCancellationStopsAWalkBetweenTheNamesOfOneDirectory()
+        async throws {
+        let entryCount = 60
+        let candidate = try mkdir(
+            sharedRootURL.appendingPathComponent("wide")
+        )
+        for index in 0..<entryCount {
+            try writeFile(
+                candidate.appendingPathComponent("payload-\(index).bin"),
+                bytes: 4_096
+            )
+        }
+        try backdate(candidate, to: oldDate)
+
+        let canceller = TaskCanceller()
+        let provider = CancellingKindProbeProvider(
+            under: canonical(candidate).path, cancelAtCall: 5,
+            canceller: canceller
+        )
+        let scanner = makeScanner(roots: [sharedRoot()], provider: provider)
+        let gate = ScanRendezvous()
+        let task = Task {
+            await gate.waitForRelease()
+            return await scanner.scan(
+                context: ScanContext(trigger: .userInitiated)
+            )
+        }
+        canceller.hold { task.cancel() }
+        gate.release()
+        _ = await task.value
+
+        XCTAssertLessThanOrEqual(
+            provider.callsUnderCandidate, 6,
+            "the walk must stop at the next NAME once cancelled, not probe "
+                + "all \(entryCount) entries of the batch"
+        )
+    }
+}
+
+/// A thread-safe call counter for the walk seams.
+final class WalkSeamCallCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = 0
+    var count: Int {
+        lock.lock(); defer { lock.unlock() }
+        return value
+    }
+    func bump() {
+        lock.lock(); defer { lock.unlock() }
+        value += 1
+    }
+}
+
+/// Cancels the scan's OWN task from inside a seam the scan calls, exactly
+/// once. The action is installed after the task exists and before the gate
+/// releases it, so the ordering is deterministic rather than raced.
+final class TaskCanceller: @unchecked Sendable {
+    private let lock = NSLock()
+    private var action: (@Sendable () -> Void)?
+    private var fired = false
+
+    func hold(_ action: @escaping @Sendable () -> Void) {
+        lock.lock(); defer { lock.unlock() }
+        self.action = action
+    }
+
+    func fire() {
+        lock.lock()
+        let action = fired ? nil : self.action
+        fired = true
+        lock.unlock()
+        action?()
+    }
+}
+
+/// Counts `probeKind` calls under one candidate and cancels the scan at the
+/// Nth of them — the walk's per-NAME admission point.
+final class CancellingKindProbeProvider: FileSystemIdentityProvider,
+    @unchecked Sendable {
+    private let prefix: String
+    private let cancelAtCall: Int
+    private let canceller: TaskCanceller
+    private let lock = NSLock()
+    private var calls = 0
+
+    init(under prefix: String, cancelAtCall: Int, canceller: TaskCanceller) {
+        self.prefix = prefix + "/"
+        self.cancelAtCall = cancelAtCall
+        self.canceller = canceller
+        super.init()
+    }
+
+    var callsUnderCandidate: Int {
+        lock.lock(); defer { lock.unlock() }
+        return calls
+    }
+
+    override func probeKind(of url: URL) -> KindProbe {
+        var shouldCancel = false
+        if url.path.hasPrefix(prefix) {
+            lock.lock()
+            calls += 1
+            shouldCancel = calls == cancelAtCall
+            lock.unlock()
+        }
+        if shouldCancel { canceller.fire() }
+        return super.probeKind(of: url)
     }
 }

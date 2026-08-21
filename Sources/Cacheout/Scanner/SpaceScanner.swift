@@ -486,10 +486,13 @@ struct ScanIssue: Equatable, Sendable {
         case permissionDenied
         /// Enumeration or metadata failure that is not a permission problem.
         case unreadable
-        /// A root listing hit its ENTRY CAP: everything listed is real, but
-        /// MORE remained uninspected (PR #459 review r4, codex C3 — the bound
-        /// that keeps a world-writable root's population from stalling the
-        /// scan). A FILESYSTEM kind: `url` names the truncated root.
+        /// A root's inspection hit an ENTRY CAP: everything listed is real,
+        /// but MORE remained uninspected (PR #459 review r4, codex C3 — the
+        /// bound that keeps a world-writable root's population from stalling
+        /// the scan). A FILESYSTEM kind: `url` names the truncated root.
+        /// TWO caps reach it in the ephemeral-temp scanner — the first-level
+        /// listing's, and the shared pre-filter allowance its candidates spend
+        /// (PR #459 codex r16) — and the label below is true of both.
         ///
         /// A cap hit ONLY (narrowed in PR #459 review r7, codex C2). A
         /// listing that stopped because the READ failed is a denial and

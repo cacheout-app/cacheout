@@ -381,6 +381,18 @@ and docs/v1/CLI-REFERENCE.md) — the pre-release `node_modules` →
   runs, which also means a scan narrowed to one scanner touches nothing
   outside it. Nothing you can clean is affected: a scanner that did not run in
   the latest scan already could not be cleaned until it runs again.
+- **A temp folder stuffed with directories can no longer make a scan crawl.**
+  The ephemeral-temp scanner advertised two limits — at most 20,000
+  first-level entries per temp folder, and at most 20,000 entries of
+  staleness checking per entry — but the second was handed out afresh to
+  every entry, so the two multiplied to 400 million filesystem probes for one
+  temp folder. `/private/tmp` is writable by anyone on the machine, so any
+  local program could stage that. Each temp folder now has ONE staleness
+  allowance its entries share; when it runs out the folder says so on the
+  results row ("too many entries — partially inspected"), and clearing
+  entries — including cleaning the items listed there — lets a later scan get
+  further. Cancelling a scan is also honoured while an entry is being
+  checked, instead of only between entries.
 - **Deleting a folder nested deeper than the system path limit now works.**
   Inspection had been made descriptor-relative and could read such trees;
   permanent deletion still went through `FileManager.removeItem`, which

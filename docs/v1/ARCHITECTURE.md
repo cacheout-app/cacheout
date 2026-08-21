@@ -345,13 +345,29 @@ the same admission as everything else.
 
 ### Why two canonicalization rules?
 
-Roots are resolved fully with `realpath(3)` — a symlink root is judged and
-walked by its real location, so an inadmissible target can't hide behind a
-link. Deletion-target *leaves* are never resolved: only the deepest existing
-ancestor is canonicalized, and deletion uses the unresolved URL — removing a
-symlink child deletes the link, never its target.
-(`URL.resolvingSymlinksInPath()` is not used for admission decisions: it is
-lexically wrong past a symlink and misses `/private` aliasing.)
+Full `realpath(3)` resolution is used where the result feeds a **deny check**
+— `admitDeletionRoot`, `matchConfiguredRoot`, alias-shadow keys — so an
+inadmissible target can't hide behind a link, and two spellings of one
+location collapse onto one comparison value.
+
+It is **not** used where the result becomes a **trusted container root**.
+There, only the deepest existing ancestor is canonicalized and the leaf is
+appended unresolved (`resolveTargetKeepingLeaf`). The deny list refuses `/`,
+volume roots and `$HOME` itself, but not their children — `~/Documents` is a
+legal container — so resolving a symlink leaf would register the link's
+destination as a trusted root and admit an arbitrary directory. Keeping the
+leaf means the declared spelling stays the link, which the scanners' no-follow
+(`lstat`) root gates see and refuse with a visible `symlinkRoot` issue, and
+which `ContainerSnapshot.capture` binds by the link's own identity at delete
+time. On stock macOS the two rules agree for every shipped root: the symlinks
+into `/var/folders/…/{C,T}` are ancestors (`/var` → `private/var`), which the
+parent chain still resolves.
+
+Deletion-target *leaves* follow the same rule and for the same reason:
+deletion uses the unresolved URL, so removing a symlink child deletes the
+link, never its target. (`URL.resolvingSymlinksInPath()` is not used for
+admission decisions: it is lexically wrong past a symlink and misses
+`/private` aliasing.)
 
 ### Why does DirectorySizer have two modes?
 

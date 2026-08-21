@@ -474,9 +474,11 @@ struct EphemeralTempScanner: @unchecked Sendable {
     /// The canonical root spellings, declared at REGISTRATION — this is HOW
     /// the container reaches the cleaner (the runtime unions scanner-declared
     /// roots into PathGuard's delete-time admission; nothing item-side can
-    /// widen it). fn-6.1 canonicalized each root exactly once, so the origin
-    /// claim on every item, the root records, and the identity parent chains
-    /// all speak ONE spelling.
+    /// widen it). fn-6.1 resolved each root exactly once — canonical parent
+    /// chain, UNRESOLVED leaf — so the origin claim on every item, the root
+    /// records, and the identity parent chains all speak ONE spelling, and a
+    /// symlink standing at a container's own name is still visible to the
+    /// no-follow root gate below rather than replaced by its destination.
     var trustedContainerRoots: [URL] { roots.map(\.url) }
 
     /// THE TRIGGER POLICY, EXPRESSED AS NON-PARTICIPATION (PR #459 review r1).
@@ -663,10 +665,11 @@ struct EphemeralTempScanner: @unchecked Sendable {
 
             // The two per-root mount facts (PR #459 review r5, codex C2).
             // `mountsUnderRoot` is the stall-free arm: kernel-spelled mount
-            // points strictly under this root (the declared roots are
-            // CANONICAL — fn-6.1 canonicalizes once — and the walk composes
-            // children from them without following links, so the two
-            // spellings agree). `rootDevice` is the racing-mount arm's
+            // points strictly under this root (fn-6.1 resolves the root's
+            // PARENT CHAIN once, and the walk composes children from that
+            // spelling without following links, so the two spellings agree.
+            // A root whose own leaf is a symlink never reaches this line —
+            // the no-follow root gate above refused it). `rootDevice` is the racing-mount arm's
             // baseline: one `lstat` of the ROOT itself — foreign only when
             // a mount lands on the root AFTER the over-mounted-root arm's
             // table check above (r6, codex C2: in that racing window this

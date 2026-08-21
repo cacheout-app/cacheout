@@ -34,21 +34,43 @@
 /// exist right after resolution. The live output also carries a TRAILING
 /// SLASH, normalized away here before any URL is built.
 ///
-/// ## Canonical-spelling discipline (R3)
+/// ## Canonical-spelling discipline (R3), and why the LEAF stays unresolved
 ///
-/// Every root is canonicalized EXACTLY ONCE, here, via
-/// `FileSystemIdentityProvider.canonicalize(_:)` — `/var/folders/…` becomes
-/// `/private/var/folders/…`, `/tmp` becomes `/private/tmp`. That ONE spelling
-/// is what fn-6.2 declares as `trustedContainerRoots`, stamps into every
-/// item's `originContainer`, and uses as the canonical PARENT chain of item
-/// identity (`resolveTargetKeepingLeaf` — canonical parent + UNRESOLVED
-/// leaf). A second spelling anywhere downstream makes the outcome
+/// Every root is resolved EXACTLY ONCE, here, via
+/// `FileSystemIdentityProvider.resolveTargetKeepingLeaf(_:)`: the PARENT
+/// CHAIN is canonicalized (`/var/folders/…` becomes `/private/var/folders/…`)
+/// and the LEAF — the container's own name — is appended UNRESOLVED. That ONE
+/// spelling is what fn-6.2 declares as `trustedContainerRoots`, stamps into
+/// every item's `originContainer`, and uses as the canonical PARENT chain of
+/// item identity. A second spelling anywhere downstream makes the outcome
 /// validator-rejected or deletion structurally unreachable, because
 /// `ContainerSnapshot.capture` keys by the DECLARED spelling
-/// (`PathGuard.swift:124-155`). Roots are de-duped by INODE identity
-/// (`sameLocation`), never string equality — `$TMPDIR`,
+/// (`PathGuard.swift:124-155`).
+///
+/// The leaf is left unresolved because this URL becomes a TRUSTED CONTAINER
+/// ROOT, not a comparison value. `realpath(3)` resolves the leaf too, so a
+/// symlink standing where `C`/`T` should be would silently register its
+/// DESTINATION as a temp root — and the container-root policy only refuses
+/// `/`, volume roots and `$HOME` itself (`PathGuard.swift:344-355` says so in
+/// as many words: "`~/Documents` can be a container while `admitDeletionRoot`
+/// refuses it"), so an arbitrary directory would be admitted, walked, listed
+/// as cache-container payload and deleted. Keeping the leaf means the
+/// declared spelling IS the link, so fn-6.2's no-follow root gate (an `lstat`
+/// `probeKind`) sees a symlink and refuses the root with a VISIBLE
+/// `.symlinkRoot` issue, and `ContainerSnapshot.capture` binds the LINK's own
+/// identity at delete time.
+///
+/// On stock macOS this is a NO-OP: the symlink on the way to these containers
+/// is `/var` → `private/var`, an ANCESTOR, which the parent chain still
+/// resolves; `/private/tmp` is declared canonically for the same reason. Both
+/// live-Mac cells below assert the resulting spellings.
+///
+/// Roots are de-duped by INODE identity (`sameLocation`) of a fully canonical
+/// comparison KEY — never string equality, and the key never reaches the kept
+/// set (the `DevRootsStore.swift:315-324` pattern). `$TMPDIR`,
 /// `NSTemporaryDirectory()` and confstr `T` are one directory under three
-/// spellings.
+/// spellings; because `sameLocation` is `lstat`-based, an alias spelling only
+/// collapses onto its target through the leaf-resolving key.
 ///
 /// ## Resolution time vs SCAN time — two distinct layers, deliberately
 ///
@@ -217,27 +239,38 @@ enum EphemeralTempRoots {
     ///
     /// Per definition: obtain the raw path (constant, or confstr) → drop it
     /// silently if the lookup failed or produced a non-absolute / bare-`/`
-    /// value → normalize the trailing slash → canonicalize ONCE → drop it if
-    /// it is the same filesystem object as an already-kept root (inode
-    /// identity, first declaration wins). Nothing probes existence or
-    /// permissions: that is scan time, and fn-6.2's contract (R11).
+    /// value → normalize the trailing slash → resolve ONCE, parent chain only
+    /// → drop it if it is the same filesystem object as an already-kept root
+    /// (inode identity of a fully canonical comparison KEY, first declaration
+    /// wins). Nothing probes existence or permissions: that is scan time, and
+    /// fn-6.2's contract (R11).
     static func resolve(
         provider: FileSystemIdentityProvider = FileSystemIdentityProvider(),
         confstrPath: ConfstrResolver = EphemeralTempRoots.confstrPath(_:)
     ) -> [EphemeralTempRoot] {
         var kept: [EphemeralTempRoot] = []
+        // Fully canonical (LEAF RESOLVED) de-dupe keys, parallel to `kept`.
+        // Comparison values ONLY: a key never reaches the kept set, so the
+        // leaf-preserving discipline above is untouched (this is verbatim the
+        // `DevRootsStore.swift:315-324` pattern). The leaf MUST be resolved
+        // here or an alias spelling stops collapsing onto its target —
+        // `sameLocation` is `lstat`-based, so a symlink and its destination
+        // are two different inodes.
+        var keys: [URL] = []
         for definition in definitions {
             guard let raw = rawPath(for: definition.source, confstrPath: confstrPath),
-                  let canonical = canonicalRoot(fromRawPath: raw, provider: provider)
+                  let declared = canonicalRoot(fromRawPath: raw, provider: provider)
             else { continue }
+            let key = provider.canonicalize(declared)
             // Inode-identity de-dupe: $TMPDIR / NSTemporaryDirectory() /
             // confstr T are one directory under several spellings, and a
             // string compare would keep both.
-            guard !kept.contains(where: { provider.sameLocation($0.url, canonical) })
+            guard !keys.contains(where: { provider.sameLocation($0, key) })
             else { continue }
+            keys.append(key)
             kept.append(
                 EphemeralTempRoot(
-                    url: canonical,
+                    url: declared,
                     label: definition.label,
                     cleanupEvidence: definition.cleanupEvidence,
                     writability: definition.writability
@@ -258,11 +291,21 @@ enum EphemeralTempRoots {
         }
     }
 
-    /// Trailing-slash normalization + the ONE canonicalization (R3).
-    /// `nil` for anything that is not a usable root: an empty or relative
-    /// path, or `/` itself — a filesystem root can never be a temp container,
-    /// and registering it would hand the deletion layer the widest possible
-    /// trusted root.
+    /// Trailing-slash normalization + the ONE resolution (R3): canonical
+    /// PARENT CHAIN, leaf appended UNRESOLVED. `nil` for anything that is not
+    /// a usable root: an empty or relative path, or `/` itself — a filesystem
+    /// root can never be a temp container, and registering it would hand the
+    /// deletion layer the widest possible trusted root.
+    ///
+    /// The leaf is deliberately NOT followed. This URL becomes a trusted
+    /// container root, so resolving a symlink leaf here would register the
+    /// link's DESTINATION — an attacker-chosen or user-relocated directory —
+    /// as a temp root, past every later gate (they all then inspect the real
+    /// destination directory, which is genuine and stable). Preserved, the
+    /// link is what fn-6.2's no-follow root gate sees, and it refuses it
+    /// visibly. Probing nothing is still this layer's contract: this is a
+    /// spelling transform, and whether the leaf IS a link is judged at scan
+    /// time, where absence and denial are already told apart.
     static func canonicalRoot(
         fromRawPath raw: String,
         provider: FileSystemIdentityProvider = FileSystemIdentityProvider()
@@ -272,7 +315,7 @@ enum EphemeralTempRoots {
         // never past the leading one.
         while trimmed.count > 1, trimmed.hasSuffix("/") { trimmed.removeLast() }
         guard trimmed.hasPrefix("/"), trimmed != "/" else { return nil }
-        return provider.canonicalize(URL(fileURLWithPath: trimmed))
+        return provider.resolveTargetKeepingLeaf(URL(fileURLWithPath: trimmed))
     }
 
     /// `confstr(3)` for a configuration name, two-call sizing idiom

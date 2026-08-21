@@ -111,11 +111,13 @@ final class EphemeralTempScannerTests: XCTestCase {
         FileSystemIdentityProvider().canonicalize(url)
     }
 
-    /// The spelling the scanner works in: the CANONICAL root plus the entry
-    /// leaf. Fixture URLs come back from `FileManager.temporaryDirectory` in
-    /// the `/var/…` alias spelling, and fn-6.1 canonicalizes roots exactly
-    /// once — so an assertion against the raw fixture URL would compare the
-    /// wrong spelling.
+    /// The spelling the scanner works in: the root's resolved spelling plus
+    /// the entry leaf. Fixture URLs come back from
+    /// `FileManager.temporaryDirectory` in the `/var/…` alias spelling, and
+    /// fn-6.1 resolves each root's parent chain exactly once — so an
+    /// assertion against the raw fixture URL would compare the wrong
+    /// spelling. These fixture roots are real directories, so the resolved
+    /// spelling and the fully canonical one coincide.
     private func entryPath(_ name: String, under root: URL) -> String {
         canonical(root).appendingPathComponent(name).path
     }
@@ -1998,13 +2000,97 @@ final class EphemeralTempScannerTests: XCTestCase {
         let link = base.appendingPathComponent("linked-root")
         try fm.createSymbolicLink(at: link, withDestinationURL: realDirectory)
 
-        // Declared WITHOUT canonicalization so the root stays the link itself.
+        // Declared WITHOUT canonicalization so the root stays the link
+        // itself. That is a HAND-BUILT root: it proves the gate works on the
+        // input it is given, and it can say nothing about whether fn-6.1's
+        // resolution ever delivers such a root. The sibling cell below is the
+        // one that closes that hole, by going through
+        // `EphemeralTempRoots.resolve` and then through the real cleaner.
         let root = makeRoot(link, label: "Linked", writability: .perUser,
                             canonicalize: false)
         let outcome = await scan(makeScanner(roots: [root]))
 
         XCTAssertTrue(outcome.items.isEmpty)
         XCTAssertEqual(outcome.errors.first?.kind, .symlinkRoot)
+    }
+
+    /// PRODUCTION-PATH symlink root: resolution → scan → deletion, end to end.
+    ///
+    /// The round-7 defect this pins: fn-6.1 resolved each declared root with
+    /// full `realpath(3)`, which follows the LEAF. A symlink standing where
+    /// the per-user `C` container should be was therefore replaced by its
+    /// DESTINATION before the scanner ever saw it, so the no-follow root gate
+    /// inspected a genuine directory and passed it; the destination became a
+    /// `trustedContainerRoot`; its children were listed as cache-container
+    /// payload; the delete-time revalidator allowed them; and the cleaner
+    /// deleted them. No later gate refused, because the container-root policy
+    /// refuses only `/`, volume roots and `$HOME` itself — `~/Documents` is a
+    /// legal container by design (`PathGuard.swift:344-355`).
+    ///
+    /// The victim is deliberately `<home>/Documents`, the production shape,
+    /// and the disposal is the PERMANENT arm so the assertion observes a real
+    /// destroyed tree rather than a missing issue.
+    func testResolvedSymlinkContainerIsRefusedAndItsTargetSurvives() async throws {
+        let victim = try mkdir(home.appendingPathComponent("Documents"))
+        let payload = try makeStaleCandidate("Taxes-2019", under: victim)
+
+        // The per-user `C` container is a SYMLINK to the victim's Documents.
+        let container = base.appendingPathComponent("var-folders-bucket-C")
+        try fm.createSymbolicLink(at: container, withDestinationURL: victim)
+
+        // Resolution goes through PRODUCTION `EphemeralTempRoots.resolve`.
+        // Only the confstr(3) lookup is stubbed; the shared `/private/tmp`
+        // root is dropped afterwards so no test reads a real temp root.
+        let resolved = EphemeralTempRoots.resolve(
+            confstrPath: { name in
+                name == _CS_DARWIN_USER_CACHE_DIR ? container.path + "/" : nil
+            }
+        )
+        let cacheRoot = try XCTUnwrap(
+            resolved.first { $0.label == EphemeralTempRoots.userCache.label }
+        )
+        XCTAssertNotEqual(
+            cacheRoot.url.path, canonical(victim).path,
+            "resolution must not hand the scanner the symlink's destination"
+        )
+
+        let scanner = makeScanner(roots: [cacheRoot])
+        let runtime = try SpaceScannerRuntime(
+            scanners: [scanner], categories: [], home: home,
+            provider: FileSystemIdentityProvider()
+        )
+        let session = runtime.scanValidatedSession(
+            context: ScanContext(trigger: .userInitiated)
+        )
+        var outcome: ScanOutcome?
+        for await event in session.events {
+            if case .outcome(_, let produced) = event { outcome = produced }
+        }
+        let scanned = try XCTUnwrap(outcome)
+
+        XCTAssertEqual(
+            scanned.errors.first?.kind, .symlinkRoot,
+            "a symlink standing at a container's own name must be REFUSED "
+                + "visibly, not silently followed: \(scanned.errors)"
+        )
+        XCTAssertTrue(
+            scanned.items.isEmpty,
+            "nothing behind a container symlink may be listed: "
+                + "\(scanned.items.map(\.displayName))"
+        )
+
+        // Whatever the scan emitted, hand it to the REAL cleaner on the
+        // permanent (non-Trash) arm. With the leaf resolved this deleted the
+        // user's document tree outright.
+        let report = await runtime
+            .makeCleaner(snapshot: session.snapshot)
+            .clean(items: scanned.items, moveToTrash: false)
+
+        XCTAssertTrue(
+            fm.fileExists(atPath: payload.path),
+            "the symlink's destination was DELETED — \(report.entries.count) "
+                + "entries removed, errors: \(report.errors)"
+        )
     }
 
     // MARK: - R3/R8: identity, dedupe and the emitted item shape

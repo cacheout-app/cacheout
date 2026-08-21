@@ -157,12 +157,19 @@ final class EphemeralTempRootsTests: XCTestCase {
             )?.path,
             "/private/tmp"
         )
+        // The LEAF is never followed: `/tmp` is itself a symlink, so the
+        // declared spelling keeps the link and fn-6.2's no-follow root gate
+        // refuses it visibly instead of silently adopting its destination.
+        // Production never feeds this input — the shared root is DECLARED as
+        // `/private/tmp` (EphemeralTempRoots.sharedTemp) precisely so the
+        // canonical spelling is the one that ships.
         XCTAssertEqual(
             EphemeralTempRoots.canonicalRoot(
                 fromRawPath: "/tmp", provider: provider
             )?.path,
-            "/private/tmp",
-            "/tmp is a symlink to private/tmp — the canonical spelling wins"
+            "/tmp",
+            "a symlink LEAF stays unresolved — resolving it would register "
+                + "the destination as a trusted container root"
         )
         XCTAssertNil(
             EphemeralTempRoots.canonicalRoot(fromRawPath: "/", provider: provider),
@@ -213,6 +220,43 @@ final class EphemeralTempRootsTests: XCTestCase {
         XCTAssertEqual(roots.last?.label, EphemeralTempRoots.userCache.label)
     }
 
+    /// A symlink standing where a per-user container should be must be
+    /// declared AT THE LINK, never replaced by its destination.
+    ///
+    /// This is the resolution half of the round-7 symlink-root defect: a
+    /// leaf-resolving `realpath` here registers the link's target as a
+    /// TRUSTED CONTAINER ROOT, and the container-root policy refuses only
+    /// `/`, volume roots and `$HOME` itself — so an ordinary directory such
+    /// as `~/Documents` is admitted, walked and deleted. Keeping the leaf is
+    /// what lets fn-6.2's no-follow root gate see the link at all; the
+    /// end-to-end consequence is pinned by
+    /// `EphemeralTempScannerTests.testResolvedSymlinkContainerIsRefusedAndItsTargetSurvives`.
+    func testSymlinkContainerLeafIsDeclaredAtTheLinkNotItsDestination() throws {
+        let destination = try mkdir(base.appendingPathComponent("victim-tree"))
+        let container = base.appendingPathComponent("bucket-C")
+        try fm.createSymbolicLink(at: container, withDestinationURL: destination)
+
+        let stub = ConfstrStub([_CS_DARWIN_USER_CACHE_DIR: container.path + "/"])
+        let roots = EphemeralTempRoots.resolve(confstrPath: stub.resolve(_:))
+
+        let cache = try XCTUnwrap(root(roots, labelled: EphemeralTempRoots.userCache))
+        XCTAssertEqual(
+            cache.url.path, canonicalPath(container.deletingLastPathComponent())
+                + "/bucket-C",
+            "the declared root keeps the LINK's own name — the parent chain "
+                + "is canonical, the leaf is not followed"
+        )
+        XCTAssertNotEqual(
+            cache.url.path, canonicalPath(destination),
+            "resolving the leaf would register the symlink's destination as "
+                + "a trusted container root"
+        )
+        XCTAssertFalse(
+            roots.map(\.url.path).contains(canonicalPath(destination)),
+            "no resolved root may be the destination of a container symlink"
+        )
+    }
+
     func testResolvedRootsAreCanonicalIdempotentAndDistinct() {
         let provider = FileSystemIdentityProvider()
         let roots = EphemeralTempRoots.resolve(provider: provider)
@@ -221,10 +265,17 @@ final class EphemeralTempRootsTests: XCTestCase {
         for root in roots {
             XCTAssertTrue(root.url.path.hasPrefix("/"), root.url.path)
             XCTAssertFalse(root.url.path.hasSuffix("/"), root.url.path)
+            // MEASURED, not contractual: none of the three shipped roots has
+            // a symlink LEAF on a stock Mac (the link into the containers is
+            // `/var` → `private/var`, an ancestor), so the leaf-preserving
+            // spelling this layer emits is also fully canonical here. If this
+            // ever fails, the machine has a relocated container — and the
+            // scan-time root gate, not this layer, is what must refuse it.
             XCTAssertEqual(
                 provider.canonicalize(root.url).path, root.url.path,
-                "the exposed spelling is already canonical — fn-6.2 declares, "
-                    + "stamps and derives identity from exactly this URL"
+                "the exposed spelling is already canonical on this machine — "
+                    + "fn-6.2 declares, stamps and derives identity from "
+                    + "exactly this URL"
             )
         }
         XCTAssertEqual(Set(roots.map(\.url.path)).count, roots.count,

@@ -489,6 +489,41 @@ final class DevRootsSettingsTests: XCTestCase {
         XCTAssertEqual(refusal.label, "not a configured search root")
         XCTAssertNotEqual(refusal.label, mounted.label,
                           "two conditions, two sentences")
+
+        // ONE CONDITION, TWO REMEDIES (PR #459 codex r15). The mount can
+        // also be standing when the app STARTS, in which case fn-6.1 refuses
+        // the root before registering it — a verdict made once per runtime
+        // and replayed from stored resolution issues, so the row above's
+        // "then re-scan" would send the user round a loop that never clears
+        // it. Same condition, different kind, and the labels must differ in
+        // exactly that half.
+        let atRegistration = ScanIssueRowPresentation(
+            issue: ScanIssue(
+                url: root, kind: .mountedVolumeRootAtRegistration,
+                detail: "Shared temp is a mounted volume — the root was not "
+                    + "registered, so nothing under it is scanned; its "
+                    + "contents belong to that volume. "
+                    + EphemeralTempRoots.registrationMountRemedy
+            ),
+            home: fixtureHome
+        )
+        XCTAssertEqual(
+            atRegistration.label,
+            "mounted volume at launch; unmount it, then relaunch"
+        )
+        XCTAssertEqual(
+            atRegistration.text,
+            "/private/tmp — mounted volume at launch; unmount it, "
+                + "then relaunch"
+        )
+        XCTAssertFalse(
+            atRegistration.label.contains("re-scan"),
+            "a re-scan cannot clear a verdict made once per runtime"
+        )
+        XCTAssertNotEqual(atRegistration.label, mounted.label,
+                          "one condition, two remedies, two sentences")
+        XCTAssertFalse(atRegistration.showsSettingsLink,
+                       "Full Disk Access cannot unmount a volume")
     }
 
     /// THE SIBLINGS OF THAT SAME DEFECT (PR #459 codex r13, P2 DISCLOSURE) —

@@ -94,6 +94,32 @@ struct ScannerItemSection: View {
             // Classified scan problems (R14/D6): a denied search root is
             // information, never a silent skip — and a malformed outcome is
             // a visible failure, never a silent retention.
+            //
+            // RESIDUAL, RECORDED AT MEASURED SCOPE (PR #459 codex r10, D6).
+            // This call is the LAST link before the user's eye — every
+            // per-item scanner reaches it from `ContentView.swift:181-186`,
+            // and every disclosure the scanners work to produce (fn-6.1's
+            // `.symlinkRoot` alias drop, denied roots, truncated listings, a
+            // malformed outcome) is displayed by this line and by nothing
+            // else. It is NOT covered by any cell: measured at the r9 tip,
+            // replacing it with `EmptyView()` left the FULL suite green at
+            // 1172/2/0. The cause is structural rather than an oversight —
+            // SwiftUI bodies are assertion-dead (`ScanIssueRowPresentation`
+            // below exists BECAUSE of that) and this repo has no view-test
+            // harness, so no assertion can reach this expression.
+            //
+            // What IS pinned is the chain up to here, each by a named cell:
+            // resolution raises the issue, the scanner carries it
+            // (`testUserInitiatedLeadsWithTheSameResolutionIssues`), the
+            // production factory hands it to the registered scanner on BOTH
+            // arms (the two `…CarriesResolutionIssues…` /
+            // `…OwnResolutionArmCarriesItsIssuesToo` cells in
+            // `EphemeralTempRegistrationTests`), and each row's
+            // wording/location/remedy is derived testably
+            // below. The gap is the RENDERING, and only that. Building a view
+            // harness is out of scope for this round; the honest statement is
+            // that the chain is evidenced up to the view boundary and not
+            // across it, so a refactor of this line would ship silently.
             if isExpanded && !section.isScanning && !section.issues.isEmpty {
                 ScanIssuesBlock(issues: section.issues)
             }

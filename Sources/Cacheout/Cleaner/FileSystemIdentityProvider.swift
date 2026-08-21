@@ -694,6 +694,34 @@ class FileSystemIdentityProvider {
         return canonicalize(parent).appendingPathComponent(leaf)
     }
 
+    // MARK: - Symlink content (read, never followed)
+
+    /// The LITERAL content of the symlink at `url` — one `readlink(2)`.
+    ///
+    /// The difference from `canonicalize`/`resolveTargetKeepingLeaf` is the
+    /// whole point: `readlink(2)` walks the link's ANCESTORS and then reads
+    /// the link's own data. It never names the destination, so it cannot
+    /// block on an unresponsive destination volume and cannot reach a
+    /// destination the process has no right to. What comes back is a
+    /// STRING — possibly relative, possibly non-canonical, possibly pointing
+    /// at nothing — and callers must treat it as such: turning it into a
+    /// canonical path is exactly the resolution this call exists to avoid.
+    ///
+    /// `nil` on every failure, including `EINVAL` for a path that is not a
+    /// symlink. Truncation is not a case: `symlink(2)` refuses a target
+    /// longer than `PATH_MAX - 1` (measured on this machine, Darwin 25.5: a
+    /// 2000-byte target is refused `ENAMETOOLONG` (63)), so a link the kernel
+    /// accepted always fits the buffer below.
+    func symlinkTarget(of url: URL) -> String? {
+        var buffer = [CChar](repeating: 0, count: Int(PATH_MAX))
+        // `readlink` does NOT NUL-terminate; one byte is held back so the
+        // terminator below is always in bounds.
+        let written = readlink(url.path, &buffer, buffer.count - 1)
+        guard written > 0 else { return nil }
+        buffer[written] = 0
+        return String(cString: buffer)
+    }
+
     // MARK: - Location comparison
 
     /// Same filesystem object? Inode identity when both sides exist (immune to

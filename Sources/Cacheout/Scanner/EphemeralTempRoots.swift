@@ -103,16 +103,48 @@
 /// `/var/…`. What that two-spelling split inside each item costs is NOT
 /// measured, so this file claims nothing about it either way.
 ///
+/// ## Nothing a symlink leaf points at is contacted (PR #459 codex r12)
+///
+/// Resolution runs synchronously inside `SpaceScannerRuntime.production()`,
+/// which is ordinary app construction: the GUI evaluates it on the main
+/// thread while building its `@StateObject`
+/// (`CacheoutApp.swift:58` → `CacheoutViewModel.production()` →
+/// `CacheoutViewModel.swift:541` → `SpaceScanner.swift:1096-1099`), long
+/// before any trigger or `participates(in:)` gate exists to consult. So
+/// whatever this file does to a DECLARED path, a user waits for.
+///
+/// `C` and `T` sit in a user-owned bucket directory, so a same-UID process
+/// can replace either with a symlink to any destination it likes. This file
+/// therefore never resolves a leaf the `lstat` probe says is not a real
+/// directory: `realpath(3)` on such a leaf names the DESTINATION, and naming
+/// it is what blocks (an unresponsive volume) or reaches somewhere the app
+/// has no business reaching. Measured at the r11 tip, before this rule:
+/// `SpaceScannerRuntime.production()` canonicalized a symlinked `C` twice and
+/// both calls returned the destination's own canonical path, and a 0.75 s
+/// stall injected on calls naming the destination made `production()` take
+/// 3.02 s.
+///
+/// An alias's target is instead READ, never followed — one `readlink(2)` of
+/// the link's own content (`FileSystemIdentityProvider.symlinkTarget(of:)`),
+/// folded to an absolute path by string arithmetic — and then COMPARED, as a
+/// name, against the spellings resolution already holds. That is strictly
+/// weaker than an inode comparison, and the residual is recorded below.
+///
+/// This is where the file DIVERGES from the two dev-root precedents it
+/// otherwise follows: `DevRootsStore.swift:322` and `SpaceScanner.swift:938`
+/// both still build their comparison key with `provider.canonicalize`, on
+/// every root including non-directory ones, at the same construction time.
+/// Neither has been changed here.
+///
 /// ## De-dupe and alias suppression — two halves, cited one at a time
 ///
-/// Two values are probed ONCE per declared root: a fully canonical (LEAF
-/// RESOLVED) comparison KEY, and whether the DECLARED spelling is itself a
-/// real directory (`lstat` leaf, no follow). The key is a comparison value
-/// only and never reaches the kept set, so the leaf-preserving discipline
-/// above is untouched. The probe PAIR is the one at
-/// `DevRootsStore.swift:320-324` and `SpaceScanner.swift:937-941`. The two
-/// halves that consume it have different precedents — do not read this as
-/// one pattern copied whole from either:
+/// One value is probed per declared root: whether the DECLARED spelling is
+/// itself a real directory (`lstat` leaf, no follow), which is the
+/// `isDirectory` half of the probe pair at `DevRootsStore.swift:320-324` and
+/// `SpaceScanner.swift:937-941`. The `key:` half of that pair is deliberately
+/// NOT taken (see above). The two halves that consume the probe have
+/// different precedents — do not read this as one pattern copied whole from
+/// either:
 ///
 /// - **De-dupe** — real directories only: a real-directory spelling of a
 ///   location already kept is dropped. Precedent is `DevRootsStore.swift`
@@ -126,18 +158,27 @@
 ///   de-duping there; `SpaceScanner.swift:884-895` records the
 ///   identity-binding breakage that choice exists to avoid.
 ///
-///   The comparison here is INODE identity (`sameLocation`) of the key, where
-///   that precedent compares the key as a STRING
-///   (`DevRootsStore.swift:322` builds `.path`). Not because a string compare
-///   would fail on these spellings: measured, `$TMPDIR`,
+///   The comparison here is INODE identity (`sameLocation`) of the declared
+///   spellings, where that precedent compares canonical paths as STRINGS
+///   (`DevRootsStore.swift:322` builds `.path`). Comparing the declared
+///   spellings is sound only because both sides are real DIRECTORIES, whose
+///   parent chain resolution already made them canonical: measured on this
+///   machine (Darwin 25.5), `realpath(dir)` and `realpath(parent) + "/" +
+///   leaf` are the same string for a real directory. Not that a string
+///   compare would fail on these spellings either: measured, `$TMPDIR`,
 ///   `NSTemporaryDirectory()` and confstr `T` all realpath to the ONE string
-///   `/private/var/folders/<bucket>/T`, so a string compare of the keys
-///   collapses them too. No case is recorded here where the two verdicts
-///   differ — inode identity is used because it is the stronger of the two,
-///   and that is the whole reason.
+///   `/private/var/folders/<bucket>/T`. No case is recorded here where the
+///   two verdicts differ — inode identity is used because it is the stronger
+///   of the two, and that is the whole reason.
 /// - **Alias suppression** — a declared spelling that is NOT a real directory
-///   but resolves onto a spelling that IS one is DROPPED, and the drop is
-///   disclosed as a `.symlinkRoot` issue naming the root that covers it. The
+///   but NAMES one that IS (its `readlink(2)` content, folded to an absolute
+///   path, equals a real-directory root's parent-canonical spelling or the
+///   raw source spelling that root came from) is DROPPED, and the drop is
+///   disclosed as a `.symlinkRoot` issue naming the root that covers it. Both
+///   spellings are compared because both really occur: confstr `T` answers
+///   `/var/folders/<bucket>/T/` on this machine while the resolved root is
+///   `/private/var/folders/<bucket>/T`, so a link written to either one
+///   collapses. The
 ///   ALIAS goes, never the real directory: dropping the real root instead
 ///   loses the only spelling anything can be scanned or cleaned through,
 ///   while the alias could never be walked (fn-6.2's no-follow root gate
@@ -159,6 +200,20 @@
 /// A non-directory spelling that NOTHING else covers passes through verbatim:
 /// scan time is where absence and denial are told apart, and the no-follow
 /// root gate classifies it there.
+///
+/// ### RESIDUAL, at measured scope: a name compare misses a third spelling
+///
+/// The alias comparison is by NAME, so it only collapses a link whose content
+/// is one of the two spellings resolution holds. A link written through some
+/// THIRD spelling of the same directory — an ancestor symlink other than
+/// `/var`, a case variant on a case-insensitive volume — is no longer
+/// recognised as an alias, where the leaf-resolving key it replaced would
+/// have caught it by inode. That case is fail-safe and measured
+/// (`testAliasWrittenThroughAThirdSpellingKeepsBothRootsRatherThanGuessing`):
+/// BOTH roots are kept, the real one is scanned exactly as before, and the
+/// alias is refused at scan time by fn-6.2's no-follow root gate with its own
+/// `.symlinkRoot` issue. Nothing is silently dropped, and no REAL root is
+/// ever dropped by this arm — only aliases are.
 ///
 /// ## Resolution time vs SCAN time — two distinct layers, deliberately
 ///
@@ -356,50 +411,50 @@ enum EphemeralTempRoots {
     /// Per definition: obtain the raw path (constant, or confstr) → drop it
     /// silently if the lookup failed or produced a non-absolute / bare-`/`
     /// value → normalize the trailing slash → resolve ONCE, parent chain
-    /// only. The surviving spellings then go through the two-half house
-    /// pattern documented at the head of this file: real-directory de-dupe by
-    /// inode identity, then alias suppression with a classified issue.
+    /// only. The surviving spellings then go through the two halves
+    /// documented at the head of this file: real-directory de-dupe by inode
+    /// identity, then alias suppression with a classified issue.
     ///
     /// Existence and permissions are still not this layer's business (R11 —
-    /// that is scan time, fn-6.2's contract). The ONE probe here is the
-    /// `lstat` kind of each declared LEAF, and it decides only which of two
-    /// spellings of the SAME directory to keep: it never admits or refuses a
-    /// root on its own, and a root that no other spelling covers survives
-    /// whatever the probe says (including `.absent` and `.failed`).
+    /// that is scan time, fn-6.2's contract). The probes here are the `lstat`
+    /// kind of each declared LEAF and, for a leaf that is a symlink, ONE
+    /// `readlink(2)` of that link's own content. They decide only which of
+    /// two spellings of the same directory to keep: they never admit or
+    /// refuse a root on their own, and a root nothing else covers survives
+    /// whatever they say (including `.absent` and `.failed`).
+    ///
+    /// NOTHING a declared leaf points AT is touched (PR #459 codex r12) —
+    /// see the file header's "Nothing a symlink leaf points at is contacted".
     static func resolve(
         provider: FileSystemIdentityProvider = FileSystemIdentityProvider(),
         confstrPath: ConfstrResolver = EphemeralTempRoots.confstrPath(_:)
     ) -> EphemeralTempRootsResolution {
-        // Probed ONCE per declared root — the same probe pair, with the same
-        // meaning, as `DevRootsStore.swift:315-324` and
-        // `SpaceScanner.swift:933-941`: the fully canonical (LEAF RESOLVED)
-        // comparison KEY, and whether the DECLARED spelling is itself a real
-        // directory. The key is a comparison value ONLY and never reaches the
-        // kept set, so the leaf-preserving discipline is untouched; the leaf
-        // MUST be resolved in the KEY or an alias spelling stops collapsing
-        // onto its target, because `sameLocation` is `lstat`-based and a
-        // symlink and its destination are two different inodes.
+        // Probed ONCE per declared root: whether the DECLARED spelling is
+        // itself a real directory (`lstat` leaf, no follow). NOTHING here
+        // resolves a leaf the probe says is not a real directory — that is
+        // the whole no-destination-contact rule, and the two spellings each
+        // root is compared BY are the two it already came with.
         let probed = definitions.compactMap {
-            definition -> (definition: Definition, declared: URL,
-                           key: URL, isDirectory: Bool)? in
+            definition -> (definition: Definition, rawPath: String,
+                           declared: URL, isDirectory: Bool)? in
             guard let raw = rawPath(for: definition.source, confstrPath: confstrPath),
-                  let declared = resolvedRoot(fromRawPath: raw, provider: provider)
+                  let usable = usableRawPath(raw),
+                  let declared = resolvedRoot(fromRawPath: usable, provider: provider)
             else { return nil }
             return (definition: definition,
+                    rawPath: usable,
                     declared: declared,
-                    key: provider.canonicalize(declared),
                     isDirectory: provider.probeKind(of: declared)
                         == .kind(.directory))
         }
-        // The canonical locations a REAL-DIRECTORY spelling already covers
-        // (`DevRootsStore.swift:325-335`, `SpaceScanner.swift:942-944`).
-        let coveredByRealDirectory = probed.filter(\.isDirectory).map(\.key)
+        // The REAL-DIRECTORY roots an alias can collapse onto.
+        let realDirectories = probed.filter(\.isDirectory)
 
         var kept: [EphemeralTempRoot] = []
         var issues: [ScanIssue] = []
-        // De-dupe keys of the real directories kept so far, parallel to
-        // `kept` — inode identity, never string equality.
-        var seenRealKeys: [URL] = []
+        // The real directories kept so far, parallel to `kept` — compared by
+        // inode identity, never string equality.
+        var seenRealRoots: [URL] = []
         for root in probed {
             let root0 = EphemeralTempRoot(
                 url: root.declared,
@@ -408,39 +463,89 @@ enum EphemeralTempRoots {
                 writability: root.definition.writability
             )
             guard root.isDirectory else {
-                // Alias suppression (`DevRootsStore.swift:341-357`). Strictly
-                // fail-CLOSED: the alias could never be walked nor admitted
-                // as a container, and it is dropped ONLY when a
-                // real-directory spelling of the SAME location survives — so
-                // every entry it could have covered is still scanned, through
-                // the spelling that also passes the gates. Never silent: the
-                // same `.symlinkRoot` kind the walk-time gate would have
-                // produced, naming the root that covers it.
-                if coveredByRealDirectory.contains(
-                    where: { provider.sameLocation($0, root.key) }
-                ) {
+                // Alias suppression. Strictly fail-CLOSED: the alias could
+                // never be walked nor admitted as a container, and it is
+                // dropped ONLY when a real-directory root it demonstrably
+                // names survives — so every entry it could have covered is
+                // still scanned, through the spelling that also passes the
+                // gates. Never silent: the same `.symlinkRoot` kind the
+                // walk-time gate would have produced, naming the covering
+                // root.
+                if let target = aliasTargetPath(of: root.declared,
+                                                provider: provider),
+                   let covering = realDirectories.first(where: {
+                       $0.declared.path == target || $0.rawPath == target
+                   }) {
                     issues.append(ScanIssue(
                         url: root.declared,
                         kind: .symlinkRoot,
                         detail: "\(root.definition.label) is not a real "
-                            + "directory and aliases \(root.key.path), which "
-                            + "is declared separately — the alias was "
+                            + "directory and aliases \(covering.declared.path), "
+                            + "which is declared separately — the alias was "
                             + "dropped and that root is scanned instead"
                     ))
                     continue
                 }
-                // Covered by nothing: passes through verbatim, and fn-6.2's
-                // no-follow root gate classifies it at scan time.
+                // Named nothing this resolution holds: passes through
+                // verbatim, and fn-6.2's no-follow root gate classifies it at
+                // scan time.
                 kept.append(root0)
                 continue
             }
-            guard !seenRealKeys.contains(
-                where: { provider.sameLocation($0, root.key) }
+            guard !seenRealRoots.contains(
+                where: { provider.sameLocation($0, root.declared) }
             ) else { continue } // exact duplicate of an earlier real root
-            seenRealKeys.append(root.key)
+            seenRealRoots.append(root.declared)
             kept.append(root0)
         }
         return EphemeralTempRootsResolution(roots: kept, issues: issues)
+    }
+
+    /// The absolute path a DECLARED spelling's symlink content names, or
+    /// `nil` when the spelling is not a symlink, the read fails, or the
+    /// content cannot be turned into an absolute path WITHOUT touching what
+    /// it names.
+    ///
+    /// One `readlink(2)` on the link itself
+    /// (`FileSystemIdentityProvider.symlinkTarget(of:)`), then string
+    /// arithmetic. The result is a NAME, never a resolved location: it is
+    /// only ever compared, never registered, walked or opened.
+    private static func aliasTargetPath(
+        of declared: URL, provider: FileSystemIdentityProvider
+    ) -> String? {
+        guard let content = provider.symlinkTarget(of: declared) else {
+            return nil
+        }
+        return lexicalTargetPath(ofLink: declared, content: content)
+    }
+
+    /// `content` as an absolute path, folded LEXICALLY — no syscall of any
+    /// kind. A relative target is joined to the link's own directory (already
+    /// parent-canonical, since `declared` came from `resolvedRoot`); `.` is
+    /// dropped and `..` pops a component in the STRING, because popping it
+    /// against the filesystem is precisely the resolution this avoids.
+    ///
+    /// `nil` for anything that is not a usable comparison subject: empty
+    /// content, a `..` that walks off the root, and a target of `/` itself.
+    static func lexicalTargetPath(ofLink link: URL, content: String) -> String? {
+        guard !content.isEmpty else { return nil }
+        let joined = content.hasPrefix("/")
+            ? content
+            : link.deletingLastPathComponent().path + "/" + content
+        var components: [String] = []
+        for component in joined.split(separator: "/") {
+            switch component {
+            case ".":
+                continue
+            case "..":
+                guard !components.isEmpty else { return nil }
+                components.removeLast()
+            default:
+                components.append(String(component))
+            }
+        }
+        guard !components.isEmpty else { return nil }
+        return "/" + components.joined(separator: "/")
     }
 
     /// The raw, un-normalized path for a source — `nil` when a confstr
@@ -477,12 +582,22 @@ enum EphemeralTempRoots {
         fromRawPath raw: String,
         provider: FileSystemIdentityProvider = FileSystemIdentityProvider()
     ) -> URL? {
+        guard let usable = usableRawPath(raw) else { return nil }
+        return provider.resolveTargetKeepingLeaf(URL(fileURLWithPath: usable))
+    }
+
+    /// The trailing-slash normalization and the usability verdict on their
+    /// own, so `resolve` can keep the SOURCE spelling beside the resolved one
+    /// (an alias's link content is compared against both — see
+    /// `aliasTargetPath`). Idempotent: its own output passes back through
+    /// unchanged.
+    static func usableRawPath(_ raw: String) -> String? {
         var trimmed = raw
         // Live confstr output ends in "/" — strip every trailing slash, but
         // never past the leading one.
         while trimmed.count > 1, trimmed.hasSuffix("/") { trimmed.removeLast() }
         guard trimmed.hasPrefix("/"), trimmed != "/" else { return nil }
-        return provider.resolveTargetKeepingLeaf(URL(fileURLWithPath: trimmed))
+        return trimmed
     }
 
     /// `confstr(3)` for a configuration name, two-call sizing idiom

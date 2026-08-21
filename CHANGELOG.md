@@ -47,10 +47,14 @@ and docs/v1/CLI-REFERENCE.md) — the pre-release `node_modules` →
   temp (`…/T`) and cache (`…/C`) containers, resolved from the OS rather
   than hardcoded. Those three DECLARED locations can resolve to fewer roots:
   one the OS does not name, or that is missing at scan time, is skipped
-  silently, and one that turns out to be a symlink ALIAS of another declared
+  silently, and one that turns out to be a symlink NAMING another declared
   root is dropped at resolution with a `symlink_root` issue naming the
   dropped spelling — the ALIAS goes, never the real root, and the drop is
-  never silent. A MEASURED entry qualifies when its OWN timestamp and its
+  never silent. Resolution reads such a link but never follows it, so nothing
+  a replaced temp root points at is touched while the app is starting up; a
+  link spelled so that Cacheout cannot match it to a declared root is kept
+  instead of dropped, and the scan then refuses it with the same
+  `symlink_root` issue. A MEASURED entry qualifies when its OWN timestamp and its
   newest REGULAR FILE are both older than the age threshold (default 7 days)
   and it meets the size floor (default 10 MB) — a directory holding one fresh
   file deep inside is not stale, so a workspace whose files are still being

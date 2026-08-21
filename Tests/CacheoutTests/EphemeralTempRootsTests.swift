@@ -356,6 +356,222 @@ final class EphemeralTempRootsTests: XCTestCase {
                        "no duplicate roots survive resolution")
     }
 
+    // MARK: - PR #459 codex r12: nothing a symlink leaf points at is contacted
+
+    /// A provider that FAILS THE TEST on contact, under two rules.
+    ///
+    /// Every filesystem access `EphemeralTempRoots.resolve` performs goes
+    /// through one of these overrides, so a call recorded here IS the syscall.
+    ///
+    /// - `offLimits`: no call may name this subtree. Used for a destination
+    ///   nothing declared — the attacker-chosen directory that must stay
+    ///   untouched.
+    /// - `neverResolved`: `realpath(3)` must never be called on these
+    ///   spellings. Used for a symlink root whose destination IS a declared
+    ///   root, where naming the destination is legitimate but resolving the
+    ///   LINK to get there is the defect.
+    ///
+    /// `realPath`/`canonicalize` are checked at both ends: `realpath(3)` can
+    /// only RETURN a path under a subtree by having walked into it.
+    /// `symlinkTarget`'s output is deliberately exempt — `readlink(2)` reads
+    /// the link's own data block and returns a name it never visits, which is
+    /// the entire reason this file uses it.
+    private final class ContactForbiddingProvider: FileSystemIdentityProvider {
+        private let offLimits: String?
+        private let neverResolved: [String]
+        private let fail: (String) -> Void
+
+        init(offLimits: String?, neverResolved: [String],
+             fail: @escaping (String) -> Void) {
+            self.offLimits = offLimits
+            self.neverResolved = neverResolved
+            self.fail = fail
+        }
+
+        private func check(_ path: String, _ what: String) {
+            guard let offLimits,
+                  path == offLimits || path.hasPrefix(offLimits + "/")
+            else { return }
+            fail("\(what) named the off-limits destination: \(path)")
+        }
+
+        private func checkResolutionSubject(_ path: String, _ what: String) {
+            guard neverResolved.contains(path) else { return }
+            fail("\(what) resolved a non-directory leaf: \(path)")
+        }
+
+        override func realPath(of path: String) -> String? {
+            check(path, "realPath(of:) input")
+            checkResolutionSubject(path, "realPath(of:)")
+            let out = super.realPath(of: path)
+            if let out { check(out, "realPath(of:) output") }
+            return out
+        }
+
+        override func canonicalize(_ url: URL) -> URL {
+            check(url.path, "canonicalize input")
+            checkResolutionSubject(url.path, "canonicalize")
+            let out = super.canonicalize(url)
+            check(out.path, "canonicalize output")
+            return out
+        }
+
+        override func probeKind(of url: URL) -> KindProbe {
+            check(url.path, "probeKind input")
+            return super.probeKind(of: url)
+        }
+
+        override func identity(of url: URL) -> Identity? {
+            check(url.path, "identity input")
+            return super.identity(of: url)
+        }
+
+        override func ownerProbe(of url: URL) -> OwnerProbe {
+            check(url.path, "ownerProbe input")
+            return super.ownerProbe(of: url)
+        }
+
+        override func canEnumerateDirectory(_ url: URL) -> Bool {
+            check(url.path, "canEnumerateDirectory input")
+            return super.canEnumerateDirectory(url)
+        }
+
+        override func symlinkTarget(of url: URL) -> String? {
+            check(url.path, "symlinkTarget input")
+            return super.symlinkTarget(of: url)
+        }
+    }
+
+    /// The r12 finding: a leaf-following `realpath(3)` ran at REGISTRATION.
+    ///
+    /// `C` and `T` live in a user-owned bucket directory, so a same-UID
+    /// process can replace either with a symlink to any destination it
+    /// chooses. Resolution runs inside `SpaceScannerRuntime.production()` —
+    /// app construction, on the GUI's main thread — so a destination that
+    /// blocks blocks the app, and a destination the app has no business
+    /// reaching is reached before any trigger gate exists.
+    ///
+    /// Both arms are driven, because they take different paths through the
+    /// alias check: an alias the resolution CAN place (dropped, disclosed)
+    /// and one it cannot (kept verbatim for the scan-time gate).
+    func testResolutionNeverContactsWhatADeclaredSymlinkPointsAt() throws {
+        for coversARealRoot in [true, false] {
+            let destination = try mkdir(
+                base.appendingPathComponent("destination-\(coversARealRoot)")
+            )
+            let aliasCache = base
+                .appendingPathComponent("alias-C-\(coversARealRoot)")
+            try fm.createSymbolicLink(at: aliasCache, withDestinationURL: destination)
+
+            let stub = ConfstrStub(
+                coversARealRoot
+                    ? [
+                        _CS_DARWIN_USER_CACHE_DIR: aliasCache.path,
+                        // The destination declared separately, as a real
+                        // directory: the alias is droppable.
+                        _CS_DARWIN_USER_TEMP_DIR: destination.path,
+                    ]
+                    : [_CS_DARWIN_USER_CACHE_DIR: aliasCache.path]
+            )
+            let provider = ContactForbiddingProvider(
+                // When the destination is ALSO a declared root, naming it is
+                // legitimate — what must not happen is resolving the link to
+                // reach it.
+                offLimits: coversARealRoot ? nil : canonicalPath(destination),
+                neverResolved: [declaredPath(aliasCache)],
+                fail: { XCTFail("\($0) (covers a real root: \(coversARealRoot))") }
+            )
+
+            let resolved = EphemeralTempRoots.resolve(
+                provider: provider, confstrPath: stub.resolve(_:)
+            )
+
+            // The behaviour is unchanged by the no-contact rule — asserted
+            // here so a mutation that satisfies the rule by doing nothing at
+            // all cannot pass this cell.
+            if coversARealRoot {
+                XCTAssertEqual(resolved.issues.map(\.kind), [.symlinkRoot])
+                XCTAssertNil(root(resolved.roots, labelled: EphemeralTempRoots.userCache),
+                             "the alias is still dropped")
+            } else {
+                XCTAssertEqual(resolved.issues, [])
+                XCTAssertEqual(
+                    root(resolved.roots, labelled: EphemeralTempRoots.userCache)?
+                        .url.path,
+                    declaredPath(aliasCache),
+                    "an alias covered by nothing is still kept AT THE LINK"
+                )
+            }
+        }
+    }
+
+    /// The residual the name comparison leaves, measured rather than claimed.
+    ///
+    /// The link is written through a THIRD spelling of the real root —
+    /// neither the parent-canonical one nor the raw source one — by pointing
+    /// it through a sibling symlinked directory. The inode key this replaced
+    /// would have collapsed it; a name compare cannot. What matters is the
+    /// DIRECTION of the miss: both roots survive, so the real one is scanned
+    /// exactly as before, and the alias carries no registration issue because
+    /// fn-6.2's no-follow root gate is what classifies it at scan time.
+    func testAliasWrittenThroughAThirdSpellingKeepsBothRootsRatherThanGuessing()
+        throws
+    {
+        let realTemp = try mkdir(base.appendingPathComponent("real-T"))
+        // A third spelling of `real-T`: through a symlinked PARENT.
+        let parentAlias = base.appendingPathComponent("bucket-alias")
+        try fm.createSymbolicLink(at: parentAlias, withDestinationURL: base)
+        let aliasCache = base.appendingPathComponent("alias-C")
+        try fm.createSymbolicLink(
+            at: aliasCache,
+            withDestinationURL: parentAlias.appendingPathComponent("real-T")
+        )
+
+        let stub = ConfstrStub([
+            _CS_DARWIN_USER_CACHE_DIR: aliasCache.path,
+            _CS_DARWIN_USER_TEMP_DIR: realTemp.path,
+        ])
+
+        let resolved = EphemeralTempRoots.resolve(confstrPath: stub.resolve(_:))
+
+        XCTAssertEqual(
+            root(resolved.roots, labelled: EphemeralTempRoots.userTemp)?.url.path,
+            canonicalPath(realTemp),
+            "the REAL root survives — that is the half that must never be lost"
+        )
+        XCTAssertEqual(
+            root(resolved.roots, labelled: EphemeralTempRoots.userCache)?.url.path,
+            declaredPath(aliasCache),
+            "the unrecognised alias is KEPT at the link, not silently dropped"
+        )
+        XCTAssertEqual(resolved.issues, [],
+                       "no registration issue — the scan-time root gate is "
+                           + "what classifies a kept symlink root")
+    }
+
+    /// The name arithmetic on its own: relative and `..` targets are folded
+    /// in the STRING, and nothing that cannot become a usable absolute path
+    /// is ever offered for comparison.
+    func testLexicalTargetPathFoldsWithoutTouchingTheFilesystem() {
+        let link = URL(fileURLWithPath: "/private/var/folders/mq/bucket/C")
+        func fold(_ content: String) -> String? {
+            EphemeralTempRoots.lexicalTargetPath(ofLink: link, content: content)
+        }
+        XCTAssertEqual(fold("T"), "/private/var/folders/mq/bucket/T",
+                       "a relative target joins the LINK's own directory")
+        XCTAssertEqual(fold("./T"), "/private/var/folders/mq/bucket/T")
+        XCTAssertEqual(fold("../other/T"), "/private/var/folders/mq/other/T")
+        XCTAssertEqual(fold("/var/folders/mq/bucket/T"),
+                       "/var/folders/mq/bucket/T",
+                       "an absolute target is folded but NEVER canonicalized "
+                           + "— /var is left alone")
+        XCTAssertEqual(fold("/private/tmp/"), "/private/tmp",
+                       "a trailing slash is not a spelling difference")
+        XCTAssertNil(fold(""), "empty content names nothing")
+        XCTAssertNil(fold("/"), "the filesystem root is never a temp root")
+        XCTAssertNil(fold("/.."), "a target that walks off the root is refused")
+    }
+
     // MARK: - R2: live-Mac integration (conditionally skipped)
 
     func testLiveConfstrResolvesPerUserContainersUnderPrivateVarFolders() throws {

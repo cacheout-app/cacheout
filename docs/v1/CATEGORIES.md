@@ -483,11 +483,15 @@ three dispositions that reduce them are:
   skipped **silently**;
 - a root that is present but **unreadable** is reported as a **scan issue**,
   never a silent zero;
-- a root that resolves to a **symlink alias** of another declared root — a
-  `…/C` that is a link onto `…/T`, say — is dropped at RESOLUTION time with a
+- a root that is a **symlink naming** another declared root — a `…/C` that is
+  a link onto `…/T`, say — is dropped at RESOLUTION time with a
   `symlink_root` issue naming the dropped spelling, so the covering root is
   scanned once instead of twice and the drop is never silent. The ALIAS is
-  what goes; the real root always survives.
+  what goes; the real root always survives. Resolution READS the link and
+  never follows it, so a replaced root cannot make Cacheout touch whatever it
+  points at while the app is starting up — and a link spelled so that it
+  cannot be matched to a declared root is therefore kept rather than dropped,
+  and the scan refuses it with the same `symlink_root` issue.
 
 Nothing below the first level is listed: the entry itself is the unit.
 

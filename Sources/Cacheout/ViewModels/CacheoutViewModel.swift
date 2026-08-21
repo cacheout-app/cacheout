@@ -620,15 +620,44 @@ class CacheoutViewModel: ObservableObject {
         outcomesByScannerID.values.contains { !$0.items.isEmpty }
     }
 
+    /// Whether ANY per-item scanner has never been inspected — the outer
+    /// gate's share of `ScannerSectionModel.isAwaitingFirstScan`, hoisted
+    /// here for the same reason `isDisplayed` was hoisted onto the section
+    /// model: `ContentView`'s body is assertion-dead, so a visibility rule
+    /// spelled only there cannot be pinned by a cell.
+    var hasAwaitingFirstScanSection: Bool {
+        perItemSections.contains { $0.isAwaitingFirstScan }
+    }
+
     /// What the results list gates on: items OR classified issues OR a
-    /// malformed-outcome surface. An issue-only scan (every root denied,
-    /// zero items) and a first-event malformed scanner both MUST render —
-    /// a denied search root is information, never an empty state (R14/D6),
-    /// and a fail-closed refusal is only fail-closed if it is visible.
+    /// malformed-outcome surface OR a scanner that has never been inspected.
+    /// An issue-only scan (every root denied, zero items) and a first-event
+    /// malformed scanner both MUST render — a denied search root is
+    /// information, never an empty state (R14/D6), and a fail-closed refusal
+    /// is only fail-closed if it is visible.
+    ///
+    /// THE FOURTH CLAUSE IS WHAT MAKES r11's DISCLOSURE REACHABLE (PR #459
+    /// codex r14, DISCLOSURE). r11 taught a never-inspected section to say
+    /// "not scanned yet" and hoisted `isDisplayed` so a cell could pin it,
+    /// then disclosed — and did not close — that this outer gate still could
+    /// not see it. On the machine the disclosure exists for, that gap is
+    /// total: the participating scanners publish EMPTY outcomes (no items, no
+    /// errors, nothing malformed), all three clauses above read false,
+    /// `cachesTab` takes its `emptyState` branch, and the results list —
+    /// with it every section, `isDisplayed` included — is never built. So the
+    /// "not yet scanned" row for `ephemeral_tmp` appeared on exactly the
+    /// machines that did not need it and never on a clean one.
+    ///
+    /// FOLDED HERE RATHER THAN RE-WORDING `emptyState`, because the two are
+    /// different claims. The empty state can only speak for the window; it
+    /// cannot name WHICH scanner has not run, and naming it is the whole
+    /// disclosure. Its own text is a separate, pre-existing matter — see the
+    /// residual recorded at `ContentView.swift`'s gate.
     var hasDisplayableScanOutput: Bool {
         hasResults
             || outcomesByScannerID.values.contains { !$0.errors.isEmpty }
             || !malformedIssuesByScannerID.isEmpty
+            || hasAwaitingFirstScanSection
     }
 
     var hasSelection: Bool { !selectedItemKeys.isEmpty }

@@ -97,7 +97,23 @@ struct ContentView: View {
 
             // Results list — gated on DISPLAYABLE output, not just items:
             // an issue-only scan (denied roots, malformed outcome) must
-            // render its warnings, never the empty state (R14/D6).
+            // render its warnings, and a scanner that has NEVER BEEN
+            // INSPECTED must reach its own "not yet scanned" row, never the
+            // empty state (R14/D6; PR #459 codex r14 for the fourth clause).
+            // The whole predicate lives on the view model because this
+            // expression is assertion-dead.
+            //
+            // RESIDUAL, RECORDED AT MEASURED SCOPE. `emptyState` below says
+            // "Click Scan to find caches". After a scan in which every
+            // per-item scanner published and nothing was found, that is an
+            // invitation to do what was just done — it does not say a scan
+            // has run and found nothing. Folding the awaiting clause into
+            // the gate shrinks the set of machines that see it (a machine
+            // with a deferred scanner now reaches the results list instead)
+            // but does not make the sentence true for the rest. Left alone
+            // deliberately: it is the WINDOW's text, not the disclosure this
+            // round is about, and it is not covered by any cell — SwiftUI
+            // bodies are assertion-dead and this repo has no view harness.
             if viewModel.hasDisplayableScanOutput {
                 resultsList
             } else if !viewModel.isAnyScanInProgress {

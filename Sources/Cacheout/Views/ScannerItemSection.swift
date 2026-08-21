@@ -102,7 +102,7 @@ struct ScannerItemSection: View {
             //
             // RESIDUAL, RECORDED AT MEASURED SCOPE (PR #459 codex r10, D6).
             // This call is the LAST link before the user's eye — every
-            // per-item scanner reaches it from `ContentView.swift:181-186`,
+            // per-item scanner reaches it from `ContentView.swift:203-208`,
             // and every disclosure the scanners work to produce (fn-6.1's
             // `.symlinkRoot` alias drop, denied roots, truncated listings, a
             // malformed outcome) is displayed by this line and by nothing
@@ -185,10 +185,17 @@ struct ScannerItemSection: View {
             // `isDisplayed` now admits the never-inspected case and this
             // block says so. A scanner that ran and found nothing is still
             // hidden, so an ABSENT section means that and nothing else.
-            // (Scoped to the results list: when nothing at all has results
-            // `ContentView` renders its window-level empty state instead,
-            // and no section of any kind appears — a different surface,
-            // which says in so many words that no scan has run.)
+            //
+            // AND THE OUTER GATE NOW ADMITS IT TOO (PR #459 codex r14). The
+            // sentence that stood here said the window-level empty state
+            // "says in so many words that no scan has run"; it says "Click
+            // Scan to find caches", which is an invitation, names no
+            // scanner, and is what a clean machine saw INSTEAD of this
+            // block — `hasDisplayableScanOutput` read false with every
+            // participating scanner's outcome empty, so the results list
+            // that would have built this section was never built.
+            // `CacheoutViewModel.hasAwaitingFirstScanSection` is that
+            // gate's share of the same predicate.
             if isExpanded && section.isAwaitingFirstScan {
                 VStack(spacing: 8) {
                     Image(systemName: "magnifyingglass")

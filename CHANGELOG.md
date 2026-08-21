@@ -87,7 +87,12 @@ and docs/v1/CLI-REFERENCE.md) — the pre-release `node_modules` →
   "Not yet scanned" instead of a size and a count, so a location nobody has
   looked at never reads as a location with nothing in it. (Any per-item
   scanner in that state says the same; a scanner that HAS run and found
-  nothing keeps its section hidden, as before.)
+  nothing keeps its section hidden, as before.) That row now appears on a
+  machine where the automatic scan found NOTHING, which is where it matters
+  most — the results list is built whenever some scanner has yet to run, not
+  only when something was found or something went wrong. Previously a clean
+  machine went straight to the window's "Click Scan to find caches" screen
+  and the row was never built at all.
   Thresholds persist as `cacheout.ephemeralTmp.ageDays` /
   `cacheout.ephemeralTmp.minSizeMB` and take invocation-scoped
   `--tmp-age-days` / `--tmp-min-size-mb` overrides on `scan` and `clean`

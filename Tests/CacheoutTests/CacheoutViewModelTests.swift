@@ -1518,6 +1518,78 @@ final class CacheoutViewModelTests: XCTestCase {
                       "the issue block renders (unchanged behavior)")
     }
 
+    /// THE OUTER GATE, on the machine the disclosure exists for (PR #459
+    /// codex r14). r11 gave a never-inspected section `isDisplayed` and a
+    /// "not scanned yet" label, then disclosed — and left open — that
+    /// `hasDisplayableScanOutput` could not see it. This is the state that
+    /// gap is total in: a CLEAN machine, where the participating scanner
+    /// publishes an EMPTY outcome and the deferred one publishes nothing.
+    /// All three original clauses read false, `cachesTab` takes its
+    /// `emptyState` branch, and the results list that would have built the
+    /// section — and evaluated `isDisplayed` at all — is never built.
+    ///
+    /// Both halves are asserted: the section still says it wants to be
+    /// shown, AND the gate above it now agrees.
+    @MainActor
+    func testACleanScanStillDisplaysASectionThatWasNeverInspected() async throws {
+        let runtime = try makeRuntime([
+            fixtureScanner("looked") { ScanOutcome(items: [], errors: []) },
+            fixtureScanner("deferred") { ScanOutcome(items: [], errors: []) },
+        ])
+        let viewModel = CacheoutViewModel(runtime: runtime)
+
+        await viewModel.scan(trigger: .userInitiated, scannerIDs: ["looked"])
+
+        // The three original clauses, each false — nothing was found and
+        // nothing went wrong.
+        XCTAssertFalse(viewModel.hasResults, "no items anywhere")
+        XCTAssertTrue(
+            viewModel.outcomesByScannerID.values.allSatisfy { $0.errors.isEmpty },
+            "no classified issues anywhere"
+        )
+        XCTAssertTrue(viewModel.malformedIssuesByScannerID.isEmpty,
+                      "nothing malformed")
+
+        let deferredSection = try XCTUnwrap(
+            viewModel.perItemSections.first { $0.scannerID == "deferred" }
+        )
+        XCTAssertTrue(deferredSection.isDisplayed,
+                      "r11's half: the section asks to be rendered")
+        XCTAssertTrue(
+            viewModel.hasAwaitingFirstScanSection,
+            "…and the fourth clause sees it"
+        )
+        XCTAssertTrue(
+            viewModel.hasDisplayableScanOutput,
+            "a never-inspected scanner is displayable output — otherwise the "
+                + "results list is never built and the 'not yet scanned' row "
+                + "is unreachable on exactly the machines it exists for"
+        )
+    }
+
+    /// The other direction, so the fourth clause is a GATE and not a
+    /// constant: once every per-item scanner has published, a clean machine
+    /// is displayable-empty again and the window-level empty state is what
+    /// renders.
+    @MainActor
+    func testAFullyInspectedCleanMachineIsNotDisplayable() async throws {
+        let runtime = try makeRuntime([
+            fixtureScanner("a") { ScanOutcome(items: [], errors: []) },
+            fixtureScanner("b") { ScanOutcome(items: [], errors: []) },
+        ])
+        let viewModel = CacheoutViewModel(runtime: runtime)
+
+        await viewModel.scan(trigger: .userInitiated)
+
+        XCTAssertFalse(viewModel.hasAwaitingFirstScanSection,
+                       "every scanner published")
+        XCTAssertFalse(
+            viewModel.hasDisplayableScanOutput,
+            "nothing found, nothing deferred, nothing wrong — the empty "
+                + "state is the correct surface here"
+        )
+    }
+
     // MARK: - Runtime reconstruction (fn-4.10, R8)
 
     /// The seam is OPT-IN: a view model handed a finished runtime and no

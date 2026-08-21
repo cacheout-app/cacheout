@@ -282,7 +282,7 @@ struct EphemeralTempScanner: @unchecked Sendable {
     /// implementation — injected or production — to materialize the full
     /// array before the scanner saw one entry. Basenames and a truncation
     /// CAUSE, never URLs: the scan rebuilds each entry under the DECLARED
-    /// canonical root spelling anyway. The cause (rather than the `Bool` that
+    /// root spelling anyway. The cause (rather than the `Bool` that
     /// stood here until r7, codex C2) is what lets the root arm say WHY the
     /// listing stopped instead of inferring it from the entry count.
     typealias DirectoryLister = @Sendable (URL, Int) throws
@@ -318,8 +318,9 @@ struct EphemeralTempScanner: @unchecked Sendable {
 
     // MARK: - Stored state (all construction state — never `ScanContext`)
 
-    /// The resolved roots, canonical spellings verbatim (fn-6.1). Injectable:
-    /// no unit test ever reads a real temp root.
+    /// The resolved roots, DECLARED spellings verbatim (fn-6.1 — canonical
+    /// parent chain, leaf unresolved, so a root whose leaf is a symlink is
+    /// NOT canonical). Injectable: no unit test ever reads a real temp root.
     let roots: [EphemeralTempRoot]
     /// Classified issues fn-6.1's resolution produced for the spellings it
     /// DROPPED — today exactly one shape, an alias of a root declared
@@ -516,7 +517,7 @@ struct EphemeralTempScanner: @unchecked Sendable {
     var id: String { Self.registeredID }
     var displayName: String { "Ephemeral Temp Files" }
 
-    /// The canonical root spellings, declared at REGISTRATION — this is HOW
+    /// The declared root spellings, fixed at REGISTRATION — this is HOW
     /// the container reaches the cleaner (the runtime unions scanner-declared
     /// roots into PathGuard's delete-time admission; nothing item-side can
     /// widen it). fn-6.1 resolved each root exactly once — canonical parent
@@ -631,8 +632,12 @@ struct EphemeralTempScanner: @unchecked Sendable {
             // THE OVER-MOUNTED-ROOT ARM (PR #459 review r6, codex C2 —
             // AVAILABILITY): a volume mounted EXACTLY at this root, answered
             // from the table snapshot above by pure string membership (the
-            // kernel spells `f_mntonname` canonically — the same spelling
-            // fn-6.1 declares roots in). Every root-touching syscall below
+            // kernel spells `f_mntonname` canonically, which is the spelling
+            // fn-6.1 declares whenever the root's own leaf is a real
+            // directory — the only case where a mount AT the root can hang
+            // anything, since `lstat` of a symlink leaf never crosses into
+            // the mount and the kind gate below refuses it). Every
+            // root-touching syscall below
             // this line — the kind gate's `lstat`, `admitSearchRoot`'s
             // realpath/lstat/statfs, `rootDevice`, the listing — is served
             // BY the mounted filesystem when the root IS a mount point, so
@@ -718,17 +723,18 @@ struct EphemeralTempScanner: @unchecked Sendable {
             // PARENT CHAIN once, and the walk composes children from that
             // spelling without following links, so the two spellings agree.
             // A root whose own leaf is a symlink never reaches this line —
-            // the no-follow root gate above refused it). `rootDevice` is the racing-mount arm's
-            // baseline: one `lstat` of the ROOT itself — foreign only when
-            // a mount lands on the root AFTER the over-mounted-root arm's
-            // table check above (r6, codex C2: in that racing window this
-            // lstat is also the scan's first, possibly hanging, contact,
-            // and the foreign baseline blinds the racing-device arm for
-            // this root's candidates, whose entries share the foreign
-            // device — disclosure-class; the delete-time gates behind it
-            // hold). A `nil` rootDevice (the root vanished since its gate)
-            // skips only that arm — the table arm still stands, and the
-            // sizer/cleaner mount gates behind it are unchanged.
+            // the no-follow root gate above refused it). `rootDevice` is the
+            // racing-mount arm's baseline: one `lstat` of the ROOT itself —
+            // foreign only when a mount lands on the root AFTER the
+            // over-mounted-root arm's table check above (r6, codex C2: in
+            // that racing window this lstat is also the scan's first,
+            // possibly hanging, contact, and the foreign baseline blinds
+            // the racing-device arm for this root's candidates, whose
+            // entries share the foreign device — disclosure-class; the
+            // delete-time gates behind it hold). A `nil` rootDevice (the
+            // root vanished since its gate) skips only that arm — the table
+            // arm still stands, and the sizer/cleaner mount gates behind it
+            // are unchanged.
             let mountsUnderRoot = Self.mountPoints(
                 in: mountTable, strictlyUnder: root.url
             )
@@ -781,9 +787,12 @@ struct EphemeralTempScanner: @unchecked Sendable {
             // was ever proven to exist — and `.enumerationTruncated`'s only
             // GUI label is the fixed sentence "too many entries — partially
             // inspected", which is simply false for a failed read. So a read
-            // failure takes the same `.unreadable` denial route the per-entry
-            // arms use, and `.enumerationTruncated` now means a cap hit and
-            // nothing else.
+            // failure takes the same CLASSIFIED denial route the per-entry
+            // arms use — `record` -> `classify`, which maps EACCES to
+            // `.permissionDenied` and EPERM (with every other errno) to
+            // `.unreadable`; naming only one of the two here would be a
+            // claim the code does not make. `.enumerationTruncated` now
+            // means a cap hit and nothing else.
             switch listing.truncation {
             case .budget:
                 issues.append(ScanIssue(
@@ -819,7 +828,7 @@ struct EphemeralTempScanner: @unchecked Sendable {
                 $0.utf8.lexicographicallyPrecedes($1.utf8)
             }) {
                 if Task.isCancelled { break }
-                // Build under the DECLARED canonical root: the listing hands
+                // Build under the DECLARED root spelling: the listing hands
                 // back bare basenames, and identity/display/deletion must all
                 // speak the root spelling this scanner declared.
                 let entry = root.url.appendingPathComponent(name)
@@ -837,8 +846,9 @@ struct EphemeralTempScanner: @unchecked Sendable {
                 // NOT a strand (the deterministic-bound rule): unmounting is
                 // a real remedy and the row's message says so.
                 // `resolveTargetKeepingLeaf` resolves only the PARENT chain
-                // — the root, already canonical — so it touches nothing
-                // foreign.
+                // — the root, whose own leaf the no-follow gate above proved
+                // a real directory, so ITS spelling is fully canonical by
+                // then — so it touches nothing foreign.
                 if mountsUnderRoot.contains(entry.path) {
                     let identity = provider.resolveTargetKeepingLeaf(entry)
                     guard seenIdentities.insert(identity.path).inserted else {

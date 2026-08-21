@@ -2043,7 +2043,10 @@ final class EphemeralTempScannerTests: XCTestCase {
     /// writing. Worse, `.enumerationTruncated`'s single GUI label is the
     /// fixed sentence "too many entries — partially inspected"
     /// (`ScannerItemSection.label(for:)`), which is simply false for a read
-    /// that FAILED. So a read failure now takes `.unreadable`, and
+    /// that FAILED. So a read failure now takes the CLASSIFIED denial route:
+    /// `classify` maps EACCES to `.permissionDenied` and EPERM (with every
+    /// other errno) to `.unreadable`, so the kind follows the errno rather
+    /// than being fixed. This cell drives EIO, i.e. the `.unreadable` arm.
     /// `.enumerationTruncated` means a cap hit and nothing else.
     func testRootReadFailureIsNotReportedAsTooManyEntries() async throws {
         for name in ["cap-a", "cap-b", "cap-c"] {
@@ -2068,9 +2071,10 @@ final class EphemeralTempScannerTests: XCTestCase {
         )
         XCTAssertEqual(
             issue.kind, .unreadable,
-            "a listing that FAILED is a denial — `.enumerationTruncated` "
-                + "renders as \"too many entries — partially inspected\", "
-                + "which would be a false claim about the cause"
+            "EIO takes `classify`'s default arm; a listing that FAILED is a "
+                + "denial either way — `.enumerationTruncated` renders as "
+                + "\"too many entries — partially inspected\", which would be "
+                + "a false claim about the cause"
         )
         XCTAssertFalse(
             issue.detail.contains("holds more than"),
@@ -2080,6 +2084,24 @@ final class EphemeralTempScannerTests: XCTestCase {
         XCTAssertTrue(
             issue.detail.contains("could not be enumerated completely"),
             issue.detail
+        )
+
+        // The OTHER arm of the same route (r8, D6): the kind follows the
+        // errno, so a comment or message naming just one of the two is a
+        // claim the code does not make.
+        let denied = await scan(makeScanner(
+            roots: [sharedRoot()], rootEntryLimit: 3,
+            listDirectory: { url, limit in
+                let read = try EphemeralTempScanner.boundedFirstLevelNames(
+                    of: url, limit: limit
+                )
+                return (read.names, .readFailed(errno: EACCES))
+            }
+        ))
+        XCTAssertEqual(
+            denied.errors.first?.kind, .permissionDenied,
+            "EACCES is unambiguous BSD permissions — `classify` does not "
+                + "flatten it to `.unreadable`: \(denied.errors)"
         )
     }
 

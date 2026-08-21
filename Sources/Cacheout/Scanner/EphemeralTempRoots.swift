@@ -34,7 +34,7 @@
 /// exist right after resolution. The live output also carries a TRAILING
 /// SLASH, normalized away here before any URL is built.
 ///
-/// ## Canonical-spelling discipline (R3), and why the LEAF stays unresolved
+/// ## One-spelling discipline (R3), and why the LEAF stays unresolved
 ///
 /// Every root is resolved EXACTLY ONCE, here, via
 /// `FileSystemIdentityProvider.resolveTargetKeepingLeaf(_:)`: the PARENT
@@ -194,9 +194,10 @@ struct EphemeralTempRootsResolution: Equatable, Sendable {
 
 // MARK: - Root model (R2/R3/R14)
 
-/// One RESOLVED ephemeral temp root: the canonical URL plus the three
-/// declared facts fn-6.2 needs — a human label, the truthful per-root
-/// OS-cleanup evidence line, and the static writability class.
+/// One RESOLVED ephemeral temp root: the resolved URL — canonical PARENT
+/// chain, leaf UNRESOLVED — plus the three declared facts fn-6.2 needs: a
+/// human label, the truthful per-root OS-cleanup evidence line, and the
+/// static writability class.
 struct EphemeralTempRoot: Equatable, Sendable {
 
     /// The DECLARED write scope of a temp root — static, never probed
@@ -211,9 +212,16 @@ struct EphemeralTempRoot: Equatable, Sendable {
         case perUser
     }
 
-    /// The ONE canonical spelling (R3): `trustedContainerRoots`,
+    /// The ONE spelling (R3) — canonical PARENT chain with the leaf left
+    /// UNRESOLVED, NOT a fully canonical URL: `trustedContainerRoots`,
     /// `originContainer`, root records and item identity parent chains all
     /// derive from exactly this URL.
+    ///
+    /// Do not "fix" this into a `canonicalize` call. Resolving the leaf is
+    /// what registers a symlinked container's DESTINATION as a trusted root,
+    /// which the file header explains and which a live cell measures ending
+    /// in a deleted `~/Documents` subtree
+    /// (`EphemeralTempScannerTests.testResolvedSymlinkContainerIsRefusedAndItsTargetSurvives`).
     let url: URL
     /// Short human label — disambiguates the two per-user containers in
     /// item evidence and root records.
@@ -342,7 +350,7 @@ enum EphemeralTempRoots {
             definition -> (definition: Definition, declared: URL,
                            key: URL, isDirectory: Bool)? in
             guard let raw = rawPath(for: definition.source, confstrPath: confstrPath),
-                  let declared = canonicalRoot(fromRawPath: raw, provider: provider)
+                  let declared = resolvedRoot(fromRawPath: raw, provider: provider)
             else { return nil }
             return (definition: definition,
                     declared: declared,
@@ -419,6 +427,10 @@ enum EphemeralTempRoots {
     /// root can never be a temp container, and registering it would hand the
     /// deletion layer the widest possible trusted root.
     ///
+    /// NOT named `canonicalRoot` (r8, D5): the result is deliberately not
+    /// canonical when the leaf is a link, and a name that says otherwise is
+    /// how a maintainer talks themselves into `canonicalize`.
+    ///
     /// The leaf is deliberately NOT followed. This URL becomes a trusted
     /// container root, so resolving a symlink leaf here would register the
     /// link's DESTINATION — an attacker-chosen or user-relocated directory —
@@ -428,7 +440,7 @@ enum EphemeralTempRoots {
     /// visibly. Probing nothing is still this layer's contract: this is a
     /// spelling transform, and whether the leaf IS a link is judged at scan
     /// time, where absence and denial are already told apart.
-    static func canonicalRoot(
+    static func resolvedRoot(
         fromRawPath raw: String,
         provider: FileSystemIdentityProvider = FileSystemIdentityProvider()
     ) -> URL? {

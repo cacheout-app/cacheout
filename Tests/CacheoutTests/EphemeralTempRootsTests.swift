@@ -150,18 +150,19 @@ final class EphemeralTempRootsTests: XCTestCase {
         }
     }
 
-    // MARK: - R3: one canonical spelling, inode de-dupe
+    // MARK: - R3: one spelling (parent-canonical, leaf unresolved), inode
+    // de-dupe and alias suppression
 
     func testTrailingSlashesAreStrippedBeforeCanonicalization() {
         let provider = FileSystemIdentityProvider()
         XCTAssertEqual(
-            EphemeralTempRoots.canonicalRoot(
+            EphemeralTempRoots.resolvedRoot(
                 fromRawPath: "/private/tmp/", provider: provider
             )?.path,
             "/private/tmp"
         )
         XCTAssertEqual(
-            EphemeralTempRoots.canonicalRoot(
+            EphemeralTempRoots.resolvedRoot(
                 fromRawPath: "/private/tmp///", provider: provider
             )?.path,
             "/private/tmp"
@@ -173,7 +174,7 @@ final class EphemeralTempRootsTests: XCTestCase {
         // `/private/tmp` (EphemeralTempRoots.sharedTemp) precisely so the
         // canonical spelling is the one that ships.
         XCTAssertEqual(
-            EphemeralTempRoots.canonicalRoot(
+            EphemeralTempRoots.resolvedRoot(
                 fromRawPath: "/tmp", provider: provider
             )?.path,
             "/tmp",
@@ -181,7 +182,7 @@ final class EphemeralTempRootsTests: XCTestCase {
                 + "the destination as a trusted container root"
         )
         XCTAssertNil(
-            EphemeralTempRoots.canonicalRoot(fromRawPath: "/", provider: provider),
+            EphemeralTempRoots.resolvedRoot(fromRawPath: "/", provider: provider),
             "the filesystem root can never be a temp container"
         )
     }
@@ -327,7 +328,10 @@ final class EphemeralTempRootsTests: XCTestCase {
         )
     }
 
-    func testResolvedRootsAreCanonicalIdempotentAndDistinct() {
+    /// The exposed spelling is parent-canonical with an UNRESOLVED leaf. On a
+    /// stock Mac that ALSO happens to be fully canonical, which this cell
+    /// measures rather than claims — see the note inside.
+    func testResolvedRootsAreAbsoluteDistinctAndFullyCanonicalOnThisMachine() {
         let provider = FileSystemIdentityProvider()
         let roots = EphemeralTempRoots.resolve(provider: provider).roots
 

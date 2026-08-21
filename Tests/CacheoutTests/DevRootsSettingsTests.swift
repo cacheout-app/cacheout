@@ -432,6 +432,63 @@ final class DevRootsSettingsTests: XCTestCase {
                        "a BSD-permission denial has no System Settings remedy")
     }
 
+    /// AN OVER-MOUNTED ROOT SAYS SO, IN THE VISIBLE ROW (PR #459 codex r11,
+    /// P2 DISCLOSURE).
+    ///
+    /// `ScanIssuesBlock` renders `row.text` and relegates `issue.detail` to
+    /// a `.help` tooltip, so whatever the KIND maps to is the whole visible
+    /// diagnosis. Under `.containerRefused` this row read "not a configured
+    /// search root" — false for a root that is registered and admissible —
+    /// and named no remedy at all, while the true condition and the fix sat
+    /// in the hover text.
+    ///
+    /// The two kinds are asserted TOGETHER and must differ in both halves:
+    /// the mounted row states the condition AND its remedy, and the refusal
+    /// row is left exactly as it was, because `DevRootsStore` (a
+    /// policy-rejected persisted root), `ProjectTreeWalker` (a scan-time
+    /// admission refusal) and `EphemeralTempScanner`'s own
+    /// `admitSearchRoot` catch all still render through it.
+    func testAMountedRootRowStatesTheConditionAndTheRemedyRefusalRowUnchanged() throws {
+        let root = URL(fileURLWithPath: "/private/tmp")
+        let mounted = ScanIssueRowPresentation(
+            issue: ScanIssue(
+                url: root, kind: .mountedVolumeRoot,
+                detail: "Shared temp is a mounted volume — not scanned; its "
+                    + "contents belong to that volume. "
+                    + EphemeralTempScanner.mountRemedy
+            ),
+            home: fixtureHome
+        )
+        XCTAssertEqual(mounted.location, "/private/tmp",
+                       "the row NAMES the over-mounted root")
+        XCTAssertEqual(
+            mounted.label, "mounted volume; eject or unmount it, then re-scan"
+        )
+        XCTAssertEqual(
+            mounted.text,
+            "/private/tmp — mounted volume; eject or unmount it, then re-scan",
+            "the VISIBLE line carries both the condition and the remedy"
+        )
+        XCTAssertFalse(
+            mounted.label.contains("not a configured search root"),
+            "the root IS configured — that sentence was the defect"
+        )
+        XCTAssertFalse(mounted.showsSettingsLink,
+                       "Full Disk Access cannot unmount a volume")
+
+        // The OTHER producers of `.containerRefused` are untouched: same
+        // kind, same fixed label as before this change.
+        let refusal = ScanIssueRowPresentation(
+            issue: ScanIssue(
+                url: root, kind: .containerRefused, detail: "refused: …"
+            ),
+            home: fixtureHome
+        )
+        XCTAssertEqual(refusal.label, "not a configured search root")
+        XCTAssertNotEqual(refusal.label, mounted.label,
+                          "two conditions, two sentences")
+    }
+
     /// END TO END through the REAL scanner: a policy-rejected persisted root
     /// and a corrupt stored value both reach the GUI section as VISIBLE
     /// issue rows — never a zero-byte item row, never an empty section.

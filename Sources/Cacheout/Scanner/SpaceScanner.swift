@@ -419,6 +419,19 @@ struct ScanIssue: Equatable, Sendable {
     enum Kind: Equatable, Sendable {
         /// `PathGuard.admitContainer` refused the search root.
         case containerRefused
+        /// A REGISTERED search root that the kernel's mount table names as a
+        /// mount point: another volume stands at that path, so what is there
+        /// belongs to that volume and is not the root's own contents. The
+        /// root is NOT refused as a root — it is registered and admissible —
+        /// and the condition is CLEARABLE by the user: unmount, re-scan.
+        ///
+        /// Its own kind because the GUI's visible row label is derived from
+        /// the kind alone (`ScanIssueRowPresentation.label(for:)`), and
+        /// `.containerRefused`'s label — "not a configured search root" —
+        /// states the opposite of the truth here and names no remedy
+        /// (PR #459 codex r11, DISCLOSURE). A FILESYSTEM kind: `url` names
+        /// the over-mounted root.
+        case mountedVolumeRoot
         /// The search root is a symlink (or not a real directory).
         case symlinkRoot
         /// macOS TCC (privacy) denial — EPERM under the Cocoa error.
@@ -462,6 +475,7 @@ struct ScanIssue: Equatable, Sendable {
         var wireString: String {
             switch self {
             case .containerRefused: return "container_refused"
+            case .mountedVolumeRoot: return "mounted_volume_root"
             case .symlinkRoot: return "symlink_root"
             case .tccDenied: return "tcc_denied"
             case .permissionDenied: return "permission_denied"

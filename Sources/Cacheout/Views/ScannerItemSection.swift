@@ -282,6 +282,13 @@ struct ScanIssueRowPresentation: Equatable {
     private static func label(for kind: ScanIssue.Kind) -> String {
         switch kind {
         case .containerRefused: return "not a configured search root"
+        // The visible row must state the TRUE condition and the remedy
+        // (PR #459 codex r11): this root IS configured, and the user clears
+        // it by unmounting. Under `.containerRefused` the row said the
+        // opposite and left the remedy in `detail`, which this block shows
+        // only as a hover tooltip.
+        case .mountedVolumeRoot:
+            return "mounted volume; eject or unmount it, then re-scan"
         case .symlinkRoot: return "symlinked — not searched"
         case .tccDenied: return "access denied by macOS privacy settings"
         case .permissionDenied: return "permission denied"

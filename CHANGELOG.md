@@ -129,10 +129,19 @@ and docs/v1/CLI-REFERENCE.md) — the pre-release `node_modules` →
   refused by the sizing and delete-time mount gates that always stood.
   **A volume mounted exactly AT a temp root is refused the same way**: the
   scan answers from the mount table before any syscall touches the root and
-  reports it as a visible refusal whose message says unmounting clears it
-  (previously the refusal happened only after several syscalls served by
-  the mounted volume — a hang on an unresponsive hard mount — and never
-  named the remedy). The same table read now guards the scan session's
+  reports it as a visible row that names the condition and the remedy —
+  "mounted volume; eject or unmount it, then re-scan" (previously the
+  refusal happened only after several syscalls served by the mounted volume
+  — a hang on an unresponsive hard mount — and never named the remedy).
+  That row is its OWN classification: `scanner_errors[].kind` is
+  `"mounted_volume_root"`, an ADDITION to an enumeration the protocol has
+  always declared extensible (`schema_version` stays 4). It was
+  `"container_refused"` until PR #459 review r11, which made the app's
+  visible label — derived from the kind alone — read "not a configured
+  search root" for a root that IS configured, with the real explanation
+  reachable only by hovering. Consumers keying on `"container_refused"` for
+  this case must add the new string; every other producer of
+  `"container_refused"` is unchanged. The same table read now guards the scan session's
   container-identity capture and container admission, so a mounted
   registered root no longer has its identity read at session start or its
   path resolved when a healthy sibling root is admitted; a root skipped

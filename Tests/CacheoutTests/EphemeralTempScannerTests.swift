@@ -4001,7 +4001,7 @@ extension EphemeralTempScannerTests {
         provider.armed = false
         try assertValidates(outcome, scanner: scanner)
 
-        let refusals = outcome.errors.filter { $0.kind == .containerRefused }
+        let refusals = outcome.errors.filter { $0.kind == .mountedVolumeRoot }
         XCTAssertEqual(refusals.count, 1, "\(outcome.errors)")
         let issue = try XCTUnwrap(refusals.first)
         XCTAssertEqual(issue.url?.path, canonical(sharedRootURL).path)
@@ -4011,6 +4011,13 @@ extension EphemeralTempScannerTests {
         // refusal, and the message says so, verbatim.
         XCTAssertTrue(issue.detail.contains(EphemeralTempScanner.mountRemedy),
                       issue.detail)
+        // …and the KIND is what the GUI turns into the visible row label
+        // (PR #459 codex r11): `.containerRefused` would render "not a
+        // configured search root" for a root that IS configured.
+        XCTAssertEqual(
+            ScanIssueRowPresentation(issue: issue, home: home).label,
+            "mounted volume; eject or unmount it, then re-scan"
+        )
 
         // The arm refuses ONE root, never the scan: the sibling root's
         // candidate is still emitted.
@@ -4058,7 +4065,7 @@ extension EphemeralTempScannerTests {
                         + "\(outcome.items.map(\.displayName))")
         XCTAssertEqual(outcome.errors.count, 1, "\(outcome.errors)")
         let issue = try XCTUnwrap(outcome.errors.first)
-        XCTAssertEqual(issue.kind, .containerRefused)
+        XCTAssertEqual(issue.kind, .mountedVolumeRoot)
         XCTAssertEqual(issue.url?.path, rootPath)
         XCTAssertTrue(issue.detail.contains("is a mounted volume"),
                       issue.detail)

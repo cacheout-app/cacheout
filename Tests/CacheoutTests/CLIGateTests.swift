@@ -1045,15 +1045,21 @@ final class CLIGateTests: XCTestCase {
                            "argv arrays never appear in any row")
         }
 
-        // ALL SEVEN ScanIssue.Kind wire strings through the scanner_errors
-        // row builder — exact rows: the five filesystem kinds carry their
-        // real `path`; the non-filesystem kinds (`malformed_outcome`,
-        // `config_invalid`) have NO path key at all; `tcc_denied` ALONE
-        // additionally carries `grant_hint` (macOS denies CLI processes
-        // silently — the row must say what to do about it).
+        // ALL NINE ScanIssue.Kind wire strings through the scanner_errors
+        // row builder (the count was stale at "seven" before PR #459 codex
+        // r11 — `enumeration_truncated` and `config_invalid` had already
+        // landed) — exact rows: the six non-TCC filesystem kinds below carry
+        // their real `path`; `tcc_denied` carries its path AND, ALONE, a
+        // `grant_hint` (macOS denies CLI processes silently, so the row must
+        // say what to do about it); the two non-filesystem kinds
+        // (`malformed_outcome`, `config_invalid`) have NO path key at all.
         let url = URL(fileURLWithPath: "/tmp/wire-fixture-root")
         let filesystemKinds: [(ScanIssue.Kind, String)] = [
             (.containerRefused, "container_refused"),
+            // ADDED PR #459 codex r11 — a WIRE ADDITION on schema 4, which
+            // this release already breaks; consumers tolerate unknown kinds
+            // by contract.
+            (.mountedVolumeRoot, "mounted_volume_root"),
             (.symlinkRoot, "symlink_root"),
             (.permissionDenied, "permission_denied"),
             (.unreadable, "unreadable"),

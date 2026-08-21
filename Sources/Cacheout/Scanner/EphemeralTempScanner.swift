@@ -667,8 +667,16 @@ struct EphemeralTempScanner: @unchecked Sendable {
             // and only one landing between THAT table read and the child
             // lookups behind it can still block them.
             if mountTable.contains(root.url.path) {
+                // `.mountedVolumeRoot`, NOT `.containerRefused` (PR #459
+                // codex r11, DISCLOSURE): this root is registered and
+                // admissible — nothing refused it as a root — and the GUI
+                // derives its VISIBLE row label from the kind alone, so
+                // under `.containerRefused` the ordinary row read "not a
+                // configured search root" (false here) while the true
+                // condition and the remedy lived only in `detail`, which
+                // `ScanIssuesBlock` shows as a hover tooltip.
                 issues.append(ScanIssue(
-                    url: root.url, kind: .containerRefused,
+                    url: root.url, kind: .mountedVolumeRoot,
                     detail: "\(root.label) is a mounted volume — not "
                         + "scanned; its contents belong to that volume. "
                         + Self.mountRemedy

@@ -291,7 +291,7 @@ refreshes.
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `scanner_id` | string | yes | Which scanner reported (or failed validation) |
-| `kind` | string | yes | One of: `"container_refused"`, `"symlink_root"`, `"tcc_denied"`, `"permission_denied"`, `"unreadable"`, `"enumeration_truncated"`, `"config_invalid"`, `"malformed_outcome"`. The list is EXTENSIBLE — consumers must tolerate unknown kinds |
+| `kind` | string | yes | One of: `"container_refused"`, `"mounted_volume_root"`, `"symlink_root"`, `"tcc_denied"`, `"permission_denied"`, `"unreadable"`, `"enumeration_truncated"`, `"config_invalid"`, `"malformed_outcome"`. The list is EXTENSIBLE — consumers must tolerate unknown kinds |
 | `detail` | string | yes | Human-readable description |
 | `path` | string | conditional | Present for the FILESYSTEM kinds; ABSENT for the NON-FILESYSTEM kinds — `"malformed_outcome"` and `"config_invalid"` — where no filesystem location exists and a fake path is therefore never invented |
 | `grant_hint` | string | no | Present only when `kind == "tcc_denied"` — the same user-side remedy (Full Disk Access) as category and `scanner_items` rows, since macOS denies CLI processes silently |
@@ -309,6 +309,14 @@ silent. It carries no `path` because a config parse failure has no honest
 filesystem location. A configured root that was REJECTED by policy (the
 filesystem root, a volume root/mount point, `$HOME`) is a different thing
 and reports honestly under `container_refused` WITH its offending path.
+
+A `mounted_volume_root` row means a REGISTERED root has another volume
+mounted exactly at its path, so whatever is there belongs to that volume
+rather than to the root. It is deliberately NOT `container_refused`: the
+root is configured and admissible, nothing rejected it, and the condition is
+one the user clears — eject or unmount the volume, then re-scan. Emitted
+today by `ephemeral_tmp`, which answers from the kernel's mount table before
+any syscall touches the root.
 
 **Per-item valuables element (pinned, shared by three surfaces):** the same
 six-field object appears in `scanner_items[].valuables`, in clean plan rows

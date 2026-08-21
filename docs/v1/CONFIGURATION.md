@@ -25,7 +25,7 @@ also has an invocation-scoped CLI override that is never persisted (see
 | `cacheout.orphanedCaches.sizeFloorMB` | `Int` | `50` | `--orphan-size-floor-mb N` | Orphaned-caches sweep: stale-large size floor in decimal MB |
 | `cacheout.orphanedCaches.staleAgeDays` | `Int` | `60` | `--orphan-stale-days N` | Orphaned-caches sweep: stale-large age in days |
 | `cacheout.ephemeralTmp.minSizeMB` | `Int` | `10` | `--tmp-min-size-mb N` | Ephemeral temp scanner: entry size floor in decimal MB |
-| `cacheout.ephemeralTmp.ageDays` | `Int` | `7` | `--tmp-age-days N` | Ephemeral temp scanner: staleness age in days (newest content older than this) |
+| `cacheout.ephemeralTmp.ageDays` | `Int` | `7` | `--tmp-age-days N` | Ephemeral temp scanner: staleness age in days — the entry's own timestamp and its newest regular file must both be older than this (nested directory timestamps are not inputs; see CATEGORIES.md) |
 
 ### Scan Interval Options
 

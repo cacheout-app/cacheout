@@ -14,7 +14,7 @@ Built for developers on space-constrained Macs (especially the 256GB M4 Mac Mini
 
 - **Built-in cache categories** — Xcode, Docker, npm, Yarn, pnpm, Homebrew, Playwright, CocoaPods, Swift PM, Gradle, browser caches, VS Code, Electron, pip, and more (the full list lives in [docs/v1/CATEGORIES.md](docs/v1/CATEGORIES.md))
 - **Project build-artifact scanner** — Walks your configured dev roots for build output proven by an ecosystem marker file (`target/` beside `Cargo.toml`, `node_modules/` beside `package.json`, `.venv/` containing `pyvenv.cfg`, and more), shows size and staleness (30d+), and refuses to delete a directory holding release artifacts (`.dmg`, `.pkg`, `.ipa`, `.app`, `.xcarchive`, `.dSYM`) until you acknowledge them
-- **Ephemeral temp sweep** — Lists stale scratch directories in the temp locations macOS does not reliably prune (`/private/tmp` and your per-user temp/cache containers). An entry is listed only when neither it nor anything inside it has been written for 7 days and it holds at least 10 MB (both adjustable), and every gate is re-checked from a held descriptor immediately before deletion, so a workspace that has come back to life is refused. Age is the protection — Cacheout also skips an entry a program has advisory-locked, but it cannot see a program that merely holds a file inside it open for reading. Scanned only when you explicitly ask, never selected for you
+- **Ephemeral temp sweep** — Lists stale scratch directories in the temp locations macOS does not reliably prune (`/private/tmp` and your per-user temp/cache containers). An entry is listed only when its own timestamp and every file inside it are at least 7 days old and it holds at least 10 MB (both adjustable); timestamps on folders nested inside are not consulted, so creating an empty folder deep in an old entry does not keep it off the list. Every gate is re-checked from a held descriptor immediately before deletion, so an entry is refused if its own directory changed, or a fresh file appeared anywhere inside it, since the scan. Age is the protection — Cacheout also skips an entry a program has advisory-locked, but it cannot see a program that merely holds a file inside it open for reading. Scanned only when you explicitly ask, never selected for you
 - **Risk-level indicators** — Each category rated Safe / Review / Caution so you know what's risk-free
 - **Async parallel scanning** — Scans all categories concurrently for fast results
 - **Sparse file awareness** — Reports allocated (on-disk) usage everywhere, so sparse files — Docker's disk image, simulator disk images, and anything else logically larger than it really is — show what they actually consume, not inflated logical sizes
@@ -112,16 +112,23 @@ Headless too: `--cli scan` lists every find as a `scanner_items` row, and
 `/private/tmp` and your per-user temp and cache containers collect scratch
 directories that nothing on modern macOS reliably cleans up — a month-old
 build sandbox or agent workspace can sit there through reboots. Cacheout
-lists the stale ones: an entry qualifies when its NEWEST content is older
-than the age threshold (7 days by default) and it is at least 10 MB, so a
-directory holding one fresh file deep inside is left alone, and so is
-anything the current session just wrote.
+lists the stale ones: an entry qualifies when its own timestamp and its
+newest FILE are both older than the age threshold (7 days by default) and it
+is at least 10 MB, so a directory holding one fresh file deep inside is left
+alone, and so is anything the current session just wrote.
+
+Folder timestamps below the entry are not part of that test. Creating an
+empty folder — or deleting a file — deep inside an old entry changes only a
+nested folder's timestamp, so the entry still counts as stale and can still
+be listed and cleaned.
 
 Cacheout also skips an entry a process has taken an advisory lock on, but
 that check only sees a lock on the entry itself — it cannot detect a process
 merely holding a file open somewhere inside. Age is the real protection, and
 every gate is re-established from a held descriptor immediately before
-deletion, so an entry that has been written into since the scan is refused.
+deletion, so an entry is refused if its own directory changed, or a fresh
+file appeared anywhere inside it, since the scan — with the same blind spot:
+a change that only bumps a nested folder's timestamp is not refused.
 
 These locations are scanned only when you explicitly press Scan (or run
 `--cli scan`) — automatic background refreshes never touch them. Findings

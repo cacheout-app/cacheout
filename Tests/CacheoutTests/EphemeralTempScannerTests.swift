@@ -886,6 +886,96 @@ final class EphemeralTempScannerTests: XCTestCase {
         }
     }
 
+    /// THE RESIDUAL BEHIND THE README'S STALENESS WORDING (r8, D3/D4) — a
+    /// CHARACTERISATION cell, not an endorsement.
+    ///
+    /// README.md used to promise that an entry is listed "only when neither it
+    /// nor anything inside it has been written for 7 days", and that at delete
+    /// time "an entry that has been written into since the scan is refused".
+    /// Neither holds. The staleness inputs are the entry's OWN mtime plus the
+    /// mtimes of REGULAR FILES below it: `walkForFreshContent` dates only
+    /// `.kind(.regularFile)` children, and `directoryStaleness`'s truth table
+    /// says intermediate DIRECTORY mtimes are deliberately not inputs.
+    /// `freshContentBelow` is the descriptor-relative twin of the same rule,
+    /// so delete time answers identically. A write that only bumps a NESTED
+    /// directory's mtime — creating a subdirectory, a socket/FIFO or a
+    /// symlink inside one, or unlinking a file from one — is therefore
+    /// invisible on both sides.
+    ///
+    /// The README, CHANGELOG and docs/v1 sentences now state what this cell
+    /// measures. If it ever goes RED because directory mtimes became inputs,
+    /// those sentences must be re-read in the SAME change — that is what it is
+    /// here for.
+    func testOnlyOwnMtimeAndRegularFilesDecideStalenessAtScanAndDeleteTime()
+        async throws
+    {
+        /// An old entry with an old payload and an old `data/` subdirectory.
+        func entry(_ name: String) throws -> URL {
+            let url = try mkdir(sharedRootURL.appendingPathComponent(name))
+            try writeFile(url.appendingPathComponent("payload.bin"))
+            try mkdir(url.appendingPathComponent("data"))
+            try writeFile(url.appendingPathComponent("data/inner.bin"))
+            try backdate(url, to: oldDate)
+            return url
+        }
+
+        // Only a NESTED DIRECTORY is fresh — the entry's own mtime and every
+        // regular file below it stay old.
+        let nestedDirectory = try entry("nested-directory-fresh")
+        try setDate(nestedDirectory.appendingPathComponent("data"), freshDate)
+        // A nested REGULAR FILE is fresh: an input, so this must not be listed.
+        let nestedFile = try entry("nested-file-fresh")
+        try setDate(nestedFile.appendingPathComponent("data/inner.bin"), freshDate)
+        // The entry's OWN directory changed: also an input.
+        let ownDirectory = try entry("own-directory-fresh")
+        try setDate(ownDirectory, freshDate)
+        // Untouched — the delete-time control.
+        let control = try entry("control")
+
+        let scanner = makeScanner(roots: [sharedRoot()])
+        let outcome = await scan(scanner)
+        try assertValidates(outcome, scanner: scanner)
+        let listed = itemsByName(outcome)
+
+        XCTAssertEqual(
+            listed.keys.sorted(), ["control", "nested-directory-fresh"],
+            "a fresh NESTED DIRECTORY does not keep an entry off the list, "
+                + "while a fresh regular file and a fresh own mtime both do"
+        )
+        let nested = try XCTUnwrap(listed["nested-directory-fresh"])
+        XCTAssertEqual(nested.isStale, true)
+        XCTAssertTrue(
+            nested.evidence.contains("newest content is 30 days old"),
+            "the age shown is the newest REGULAR FILE's, not the newest "
+                + "directory's: \(nested.evidence)"
+        )
+
+        // DELETE TIME — the same rule, from a held descriptor.
+        let revalidator = try XCTUnwrap(scanner.preDeleteRevalidator)
+
+        // A post-scan write that only bumps a nested DIRECTORY is allowed
+        // through: this is the D4 residual, stated in the README rather than
+        // papered over.
+        try setDate(nestedDirectory.appendingPathComponent("data"), freshDate)
+        guard case .allow = revalidator.revalidate(item: nested, authorization: nil)
+        else {
+            return XCTFail(
+                "delete time refused a nested-directory-only change — if that "
+                    + "is now the contract, the README, CHANGELOG and "
+                    + "docs/v1 staleness sentences are out of date"
+            )
+        }
+
+        // A post-scan fresh REGULAR FILE anywhere inside IS refused.
+        let controlItem = try XCTUnwrap(listed["control"])
+        try setDate(control.appendingPathComponent("data/inner.bin"), freshDate)
+        guard case .refuse = revalidator.revalidate(
+            item: controlItem, authorization: nil
+        ) else {
+            return XCTFail("a fresh regular file inside must be refused")
+        }
+    }
+
     func testUnlockedCandidateProceedsThroughTheProductionProbe() async throws {
         try makeStaleCandidate("free", under: sharedRootURL)
         // No lock held; the PRODUCTION probe takes and drops one.

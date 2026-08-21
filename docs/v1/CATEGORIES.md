@@ -505,6 +505,13 @@ session (Cacheout included) has just written is fresh by construction, which
 is exactly what keeps a live session's own scratch directory off the list —
 there is no separate exclusion list to fall out of date.
 
+"Content" here means REGULAR FILES. Timestamps on nested directories are
+deliberately not inputs, at scan time or at delete time: creating a
+subdirectory, or a socket, FIFO or symlink inside one, or unlinking a nested
+file, bumps only a directory mtime, so it neither un-stales an entry nor
+refuses its deletion. The entry's OWN timestamp is an input on both sides, so
+a write at the top level of the entry is caught.
+
 **Size floor.** Only entries at or above the floor are listed, so ordinary
 small temp files never appear.
 

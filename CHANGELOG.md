@@ -45,13 +45,18 @@ and docs/v1/CLI-REFERENCE.md) — the pre-release `node_modules` →
   per-item scanner lists STALE first-level entries in the three ephemeral
   locations macOS does not reliably prune: `/private/tmp` and the per-user
   temp (`…/T`) and cache (`…/C`) containers, resolved from the OS rather
-  than hardcoded. An entry qualifies when its NEWEST content is older than
-  the age threshold (default 7 days) and it meets the size floor (default
-  10 MB) — a directory holding one fresh file deep inside is not stale, so a
-  workspace still being WRITTEN to, including the running session's own
-  scratch directory, is not listed. An entry a process merely holds open for
-  reading is NOT detected: age is the protection, and every gate is
-  re-established from a held descriptor immediately before deletion.
+  than hardcoded. An entry qualifies when its OWN timestamp and its newest
+  REGULAR FILE are both older than the age threshold (default 7 days) and it
+  meets the size floor (default 10 MB) — a directory holding one fresh file
+  deep inside is not stale, so a workspace whose files are still being
+  written, including the running session's own scratch directory, is not
+  listed. Timestamps on NESTED DIRECTORIES are deliberately not inputs (the
+  same blind spot the sizer accepts): creating a subdirectory, or a socket,
+  FIFO or symlink inside one, or unlinking a nested file, bumps only a
+  directory mtime, so it neither keeps an entry off the list nor refuses it
+  at delete time. An entry a process merely holds open for reading is NOT
+  detected: age is the protection, and every gate is re-established from a
+  held descriptor immediately before deletion.
   Findings are Review risk, never default-selected, and never part
   of Quick Clean or `smart-clean`. Entries another user owns are never
   listed — sticky-directory rules make them undeletable, so claiming their
@@ -71,8 +76,9 @@ and docs/v1/CLI-REFERENCE.md) — the pre-release `node_modules` →
   by proving the object IS the one the scan inspected: the scan records the
   entry's filesystem identity and the re-check compares it, so an entry
   renamed away and replaced under the same name is refused even when the
-  replacement is itself old and idle. If the entry has been replaced, written
-  into, locked by a running process, or has shrunk below the size threshold
+  replacement is itself old and idle. If the entry has been replaced, its own
+  directory has changed, a fresh REGULAR FILE has appeared anywhere inside it,
+  it is locked by a running process, or it has shrunk below the size threshold
   since the scan, the deletion is refused
   with nothing removed and nothing reported freed — re-scan to see its current
   state. Under the world-writable shared root (`/tmp`) an entry that has

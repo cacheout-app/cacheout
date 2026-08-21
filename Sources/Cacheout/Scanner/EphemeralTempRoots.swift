@@ -65,6 +65,36 @@
 /// resolves; `/private/tmp` is declared canonically for the same reason. Both
 /// live-Mac cells below assert the resulting spellings.
 ///
+/// ### RESIDUAL, at measured scope: this is closed AT THE LEAF only
+///
+/// Only the leaf is left unfollowed. Every INTERMEDIATE component is still
+/// resolved, so the escalation above survives one component up, verbatim: a
+/// symlink at an intermediate with a real directory behind it registers the
+/// destination as a trusted container root. Measured end-to-end through the
+/// real cleaner (r8) with `<base>/bucket` a symlink to `<home>/Documents`
+/// and a confstr output of `<base>/bucket/C`: `resolve` registered
+/// `<home>/Documents/C`, the no-follow root gate passed it, ZERO issues were
+/// raised, and the permanent-disposal arm deleted
+/// `<home>/Documents/C/Taxes-2019`.
+///
+/// It is a residual to DISCLOSE, not a hole an unprivileged process can
+/// reach on the shipped roots, and the reason is ownership. Replacing a
+/// component with a symlink requires write permission on that component's
+/// PARENT, and on this machine every intermediate's parent is root-owned
+/// (measured r8, `stat -f '%Sp %Su:%Sg'`): `/`, `/private`, `/private/var`,
+/// `/private/var/folders` and `/private/var/folders/mq` are all
+/// `drwxr-xr-x root:wheel`. The per-user bucket directory below them IS
+/// user-owned (`drwxr-xr-x <user>:staff`) — but it is the parent of the
+/// LEAF, so what an unprivileged process can swap there is `C`/`T`
+/// themselves, which is exactly the case the leaf rule closes.
+///
+/// So the residual needs root, or a machine where confstr returns a
+/// RELOCATED container whose chain has a user-writable intermediate parent.
+/// Closing it would mean not resolving the parent chain either, which the
+/// R3 one-spelling discipline above forbids: `/var/folders/…` and
+/// `/private/var/folders/…` would then be two registered spellings of one
+/// container.
+///
 /// ## De-dupe and alias suppression — the complete house pattern
 ///
 /// Two values are probed ONCE per declared root: a fully canonical (LEAF

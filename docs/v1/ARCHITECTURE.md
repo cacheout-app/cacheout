@@ -363,6 +363,22 @@ time. On stock macOS the two rules agree for every shipped root: the symlinks
 into `/var/folders/…/{C,T}` are ancestors (`/var` → `private/var`), which the
 parent chain still resolves.
 
+This is closed **at the leaf only** — a disclosed residual, not a hole an
+unprivileged process can reach on the shipped roots. Intermediate components
+are still resolved, so the same escalation survives one component up:
+measured end to end, a symlink at an intermediate with a real directory
+behind it registered that directory as a trusted container root, raised no
+issue, and the permanent-disposal arm deleted a file under it. Reaching it
+needs write permission on an intermediate's *parent*, and every such parent
+on the shipped chains is root-owned `drwxr-xr-x root:wheel` (`/`, `/private`,
+`/private/var`, `/private/var/folders`, and the `/private/var/folders/<xx>`
+prefix directory). The per-user bucket directory below those is user-owned,
+but it is the parent of the *leaf* — the component the leaf rule already
+protects. So the residual needs root, or a relocated container whose chain
+has a user-writable intermediate parent. Leaving the parent chain unresolved
+as well is not available: one container would then have two registered
+spellings, which the one-spelling rule forbids.
+
 Deletion-target *leaves* follow the same rule and for the same reason:
 deletion uses the unresolved URL, so removing a symlink child deletes the
 link, never its target. (`URL.resolvingSymlinksInPath()` is not used for

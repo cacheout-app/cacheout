@@ -699,6 +699,55 @@ final class EphemeralTempScannerTests: XCTestCase {
         XCTAssertTrue(outcome.errors.isEmpty)
     }
 
+    /// BOTH THRESHOLD BOUNDARIES, which the docs word DIFFERENTLY on purpose
+    /// (PR #459 codex r10, D9): the size floor is "at least 10 MB" and the
+    /// age is "OLDER THAN 7 days". One is inclusive and one is not, and until
+    /// this cell neither word had a falsifier — the cells around it pin "well
+    /// over" and "well under", and no pair of those can tell `>=` from `>`.
+    ///
+    /// If either assertion goes RED the corresponding word in README.md,
+    /// CHANGELOG.md and docs/v1 must change in the SAME commit.
+    ///
+    /// MUTATION-MEASURED, and the age half is not what it looks like:
+    /// relaxing `fileStaleness`'s `date < cutoff` to `<=` ALONE leaves this
+    /// cell green, because the post-sizing own-mtime re-check
+    /// (`guard own < cutoff`, stage 6) enforces the same boundary a second
+    /// time. Both had to be relaxed together — plus the content re-check's
+    /// `newest >= cutoff` — before the cell went RED and `exact-age.bin`
+    /// appeared. So the cell pins the BEHAVIOUR the docs describe, not any
+    /// single comparison; that redundancy is defence in depth, not a spare
+    /// line to delete.
+    func testTheFloorIsInclusiveAndTheAgeCutoffIsNot() async throws {
+        // 8,192 bytes allocates exactly two 4 KB blocks — no rounding slack
+        // between the written size and `st_blocks * 512`.
+        let floored = EphemeralTempSweepConfig.Thresholds(
+            sizeFloorBytes: 8_192, staleAge: 7 * 86_400
+        )
+        let exactSize = try writeFile(
+            sharedRootURL.appendingPathComponent("exact-size.bin"),
+            bytes: 8_192
+        )
+        try setDate(exactSize, oldDate)
+        // EXACTLY the cutoff instant: `now - staleAge`. `date < cutoff` is
+        // false here, so "older than" excludes it.
+        let exactAge = try writeFile(
+            sharedRootURL.appendingPathComponent("exact-age.bin"), bytes: 65_536
+        )
+        try setDate(exactAge, clock.addingTimeInterval(-7 * 86_400))
+
+        let scanner = makeScanner(roots: [sharedRoot()], thresholds: floored)
+        let outcome = await scan(scanner)
+        try assertValidates(outcome, scanner: scanner)
+
+        XCTAssertEqual(
+            outcome.items.map(\.displayName), ["exact-size.bin"],
+            "an entry allocating EXACTLY the floor is listed (the docs say "
+                + "\"at least\", and the gate is `>=`) while an entry exactly "
+                + "AT the cutoff is not (the docs say \"older than\", and the "
+                + "gate is `<`)"
+        )
+    }
+
     // MARK: - R4: own-process safety is the AGE gate
 
     /// The field case: the CURRENTLY RUNNING session's scratchpad sits beside
@@ -1002,15 +1051,27 @@ final class EphemeralTempScannerTests: XCTestCase {
     /// `.kind(.regularFile)` children, and `directoryStaleness`'s truth table
     /// says intermediate DIRECTORY mtimes are deliberately not inputs.
     /// `freshContentBelow` is the descriptor-relative twin of the same rule,
-    /// so delete time answers identically. A write that only bumps a NESTED
-    /// directory's mtime — creating a subdirectory, a socket/FIFO or a
-    /// symlink inside one, or unlinking a file from one — is therefore
-    /// invisible on both sides.
+    /// so delete time answers identically.
     ///
-    /// The README, CHANGELOG and docs/v1 sentences now state what this cell
-    /// measures. If it ever goes RED because directory mtimes became inputs,
-    /// those sentences must be re-read in the SAME change — that is what it is
-    /// here for.
+    /// WHAT THIS CELL DOES **NOT** SAY (PR #459 codex r10, D1). Until this
+    /// round the paragraph here went on to generalise from a bare `utimes`
+    /// on `data/` to a whole CLASS of operations — "creating a subdirectory,
+    /// a socket/FIFO or a symlink inside one, or unlinking a file from one,
+    /// is therefore invisible on both sides" — and the README, the CHANGELOG
+    /// and docs/v1 all carried that sentence. Two of the five were FALSE, and
+    /// the suite stayed green for four rounds because the falsification was
+    /// applied per-CELL rather than per-OPERATION: this cell exercises
+    /// exactly ONE of the five. Unlinking a nested file can take the entry
+    /// below the SIZE FLOOR and creating enough subdirectories can push it
+    /// past the INSPECTION BUDGET, and both of those gates delist AND refuse.
+    /// The per-operation falsifiers are the four cells under "The five nested
+    /// VERBS" below; the docs no longer enumerate operations at all.
+    ///
+    /// So what this cell measures is the narrow, true thing: a nested
+    /// DIRECTORY's own timestamp is not itself a staleness input on either
+    /// side. If it ever goes RED because directory mtimes became inputs, the
+    /// README, CHANGELOG and docs/v1 staleness sentences must be re-read in
+    /// the SAME change — that is what it is here for.
     func testOnlyOwnMtimeAndRegularFilesDecideStalenessAtScanAndDeleteTime()
         async throws
     {
@@ -1079,6 +1140,333 @@ final class EphemeralTempScannerTests: XCTestCase {
         ) else {
             return XCTFail("a fresh regular file inside must be refused")
         }
+    }
+
+    // MARK: - The five nested VERBS, one falsifier each (r10, D1)
+
+    /// The five operations the README used to name as a HARMLESS CLASS —
+    /// "creating a subdirectory, or a socket, FIFO or symlink inside one, or
+    /// unlinking a nested file, bumps only a directory mtime, so it neither
+    /// keeps an entry off the list nor refuses it at delete time".
+    ///
+    /// That universal was false for two of the five, and the suite stayed
+    /// green because falsification was applied per-CELL rather than
+    /// per-VERB: the cell above exercises exactly ONE of them (a bare
+    /// `utimes` on `data/`). These cells run all five, on both sides, at
+    /// both scales — and the docs no longer enumerate verbs at all, because
+    /// the property that survives measurement is about the TIMESTAMP, not
+    /// about the operations that move it.
+    private enum NestedVerb: String, CaseIterable {
+        case makeSubdirectory = "verb-mkdir"
+        case makeSocket = "verb-socket"
+        case makeFIFO = "verb-fifo"
+        case makeSymlink = "verb-symlink"
+        case unlinkRegularFile = "verb-unlink"
+    }
+
+    /// An entry whose payload sits at the top level AND inside `data/`, so a
+    /// verb applied inside `data/` never touches the entry's own mtime and
+    /// never takes the tree below the (4 KB) floor.
+    private func verbFixture(_ name: String) throws -> URL {
+        let url = try mkdir(sharedRootURL.appendingPathComponent(name))
+        try writeFile(url.appendingPathComponent("payload.bin"))
+        try mkdir(url.appendingPathComponent("data"))
+        try writeFile(url.appendingPathComponent("data/inner.bin"))
+        try writeFile(url.appendingPathComponent("data/spare.bin"))
+        try backdate(url, to: oldDate)
+        return url
+    }
+
+    /// A REAL bound `AF_UNIX` socket at `url`. `sun_path` is 104 bytes and
+    /// the fixture base is a long `/var/folders/…` path, so it is bound at a
+    /// short `/private/tmp` name and renamed into place — the same pattern
+    /// the swap-window socket cell below uses.
+    private func bindSocket(at url: URL) throws {
+        let shortPath = "/private/tmp/co-r10-"
+            + UUID().uuidString.prefix(8).lowercased() + ".sock"
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else {
+            throw XCTSkip("socket(2): \(String(cString: strerror(errno)))")
+        }
+        var address = sockaddr_un()
+        address.sun_family = sa_family_t(AF_UNIX)
+        address.sun_len = UInt8(MemoryLayout<sockaddr_un>.size)
+        let bytes = Array(shortPath.utf8)
+        XCTAssertLessThan(bytes.count, 104)
+        withUnsafeMutableBytes(of: &address.sun_path) { raw in
+            raw.baseAddress!.copyMemory(from: bytes, byteCount: bytes.count)
+        }
+        let bound = withUnsafePointer(to: &address) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.bind(
+                    fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size)
+                )
+            }
+        }
+        guard bound == 0 else {
+            close(fd)
+            unlink(shortPath)
+            throw XCTSkip("bind(2): \(String(cString: strerror(errno)))")
+        }
+        guard rename(shortPath, url.path) == 0 else {
+            close(fd)
+            unlink(shortPath)
+            throw XCTSkip("rename(2): \(String(cString: strerror(errno)))")
+        }
+        addTeardownBlock { close(fd) }
+    }
+
+    /// Run `verb` INSIDE the entry's `data/` subdirectory. Every arm bumps
+    /// `data/`'s own mtime and nothing else the staleness rule reads.
+    private func apply(_ verb: NestedVerb, inside entry: URL) throws {
+        let data = entry.appendingPathComponent("data")
+        switch verb {
+        case .makeSubdirectory:
+            try mkdir(data.appendingPathComponent("sub"))
+        case .makeSocket:
+            try bindSocket(at: data.appendingPathComponent("s.sock"))
+        case .makeFIFO:
+            let fifo = data.appendingPathComponent("f.fifo")
+            XCTAssertEqual(
+                mkfifo(fifo.path, 0o600), 0,
+                "mkfifo: \(String(cString: strerror(errno)))"
+            )
+        case .makeSymlink:
+            try fm.createSymbolicLink(
+                at: data.appendingPathComponent("l.link"),
+                withDestinationURL: data.appendingPathComponent("inner.bin")
+            )
+        case .unlinkRegularFile:
+            let spare = data.appendingPathComponent("spare.bin")
+            XCTAssertEqual(
+                unlink(spare.path), 0,
+                "unlink: \(String(cString: strerror(errno)))"
+            )
+        }
+    }
+
+    /// The entry's OWN mtime, by no-follow `lstat` — what every one of these
+    /// cells pins before and after the verb, so a green result means the
+    /// NESTED directory's timestamp is the only thing that moved.
+    private func ownMtime(_ url: URL) throws -> String {
+        var status = stat()
+        XCTAssertEqual(
+            lstat(url.path, &status), 0,
+            "lstat \(url.path): \(String(cString: strerror(errno)))"
+        )
+        return "\(status.st_mtimespec.tv_sec).\(status.st_mtimespec.tv_nsec)"
+    }
+
+    /// FALSIFIER 1/5-per-verb, SCAN side, SINGLE scale. All five verbs, each
+    /// applied once to a distinct entry before the scan, with the entry's own
+    /// mtime proven unmoved by `lstat` on both sides of the verb. Every entry
+    /// stays on the list: at this scale the nested directory's timestamp
+    /// really is not an input.
+    func testEverySingleNestedVerbLeavesTheEntryOnTheList() async throws {
+        for verb in NestedVerb.allCases {
+            let entry = try verbFixture(verb.rawValue)
+            let before = try ownMtime(entry)
+            try apply(verb, inside: entry)
+            XCTAssertEqual(
+                try ownMtime(entry), before,
+                "\(verb.rawValue): the verb must move ONLY the nested "
+                    + "directory's mtime, or this cell measures the wrong thing"
+            )
+        }
+
+        let scanner = makeScanner(roots: [sharedRoot()])
+        let outcome = await scan(scanner)
+        try assertValidates(outcome, scanner: scanner)
+
+        XCTAssertEqual(
+            itemsByName(outcome).keys.sorted(),
+            NestedVerb.allCases.map(\.rawValue).sorted(),
+            "at single scale every one of the five verbs leaves the entry "
+                + "listed — the nested directory's own timestamp is not a "
+                + "staleness input"
+        )
+        XCTAssertTrue(outcome.errors.isEmpty, "and none of them is a denial")
+    }
+
+    /// FALSIFIER 1/5-per-verb, DELETE side, SINGLE scale. The same five verbs
+    /// applied AFTER the scan, through the production revalidator.
+    func testEverySingleNestedVerbStillPassesTheDeleteTimeRecheck()
+        async throws
+    {
+        for verb in NestedVerb.allCases {
+            _ = try verbFixture(verb.rawValue)
+        }
+        let scanner = makeScanner(roots: [sharedRoot()])
+        let outcome = await scan(scanner)
+        let listed = itemsByName(outcome)
+        XCTAssertEqual(listed.count, NestedVerb.allCases.count)
+        let revalidator = try XCTUnwrap(scanner.preDeleteRevalidator)
+
+        for verb in NestedVerb.allCases {
+            let entry = sharedRootURL.appendingPathComponent(verb.rawValue)
+            let before = try ownMtime(entry)
+            try apply(verb, inside: entry)
+            XCTAssertEqual(try ownMtime(entry), before, verb.rawValue)
+
+            let item = try XCTUnwrap(listed[verb.rawValue])
+            guard case .allow = revalidator.revalidate(
+                item: item, authorization: nil
+            ) else {
+                return XCTFail(
+                    "\(verb.rawValue): refused at delete time. If that is now "
+                        + "the contract, the README, CHANGELOG and docs/v1 "
+                        + "staleness sentences must be re-read in this change"
+                )
+            }
+        }
+    }
+
+    /// FALSIFIER for the SIZE-FLOOR clause, both sides. Unlinking a nested
+    /// regular file bumps only `data/`'s mtime — and takes the entry below
+    /// the floor, which keeps it OFF the list and REFUSES it at delete time.
+    /// This is one of the two verbs the retired universal got wrong.
+    func testUnlinkingANestedFileBelowTheFloorDelistsAndRefuses()
+        async throws
+    {
+        let floor = EphemeralTempSweepConfig.Thresholds(
+            sizeFloorBytes: 1_048_576, staleAge: 7 * 86_400
+        )
+        /// 4 MB of nested payload, 8 KB at the top level: unlinking the
+        /// nested file drops the tree far below a 1 MB floor.
+        func entry(_ name: String) throws -> URL {
+            let url = try mkdir(sharedRootURL.appendingPathComponent(name))
+            try writeFile(url.appendingPathComponent("payload.bin"))
+            try mkdir(url.appendingPathComponent("data"))
+            try writeFile(
+                url.appendingPathComponent("data/big.bin"), bytes: 4_194_304
+            )
+            try backdate(url, to: oldDate)
+            return url
+        }
+
+        // SCAN side: the unlink happens BEFORE the scan.
+        let delisted = try entry("delisted-by-unlink")
+        let beforeDelist = try ownMtime(delisted)
+        XCTAssertEqual(
+            unlink(delisted.appendingPathComponent("data/big.bin").path), 0
+        )
+        XCTAssertEqual(
+            try ownMtime(delisted), beforeDelist,
+            "only data/'s mtime moved"
+        )
+        // DELETE side: this one is unlinked after the scan.
+        let refused = try entry("refused-by-unlink")
+
+        let scanner = makeScanner(roots: [sharedRoot()], thresholds: floor)
+        let outcome = await scan(scanner)
+        try assertValidates(outcome, scanner: scanner)
+
+        XCTAssertEqual(
+            itemsByName(outcome).keys.sorted(), ["refused-by-unlink"],
+            "unlinking a nested regular file DOES keep an entry off the list "
+                + "— via the size floor, not via any timestamp"
+        )
+        XCTAssertTrue(
+            outcome.errors.isEmpty, "and it is delisted silently, not denied"
+        )
+
+        let item = try XCTUnwrap(itemsByName(outcome)["refused-by-unlink"])
+        let revalidator = try XCTUnwrap(scanner.preDeleteRevalidator)
+        let beforeRefuse = try ownMtime(refused)
+        XCTAssertEqual(
+            unlink(refused.appendingPathComponent("data/big.bin").path), 0
+        )
+        XCTAssertEqual(
+            try ownMtime(refused), beforeRefuse, "only data/'s mtime moved"
+        )
+        guard case .refuse(let reason, _, _) = revalidator.revalidate(
+            item: item, authorization: nil
+        ) else {
+            return XCTFail("a below-floor shrink must be refused")
+        }
+        XCTAssertTrue(
+            reason.contains("shrunk below the size threshold"),
+            "the refusal must name the floor, not a timestamp: \(reason)"
+        )
+    }
+
+    /// FALSIFIER for the INSPECTION-BUDGET clause, both sides. Creating
+    /// subdirectories inside `data/` bumps only `data/`'s mtime — and once
+    /// there are more of them than the walk's budget, the entry is kept OFF
+    /// the list (silently, `walkForFreshContent`'s `.budget` arm) and REFUSED
+    /// at delete time (`freshContentBelow`'s `.budget` arm). This is the
+    /// second verb the retired universal got wrong.
+    ///
+    /// The budget is INJECTED rather than staged at its 20,000 default: the
+    /// arm under test is the same one either way, and 20,010 real
+    /// subdirectories cost the suite minutes for no extra proof. It IS the
+    /// shipped behaviour, not only the injected one — r9's verifier staged
+    /// 20,010 real subdirectories against the untouched
+    /// `defaultPrefilterEntryLimit` and got this same refusal, quoting "more
+    /// entries than the inspection budget".
+    func testCreatingEnoughNestedSubdirectoriesDelistsAndRefuses()
+        async throws
+    {
+        func entry(_ name: String) throws -> URL {
+            let url = try mkdir(sharedRootURL.appendingPathComponent(name))
+            try writeFile(url.appendingPathComponent("payload.bin"))
+            try mkdir(url.appendingPathComponent("data"))
+            try writeFile(url.appendingPathComponent("data/inner.bin"))
+            try backdate(url, to: oldDate)
+            return url
+        }
+        func spam(_ entry: URL, count: Int) throws {
+            let data = entry.appendingPathComponent("data")
+            for index in 0..<count {
+                try mkdir(data.appendingPathComponent("sub-\(index)"))
+            }
+        }
+
+        // SCAN side: already over budget when the scan runs.
+        let delisted = try entry("delisted-by-mkdir")
+        let beforeDelist = try ownMtime(delisted)
+        try spam(delisted, count: 20)
+        try backdate(delisted.appendingPathComponent("data"), to: oldDate)
+        try setDate(delisted, oldDate)
+        XCTAssertEqual(
+            try ownMtime(delisted), beforeDelist,
+            "every timestamp is re-pinned old: only the entry COUNT differs"
+        )
+        // DELETE side: within budget at scan time, spammed afterwards.
+        let refused = try entry("refused-by-mkdir")
+
+        let scanner = makeScanner(
+            roots: [sharedRoot()], prefilterEntryLimit: 8
+        )
+        let outcome = await scan(scanner)
+        try assertValidates(outcome, scanner: scanner)
+
+        XCTAssertEqual(
+            itemsByName(outcome).keys.sorted(), ["refused-by-mkdir"],
+            "creating subdirectories DOES keep an entry off the list — via "
+                + "the inspection budget, not via any timestamp"
+        )
+        XCTAssertTrue(
+            outcome.errors.isEmpty,
+            "the budget arm delists SILENTLY (r5, codex C5)"
+        )
+
+        let item = try XCTUnwrap(itemsByName(outcome)["refused-by-mkdir"])
+        let revalidator = try XCTUnwrap(scanner.preDeleteRevalidator)
+        let beforeRefuse = try ownMtime(refused)
+        try spam(refused, count: 20)
+        XCTAssertEqual(
+            try ownMtime(refused), beforeRefuse, "only data/'s mtime moved"
+        )
+        guard case .refuse(let reason, _, _) = revalidator.revalidate(
+            item: item, authorization: nil
+        ) else {
+            return XCTFail("an over-budget re-inspection must be refused")
+        }
+        XCTAssertTrue(
+            reason.contains("more entries than the inspection budget"),
+            "the refusal must name the budget, not a timestamp: \(reason)"
+        )
     }
 
     func testUnlockedCandidateProceedsThroughTheProductionProbe() async throws {
@@ -1458,15 +1846,30 @@ final class EphemeralTempScannerTests: XCTestCase {
 
     // MARK: - R13: scanner-wide trigger policy
 
+    /// The deferral arm emits NOTHING — items and errors both, including the
+    /// `resolutionIssues` an inspecting scan would lead with.
+    ///
+    /// D5 (PR #459 codex r10): until this round the `resolutionIssues:` half
+    /// was VACUOUS. This cell built its scanner without the argument, so the
+    /// field was `[]` and `outcome.errors.isEmpty` held no matter what the
+    /// deferral arm returned — flipping it to `errors: resolutionIssues` left
+    /// the suite green. The list below is non-empty precisely so that flip
+    /// goes RED here.
     func testAutomaticTriggerDefersEveryRootEntirely() async throws {
         try makeStaleCandidate("old-scratch", under: sharedRootURL)
         try makeStaleCandidate("other", under: userRootURL)
         let lister = ListerSpy()
         let spy = SizingSpy()
+        let dropped = ScanIssue(
+            url: sharedRootURL.appendingPathComponent("alias-C"),
+            kind: .symlinkRoot,
+            detail: "an alias of a root already declared as a real directory"
+        )
 
         let outcome = await scan(
             makeScanner(
                 roots: [sharedRoot(), userRoot()],
+                resolutionIssues: [dropped],
                 listDirectory: { [lister] url, limit in try lister.list(url, limit) },
                 candidateSizer: { [spy] url, mode in spy.measure(url, mode) }
             ),
@@ -1478,7 +1881,28 @@ final class EphemeralTempScannerTests: XCTestCase {
         XCTAssertTrue(outcome.items.isEmpty)
         XCTAssertTrue(outcome.errors.isEmpty,
                       "a deferral is not an anomaly — the same silent "
-                        + "semantics a skipped protected root has")
+                        + "semantics a skipped protected root has. The "
+                        + "resolution issue this scanner HOLDS must not ride "
+                        + "a deferred outcome: \(outcome.errors)")
+    }
+
+    /// The other side of the same divergence, so a swap of the two arms is
+    /// not mistaken for a pass: an INSPECTING scan DOES lead with the same
+    /// `resolutionIssues` the deferral arm suppresses.
+    func testUserInitiatedLeadsWithTheSameResolutionIssues() async throws {
+        let dropped = ScanIssue(
+            url: sharedRootURL.appendingPathComponent("alias-C"),
+            kind: .symlinkRoot,
+            detail: "an alias of a root already declared as a real directory"
+        )
+        let scanner = makeScanner(
+            roots: [sharedRoot()], resolutionIssues: [dropped]
+        )
+        let outcome = await scan(scanner)
+        try assertValidates(outcome, scanner: scanner)
+
+        XCTAssertEqual(outcome.errors, [dropped],
+                       "an inspecting outcome carries the drop verbatim")
     }
 
     func testUserInitiatedEnumeratesEveryResolvedRoot() async throws {

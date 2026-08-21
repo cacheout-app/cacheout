@@ -45,13 +45,13 @@
 /// item identity. A second spelling anywhere downstream makes the outcome
 /// validator-rejected or deletion structurally unreachable, because
 /// `ContainerSnapshot.capture` keys by the DECLARED spelling
-/// (`PathGuard.swift:124-155`).
+/// (`PathGuard.swift:159-170`).
 ///
 /// The leaf is left unresolved because this URL becomes a TRUSTED CONTAINER
 /// ROOT, not a comparison value. `realpath(3)` resolves the leaf too, so a
 /// symlink standing where `C`/`T` should be would silently register its
 /// DESTINATION as a temp root — and the container-root policy only refuses
-/// `/`, volume roots and `$HOME` itself (`PathGuard.swift:344-355` says so in
+/// `/`, volume roots and `$HOME` itself (`PathGuard.swift:351` says so in
 /// as many words: "`~/Documents` can be a container while `admitDeletionRoot`
 /// refuses it"), so an arbitrary directory would be admitted, walked, listed
 /// as cache-container payload and deleted. Keeping the leaf means the
@@ -110,8 +110,11 @@
 /// thread while building its `@StateObject`
 /// (`CacheoutApp.swift:58` → `CacheoutViewModel.production()` →
 /// `CacheoutViewModel.swift:541` → `SpaceScanner.swift:1096-1099`), long
-/// before any trigger or `participates(in:)` gate exists to consult. So
-/// whatever this file does to a DECLARED path, a user waits for.
+/// before any trigger or `participates(in:)` gate exists to consult. The main
+/// thread is not an inference: `CacheoutViewModel` is `@MainActor`
+/// (`CacheoutViewModel.swift:264`), so its `production()` factory cannot be
+/// called from anywhere else. So whatever this file does to a DECLARED path,
+/// a user waits for — with the window frozen, not merely a scan delayed.
 ///
 /// `C` and `T` sit in a user-owned bucket directory, so a same-UID process
 /// can replace either with a symlink to any destination it likes. This file
@@ -131,7 +134,7 @@
 /// weaker than an inode comparison, and the residual is recorded below.
 ///
 /// This is where the file DIVERGES from the two dev-root precedents it
-/// otherwise follows: `DevRootsStore.swift:322` and `SpaceScanner.swift:938`
+/// otherwise follows: `DevRootsStore.swift:322` and `SpaceScanner.swift:953`
 /// both still build their comparison key with `provider.canonicalize`, on
 /// every root including non-directory ones, at the same construction time.
 /// Neither has been changed here.
@@ -141,7 +144,7 @@
 /// One value is probed per declared root: whether the DECLARED spelling is
 /// itself a real directory (`lstat` leaf, no follow), which is the
 /// `isDirectory` half of the probe pair at `DevRootsStore.swift:320-324` and
-/// `SpaceScanner.swift:937-941`. The `key:` half of that pair is deliberately
+/// `SpaceScanner.swift:951-955`. The `key:` half of that pair is deliberately
 /// NOT taken (see above). The two halves that consume the probe have
 /// different precedents — do not read this as one pattern copied whole from
 /// either:
@@ -150,12 +153,12 @@
 ///   location already kept is dropped. Precedent is `DevRootsStore.swift`
 ///   alone (:361-364, `seenCanonicalKeys.insert`).
 ///   `SpaceScannerRuntime.suppressingAliasShadows` does NOT do this half — it
-///   deliberately DECLINES it, and `SpaceScanner.swift:945-948` says so:
+///   deliberately DECLINES it, and `SpaceScanner.swift:959-962` says so:
 ///   "Two real-directory spellings of one location are NOT touched: both pass
 ///   the reality gate, so neither shadows the other, and dropping either would
 ///   change which declared spelling the identity binding keys off for no
 ///   safety gain." A maintainer reconciling the two files must not add
-///   de-duping there; `SpaceScanner.swift:884-895` records the
+///   de-duping there; `SpaceScanner.swift:899-909` records the
 ///   identity-binding breakage that choice exists to avoid.
 ///
 ///   The comparison here is INODE identity (`sameLocation`) of the declared
@@ -187,13 +190,13 @@
 ///   returns the FIRST configured root that matches and `admitContainer`
 ///   refuses THAT spelling without trying the real one behind it.
 ///   `DevRootsStore.swift:326-332` names that shape "ACTIVELY HARMFUL";
-///   `SpaceScanner.swift:884-895` records the breakage it caused when the
+///   `SpaceScanner.swift:899-909` records the breakage it caused when the
 ///   shadowed root came from another scanner.
 ///
 ///   BOTH files do this half — `DevRootsStore.swift:333-335` + :341-357 and
-///   `SpaceScanner.swift:942-951` — but only `DevRootsStore` classifies the
-///   drop. `suppressingAliasShadows` returns a bare `[URL]` (:930-932) with
-///   no issue channel of its own; `SpaceScanner.swift:924-929` records what
+///   `SpaceScanner.swift:956-965` — but only `DevRootsStore` classifies the
+///   drop. `suppressingAliasShadows` returns a bare `[URL]` (:944-946) with
+///   no issue channel of its own; `SpaceScanner.swift:938-943` records what
 ///   reports its drops instead. The `.symlinkRoot` issue raised here follows
 ///   `DevRootsStore.swift:349-355`, not that function.
 ///

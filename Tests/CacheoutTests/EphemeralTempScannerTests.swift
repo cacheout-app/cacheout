@@ -886,6 +886,111 @@ final class EphemeralTempScannerTests: XCTestCase {
         }
     }
 
+    /// Set an mtime WITHOUT following a symlink — the only way to age a
+    /// symlink's own timestamp (`FileManager.setAttributes` and `utimes(2)`
+    /// both follow, and a dangling link makes them fail outright).
+    private func setDateNoFollow(_ url: URL, _ date: Date) throws {
+        let seconds = time_t(date.timeIntervalSince1970)
+        var times = [
+            timespec(tv_sec: seconds, tv_nsec: 0),
+            timespec(tv_sec: seconds, tv_nsec: 0),
+        ]
+        let result = utimensat(AT_FDCWD, url.path, &times, AT_SYMLINK_NOFOLLOW)
+        XCTAssertEqual(result, 0, "utimensat(\(url.path)): "
+            + String(cString: strerror(errno)))
+    }
+
+    /// THE SECOND HALF OF THE SAME RESIDUAL (r9, D2) — a CHARACTERISATION
+    /// cell, not an endorsement.
+    ///
+    /// The sibling cell below measures nested DIRECTORY mtimes. This one
+    /// measures the other non-input: a nested node that is neither a
+    /// directory nor a regular file. `walkForFreshContent`
+    /// (`EphemeralTempScanner.swift:1391-1395`) and `freshContentBelow`
+    /// (`:2641-2644`) both `continue` past `.symlink` and `.other` without
+    /// dating them, so a FIFO, socket or symlink nested below an entry has
+    /// no effect on staleness however fresh its OWN timestamp is — at scan
+    /// time or at delete time.
+    ///
+    /// Here the entry's own mtime, its `data/` subdirectory and every regular
+    /// file below it are 30 days old, and ONLY a nested FIFO and a nested
+    /// symlink carry fresh timestamps. If this ever goes RED because those
+    /// kinds became inputs, the README, CHANGELOG and docs/v1 staleness
+    /// sentences must be re-read in the SAME change.
+    ///
+    /// The shipped sentences also name SOCKETS, which are not staged here: a
+    /// bound `AF_UNIX` socket needs a path within `sun_path`'s 104 bytes and
+    /// this fixture's nested path is ~147. The FIFO covers them at the level
+    /// the decision is made — `probeKind` maps every non-regular,
+    /// non-directory, non-symlink object to the SAME `.other` value through
+    /// one `default` arm (`FileSystemIdentityProvider.swift:292-296`), and
+    /// the assertion below pins the FIFO to it, so both walks see one kind
+    /// for both objects and have no arm that could tell them apart.
+    func testNestedFIFOAndSymlinkTimestampsDecideNothingAtScanOrDeleteTime()
+        async throws
+    {
+        let entry = try mkdir(sharedRootURL.appendingPathComponent("nested-nondir"))
+        try writeFile(entry.appendingPathComponent("payload.bin"))
+        let data = try mkdir(entry.appendingPathComponent("data"))
+        try writeFile(data.appendingPathComponent("inner.bin"))
+        let fifo = data.appendingPathComponent("pipe")
+        XCTAssertEqual(mkfifo(fifo.path, 0o600), 0,
+                       "mkfifo: \(String(cString: strerror(errno)))")
+        let link = data.appendingPathComponent("link")
+        try fm.createSymbolicLink(at: link, withDestinationURL:
+            data.appendingPathComponent("missing-target"))
+
+        // Age everything that IS an input — children first, directories last,
+        // because writing a child bumps its parent.
+        try setDate(data.appendingPathComponent("inner.bin"), oldDate)
+        try setDate(entry.appendingPathComponent("payload.bin"), oldDate)
+        try setDate(data, oldDate)
+        try setDate(entry, oldDate)
+        // …and leave ONLY the two non-inputs fresh.
+        try setDateNoFollow(fifo, freshDate)
+        try setDateNoFollow(link, freshDate)
+
+        // The FIFO stands for every socket/device/FIFO: one `.other` value,
+        // one `default` arm, no way for either walk to tell them apart.
+        let provider = FileSystemIdentityProvider()
+        XCTAssertEqual(provider.probeKind(of: fifo), .kind(.other))
+        XCTAssertEqual(provider.probeKind(of: link), .kind(.symlink))
+
+        let scanner = makeScanner(roots: [sharedRoot()])
+        let outcome = await scan(scanner)
+        try assertValidates(outcome, scanner: scanner)
+        let listed = itemsByName(outcome)
+        XCTAssertEqual(
+            listed.keys.sorted(), ["nested-nondir"],
+            "a fresh nested FIFO and a fresh nested symlink do not keep an "
+                + "entry off the list"
+        )
+        let item = try XCTUnwrap(listed["nested-nondir"])
+        XCTAssertEqual(item.isStale, true)
+
+        // DELETE TIME — two MORE fresh non-inputs appear after the scan, and
+        // the re-check still allows the deletion.
+        let second = data.appendingPathComponent("pipe2")
+        XCTAssertEqual(mkfifo(second.path, 0o600), 0,
+                       "mkfifo: \(String(cString: strerror(errno)))")
+        let secondLink = data.appendingPathComponent("link2")
+        try fm.createSymbolicLink(at: secondLink, withDestinationURL:
+            data.appendingPathComponent("missing-target"))
+        try setDateNoFollow(second, freshDate)
+        try setDateNoFollow(secondLink, freshDate)
+
+        let verdict = try XCTUnwrap(scanner.preDeleteRevalidator)
+            .revalidate(item: item, authorization: nil)
+        guard case .allow = verdict else {
+            return XCTFail(
+                "delete time refused an entry whose only post-scan change was "
+                    + "a nested FIFO and a nested symlink — if that is now the "
+                    + "contract, the README, CHANGELOG and docs/v1 staleness "
+                    + "sentences are out of date: \(verdict)"
+            )
+        }
+    }
+
     /// THE RESIDUAL BEHIND THE README'S STALENESS WORDING (r8, D3/D4) — a
     /// CHARACTERISATION cell, not an endorsement.
     ///

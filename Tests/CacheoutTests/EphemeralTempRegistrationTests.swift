@@ -188,6 +188,68 @@ final class EphemeralTempRegistrationTests: XCTestCase {
         }
     }
 
+    /// D1 (PR #459 codex r9) — the COMPOSITION link of the alias-drop
+    /// disclosure: `production` must hand resolution's `issues` to the
+    /// scanner it registers, not just its `roots`.
+    ///
+    /// b80f15d made a dropped alias spelling visible instead of silent, and
+    /// every other link in that chain has a cell: resolution raises the
+    /// `.symlinkRoot` issue, and the scanner leads an inspecting outcome with
+    /// its `resolutionIssues`. This one did not — deleting the
+    /// `resolutionIssues:` argument in `SpaceScannerRuntime.production` left
+    /// the whole suite green, so a refactor could drop the argument and ship
+    /// a build where a user whose `C` is a symlink onto `T` gets a scan with
+    /// `C` absent and nothing naming it.
+    ///
+    /// Composition only — nothing is scanned, and the fixture roots reach
+    /// `production` through the `ephemeralTempRoots:` seam so the resolution
+    /// under test is a real `EphemeralTempRoots.resolve` over a real symlink
+    /// (only confstr(3) is stubbed).
+    func testProductionCarriesResolutionIssuesIntoTheRegisteredScanner() throws {
+        let realTemp = base.appendingPathComponent("real-T")
+        try fm.createDirectory(at: realTemp, withIntermediateDirectories: true)
+        let aliasCache = base.appendingPathComponent("alias-C")
+        try fm.createSymbolicLink(at: aliasCache, withDestinationURL: realTemp)
+
+        let resolved = EphemeralTempRoots.resolve(
+            confstrPath: { name in
+                switch name {
+                case _CS_DARWIN_USER_CACHE_DIR: return aliasCache.path
+                case _CS_DARWIN_USER_TEMP_DIR: return realTemp.path
+                default: return nil
+                }
+            }
+        )
+        XCTAssertEqual(
+            resolved.issues.map(\.kind), [.symlinkRoot],
+            "fixture precondition: the alias spelling is dropped WITH an "
+                + "issue — \(resolved.issues)"
+        )
+
+        let suite = try makeSuite()
+        let runtime = SpaceScannerRuntime.production(
+            home: fixtureHome,
+            devRoots: DevRootsStore(defaults: suite).effectiveRoots(home: fixtureHome),
+            ephemeralTempRoots: resolved
+        )
+        let scanner = try XCTUnwrap(
+            runtime.scanners.compactMap { $0 as? EphemeralTempScanner }.first
+        )
+
+        XCTAssertEqual(
+            scanner.resolutionIssues, resolved.issues,
+            "the registered scanner must carry resolution's drops verbatim"
+        )
+        XCTAssertFalse(
+            scanner.resolutionIssues.isEmpty,
+            "an empty list here is the silent-drop regression itself"
+        )
+        // The other half of the same hand-off, so a swap of the two is not
+        // mistaken for a pass.
+        XCTAssertEqual(scanner.trustedContainerRoots.map(\.path),
+                       resolved.roots.map(\.url.path))
+    }
+
     /// Thresholds are CONSTRUCTION state, threaded through the factory: a
     /// non-nil value reaches the scanner unchanged (the CLI's
     /// invocation-scoped path), and `nil` — the GUI's bare composition —

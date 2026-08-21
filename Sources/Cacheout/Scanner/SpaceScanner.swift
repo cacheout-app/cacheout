@@ -998,15 +998,31 @@ struct SpaceScannerRuntime {
     ///   `orphanedCachesThresholds`; the CLI passes an invocation-scoped
     ///   layering that folds in its `--tmp-*` flags (never persisted).
     ///   Construction state by frozen contract: thresholds do not ride
-    ///   `ScanContext`. The scanner's ROOTS are not a parameter — they are
-    ///   the closed 3-root confstr declaration (`EphemeralTempRoots`), which
-    ///   resolves them here and hands the canonical spellings straight to
-    ///   `trustedContainerRoots`.
+    ///   `ScanContext`.
+    /// - Parameter ephemeralTempRoots: fn-6.1's `{roots, issues}` resolution.
+    ///   `nil` — every shipped composition, GUI and CLI alike — calls
+    ///   `EphemeralTempRoots.resolve(provider:)` here; `roots` become the
+    ///   scanner's declared `trustedContainerRoots` and `issues` ride every
+    ///   inspecting scan's outcome, so a spelling resolution DROPPED stays
+    ///   visible without being registered or walked.
+    ///
+    ///   The parameter shape is copied from `devRoots:` above (declared
+    ///   `:1024`, consumed `:1035-1037`) — an optional whole resolution,
+    ///   defaulted `nil`, `??`-resolved at this site. Two differences, both
+    ///   real: `devRoots` has production callers passing non-nil (the CLI's
+    ///   `--dev-root`, `CLIHandler.swift:427/433`) whereas nothing outside
+    ///   the test suite passes this one — confstr(3) is the only production
+    ///   source, there is no persisted store and no CLI flag behind it; and
+    ///   `DevRootsResolution` carries bare `[URL]` roots while this carries
+    ///   `[EphemeralTempRoot]` records. It exists so a cell can hold the
+    ///   `issues` wire: resolved internally, no test could compose a
+    ///   production runtime whose resolution carries any.
     static func production(
         home: URL = FileManager.default.homeDirectoryForCurrentUser,
         provider: FileSystemIdentityProvider = FileSystemIdentityProvider(),
         orphanedCachesThresholds: OrphanedCacheClassifier.Thresholds? = nil,
         devRoots: DevRootsResolution? = nil,
+        ephemeralTempRoots: EphemeralTempRootsResolution? = nil,
         ephemeralTempThresholds: EphemeralTempSweepConfig.Thresholds? = nil
     ) -> SpaceScannerRuntime {
         let categories = CacheCategory.allCategories
@@ -1039,10 +1055,11 @@ struct SpaceScannerRuntime {
         // hardcoded `/var/folders` guess), and the scanner defers entirely on
         // `.automatic` triggers, so registering it costs a background scan
         // nothing.
-        let ephemeralTempRoots = EphemeralTempRoots.resolve(provider: provider)
+        let resolvedTempRoots = ephemeralTempRoots
+            ?? EphemeralTempRoots.resolve(provider: provider)
         let ephemeralTempScanner = EphemeralTempScanner(
-            roots: ephemeralTempRoots.roots,
-            resolutionIssues: ephemeralTempRoots.issues,
+            roots: resolvedTempRoots.roots,
+            resolutionIssues: resolvedTempRoots.issues,
             home: home,
             thresholds: ephemeralTempThresholds
                 ?? EphemeralTempSweepConfig.resolvedThresholds(),

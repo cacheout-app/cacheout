@@ -14,7 +14,7 @@ Built for developers on space-constrained Macs (especially the 256GB M4 Mac Mini
 
 - **Built-in cache categories** — Xcode, Docker, npm, Yarn, pnpm, Homebrew, Playwright, CocoaPods, Swift PM, Gradle, browser caches, VS Code, Electron, pip, and more (the full list lives in [docs/v1/CATEGORIES.md](docs/v1/CATEGORIES.md))
 - **Project build-artifact scanner** — Walks your configured dev roots for build output proven by an ecosystem marker file (`target/` beside `Cargo.toml`, `node_modules/` beside `package.json`, `.venv/` containing `pyvenv.cfg`, and more), shows size and staleness (30d+), and refuses to delete a directory holding release artifacts (`.dmg`, `.pkg`, `.ipa`, `.app`, `.xcarchive`, `.dSYM`) until you acknowledge them
-- **Ephemeral temp sweep** — Lists stale scratch directories in the temp locations macOS does not reliably prune (`/private/tmp` and your per-user temp/cache containers). An entry is listed only when its own timestamp and its newest regular file are both at least 7 days old and it holds at least 10 MB (both adjustable). Timestamps on nested directories are deliberately not inputs: creating a subdirectory, or a socket, FIFO or symlink inside one, or unlinking a nested file, bumps only a directory mtime, so it neither keeps an entry off the list nor refuses it at delete time. Every gate is re-checked from a held descriptor immediately before deletion, so an entry is refused if its own directory changed, or a fresh regular file appeared anywhere inside it, since the scan. Age is the protection — Cacheout also skips an entry a program has advisory-locked, but it cannot see a program that merely holds a file inside it open for reading. Scanned only when you explicitly ask, never selected for you
+- **Ephemeral temp sweep** — Lists stale scratch directories in the temp locations macOS does not reliably prune (`/private/tmp` and your per-user temp/cache containers). An entry is listed only when its own timestamp and its newest regular file are both older than 7 days and it holds at least 10 MB (both adjustable). A nested directory's own timestamp is not itself an input, at scan time or at delete time — but a change inside one is not therefore invisible: unlinking a file in there can take the entry below the size floor, and creating enough subdirectories in there can push its contents past the inspection budget, and either of those both keeps the entry off the list and refuses it at delete time. Every gate is re-established from a held descriptor immediately before deletion, so an entry is refused if it was replaced, its own directory changed, a fresh regular file appeared anywhere inside it, it shrank below the floor, or its contents could not be fully re-inspected. Age is the protection — Cacheout also skips an entry a program has advisory-locked, but it cannot see a program that merely holds a file inside it open for reading. Scanned only when you explicitly ask, never selected for you
 - **Risk-level indicators** — Each category rated Safe / Review / Caution so you know what's risk-free
 - **Async parallel scanning** — Scans all categories concurrently for fast results
 - **Sparse file awareness** — Reports allocated (on-disk) usage everywhere, so sparse files — Docker's disk image, simulator disk images, and anything else logically larger than it really is — show what they actually consume, not inflated logical sizes
@@ -117,20 +117,29 @@ newest REGULAR FILE are both older than the age threshold (7 days by default)
 and it is at least 10 MB, so a directory holding one fresh file deep inside is
 left alone, and so is anything the current session just wrote.
 
-Timestamps on nested directories are deliberately not inputs, at scan time or
-at delete time: creating a subdirectory, or a socket, FIFO or symlink inside
-one, or unlinking a nested file, bumps only a directory mtime, so it neither
-un-stales an entry nor refuses its deletion. The entry's OWN timestamp is an
-input on both sides, so a write at the top level of the entry is caught.
+A nested directory's OWN timestamp is deliberately not an input, at scan time
+or at delete time — only the entry's own timestamp and the mtimes of the
+REGULAR FILES below it. So a write at the top level of the entry is caught,
+while one that only re-stamps a directory deeper down is not.
+
+That is a statement about the TIMESTAMP, not about the operations that move
+it, and the difference matters: a nested change can still trip a gate that is
+not a timestamp at all. Unlinking a file inside a nested directory can take
+the entry below the size floor, and creating enough subdirectories inside one
+can push its contents past the budget the inspection walk is bounded by —
+either of those both keeps the entry off the list and refuses it at delete
+time. (Earlier releases of this document claimed the whole class of such
+changes was invisible on both sides. Two of the five operations it named were
+not, and there is now a falsifier per operation beside the code.)
 
 Cacheout also skips an entry a process has taken an advisory lock on, but
 that check only sees a lock on the entry itself — it cannot detect a process
 merely holding a file open somewhere inside. Age is the real protection, and
 every gate is re-established from a held descriptor immediately before
-deletion, so an entry is refused if its own directory changed, or a fresh
-regular file appeared anywhere inside it, since the scan — with the same
-blind spot: a change that only bumps a nested directory's timestamp is not
-refused.
+deletion, so an entry is refused if it was replaced under the same name, its
+own directory changed, a fresh regular file appeared anywhere inside it, it
+shrank below the size floor, or its contents could not be fully re-inspected
+within that budget.
 
 These locations are scanned only when you explicitly press Scan (or run
 `--cli scan`) — automatic background refreshes never touch them. Findings

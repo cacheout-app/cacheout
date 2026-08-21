@@ -473,13 +473,23 @@ ephemeral locations macOS does not reliably prune. Long-lived scratch
 directories accumulate there unnoticed — a month-old build sandbox or agent
 scratchpad survives reboots and shows up in no cache category.
 
-**Roots (exactly three, resolved at runtime).** `/private/tmp`, plus the
+**Roots (three DECLARED, resolved at runtime).** `/private/tmp`, plus the
 per-user temp (`…/T`) and cache (`…/C`) containers under
 `/private/var/folders`, whose machine-specific paths come from the OS rather
-than being hardcoded. A root that is missing at scan time is skipped
-silently; a root that is present but unreadable is reported as a scan issue,
-never a silent zero. Nothing below the first level is listed: the entry
-itself is the unit.
+than being hardcoded. Three declarations can resolve to fewer roots — the
+three dispositions that reduce them are:
+
+- a root the OS does not name, or that is **missing** at scan time, is
+  skipped **silently**;
+- a root that is present but **unreadable** is reported as a **scan issue**,
+  never a silent zero;
+- a root that resolves to a **symlink alias** of another declared root — a
+  `…/C` that is a link onto `…/T`, say — is dropped at RESOLUTION time with a
+  `symlink_root` issue naming the dropped spelling, so the covering root is
+  scanned once instead of twice and the drop is never silent. The ALIAS is
+  what goes; the real root always survives.
+
+Nothing below the first level is listed: the entry itself is the unit.
 
 **Per-root note on OS cleanup**, shown as item evidence:
 
@@ -505,12 +515,20 @@ session (Cacheout included) has just written is fresh by construction, which
 is exactly what keeps a live session's own scratch directory off the list —
 there is no separate exclusion list to fall out of date.
 
-"Content" here means REGULAR FILES. Timestamps on nested directories are
-deliberately not inputs, at scan time or at delete time: creating a
-subdirectory, or a socket, FIFO or symlink inside one, or unlinking a nested
-file, bumps only a directory mtime, so it neither un-stales an entry nor
-refuses its deletion. The entry's OWN timestamp is an input on both sides, so
-a write at the top level of the entry is caught.
+"Content" here means REGULAR FILES. A nested directory's OWN timestamp is
+deliberately not an input, at scan time or at delete time — the inputs are the
+entry's own timestamp and the mtimes of the regular files below it, so a write
+at the top level of the entry is caught while one that only re-stamps a
+directory deeper down is not.
+
+That is a claim about the TIMESTAMP, not about the operations that move one.
+A nested change can still trip a gate that is not a timestamp: unlinking a
+file inside a nested directory can take the entry below the **size floor**
+below, and creating enough subdirectories inside one can push its contents
+past the **inspection budget** the staleness walk and the delete-time re-check
+are both bounded by. Either of those both keeps the entry off the list — the
+budget arm silently, since a cap denied nothing — and refuses it at delete
+time, where the refusal names the budget rather than any timestamp.
 
 **Size floor.** Only entries at or above the floor are listed, so ordinary
 small temp files never appear.

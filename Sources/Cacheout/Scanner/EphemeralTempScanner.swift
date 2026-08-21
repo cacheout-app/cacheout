@@ -163,7 +163,7 @@
 ///   (`denial(forFailedProbe:errno:)`'s `case EPERM`, :545); the only
 ///   surviving discriminator is a detail STRING, and classification derived
 ///   from message text is forbidden house doctrine (`CacheCleaner.refusalTag`
-///   :1393 switches the TYPED error). Anchors re-verified r4 — the three
+///   :1402 switches the TYPED error). Anchors re-verified r10 — the three
 ///   that stood here pointed at a sparse-accounting comment, a hardlink
 ///   comment and an unrelated line (R3-V5); re-grep before trusting these
 ///   too (SCANNERS-ROADMAP doctrine).

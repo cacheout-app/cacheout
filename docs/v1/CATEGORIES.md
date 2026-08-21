@@ -531,15 +531,22 @@ entry off the list — the
 budget arm silently, since a cap denied nothing — and refuses it at delete
 time, where the refusal names the budget rather than any timestamp.
 
-**Size floor.** Only entries at or above the floor are listed, so ordinary
-small temp files never appear.
+**Size floor.** Ordinary small temp files never appear: a MEASURED entry
+below the floor is not listed. Denied or mount-boundary entries are always
+listed, never hidden by the size cut — the same carve-out the orphaned-caches
+scanner states above, and for the same reason: an unverified zero must not
+render as "nothing here" (D6).
 
-**Entries other users own are never listed.** `/private/tmp` is shared and
+**Entries other users own are skipped.** `/private/tmp` is shared and
 sticky: another user's entry may be readable but is not yours to delete, so
 listing it would claim bytes that cannot be freed. Those entries are skipped
 silently — that is normal multi-user background noise, not an anomaly. The
 per-user `T`/`C` containers are yours by construction, so the rule is
-vacuous there.
+vacuous there. One carve-out, deliberate and measured: the mount-boundary arm
+runs BEFORE the ownership probe, so an entry that is a mounted volume is
+reported as a refused, not-measured row whoever owns it — the scanner refuses
+it without entering, which is precisely why it does not wait to learn the
+owner first.
 
 **Entries in use are skipped** when a process holds an advisory lock on the
 entry itself. That check is a narrow supplement, not a guarantee: it does

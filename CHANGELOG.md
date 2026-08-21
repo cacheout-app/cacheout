@@ -50,12 +50,14 @@ and docs/v1/CLI-REFERENCE.md) — the pre-release `node_modules` →
   silently, and one that turns out to be a symlink ALIAS of another declared
   root is dropped at resolution with a `symlink_root` issue naming the
   dropped spelling — the ALIAS goes, never the real root, and the drop is
-  never silent. An entry qualifies when its OWN timestamp and its newest
-  REGULAR FILE are both older than the age threshold (default 7 days) and it
-  meets the size floor (default 10 MB) — a directory holding one fresh file
-  deep inside is not stale, so a workspace whose files are still being
+  never silent. A MEASURED entry qualifies when its OWN timestamp and its
+  newest REGULAR FILE are both older than the age threshold (default 7 days)
+  and it meets the size floor (default 10 MB) — a directory holding one fresh
+  file deep inside is not stale, so a workspace whose files are still being
   written, including the running session's own scratch directory, is not
-  listed. A NESTED DIRECTORY's own timestamp is deliberately not an input
+  listed. Those thresholds gate the MEASURED entries only: a denied or
+  mount-boundary entry is listed as an explicit not-measured row regardless of
+  the floor (D6 — an unverified zero must not render as empty). A NESTED DIRECTORY's own timestamp is deliberately not an input
   (the same blind spot the sizer accepts) on either side: the inputs are the
   entry's own mtime and the mtimes of the REGULAR FILES below it. That is a
   claim about the TIMESTAMP and not about the operations that move one — a
@@ -67,9 +69,11 @@ and docs/v1/CLI-REFERENCE.md) — the pre-release `node_modules` →
   reading is NOT detected: age is the protection, and every gate is
   re-established from a held descriptor immediately before deletion.
   Findings are Review risk, never default-selected, and never part
-  of Quick Clean or `smart-clean`. Entries another user owns are never
-  listed — sticky-directory rules make them undeletable, so claiming their
-  bytes would be false; anything unreadable is reported instead of silently
+  of Quick Clean or `smart-clean`. An ordinary entry another user owns is
+  skipped — sticky-directory rules make them undeletable, so claiming their
+  bytes would be false; the one exception is a mounted volume, whose refusal
+  arm runs ahead of the ownership probe by design and reports the row without
+  entering it. Anything unreadable is reported instead of silently
   counted as empty. `--cli scan` reports each find as a `scanner_items` row
   and `--cli clean` accepts `ephemeral_tmp` or `ephemeral_tmp:<item-id>`,
   with `--confirm` required as everywhere else. **These locations are

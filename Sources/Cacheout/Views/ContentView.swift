@@ -177,11 +177,15 @@ struct ContentView: View {
                 // One generic section per registered per-item scanner —
                 // also shown when the scan produced only classified issues
                 // (a denied search root must be visible, never an empty
-                // section — R14/D6).
+                // section — R14/D6), and when the scanner has NEVER BEEN
+                // INSPECTED (PR #459 codex r11: hiding that case made it
+                // indistinguishable from "inspected, found nothing").
+                //
+                // The predicate itself lives on the section model
+                // (`isDisplayed`) because this expression is assertion-dead:
+                // hoisting it is what lets a cell pin the visibility rule.
                 ForEach(viewModel.perItemSections) { section in
-                    if !section.items.isEmpty
-                        || section.isScanning
-                        || !section.issues.isEmpty {
+                    if section.isDisplayed {
                         Divider().padding(.horizontal)
                         ScannerItemSection(section: section)
                     }

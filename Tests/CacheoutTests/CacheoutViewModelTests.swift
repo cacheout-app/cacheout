@@ -1411,6 +1411,113 @@ final class CacheoutViewModelTests: XCTestCase {
         XCTAssertTrue(viewModel.selectedItemKeys.isEmpty)
     }
 
+    // MARK: - Never inspected vs inspected-and-empty (PR #459 codex r11)
+
+    /// CLAUSE ONE of `isAwaitingFirstScan`, both ways: `!hasPublishedOutcome`.
+    ///
+    /// Two scanners with identical (empty) outputs; a SUBSET session runs
+    /// only one. Their `items`/`issues` are then byte-identical — both `[]`
+    /// — so nothing on the section itself distinguishes them except whether
+    /// `reconcile` ever ran. Deleting the clause collapses the two, and the
+    /// two `isAwaitingFirstScan` assertions below disagree about which way.
+    @MainActor
+    func testANeverInspectedSectionIsDistinguishableFromOneThatFoundNothing() async throws {
+        let runtime = try makeRuntime([
+            fixtureScanner("looked") { ScanOutcome(items: [], errors: []) },
+            fixtureScanner("never_looked") { ScanOutcome(items: [], errors: []) },
+        ])
+        let viewModel = CacheoutViewModel(runtime: runtime)
+        func section(_ id: String) throws -> ScannerSectionModel {
+            try XCTUnwrap(viewModel.perItemSections.first { $0.scannerID == id })
+        }
+
+        // Before any scan BOTH are awaiting — the state is about the scan,
+        // not about the scanner.
+        XCTAssertEqual(
+            viewModel.perItemSections.map(\.isAwaitingFirstScan), [true, true]
+        )
+
+        await viewModel.scan(trigger: .userInitiated, scannerIDs: ["looked"])
+
+        let looked = try section("looked")
+        let never = try section("never_looked")
+        XCTAssertEqual(looked.items.count, 0)
+        XCTAssertEqual(never.items.count, 0)
+        XCTAssertEqual(looked.issues.count, 0)
+        XCTAssertEqual(never.issues.count, 0)
+        XCTAssertEqual(looked.isScanning, never.isScanning,
+                       "items, issues and pending state are all identical — "
+                        + "`hasPublishedOutcome` is the ONLY thing that "
+                        + "separates the two cases")
+
+        XCTAssertFalse(looked.isAwaitingFirstScan,
+                       "an empty outcome WAS published — 'nothing' is an answer")
+        XCTAssertTrue(never.isAwaitingFirstScan,
+                      "this scanner was never in a session; nothing was looked at")
+
+        // …and the two derivations the view reads follow from it.
+        XCTAssertEqual(looked.headerCountLabel, "0 found")
+        XCTAssertEqual(never.headerCountLabel, "not scanned yet")
+        XCTAssertFalse(looked.isDisplayed,
+                       "inspected-and-empty stays hidden (unchanged)")
+        XCTAssertTrue(never.isDisplayed,
+                      "never-inspected must reach the user")
+    }
+
+    /// CLAUSE TWO: `!isScanning`. A FIRST scan in flight has published no
+    /// outcome yet, but it is not the never-inspected state — the section's
+    /// own spinner owns that window. Dropping the clause would make a
+    /// running scan claim it never happened.
+    @MainActor
+    func testAFirstScanInFlightIsNotTheNeverInspectedState() async throws {
+        let runtime = try makeRuntime([
+            fixtureScanner("busy") { ScanOutcome(items: [], errors: []) },
+        ])
+        let viewModel = CacheoutViewModel(runtime: runtime)
+        // The documented seam for pinning a mid-scan window.
+        viewModel.scanningScannerIDs = ["busy"]
+
+        let section = try XCTUnwrap(viewModel.perItemSections.first)
+        XCTAssertTrue(section.isScanning)
+        XCTAssertFalse(section.hasPublishedOutcome,
+                       "the fixture is mid-FIRST-scan: nothing published yet")
+        XCTAssertFalse(section.isAwaitingFirstScan,
+                       "a scan IS happening — the spinner is the disclosure")
+        XCTAssertEqual(section.headerCountLabel, "0 found",
+                       "the header keeps its ordinary running count — the "
+                        + "withheld form belongs to the never-inspected case")
+        XCTAssertTrue(section.isDisplayed, "the spinner still renders")
+    }
+
+    /// CLAUSE THREE: `issues.isEmpty`. A scanner whose ONLY event was
+    /// `malformedOutcome` has no outcome either — but it is not silent, and
+    /// mislabelling its visible failure as "not scanned yet" would replace a
+    /// disclosed fault with a benign-looking one. Dropping the clause makes
+    /// this section claim both at once.
+    @MainActor
+    func testAMalformedFirstEventIsAVisibleFaultNotANeverInspectedSection() async throws {
+        let runtime = try makeRuntime([
+            fixtureScanner("mal") { ScanOutcome(items: [], errors: []) },
+        ])
+        let viewModel = CacheoutViewModel(runtime: runtime)
+        let issue = ScanIssue(
+            url: nil, kind: .malformedOutcome,
+            detail: "rejected — malformed scanner output"
+        )
+        viewModel.handle(.malformed(scannerID: "mal", issue))
+
+        let section = try XCTUnwrap(viewModel.perItemSections.first)
+        XCTAssertFalse(section.hasPublishedOutcome,
+                       "a malformed event publishes NOTHING (fail-closed)")
+        XCTAssertEqual(section.issues, [issue],
+                       "…but the fault is surfaced on the section")
+        XCTAssertFalse(section.isAwaitingFirstScan,
+                       "a disclosed fault must not be re-labelled 'not "
+                        + "scanned yet' — the scan ran and failed")
+        XCTAssertTrue(section.isDisplayed,
+                      "the issue block renders (unchanged behavior)")
+    }
+
     // MARK: - Runtime reconstruction (fn-4.10, R8)
 
     /// The seam is OPT-IN: a view model handed a finished runtime and no

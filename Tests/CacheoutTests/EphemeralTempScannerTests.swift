@@ -563,8 +563,11 @@ final class EphemeralTempScannerTests: XCTestCase {
     ///
     /// A `readdir` that FAILS mid-directory used to be folded into the same
     /// `truncated: Bool` a benign cap hit sets, so the candidate was dropped
-    /// with NO item and NO issue — a refusal the user is never told about,
-    /// which the GUI then renders as the "Nothing found" empty state (D6).
+    /// with NO item and NO issue — a refusal the user is never told about.
+    /// (The GUI consequence stated here was WRONG and is corrected in
+    /// PR #459 codex r11: with no items and no issues the section is not
+    /// rendered at all — `ScannerSectionModel.isDisplayed` is false — so the
+    /// refusal was silent rather than mislabelled "Nothing found".)
     /// An `opendir` failure on the very same subdirectory one entry earlier
     /// was already visible; this closes the asymmetry.
     ///

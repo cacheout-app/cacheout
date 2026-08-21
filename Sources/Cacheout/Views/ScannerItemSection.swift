@@ -65,13 +65,18 @@ struct ScannerItemSection: View {
                         .foregroundStyle(.purple)
                     Text(section.displayName)
                         .font(.headline)
-                    Text("(\(section.items.count) found)")
+                    // "(0 found)" is an affirmative claim about a completed
+                    // inspection — `headerCountLabel` withholds it (and the
+                    // total below it) until one has happened.
+                    Text("(\(section.headerCountLabel))")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     Spacer()
-                    Text(viewModel.formattedTotalSize(forScanner: section.scannerID))
-                        .font(.body.monospacedDigit().bold())
-                        .foregroundStyle(.purple)
+                    if !section.isAwaitingFirstScan {
+                        Text(viewModel.formattedTotalSize(forScanner: section.scannerID))
+                            .font(.body.monospacedDigit().bold())
+                            .foregroundStyle(.purple)
+                    }
                 }
                 .padding(.horizontal, 10)
                 .padding(.vertical, 8)
@@ -164,18 +169,33 @@ struct ScannerItemSection: View {
                 }
             }
 
-            // "Found none" is claimed only when the scan had no classified
-            // problems — a denied root is NOT "nothing there" (R14/D6).
-            if isExpanded && !section.isScanning
-                && section.items.isEmpty
-                && section.issues.isEmpty {
+            // NEVER INSPECTED — the only empty state this section renders
+            // (PR #459 codex r11, DISCLOSURE).
+            //
+            // The RETIRED block here claimed "Nothing found" under exactly
+            // `!isScanning && items.isEmpty && issues.isEmpty`, which is the
+            // negation of `ContentView`'s own render gate — the section was
+            // never constructed in that state, so the affirmative empty
+            // result was unreachable through the app's ONE call site
+            // (`ContentView.swift`, the sole `ScannerItemSection(` in the
+            // repo). What the user actually saw for a never-scanned scanner
+            // was the same thing they saw for a scanner that found nothing:
+            // no section at all. Two different facts, one silence.
+            //
+            // `isDisplayed` now admits the never-inspected case and this
+            // block says so, so silence again means one thing only. A
+            // scanner that ran and found nothing is still hidden.
+            if isExpanded && section.isAwaitingFirstScan {
                 VStack(spacing: 8) {
-                    Image(systemName: "shippingbox")
+                    Image(systemName: "magnifyingglass")
                         .font(.largeTitle)
                         .foregroundStyle(.tertiary)
-                    Text("Nothing found")
+                    Text("Not yet scanned")
                         .font(.callout)
                         .foregroundStyle(.secondary)
+                    Text("Press Scan to inspect \(section.displayName).")
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
                 }
                 .frame(maxWidth: .infinity, alignment: .center)
                 .padding(.vertical, 24)

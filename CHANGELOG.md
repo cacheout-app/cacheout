@@ -79,7 +79,12 @@ and docs/v1/CLI-REFERENCE.md) — the pre-release `node_modules` →
   with `--confirm` required as everywhere else. **These locations are
   scanned only on EXPLICIT user-initiated scans** — the app's automatic
   background refreshes never enumerate them, and a CLI scan is always
-  user-initiated. Thresholds persist as `cacheout.ephemeralTmp.ageDays` /
+  user-initiated. Until you run one, the app SAYS SO: the section shows
+  "Not yet scanned" instead of a size and a count, so a location nobody has
+  looked at never reads as a location with nothing in it. (Any per-item
+  scanner in that state says the same; a scanner that HAS run and found
+  nothing keeps its section hidden, as before.)
+  Thresholds persist as `cacheout.ephemeralTmp.ageDays` /
   `cacheout.ephemeralTmp.minSizeMB` and take invocation-scoped
   `--tmp-age-days` / `--tmp-min-size-mb` overrides on `scan` and `clean`
   (never persisted; refused on every other command, `smart-clean`

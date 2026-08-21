@@ -202,11 +202,63 @@ struct ScannerSectionModel: Identifiable {
     let items: [ReclaimableItem]
     let issues: [ScanIssue]
     let isScanning: Bool
+    /// Whether this scanner has an entry in `outcomesByScannerID` — i.e.
+    /// whether it has published a validated outcome at all this session. A
+    /// scanner that RAN and found nothing publishes an EMPTY outcome, so
+    /// this is false only for one that has never been inspected.
+    let hasPublishedOutcome: Bool
     var id: String { scannerID }
 
     /// "Select Stale" renders only where staleness applies to at least one
     /// item (`isStale == nil` = control hidden/inapplicable).
     var supportsStaleness: Bool { items.contains { $0.isStale != nil } }
+
+    /// NEVER INSPECTED, as distinct from INSPECTED AND FOUND NOTHING
+    /// (PR #459 codex r11, DISCLOSURE). `items` and `issues` both fall back
+    /// to `[]` when no outcome exists (`CacheoutViewModel.items(forScanner:)`
+    /// / `issues(forScanner:)`), so an empty section on its own cannot tell
+    /// the two apart — and the ephemeral temp scanner sits in exactly that
+    /// state from launch until the user presses Scan, because
+    /// `EphemeralTempScanner.participates(in:)` returns
+    /// `context.includeProtectedRoots` and a non-participating scanner
+    /// publishes NO outcome (deliberately — that is what keeps an automatic
+    /// refresh from erasing prior findings and ticks).
+    ///
+    /// Three clauses, each load-bearing:
+    /// - `!hasPublishedOutcome` — an outcome ever published means the
+    ///   answer is known, and "nothing" is then a real finding.
+    /// - `!isScanning` — a first scan IN FLIGHT has its own spinner; this
+    ///   state is about the absence of a scan, not its progress.
+    /// - `issues.isEmpty` — a scanner whose only event was
+    ///   `malformedOutcome` has no outcome but DOES have a visible issue
+    ///   (`malformedIssuesByScannerID`), and that is not silence.
+    ///
+    /// `items.isEmpty` is IMPLIED by `!hasPublishedOutcome` and is
+    /// deliberately not restated: a clause no mutation can falsify is not a
+    /// guard.
+    var isAwaitingFirstScan: Bool {
+        !hasPublishedOutcome && !isScanning && issues.isEmpty
+    }
+
+    /// Whether `ContentView` renders this section at all — HOISTED out of
+    /// the view body (PR #459 codex r11) so the visibility rule is
+    /// assertable: SwiftUI bodies are assertion-dead, and this predicate is
+    /// what decides whether the not-yet-scanned disclosure reaches the user
+    /// at all.
+    ///
+    /// The first three clauses are the as-built gate, verbatim; the fourth
+    /// is the fix. A section that HAS been scanned and holds nothing stays
+    /// hidden exactly as before — silence still means "looked, found
+    /// nothing", and it no longer also means "never looked".
+    var isDisplayed: Bool {
+        !items.isEmpty || isScanning || !issues.isEmpty || isAwaitingFirstScan
+    }
+
+    /// The header's parenthetical. "0 found" is an AFFIRMATIVE claim about a
+    /// completed inspection, so a never-inspected section must not make it.
+    var headerCountLabel: String {
+        isAwaitingFirstScan ? "not scanned yet" : "\(items.count) found"
+    }
 }
 
 @MainActor
@@ -824,7 +876,13 @@ class CacheoutViewModel: ObservableObject {
                     displayName: scanner.displayName,
                     items: items(forScanner: scanner.id),
                     issues: issues,
-                    isScanning: scanningScannerIDs.contains(scanner.id)
+                    isScanning: scanningScannerIDs.contains(scanner.id),
+                    // THE never-inspected signal (PR #459 codex r11): an
+                    // entry exists iff `reconcile` ever ran for this
+                    // scanner, and it runs for an EMPTY outcome too — so
+                    // absence means "no scan has ever reported", never
+                    // "reported nothing".
+                    hasPublishedOutcome: outcomesByScannerID[scanner.id] != nil
                 )
             }
     }

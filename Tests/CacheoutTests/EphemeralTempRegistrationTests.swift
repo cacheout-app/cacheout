@@ -440,6 +440,73 @@ final class EphemeralTempRegistrationTests: XCTestCase {
                       "the temp ROOT is never a deletion target")
     }
 
+    /// THE DEFERRAL IS DISCLOSED, NOT SILENT (PR #459 codex r11, P2
+    /// DISCLOSURE — the exact launch sequence the finding names).
+    ///
+    /// `ContentView.task` starts an `.automatic` scan on first appearance,
+    /// and this scanner does not participate in one, so it publishes NO
+    /// outcome: its section carries no items and no issues. That is ALSO
+    /// the shape of a scanner that ran and found nothing, and the render
+    /// gate hid both — one silence standing for two different facts, with
+    /// no way for a user to tell "never looked" from "looked, found
+    /// nothing".
+    ///
+    /// Both halves are asserted here and they MUST differ. After the
+    /// automatic scan the section is DISPLAYED and withholds every
+    /// affirmative claim ("not scanned yet", no total); after a
+    /// user-initiated scan over the SAME (empty) root it goes back to
+    /// silence and says "0 found" — which is now a finding rather than a
+    /// default.
+    @MainActor
+    func testTheAutomaticDeferralIsDisclosedAndOnlyAnActualScanClaimsNothingFound() async throws {
+        let runtime = try makeRuntime([makeScanner()])
+        let viewModel = CacheoutViewModel(runtime: runtime)
+        let onlyTemp: Set<String> = [EphemeralTempScanner.registeredID]
+        func section() throws -> ScannerSectionModel {
+            try XCTUnwrap(viewModel.perItemSections.first {
+                $0.scannerID == EphemeralTempScanner.registeredID
+            })
+        }
+
+        // (1) The launch scan. The scanner defers, so nothing is published.
+        await viewModel.scan(trigger: .automatic, scannerIDs: onlyTemp)
+        let deferred = try section()
+        XCTAssertTrue(deferred.items.isEmpty)
+        XCTAssertTrue(deferred.issues.isEmpty)
+        XCTAssertFalse(deferred.isScanning)
+        XCTAssertTrue(
+            deferred.isAwaitingFirstScan,
+            "no temp root has been opened — the section may not present "
+                + "itself as an inspected one"
+        )
+        XCTAssertTrue(
+            deferred.isDisplayed,
+            "the never-inspected case must REACH the user: hiding it is "
+                + "the same silence as an inspected-and-empty scanner"
+        )
+        XCTAssertEqual(deferred.headerCountLabel, "not scanned yet",
+                       "\"0 found\" would be an affirmative claim about an "
+                        + "inspection that never happened")
+
+        // (2) The user presses Scan. The root is genuinely empty, so this
+        //     time "nothing" is a finding — and the section falls silent
+        //     again, exactly as every other empty scanner does.
+        await viewModel.scan(trigger: .userInitiated, scannerIDs: onlyTemp)
+        let scanned = try section()
+        XCTAssertTrue(scanned.items.isEmpty)
+        XCTAssertTrue(scanned.issues.isEmpty, "\(scanned.issues)")
+        XCTAssertFalse(
+            scanned.isAwaitingFirstScan,
+            "the roots WERE opened this time — an empty outcome is an answer"
+        )
+        XCTAssertEqual(scanned.headerCountLabel, "0 found")
+        XCTAssertFalse(
+            scanned.isDisplayed,
+            "an inspected-and-empty section stays hidden, unchanged by this "
+                + "round — silence now means exactly one thing"
+        )
+    }
+
     /// SCANNER-DEFINED STALENESS IS THE BULK-SELECTION CONTRACT (PR #459
     /// review r4, codex C2 — DISCLOSURE). At the SHIPPED default thresholds
     /// (7 days / 10 MB), an 8-day-old entry is `isStale: true` and the

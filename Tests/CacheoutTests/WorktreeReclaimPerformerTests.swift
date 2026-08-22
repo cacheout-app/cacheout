@@ -205,8 +205,10 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         moveToTrash: Bool = false,
         trash: ((URL) async throws -> Void)? = nil,
         revalidate: ((ReclaimableItem) -> PreDeleteSeamRefusal?)? = nil,
-        gitTimeout: TimeInterval = WorktreeReclaimPerformer.deleteTimeGitTimeout
+        gitTimeout: TimeInterval = WorktreeReclaimPerformer.deleteTimeGitTimeout,
+        provider overrideProvider: FileSystemIdentityProvider? = nil
     ) -> WorktreeReclaimPerformer {
+        let provider = overrideProvider ?? self.provider
         let sizer = DirectorySizer(provider: provider)
         let fileManager = fm
         let trashRoot = trashDirectory!
@@ -539,6 +541,59 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         XCTAssertTrue(fm.fileExists(
             atPath: trashDirectory.appendingPathComponent("wt").path
         ))
+    }
+
+    /// Reports NO identity for any DESCRIPTOR — the "I opened the folder but
+    /// cannot prove which folder it is" case.
+    private final class UnprovableDescriptorProvider: FileSystemIdentityProvider {
+        override func identity(ofDescriptor fd: Int32) -> Identity? { nil }
+    }
+
+    func testTheFallbackRefusesWhenItCannotBindTheFolderItWouldDeleteIn()
+        async throws
+    {
+        // fn-6 RECONCILIATION, and the cell that EVIDENCES the binding.
+        //
+        // fn-6's removal proves the folder it opens against an identity the
+        // caller captured from a descriptor first, so this fallback captures
+        // one before its TOCTOU rechecks. Handing `.unbound` instead still
+        // compiles and still deletes — measured: replacing the capture with
+        // `.unbound` left the whole suite green at 1418/2/0 — so without this
+        // cell the binding is a parameter nobody checks.
+        //
+        // The capture is the fallback's FIRST descriptor-identity call (the
+        // gates before it are path-based), so a provider that can prove no
+        // descriptor makes exactly that capture fail and nothing else.
+        // FAIL-CLOSED is the assertion: the reclaim reports an error and the
+        // worktree is still on disk. Under `.unbound` nothing throws, the
+        // removal runs, and the existence check below goes red.
+        let repository = try makeRepository(named: "repo")
+        let worktree = try addWorktree(named: "wt", branch: "feature", in: repository)
+        let plan = staleplan(
+            worktree: worktree, membership: try membership(of: worktree, in: repository)
+        )
+        // git refuses `remove`, which is what routes this item to the
+        // filesystem fallback in the first place.
+        let failing = InterceptingGitRunner(wrapping: realRunner()) { arguments, _ in
+            arguments.contains("remove")
+                ? .failure(exitCode: 128, stderr: "injected refusal")
+                : nil
+        }
+
+        let outcome = await perform(
+            item(plan), plan: plan,
+            with: makePerformer(
+                runner: failing, moveToTrash: false,
+                provider: UnprovableDescriptorProvider()
+            )
+        )
+
+        XCTAssertNil(outcome.entry, "an unprovable container yields NO entry")
+        XCTAssertFalse(outcome.errors.isEmpty, "the refusal must be reported")
+        XCTAssertTrue(
+            fm.fileExists(atPath: worktree.path),
+            "a container the deletion cannot bind must leave the tree alone"
+        )
     }
 
     func testGatedPruneIsSkippedWhenAnUndisclosedOrphanWouldAlsoBeSwept()

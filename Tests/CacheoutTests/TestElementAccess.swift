@@ -33,6 +33,14 @@ import XCTest
 /// the measured strand above happened with `XCTAssertEqual(disclosures.count,
 /// 2, "\(disclosures)")` sitting on the line directly above the trap.
 ///
+/// The rule covers a VARIABLE index too — `xs[i]` traps exactly like
+/// `xs[0]`. `StrandFenceTests` reads the literal-index shape everywhere and
+/// the variable-index shape wherever the index name is loop-bound to an
+/// integer; PR #460 codex r8 found one live site of the latter
+/// (`clauses[index]` in `WorktreeStalenessAssessorTests`, under its own
+/// `XCTAssertEqual(clauses.count, 4, …)`) and measured the strand: 25 cells
+/// never ran and the total line never printed.
+///
 /// A literal-fixture subscript (`["a", "b"][0]`) cannot trap, but the sites
 /// here were converted uniformly anyway: "is this array's length decided by
 /// production?" is a question a future edit can silently change the answer

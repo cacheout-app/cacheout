@@ -2761,7 +2761,11 @@ final class OrphanedCachesScannerTests: XCTestCase {
                        "an observer must see the walk's OWN spelling, "
                            + "composed root-first, one component per level")
         for (index, component) in components.enumerated() {
-            XCTAssertEqual(descended[component], expected[index],
+            // `expected` is the test's own array, but `index` runs over a
+            // DIFFERENT collection: the pairing is an invariant, not a
+            // guarantee, and a trap here would strand the run.
+            let parent = try XCTUnwrapElement(expected, index)
+            XCTAssertEqual(descended[component], parent,
                            "descent into \(component) was reported from the "
                                + "wrong parent spelling")
         }

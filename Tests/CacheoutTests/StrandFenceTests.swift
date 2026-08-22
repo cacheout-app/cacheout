@@ -61,7 +61,7 @@ import XCTest
 /// `Fatal error: Unexpectedly found nil`, **signal 5, the total line never
 /// printed, 493 of the 1471 cells AT COMMIT 26c880b never ran**, and this
 /// PR's own `WorktreeReclaimPerformerTests` appeared in the log zero times.
-/// (The suite is 1480 at r7; the figure belongs to the commit it was taken
+/// (The suite is 1482 at r8; the figure belongs to the commit it was taken
 /// at — see `WorktreeReclaimPerformerTests`' class header, D5.)
 ///
 /// So r7 converted that population — 14 sites in `CategoryScannerTests`,
@@ -86,19 +86,25 @@ import XCTest
 ///
 /// ## What this fence does NOT cover, stated rather than implied
 ///
-/// - **A subscript with a VARIABLE index (`xs[i]`) is NOT matched, and the
-///   forbidden set is a LITERAL integer index only** (PR #460 codex r7, D4).
-///   The r6 wording said "an integer subscript on a named receiver" and
-///   explained the regex only in terms of the receiver, which reads as though
-///   `xs[i]` were covered; it is not, and it traps identically. It is not
-///   matched because a regex cannot tell an ARRAY subscript from a DICTIONARY
-///   one, and a dictionary subscript returns an Optional and cannot trap.
-///   MEASURED at r7: widening the pattern to any identifier index reports
-///   **105** lines across the suite, of which the overwhelming majority are
+/// - **`statementTraps`' subscript pattern matches a LITERAL integer index
+///   only** (PR #460 codex r7, D4), and a variable index is handled by a
+///   SEPARATE cell rather than by that pattern (PR #460 codex r8, D1).
+///   `statementTraps` cannot widen because a regex cannot tell an ARRAY
+///   subscript from a DICTIONARY one, and a dictionary subscript returns an
+///   Optional and cannot trap. MEASURED at r7: widening the pattern to any
+///   identifier index reports **105** lines across the suite (**117** when
+///   re-run at r8 on this branch: `grep -rnE
+///   '[A-Za-z0-9_\)\]]\s*\[\s*[A-Za-z_][A-Za-z0-9_.]*\s*\]' Tests
+///   --include='*.swift' | wc -l`), of which the overwhelming majority are
 ///   dictionary reads (`failures[url.path]`, `paths[scanner.registeredID]`,
 ///   `environment[key]`) — a fence that is ~90% false positives is a fence
 ///   that gets suppressed. `testTheIntegerSubscriptPatternMatchesLiteralIndicesOnly`
 ///   pins this scope so the claim and the regex cannot drift apart again.
+///   What r7 did NOT do, and r8 does, is separate the subset where the
+///   dictionary ambiguity does not exist: when the index name is bound by a
+///   loop over integers the read IS an array read.
+///   `testNoLoopBoundIndexSubscriptCanStrandTheRun` covers exactly that
+///   subset — 7 lines, not 117 — and its own header states its limits.
 /// - **`as!`, `precondition`, `fatalError`, arithmetic overflow, out-of-range
 ///   `Range` subscripts, `Array(repeating:count:)` with a negative count** —
 ///   not scanned at all. No occurrence of any of them has stranded a run here.
@@ -231,9 +237,12 @@ final class StrandFenceTests: XCTestCase {
     /// both pinned by `testTheIntegerSubscriptPatternMatchesLiteralIndicesOnly`:
     /// a subscript into an array LITERAL (`+ [0]`, `[20]`) is not a claim about
     /// production, so the regex requires an identifier, `)` or `]` immediately
-    /// before the bracket; and a VARIABLE index (`xs[i]`) is not matched at
-    /// all, because no regex can separate it from a dictionary read, which
-    /// cannot trap (see the header, D4).
+    /// before the bracket; and a VARIABLE index (`xs[i]`) is not matched by
+    /// THIS pattern, because no regex can separate it from a dictionary read,
+    /// which cannot trap (see the header, D4). The subset of variable indices
+    /// that provably ARE array reads — the index name is loop-bound to an
+    /// integer — is fenced by
+    /// `testNoLoopBoundIndexSubscriptCanStrandTheRun` (r8, D1).
     private static let statementTraps: [(name: String, pattern: String)] = [
         ("try!", #"\btry!"#),
         ("literal-integer subscript",
@@ -470,8 +479,11 @@ final class StrandFenceTests: XCTestCase {
             XCTAssertTrue(matches(trapping), "must be reported: \(trapping)")
         }
         for notReported in [
-            // A VARIABLE index traps identically and is NOT reported — the
-            // exclusion this cell exists to make visible rather than imply.
+            // A VARIABLE index traps identically and is NOT reported BY THIS
+            // PATTERN — the exclusion this cell exists to make visible rather
+            // than imply. Both of these lines ARE read by
+            // `testNoLoopBoundIndexSubscriptCanStrandTheRun`, which allows
+            // them because both receivers are pointers (r8, D1).
             "let entry = buffer[index]",
             "unlinkat(fds[index], segment, AT_REMOVEDIR)",
             // A dictionary read, which is why the exclusion above exists.
@@ -484,6 +496,279 @@ final class StrandFenceTests: XCTestCase {
         ] {
             XCTAssertFalse(
                 matches(notReported), "must NOT be reported: \(notReported)"
+            )
+        }
+    }
+
+    // MARK: - Variable index, LOOP-BOUND to an integer (PR #460 codex r8, D1)
+
+    /// The r7 header said a variable index "is NOT matched", gave the reason
+    /// (a regex cannot separate an array read from a dictionary read, and a
+    /// dictionary read returns an Optional and cannot trap), and stopped
+    /// there. That reason does not hold for the whole population: when the
+    /// index name is BOUND BY A LOOP over integers — `.enumerated()`,
+    /// `.indices`, an integer range, `stride` — the subscript is an INTEGER
+    /// subscript, so the receiver is a collection indexed by `Int` and the
+    /// read traps exactly like `xs[0]`. MEASURED at r8: the live site was
+    /// `WorktreeStalenessAssessorTests.swift:974-975`,
+    /// `clauses[index].hasPrefix(…)` with `clauses` composed by
+    /// `WorktreeStalenessAssessor.evidence` — the exact shape
+    /// `TestElementAccess.swift` calls out, sitting one line under its
+    /// `XCTAssertEqual(clauses.count, 4, …)`.
+    ///
+    /// ## What this cell covers, stated so it cannot drift
+    ///
+    /// - The index must be a BARE identifier bound in the same file by one of
+    ///   `integerIndexBindings`. `xs[i + 1]`, `xs[someCall()]` and an index
+    ///   bound any other way (a `var` counter, a function parameter) are NOT
+    ///   matched. Over the whole suite the loop-bound population is 7 lines
+    ///   against 117 for "any identifier index" — the ~90%-dictionary noise
+    ///   r7 measured is exactly what the loop-bound requirement removes.
+    /// - The receiver must be a bare identifier: `xs[i]` and `report.rows[i]`
+    ///   are read, `f()[i]` and `xs[0][i]` are not.
+    /// - Two allowances, both PROVABLE from the same line rather than
+    ///   asserted: the index came from THIS receiver's own `.indices` or from
+    ///   a `stride` over THIS receiver's own `.count` (it cannot be out of
+    ///   range), or the receiver is a POINTER — a name declared
+    ///   `Unsafe…Pointer` or bound by a `withUnsafe…` closure in the same
+    ///   file — whose extent is the test's own allocation and which has no
+    ///   `Array` bounds check to trap on.
+    /// - Both allowances are FILE-WIDE on the name, as the force-unwrap
+    ///   fixture allowance already is: a second array that happens to reuse
+    ///   the name `buffer` in a file that also declares a `buffer` pointer is
+    ///   waved through. Narrowing that needs a scope analysis this file does
+    ///   not have, and the coarseness is here rather than implied.
+    ///
+    /// `testTheLoopBoundIndexFenceIsExactlyWhatItClaims` pins every clause
+    /// above on synthetic lines, in both directions.
+    struct IntegerIndexBinding {
+        let label: String
+        let pattern: String
+        /// The capture holding the INDEX name.
+        let indexGroup: Int
+        /// The capture holding a receiver the bound proves the index in range
+        /// for, or 0 when the bound proves nothing about any receiver.
+        let receiverGroup: Int
+    }
+
+    static let integerIndexBindings: [IntegerIndexBinding] = [
+        IntegerIndexBinding(
+            label: "`.enumerated()`",
+            pattern: #"for\s*\(\s*(\w+)\s*,\s*\w+\s*\)\s+in[^\n]*\.enumerated\(\)"#,
+            indexGroup: 1, receiverGroup: 0
+        ),
+        IntegerIndexBinding(
+            label: "`for … in x.indices`",
+            pattern: #"for\s+(\w+)\s+in\s+(\w+)\.indices\b"#,
+            indexGroup: 1, receiverGroup: 2
+        ),
+        IntegerIndexBinding(
+            label: "`x.indices.…  { i in`",
+            pattern: #"(\w+)\.indices\.\w+\s*\{\s*(\w+)\s+in\b"#,
+            indexGroup: 2, receiverGroup: 1
+        ),
+        IntegerIndexBinding(
+            label: "an integer range",
+            pattern: #"for\s+(\w+)\s+in\s+-?\d+\s*\.\.[.<]"#,
+            indexGroup: 1, receiverGroup: 0
+        ),
+        IntegerIndexBinding(
+            label: "`stride(from: x.count`",
+            pattern: #"for\s+(\w+)\s+in\s+stride\(from:\s*(\w+)\.count"#,
+            indexGroup: 1, receiverGroup: 2
+        ),
+    ]
+
+    /// Names a `withUnsafe…` closure binds, plus names declared with an
+    /// `Unsafe…Pointer` type — an unchecked receiver whose extent the test
+    /// itself allocated.
+    static let pointerBindings: [String] = [
+        #"(\w+)\s*:\s*Unsafe\w*Pointer"#,
+        #"withUnsafe\w*[^\n{]*\{\s*(\w+)\s+in\b"#,
+    ]
+
+    /// `(indexNames, provablyInRange)` for one source file.
+    static func integerIndexNames(
+        in source: String
+    ) -> (names: Set<String>, inRange: [String: Set<String>]) {
+        var names: Set<String> = []
+        var inRange: [String: Set<String>] = [:]
+        let full = NSRange(source.startIndex..., in: source)
+        for binding in integerIndexBindings {
+            guard let regex = try? NSRegularExpression(pattern: binding.pattern)
+            else { continue }
+            for match in regex.matches(in: source, range: full) {
+                guard binding.indexGroup < match.numberOfRanges,
+                      let indexRange = Range(
+                        match.range(at: binding.indexGroup), in: source
+                      )
+                else { continue }
+                let name = String(source[indexRange])
+                names.insert(name)
+                guard binding.receiverGroup > 0,
+                      binding.receiverGroup < match.numberOfRanges,
+                      let receiverRange = Range(
+                        match.range(at: binding.receiverGroup), in: source
+                      )
+                else { continue }
+                inRange[name, default: []].insert(String(source[receiverRange]))
+            }
+        }
+        return (names, inRange)
+    }
+
+    /// Every pointer-bound name in one source file.
+    static func pointerNames(in source: String) -> Set<String> {
+        var names: Set<String> = []
+        let full = NSRange(source.startIndex..., in: source)
+        for pattern in pointerBindings {
+            guard let regex = try? NSRegularExpression(pattern: pattern)
+            else { continue }
+            for match in regex.matches(in: source, range: full) {
+                guard match.numberOfRanges > 1,
+                      let range = Range(match.range(at: 1), in: source)
+                else { continue }
+                names.insert(String(source[range]))
+            }
+        }
+        return names
+    }
+
+    /// The `receiver[index]` reads on one line that no allowance covers.
+    static func unfencedLoopBoundSubscripts(
+        in line: String,
+        names: Set<String>,
+        inRange: [String: Set<String>],
+        pointers: Set<String>
+    ) -> [String] {
+        guard let regex = try? NSRegularExpression(
+            pattern: #"([A-Za-z_]\w*)\s*\[\s*([A-Za-z_]\w*)\s*\]"#
+        ) else { return [] }
+        let full = NSRange(line.startIndex..., in: line)
+        var hits: [String] = []
+        for match in regex.matches(in: line, range: full) {
+            guard let receiverRange = Range(match.range(at: 1), in: line),
+                  let indexRange = Range(match.range(at: 2), in: line)
+            else { continue }
+            let receiver = String(line[receiverRange])
+            // NOT named `index`: a dictionary read `inRange[index]` in THIS
+            // file would then be a live offender of this very cell the moment
+            // anyone bound `index` in an `.enumerated()` loop here.
+            let indexName = String(line[indexRange])
+            guard names.contains(indexName) else { continue }
+            if inRange[indexName]?.contains(receiver) == true { continue }
+            if pointers.contains(receiver) { continue }
+            hits.append("\(receiver)[\(indexName)]")
+        }
+        return hits
+    }
+
+    func testNoLoopBoundIndexSubscriptCanStrandTheRun() throws {
+        var offenders: [String] = []
+        var scannedFiles = 0
+
+        for file in try testSources() {
+            let source = Self.blankingLiteralText(
+                Self.blankingComments(
+                    try String(contentsOf: file, encoding: .utf8)
+                )
+            )
+            scannedFiles += 1
+            let (names, inRange) = Self.integerIndexNames(in: source)
+            let pointers = Self.pointerNames(in: source)
+            for (number, line) in source.split(
+                separator: "\n", omittingEmptySubsequences: false
+            ).enumerated() {
+                for hit in Self.unfencedLoopBoundSubscripts(
+                    in: String(line), names: names, inRange: inRange,
+                    pointers: pointers
+                ) {
+                    offenders.append(
+                        "\(target(of: file))/\(file.lastPathComponent):"
+                            + "\(number + 1): \(hit)"
+                    )
+                }
+            }
+        }
+
+        XCTAssertGreaterThan(
+            scannedFiles, 40,
+            "the fence must actually have read the suite, not an empty listing"
+        )
+        XCTAssertEqual(
+            offenders, [],
+            "an integer subscript with a LOOP-BOUND index traps exactly like "
+                + "`xs[0]` and kills the PROCESS, not the cell — measured at "
+                + "r3 and r7: 985 and 493 cells never ran. Use "
+                + "`try XCTUnwrapElement(xs, i)`."
+        )
+    }
+
+    /// The widened fence's own regression guard: every clause of the doc
+    /// comment above, on synthetic sources, in both directions.
+    func testTheLoopBoundIndexFenceIsExactlyWhatItClaims() {
+        func offenders(_ source: String) -> [String] {
+            let (names, inRange) = Self.integerIndexNames(in: source)
+            let pointers = Self.pointerNames(in: source)
+            return source.split(
+                separator: "\n", omittingEmptySubsequences: false
+            ).flatMap {
+                Self.unfencedLoopBoundSubscripts(
+                    in: String($0), names: names, inRange: inRange,
+                    pointers: pointers
+                )
+            }
+        }
+
+        // Reported: the index is loop-bound to an integer and nothing proves
+        // the receiver long enough. The first is the r8 live site.
+        XCTAssertEqual(
+            offenders("""
+                for (index, gate) in gates.enumerated() {
+                    XCTAssertTrue(clauses[index].hasPrefix(gate))
+                }
+                """),
+            ["clauses[index]"]
+        )
+        XCTAssertEqual(
+            offenders("""
+                for i in components.indices {
+                    XCTAssertEqual(rows[i], expected[i])
+                }
+                """),
+            ["rows[i]", "expected[i]"],
+            "a `.indices` bound proves nothing about a DIFFERENT receiver"
+        )
+        XCTAssertEqual(
+            offenders("""
+                for slot in 0..<4 { print(report.entries[slot]) }
+                """),
+            ["entries[slot]"],
+            "a dotted receiver is read as its last component"
+        )
+
+        // Not reported, each for the reason the header states.
+        for quiet in [
+            // The index came from THIS receiver.
+            "for i in rows.indices { print(rows[i]) }",
+            "let hits = seq.indices.filter { i in seq[i] == \"pop\" }",
+            "for i in stride(from: fds.count - 2, through: 0, by: -1) "
+                + "{ close(fds[i]) }",
+            // A pointer receiver: unchecked, and the test allocated it.
+            "var buffer: UnsafeMutablePointer<statfs>?\n"
+                + "for index in 0..<count { var e = buffer[index] }",
+            "withUnsafeMutableBytes(of: &addr) { ptr in\n"
+                + "for i in 0..<n { ptr[i] = 0 } }",
+            // Not loop-bound to an integer at all — a dictionary read, which
+            // returns an Optional and cannot trap. This is the exclusion that
+            // keeps the fence off the 117-line identifier-index population.
+            "for (key, value) in extra { environment[key] = value }",
+            "if let code = failures[path] { return code }",
+            // Not a BARE identifier index, so out of scope by construction.
+            "for i in rows.indices { print(other[i + 1]) }",
+        ] {
+            XCTAssertEqual(
+                offenders(quiet), [], "must NOT be reported: \(quiet)"
             )
         }
     }

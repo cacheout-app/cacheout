@@ -970,9 +970,17 @@ final class WorktreeStalenessAssessorTests: XCTestCase {
         let clauses = assessment.evidence.components(separatedBy: "; ")
         XCTAssertEqual(clauses.count, 4, "a non-candidate carries the four clauses and no tail")
         for (index, gate) in WorktreeGate.allCases.enumerated() {
+            // NOT `clauses[index]`: `clauses` is decided by
+            // `WorktreeStalenessAssessor.evidence` (Sources/Cacheout/Scanner/
+            // WorktreeStalenessAssessor.swift), so a production change that
+            // drops a clause traps here and strands every cell sorting after
+            // this one — the count assertion above does NOT halt the cell.
+            let clause = try XCTUnwrapElement(
+                clauses, index, "gate \(gate.rawValue)"
+            )
             XCTAssertTrue(
-                clauses[index].hasPrefix("\(gate.rawValue) "),
-                "clause \(index): \(clauses[index])"
+                clause.hasPrefix("\(gate.rawValue) "),
+                "clause \(index): \(clause)"
             )
         }
         XCTAssertFalse(assessment.evidence.contains("branch ref survives removal"))

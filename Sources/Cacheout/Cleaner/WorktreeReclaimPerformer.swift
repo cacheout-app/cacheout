@@ -2218,12 +2218,38 @@ struct WorktreeReclaimPerformer {
             }
             return .uncorroborated(live: live, expected: expected ?? "nothing")
         }
-        // (3) HEAD is not a readable regular file. The stack may still be.
-        if let stack = readWitness(
-            adminEntry: adminEntry, substrate: .reftableStack
-        ) {
-            return .witness(stack)
-        }
+        // (3) HEAD IS NOT A READABLE REGULAR FILE. There is no third arm
+        // here, and the measurement is why (PR #460 codex r6, D5).
+        //
+        // r5 shipped `if let stack = readWitness(adminEntry:substrate:
+        // .reftableStack) { return .witness(stack) }` on this line, in the
+        // round whose own doctrine deleted a guard twenty lines above for
+        // being unevidenced. It was unevidenced too: MUTATION M7 replaced this
+        // whole block with `return .unreadable` and the FULL suite stayed at
+        // 1466 executed / 2 skipped / 0 failures.
+        //
+        // MEASURED, git 2.50.1, on a `--ref-format=reftable` linked worktree
+        // (`git init --ref-format=reftable`, seed commit, `worktree add -b
+        // feature`), making `<admin>/HEAD` unreadable in the only two ways
+        // there are — replacing it with a symlink, and removing it outright:
+        //
+        //   git -C <parent> worktree list --porcelain   exit 0, BOTH records
+        //                                               reported normally
+        //   git -C <worktree> status --porcelain        exit 128,
+        //                                               "fatal: not a git
+        //                                               repository: …/worktrees/wt"
+        //
+        // So the state this arm existed for is exactly the state in which git
+        // cannot answer ANY question about the worktree: the parent's record
+        // still passes R0/R1/R1b, and then the ignored witness, G2 and R2's
+        // ladder all fail closed. The arm could turn `.unreadable` into a
+        // witness, and the witness could never change an outcome — the removal
+        // is refused either way, by gates that already exist. And `.unreadable`
+        // is the STRICTER answer: on a DETACHED record it earns
+        // `worktree-head-unwitnessable` outright.
+        //
+        // `testAReftableWorktreeWhoseHeadFileIsGoneIsRefusedByTheGatesThatRemain`
+        // pins that outcome.
         return .unreadable
     }
 

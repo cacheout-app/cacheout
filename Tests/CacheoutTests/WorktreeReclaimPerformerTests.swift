@@ -18,6 +18,49 @@ import XCTest
 ///   is answered synthetically, everything else runs for real — so a fallback
 ///   cell still proves branch-ref survival, real prune behaviour and real
 ///   porcelain output.
+/// ## THE MUTATION LEDGER, AND A CORRECTION OF RECORD (PR #460 codex r6, D6)
+///
+/// `7260964`'s commit message published a mutation table against
+/// `swift test --filter 'Worktree|GitWorktree'` with "baseline 220 executed"
+/// and, for two of its four rows, **"218 exec, 1 cell RED"**. 218 is
+/// unreachable: mutating PRODUCTION cannot change which CELLS exist, and this
+/// filtered family has no skips, so the executed count is invariant under
+/// every mutation in that table. The rows also conflated "cells that went red"
+/// with XCTest's failure count.
+///
+/// Re-run at r6's baseline, command stated, output pasted:
+///
+///     swift test --filter 'Worktree|GitWorktree'
+///
+///     baseline
+///       Executed 222 tests, with 0 failures (0 unexpected) in 41.038 seconds
+///       exit 0
+///
+///     D2 — `if let first = appeared.first` → `if false, let first = …`
+///       Executed 222 tests, with 3 failures (1 unexpected) in 44.161 seconds
+///       exit 1
+///       RED: testAnIgnoredFileThatAppearsInTheGateWindowIsNotDestroyed
+///
+///     D3 — the `.reftableStack` branch deleted from `captureHead`'s
+///          corroboration-failure arm
+///       Executed 222 tests, with 3 failures (1 unexpected) in 44.475 seconds
+///       exit 1
+///       RED: testAReftableAttachedWorktreeDetachedAndCommittedInsideTheWindowIsRefused
+///
+/// Both guards ARE evidenced — one cell each, exactly as claimed. It was the
+/// figures that could not be reproduced, in the very round whose job included
+/// fixing that class of claim. The count that MOVES under a mutation is the
+/// FAILURE count (3 here: two assertions plus `XCTUnwrapElement`'s own throw);
+/// the executed count moves only when CELLS are added or removed.
+///
+/// A THIRD MUTATION, from the same round, is recorded here because its
+/// subject no longer exists: M7 replaced `captureHead`'s THIRD arm — the
+/// reftable-stack read after "HEAD is not a readable regular file" — with
+/// `return .unreadable`, and the FULL suite stayed at 1466 executed / 2
+/// skipped / 0 failures. That arm was deleted at r6 rather than evidenced; see
+/// `testAReftableWorktreeWhoseHeadFileIsGoneIsRefusedByTheGatesThatRemain` and
+/// the measurement in `captureHead` itself.
+///
 final class WorktreeReclaimPerformerTests: XCTestCase {
 
     // MARK: - Fixture state
@@ -3336,6 +3379,76 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         XCTAssertNil(runner.argvs.first { $0.contains("remove") },
                      "\(runner.argvs)")
         XCTAssertTrue(fm.fileExists(atPath: worktree.path))
+    }
+
+    /// D5 (PR #460 codex r6) — THE OUTCOME THAT MADE `captureHead`'s THIRD
+    /// ARM INERT, pinned so its deletion is a decision rather than a gap.
+    ///
+    /// r5 shipped a reftable-stack fallback after "(3) HEAD is not a readable
+    /// regular file", and MUTATION M7 — replacing that block with
+    /// `return .unreadable` — left the full suite at 1466 / 2 skipped / 0
+    /// failures. It could not be otherwise: MEASURED on git 2.50.1, making a
+    /// reftable worktree's `<admin>/HEAD` unreadable (symlink, or removed)
+    /// leaves `git -C <parent> worktree list` reporting BOTH records at exit 0
+    /// while `git -C <worktree> …` returns exit 128, "fatal: not a git
+    /// repository". So the arm could only ever hand a witness to a removal
+    /// that the very next gate refuses.
+    ///
+    /// This cell is that refusal, through the real performer: the arm is gone
+    /// and the tree still survives, because the ignored witness — the FIRST
+    /// `status` after the record is re-read — cannot be answered at all.
+    func testAReftableWorktreeWhoseHeadFileIsGoneIsRefusedByTheGatesThatRemain()
+        async throws
+    {
+        let repository = try makeReftableRepository(named: "reftable-nohead")
+        try XCTSkipUnless(
+            fm.fileExists(
+                atPath: repository.appendingPathComponent(".git/reftable").path
+            ),
+            "this git has no reftable ref backend"
+        )
+        let worktree = try addWorktree(
+            named: "rnwt", branch: "feature", in: repository
+        )
+        let admin = try liveAdminDirectory(of: worktree)
+        let headFile = admin.appendingPathComponent("HEAD")
+        XCTAssertTrue(
+            fm.fileExists(
+                atPath: admin.appendingPathComponent("reftable/tables.list").path
+            ),
+            "the ref stack — the substrate the deleted arm would have used — "
+                + "is present, which is what makes this the arm's own case"
+        )
+
+        let plan = staleplan(
+            worktree: worktree,
+            membership: try membership(of: worktree, in: repository)
+        )
+        // Staged on R1's registry read, so the porcelain record is answered
+        // normally and `captureHead` is the next thing to run.
+        let fileManager = fm
+        let broke = InvocationCounter()
+        let runner = InterceptingGitRunner(wrapping: realRunner()) { arguments, _ in
+            guard arguments.contains("list") else { return nil }
+            if (try? fileManager.removeItem(at: headFile)) != nil {
+                broke.bump()
+            }
+            return nil
+        }
+        let outcome = await perform(
+            item(plan), plan: plan, with: makePerformer(runner: runner)
+        )
+
+        XCTAssertEqual(broke.count, 1, "the fixture never removed the HEAD file")
+        XCTAssertNil(outcome.entry, "\(String(describing: outcome.entry))")
+        XCTAssertFalse(
+            outcome.errors.isEmpty,
+            "an unanswerable worktree must produce a per-item error"
+        )
+        XCTAssertTrue(
+            fm.fileExists(atPath: worktree.path),
+            "the checkout survives: \(outcome.errors.map(\.message))"
+        )
     }
 
     // MARK: - D4: the two refusals r4 shipped with no cell that could fire

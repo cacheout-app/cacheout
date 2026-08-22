@@ -222,6 +222,15 @@ Enumerate-and-explain, the counterpart to the curated allowlist:
   `git worktree prune` in the parent repo. Branch refs live in the main
   repo's `.git` and **survive removal by construction**; say so in
   `evidence`.
+  - **CORRECTED AS BUILT (PR #460 codex r1).** Two claims in the bullet above
+    are wrong as written, and both had shipped. (a) "Branch refs survive by
+    construction" holds only for a worktree checked out ON A BRANCH: a
+    DETACHED worktree has no branch ref, so removal leaves whatever HEAD
+    names reachable from nothing — the evidence now says that instead for
+    that shape. (b) `git worktree prune` accepts no path and no set; it
+    re-enumerates the admin container itself, after every gate has already
+    answered. The shipped code therefore removes exactly the admin
+    directories it disclosed and runs no repository-wide prune.
 - Risk: review; `defaultSelected: false`. Never touch a worktree that fails
   any gate; never run `git branch -d`.
 - Run git binary via argv (`/usr/bin/env git …`), no shell, bounded timeout —

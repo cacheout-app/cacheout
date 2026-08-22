@@ -787,6 +787,63 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         assertNoForbiddenArgv(runner)
     }
 
+    /// D2, THE HALF THAT REFUSES. A file a committed `.gitignore` hides,
+    /// created while the delete-time checks are running, is not destroyed.
+    ///
+    /// MEASURED at r4, with no witness: `secret.env` written in exactly this
+    /// window was destroyed with the tree and the performer returned
+    /// `Entry(exactBytes: 49152, .permanent, warning: nil)` with
+    /// `errors == []`, while the same fixture using a NON-ignored file
+    /// refused — because `git status --porcelain` reports nothing at all
+    /// about an ignored path. `docs/v1/CATEGORIES.md:519` said "work saved
+    /// while the checks were running is caught rather than destroyed", which
+    /// was false for exactly that file.
+    ///
+    /// The write is staged on the ancestry rung: after the ignored WITNESS
+    /// and before the LAST gate, so only the set comparison can catch it.
+    ///
+    /// MUTATION: delete the `appeared` refusal from
+    /// `removeUnderLastInstantProof` and this cell goes RED — the tree and
+    /// the file are gone and `outcome.entry` is non-nil.
+    func testAnIgnoredFileThatAppearsInTheGateWindowIsNotDestroyed()
+        async throws
+    {
+        let repository = try makeRepository(named: "repo")
+        let worktree = try addWorktree(named: "wt", branch: "feature", in: repository)
+        try commitIgnoreRule("secret.env", in: worktree)
+        try fastForwardDefaultBranch(to: "feature", in: repository)
+        let plan = staleplan(
+            worktree: worktree, membership: try membership(of: worktree, in: repository)
+        )
+        let secret = worktree.appendingPathComponent("secret.env")
+        let payload = Data("TOKEN=the-only-copy".utf8)
+        let staged = InvocationCounter()
+
+        let runner = InterceptingGitRunner(wrapping: realRunner()) { arguments, _ in
+            if arguments.contains("merge-base"), staged.bump() == 1 {
+                try? payload.write(to: secret)
+            }
+            return nil
+        }
+        let outcome = await perform(
+            item(plan), plan: plan, with: makePerformer(runner: runner)
+        )
+
+        XCTAssertEqual(staged.count, 1, "the fixture never staged the write")
+        // The tree is CLEAN throughout — this is not the dirty gate firing.
+        XCTAssertNil(outcome.entry)
+        let message = try XCTUnwrapElement(outcome.errors, 0).message
+        XCTAssertTrue(message.contains("`.gitignore` hides"), message)
+        XCTAssertTrue(message.contains("secret.env"), message)
+        XCTAssertFalse(message.contains("DIRTY"),
+                       "an ignored file is not dirt: \(message)")
+        XCTAssertTrue(fm.fileExists(atPath: secret.path),
+                      "the only copy of that work was destroyed")
+        XCTAssertEqual(try Data(contentsOf: secret), payload)
+        XCTAssertTrue(fm.fileExists(atPath: worktree.path))
+        XCTAssertEqual(try porcelainRecordCount(of: repository), 2)
+    }
+
     // MARK: - D1: the clean re-check is the LAST gate (PR #460 codex r3)
 
     /// Work saved WHILE the delete-time gates are running survives, in BOTH
@@ -3058,6 +3115,114 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         XCTAssertTrue(fm.fileExists(atPath: worktree.path))
     }
 
+    // MARK: - D4: the two refusals r4 shipped with no cell that could fire
+
+    /// `worktree-head-unreadable`. r4 measured that replacing this refusal
+    /// with `return .proceed` left the 225-cell `Worktree|GitWorktree` family
+    /// at 225 executed / 0 failures — an unevidenced guard, the class this
+    /// file's own commit message forbids.
+    ///
+    /// It is reachable, and this is the window: the witness was captured and
+    /// corroborated around R2, and by the last instant the file it was read
+    /// through is no longer a readable regular file. On a DETACHED head that
+    /// file IS the commit id, so proceeding would remove the checkout with
+    /// the ancestry answer tied to nothing.
+    ///
+    /// MUTATION: replace the refusal with `return .proceed` and this cell
+    /// goes RED — the checkout is destroyed and its commit is reachable from
+    /// no ref.
+    func testAHeadWitnessThatCannotBeReReadAtTheLastInstantRefuses()
+        async throws
+    {
+        let repository = try makeRepository(named: "repo")
+        let worktree = container.appendingPathComponent("dwt")
+        try git(["-C", repository.path, "worktree", "add", "--detach",
+                 worktree.path, "HEAD"])
+        let headFile = try liveAdminDirectory(of: worktree)
+            .appendingPathComponent("HEAD")
+        let plan = staleplan(
+            worktree: worktree,
+            membership: try membership(of: worktree, in: repository)
+        )
+
+        let fileManager = fm
+        let broke = InvocationCounter()
+        // THE WINDOW: after the LAST gate answered, before the disposal.
+        let runner = lastGateRunner {
+            if (try? fileManager.removeItem(at: headFile)) != nil,
+               (try? fileManager.createDirectory(
+                   at: headFile, withIntermediateDirectories: false
+               )) != nil {
+                broke.bump()
+            }
+        }
+        let outcome = await perform(
+            item(plan), plan: plan, with: makePerformer(runner: runner)
+        )
+
+        XCTAssertEqual(broke.count, 1, "the fixture never broke the witness")
+        XCTAssertNil(outcome.entry)
+        let message = try XCTUnwrapElement(outcome.errors, 0).message
+        XCTAssertTrue(message.contains("could not be re-read at the last instant"),
+                      message)
+        XCTAssertTrue(message.contains("HEAD"), message)
+        XCTAssertTrue(fm.fileExists(atPath: worktree.path))
+    }
+
+    /// `worktree-identity-unreadable`. Same r4 finding: replacing it with
+    /// `return .proceed` left the family green.
+    ///
+    /// It cannot be reached with a fixture made of files, and that is the
+    /// point of it: `GitWorktreeGitdirResolver` proves the admin directory is
+    /// a `.kind(.directory)` with an `lstat`, and the identity `lstat` that
+    /// follows asks the SAME kernel the SAME question. Only a RACE separates
+    /// them — the directory going away in between — so the double is what
+    /// stages the race deterministically, exactly as a scripted runner stages
+    /// a subprocess outcome no fixture can produce on demand.
+    ///
+    /// Why it must refuse rather than fall through: `sameLocation` compares
+    /// INODES only when both sides can be stat'd and otherwise compares
+    /// canonical path COMPONENTS, so an unreadable admin directory answered
+    /// by a spelling is precisely the ambiguity this gate claims not to have.
+    ///
+    /// MUTATION: replace the refusal with `return .proceed` and this cell
+    /// goes RED.
+    func testAnAdminDirectoryThatCannotBeIdentifiedAtCleanTimeRefuses()
+        async throws
+    {
+        let repository = try makeRepository(named: "repo")
+        let worktree = try addWorktree(named: "wt", branch: "feature", in: repository)
+        let membership = try membership(of: worktree, in: repository)
+        // The plan carries a REAL scan-time identity — it is built through
+        // the ordinary provider, so the only thing the double changes is the
+        // delete-time reading.
+        let plan = staleplan(worktree: worktree, membership: membership)
+        XCTAssertNotNil(plan.worktreeAdminEntryIdentity)
+
+        let blind = IdentityBlindProvider(
+            blindToDirectoryNamed: "wt",
+            insideContainerNamed: GitWorktreeGitdirResolver.adminContainerName
+        )
+        let outcome = await perform(
+            item(plan), plan: plan,
+            with: makePerformer(
+                runner: InterceptingGitRunner(wrapping: realRunner()),
+                provider: blind
+            )
+        )
+
+        XCTAssertGreaterThan(blind.blindedReads, 0,
+                             "the double never blinded the admin directory")
+        XCTAssertNil(outcome.entry)
+        let message = try XCTUnwrapElement(outcome.errors, 0).message
+        XCTAssertTrue(message.contains("could not be identified at clean time"),
+                      message)
+        XCTAssertTrue(message.contains("not provably the one at"), message)
+        XCTAssertTrue(fm.fileExists(atPath: worktree.path),
+                      "an unidentifiable admin directory must not be removed")
+        XCTAssertEqual(try porcelainRecordCount(of: repository), 2)
+    }
+
     func testAPlanCarryingNoAdminIdentityIsRefusedRatherThanRunUnbound()
         async throws
     {
@@ -4178,5 +4343,43 @@ final class SizerSpy: @unchecked Sendable {
         recorded.append((url, label))
         lock.unlock()
         return stub(url)
+    }
+}
+
+/// A provider whose `identity(of:)` fails for ONE directory — the TOCTOU the
+/// `worktree-identity-unreadable` refusal exists for.
+///
+/// `identity(of:)` is `FileSystemIdentityProvider`'s documented override
+/// point; nothing else is overridden, so `probeKind`, `canonicalize` and the
+/// descriptor family all answer for real. The match is by NAME rather than by
+/// absolute path because the resolver hands back a CANONICALIZED URL, which on
+/// macOS differs from the fixture's spelling by the `/private` prefix.
+final class IdentityBlindProvider: FileSystemIdentityProvider, @unchecked Sendable {
+    private let directoryName: String
+    private let containerName: String
+    private let lock = NSLock()
+    private var blinded = 0
+
+    /// How many times the blind arm actually fired — asserted, so a cell can
+    /// never pass because the double silently matched nothing.
+    var blindedReads: Int {
+        lock.lock(); defer { lock.unlock() }
+        return blinded
+    }
+
+    init(blindToDirectoryNamed directoryName: String,
+         insideContainerNamed containerName: String) {
+        self.directoryName = directoryName
+        self.containerName = containerName
+        super.init()
+    }
+
+    override func identity(of url: URL) -> Identity? {
+        if url.lastPathComponent == directoryName,
+           url.deletingLastPathComponent().lastPathComponent == containerName {
+            lock.lock(); blinded += 1; lock.unlock()
+            return nil
+        }
+        return super.identity(of: url)
     }
 }

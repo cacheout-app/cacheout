@@ -22,9 +22,11 @@
 /// and only then unlinks — and it never re-reads admin-directory identity,
 /// HEAD, or ancestry.
 ///
-/// MEASURED, uninstrumented (fork + exec, spinning on `lstat` of the
-/// worktree's only tracked file until ENOENT; git 2.50.1, macOS 15,
-/// APFS):
+/// MEASURED THIS ROUND, uninstrumented — a C harness that forks and execs
+/// the remover while the parent spins on `lstat` of the worktree's only
+/// tracked file until ENOENT (git 2.50.1, macOS 15, APFS). The r5 review
+/// reported 19.9 ms and 159.5 ms for the git row on the same shapes; these
+/// are this round's own runs of the same experiment:
 ///
 /// | arm | 1 tracked file | 2001 tracked files |
 /// |---|---|---|
@@ -1269,13 +1271,19 @@ struct WorktreeReclaimPerformer {
         // REASON (PR #460 codex r5, D2).
         //
         // `status --porcelain` reports NOTHING about a path a committed
-        // `.gitignore` hides, so through r4 the last gate could not see one —
-        // MEASURED, `secret.env` written into the gate window was destroyed
-        // with the tree under `Entry(exactBytes: 49152, .permanent,
-        // warning: nil)` and `errors == []`, while the same fixture with a
-        // NON-ignored file refused. `docs/v1/CATEGORIES.md:519` said "work
+        // `.gitignore` hides, so through r4 the last gate could not see one.
+        // MEASURED BY THE r5 REVIEW at c8ab723 (their figures, carried here
+        // as the defect this closes): `secret.env` written into the gate
+        // window was destroyed with the tree under `Entry(exactBytes: 49152,
+        // .permanent, warning: nil)` and `errors == []`, while the same
+        // fixture with a NON-ignored file refused with "the delete-time
+        // re-check found it DIRTY". `docs/v1/CATEGORIES.md:519` said "work
         // saved while the checks were running is caught rather than
         // destroyed", which was false for exactly that file.
+        //
+        // What this round measured for itself is the FIX, not the defect:
+        // `testAnIgnoredFileThatAppearsInTheGateWindowIsNotDestroyed` stages
+        // the same write and goes RED when the comparison is removed.
         //
         // WHY HERE AND NOT EARLIER. It is a reading OF A PATH, and this
         // file's own doctrine is that a reading through a path means nothing
@@ -1874,13 +1882,16 @@ struct WorktreeReclaimPerformer {
     /// is a constant stub there, so `captureHead` returned `.uncorroborated`,
     /// an ATTACHED record fell through to `.proceed(head: nil)`, and
     /// `reproveFromTheFilesystem` skipped the HEAD proposition entirely.
-    /// MEASURED on `git init --ref-format=reftable`: a `git switch --detach`
-    /// followed by a commit inside the window destroyed the worktree, left
-    /// the commit reachable from no ref, and returned
-    /// `Entry(exactBytes: 45056, .permanent, warning: nil)` with `errors == []`.
+    /// MEASURED BY THE r5 REVIEW at c8ab723 (their figures): on
+    /// `git init --ref-format=reftable`, a `git switch --detach` followed by
+    /// a commit inside the window destroyed the worktree, left the commit
+    /// reachable from no ref, and returned `Entry(exactBytes: 45056,
+    /// .permanent, warning: nil)` with `errors == []`.
     ///
-    /// `tables.list` is the substrate that closes it. MEASURED, git 2.50.1,
-    /// on a linked worktree of a `--ref-format=reftable` repository:
+    /// `tables.list` is the substrate that closes it. MEASURED THIS ROUND,
+    /// git 2.50.1, on a linked worktree of a `--ref-format=reftable`
+    /// repository (`scratchpad/reftable2.sh`, one run, figures pasted from
+    /// its output):
     ///
     /// | operation | `tables.list` inode | contents |
     /// |---|---|---|

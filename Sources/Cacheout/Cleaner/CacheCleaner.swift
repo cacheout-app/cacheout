@@ -1204,7 +1204,7 @@ actor CacheCleaner {
                     // real closure because it carries three propositions —
                     // which checkout, the lock, HEAD — that live outside that
                     // file's vocabulary.
-                    provingImmediatelyBefore: {}
+                    provingImmediatelyBefore: LastInstantProof.nothingFurther.run
                 )
             }
         } catch {
@@ -1550,7 +1550,7 @@ actor CacheCleaner {
                     // D1): this arm's two propositions are the container
                     // binding and `probedObject`, and `DepthSafeRemoval`
                     // re-proves BOTH from descriptors on the far side.
-                    provingImmediatelyBefore: {}
+                    provingImmediatelyBefore: LastInstantProof.nothingFurther.run
                 )
             }
         } catch {
@@ -1685,7 +1685,7 @@ actor CacheCleaner {
                 try await Self.removeItemConcurrently(
                     at: url, expecting: nil, provider: provider,
                     containedIn: admittedParent,
-                    provingImmediatelyBefore: prove
+                    provingImmediatelyBefore: prove.run
                 )
             },
             revalidate: { [self] subject in
@@ -1839,21 +1839,28 @@ actor CacheCleaner {
         expecting inspected: UserDataProbeResult.InspectedRoot?,
         provider: FileSystemIdentityProvider,
         containedIn admittedParent: DepthSafeRemoval.AdmittedParent,
-        provingImmediatelyBefore prove: () throws -> Void
+        // `@escaping`, NOT `withoutActuallyEscaping` (PR #460 codex r7, D1).
+        // The first spelling of this used the latter and TRAPPED under the
+        // full suite — "closure argument was escaped in withoutActuallyEscaping
+        // block" — while every filtered run of the same tests passed. The
+        // dispatched block resumes the continuation from INSIDE itself, so the
+        // await returns while the block still holds its closure; the block is
+        // released a moment later, and whether that moment falls before or
+        // after the check is a scheduling race. The closure genuinely outlives
+        // the call, so it is genuinely escaping.
+        provingImmediatelyBefore prove: @escaping () throws -> Void
     ) async throws {
-        try await withoutActuallyEscaping(prove) { prove in
-            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                DispatchQueue.global(qos: .userInitiated).async {
-                    do {
-                        try prove()
-                        try DepthSafeRemoval.remove(
-                            at: url, expecting: inspected, provider: provider,
-                            containedIn: admittedParent
-                        )
-                        continuation.resume()
-                    } catch {
-                        continuation.resume(throwing: error)
-                    }
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            DispatchQueue.global(qos: .userInitiated).async {
+                do {
+                    try prove()
+                    try DepthSafeRemoval.remove(
+                        at: url, expecting: inspected, provider: provider,
+                        containedIn: admittedParent
+                    )
+                    continuation.resume()
+                } catch {
+                    continuation.resume(throwing: error)
                 }
             }
         }

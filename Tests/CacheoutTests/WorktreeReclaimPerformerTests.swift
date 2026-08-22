@@ -357,7 +357,7 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         moveToTrash: Bool = false,
         trash: TrashDisposal.Mover? = nil,
         removeTree: (
-            (URL, DepthSafeRemoval.AdmittedParent, () throws -> Void)
+            (URL, DepthSafeRemoval.AdmittedParent, LastInstantProof)
                 async throws -> Void
         )? = nil,
         revalidate: ((ReclaimableItem) -> PreDeleteSeamRefusal?)? = nil,

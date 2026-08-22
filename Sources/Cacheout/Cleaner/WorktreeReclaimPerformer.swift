@@ -344,6 +344,38 @@ struct LastInstantRefusal: LocalizedError {
     var errorDescription: String? { detail }
 }
 
+/// A proof a destructive seam must run on the FAR SIDE of its own hop,
+/// immediately before the destruction, destroying nothing if it throws
+/// (PR #460 codex r7, D1).
+///
+/// A NOMINAL TYPE RATHER THAN A BARE `() throws -> Void`, AND THE REASON IS A
+/// MEASURED CRASH. `removeTree`'s hop resumes its continuation from INSIDE the
+/// dispatched block, so the closure outlives the `await` that hands it over:
+/// it is genuinely escaping. A closure PARAMETER of a function TYPE is not,
+/// and cannot be annotated `@escaping`. The first spelling of this used
+/// `withoutActuallyEscaping`, which compiled, passed every filtered run, and
+/// trapped under the full suite — "closure argument was escaped in
+/// withoutActuallyEscaping block" — because whether the block is released
+/// before or after the check is a scheduling race. A struct's stored property
+/// is escaping by construction, so the contract is expressible without lying
+/// about lifetime.
+///
+/// `TrashDisposal.Mover` keeps the bare-closure spelling on purpose: its
+/// production seam runs the proof inside `MainActor.run`, which does NOT
+/// outlive the call.
+struct LastInstantProof {
+    let run: () throws -> Void
+
+    init(_ run: @escaping () throws -> Void) { self.run = run }
+
+    /// So a seam calls it the same way the mover's closure is called.
+    func callAsFunction() throws { try run() }
+
+    /// STATED, never defaulted: an arm whose every proposition is already
+    /// re-proved past its own hop by the removal itself.
+    static let nothingFurther = LastInstantProof {}
+}
+
 struct WorktreeReclaimPerformer {
 
     // MARK: - Pinned constants
@@ -498,7 +530,7 @@ struct WorktreeReclaimPerformer {
     /// queue, and `testThePermanentArmRefusesAWorktreeSwappedInsideTheHop` for
     /// the cell that goes red when the proof is deleted.
     let removeTree: (
-        URL, DepthSafeRemoval.AdmittedParent, () throws -> Void
+        URL, DepthSafeRemoval.AdmittedParent, LastInstantProof
     ) async throws -> Void
     /// The GENERALIZED per-scanner pre-delete revalidator seam (D9), bound to
     /// THIS item's authorization entry by the cleaner. It can only REFUSE,
@@ -860,18 +892,22 @@ struct WorktreeReclaimPerformer {
                 // were proved on the far side. Same closure, same order, same
                 // refusal type as the mover's above: the two arms differ only
                 // in what performs the destruction.
-                try await removeTree(worktreePath, admittedParent) {
-                    if case .refuse(let tag, let detail) =
-                        reproveFromTheFilesystem(
-                            worktreePath: worktreePath,
-                            adminEntry: adminEntry,
-                            carriedIdentity: plan.worktreeAdminEntryIdentity,
-                            head: head
-                        )
-                    {
-                        throw LastInstantRefusal(tag: tag, detail: detail)
+                try await removeTree(
+                    worktreePath, admittedParent,
+                    LastInstantProof {
+                        if case .refuse(let tag, let detail) =
+                            reproveFromTheFilesystem(
+                                worktreePath: worktreePath,
+                                adminEntry: adminEntry,
+                                carriedIdentity:
+                                    plan.worktreeAdminEntryIdentity,
+                                head: head
+                            )
+                        {
+                            throw LastInstantRefusal(tag: tag, detail: detail)
+                        }
                     }
-                }
+                )
             }
         } catch let refusal as LastInstantRefusal {
             // The re-proof that crosses either arm's hop reports through the
@@ -1218,13 +1254,15 @@ struct WorktreeReclaimPerformer {
                 // and a checkout repaired inside it is live state. It is the
                 // SAME function, so the two readings cannot disagree about
                 // what "revived" means.
-                try await removeTree(directory, admittedParent) {
-                    if let revived = revivedCheckoutRefusal(for: directory) {
-                        throw LastInstantRefusal(
-                            tag: "prune-checkout-revived", detail: revived
-                        )
+                try await removeTree(
+                    directory, admittedParent, LastInstantProof {
+                        if let revived = revivedCheckoutRefusal(for: directory) {
+                            throw LastInstantRefusal(
+                                tag: "prune-checkout-revived", detail: revived
+                            )
+                        }
                     }
-                }
+                )
             } catch let refusal as LastInstantRefusal {
                 return (refusal.tag, refusal.detail)
             } catch {

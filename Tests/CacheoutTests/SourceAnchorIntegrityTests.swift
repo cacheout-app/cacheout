@@ -42,6 +42,25 @@ import XCTest
 /// The excerpt is the point. Pinning only "the file has that many lines"
 /// would have passed every one of the shifted anchors above.
 ///
+/// ## Two counts in the commit that introduced this check are off by one
+///
+/// Recorded here because a commit message cannot be corrected in place
+/// (PR #460 codex r9, D5). Both were re-derived over `git archive 27782c0`
+/// with this file's OWN regex and comment rule.
+///
+/// - "(52 distinct anchors, 73 citing sites)" — `27782c0` has 52 anchors and
+///   **72** citing sites. 73 is the site count at its PARENT `aaf9c03`,
+///   where the distinct count is 57, so the parenthetical pairs a post-fix
+///   number with a pre-fix one.
+/// - "naming all seven affected anchors and all fifteen citing sites" —
+///   reproducing that exact mutation (12 blank lines inserted at
+///   `SpaceScanner.swift` line 701 in a `27782c0` checkout) the check reports
+///   7 anchors and **14** citing sites. Seven was right.
+///
+/// Neither figure is restated for HEAD, and deliberately: the cells below
+/// are DEFAULT-DENY on a table, so nothing here needs a count to be correct,
+/// and a count in this header would be one more number to go stale.
+///
 /// ## What this does NOT cover, stated rather than implied
 ///
 /// - **Only comments.** The scanner requires a `//` earlier on the line, so
@@ -187,7 +206,7 @@ final class SourceAnchorIntegrityTests: XCTestCase {
          "state.entries.append(entry)"),
         ("ValuablesDetector.swift:1754-1756",
          "is the only discriminator, so it is cleared before ea"),
-        ("WorktreeReclaimPerformer.swift:797-809",
+        ("WorktreeReclaimPerformer.swift:818-830",
          "let appeared = ignoredNow.subtracting(ignoredWitne"),
     ]
 

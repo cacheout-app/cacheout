@@ -1651,7 +1651,7 @@ struct WorktreeReclaimPerformer {
     //    `--ignored` DOES NOT NARROW THAT WINDOW, and r7 said it did (PR
     //    #460 codex r8, D4). The ignored comparison is `appeared =
     //    ignoredNow.subtracting(ignoredWitness)`
-    //    (`WorktreeReclaimPerformer.swift:797-809`), computed from the SAME
+    //    (`WorktreeReclaimPerformer.swift:818-830`), computed from the SAME
     //    `status --ignored` reading this proposition is about, and taken
     //    BEFORE `reproveFromTheFilesystem`,
     //    i.e. entirely on the NEAR side of both hops. Nothing re-reads the

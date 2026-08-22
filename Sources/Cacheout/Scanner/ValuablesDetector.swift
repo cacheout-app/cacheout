@@ -158,7 +158,8 @@
 /// which means network round trips, spin-up, and privacy-sensitive access to
 /// a filesystem the user never pointed this scanner at. And it buys nothing:
 /// an artifact dir containing a boundary is `.denied` at scan time and
-/// refused whole by the cleaner (`CacheCleaner.swift:875,970`), so no
+/// refused whole by the cleaner (`CacheCleaner.deleteGuardedChild`:1151 and
+/// `CacheCleaner.removeGuardedItem`:1371), so no
 /// valuable found past the mount could ever change an outcome.
 ///
 /// UNCROSSED ⇒ INCOMPLETE, never "clean": the honest report is "we did not
@@ -499,7 +500,8 @@ struct ValuablesDisclosure: Equatable, Sendable {
     /// `ValuableIdentity` integer verbatim (decimal; `device`/`inode`
     /// unsigned). The leading pair is the canonical ItemKey serialization,
     /// matching the frozen `stableID` preimage convention
-    /// (`SpaceScanner.swift:262`): item ids are scanner-scoped, so only the
+    /// (`ReclaimableItem.stableID`, `SpaceScanner.swift:784`): item ids are
+    /// scanner-scoped, so only the
     /// FULL ItemKey makes a token item-bound — a token applied to another
     /// item, even the same item id under a different scanner id, can never
     /// match.

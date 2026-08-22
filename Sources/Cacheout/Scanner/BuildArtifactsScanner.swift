@@ -726,7 +726,7 @@ struct BuildArtifactsScanner: @unchecked Sendable {
     ///   `ProjectTreeWalker.swift:376`, `ValuablesDetector.swift`). The sizer
     ///   records the boundary and skips its subtree uncounted; the cleaner
     ///   refuses any tree containing one whole
-    ///   (`CacheCleaner.swift:875,970`).
+    ///   (`CacheCleaner.deleteGuardedChild`:1151 and `removeGuardedItem`:1371).
     /// - **AN UNENUMERABLE DIRECTORY** on that same chain — the ancestor
     ///   itself, or any directory strictly between it and the descendant
     ///   (review r7). Mode `0111` is the field shape: SEARCHABLE, so a root

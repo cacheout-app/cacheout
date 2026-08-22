@@ -71,9 +71,9 @@ final class DocumentedContractTests: XCTestCase {
             return XCTFail("the documented entry shape must parse")
         }
         XCTAssertEqual(parsed.count, 1)
-        XCTAssertEqual(parsed[0].key,
+        XCTAssertEqual(try XCTUnwrapElement(parsed, 0).key,
                        ItemKey(scannerID: "build_artifacts", itemID: itemID))
-        XCTAssertEqual(parsed[0].token, token)
+        XCTAssertEqual(try XCTUnwrapElement(parsed, 0).token, token)
     }
 
     /// "64 lowercase hex characters" is a documented, checkable claim.
@@ -168,7 +168,7 @@ final class DocumentedContractTests: XCTestCase {
             ),
             "PROTOCOL.md must publish the nanosecond derivation"
         )
-        XCTAssertEqual(valuables[0].identity.modifiedAtNanoseconds,
+        XCTAssertEqual(try XCTUnwrapElement(valuables, 0).identity.modifiedAtNanoseconds,
                        1_755_057_600_123_456_789,
                        "…and the derivation the binary performs matches it")
     }
@@ -1329,14 +1329,14 @@ final class DocumentedRetryExampleTests: XCTestCase {
                        "the documented total-failure envelope")
         let refusedRows = try XCTUnwrap(details?["results"] as? [[String: Any]])
         XCTAssertEqual(refusedRows.count, 1)
-        let refused = refusedRows[0]
+        let refused = try XCTUnwrapElement(refusedRows, 0)
         XCTAssertEqual(refused["success"] as? Bool, false)
         let valuables = try XCTUnwrap(refused["valuables"] as? [[String: Any]])
-        XCTAssertEqual(Set(valuables[0].keys), [
+        XCTAssertEqual(Set(try XCTUnwrapElement(valuables, 0).keys), [
             "name", "path", "allocated_bytes", "device", "inode",
             "modified_at_ns",
         ], "the documented six-field element")
-        XCTAssertEqual(valuables[0]["name"] as? String,
+        XCTAssertEqual(try XCTUnwrapElement(valuables, 0)["name"] as? String,
                        "Murmur_0.1.7_aarch64.dmg")
         let token = try XCTUnwrap(
             refused["acknowledgement_token"] as? String,
@@ -1358,8 +1358,8 @@ final class DocumentedRetryExampleTests: XCTestCase {
         }
         let rows = try XCTUnwrap(payload["results"] as? [[String: Any]])
         XCTAssertEqual(rows.count, 1)
-        XCTAssertEqual(rows[0]["success"] as? Bool, true)
-        XCTAssertNil(rows[0]["acknowledgement_token"],
+        XCTAssertEqual(try XCTUnwrapElement(rows, 0)["success"] as? Bool, true)
+        XCTAssertNil(try XCTUnwrapElement(rows, 0)["acknowledgement_token"],
                      "a success row carries no refusal fields")
         XCTAssertFalse(fm.fileExists(atPath: artifact.path),
                        "the acknowledged retry deletes the artifact dir")

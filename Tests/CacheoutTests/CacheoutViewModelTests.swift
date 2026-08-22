@@ -2114,6 +2114,9 @@ private actor OutcomeSequence {
     }
 
     func next() -> ScanOutcome {
+        // FIXTURE-CONTROLLED, so not an `XCTUnwrapElement` site: `outcomes` is
+        // the literal list this test handed the box, `init` precondition-
+        // checks it non-empty, and no production code can shorten it.
         outcomes.count > 1 ? outcomes.removeFirst() : outcomes[0]
     }
 }

@@ -2967,11 +2967,11 @@ final class EphemeralTempScannerTests: XCTestCase {
         // The tooltip still names WHICH object it is — that half was never
         // the defect and must not regress.
         XCTAssertTrue(
-            outcome.errors[0].detail.contains("(regular file)"),
+            try XCTUnwrapElement(outcome.errors, 0).detail.contains("(regular file)"),
             "detail names the real kind: \(outcome.errors[0].detail)"
         )
         XCTAssertTrue(
-            outcome.errors[1].detail.contains("(special file)"),
+            try XCTUnwrapElement(outcome.errors, 1).detail.contains("(special file)"),
             "detail names the real kind: \(outcome.errors[1].detail)"
         )
     }
@@ -3013,7 +3013,7 @@ final class EphemeralTempScannerTests: XCTestCase {
         )
         // The clause that fired stays in the tooltip, where it always was.
         XCTAssertTrue(
-            outcome.errors[0].detail.contains("home directory"),
+            try XCTUnwrapElement(outcome.errors, 0).detail.contains("home directory"),
             "detail names the clause: \(outcome.errors[0].detail)"
         )
     }
@@ -3706,7 +3706,7 @@ final class EphemeralTempScannerTests: XCTestCase {
             tv_sec: Int(oldDate.timeIntervalSince1970), tv_nsec: 0
         )
         var times = [stamp, stamp]
-        guard utimensat(open[0], "payload.bin", &times, 0) == 0 else {
+        guard utimensat(try XCTUnwrapElement(open, 0), "payload.bin", &times, 0) == 0 else {
             throw XCTSkip("utimensat: \(errno)")
         }
         for fd in open.reversed() {

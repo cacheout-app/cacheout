@@ -146,7 +146,7 @@ final class CleanSheetPresentationTests: XCTestCase {
 
     // MARK: - Unified itemization with evidence (R1)
 
-    func testConfirmationRowsUnifyAggregateAndPerItemRowsWithEvidence() {
+    func testConfirmationRowsUnifyAggregateAndPerItemRowsWithEvidence() throws {
         let cacheAggregate = aggregate(
             name: "npm-cache",
             description: "npm package cache — restored on next install",
@@ -169,28 +169,28 @@ final class CleanSheetPresentationTests: XCTestCase {
 
         // Aggregate row: registered category icon + name; evidence is the
         // category description (description-grade — honest, not padded).
-        XCTAssertEqual(rows[0].icon, "shippingbox")
-        XCTAssertEqual(rows[0].label, "npm-cache")
+        XCTAssertEqual(try XCTUnwrapElement(rows, 0).icon, "shippingbox")
+        XCTAssertEqual(try XCTUnwrapElement(rows, 0).label, "npm-cache")
         XCTAssertEqual(
-            rows[0].evidence,
+            try XCTUnwrapElement(rows, 0).evidence,
             "npm package cache — restored on next install"
         )
 
         // Per-item row: "scanner: item" label (the pre-unification
         // "node_modules: <project>" rendering) + the item's evidence.
-        XCTAssertEqual(rows[1].icon, "shippingbox.fill")
-        XCTAssertEqual(rows[1].label, "node_modules: projectA")
+        XCTAssertEqual(try XCTUnwrapElement(rows, 1).icon, "shippingbox.fill")
+        XCTAssertEqual(try XCTUnwrapElement(rows, 1).label, "node_modules: projectA")
         XCTAssertEqual(
-            rows[1].evidence, "node_modules of projectA — ~/dev/projectA"
+            try XCTUnwrapElement(rows, 1).evidence, "node_modules of projectA — ~/dev/projectA"
         )
 
         // Sizes are the component-sum bytes through the shared formatter.
         XCTAssertEqual(
-            rows[0].formattedSize,
+            try XCTUnwrapElement(rows, 0).formattedSize,
             ByteCountFormatter.sharedFile.string(fromByteCount: 4096)
         )
         XCTAssertEqual(
-            rows[1].formattedSize,
+            try XCTUnwrapElement(rows, 1).formattedSize,
             ByteCountFormatter.sharedFile.string(fromByteCount: 8192)
         )
     }
@@ -339,7 +339,7 @@ final class CleanSheetPresentationTests: XCTestCase {
 
         let rows = CacheoutViewModel.confirmationRows(for: [partial, empty])
         XCTAssertEqual(rows.count, 2, "blocked rows STAY VISIBLE")
-        XCTAssertEqual(rows[0].valuables.map(\.name), ["Seen.dmg"],
+        XCTAssertEqual(try XCTUnwrapElement(rows, 0).valuables.map(\.name), ["Seen.dmg"],
                        "what the truncated probe DID see is still disclosed")
         for row in rows {
             XCTAssertTrue(row.isBlocked)
@@ -570,7 +570,7 @@ final class CleanSheetPresentationTests: XCTestCase {
 
     /// Both modes selected → TWO disclosures, stale first. Merging them into
     /// one sentence would state a promise that is true of neither.
-    func testBothModesDiscloseSeparatelyAndInOrder() {
+    func testBothModesDiscloseSeparatelyAndInOrder() throws {
         let stale = perItem(
             scanner: GitWorktreeScanner.registeredID, id: "wt-1",
             name: "feature-branch", action: reclaimAction(.removeStaleWorktree)
@@ -586,15 +586,15 @@ final class CleanSheetPresentationTests: XCTestCase {
         )
 
         XCTAssertEqual(disclosures.count, 2, "\(disclosures)")
-        XCTAssertTrue(disclosures[0].contains("feature-branch"))
-        XCTAssertTrue(disclosures[1].contains("orphaned worktree registry"))
+        XCTAssertTrue(try XCTUnwrapElement(disclosures, 0).contains("feature-branch"))
+        XCTAssertTrue(try XCTUnwrapElement(disclosures, 1).contains("orphaned worktree registry"))
     }
 
     /// The two disclosures are DISJOINT: the `.commands` derivation never
     /// names a worktree item, and the worktree derivation never names a
     /// command-backed one. Overlap would print the same item twice under two
     /// different promises.
-    func testTheTwoTrashDisclosuresNeverNameEachOthersItems() {
+    func testTheTwoTrashDisclosuresNeverNameEachOthersItems() throws {
         let commandItem = perItem(
             scanner: "sims", id: "sim-devices", name: "Simulator Devices",
             action: .commands([["true"]])
@@ -613,7 +613,11 @@ final class CleanSheetPresentationTests: XCTestCase {
             selectedItems: selection
         )
         XCTAssertEqual(worktrees.count, 1)
-        XCTAssertFalse(worktrees[0].contains("Simulator Devices"), worktrees[0])
+        let worktreeDisclosure = try XCTUnwrapElement(worktrees, 0)
+        XCTAssertFalse(
+            worktreeDisclosure.contains("Simulator Devices"),
+            worktreeDisclosure
+        )
     }
 
     func testNoWorktreeDisclosureWithoutACompositeSelection() {
@@ -680,14 +684,14 @@ final class CleanSheetPresentationTests: XCTestCase {
         // selected per-item row renders with its evidence line.
         XCTAssertEqual(viewModel.confirmationRows.map(\.id), [cautionRow.key])
         XCTAssertEqual(
-            viewModel.confirmationRows[0].evidence,
+            try XCTUnwrapElement(viewModel.confirmationRows, 0).evidence,
             "node_modules/ beside package.json"
         )
     }
 
     // MARK: - Report sheet: per-scanner rollup sections (R1)
 
-    func testScannerSectionsGroupEntriesByScannerWithRollups() {
+    func testScannerSectionsGroupEntriesByScannerWithRollups() throws {
         // Interleaved on purpose: grouping is by scannerID in FIRST-
         // APPEARANCE order, entries keep report order within each section.
         let report = CleanupReport(
@@ -707,31 +711,31 @@ final class CleanSheetPresentationTests: XCTestCase {
         XCTAssertEqual(sections.map(\.scannerID), ["categories", "node_modules"],
                        "first-appearance order, one section per scanner")
 
-        XCTAssertEqual(sections[0].entries.map(\.displayName),
+        XCTAssertEqual(try XCTUnwrapElement(sections, 0).entries.map(\.displayName),
                        ["npm-cache", "pip-cache"],
                        "entries keep report order within their section")
-        XCTAssertEqual(sections[0].rollup.exactBytes, 1024 + 2048,
+        XCTAssertEqual(try XCTUnwrapElement(sections, 0).rollup.exactBytes, 1024 + 2048,
                        "rollup is the pure sum of the section's entries")
-        XCTAssertEqual(sections[0].rollup.estimatedUpToBytes, 0)
-        XCTAssertEqual(sections[0].rollup.entryCount, 2)
+        XCTAssertEqual(try XCTUnwrapElement(sections, 0).rollup.estimatedUpToBytes, 0)
+        XCTAssertEqual(try XCTUnwrapElement(sections, 0).rollup.entryCount, 2)
 
-        XCTAssertEqual(sections[1].entries.map(\.displayName), ["projectA"])
-        XCTAssertEqual(sections[1].rollup.exactBytes, 4096)
-        XCTAssertEqual(sections[1].rollup.estimatedUpToBytes, 512)
+        XCTAssertEqual(try XCTUnwrapElement(sections, 1).entries.map(\.displayName), ["projectA"])
+        XCTAssertEqual(try XCTUnwrapElement(sections, 1).rollup.exactBytes, 4096)
+        XCTAssertEqual(try XCTUnwrapElement(sections, 1).rollup.estimatedUpToBytes, 512)
 
         // The section header text is the same R16 component phrase the
         // entry rows use — estimates stay hedged, never laundered.
         XCTAssertEqual(
-            sections[0].rollup.componentSummary,
+            try XCTUnwrapElement(sections, 0).rollup.componentSummary,
             CleanupReport.componentPhrase(exact: 3072, estimatedUpTo: 0)
         )
         XCTAssertEqual(
-            sections[1].rollup.componentSummary,
+            try XCTUnwrapElement(sections, 1).rollup.componentSummary,
             CleanupReport.componentPhrase(exact: 4096, estimatedUpTo: 512)
         )
     }
 
-    func testReportTotalsAndRollupsSaturateInsteadOfTrapping() {
+    func testReportTotalsAndRollupsSaturateInsteadOfTrapping() throws {
         // Round 8: report entries cross scanners, and the runtime
         // validator bounds each scanner's outcome only individually —
         // every derived report sum must clamp at Int64.max, never trap
@@ -749,7 +753,7 @@ final class CleanSheetPresentationTests: XCTestCase {
         XCTAssertEqual(report.totalFreedExact, Int64.max,
                        "the report-wide exact total clamps")
         XCTAssertEqual(report.totalEstimatedUpTo, Int64.max)
-        XCTAssertEqual(report.entries[1].bytesFreed, Int64.max,
+        XCTAssertEqual(try XCTUnwrapElement(report.entries, 1).bytesFreed, Int64.max,
                        "the per-entry compatibility sum clamps too")
         XCTAssertEqual(report.scannerRollups.map(\.bytesFreed),
                        [Int64.max, Int64.max],

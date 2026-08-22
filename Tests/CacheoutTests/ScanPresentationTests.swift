@@ -340,7 +340,7 @@ final class ScanPresentationTests: XCTestCase {
         viewModel.toggleSelection(for: categoryKey("denied-cat"))
         XCTAssertFalse(viewModel.selectedItemKeys.contains(categoryKey("denied-cat")),
                        ".denied must not be selectable from the UI (R18)")
-        XCTAssertFalse(viewModel.categoryRows[0].result.isSelected,
+        XCTAssertFalse(try XCTUnwrapElement(viewModel.categoryRows, 0).result.isSelected,
                        "the row projection must agree")
 
         viewModel.toggleSelection(for: categoryKey("partial-cat"))

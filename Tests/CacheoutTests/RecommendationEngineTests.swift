@@ -445,7 +445,7 @@ final class RecommendationEngineTests: XCTestCase {
 
     // MARK: - CLI Golden JSON Test
 
-    func testCLIGoldenSnakeCaseFields() async {
+    func testCLIGoldenSnakeCaseFields() async throws {
         let processes = [
             makeProcess(pid: 100, name: "ollama", physFootprint: 2 * 1024 * 1024 * 1024),
         ]
@@ -465,8 +465,8 @@ final class RecommendationEngineTests: XCTestCase {
         // Encode to JSON and verify snake_case field names
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        let data = try! encoder.encode(result.recommendations)
-        let json = String(data: data, encoding: .utf8)!
+        let data = try encoder.encode(result.recommendations)
+        let json = try XCTUnwrap(String(data: data, encoding: .utf8))
 
         // Verify snake_case keys are present
         XCTAssertTrue(json.contains("\"impact_value\""), "Should have snake_case impact_value")
@@ -531,12 +531,12 @@ final class StatusSocketRecommendationsTests: XCTestCase {
         defer { socket.stop() }
 
         let response = try sendSocketCommand("{\"cmd\":\"recommendations\"}\n", to: socketPath)
-        let json = try JSONSerialization.jsonObject(with: response.data(using: .utf8)!) as! [String: Any]
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: response.data(using: .utf8)!) as? [String: Any])
         XCTAssertEqual(json["ok"] as? Bool, true)
 
-        let data = json["data"] as! [String: Any]
+        let data = try XCTUnwrap(json["data"] as? [String: Any])
         XCTAssertNotNil(data["recommendations"])
-        let meta = data["_meta"] as! [String: Any]
+        let meta = try XCTUnwrap(data["_meta"] as? [String: Any])
         XCTAssertNotNil(meta["count"])
         XCTAssertEqual(meta["source"] as? String, "daemon")
         XCTAssertNotNil(meta["scan_partial"])
@@ -553,7 +553,7 @@ final class StatusSocketRecommendationsTests: XCTestCase {
         defer { socket.stop() }
 
         let response = try sendSocketCommand("{\"cmd\":\"recommendations\"}\n", to: socketPath)
-        let json = try JSONSerialization.jsonObject(with: response.data(using: .utf8)!) as! [String: Any]
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: response.data(using: .utf8)!) as? [String: Any])
         XCTAssertEqual(json["ok"] as? Bool, false)
     }
 }

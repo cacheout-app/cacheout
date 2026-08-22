@@ -188,7 +188,7 @@ final class GitWorktreeEndToEndTests: XCTestCase {
                     file: file, line: line)
             throw CocoaError(.featureUnsupported)
         }
-        return matching[0]
+        return try XCTUnwrapElement(matching, 0)
     }
 
     /// `git worktree list --porcelain` through the FIXTURE git (never the code
@@ -475,8 +475,8 @@ final class GitWorktreeEndToEndTests: XCTestCase {
         // selection (F7): both modes, named separately.
         let disclosures = viewModel.gitWorktreeTrashDisclosures
         XCTAssertEqual(disclosures.count, 2, "\(disclosures)")
-        XCTAssertTrue(disclosures[0].contains("unlinked permanently"))
-        XCTAssertTrue(disclosures[1].contains("repository admin data permanently"))
+        XCTAssertTrue(try XCTUnwrapElement(disclosures, 0).contains("unlinked permanently"))
+        XCTAssertTrue(try XCTUnwrapElement(disclosures, 1).contains("repository admin data permanently"))
 
         let expectedExact = DirectorySizer()
             .measure(at: fixture.merged, mode: .deletionTarget).exactAllocatedBytes

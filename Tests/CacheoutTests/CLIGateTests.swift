@@ -459,7 +459,11 @@ final class CLIGateTests: XCTestCase {
         let entries = try XCTUnwrap(payload["results"] as? [[String: Any]])
         XCTAssertEqual(entries.count, 4, "every requested target appears, whatever its fate")
 
-        let bySlug = Dictionary(uniqueKeysWithValues: entries.map { ($0["slug"] as! String, $0) })
+        let bySlug = Dictionary(
+            uniqueKeysWithValues: try entries.map {
+                (try XCTUnwrap($0["slug"] as? String), $0)
+            }
+        )
         XCTAssertEqual(bySlug["m"]?["bytes_would_free"] as? Int64, 4096,
                        "per-entry would-free is exact-only; the 512 estimated bytes are additive")
         XCTAssertEqual(bySlug["m"]?["estimated_up_to_bytes"] as? Int64, 512)
@@ -485,7 +489,7 @@ final class CLIGateTests: XCTestCase {
         let plan = try XCTUnwrap(details["plan"] as? [[String: Any]])
         XCTAssertEqual(plan.count, 2,
                        "the plan mirrors the real run's per-target decisions")
-        XCTAssertEqual(plan[1]["action"] as? String, "refuse")
+        XCTAssertEqual(try XCTUnwrapElement(plan, 1)["action"] as? String, "refuse")
     }
 
     func testCleanPlanTotalsSaturateAcrossScanners() throws {
@@ -617,7 +621,7 @@ final class CLIGateTests: XCTestCase {
 
     // MARK: - Smart-clean loop decision: exact-only target math (R16)
 
-    func testSmartCleanTargetMathIsExactOnly() {
+    func testSmartCleanTargetMathIsExactOnly() throws {
         // Hardlink-heavy category: 10 GB estimated, ZERO exact. The pre-split
         // code would have counted 10 GB and claimed target_met.
         let hardlinkHeavy = makeItem(
@@ -631,17 +635,17 @@ final class CLIGateTests: XCTestCase {
         XCTAssertEqual(plan.totalEstimated, 10 * gb)
         XCTAssertEqual(plan.entries.count, 1,
                        "the category is still cleaned — it just cannot satisfy the target")
-        XCTAssertEqual(plan.entries[0]["bytes_freed"] as? Int64, 0,
+        XCTAssertEqual(try XCTUnwrapElement(plan.entries, 0)["bytes_freed"] as? Int64, 0,
                        "per-entry freed bytes are exact-only")
         // Plan shape parity with `clean` (PROTOCOL.md details.plan).
-        XCTAssertEqual(plan.entries[0]["state"] as? String, "measured")
-        XCTAssertEqual(plan.entries[0]["action"] as? String, "clean")
+        XCTAssertEqual(try XCTUnwrapElement(plan.entries, 0)["state"] as? String, "measured")
+        XCTAssertEqual(try XCTUnwrapElement(plan.entries, 0)["action"] as? String, "clean")
         // Identity fields ride smart-clean rows too (schema 4).
-        XCTAssertEqual(plan.entries[0]["scanner_id"] as? String, "categories")
-        XCTAssertEqual(plan.entries[0]["item_id"] as? String, "links")
+        XCTAssertEqual(try XCTUnwrapElement(plan.entries, 0)["scanner_id"] as? String, "categories")
+        XCTAssertEqual(try XCTUnwrapElement(plan.entries, 0)["item_id"] as? String, "links")
     }
 
-    func testSmartCleanPlanMarksPostTargetCandidatesAsConditionalFallbacks() {
+    func testSmartCleanPlanMarksPostTargetCandidatesAsConditionalFallbacks() throws {
         // Same risk tier — ordering is by compatibility size descending:
         // links (10 GB estimated), exact6 (6 GB exact), small (4 KB).
         let hardlinkHeavy = makeItem(
@@ -675,8 +679,8 @@ final class CLIGateTests: XCTestCase {
         )
         // The fallback projects zero freed bytes but keeps its would-free
         // components intact.
-        XCTAssertEqual(plan.entries[2]["bytes_freed"] as? Int64, 0)
-        XCTAssertEqual(plan.entries[2]["exact_bytes"] as? Int64, 4096)
+        XCTAssertEqual(try XCTUnwrapElement(plan.entries, 2)["bytes_freed"] as? Int64, 0)
+        XCTAssertEqual(try XCTUnwrapElement(plan.entries, 2)["exact_bytes"] as? Int64, 4096)
     }
 
     // MARK: - Exit decision: total vs partial failure (R5)
@@ -839,8 +843,8 @@ final class CLIGateTests: XCTestCase {
 
         XCTAssertEqual(rows as NSArray, expected as NSArray,
                        "denied rows (state + scan_error) survive the envelope byte-for-byte")
-        XCTAssertEqual(rows[0]["state"] as? String, "denied")
-        XCTAssertNotNil(rows[0]["scan_error"])
+        XCTAssertEqual(try XCTUnwrapElement(rows, 0)["state"] as? String, "denied")
+        XCTAssertNotNil(try XCTUnwrapElement(rows, 0)["scan_error"])
     }
 
     /// fn-4.5 (R6/R7/R12): the SAME envelope assertions as the node_modules
@@ -886,7 +890,7 @@ final class CLIGateTests: XCTestCase {
         XCTAssertEqual(envelope["schema_version"] as? Int, 4)
         let items = try XCTUnwrap(envelope["scanner_items"] as? [[String: Any]])
         XCTAssertEqual(items.count, 1)
-        let row = items[0]
+        let row = try XCTUnwrapElement(items, 0)
         XCTAssertEqual(row["scanner_id"] as? String, "build_artifacts")
         XCTAssertFalse(
             items.contains { $0["scanner_id"] as? String == "node_modules" },
@@ -928,7 +932,7 @@ final class CLIGateTests: XCTestCase {
                 && $0["kind"] as? String == "container_refused"
         }
         XCTAssertEqual(refusals.count, 1, "\(errors)")
-        XCTAssertEqual(refusals[0]["path"] as? String, "/")
+        XCTAssertEqual(try XCTUnwrapElement(refusals, 0)["path"] as? String, "/")
     }
 
     /// R12: a DENIED dev root is a classified, visible error on the wire —
@@ -970,9 +974,9 @@ final class CLIGateTests: XCTestCase {
         let errors = try XCTUnwrap(envelope["scanner_errors"] as? [[String: Any]])
         let denials = errors.filter { $0["path"] as? String == denied.path }
         XCTAssertEqual(denials.count, 1, "\(errors)")
-        XCTAssertEqual(denials[0]["scanner_id"] as? String, "build_artifacts")
-        XCTAssertEqual(denials[0]["kind"] as? String, "permission_denied")
-        XCTAssertFalse((denials[0]["detail"] as? String ?? "").isEmpty)
+        XCTAssertEqual(try XCTUnwrapElement(denials, 0)["scanner_id"] as? String, "build_artifacts")
+        XCTAssertEqual(try XCTUnwrapElement(denials, 0)["kind"] as? String, "permission_denied")
+        XCTAssertFalse((try XCTUnwrapElement(denials, 0)["detail"] as? String ?? "").isEmpty)
 
         let items = try XCTUnwrap(envelope["scanner_items"] as? [[String: Any]])
         XCTAssertEqual(items.map { $0["name"] as? String }, ["target"],
@@ -1011,7 +1015,7 @@ final class CLIGateTests: XCTestCase {
         XCTAssertEqual(errors.count, 2)
 
         // Exact JSON, filesystem form: path PRESENT.
-        XCTAssertEqual(errors[0] as NSDictionary, [
+        XCTAssertEqual(try XCTUnwrapElement(errors, 0) as NSDictionary, [
             "scanner_id": "err_scanner",
             "kind": "permission_denied",
             "detail": "fixture denial",
@@ -1020,7 +1024,7 @@ final class CLIGateTests: XCTestCase {
 
         // Exact-shape assertion, malformed form: NO path key at all — the
         // detail is the validator's synthesized message.
-        let malformedRow = errors[1]
+        let malformedRow = try XCTUnwrapElement(errors, 1)
         XCTAssertEqual(malformedRow["scanner_id"] as? String, "bad_scanner")
         XCTAssertEqual(malformedRow["kind"] as? String, "malformed_outcome")
         XCTAssertNil(malformedRow["path"],
@@ -1034,7 +1038,7 @@ final class CLIGateTests: XCTestCase {
         // rows are intact (excluded-and-report, proceed with the rest).
         let items = try XCTUnwrap(envelope["scanner_items"] as? [[String: Any]])
         XCTAssertEqual(items.map { $0["item_id"] as? String }, ["ok1"])
-        XCTAssertEqual(items[0]["scanner_id"] as? String, "good_scanner")
+        XCTAssertEqual(try XCTUnwrapElement(items, 0)["scanner_id"] as? String, "good_scanner")
     }
 
     func testNoArgvContentAppearsInAnyCLIPayload() async throws {
@@ -1081,7 +1085,7 @@ final class CLIGateTests: XCTestCase {
         ))
         XCTAssertFalse(try jsonString(confirmed).contains(token))
         let rows = try XCTUnwrap(confirmed["results"] as? [[String: Any]])
-        XCTAssertEqual(rows[0]["success"] as? Bool, true)
+        XCTAssertEqual(try XCTUnwrapElement(rows, 0)["success"] as? Bool, true)
     }
 
     // MARK: - Frozen wire values, complete matrix (R8)
@@ -1270,7 +1274,7 @@ final class CLIGateTests: XCTestCase {
         ))
         let slugRows = try XCTUnwrap(bySlug["results"] as? [[String: Any]])
         XCTAssertEqual(slugRows.map { $0["slug"] as? String }, ["cat_a"])
-        XCTAssertEqual(slugRows[0]["scanner_id"] as? String, "categories")
+        XCTAssertEqual(try XCTUnwrapElement(slugRows, 0)["scanner_id"] as? String, "categories")
 
         // Form 2: bare per-item scanner slug — ALL its items.
         let byScanner = try successPayload(await CLIHandler.cleanCLIOutcome(
@@ -1287,7 +1291,7 @@ final class CLIGateTests: XCTestCase {
         ))
         let addressRows = try XCTUnwrap(byAddress["results"] as? [[String: Any]])
         XCTAssertEqual(addressRows.count, 1)
-        XCTAssertEqual(addressRows[0]["item_id"] as? String, itemID)
+        XCTAssertEqual(try XCTUnwrapElement(addressRows, 0)["item_id"] as? String, itemID)
 
         // Mixed forms in one invocation resolve together, deduped by item.
         let mixed = try successPayload(await CLIHandler.cleanCLIOutcome(
@@ -1386,9 +1390,9 @@ final class CLIGateTests: XCTestCase {
         XCTAssertEqual(payload["schema_version"] as? Int, 4)
         let cleaned = try XCTUnwrap(payload["cleaned"] as? [[String: Any]])
         XCTAssertEqual(cleaned.map { $0["slug"] as? String }, ["cat_a"])
-        XCTAssertEqual(cleaned[0]["scanner_id"] as? String, "categories",
+        XCTAssertEqual(try XCTUnwrapElement(cleaned, 0)["scanner_id"] as? String, "categories",
                        "smart-clean aggregate rows carry the frozen 'categories' id")
-        XCTAssertEqual(cleaned[0]["item_id"] as? String, "cat_a")
+        XCTAssertEqual(try XCTUnwrapElement(cleaned, 0)["item_id"] as? String, "cat_a")
         let calls = await recorder.count()
         XCTAssertEqual(calls, 0,
                        "smart-clean scans the aggregate `categories` scanner ONLY (round 10)")
@@ -1459,8 +1463,8 @@ final class CLIGateTests: XCTestCase {
         let details = try XCTUnwrap(failure.details)
         let plan = try XCTUnwrap(details["plan"] as? [[String: Any]])
         XCTAssertEqual(plan.count, 1)
-        XCTAssertEqual(plan[0]["slug"] as? String, "build_artifacts:\(itemID)")
-        XCTAssertEqual(plan[0]["action"] as? String, "clean")
+        XCTAssertEqual(try XCTUnwrapElement(plan, 0)["slug"] as? String, "build_artifacts:\(itemID)")
+        XCTAssertEqual(try XCTUnwrapElement(plan, 0)["action"] as? String, "clean")
         XCTAssertTrue(fm.fileExists(atPath: fixture.artifact.path),
                       "an unconfirmed clean deletes NOTHING")
     }
@@ -1490,7 +1494,7 @@ final class CLIGateTests: XCTestCase {
         XCTAssertEqual(payload["schema_version"] as? Int, 4)
         let rows = try XCTUnwrap(payload["results"] as? [[String: Any]])
         XCTAssertEqual(rows.count, 1)
-        let row = rows[0]
+        let row = try XCTUnwrapElement(rows, 0)
         // Exact row contract (R8): the retained `category` key IS the
         // composite address, with separate sibling identity fields whose
         // concatenation matches it.
@@ -1512,9 +1516,9 @@ final class CLIGateTests: XCTestCase {
         // Per-scanner rollup rides additively (fn-2.3's report on the wire).
         let rollups = try XCTUnwrap(payload["scanner_rollups"] as? [[String: Any]])
         XCTAssertEqual(rollups.count, 1)
-        XCTAssertEqual(rollups[0]["scanner_id"] as? String, "build_artifacts")
-        XCTAssertEqual(rollups[0]["entry_count"] as? Int, 1)
-        XCTAssertEqual(rollups[0]["exact_bytes"] as? Int64, freed)
+        XCTAssertEqual(try XCTUnwrapElement(rollups, 0)["scanner_id"] as? String, "build_artifacts")
+        XCTAssertEqual(try XCTUnwrapElement(rollups, 0)["entry_count"] as? Int, 1)
+        XCTAssertEqual(try XCTUnwrapElement(rollups, 0)["exact_bytes"] as? Int64, freed)
     }
 
     func testExplicitlyAddressedEmptyPerItemCandidateIsANoOp() async throws {
@@ -1617,7 +1621,7 @@ final class CLIGateTests: XCTestCase {
         XCTAssertEqual((details["plan"] as? [[String: Any]])?.count, 0)
         let planErrors = try XCTUnwrap(details["scanner_errors"] as? [[String: Any]])
         XCTAssertEqual(planErrors.count, 1)
-        XCTAssertEqual(planErrors[0] as NSDictionary, expectedRow)
+        XCTAssertEqual(try XCTUnwrapElement(planErrors, 0) as NSDictionary, expectedRow)
 
         // Dry run: empty results, zero bytes — WITH the denial rows.
         let dryRun = try successPayload(await CLIHandler.cleanCLIOutcome(
@@ -1627,7 +1631,7 @@ final class CLIGateTests: XCTestCase {
         XCTAssertEqual((dryRun["results"] as? [[String: Any]])?.count, 0)
         XCTAssertEqual(dryRun["total_would_free"] as? Int64, 0)
         let dryErrors = try XCTUnwrap(dryRun["scanner_errors"] as? [[String: Any]])
-        XCTAssertEqual(dryErrors[0] as NSDictionary, expectedRow)
+        XCTAssertEqual(try XCTUnwrapElement(dryErrors, 0) as NSDictionary, expectedRow)
 
         // Confirmed: STILL a process-level success — scan-time impediments
         // are payload data (the `scan` envelope precedent; CLEAN_FAILED
@@ -1639,7 +1643,7 @@ final class CLIGateTests: XCTestCase {
         XCTAssertEqual((confirmed["results"] as? [[String: Any]])?.count, 0)
         XCTAssertEqual(confirmed["total_freed_bytes"] as? Int64, 0)
         let confirmedErrors = try XCTUnwrap(confirmed["scanner_errors"] as? [[String: Any]])
-        XCTAssertEqual(confirmedErrors[0] as NSDictionary, expectedRow)
+        XCTAssertEqual(try XCTUnwrapElement(confirmedErrors, 0) as NSDictionary, expectedRow)
     }
 
     func testScannerWideCleanPartialDenialReportsRowsPlusScannerErrors() async throws {
@@ -1664,11 +1668,11 @@ final class CLIGateTests: XCTestCase {
                        "the accessible item is cleaned for real")
         let rows = try XCTUnwrap(payload["results"] as? [[String: Any]])
         XCTAssertEqual(rows.count, 1)
-        XCTAssertEqual(rows[0]["success"] as? Bool, true)
-        XCTAssertGreaterThan(try XCTUnwrap(rows[0]["bytes_freed"] as? Int64), 0)
+        XCTAssertEqual(try XCTUnwrapElement(rows, 0)["success"] as? Bool, true)
+        XCTAssertGreaterThan(try XCTUnwrap(try XCTUnwrapElement(rows, 0)["bytes_freed"] as? Int64), 0)
         let errors = try XCTUnwrap(payload["scanner_errors"] as? [[String: Any]])
         XCTAssertEqual(errors.count, 1)
-        XCTAssertEqual(errors[0] as NSDictionary, [
+        XCTAssertEqual(try XCTUnwrapElement(errors, 0) as NSDictionary, [
             "scanner_id": "px_scanner",
             "kind": "permission_denied",
             "detail": "fixture EACCES",
@@ -1695,8 +1699,8 @@ final class CLIGateTests: XCTestCase {
         XCTAssertEqual(failure.code, "CLEAN_FAILED")
         let rows = try XCTUnwrap(failure.details?["results"] as? [[String: Any]])
         XCTAssertEqual(rows.count, 1)
-        XCTAssertEqual(rows[0]["success"] as? Bool, false)
-        XCTAssertEqual(Set(rows[0].keys), [
+        XCTAssertEqual(try XCTUnwrapElement(rows, 0)["success"] as? Bool, false)
+        XCTAssertEqual(Set(try XCTUnwrapElement(rows, 0).keys), [
             "category", "name", "bytes_freed", "exact_bytes",
             "estimated_up_to_bytes", "freed_human", "success", "scanner_id",
             "item_id", "error",
@@ -1757,8 +1761,8 @@ final class CLIGateTests: XCTestCase {
             targets: ["cat_valid"], dryRun: false, confirmed: true, euid: 501, deps: deps
         ))
         let rows = try XCTUnwrap(payload["results"] as? [[String: Any]])
-        XCTAssertEqual(rows[0]["category"] as? String, "cat_valid")
-        XCTAssertEqual(rows[0]["success"] as? Bool, true)
+        XCTAssertEqual(try XCTUnwrapElement(rows, 0)["category"] as? String, "cat_valid")
+        XCTAssertEqual(try XCTUnwrapElement(rows, 0)["success"] as? Bool, true)
         XCTAssertFalse(fm.fileExists(atPath: survivor.path),
                        "the valid category's confirmed clean proceeded")
     }
@@ -1829,7 +1833,7 @@ final class CLIGateTests: XCTestCase {
         XCTAssertEqual(payload["tagged_count"] as? Int, 1)
         let tagged = try XCTUnwrap(payload["directories"] as? [[String: Any]])
         XCTAssertEqual(tagged.map { $0["slug"] as? String }, ["cache-a"])
-        XCTAssertEqual(tagged[0]["marker_written"] as? Bool, true,
+        XCTAssertEqual(try XCTUnwrapElement(tagged, 0)["marker_written"] as? Bool, true,
                        "write outcomes are captured, never assumed")
         XCTAssertTrue(
             fm.fileExists(atPath: cacheRoot.appendingPathComponent(".cacheout-managed").path),
@@ -1839,9 +1843,9 @@ final class CLIGateTests: XCTestCase {
         let refused = try XCTUnwrap(payload["refused"] as? [[String: Any]])
         XCTAssertEqual(refused.count, 1)
         XCTAssertEqual(payload["refused_count"] as? Int, 1)
-        XCTAssertEqual(refused[0]["path"] as? String, docs.path)
+        XCTAssertEqual(try XCTUnwrapElement(refused, 0)["path"] as? String, docs.path)
         XCTAssertTrue(
-            try XCTUnwrap(refused[0]["reason"] as? String)
+            try XCTUnwrap(try XCTUnwrapElement(refused, 0)["reason"] as? String)
                 .localizedCaseInsensitiveContains("protected"),
             "the refusal reason is the typed PathGuard message"
         )
@@ -1865,7 +1869,7 @@ final class CLIGateTests: XCTestCase {
         XCTAssertEqual(payload["tagged_count"] as? Int, 0)
         let refused = try XCTUnwrap(payload["refused"] as? [[String: Any]])
         XCTAssertEqual(refused.count, 1)
-        let reason = try XCTUnwrap(refused[0]["reason"] as? String)
+        let reason = try XCTUnwrap(try XCTUnwrapElement(refused, 0)["reason"] as? String)
         XCTAssertTrue(reason.contains("scan denied (tcc_denied)"),
                       "the scan-state refusal is classified, never string-matched: \(reason)")
         XCTAssertFalse(
@@ -1897,7 +1901,7 @@ final class CLIGateTests: XCTestCase {
         let refused = try XCTUnwrap(payload["refused"] as? [[String: Any]])
         XCTAssertEqual(refused.count, 1)
         XCTAssertTrue(
-            try XCTUnwrap(refused[0]["reason"] as? String).contains("metadata writes failed"),
+            try XCTUnwrap(try XCTUnwrapElement(refused, 0)["reason"] as? String).contains("metadata writes failed"),
             "the failure is reported, not swallowed"
         )
     }
@@ -2663,7 +2667,7 @@ final class CLIGateFramingTests: XCTestCase {
         XCTAssertEqual(details["command"] as? String, "clean")
         let plan = try XCTUnwrap(details["plan"] as? [[String: Any]])
         XCTAssertEqual(plan.count, 1)
-        XCTAssertEqual(plan[0]["slug"] as? String, "npm_cache")
+        XCTAssertEqual(try XCTUnwrapElement(plan, 0)["slug"] as? String, "npm_cache")
     }
 
     func testUnconfirmedSmartCleanFraming() throws {
@@ -3167,13 +3171,13 @@ final class CLIAcknowledgementTests: XCTestCase {
         let valuableRow = try row(forItem: valuable, in: dryRows)
         let valuables = try XCTUnwrap(valuableRow["valuables"] as? [[String: Any]])
         XCTAssertEqual(valuables.count, 1)
-        XCTAssertEqual(Set(valuables[0].keys), [
+        XCTAssertEqual(Set(try XCTUnwrapElement(valuables, 0).keys), [
             "name", "path", "allocated_bytes", "device", "inode",
             "modified_at_ns",
         ], "the pinned SIX-FIELD element, reused verbatim")
-        XCTAssertEqual(valuables[0]["name"] as? String, "App.dmg")
+        XCTAssertEqual(try XCTUnwrapElement(valuables, 0)["name"] as? String, "App.dmg")
         XCTAssertEqual(
-            valuables[0]["path"] as? String,
+            try XCTUnwrapElement(valuables, 0)["path"] as? String,
             FileSystemIdentityProvider().resolveTargetKeepingLeaf(
                 valuable.appendingPathComponent("release/bundle/App.dmg")
             ).path,

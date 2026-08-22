@@ -330,7 +330,7 @@ final class BuildArtifactRulesTests: XCTestCase {
 
     // MARK: - Determinism: multiple matches in one event
 
-    func testMultipleMatchesInOneEventInEntryOrder() {
+    func testMultipleMatchesInOneEventInEntryOrder() throws {
         let matches = BuildArtifactRules.matches(in: event(entries: [
             ("node_modules", .directory),
             ("dist", .directory),
@@ -345,8 +345,8 @@ final class BuildArtifactRulesTests: XCTestCase {
             .child(name: ".next"),
             .currentDirectory,
         ])
-        XCTAssertEqual(matches[0].rule, siblingRule("node_modules"))
-        XCTAssertEqual(matches[0].rule.risk, .review,
+        XCTAssertEqual(try XCTUnwrapElement(matches, 0).rule, siblingRule("node_modules"))
+        XCTAssertEqual(try XCTUnwrapElement(matches, 0).rule.risk, .review,
                        "node_modules stays .review — the as-built doctrine")
     }
 }

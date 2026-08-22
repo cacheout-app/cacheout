@@ -316,7 +316,7 @@ final class DaemonAlertTests: XCTestCase {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         let data = try encoder.encode(alert)
-        let json = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
         // Fields must be present as NSNull, not absent
         XCTAssertTrue(json.keys.contains("snapshot_age_ms"),
                       "snapshot_age_ms must be present (as null) in JSON")
@@ -350,7 +350,7 @@ final class DaemonAlertTests: XCTestCase {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         let data = try encoder.encode(alert)
-        let json = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
 
         // Verify snake_case keys
         XCTAssertNotNil(json["snapshot_age_ms"])
@@ -390,7 +390,7 @@ final class DaemonConfigTests: XCTestCase {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         let data = try encoder.encode(status)
-        let json = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
         XCTAssertTrue(json.keys.contains("last_reload"),
                       "last_reload must be present (as null) in JSON")
         XCTAssertTrue(json.keys.contains("error"),
@@ -409,7 +409,7 @@ final class DaemonConfigTests: XCTestCase {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         let data = try encoder.encode(status)
-        let json = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
         XCTAssertEqual(json["generation"] as? Int, 3)
         XCTAssertNotNil(json["last_reload"])
         XCTAssertEqual(json["status"] as? String, "ok")
@@ -452,11 +452,11 @@ final class AutopilotConfigValidatorTests: XCTestCase {
         XCTAssertTrue(errors.isEmpty, "Full valid config should pass: \(errors)")
     }
 
-    func testInvalidJSON() {
+    func testInvalidJSON() throws {
         let data = "not json".data(using: .utf8)!
         let errors = AutopilotConfigValidator.validate(data: data)
         XCTAssertFalse(errors.isEmpty)
-        XCTAssertTrue(errors[0].contains("Invalid JSON"))
+        XCTAssertTrue(try XCTUnwrapElement(errors, 0).contains("Invalid JSON"))
     }
 
     func testMissingVersion() {
@@ -814,10 +814,10 @@ final class StatusSocketIntegrationTests: XCTestCase {
         XCTAssertNotNil(response)
 
         // Parse response envelope
-        let json = try JSONSerialization.jsonObject(with: response.data(using: .utf8)!) as! [String: Any]
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: response.data(using: .utf8)!) as? [String: Any])
         XCTAssertEqual(json["ok"] as? Bool, true)
 
-        let data = json["data"] as! [String: Any]
+        let data = try XCTUnwrap(json["data"] as? [String: Any])
         XCTAssertEqual(data["health_score"] as? Int, -1, "No snapshot → health_score should be -1")
         XCTAssertEqual(data["helper_available"] as? Bool, false)
         XCTAssertNotNil(data["alerts"])
@@ -834,7 +834,7 @@ final class StatusSocketIntegrationTests: XCTestCase {
         defer { socket.stop() }
 
         let response = try sendSocketCommand("{\"cmd\":\"stats\"}\n", to: socketPath)
-        let json = try JSONSerialization.jsonObject(with: response.data(using: .utf8)!) as! [String: Any]
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: response.data(using: .utf8)!) as? [String: Any])
         XCTAssertEqual(json["ok"] as? Bool, true)
         XCTAssertNotNil(json["data"])
     }
@@ -850,7 +850,7 @@ final class StatusSocketIntegrationTests: XCTestCase {
         defer { socket.stop() }
 
         let response = try sendSocketCommand("{\"cmd\":\"config_status\"}\n", to: socketPath)
-        let json = try JSONSerialization.jsonObject(with: response.data(using: .utf8)!) as! [String: Any]
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: response.data(using: .utf8)!) as? [String: Any])
         XCTAssertEqual(json["ok"] as? Bool, true, "Response: \(response)")
         guard let data = json["data"] as? [String: Any] else {
             XCTFail("Expected data in response: \(response)")
@@ -879,9 +879,9 @@ final class StatusSocketIntegrationTests: XCTestCase {
 
         let vcJSON = "{\"cmd\":\"validate_config\",\"path\":\"\(configPath.path)\"}\n"
         let response = try sendSocketCommand(vcJSON, to: socketPath)
-        let json = try JSONSerialization.jsonObject(with: response.data(using: .utf8)!) as! [String: Any]
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: response.data(using: .utf8)!) as? [String: Any])
         XCTAssertEqual(json["ok"] as? Bool, true)
-        let data = json["data"] as! [String: Any]
+        let data = try XCTUnwrap(json["data"] as? [String: Any])
         XCTAssertEqual(data["valid"] as? Bool, true)
     }
 
@@ -901,9 +901,9 @@ final class StatusSocketIntegrationTests: XCTestCase {
 
         let vcJSON = "{\"cmd\":\"validate_config\",\"path\":\"\(configPath.path)\"}\n"
         let response = try sendSocketCommand(vcJSON, to: socketPath)
-        let json = try JSONSerialization.jsonObject(with: response.data(using: .utf8)!) as! [String: Any]
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: response.data(using: .utf8)!) as? [String: Any])
         XCTAssertEqual(json["ok"] as? Bool, true)
-        let data = json["data"] as! [String: Any]
+        let data = try XCTUnwrap(json["data"] as? [String: Any])
         XCTAssertEqual(data["valid"] as? Bool, false)
         XCTAssertFalse((data["errors"] as? [String])?.isEmpty ?? true)
     }
@@ -929,9 +929,9 @@ final class StatusSocketIntegrationTests: XCTestCase {
 
         let vcJSON = "{\"cmd\":\"validate_config\",\"path\":\"\(symlinkPath)\"}\n"
         let response = try sendSocketCommand(vcJSON, to: socketPath)
-        let json = try JSONSerialization.jsonObject(with: response.data(using: .utf8)!) as! [String: Any]
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: response.data(using: .utf8)!) as? [String: Any])
         XCTAssertEqual(json["ok"] as? Bool, true)
-        let data = json["data"] as! [String: Any]
+        let data = try XCTUnwrap(json["data"] as? [String: Any])
         XCTAssertEqual(data["valid"] as? Bool, false, "Symlink path should not validate as a real config")
         let errors = (data["errors"] as? [String]) ?? []
         XCTAssertTrue(errors.contains(where: { $0.contains("symlink") }),
@@ -949,7 +949,7 @@ final class StatusSocketIntegrationTests: XCTestCase {
         defer { socket.stop() }
 
         let response = try sendSocketCommand("{\"cmd\":\"bogus\"}\n", to: socketPath)
-        let json = try JSONSerialization.jsonObject(with: response.data(using: .utf8)!) as! [String: Any]
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: response.data(using: .utf8)!) as? [String: Any])
         XCTAssertEqual(json["ok"] as? Bool, false)
         let errorObj = json["error"] as? [String: Any]
         XCTAssertEqual(errorObj?["code"] as? String, "UNKNOWN_COMMAND")
@@ -1007,7 +1007,7 @@ final class StatusSocketIntegrationTests: XCTestCase {
         defer { socket.stop() }
 
         let response = try sendSocketCommand("{\"cmd\":\"processes\",\"top_n\":-1}\n", to: socketPath)
-        let json = try JSONSerialization.jsonObject(with: response.data(using: .utf8)!) as! [String: Any]
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: response.data(using: .utf8)!) as? [String: Any])
         XCTAssertEqual(json["ok"] as? Bool, false, "Negative top_n should be rejected")
         let errorObj = json["error"] as? [String: Any]
         XCTAssertEqual(errorObj?["code"] as? String, "INVALID_ARGUMENT")
@@ -1024,7 +1024,7 @@ final class StatusSocketIntegrationTests: XCTestCase {
         defer { socket.stop() }
 
         let response = try sendSocketCommand("{\"cmd\":\"processes\",\"top_n\":0}\n", to: socketPath)
-        let json = try JSONSerialization.jsonObject(with: response.data(using: .utf8)!) as! [String: Any]
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: response.data(using: .utf8)!) as? [String: Any])
         XCTAssertEqual(json["ok"] as? Bool, false, "Zero top_n should be rejected")
     }
 
@@ -1064,7 +1064,7 @@ final class StatusSocketIntegrationTests: XCTestCase {
             }
             XCTAssertEqual(responses.count, 10, "All 10 concurrent clients should get responses")
             for response in responses {
-                let json = try JSONSerialization.jsonObject(with: response.data(using: .utf8)!) as! [String: Any]
+                let json = try XCTUnwrap(JSONSerialization.jsonObject(with: response.data(using: .utf8)!) as? [String: Any])
                 XCTAssertEqual(json["ok"] as? Bool, true)
             }
         }

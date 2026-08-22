@@ -95,7 +95,7 @@ final class GitWorktreeInventoryTests: XCTestCase {
         let inventory = try XCTUnwrap(GitWorktreeInventory.parse(data))
         XCTAssertEqual(inventory.entries.count, 2)
 
-        let main = inventory.entries[0]
+        let main = try XCTUnwrapElement(inventory.entries, 0)
         XCTAssertTrue(main.isMain, "the FIRST record is the main worktree by git contract")
         XCTAssertEqual(main.path.path, "/repos/r")
         XCTAssertEqual(main.headSHA, "abc123")
@@ -105,7 +105,7 @@ final class GitWorktreeInventoryTests: XCTestCase {
         XCTAssertFalse(main.isLocked)
         XCTAssertFalse(main.isPrunable)
 
-        let linked = inventory.entries[1]
+        let linked = try XCTUnwrapElement(inventory.entries, 1)
         XCTAssertFalse(linked.isMain, "isMain is POSITIONAL, never a path heuristic")
         XCTAssertEqual(linked.branchRef, "refs/heads/feature")
 
@@ -119,10 +119,10 @@ final class GitWorktreeInventoryTests: XCTestCase {
             ["worktree /repos/det", "HEAD deadbeef", "detached", "another-unknown"]
         ])
         let inventory = try XCTUnwrap(GitWorktreeInventory.parse(data))
-        XCTAssertTrue(inventory.entries[0].isBare)
-        XCTAssertNil(inventory.entries[0].headSHA)
-        XCTAssertTrue(inventory.entries[1].isDetached)
-        XCTAssertNil(inventory.entries[1].branchRef,
+        XCTAssertTrue(try XCTUnwrapElement(inventory.entries, 0).isBare)
+        XCTAssertNil(try XCTUnwrapElement(inventory.entries, 0).headSHA)
+        XCTAssertTrue(try XCTUnwrapElement(inventory.entries, 1).isDetached)
+        XCTAssertNil(try XCTUnwrapElement(inventory.entries, 1).branchRef,
                      "`detached` and `branch` are exclusive")
         XCTAssertEqual(inventory.entries.count, 2,
                        "unknown attributes are ignored, never fatal")
@@ -139,15 +139,15 @@ final class GitWorktreeInventoryTests: XCTestCase {
              "prunable gitdir file points to non-existent location"]
         ])
         let entries = try XCTUnwrap(GitWorktreeInventory.parse(data)).entries
-        XCTAssertTrue(entries[1].isLocked)
-        XCTAssertNil(entries[1].lockReason, "a bare `locked` carries no reason")
-        XCTAssertTrue(entries[2].isLocked)
-        XCTAssertEqual(entries[2].lockReason, "in use on machine")
-        XCTAssertTrue(entries[3].isPrunable)
-        XCTAssertNil(entries[3].prunableReason)
-        XCTAssertTrue(entries[4].isPrunable)
+        XCTAssertTrue(try XCTUnwrapElement(entries, 1).isLocked)
+        XCTAssertNil(try XCTUnwrapElement(entries, 1).lockReason, "a bare `locked` carries no reason")
+        XCTAssertTrue(try XCTUnwrapElement(entries, 2).isLocked)
+        XCTAssertEqual(try XCTUnwrapElement(entries, 2).lockReason, "in use on machine")
+        XCTAssertTrue(try XCTUnwrapElement(entries, 3).isPrunable)
+        XCTAssertNil(try XCTUnwrapElement(entries, 3).prunableReason)
+        XCTAssertTrue(try XCTUnwrapElement(entries, 4).isPrunable)
         XCTAssertEqual(
-            entries[4].prunableReason, "gitdir file points to non-existent location"
+            try XCTUnwrapElement(entries, 4).prunableReason, "gitdir file points to non-existent location"
         )
     }
 
@@ -161,8 +161,8 @@ final class GitWorktreeInventoryTests: XCTestCase {
         ])
         let entries = try XCTUnwrap(GitWorktreeInventory.parse(data)).entries
         XCTAssertEqual(entries.count, 3, "a newline must NOT split a record")
-        XCTAssertEqual(entries[1].path.path, spaced)
-        XCTAssertEqual(entries[2].path.path, newlined)
+        XCTAssertEqual(try XCTUnwrapElement(entries, 1).path.path, spaced)
+        XCTAssertEqual(try XCTUnwrapElement(entries, 2).path.path, newlined)
     }
 
     func testDoubleNulRecordBoundariesAreHonoredExactly() throws {
@@ -180,8 +180,8 @@ final class GitWorktreeInventoryTests: XCTestCase {
 
         let entries = try XCTUnwrap(GitWorktreeInventory.parse(data)).entries
         XCTAssertEqual(entries.count, 2)
-        XCTAssertTrue(entries[0].isBare)
-        XCTAssertTrue(entries[1].isDetached)
+        XCTAssertTrue(try XCTUnwrapElement(entries, 0).isBare)
+        XCTAssertTrue(try XCTUnwrapElement(entries, 1).isDetached)
     }
 
     func testEmptyOutputParsesToAnEmptyInventory() throws {
@@ -263,7 +263,7 @@ final class GitWorktreeInventoryTests: XCTestCase {
         let inventory = try XCTUnwrap(GitWorktreeInventory.parse(stdout))
 
         XCTAssertEqual(inventory.entries.count, 4)
-        XCTAssertTrue(inventory.entries[0].isMain)
+        XCTAssertTrue(try XCTUnwrapElement(inventory.entries, 0).isMain)
         XCTAssertEqual(
             inventory.parentRepoWorkingDir?.resolvingSymlinksInPath().path,
             repository.resolvingSymlinksInPath().path

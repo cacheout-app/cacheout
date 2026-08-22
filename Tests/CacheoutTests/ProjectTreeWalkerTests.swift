@@ -166,7 +166,7 @@ final class ProjectTreeWalkerTests: XCTestCase {
             root.appendingPathComponent("zeta").path,
             root.appendingPathComponent("zeta/inner").path,
         ])
-        XCTAssertEqual(events[0].entries.map(\.name),
+        XCTAssertEqual(try XCTUnwrapElement(events, 0).entries.map(\.name),
                        ["Zupper", "alpha", "mid", "zeta"])
     }
 

@@ -702,7 +702,7 @@ final class EphemeralTempRegistrationTests: XCTestCase {
             case .success(let parsed):
                 XCTFail("\(args) must be rejected, parsed \(parsed)")
             case .failure(let error):
-                XCTAssertTrue(error.message.contains(args[0]),
+                XCTAssertTrue(error.message.contains(try XCTUnwrapElement(args, 0)),
                               "the refusal names the flag: \(error.message)")
             }
         }
@@ -1165,7 +1165,7 @@ final class EphemeralTempRegistrationTests: XCTestCase {
 
         XCTAssertEqual(report.entries.count, 1,
                        "one directory, one deletion", file: file, line: line)
-        XCTAssertEqual(report.entries.first?.scannerID, ordered[0].scannerID,
+        XCTAssertEqual(report.entries.first?.scannerID, try XCTUnwrapElement(ordered, 0).scannerID,
                        "the row that ran FIRST is the one that deleted",
                        file: file, line: line)
         XCTAssertEqual(report.totalFreedExact, build.exactBytes,
@@ -1175,7 +1175,7 @@ final class EphemeralTempRegistrationTests: XCTestCase {
                        "the second row is not a silent no-op — it surfaces as "
                         + "a per-item error", file: file, line: line)
         XCTAssertEqual(report.errors.first?.key.scannerID,
-                       ordered[1].scannerID, file: file, line: line)
+                       try XCTUnwrapElement(ordered, 1).scannerID, file: file, line: line)
         XCTAssertFalse(fm.fileExists(atPath: path),
                        "and the directory really is gone",
                        file: file, line: line)

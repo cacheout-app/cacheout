@@ -244,9 +244,9 @@ final class SpaceScannerIntegrationTests: XCTestCase {
         XCTAssertEqual(report.disposal, .permanent)
         XCTAssertEqual(report.errors.map(\.message), [])
         XCTAssertEqual(report.entries.map(\.key), [aggregateKey, projAKey])
-        XCTAssertEqual(report.entries[0].exactBytes, expectedAggregateExact,
+        XCTAssertEqual(try XCTUnwrapElement(report.entries, 0).exactBytes, expectedAggregateExact,
                        "aggregate freed bytes == independent per-child math")
-        XCTAssertEqual(report.entries[1].exactBytes, expectedItemExact,
+        XCTAssertEqual(try XCTUnwrapElement(report.entries, 1).exactBytes, expectedItemExact,
                        "per-item freed bytes == independent target math")
         XCTAssertEqual(report.entries.map(\.estimatedUpToBytes), [0, 0],
                        "no hardlinks in the fixture — everything is exact")

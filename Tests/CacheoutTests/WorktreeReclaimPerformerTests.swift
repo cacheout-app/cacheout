@@ -2381,7 +2381,7 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         // first recompute and the final pre-removal one, which is exactly
         // the window to swap the container in.
         let fixture = try makePruneFixture(orphans: ["gone"])
-        let orphan = fixture.admin[0]
+        let orphan = try XCTUnwrapElement(fixture.admin, 0)
         let adminContainer = fixture.membership.parentAdminContainer
         let plan = prunePlan(membership: fixture.membership, disclosed: [orphan])
         let runner = InterceptingGitRunner(wrapping: realRunner())
@@ -2424,7 +2424,7 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
 
     func testFreshOrphansAreActuallyRemovedByTheExecutionPrune() async throws {
         let fixture = try makePruneFixture(orphans: ["gone"])
-        let orphan = fixture.admin[0]
+        let orphan = try XCTUnwrapElement(fixture.admin, 0)
         let plan = prunePlan(membership: fixture.membership, disclosed: [orphan])
         let runner = InterceptingGitRunner(wrapping: realRunner())
 
@@ -2472,7 +2472,7 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         // with ~0 bytes must still execute — and must still be REPORTED.
         let fixture = try makePruneFixture(orphans: ["gone"])
         let plan = prunePlan(
-            membership: fixture.membership, disclosed: [fixture.admin[0]]
+            membership: fixture.membership, disclosed: [try XCTUnwrapElement(fixture.admin, 0)]
         )
         let zeroByte = item(plan, id: "zero", exactBytes: 0, itemCount: 1)
         XCTAssertEqual(zeroByte.allocatedBytes, 0)
@@ -2495,7 +2495,7 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         // while removing nothing accepts nothing — and STILL reports a row,
         // never a silent success.
         let fixture = try makePruneFixture(orphans: ["gone"])
-        let orphan = fixture.admin[0]
+        let orphan = try XCTUnwrapElement(fixture.admin, 0)
         let plan = prunePlan(membership: fixture.membership, disclosed: [orphan])
         let runner = InterceptingGitRunner(wrapping: realRunner())
         let outcome = await perform(
@@ -2527,7 +2527,7 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
             // a shared fixture would leave the previous iteration's worktree
             // paths behind and make `worktree add` fail.
             let fixture = try makePruneFixture(orphans: ["gone-\(name)"], suffix: "-\(name)")
-            let orphan = fixture.admin[0]
+            let orphan = try XCTUnwrapElement(fixture.admin, 0)
             let plan = prunePlan(membership: fixture.membership, disclosed: [orphan])
             let runner = InterceptingGitRunner(wrapping: realRunner()) { arguments, index in
                 // The FIRST recompute only — a scripted second one would be
@@ -2563,7 +2563,7 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         // The recomputed set must be a SUBSET of the disclosure: a new orphan
         // would ride a repo-wide prune nobody was told about.
         let fixture = try makePruneFixture(orphans: ["gone"])
-        let disclosed = fixture.admin[0]
+        let disclosed = try XCTUnwrapElement(fixture.admin, 0)
         let surprise = try makeOrphan(
             named: "surprise", in: fixture.repository, membership: fixture.membership
         )
@@ -2593,7 +2593,7 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         // appearing DURING them would be pruned outside every checked set.
         // The window is opened here between the FIRST and the SECOND listing.
         let fixture = try makePruneFixture(orphans: ["gone"])
-        let disclosed = fixture.admin[0]
+        let disclosed = try XCTUnwrapElement(fixture.admin, 0)
         let plan = prunePlan(membership: fixture.membership, disclosed: [disclosed])
 
         let secondOrphanPath = container.appendingPathComponent("late")
@@ -2636,7 +2636,7 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         // sizer can. The drift is simulated at the sizer seam because a real
         // mount cannot be staged in a unit test.
         let fixture = try makePruneFixture(orphans: ["gone"])
-        let orphan = fixture.admin[0]
+        let orphan = try XCTUnwrapElement(fixture.admin, 0)
         let plan = prunePlan(membership: fixture.membership, disclosed: [orphan])
         let boundary = orphan.appendingPathComponent("mounted")
         let runner = InterceptingGitRunner(wrapping: realRunner())
@@ -2669,8 +2669,8 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         // subset, and the survivor's bytes are NOT reported freed
         // (verified-removal accounting).
         let fixture = try makePruneFixture(orphans: ["gone", "locked"])
-        let swept = fixture.admin[0]
-        let survivor = fixture.admin[1]
+        let swept = try XCTUnwrapElement(fixture.admin, 0)
+        let survivor = try XCTUnwrapElement(fixture.admin, 1)
         // A LOCK, exactly as git records one, plus a big filler so the
         // survivor's bytes would be unmissable if they leaked into the row.
         try Data("held".utf8).write(to: survivor.appendingPathComponent("locked"))
@@ -2809,8 +2809,8 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         // removed is the recomputed, DISCLOSED set — never whatever else the
         // container happens to hold.
         let fixture = try makePruneFixture(orphans: ["disclosed", "undisclosed"])
-        let disclosed = fixture.admin[0]
-        let undisclosed = fixture.admin[1]
+        let disclosed = try XCTUnwrapElement(fixture.admin, 0)
+        let undisclosed = try XCTUnwrapElement(fixture.admin, 1)
         // Only ONE of the two orphans is disclosed; the other is prunable and
         // would ride a repository-wide prune.
         let plan = prunePlan(
@@ -2843,7 +2843,7 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         // leaves the repository in the state git's own prune would leave,
         // asserted through git rather than through our own bookkeeping.
         let fixture = try makePruneFixture(orphans: ["gone"])
-        let orphan = fixture.admin[0]
+        let orphan = try XCTUnwrapElement(fixture.admin, 0)
         let anchorAdmin = fixture.membership.parentAdminContainer
             .appendingPathComponent("anchor")
         XCTAssertTrue(fm.fileExists(atPath: anchorAdmin.path))
@@ -2882,7 +2882,7 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         // worktree — and the mapper excludes locked entries because git's own
         // prune skips them too.
         let fixture = try makePruneFixture(orphans: ["gone"])
-        let orphan = fixture.admin[0]
+        let orphan = try XCTUnwrapElement(fixture.admin, 0)
         let plan = prunePlan(membership: fixture.membership, disclosed: [orphan])
 
         let listings = Timeline()
@@ -2923,7 +2923,7 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         let plan = prunePlan(
             membership: fixture.membership, disclosed: fixture.admin
         )
-        let revivedAdmin = fixture.admin[1]
+        let revivedAdmin = try XCTUnwrapElement(fixture.admin, 1)
         let revivedCheckout = container.appendingPathComponent("revived")
         let fileManager = fm
         let removed = TrashRecorder()
@@ -2980,7 +2980,7 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         for swap in ["parent", "adminContainer"] {
             let fixture = try makePruneFixture(orphans: ["gone"], suffix: "-\(swap)")
             let plan = prunePlan(
-                membership: fixture.membership, disclosed: [fixture.admin[0]]
+                membership: fixture.membership, disclosed: [try XCTUnwrapElement(fixture.admin, 0)]
             )
             let outside = try makeOutsideRepository()
             switch swap {
@@ -3019,7 +3019,7 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         // passed against the real one.
         let fixture = try makePruneFixture(orphans: ["gone"])
         let plan = prunePlan(
-            membership: fixture.membership, disclosed: [fixture.admin[0]]
+            membership: fixture.membership, disclosed: [try XCTUnwrapElement(fixture.admin, 0)]
         )
         let outside = try makeOutsideRepository()
         let repository = fixture.repository

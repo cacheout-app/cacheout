@@ -638,19 +638,19 @@ final class WorktreeStalenessAssessorTests: XCTestCase {
             $0.argv.contains("symbolic-ref") || $0.argv.contains("rev-parse")
         }
         XCTAssertEqual(ladder.count, 2, "origin/HEAD, then refs/heads/main — and stop")
-        XCTAssertTrue(ladder[0].argv.contains("refs/remotes/origin/HEAD"))
+        XCTAssertTrue(try XCTUnwrapElement(ladder, 0).argv.contains("refs/remotes/origin/HEAD"))
         XCTAssertTrue(
-            ladder[0].argv.contains("-q"),
+            try XCTUnwrapElement(ladder, 0).argv.contains("-q"),
             "-q is what makes an unset origin/HEAD exit 1 instead of a fatal 128"
         )
-        guard case .failure(let exitCode, _) = ladder[0].outcome else {
+        guard case .failure(let exitCode, _) = try XCTUnwrapElement(ladder, 0).outcome else {
             return XCTFail("expected the origin/HEAD probe to fail, got \(ladder[0].outcome)")
         }
         XCTAssertEqual(
             exitCode, 1,
             "real git answers an unset origin/HEAD under -q with the MISS exit, not a fatal"
         )
-        XCTAssertTrue(ladder[1].argv.contains("refs/heads/main"))
+        XCTAssertTrue(try XCTUnwrapElement(ladder, 1).argv.contains("refs/heads/main"))
         XCTAssertFalse(
             recorder.invocations.contains { $0.argv.contains("refs/heads/master") },
             "the master rung must not run once main resolved"

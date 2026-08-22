@@ -924,7 +924,7 @@ final class OrphanedCachesScannerTests: XCTestCase {
             case .success(let parsed):
                 XCTFail("\(args) must be rejected, parsed \(parsed)")
             case .failure(let error):
-                XCTAssertTrue(error.message.contains(args[0]),
+                XCTAssertTrue(error.message.contains(try XCTUnwrapElement(args, 0)),
                               "the refusal names the flag: \(error.message)")
             }
         }
@@ -5767,7 +5767,7 @@ final class OrphanedCachesScannerTests: XCTestCase {
     /// guidance turns on — can a retry, unaided, change this? — instead of
     /// letting one benign case (the mid-walk race) justify a catch-all
     /// default that absorbs structural failures too.
-    func testErrnoRoutingSeparatesPermanentFromTransientFailures() {
+    func testErrnoRoutingSeparatesPermanentFromTransientFailures() throws {
         // Grantable.
         for code in [EACCES, EPERM] {
             XCTAssertEqual(OrphanedCachesScanner.obstruction(forErrno: code),
@@ -5811,7 +5811,7 @@ final class OrphanedCachesScannerTests: XCTestCase {
         under root: URL, segment: String, levels: Int
     ) throws -> [Int32] {
         var fds = [open(root.path, O_RDONLY | O_DIRECTORY)]
-        guard fds[0] >= 0 else {
+        guard try XCTUnwrapElement(fds, 0) >= 0 else {
             throw XCTSkip("cannot open fixture root: \(errno)")
         }
         for _ in 0..<levels {
@@ -6538,7 +6538,10 @@ private actor OutcomeSequenceBox {
     private var outcomes: [ScanOutcome]
     init(_ outcomes: [ScanOutcome]) { self.outcomes = outcomes }
     func next() -> ScanOutcome {
-        outcomes.count > 1 ? outcomes.removeFirst() : outcomes[0]
+        // FIXTURE-CONTROLLED (see the note on the twin in
+        // CacheoutViewModelTests): the literal list is the test's own.
+        precondition(!outcomes.isEmpty)
+        return outcomes.count > 1 ? outcomes.removeFirst() : outcomes[0]
     }
 }
 

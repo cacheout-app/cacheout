@@ -1527,7 +1527,7 @@ final class BuildArtifactsScannerTests: XCTestCase {
         let found = try XCTUnwrap(item(outcome, at: target))
 
         // The `target` rule row is SAFE — the gate forces it off safe.
-        XCTAssertEqual(BuildArtifactRules.v1[0].risk, .safe,
+        XCTAssertEqual(try XCTUnwrapElement(BuildArtifactRules.v1, 0).risk, .safe,
                        "fixture precondition: the row under test IS safe")
         XCTAssertEqual(found.risk, .review,
                        "a valuable forces the row OFF safe")
@@ -1760,11 +1760,11 @@ final class BuildArtifactsScannerTests: XCTestCase {
         let outcome = try await runScan(makeScanner())
         let found = try XCTUnwrap(item(outcome, at: target))
 
-        XCTAssertEqual(found.risk, BuildArtifactRules.v1[0].risk)
+        XCTAssertEqual(found.risk, try XCTUnwrapElement(BuildArtifactRules.v1, 0).risk)
         XCTAssertEqual(found.defaultSelected,
-                       BuildArtifactRules.v1[0].defaultSelected)
+                       try XCTUnwrapElement(BuildArtifactRules.v1, 0).defaultSelected)
         XCTAssertEqual(found.automaticCleanEligible,
-                       BuildArtifactRules.v1[0].automaticCleanEligible)
+                       try XCTUnwrapElement(BuildArtifactRules.v1, 0).automaticCleanEligible)
         XCTAssertEqual(found.evidence,
                        "target/ beside Cargo.toml; last build today",
                        "a clean probe appends NOTHING")
@@ -4132,7 +4132,7 @@ final class BuildArtifactsScannerTests: XCTestCase {
         ))
         let candidate = BuildArtifactCandidate(
             artifactDirectory: data, originRoot: systemVolumes,
-            rule: BuildArtifactRules.v1[0], marker: "Cargo.toml"
+            rule: try XCTUnwrapElement(BuildArtifactRules.v1, 0), marker: "Cargo.toml"
         )
 
         switch BuildArtifactsScanner.anchoredArtifactDirectory(
@@ -5127,7 +5127,7 @@ final class BuildArtifactsScannerTests: XCTestCase {
         XCTAssertEqual(rows.count, 1)
         // The ONE pinned SIX-FIELD element shape, exactly.
         let st = try rawStat(dmg)
-        XCTAssertEqual(rows[0] as NSDictionary, [
+        XCTAssertEqual(try XCTUnwrapElement(rows, 0) as NSDictionary, [
             "name": "App.dmg",
             "path": identityPath(of: dmg),
             "allocated_bytes": Int64(st.st_blocks) * 512,
@@ -7222,10 +7222,10 @@ final class BuildArtifactsScannerTests: XCTestCase {
 
     private func candidate(
         artifact: URL, originRoot: URL
-    ) -> BuildArtifactCandidate {
+    ) throws -> BuildArtifactCandidate {
         BuildArtifactCandidate(
             artifactDirectory: artifact, originRoot: originRoot,
-            rule: BuildArtifactRules.v1[0], marker: "Cargo.toml"
+            rule: try XCTUnwrapElement(BuildArtifactRules.v1, 0), marker: "Cargo.toml"
         )
     }
 
@@ -7272,7 +7272,7 @@ final class BuildArtifactsScannerTests: XCTestCase {
                       "fixture precondition: the candidate spells a climb")
 
         switch BuildArtifactsScanner.anchoredArtifactDirectory(
-            candidate(artifact: escaping, originRoot: root),
+            try candidate(artifact: escaping, originRoot: root),
             rootAnchors: held, provider: provider
         ) {
         case .obstructed(let report):
@@ -7319,7 +7319,7 @@ final class BuildArtifactsScannerTests: XCTestCase {
         // (a) A SIBLING spelling: same component COUNT past the root, so the
         // suffix looks plausible and lands on the wrong directory.
         switch BuildArtifactsScanner.anchoredArtifactDirectory(
-            candidate(artifact: claimed, originRoot: rootA),
+            try candidate(artifact: claimed, originRoot: rootA),
             rootAnchors: held, provider: provider
         ) {
         case .obstructed(let report):
@@ -7344,7 +7344,7 @@ final class BuildArtifactsScannerTests: XCTestCase {
         // (b) SHORTER than the root: the suffix is EMPTY, so an unguarded
         // descent takes no step at all and hands back the ROOT itself.
         switch BuildArtifactsScanner.anchoredArtifactDirectory(
-            candidate(artifact: dev, originRoot: rootA),
+            try candidate(artifact: dev, originRoot: rootA),
             rootAnchors: held, provider: provider
         ) {
         case .obstructed:
@@ -7362,7 +7362,7 @@ final class BuildArtifactsScannerTests: XCTestCase {
         // (c) …and a candidate whose root was never anchored is refused too,
         // never assumed.
         switch BuildArtifactsScanner.anchoredArtifactDirectory(
-            candidate(artifact: claimed, originRoot: rootB),
+            try candidate(artifact: claimed, originRoot: rootB),
             rootAnchors: held, provider: provider
         ) {
         case .obstructed(let report):

@@ -2597,7 +2597,7 @@ final class CacheCleanerTests: XCTestCase {
         let second = await equipped.clean(items: marked, moveToTrash: false)
         XCTAssertTrue(second.entries.isEmpty)
         XCTAssertEqual(second.errors.count, 1, "only the `.denied` item errors")
-        XCTAssertEqual(second.errors.first?.key, marked[2].key)
+        XCTAssertEqual(second.errors.first?.key, try XCTUnwrapElement(marked, 2).key)
         XCTAssertFalse(
             try XCTUnwrap(second.errors.first?.message)
                 .contains("no revalidator is registered"),
@@ -3072,14 +3072,14 @@ final class CacheCleanerTests: XCTestCase {
         let fixtureEntries = report.entries.filter { $0.scannerID == "fixture_scanner" }
         XCTAssertEqual(fixtureEntries.count, 2)
         XCTAssertEqual(
-            rollups[0].exactBytes,
+            try XCTUnwrapElement(rollups, 0).exactBytes,
             fixtureEntries.reduce(0) { $0 + $1.exactBytes }
         )
         XCTAssertEqual(
-            rollups[0].estimatedUpToBytes,
+            try XCTUnwrapElement(rollups, 0).estimatedUpToBytes,
             fixtureEntries.reduce(0) { $0 + $1.estimatedUpToBytes }
         )
-        XCTAssertEqual(rollups[0].entryCount, 2)
+        XCTAssertEqual(try XCTUnwrapElement(rollups, 0).entryCount, 2)
         XCTAssertEqual(
             rollups.reduce(0) { $0 + $1.exactBytes }, report.totalFreedExact,
             "rollups partition the report totals"

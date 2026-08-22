@@ -1630,19 +1630,13 @@ actor CacheCleaner {
             },
             gitTimeout: gitTimeout,
             moveToTrash: moveToTrash,
-            // THE RAW MOVER, AND THAT IS A KNOWN GAP — NOT A DECISION THAT
-            // THIS ARM NEEDS NO BINDING (fn-6 reconciliation; flagged for its
-            // own round, deliberately not widened here).
-            //
-            // Every OTHER item's Trash disposal now goes through
-            // `TrashDisposal.dispose(_:containedIn:provider:via:)`, which
-            // resolves the target's name inside the bound folder and undoes a
-            // disposal it cannot prove. This composite arm still hands the
-            // mover a bare URL, so the GUI's DEFAULT disposal of a stale
-            // worktree is the one deletion path in the app with no container
-            // binding. `_ =` discards the landing URL that seam exists to
-            // answer — the discard is what makes the omission legible.
-            trash: { url in _ = try await MainActor.run { try handler(url) } },
+            // THE RAW MOVER, AND THE LANDING URL IT ANSWERS WITH. The
+            // performer never calls it directly — it goes through
+            // `TrashDisposal.dispose(_:containedIn:provider:via:)`, the same
+            // no-leaf-verdict overload the item and contents arms above use,
+            // against the container binding the performer captures before its
+            // rechecks.
+            trash: { url in try await MainActor.run { try handler(url) } },
             removeTree: { url, admittedParent in
                 // `expecting: nil` is STATED, not defaulted (fn-6's item path
                 // states its own the same way): `git_worktrees` registers no

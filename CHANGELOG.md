@@ -596,7 +596,10 @@ below are both part of that coordination, and the latter BLOCKS this release.
   actually took afterwards; anything it cannot prove is PUT BACK and reported
   as a refusal, with nothing counted as freed. If the put-back cannot be
   performed the item stays in the Trash and the error names its path, so it is
-  recoverable in one drag.
+  recoverable in one drag. The stale-worktree fallback added in this same
+  release — the disposal the GUI performs when git refuses to remove a
+  worktree — goes through the identical check, so no Trash disposal in the app
+  is handed a bare path.
 - **"Move to Trash" undo: a put-back will not restore into a folder it cannot
   prove.** When the Trash turns out to have taken the wrong folder, Cacheout
   puts it back. That undo held its destination folder open but never checked

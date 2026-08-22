@@ -155,7 +155,23 @@ struct WorktreeReclaimPerformer {
     /// The run's REQUESTED disposal mode. Only the filesystem fallback honours
     /// it (D16).
     let moveToTrash: Bool
-    let trash: (URL) async throws -> Void
+    /// The RAW mover, answering WHERE IT LANDED — `nil` when the disposal
+    /// would not say. It is never called directly: the fallback reaches it
+    /// only through `TrashDisposal.dispose(_:containedIn:provider:via:)`,
+    /// which binds the leaf under the admitted container on both sides of it.
+    ///
+    /// IT RETURNS THE LANDING URL RATHER THAN TAKING THE BINDING (the shape
+    /// `removeTree` below uses). The two seams differ because what they front
+    /// differs: `removeTree` fronts the cleaner's own background-queue
+    /// removal, so the proving lives in cleaner code and the binding has to
+    /// travel to it; `trash` fronts `FileManager.trashItem`, a bare mover with
+    /// no descriptor to give and nothing of its own to prove — so the proving
+    /// happens HERE, where the binding and the provider already are, and the
+    /// seam's only job is to say where the object went. Wrapping it at the
+    /// injection site instead would put the proof in a closure that every
+    /// test replaces, which is how a binding becomes a parameter nobody
+    /// checks.
+    let trash: (URL) async throws -> URL?
     /// The permanent-delete seam. It takes the container binding as a SECOND
     /// argument (fn-6 reconciliation) because the removal it fronts —
     /// `DepthSafeRemoval.remove` — proves the folder it opens against an
@@ -391,7 +407,7 @@ struct WorktreeReclaimPerformer {
         // the trash toggle (a trash failure is an error, NEVER a fall-through
         // to a permanent delete).
         do {
-            // WHICH FOLDER THIS REMOVAL WILL OPEN, bound from a descriptor —
+            // WHICH FOLDER THIS DISPOSAL WILL OPEN, bound from a descriptor —
             // fn-6's doctrine, and its ORDERING verbatim (see the item path in
             // CacheCleaner): taken FIRST, before the rechecks below, because
             // everything after the capture is what the binding covers; taken
@@ -400,6 +416,14 @@ struct WorktreeReclaimPerformer {
             // binds the container ROOT and the worktree is a strict descendant
             // of it. It fails closed and costs nothing to do so: the removal
             // performs the identical open a moment later.
+            //
+            // BOTH ARMS USE IT. It was captured for the permanent arm alone
+            // and the Trash arm — the GUI's default, `moveToTrash` is `true`
+            // out of the box — handed the mover a bare URL beside it, which
+            // made this the one deletion path in the app with no container
+            // binding (fn-5/fn-6 reconciliation). The ordering the capture
+            // already had is the ordering the Trash arm needs: the binding
+            // covers the two rechecks below, not merely the seam call.
             let admittedParent = try DepthSafeRemoval.admittedParent(
                 directory: worktreePath.deletingLastPathComponent(),
                 displayPath: worktreePath.path, provider: provider
@@ -407,7 +431,18 @@ struct WorktreeReclaimPerformer {
             let recheck = try pathGuard.admitContainer(origin, snapshot: snapshot)
             try pathGuard.validateRemovableItem(worktreePath, inside: recheck)
             if moveToTrash {
-                try await trash(worktreePath)
+                // NO LEAF VERDICT, WHICH IS THE POPULATION THIS OVERLOAD IS
+                // FOR: `git_worktrees` registers no `PreDeleteRevalidator`, so
+                // there is nothing to bind the leaf's CONTENTS to — but there
+                // is an admitted container, and a leaf read under a proved
+                // container descriptor is a fact about an OBJECT. The disposal
+                // binds it before the move, re-reads it where the mover says
+                // it landed, and PUTS BACK anything it cannot prove: no entry,
+                // no bytes.
+                try await TrashDisposal.dispose(
+                    worktreePath, containedIn: admittedParent,
+                    provider: provider, via: trash
+                )
             } else {
                 try await removeTree(worktreePath, admittedParent)
             }

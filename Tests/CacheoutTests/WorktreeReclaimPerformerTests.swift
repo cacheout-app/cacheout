@@ -203,7 +203,7 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         runner: any GitCommandRunning,
         measure: ((URL, DirectorySizer.Mode, Set<FileSystemIdentityProvider.Identity>) -> SizeReport)? = nil,
         moveToTrash: Bool = false,
-        trash: ((URL) async throws -> Void)? = nil,
+        trash: ((URL) async throws -> URL?)? = nil,
         revalidate: ((ReclaimableItem) -> PreDeleteSeamRefusal?)? = nil,
         gitTimeout: TimeInterval = WorktreeReclaimPerformer.deleteTimeGitTimeout,
         provider overrideProvider: FileSystemIdentityProvider? = nil
@@ -226,10 +226,11 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
             gitTimeout: gitTimeout,
             moveToTrash: moveToTrash,
             trash: trash ?? { url in
-                try fileManager.moveItem(
-                    at: url,
-                    to: trashRoot.appendingPathComponent(url.lastPathComponent)
+                let landed = trashRoot.appendingPathComponent(
+                    url.lastPathComponent
                 )
+                try fileManager.moveItem(at: url, to: landed)
+                return landed
             },
             removeTree: { url, _ in try fileManager.removeItem(at: url) },
             revalidate: revalidate ?? { _ in nil },
@@ -357,7 +358,10 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         let performer = makePerformer(
             runner: InterceptingGitRunner(wrapping: realRunner()),
             moveToTrash: true,
-            trash: { url in trashed.record(url) }
+            trash: { url in
+                trashed.record(url)
+                return nil
+            }
         )
         let outcome = await perform(item(plan), plan: plan, with: performer)
 
@@ -541,6 +545,98 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         XCTAssertTrue(fm.fileExists(
             atPath: trashDirectory.appendingPathComponent("wt").path
         ))
+    }
+
+    func testTheFallbackRefusesATrashDisposalItCannotProveTookTheWorktree()
+        async throws
+    {
+        // fn-5 RECONCILIATION — the LAST unbound deletion path in the app.
+        //
+        // `moveToTrash` is `true` out of the box (`CacheoutViewModel`), so
+        // this is the disposal the GUI actually performs on a stale worktree,
+        // and it handed the mover a BARE URL while every other item's Trash
+        // disposal went through
+        // `TrashDisposal.dispose(_:containedIn:provider:via:)`. The CLI is not
+        // exposed at all — it always passes `moveToTrash: false`.
+        //
+        // WHAT THIS ASSERTS IS WHAT THE DISPOSAL PROVED, not that it returned.
+        // The seam performs two real renames INSIDE itself, which is the one
+        // window `trashItem` leaves open: it takes a URL and resolves it
+        // internally, so no descriptor can ride into the call. The object that
+        // reaches the Trash is therefore a STRANGER, and the only thing that
+        // can notice is the after-proof — the leaf re-read where the mover
+        // said it landed, compared with the facts bound under the admitted
+        // container before the move.
+        //
+        // Unbound, the app reports SUCCESS while a stranger's tree sits in the
+        // Trash and the worktree it measured is untouched: `disposal: .trash`
+        // with the measured byte count, `errors=[]`. That is the shape the
+        // four assertions below are pinned to.
+        let repository = try makeRepository(named: "repo")
+        let worktree = try addWorktree(named: "wt", branch: "feature", in: repository)
+        let plan = staleplan(
+            worktree: worktree, membership: try membership(of: worktree, in: repository)
+        )
+        let failing = InterceptingGitRunner(wrapping: realRunner()) { arguments, _ in
+            arguments.contains("remove")
+                ? .failure(exitCode: 128, stderr: "injected refusal")
+                : nil
+        }
+
+        // A stranger's tree, and somewhere to park the real worktree — both
+        // OUTSIDE the container, so nothing the guard admits changes shape.
+        let stranger = base.appendingPathComponent("stranger")
+        try fm.createDirectory(at: stranger, withIntermediateDirectories: true)
+        try Data("not yours".utf8)
+            .write(to: stranger.appendingPathComponent("STRANGER"))
+        let stash = base.appendingPathComponent("stashed-worktree")
+        let landing = trashDirectory.appendingPathComponent(
+            worktree.lastPathComponent
+        )
+        let fileManager = fm
+        let outcome = await perform(
+            item(plan), plan: plan,
+            with: makePerformer(
+                runner: failing, moveToTrash: true,
+                trash: { url in
+                    // The swap the mover cannot be protected from: the
+                    // worktree steps aside and the stranger answers to its
+                    // name, all after the binding was taken.
+                    try fileManager.moveItem(at: url, to: stash)
+                    try fileManager.moveItem(at: stranger, to: url)
+                    try fileManager.moveItem(at: url, to: landing)
+                    return landing
+                }
+            )
+        )
+
+        XCTAssertNil(
+            outcome.entry,
+            "a disposal that cannot be proved reports NO entry and NO bytes"
+        )
+        XCTAssertTrue(
+            try XCTUnwrap(outcome.errors.first?.message).contains("PUT BACK"),
+            "the refusal must be the disposal's own after-proof, which says "
+                + "what it established: \(outcome.errors)"
+        )
+        XCTAssertFalse(
+            fileManager.fileExists(atPath: landing.path),
+            "the stranger's tree must not be LEFT in the Trash — the "
+                + "unprovable disposal is undone, not merely reported"
+        )
+        XCTAssertTrue(
+            fileManager.fileExists(
+                atPath: worktree.appendingPathComponent("STRANGER").path
+            ),
+            "the put-back must restore the stranger to the name it was taken "
+                + "from, inside the admitted container"
+        )
+        XCTAssertTrue(
+            fileManager.fileExists(
+                atPath: stash.appendingPathComponent("tracked.txt").path
+            ),
+            "the worktree the app measured was never disposed of at all"
+        )
     }
 
     /// Reports NO identity for any DESCRIPTOR — the "I opened the folder but

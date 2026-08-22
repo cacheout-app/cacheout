@@ -2449,12 +2449,16 @@ struct WorktreeReclaimPerformer {
         //
         // THE COMMAND AND THE COMMIT ARE BOTH STATED BECAUSE THE TOTAL MOVES
         // (PR #460 codex r7, D5). 1466 is 06c1ad5's total, not this branch's:
-        // 0284fd1 took it to 1467, 193b043 to 1470, bcfcb7e to 1471, and r7's
-        // own cells to 1480, and r8's six fence and citation cells to 1486
-        // (`swift test`, this commit). The half that
-        // survives every
-        // commit — and the half a mutation actually establishes — is the ZERO
-        // FAILURES.
+        // 0284fd1 took it to 1467, 193b043 to 1470, bcfcb7e to 1471, r7's own
+        // cells to 1480, and r8's six fence and citation cells to 1486 (the
+        // measurement 7e9b2c5 records). "THIS COMMIT" IS NOT AN ENDPOINT, SO
+        // IT WENT STALE AT THE VERY NEXT COMMIT (PR #460 codex r10, D4): r9's
+        // cells moved the total and this line did not follow. r9 and r10 took
+        // it to 1496 — `swift test` AT COMMIT 101753b reported 1496 executed /
+        // 2 skipped / 0 failures, exit 0. Every figure here now names the
+        // commit it was taken at, which is the only spelling that cannot rot.
+        // The half that survives every commit — and the half a mutation
+        // actually establishes — is the ZERO FAILURES.
         //
         // MEASURED, git 2.50.1, on a `--ref-format=reftable` linked worktree
         // (`git init --ref-format=reftable`, seed commit, `worktree add -b

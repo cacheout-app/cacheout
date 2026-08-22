@@ -1107,15 +1107,17 @@ final class CLIGateTests: XCTestCase {
                            "argv arrays never appear in any row")
         }
 
-        // ALL TWELVE ScanIssue.Kind wire strings through the scanner_errors
+        // ALL THIRTEEN ScanIssue.Kind wire strings through the scanner_errors
         // row builder (the count was stale at "seven" before PR #459 codex
         // r11 — `enumeration_truncated` and `config_invalid` had already
-        // landed; codex r13 added two more, r15 one) — exact rows: the nine
+        // landed; codex r13 added two more, r15 one; the fn-5 merge added
+        // `tool_unavailable`) — exact rows: the nine
         // non-TCC filesystem kinds below carry
         // their real `path`; `tcc_denied` carries its path AND, ALONE, a
         // `grant_hint` (macOS denies CLI processes silently, so the row must
-        // say what to do about it); the two non-filesystem kinds
-        // (`malformed_outcome`, `config_invalid`) have NO path key at all.
+        // say what to do about it); the THREE non-filesystem kinds
+        // (`malformed_outcome`, `config_invalid`, `tool_unavailable`) have NO
+        // path key at all.
         let url = URL(fileURLWithPath: "/tmp/wire-fixture-root")
         let filesystemKinds: [(ScanIssue.Kind, String)] = [
             (.containerRefused, "container_refused"),
@@ -1180,6 +1182,23 @@ final class CLIGateTests: XCTestCase {
             "detail": "fixture detail",
         ] as NSDictionary, "config_invalid is path-less by contract (fn-4 — "
             + "a config parse failure has no honest filesystem path)")
+        // THE THIRTEENTH KIND, added by the fn-5 merge. The cell above called
+        // itself exhaustive over the taxonomy while covering twelve of
+        // thirteen — the same staleness its own header records twice before.
+        // `tool_unavailable` is the third NON-FILESYSTEM kind: a missing `git`
+        // is a fact about the machine, not about any path, so inventing one
+        // would be the fake resolution PROTOCOL.md forbids.
+        let toolUnavailableRow = CLIHandler.scannerErrorRowJSON(
+            scannerID: "wire_scanner",
+            issue: ScanIssue(url: nil, kind: .toolUnavailable,
+                             detail: "fixture detail")
+        )
+        XCTAssertEqual(toolUnavailableRow as NSDictionary, [
+            "scanner_id": "wire_scanner",
+            "kind": "tool_unavailable",
+            "detail": "fixture detail",
+        ] as NSDictionary, "tool_unavailable is path-less by contract (fn-5 — "
+            + "an absent tool has no filesystem location)")
 
         // The frozen aggregate scanner id on clean-side identity fields —
         // the literal string, not just the constant (a renamed constant

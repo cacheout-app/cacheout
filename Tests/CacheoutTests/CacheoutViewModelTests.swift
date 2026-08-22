@@ -156,6 +156,11 @@ final class CacheoutViewModelTests: XCTestCase {
         BuildArtifactsScanner.registeredID,
         OrphanedCachesScanner.registeredID,
         GitWorktreeScanner.registeredID,
+        // fn-6's scanner, added HERE as well as to the registry: the merge
+        // that brought it in left this list at four of five, which is the
+        // silent weakening the comment above warns about rather than a
+        // failure — the guard simply stopped covering `ephemeral_tmp`.
+        EphemeralTempScanner.registeredID,
     ]
 
     /// A `FixtureScanner` DECLARING the origin container `perItem(scanner:

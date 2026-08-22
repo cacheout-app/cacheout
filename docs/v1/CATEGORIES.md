@@ -504,9 +504,20 @@ git.
   re-established against the live repository (which repository the parent
   path resolves to; still registered, still linked, still unlocked, still
   merged), and anything that changed since the scan refuses with the action
-  that clears it named. If git refuses, the tree is re-checked for
-  cleanliness and only then deleted directly, followed by a narrowly-gated
-  removal of nothing but that worktree's own admin entry. The
+  that clears it named. The re-establishment binds the checkout by IDENTITY,
+  not by path: the tree at the assessed path must still back-link to the
+  admin directory the scan resolved, and that directory must still be the
+  same object — so a checkout moved onto that path, or removed and
+  re-created there, is refused rather than removed. (That scan-to-click
+  window is the desktop app's. `--cli clean` re-scans in-process before
+  executing, so a replacement is answered by the re-scan with exit 1 /
+  `INVALID_ARGUMENTS`, "Unknown item id … rescan and retry".) If git
+  refuses, those same gates run first and the cleanliness re-check runs
+  LAST, immediately before the direct delete, so work saved while the checks
+  were running is caught rather than destroyed; a tree that went dirty in
+  that window is refused and is offered again after a re-scan. The delete is
+  then followed by a narrowly-gated removal of nothing but that worktree's
+  own admin entry. The
   repository-level item removes exactly the admin directories the scan
   disclosed, one by one — no repository-wide `git worktree prune` runs,
   because git would re-enumerate its own set after every gate had answered.

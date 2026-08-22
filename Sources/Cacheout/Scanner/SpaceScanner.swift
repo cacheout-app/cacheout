@@ -187,6 +187,33 @@ struct GitWorktreeReclaimPlan: Equatable, Sendable {
     /// gate could not name what it is allowed to sweep.
     let worktreeAdminEntry: URL?
 
+    /// STALE MODE ONLY: the INODE IDENTITY of `worktreeAdminEntry` as the
+    /// scan saw it (PR #460 codex r3, closing D3).
+    ///
+    /// `worktreeAdminEntry` above is a PATH, and a path is not an identity.
+    /// MEASURED on git 2.50.1: `git worktree remove <p>` frees
+    /// `worktrees/<basename>` and a later `git worktree add <same path>`
+    /// TAKES THAT NAME BACK — same spelling, different inode. R1b re-resolved
+    /// both sides from paths, so that one re-creation was indistinguishable
+    /// from the original checkout and the delete path destroyed a brand-new
+    /// working tree — together with files `status --porcelain` never reports,
+    /// because a committed `.gitignore` makes such a tree read CLEAN to both
+    /// git and this app.
+    ///
+    /// The admin directory is the right object to bind: it is created once
+    /// per checkout and SURVIVES every operation a user legitimately performs
+    /// on one. `git worktree move` rewrites its `gitdir` file and leaves the
+    /// directory itself alone; `git worktree repair` likewise. Only `remove`
+    /// destroys it — which is exactly the event that must refuse.
+    ///
+    /// NIL means the plan was not built by a scan that could stat that
+    /// directory. `GitWorktreeScanner` always can: it has already resolved
+    /// the directory THROUGH the worktree's own back-link by the time it
+    /// builds the plan. Hand-built plans (tests, and only tests) may leave it
+    /// nil, and then the identity gate is inert and R1b falls back to its
+    /// path-level proof — which is the pre-r3 behaviour, not a new hole.
+    let worktreeAdminEntryIdentity: FileSystemIdentityProvider.Identity?
+
     /// BOTH MODES: git's `-C` target — the porcelain FIRST record's path
     /// (`WorktreeMembership.parentRepoWorkingDir`), which is the main working
     /// tree or the bare repository directory. NEVER derived from the git
@@ -209,11 +236,36 @@ struct GitWorktreeReclaimPlan: Equatable, Sendable {
     /// disclosure (D14).
     let disclosedAdminDirectories: [URL]
 
+    /// Spelled out rather than synthesized ONLY so
+    /// `worktreeAdminEntryIdentity` can default to nil: the memberwise
+    /// initializer omits `let` properties that carry a default value, and
+    /// every existing construction site (including the tests the factories
+    /// deliberately leave the memberwise init reachable for) predates that
+    /// field.
+    init(
+        mode: Mode,
+        worktreePath: URL?,
+        worktreeAdminEntry: URL?,
+        worktreeAdminEntryIdentity: FileSystemIdentityProvider.Identity? = nil,
+        parentRepoWorkingDir: URL,
+        parentAdminContainer: URL,
+        disclosedAdminDirectories: [URL]
+    ) {
+        self.mode = mode
+        self.worktreePath = worktreePath
+        self.worktreeAdminEntry = worktreeAdminEntry
+        self.worktreeAdminEntryIdentity = worktreeAdminEntryIdentity
+        self.parentRepoWorkingDir = parentRepoWorkingDir
+        self.parentAdminContainer = parentAdminContainer
+        self.disclosedAdminDirectories = disclosedAdminDirectories
+    }
+
     /// Stale-removal plan. The disclosed set is empty BY CONSTRUCTION here —
     /// a stale item discloses no repository-level removal set.
     static func removeStaleWorktree(
         worktreePath: URL,
         worktreeAdminEntry: URL,
+        worktreeAdminEntryIdentity: FileSystemIdentityProvider.Identity? = nil,
         parentRepoWorkingDir: URL,
         adminContainer: URL
     ) -> GitWorktreeReclaimPlan {
@@ -221,6 +273,7 @@ struct GitWorktreeReclaimPlan: Equatable, Sendable {
             mode: .removeStaleWorktree,
             worktreePath: worktreePath,
             worktreeAdminEntry: worktreeAdminEntry,
+            worktreeAdminEntryIdentity: worktreeAdminEntryIdentity,
             parentRepoWorkingDir: parentRepoWorkingDir,
             parentAdminContainer: adminContainer,
             disclosedAdminDirectories: []

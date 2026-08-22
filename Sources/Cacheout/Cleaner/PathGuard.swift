@@ -538,7 +538,18 @@ final class PathGuard {
 
     /// Validate a directory that is about to be handed to a SUBPROCESS which
     /// FOLLOWS it (`git -C <dir>`, `git worktree remove <dir>`) — the D13
-    /// guard, run immediately before EVERY such invocation.
+    /// guard.
+    ///
+    /// IT IS NOT RUN IMMEDIATELY BEFORE EVERY SUCH INVOCATION, and the
+    /// wording that said so was retired from `WorktreeReclaimPerformer` as
+    /// false (PR #460 codex r2) while surviving here (r3). What that file's
+    /// guard-site table actually guarantees is weaker and true: every path a
+    /// git invocation traverses is covered by a call to this function that
+    /// ran after admission and before that invocation — one guard SITE can
+    /// cover several invocations. A guard is a PATH check, not a lock and not
+    /// a handle: it cannot bind what git resolves a microsecond later, so
+    /// re-running it narrows a window and never closes one, and re-runs no
+    /// cell can distinguish would only be unevidenced guards.
     ///
     /// `validateRemovableItem` is the WRONG check here and the difference is
     /// the whole point: it deliberately leaves the LEAF unresolved because a

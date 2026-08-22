@@ -875,6 +875,14 @@ struct GitWorktreeScanner: @unchecked Sendable {
                 GitWorktreeReclaimPlan.removeStaleWorktree(
                     worktreePath: worktreePath,
                     worktreeAdminEntry: adminEntry,
+                    // D3 (PR #460 codex r3): the admin directory's INODE, not
+                    // just its spelling. `remove` + `add` at the same path
+                    // gives the new checkout the SAME admin directory NAME
+                    // back, so a carried path alone cannot tell the two
+                    // checkouts apart at delete time. Captured here because
+                    // this is the last point that provably still sees the
+                    // checkout the assessment was about.
+                    worktreeAdminEntryIdentity: provider.identity(of: adminEntry),
                     parentRepoWorkingDir: parentRepoWorkingDir,
                     adminContainer: adminContainer
                 )
@@ -900,9 +908,14 @@ struct GitWorktreeScanner: @unchecked Sendable {
     /// therefore SUPPRESSES the item and publishes what could not be accounted
     /// for. LOCKED prunable entries are the deliberate exception, excluded by
     /// the mapper WITHOUT suppression: they are not in the removal set. That
-    /// exclusion is now the SOLE enforcement of the lock (PR #460 codex r2 /
-    /// D6) — the execution is a direct removal of the mapped directories and
-    /// no longer a `git worktree prune` that would have skipped them anyway.
+    /// exclusion is the only lock check left in the pipeline (PR #460 codex
+    /// r2 / D6) — the execution is a direct removal of the mapped directories
+    /// and no longer a `git worktree prune` that would have skipped them
+    /// anyway. It is defence in depth, not a live one-line-from-disaster
+    /// path: measured on git 2.50.1, git never marks a LOCKED worktree
+    /// `prunable`, so the first clause of the filter already excludes every
+    /// such record and the covering cells inject the combination
+    /// synthetically. `GitAdminMapper.map` carries the measurement.
     private func pruneTier(
         inventory: GitWorktreeInventory,
         parentRepoWorkingDir: URL,

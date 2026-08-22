@@ -520,16 +520,24 @@ struct GitWorktreeAdminMapper {
     /// incomplete: a locked admin directory is not in the removal set, so
     /// disclosing it would be a lie (D14).
     ///
-    /// THE `!$0.isLocked` BELOW IS NOW THE SOLE ENFORCEMENT (PR #460 codex
-    /// r2 / D6). It used to be a disclosure rule with a backstop: even a bad
-    /// set could not destroy a locked admin directory, because the execution
-    /// was `git worktree prune` and git's prune skips locked entries. That
-    /// prune is retired (`WorktreeReclaimPerformer.removeAdminDirectories`
-    /// removes the mapped directories itself and knows nothing about locks),
-    /// so nothing downstream re-checks the lock. Weakening, widening or
-    /// short-circuiting this filter now removes locked admin data outright.
-    /// The behaviour is correct and evidenced end to end — a locked orphan
-    /// survives a real clean — but it survives because of THIS LINE.
+    /// THE `!$0.isLocked` BELOW IS THE ONLY LOCK CHECK LEFT IN THE PIPELINE,
+    /// and it is DEFENCE IN DEPTH rather than the thing standing between a
+    /// user and lost data (PR #460 codex r2 / D6, corrected r3).
+    ///
+    /// It used to be a disclosure rule with a backstop: the execution was
+    /// `git worktree prune`, which skips locked entries. That prune is
+    /// retired (`WorktreeReclaimPerformer.removeAdminDirectories` removes the
+    /// mapped directories itself and knows nothing about locks), so nothing
+    /// downstream re-checks the lock — hence "the only one left".
+    ///
+    /// WHAT IT IS NOT is one line away from disaster. MEASURED on git 2.50.1:
+    /// git does not annotate a locked worktree `prunable` AT ALL, even under
+    /// `-c gc.worktreePruneExpire=now`, so `isPrunable && !isLocked` is
+    /// already false on its FIRST clause for every record git produces, and
+    /// the cells that cover this filter have to INJECT prunable+locked
+    /// records synthetically. Keep the clause: it costs nothing and it holds
+    /// if a future git ever does mark such a record. Do not read it as the
+    /// last guard on a live path.
     func map(
         prunableRecordsIn entries: [GitWorktreeEntry], adminContainer: URL
     ) -> GitAdminMappingVerdict {

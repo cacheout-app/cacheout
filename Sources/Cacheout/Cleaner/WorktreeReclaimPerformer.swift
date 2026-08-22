@@ -30,9 +30,11 @@
 /// ## THE D13 SUBPROCESS-TRAVERSAL AUDIT
 ///
 /// WHAT IS ACTUALLY GUARANTEED (rewritten, PR #460 codex r2 — the previous
-/// wording, "re-runs IMMEDIATELY before EVERY git invocation", was FALSE:
-/// `grep -n guardTraversal` returned six sites and none of them was inside
-/// `reestablishStaleGates`, which fires five invocations of its own):
+/// wording, "re-runs IMMEDIATELY before EVERY git invocation", was FALSE, and
+/// it is still false at r3. MEASURED: `grep -c 'try guardTraversal('` on this
+/// file returns 8 (one of which is inside the shared `guardGroup` helper),
+/// against far more git invocations than that, and R0 and R2 are both invoked
+/// with no immediately-preceding guard, deliberately — see the table):
 ///
 /// **Every path a git invocation traverses is covered by a
 /// `validateSubprocessTraversalDirectory` that ran after admission and
@@ -53,7 +55,8 @@
 /// | admission (both modes)           | parent (or-equal), admin container; stale mode adds the worktree | everything, as the floor |
 /// | pre-`worktree remove` (stale)    | parent, worktree       | R0, R2's ladder + ancestry, and `worktree remove` itself |
 /// | inside R1 (PR #460 codex r2)     | parent, admin container | the `worktree list` re-read — it ENUMERATES `$GIT_COMMON_DIR/worktrees` to answer `prunable`, and the pre-remove guard covers only the parent and the worktree |
-/// | fallback entry                   | worktree, admin container, parent | the `status` re-check (git follows `<wt>/.git` INTO the admin/common git dir, so a swap in EITHER would redirect it — epic round 6) and the fallback's own R0/R1/R1b/R2 |
+/// | fallback entry                   | worktree, admin container, parent | the fallback's own R0/R1/R1b/R2 (R1b reads `<wt>/.git`, so the admin container is traversed there too) |
+/// | pre-`status` in the fallback (PR #460 codex r3) | worktree, admin container | the clean re-check, which is now the LAST gate and is therefore separated from the fallback-entry guard by five subprocesses — git follows `<wt>/.git` INTO the admin/common git dir, so a swap in EITHER would redirect it (epic round 6) |
 /// | inside the oracle recompute      | parent, admin container | the recompute's `worktree list` — same argv, same two paths |
 /// | pre-scoped-removal               | parent, admin container | the scoped admin removal and the R0 immediately before it |
 /// | each affected admin dir (prune mode) | the dir itself, strictly | that directory's own removal |
@@ -75,6 +78,21 @@
 /// immediately before the mutation, at BOTH mutating sites: before
 /// `worktree remove`, and again inside the fallback before the filesystem
 /// delete.
+///
+/// ## GATE ORDER INSIDE THE FALLBACK (PR #460 codex r3)
+///
+/// R0/R1/R1b/R2 run FIRST and G2 (the clean re-check) runs LAST, immediately
+/// before the disposal. The reverse order shipped in r1/r2 and was a live
+/// hole: MEASURED, a file written into the worktree after the clean re-check
+/// and before the delete was destroyed while the performer returned a SUCCESS
+/// entry, `errors == []`, `warning == nil`. Five git subprocesses and two
+/// path re-admissions sat in that window.
+///
+/// The order is safe both ways round for R0/R1/R2 — they read the PARENT's
+/// porcelain record, which the worktree's own contents cannot change — so
+/// putting the contents check last costs nothing and closes the window that
+/// mattered. What remains is the disposal call itself; `status` is a read,
+/// not a lock, so no ordering can close that.
 ///
 /// ## RUNNER-RESULT ROUTING IS TOTAL
 ///
@@ -424,9 +442,9 @@ struct WorktreeReclaimPerformer {
         }
     }
 
-    /// git refused with a nonzero exit: re-check CLEAN through the seam's
-    /// check, then delete the tree ourselves under the `removeGuardedItem`
-    /// doctrine, then run the GATED prune.
+    /// git refused with a nonzero exit: re-establish the scan's gates, then
+    /// re-check CLEAN as the LAST gate, then delete the tree ourselves under
+    /// the `removeGuardedItem` doctrine, then run the GATED prune.
     private func fallbackAfterRefusal(
         item: ReclaimableItem,
         plan: GitWorktreeReclaimPlan,
@@ -438,13 +456,18 @@ struct WorktreeReclaimPerformer {
         token: RegisteredChild,
         gitRefusal: String
     ) async -> WorktreeReclaimOutcome {
-        // The guard re-runs over BOTH paths the re-check traverses (round 6):
-        // `git -C <wt> status` follows `<wt>/.git` INTO the admin container,
-        // so a leaf swapped to a symlink in EITHER between the remove failure
-        // and this call would redirect the check outside the container. The
-        // PARENT joins them (PR #460 codex r1) because the gate
+        // The guard covers the three paths this function's git invocations
+        // traverse. The PARENT (PR #460 codex r1) because the gate
         // re-establishment below re-reads the repository and its registry
-        // with `-C <parent>`.
+        // with `-C <parent>`; the WORKTREE and the ADMIN CONTAINER (round 6)
+        // because R1b's back-link read and R2's ancestry run `-C <wt>`, and
+        // `<wt>/.git` points INTO the admin container, so a leaf swapped to a
+        // symlink in EITHER between the remove failure and this call would
+        // redirect them outside the container.
+        //
+        // The clean re-check no longer runs here — it is the LAST gate now
+        // (PR #460 codex r3) and carries its own guard, because the entry
+        // guard is separated from it by five subprocesses.
         do {
             try guardTraversal([
                 (label: "worktree", url: worktreePath,
@@ -456,33 +479,6 @@ struct WorktreeReclaimPerformer {
             ], inside: container)
         } catch {
             return refusal(item, error, at: worktreePath)
-        }
-
-        // ONE implementation of the clean check, shared with the G2 gate
-        // (fn-5.2) — the scan and the deletion can never disagree about what
-        // "clean" means. Its verdict is TOTAL over the runner's four classes,
-        // and `.failed` is deliberately distinct from `.dirty` so the abort
-        // wording can differ.
-        let verdict = await GitWorktreeCleanCheck.run(
-            worktreeAt: worktreePath, using: runner, timeout: gitTimeout
-        )
-        switch verdict {
-        case .clean:
-            break
-        case .dirty(let entryCount):
-            let detail = "aborted: git refused to remove this worktree "
-                + "(\(gitRefusal)) and the delete-time re-check found it "
-                + "DIRTY (\(entryCount) porcelain "
-                + "\(entryCount == 1 ? "entry" : "entries")) — the tree was "
-                + "left untouched"
-            logRefusal("worktree-dirty", detail)
-            return failure(item, detail, tag: nil)
-        case .failed(let reason):
-            let detail = "aborted: git refused to remove this worktree "
-                + "(\(gitRefusal)) and the delete-time re-check could not "
-                + "prove it clean (\(reason)) — the tree was left untouched"
-            logRefusal("worktree-recheck-failed", detail)
-            return failure(item, detail, tag: nil)
         }
 
         // THE GATE RE-ESTABLISHMENT, AGAIN — and this is the placement that
@@ -508,10 +504,10 @@ struct WorktreeReclaimPerformer {
             )
         }
 
-        // Still clean → the guarded filesystem fallback, `removeGuardedItem`'s
-        // doctrine verbatim: TOCTOU re-admission immediately pre-delete, then
-        // the trash toggle (a trash failure is an error, NEVER a fall-through
-        // to a permanent delete).
+        // The guarded filesystem fallback, `removeGuardedItem`'s doctrine
+        // verbatim: TOCTOU re-admission immediately pre-delete, then the
+        // trash toggle (a trash failure is an error, NEVER a fall-through to
+        // a permanent delete).
         do {
             // WHICH FOLDER THIS DISPOSAL WILL OPEN, bound from a descriptor —
             // fn-6's doctrine, and its ORDERING verbatim (see the item path in
@@ -536,6 +532,77 @@ struct WorktreeReclaimPerformer {
             )
             let recheck = try pathGuard.admitContainer(origin, snapshot: snapshot)
             try pathGuard.validateRemovableItem(worktreePath, inside: recheck)
+
+            // G2 IS THE LAST GATE, and this ordering is the whole point
+            // (PR #460 codex r3).
+            //
+            // Until this round the clean re-check ran at the TOP of this
+            // function and `reestablishStaleGates` ran after it, so between
+            // "this tree is clean" and "delete this tree" sat FIVE git
+            // subprocesses (`rev-parse --git-common-dir`, `worktree list`,
+            // `symbolic-ref`, `rev-parse --verify`, `merge-base`) plus the
+            // two rechecks above. MEASURED: a file written into the worktree
+            // in that window was destroyed and the performer returned a
+            // SUCCESS entry with `errors == []` and no warning. The comment
+            // above the gate re-establishment made exactly this argument for
+            // R0/R1/R2 — "Running the same check only before `worktree
+            // remove` would leave the window between that check and this
+            // delete open" — and never applied it to G2.
+            //
+            // G2 is now the last thing that runs before the disposal, so the
+            // surviving window is the disposal call itself, which no ordering
+            // can remove: `status` is a read, not a lock. What the ordering
+            // buys is that the window no longer CONTAINS five subprocess
+            // spawns and two path re-admissions.
+            //
+            // The guard re-runs here for the same reason it runs at entry:
+            // `git -C <wt> status` follows `<wt>/.git` INTO the admin
+            // container, and the entry guard is now separated from this
+            // invocation by the gate re-establishment's five subprocesses.
+            // The parent is not re-guarded — this invocation does not
+            // traverse it.
+            try guardTraversal([
+                (label: "worktree", url: worktreePath,
+                 containment: .strictDescendant),
+                (label: "admin container", url: plan.parentAdminContainer,
+                 containment: .strictDescendant),
+            ], inside: container)
+
+            // ONE implementation of the clean check, shared with the G2 gate
+            // (fn-5.2) — the scan and the deletion can never disagree about
+            // what "clean" means. Its verdict is TOTAL over the runner's four
+            // classes, and `.failed` is deliberately distinct from `.dirty`
+            // so the abort wording can differ.
+            //
+            // THE REFUSAL THIS ORDERING INTRODUCES IS RETRYABLE. A tree that
+            // was clean when the fallback was entered and dirty by the time
+            // the gates finished now refuses instead of being deleted. That
+            // is a fact about a CONCURRENT WRITER, not a fixed property of
+            // the input: stop the writer (or commit/stash the work), re-scan,
+            // and the same item can succeed. It is the opposite of a
+            // deterministic bound, which no re-scan can ever clear.
+            switch await GitWorktreeCleanCheck.run(
+                worktreeAt: worktreePath, using: runner, timeout: gitTimeout
+            ) {
+            case .clean:
+                break
+            case .dirty(let entryCount):
+                let detail = "aborted: git refused to remove this worktree "
+                    + "(\(gitRefusal)) and the delete-time re-check found it "
+                    + "DIRTY (\(entryCount) porcelain "
+                    + "\(entryCount == 1 ? "entry" : "entries")) — the tree "
+                    + "was left untouched"
+                logRefusal("worktree-dirty", detail)
+                return failure(item, detail, tag: nil)
+            case .failed(let reason):
+                let detail = "aborted: git refused to remove this worktree "
+                    + "(\(gitRefusal)) and the delete-time re-check could not "
+                    + "prove it clean (\(reason)) — the tree was left "
+                    + "untouched"
+                logRefusal("worktree-recheck-failed", detail)
+                return failure(item, detail, tag: nil)
+            }
+
             if moveToTrash {
                 // NO LEAF VERDICT, WHICH IS THE POPULATION THIS OVERLOAD IS
                 // FOR: `git_worktrees` registers no `PreDeleteRevalidator`, so
@@ -1275,7 +1342,8 @@ struct WorktreeReclaimPerformer {
         // R1b is the condition on ACCEPTING the record, so it runs where
         // the record is accepted.
         if case .refuse(let tag, let detail) = reestablishWorktreeIdentity(
-            worktreePath: worktreePath, adminEntry: adminEntry
+            worktreePath: worktreePath, adminEntry: adminEntry,
+            carriedIdentity: plan.worktreeAdminEntryIdentity
         ) {
             return .refuse(tag: tag, detail: detail)
         }
@@ -1314,19 +1382,41 @@ struct WorktreeReclaimPerformer {
     /// becomes its own candidate, or fails the four gates on its own merits,
     /// or is not offered at all.
     ///
-    /// RESIDUAL, MEASURED (git 2.50.1, this machine): a user who removes the
-    /// stale worktree and then re-adds one AT THE SAME PATH gets an admin
-    /// directory of the SAME NAME back (`worktrees/<basename>` is freed by
-    /// the removal and reused by the add; the two directories' inodes
-    /// differed, 110794887 → 110794910). The plan carries a PATH, not the
-    /// scan-time inode, so that one re-creation is indistinguishable here.
-    /// Closing it needs a scan-time identity carried in
-    /// `GitWorktreeReclaimPlan` — the fn-6 shape — which is a schema change
-    /// this round did not take. The `git worktree move` and
-    /// `add-under-a-different-path` shapes ARE closed, and those are the ones
-    /// that were measured destroying live work.
+    /// THE SAME-PATH RE-ADD, CLOSED (PR #460 codex r3, D3). MEASURED on git
+    /// 2.50.1: a user who removes the stale worktree and then re-adds one AT
+    /// THE SAME PATH gets an admin directory of the SAME NAME back
+    /// (`worktrees/<basename>` is freed by the removal and reused by the add)
+    /// with a DIFFERENT inode. Both sides of the path comparison below
+    /// re-resolve to that same spelling, so it passed — and the brand-new
+    /// checkout was destroyed under a SUCCESS entry, together with files
+    /// `status --porcelain` never reports (a committed `.gitignore` covering
+    /// `secret.env` and `node_modules/` makes such a tree read CLEAN to both
+    /// git and this app). The plan now carries the scan-time INODE of that
+    /// admin directory and this gate compares it, so the re-created directory
+    /// refuses.
+    ///
+    /// The inode is the right binding because the admin directory is created
+    /// once per checkout and outlives everything a user legitimately does to
+    /// one: `git worktree move` rewrites its `gitdir` file, `git worktree
+    /// repair` rewrites its pointers, and neither replaces the directory.
+    ///
+    /// WHERE THIS GATE IS REACHABLE FROM (PR #460 codex r3, D7): the GUI.
+    /// `Cacheout --cli clean` re-scans in-process before executing, so a
+    /// checkout moved onto the assessed path between scan and clean is
+    /// answered by the re-scan with exit 1 / `INVALID_ARGUMENTS` ("Unknown
+    /// item id … rescan and retry") and never reaches here. The window R1b
+    /// closes is the one the GUI holds open: a scan session kept alive across
+    /// a user's click.
+    ///
+    /// - Parameter carriedIdentity: the scan-time inode identity of
+    ///   `adminEntry`, or nil for a plan built without one. Every plan
+    ///   `GitWorktreeScanner` emits carries it (the scanner has already
+    ///   resolved that directory through the worktree's back-link);
+    ///   hand-built test plans may not, and there the gate is inert and only
+    ///   the path proof below runs — the pre-r3 behaviour, not a new hole.
     private func reestablishWorktreeIdentity(
-        worktreePath: URL, adminEntry: URL
+        worktreePath: URL, adminEntry: URL,
+        carriedIdentity: FileSystemIdentityProvider.Identity?
     ) -> GateReestablishment {
         let resolver = GitWorktreeGitdirResolver(identity: provider)
         guard let live = resolver.adminDirectory(forWorktreeAt: worktreePath)
@@ -1350,6 +1440,33 @@ struct WorktreeReclaimPerformer {
                     + "removed. Re-scan; whatever is there now is judged on "
                     + "its own merits."
             )
+        }
+        // THE SAME-PATH RE-ADD. Everything above compares SPELLINGS that
+        // survive a remove/add cycle intact; only the inode does not.
+        if let carriedIdentity {
+            guard let liveIdentity = provider.identity(of: live) else {
+                return .refuse(
+                    tag: "worktree-identity-unreadable",
+                    detail: "refused: the admin directory \(live.path) could "
+                        + "not be identified at clean time — the checkout the "
+                        + "scan assessed is not provably the one at "
+                        + "\(worktreePath.path) now; nothing was removed. "
+                        + "Re-scan to see what is actually there."
+                )
+            }
+            guard liveIdentity == carriedIdentity else {
+                return .refuse(
+                    tag: "worktree-identity-recreated",
+                    detail: "refused: \(worktreePath.path) is a DIFFERENT "
+                        + "checkout from the one that was assessed — its admin "
+                        + "directory \(live.path) has the same name but was "
+                        + "re-created since the scan, which is what a "
+                        + "`git worktree remove` followed by a fresh "
+                        + "`git worktree add` at that path does. Nothing was "
+                        + "removed. Re-scan; the checkout there now is judged "
+                        + "on its own merits."
+                )
+            }
         }
         return .proceed
     }

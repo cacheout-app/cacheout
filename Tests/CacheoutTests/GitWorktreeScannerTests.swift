@@ -678,6 +678,47 @@ final class GitWorktreeScannerTests: XCTestCase {
         try assertNonMalformed(outcome, from: scanner)
     }
 
+    /// D3 (PR #460 codex r3): every stale plan the SCANNER emits carries the
+    /// admin directory's scan-time inode, and it is the inode of the entry
+    /// the plan names.
+    ///
+    /// This is what makes the nil arm of `worktreeAdminEntryIdentity`
+    /// unreachable in production. Without it the delete-time gate would be
+    /// silently inert for real users while every hand-built test plan kept
+    /// passing — the exact shape of an unevidenced guard.
+    func testEveryStalePlanCarriesTheAdminEntrysScanTimeIdentity() async throws {
+        let repository = try makeRepositoryIgnoringPayloads(
+            at: dev.appendingPathComponent("repo")
+        )
+        try addWorktree(of: repository, at: dev.appendingPathComponent("wt-a"), branch: "a")
+        try addWorktree(of: repository, at: dev.appendingPathComponent("wt-b"), branch: "b")
+
+        let scanner = makeScanner()
+        let outcome = await scanner.scan(context: ScanContext(trigger: .userInitiated))
+
+        let provider = FileSystemIdentityProvider()
+        var checked = 0
+        for item in outcome.items {
+            let reclaim = try plan(of: item)
+            guard reclaim.mode == .removeStaleWorktree else {
+                XCTAssertNil(
+                    reclaim.worktreeAdminEntryIdentity,
+                    "a prune plan is not about one checkout"
+                )
+                continue
+            }
+            let entry = try XCTUnwrap(reclaim.worktreeAdminEntry)
+            XCTAssertNotNil(reclaim.worktreeAdminEntryIdentity, entry.path)
+            XCTAssertEqual(
+                reclaim.worktreeAdminEntryIdentity, provider.identity(of: entry),
+                "the carried identity must be \(entry.path)'s own"
+            )
+            checked += 1
+        }
+        XCTAssertEqual(checked, 2, "both stale candidates were inspected")
+        try assertNonMalformed(outcome, from: scanner)
+    }
+
     // MARK: - R6: the orphaned-admin tier
 
     func testTwoOrphanedCheckoutsYieldOneMeasuredPruneItemDisclosingBoth()
@@ -826,9 +867,14 @@ final class GitWorktreeScannerTests: XCTestCase {
             orphans.append(orphan)
         }
         // git withholds `prunable` from a locked-and-missing worktree on
-        // 2.50.1, so the LOCKED+PRUNABLE combination is injected. It must be
-        // excluded from the disclosure WITHOUT suppressing the item: git's own
-        // prune skips locked admin directories, so they are not in the set.
+        // 2.50.1, so the LOCKED+PRUNABLE combination is INJECTED — which is
+        // also why the filter is defence in depth rather than a live guard.
+        // It must be excluded from the disclosure WITHOUT suppressing the
+        // item, because the removal set is the mapper's output and a locked
+        // entry is not in it. (The old reason given here — "git's own prune
+        // skips locked admin directories" — is retired: the repository-wide
+        // prune no longer runs at all, so nothing downstream would skip
+        // anything; PR #460 codex r3 / D4.)
         let doctored = Self.porcelain([
             ["worktree \(repository.resolvingSymlinksInPath().path)", "HEAD \(String(repeating: "0", count: 40))", "branch refs/heads/main"],
             ["worktree \(orphans[0].resolvingSymlinksInPath().path)", "HEAD \(String(repeating: "0", count: 40))", "detached", "prunable gitdir file points to non-existent location"],

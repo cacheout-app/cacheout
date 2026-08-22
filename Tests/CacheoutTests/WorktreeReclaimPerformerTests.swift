@@ -134,13 +134,21 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
 
     // MARK: - Plans & items
 
+    /// - Parameter bindAdminIdentity: capture the admin directory's inode,
+    ///   exactly as `GitWorktreeScanner` does (D3 / PR #460 codex r3). Left
+    ///   TRUE by default so every cell exercises the production shape; a cell
+    ///   that wants the pre-r3, path-only R1b passes `false`.
     private func staleplan(
-        worktree: URL, membership: WorktreeMembership
+        worktree: URL, membership: WorktreeMembership,
+        bindAdminIdentity: Bool = true
     ) -> GitWorktreeReclaimPlan {
-        .removeStaleWorktree(
+        let adminEntry = membership.parentAdminContainer
+            .appendingPathComponent(worktree.lastPathComponent)
+        return .removeStaleWorktree(
             worktreePath: worktree,
-            worktreeAdminEntry: membership.parentAdminContainer
-                .appendingPathComponent(worktree.lastPathComponent),
+            worktreeAdminEntry: adminEntry,
+            worktreeAdminEntryIdentity: bindAdminIdentity
+                ? provider.identity(of: adminEntry) : nil,
             parentRepoWorkingDir: membership.parentRepoWorkingDir,
             adminContainer: membership.parentAdminContainer
         )
@@ -569,12 +577,18 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         XCTAssertNil(outcome.errors.first?.message, "the fallback should have run")
         XCTAssertNotNil(outcome.entry)
         // The full delete-time sequence, pinned as a SEQUENCE:
-        //   R0/R1/R2 → remove → status re-check → R0/R1/R2 again →
+        //   R0/R1/R2 → remove → R0/R1/R2 again → status re-check →
         //   oracle recompute → R0 → prune.
         // The re-establishment runs TWICE on purpose: once before the
-        // primary invocation and once inside the fallback, immediately
-        // before the filesystem delete (that second run is what refuses a
-        // lock taken mid-operation).
+        // primary invocation and once inside the fallback (that second run
+        // is what refuses a lock taken mid-operation).
+        //
+        // THE STATUS RE-CHECK IS LAST, and this ordering is asserted here
+        // rather than inferred (PR #460 codex r3 / D1). Through r2 it sat
+        // immediately after `remove`, which left five git subprocesses and
+        // two path re-admissions between "this tree is clean" and the
+        // delete — measured, work saved in that window was destroyed under a
+        // SUCCESS entry.
         //
         // ASSERTED AS ONE WHOLE SEQUENCE, never by subscripting (PR #460
         // codex r2 / D2). The previous shape indexed `bare[5]`,
@@ -594,8 +608,8 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
             + [WorktreeReclaimPerformer.removeArguments(
                 parentRepoWorkingDir: repository, worktreePath: worktree
             )]
-            + [GitWorktreeCleanCheck.arguments(forWorktreeAt: worktree)]
             + expected
+            + [GitWorktreeCleanCheck.arguments(forWorktreeAt: worktree)]
             + [GitWorktreeOracle.listArguments(forRepositoryAt: repository)]
             + [WorktreeReclaimPerformer.commonGitDirArguments(
                 parentRepoWorkingDir: repository
@@ -650,6 +664,87 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         // consulted, and the registry reads clean through git.
         XCTAssertNil(runner.argvs.first { $0.contains("prune") }, "\(runner.argvs)")
         assertNoForbiddenArgv(runner)
+    }
+
+    // MARK: - D1: the clean re-check is the LAST gate (PR #460 codex r3)
+
+    /// Work saved WHILE the delete-time gates are running survives, in BOTH
+    /// disposal arms.
+    ///
+    /// The write is injected on the SECOND `rev-parse --git-common-dir` — R0's
+    /// argv, and the first invocation of the FALLBACK's gate re-establishment
+    /// (the first `--git-common-dir` belongs to the primary arm's, which runs
+    /// before `worktree remove`). Under the r1/r2 order — clean re-check,
+    /// then R0/R1/R1b/R2, then the delete — that instant is AFTER the
+    /// re-check, and the file was destroyed while the performer returned a
+    /// SUCCESS entry with `errors == []` and `warning == nil`. Five git
+    /// subprocesses and two path re-admissions sat in that window.
+    ///
+    /// MUTATION EVIDENCE (PR #460 codex r3): move the
+    /// `GitWorktreeCleanCheck.run` switch back above `reestablishStaleGates`
+    /// in `fallbackAfterRefusal` and this cell goes RED on its first
+    /// assertion — the saved file is gone and `outcome.entry` is non-nil.
+    func testWorkSavedWhileTheDeleteTimeGatesRunSurvivesInBothArms()
+        async throws
+    {
+        for (index, moveToTrash) in [false, true].enumerated() {
+            let repository = try makeRepository(named: "repo-\(index)")
+            let worktree = try addWorktree(
+                named: "wt-\(index)", branch: "feature-\(index)", in: repository
+            )
+            let plan = staleplan(
+                worktree: worktree,
+                membership: try membership(of: worktree, in: repository)
+            )
+            let saved = worktree.appendingPathComponent("saved-work.txt")
+            let payload = Data("work saved after the click".utf8)
+            let commonDirCalls = InvocationCounter()
+
+            let runner = InterceptingGitRunner(wrapping: realRunner()) { arguments, _ in
+                if arguments.contains("remove") {
+                    return .failure(exitCode: 128, stderr: "injected refusal")
+                }
+                if arguments.contains("--git-common-dir"),
+                   commonDirCalls.bump() == 2 {
+                    try? payload.write(to: saved)
+                }
+                return nil
+            }
+
+            let outcome = await perform(
+                item(plan), plan: plan,
+                with: makePerformer(runner: runner, moveToTrash: moveToTrash)
+            )
+
+            XCTAssertTrue(
+                fm.fileExists(atPath: saved.path),
+                "moveToTrash=\(moveToTrash): the saved work was DESTROYED — "
+                    + "the clean re-check is not the last gate"
+            )
+            XCTAssertEqual(try Data(contentsOf: saved), payload,
+                           "moveToTrash=\(moveToTrash)")
+            XCTAssertTrue(fm.fileExists(atPath: worktree.path),
+                          "moveToTrash=\(moveToTrash)")
+            XCTAssertNil(outcome.entry,
+                         "moveToTrash=\(moveToTrash): nothing was freed")
+            XCTAssertEqual(outcome.errors.count, 1, "\(outcome.errors)")
+            let message = try XCTUnwrapElement(outcome.errors, 0).message
+            XCTAssertTrue(message.contains("DIRTY"), message)
+
+            // The tree is still registered: nothing touched the registry.
+            XCTAssertEqual(try porcelainRecordCount(of: repository), 2)
+            XCTAssertTrue(try branchExists("feature-\(index)", in: repository))
+
+            // THE ORDERING, asserted directly: the clean re-check is the LAST
+            // git invocation the fallback makes. Under the old order it was
+            // the first one after the refusal, with five more behind it.
+            XCTAssertEqual(
+                bareArgvs(runner).last ?? [],
+                GitWorktreeCleanCheck.arguments(forWorktreeAt: worktree),
+                "moveToTrash=\(moveToTrash): \(bareArgvs(runner))"
+            )
+            assertNoForbiddenArgv(runner)
+        }
     }
 
     func testFallbackEntryIsTrashOnlyWhenTheTrashHandlerActuallySucceeded()
@@ -902,9 +997,12 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         async throws
     {
         // D3 (PR #460 codex r2): the R0 re-check inside
-        // `gatedPostFallbackPrune` was the ONE unevidenced arm of the three.
-        // MEASURED before this cell existed: removing it left the FULL suite
-        // green at 1450/2/0, exit 0.
+        // `gatedPostFallbackPrune` was the ONE unevidenced arm of the three —
+        // deleting it left the whole suite green, which is why this cell
+        // exists. (r2 recorded a suite count for that run that matches no
+        // state of this branch; it is deleted rather than corrected — the
+        // proposition it supported is moot now that the arm is
+        // mutation-evidenced by this cell.)
         //
         // It is not a duplicate of its two siblings. This is the arm where
         // the RECOMPUTE has already asked `-C <parent>` which entries are
@@ -2222,25 +2320,30 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         XCTAssertTrue(fm.fileExists(atPath: worktree.path))
     }
 
-    func testTheSamePathReAddIsTheMeasuredResidualOfTheAdminEntryBinding()
+    func testASamePathReAddIsRefusedBecauseTheAdminDirectoryWasRecreated()
         async throws
     {
-        // RESIDUAL, RECORDED AND MEASURED (PR #460 codex r2 / D1).
+        // D3, CLOSED (PR #460 codex r3). Through r2 this was a recorded
+        // residual and this cell asserted the DESTRUCTION.
         //
-        // R1b binds the re-read record to the plan's carried
-        // `worktreeAdminEntry`, which is a PATH. `git worktree remove` frees
-        // the name `worktrees/<basename>`, and a later `git worktree add` at
-        // the SAME path takes that name back — so the carried spelling
-        // resolves again, to a DIFFERENT directory, and a path binding
-        // cannot tell them apart. This cell measures the mechanism (same
-        // path, different inode) rather than reasoning about it, and then
-        // states the consequence plainly.
+        // The mechanism, measured rather than reasoned about below:
+        // `git worktree remove` frees the name `worktrees/<basename>`, and a
+        // later `git worktree add` at the SAME path takes that name back —
+        // so the plan's carried `worktreeAdminEntry` SPELLING resolves again,
+        // to a different directory. Every path-level proof in R1b passes. The
+        // plan now also carries that directory's scan-time INODE, which the
+        // re-creation cannot reproduce.
         //
-        // Closing it needs a scan-time IDENTITY carried in
-        // `GitWorktreeReclaimPlan` — fn-6's shape — which is a schema change
-        // this round did not take. WHEN IT IS TAKEN, THIS CELL GOES RED, and
-        // that is the point: the residual note in
-        // `reestablishWorktreeIdentity` must be retired with it.
+        // The stakes are why this shape matters most: the replacement is a
+        // brand-new checkout whose untracked work is invisible to the clean
+        // gate whenever a committed `.gitignore` covers it, so `status
+        // --porcelain` reports nothing and every gate but this one agrees the
+        // tree is disposable.
+        //
+        // MUTATION EVIDENCE: drop the `liveIdentity == carriedIdentity`
+        // guard from `reestablishWorktreeIdentity` (or pass
+        // `bindAdminIdentity: false` here) and this cell goes RED — the
+        // ignored file and the whole new checkout are gone.
         let repository = try makeRepository(named: "repo")
         let assessed = try addWorktree(named: "wt", branch: "feature", in: repository)
         // A second worktree keeps the admin CONTAINER alive across the
@@ -2251,11 +2354,22 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
             membership: try membership(of: assessed, in: repository)
         )
         let carriedAdmin = try XCTUnwrap(plan.worktreeAdminEntry)
-        let inodeBefore = try XCTUnwrap(provider.identity(of: carriedAdmin))
+        let inodeBefore = try XCTUnwrap(plan.worktreeAdminEntryIdentity)
+        XCTAssertEqual(inodeBefore, provider.identity(of: carriedAdmin),
+                       "the plan carries the SCAN-TIME identity")
 
         try git(["-C", repository.path, "worktree", "remove", assessed.path])
         try git(["-C", repository.path, "worktree", "add", assessed.path,
                  "-b", "brand-new"])
+        // Work that the clean gate cannot see: ignored by a COMMITTED
+        // `.gitignore`, so `status --porcelain` stays empty.
+        let ignoreFile = assessed.appendingPathComponent(".gitignore")
+        try "secret.env\n".write(to: ignoreFile, atomically: true, encoding: .utf8)
+        try git(["-C", assessed.path, "add", ".gitignore"])
+        try git(["-C", assessed.path, "-c", "user.name=t", "-c", "user.email=t@t",
+                 "commit", "-m", "ignore"])
+        let secret = assessed.appendingPathComponent("secret.env")
+        try "TOKEN=live\n".write(to: secret, atomically: true, encoding: .utf8)
 
         // (a) THE MECHANISM: git reused the name, so the carried spelling is
         //     live again — pointing at a different directory.
@@ -2267,15 +2381,19 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
             "…while the directory itself is a new object"
         )
 
-        // (b) THE CONSEQUENCE, stated rather than discovered: R1b passes and
-        //     the brand-new checkout is removed.
+        // (b) THE CONSEQUENCE: refused, and the new checkout is untouched.
+        let runner = InterceptingGitRunner(wrapping: realRunner())
         let outcome = await perform(
-            item(plan), plan: plan,
-            with: makePerformer(runner: InterceptingGitRunner(wrapping: realRunner()))
+            item(plan), plan: plan, with: makePerformer(runner: runner)
         )
-        XCTAssertTrue(outcome.errors.isEmpty, "\(outcome.errors.map(\.message))")
-        XCTAssertNotNil(outcome.entry)
-        XCTAssertFalse(fm.fileExists(atPath: assessed.path))
+        XCTAssertNil(outcome.entry, "nothing may be reported as freed")
+        let message = try XCTUnwrapElement(outcome.errors, 0).message
+        XCTAssertTrue(message.contains("DIFFERENT checkout"), message)
+        XCTAssertTrue(message.contains("re-created since the scan"), message)
+        XCTAssertTrue(fm.fileExists(atPath: assessed.path))
+        XCTAssertEqual(try String(contentsOf: secret, encoding: .utf8),
+                       "TOKEN=live\n", "the ignored work survives")
+        XCTAssertNil(runner.argvs.first { $0.contains("remove") }, "\(runner.argvs)")
     }
 
     // MARK: The D13 guard sites the oracle listing needs (codex r2 / D4)

@@ -1908,7 +1908,14 @@ private struct TriggerGatedFixtureScanner: SpaceScanner {
     }
 }
 
-/// A thread-safe invocation counter for the gated fixture scanner.
+/// A thread-safe invocation counter shared by the fixture doubles.
+///
+/// `bump()` returns the NEW value so a caller can act on "the Nth time" in
+/// ONE atomic step — reading `count` after a separate `bump()` is two
+/// operations and can interleave. `WorktreeReclaimPerformerTests` uses that
+/// to fire on the fallback's `rev-parse --git-common-dir`, which is the
+/// SECOND one the performer runs (the primary arm's gate re-establishment
+/// fires the first, before `worktree remove`).
 final class InvocationCounter: @unchecked Sendable {
     private let lock = NSLock()
     private var value = 0
@@ -1916,9 +1923,11 @@ final class InvocationCounter: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         return value
     }
-    func bump() {
+    @discardableResult
+    func bump() -> Int {
         lock.lock(); defer { lock.unlock() }
         value += 1
+        return value
     }
 }
 

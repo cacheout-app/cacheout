@@ -46,13 +46,21 @@ below are both part of that coordination, and the latter BLOCKS this release.
   still linked, still unlocked and still merged. Anything that changed since
   the scan refuses, names the action that clears it ("run
   `git worktree unlock …`", "merge, rebase or push that commit"), and deletes
-  nothing. Only then is the tree re-checked for cleanliness and deleted
-  directly, followed by a narrowly gated removal of that worktree's own admin
-  entry. The re-establishment also proves WHICH worktree it is about: the
-  checkout at the assessed path must still back-link to the same admin
-  directory the scan resolved, so a worktree you retired and replaced at that
-  path — by `git worktree move` or a fresh `add` under another name — is
-  refused instead of removed. The repository-level item removes exactly the
+  nothing. If git itself refuses the removal, the direct delete runs those
+  same gates first and re-checks the tree for cleanliness LAST, immediately
+  before deleting — so work you save while the checks are running is found,
+  not destroyed — followed by a narrowly gated removal of that worktree's own
+  admin entry. A tree that went dirty in that window is refused; commit,
+  stash or stop writing, re-scan, and it is offered again. The
+  re-establishment also proves WHICH worktree it is about, by identity and
+  not by path: the checkout at the assessed path must still back-link to the
+  admin directory the scan resolved AND that directory must be the same
+  object the scan saw. So a checkout you moved onto that path, and equally
+  one you removed and re-created there, is refused rather than removed — the
+  replacement is judged on its own merits by the next scan. (This window is
+  the desktop app's: `--cli clean` re-scans before it executes, so a
+  replacement there is answered by the re-scan with "unknown item id —
+  rescan and retry".) The repository-level item removes exactly the
   admin directories it
   disclosed, one at a time — no repository-wide `git worktree prune` runs,
   because git recomputes that command's set for itself after every check has

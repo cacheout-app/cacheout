@@ -340,6 +340,9 @@ final class GitWorktreeReclaimActionTests: XCTestCase {
             "mode": "Mode",
             "worktreePath": "Optional<URL>",
             "worktreeAdminEntry": "Optional<URL>",
+            // D3 (PR #460 codex r3): the admin entry's SCAN-TIME inode.
+            // Structured like every other field — an identity, not a string.
+            "worktreeAdminEntryIdentity": "Optional<Identity>",
             "parentRepoWorkingDir": "URL",
             "parentAdminContainer": "URL",
             "disclosedAdminDirectories": "Array<URL>",

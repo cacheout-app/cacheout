@@ -81,11 +81,28 @@
 ///
 /// ## Deletion modes
 ///
-/// - **Permanent delete** (`moveToTrash: false`): `FileManager.removeItem()`
-///   offloaded to a background queue. Contents of category roots are removed
-///   individually (the root itself survives so tools/apps can recreate it).
-/// - **Move to Trash** (`moveToTrash: true`): the injectable `@MainActor`
-///   trash seam (production: `FileManager.trashItem`, which talks to Finder).
+/// - **Permanent delete** (`moveToTrash: false`): `DepthSafeRemoval` —
+///   descriptor-relative, no-follow, mount-respecting — offloaded to a
+///   background queue. NOT `FileManager.removeItem()`, which composes an
+///   absolute path per entry and therefore refuses, forever and with a
+///   misattributed message, exactly the trees past `PATH_MAX` that the
+///   descriptor-relative probe can now inspect and pronounce clean. Contents
+///   of category roots are removed individually (the root itself survives so
+///   tools/apps can recreate it).
+/// - **Move to Trash** (`moveToTrash: true` — the GUI's DEFAULT, see
+///   `CacheoutViewModel.moveToTrash`, so this is the arm most deletions take):
+///   the injectable `@MainActor` trash seam (production:
+///   `FileManager.trashItem`, which talks to Finder), reached ONLY through
+///   `TrashDisposal`. `trashItem` takes a URL and resolves it inside itself,
+///   so no binding can ride into the call; what rides in is a proof on either
+///   side of it, and a disposal that cannot be proved is PUT BACK and reported
+///   as a refusal — no entry, no bytes. WHICH fact the leaf is bound to
+///   depends on what the item has (a scanner's `PreDeleteRevalidator` verdict,
+///   or the object that stood at the name inside the admitted container), but
+///   every disposal is bound to one of them and nothing here hands the seam a
+///   bare URL. For three review rounds the two arms with no leaf verdict did
+///   exactly that — all of contents mode plus every `.unestablished` item —
+///   and this section described the arm as though they did not exist.
 ///   A trash failure is a per-child error — it never falls through to a
 ///   permanent delete.
 ///
@@ -237,7 +254,13 @@ actor CacheCleaner {
     /// Injectable Trash seam. Production moves the URL to the Trash via
     /// Finder; tests record or redirect so nothing outside a fixture root is
     /// ever trashed. `@MainActor` because `trashItem` talks to Finder.
-    typealias TrashHandler = @Sendable @MainActor (URL) throws -> Void
+    ///
+    /// IT RETURNS WHERE THE ITEM LANDED, and that is not bookkeeping: the
+    /// disposal takes a URL and resolves it itself, so the ONLY way to ask
+    /// what it actually took is to look at what it produced (see
+    /// `TrashDisposal`). `nil` means the disposal would not say — which is
+    /// treated as unprovable, never as success.
+    typealias TrashHandler = @Sendable @MainActor (URL) throws -> URL?
 
     private let fileManager = FileManager.default
     private let home: URL
@@ -329,7 +352,9 @@ actor CacheCleaner {
         self.gitRunner = gitRunner
         self.gitTimeout = gitTimeout
         self.trashHandler = trashHandler ?? { url in
-            try FileManager.default.trashItem(at: url, resultingItemURL: nil)
+            var landed: NSURL?
+            try FileManager.default.trashItem(at: url, resultingItemURL: &landed)
+            return landed as URL?
         }
     }
 
@@ -730,14 +755,30 @@ actor CacheCleaner {
     /// its declaration) is refused outright. The cleaner never inspects
     /// scanner-specific fields to decide whether revalidation was expected —
     /// the marker subsumes all of that.
+    ///
+    /// `.proceed` carries the OBJECT BINDING the inspection established (PR
+    /// #458 review r7), which the disposal proves the path still names. It is
+    /// `.unestablished` — "nothing to bind to" — in exactly three cases, all
+    /// of which are the seam's absence rather than a skipped guard: the item's
+    /// scanner registered no revalidator; the revalidator declined
+    /// applicability; or the revalidator has no object binding to offer.
+    ///
     /// `nonisolated` (fn-5.4): it reads only immutable `let` state
     /// (`preDeleteRevalidators`) and runs a pure, synchronous scanner-declared
     /// closure, so the composite performer can call it as a plain function
     /// from its own execution context instead of forcing a hop back onto the
     /// actor mid-deletion.
-    nonisolated private func preDeleteRefusal(
+    private enum PreDeleteOutcome {
+        case proceed(inspected: PreDeleteInspectedObject)
+        case refuse(
+            reason: String, tag: String,
+            payload: CleanupReport.ItemError.Refusal?
+        )
+    }
+
+    nonisolated private func preDeleteOutcome(
         for item: ReclaimableItem, authorization: String?
-    ) -> PreDeleteSeamRefusal? {
+    ) -> PreDeleteOutcome {
         // DEFENSE IN DEPTH: check (1b) already refused this shape before any
         // state skip could hide it; re-checking here keeps the destructive
         // chokepoint independently fail-closed for any future caller,
@@ -747,19 +788,30 @@ actor CacheCleaner {
         ) {
             // No revalidator ran, so there is no probe and no typed payload —
             // an unrevalidatable item discloses nothing at delete time.
-            return PreDeleteSeamRefusal(
+            return .refuse(
                 reason: refusal, tag: "revalidator-unavailable", payload: nil
             )
         }
+        // NO INSPECTION RAN, AND THIS CALL SITE SAYS SO. Two disjoint
+        // populations arrive at `.unestablished` here: items from a scanner
+        // that declares no revalidator at all, and items a declared
+        // revalidator does not consider applicable (a sweep entry whose
+        // classifier declined the clean promise, which reaches a deletion
+        // ONLY through conscious per-item confirmation against DISPLAYED
+        // caution evidence). Neither has an inspection verdict to bind a
+        // disposal to, so neither gets one — the guards they rest on are the
+        // container admission, the containment chain, the deny list and the
+        // mount doctrine. This is not a way to skip the binding; it is the
+        // absence of anything to bind to.
         guard let revalidator = preDeleteRevalidators[item.scannerID]
-        else { return nil }
+        else { return .proceed(inspected: .unestablished) }
         guard item.requiresPreDeleteRevalidation
             || revalidator.requiresRevalidation(item: item)
-        else { return nil }
+        else { return .proceed(inspected: .unestablished) }
 
         switch revalidator.revalidate(item: item, authorization: authorization) {
-        case .allow:
-            return nil
+        case .allow(let inspected):
+            return .proceed(inspected: inspected)
         case .refuse(let reason, let valuables, let token):
             // The TYPED payload travels with the refusal (fn-4.9): the report's
             // `ItemError` carries it verbatim so `confirmedCleanPayload`
@@ -774,12 +826,55 @@ actor CacheCleaner {
             // content is not what the deletion decision rests on — it
             // changed since the scan, could not be re-inspected, or was
             // never authorized on the content present NOW.
-            return PreDeleteSeamRefusal(
+            return .refuse(
                 reason: reason, tag: "content-drift",
                 payload: CleanupReport.ItemError.Refusal(
                     valuables: valuables, acknowledgementToken: token
                 )
             )
+        }
+    }
+
+    /// The composite performer's REFUSAL-ONLY view of the seam (fn-5.4 shape,
+    /// re-expressed over fn-6's `PreDeleteOutcome`). `nil` means "the seam
+    /// raised no objection"; the performer's own gates still apply.
+    ///
+    /// WHY DISCARDING `inspected` IS FAITHFUL HERE, AND WHERE THAT STOPS BEING
+    /// TRUE. The binding exists so a disposal can prove the inode it destroys
+    /// against the object a probe inspected. `git_worktrees` registers NO
+    /// `preDeleteRevalidator` (GitWorktreeScanner.swift, the
+    /// `SpaceScanner` conformance extension) and no worktree item sets
+    /// `requiresPreDeleteRevalidation`, so this seam returns
+    /// `.proceed(inspected: .unestablished)` for every item that reaches the
+    /// performer — there is no binding to carry and none is dropped.
+    ///
+    /// The `.proceed(inspected:)` arm is therefore matched EXPLICITLY rather
+    /// than with a wildcard: if a revalidator is ever registered for this
+    /// scanner, an established binding would start arriving here and this
+    /// adapter would silently drop it. `assertionFailure` makes that a loud
+    /// debug-build failure at the moment it becomes possible, instead of a
+    /// quiet loss of the identity proof; release builds still fall through to
+    /// the performer's own re-checks (the clean re-check, the oracle
+    /// recompute, the D13 traversal guard).
+    nonisolated private func preDeleteRefusal(
+        for item: ReclaimableItem, authorization: String?
+    ) -> PreDeleteSeamRefusal? {
+        switch preDeleteOutcome(for: item, authorization: authorization) {
+        case .refuse(let reason, let tag, let payload):
+            return PreDeleteSeamRefusal(
+                reason: reason, tag: tag, payload: payload
+            )
+        case .proceed(.unestablished):
+            return nil
+        case .proceed(let inspected):
+            assertionFailure(
+                "the composite performer's seam adapter cannot carry an "
+                + "established pre-delete object binding (\(inspected)) into "
+                + "the deletion; a revalidator was registered for "
+                + "'\(item.scannerID)' without teaching "
+                + "WorktreeReclaimPerformer to prove it"
+            )
+            return nil
         }
     }
 
@@ -931,6 +1026,27 @@ actor CacheCleaner {
                 continue
             }
 
+            // WHICH FOLDER ARE THESE CHILDREN CHILDREN OF (PR #458 review —
+            // the P1). Every child deleted below is opened by the removal
+            // through THIS directory's path, on the far side of a queue hop,
+            // and contents mode has no leaf binding at all (no probe runs
+            // here), so a `rename(2)` pair at that seam pointed the whole
+            // per-child loop into a stranger's directory with SUCCESS
+            // reported. The identity is read from a descriptor ONCE per root
+            // — before the enumeration, so the names the loop works from and
+            // the folder they are unlinked out of are the same folder.
+            let admittedParent: DepthSafeRemoval.AdmittedParent
+            do {
+                admittedParent = try DepthSafeRemoval.admittedParent(
+                    directory: admitted.requestedURL,
+                    displayPath: admitted.requestedURL.path,
+                    provider: provider
+                )
+            } catch {
+                errors.append(Self.itemError(item, error.localizedDescription))
+                continue
+            }
+
             // Enumerate children under the UNRESOLVED spelling — deletion
             // must remove exactly what sits at the requested location, and a
             // symlink child must be removed AS a link (R4). Containment
@@ -947,7 +1063,8 @@ actor CacheCleaner {
 
             for child in children {
                 switch await deleteGuardedChild(
-                    child, of: admitted, registry: registry,
+                    child, of: admitted, containedIn: admittedParent,
+                    registry: registry,
                     moveToTrash: moveToTrash, label: item.displayName
                 ) {
                 case .accepted(let components):
@@ -988,6 +1105,7 @@ actor CacheCleaner {
     /// failure is returned, never thrown.
     private func deleteGuardedChild(
         _ child: URL, of root: AdmittedRoot,
+        containedIn admittedParent: DepthSafeRemoval.AdmittedParent,
         registry: InodeAccountingRegistry,
         moveToTrash: Bool, label: String
     ) async -> ChildOutcome {
@@ -1044,16 +1162,62 @@ actor CacheCleaner {
             if moveToTrash {
                 // A trash failure is a child error — it never falls through
                 // to a permanent delete (R11).
-                try await trash(child)
+                //
+                // NO INSPECTION VERDICT TO BIND TO, WHICH IS WHY THE
+                // CONTAINER BINDING IS NOT OPTIONAL HERE EITHER (PR #458
+                // review — the P1 the permanent-arm rounds left open). The
+                // note that stood here justified handing a BARE URL to the
+                // mover with a fact about the LEAF: contents mode runs no
+                // user-data probe, so there is no inspected object. True, and
+                // beside the point — the very next branch was already
+                // carrying `admittedParent` for exactly this absence, and
+                // this branch ignored it. Measured with two real `rename(2)`s
+                // at the seam: the stranger's identically-named child went to
+                // the Trash and its bytes were reported as freed.
+                //
+                // So this arm binds what it HAS. `TrashDisposal` proves the
+                // container, binds the child under that descriptor, and
+                // proves what the disposal actually took on the far side of
+                // a call it cannot be given a descriptor for.
+                try await TrashDisposal.dispose(
+                    child, containedIn: admittedParent, provider: provider,
+                    via: { try await self.trash($0) }
+                )
             } else {
+                // NO INSPECTION VERDICT TO BIND TO, and the call site says
+                // so. Contents mode runs no user-data probe (only the
+                // orphaned-caches sweep carries a clean promise), so there
+                // is no inspected object here — which is precisely why the
+                // CONTAINER binding below is not optional for this arm: with
+                // `expecting: nil` there is nothing else that can notice the
+                // folder these children were enumerated from being swapped.
                 try await Self.removeItemConcurrently(
-                    at: child, fileManager: fileManager
+                    at: child, expecting: nil, provider: provider,
+                    containedIn: admittedParent
                 )
             }
         } catch {
             if error is PathGuardError {
                 logRefusal(
                     label: label, tag: Self.refusalTag(error),
+                    detail: "\(child.path): \(error.localizedDescription)"
+                )
+            } else if let failure = error as? DepthSafeRemoval.Failure,
+                      failure.cause == .notTheAdmittedContainer {
+                // The category root these children were enumerated from was
+                // replaced under the loop. Same tag item mode uses for the
+                // same event, so the cleanup log has ONE word for it.
+                logRefusal(
+                    label: label, tag: "container-drift",
+                    detail: "\(child.path): \(error.localizedDescription)"
+                )
+            } else if error is TrashDisposal.Failure {
+                // The swap landed inside `trashItem`'s own resolution, so it
+                // was caught AFTER the move and undone. Same event as the one
+                // above, one disposal over — and the same tag item mode uses
+                // for it.
+                logRefusal(
+                    label: label, tag: "content-drift",
                     detail: "\(child.path): \(error.localizedDescription)"
                 )
             }
@@ -1067,6 +1231,85 @@ actor CacheCleaner {
     }
 
     // MARK: - Item mode (.removeItem, R15)
+
+    /// Does `target` STILL name the object the pre-delete probe inspected?
+    ///
+    /// One no-follow `lstat`, asked as late as the path-based deletion API
+    /// allows. It can only REFUSE — never widen admission — and it is
+    /// deliberately asked of the UNRESOLVED target spelling, which is the
+    /// one `removeItem` will act on.
+    ///
+    /// LAYER TWO, AND SAID SO IN SOURCE (PR #458 review — the P1).
+    ///
+    /// The note that used to stand here called the window between this
+    /// `lstat` and the deletion syscall "irreducible for as long as the
+    /// deletion takes a path". BOTH HALVES WERE WRONG. The window was
+    /// measured through the production cleaner — from this `lstat` to the
+    /// deletion's first question about a descriptor, an under-estimate —
+    /// at 0.095 / 0.097 / 0.126 ms over three runs, because
+    /// `removeItemConcurrently` hops to `DispatchQueue.global` inside it:
+    /// not a syscall's width but an eternity for a `rename(2)` + `mkdir(2)`
+    /// loop. And the deletion had already stopped taking a path. It HOLDS A
+    /// DESCRIPTOR and simply never asked it who it was. It does now
+    /// (`DepthSafeRemoval.proveInspectedRoot`), so the load-bearing proof is
+    /// there, on the opened inode, past every window this method has.
+    ///
+    /// WHY THIS CHECK STAYS ANYWAY, honestly labelled: it is the arm that
+    /// refuses on an UNREADABLE target (`.failed`), where the removal would
+    /// only produce a raw errno; it refuses before the sweep spends a queue
+    /// hop; and it produces the sentence users act on. It is NOT what makes
+    /// the swap case safe. Its partner carries that, and the partner's
+    /// failing test is
+    /// `testTargetReplacedAfterTheFinalPathCheckIsRefused` — the fixture
+    /// that wins the race against this very `lstat`. Deleting this method's
+    /// body leaves that test GREEN; deleting the descriptor proof does not.
+    /// (Same disclosure discipline as the entry-budget guard in
+    /// `OrphanedCachesScanner.boundedUserDataShapeWalk`.)
+    private func probedObjectStillAtTarget(
+        _ inspected: UserDataProbeResult.InspectedRoot, target: URL
+    ) -> Bool {
+        switch inspected {
+        case .directory(let identity):
+            return provider.identity(of: target) == identity
+        case .nonDirectoryLeaf(let identity):
+            // Same comparison as the `.directory` arm — `identity(of:)` is
+            // an `lstat`, so a symlink compares as the LINK — and, like the
+            // whole method, this is the cheap early refusal, NOT the proof:
+            // the load-bearing bindings are the removal's `fstatat` under
+            // the proved parent and `TrashDisposal`'s two-sided leaf
+            // binding. `nil` (absent/unreadable) is not a match; the
+            // disposal's own arms produce the item-keyed error.
+            return provider.identity(of: target) == identity
+        case .noDirectoryTree:
+            // The clean verdict rested on there being no directory TREE of
+            // ours at that name (absent, symlink, regular file, special) —
+            // deletion removes the leaf as-is. A directory standing there
+            // now is a tree the probe never opened.
+            //
+            // `probeKind`, NOT `kind` (PR #458 review r8). `kind(of:)`
+            // collapses "absent" and "`lstat` failed" onto `nil`, so
+            // `kind(of:) != .directory` was TRUE for an EACCES or EIO
+            // `lstat` — this arm ADMITTED the deletion on a target it could
+            // not read, while the `.directory` arm below fails closed on
+            // exactly the same nil. Same site, opposite directions.
+            switch provider.probeKind(of: target) {
+            case .absent:
+                // Still nothing there: the verdict holds precisely.
+                return true
+            case .kind(let kind):
+                return kind != .directory
+            case .failed:
+                // We cannot tell what is standing there. Unverifiable ⇒
+                // refuse — and CLEARABLE: a re-scan of a readable target
+                // proceeds normally.
+                return false
+            }
+        case .unestablished:
+            // No verdict to bind to. Unreachable — an incomplete probe has
+            // already refused above — so fail closed rather than assume.
+            return false
+        }
+    }
 
     /// One `.removeItem` deletion. `origin` is the item's CLAIMED container
     /// — validated by `admitContainer` against the CONSTRUCTOR-injected
@@ -1130,8 +1373,9 @@ actor CacheCleaner {
             return (nil, [Self.itemError(item, detail)])
         }
 
-        // DELETE-TIME REVALIDATION SEAM (fn-4.8, R17/D8 — the generalization
-        // the previous hard-coded orphaned-caches gate here promised).
+        // DELETE-TIME REVALIDATION SEAM (fn-4.8, R17/D8 — #457's
+        // generalization of the hard-coded orphaned-caches gate that stood
+        // here — carrying #458's OBJECT BINDING through it).
         //
         // Why anything runs here at all: the snapshot admission above binds
         // the CONTAINER's identity, not the target's CONTENTS — a sweep
@@ -1148,35 +1392,149 @@ actor CacheCleaner {
         // never widen admission. An item of a scanner with no revalidator,
         // unmarked and deemed inapplicable, behaves exactly as it did
         // before this seam existed.
-        if let refusal = preDeleteRefusal(
-            for: item, authorization: authorization
-        ) {
-            logRefusal(label: item.displayName, tag: refusal.tag,
-                       detail: refusal.reason)
-            return (nil, [Self.itemError(
-                item, refusal.reason, refusal: refusal.payload
-            )])
+        //
+        // WHAT THE PROBE'S VERDICT IS ABOUT, CARRIED TO THE DISPOSAL ITSELF
+        // (PR #458 review r7). The verdict is a fact about an OBJECT — the
+        // probe held a descriptor — while every gate above is a fact about a
+        // PATH that a replacement at the same name satisfies. So the object
+        // travels out of the seam and into the deletion, where it is proved
+        // against the inode the removal opens.
+        //
+        // `let`, WITH BOTH ARMS WRITTEN OUT (PR #458 review — the doc claim
+        // that was false). `remove(at:expecting:)` documents `nil` as
+        // something a call site STATES; contents mode states it with a
+        // literal and a paragraph, while this call site used to let an
+        // implicitly-nil `var` fall through the `if` and reach the deletion
+        // having said nothing at all. A default is exactly what the parameter
+        // must not have, so item mode says its `nil` too — here, by mapping
+        // the seam's `.unestablished` ("nothing to bind to", see
+        // `preDeleteOutcome`) onto it.
+        let probedObject: UserDataProbeResult.InspectedRoot?
+        switch preDeleteOutcome(for: item, authorization: authorization) {
+        case .refuse(let reason, let tag, let payload):
+            logRefusal(label: item.displayName, tag: tag, detail: reason)
+            return (nil, [Self.itemError(item, reason, refusal: payload)])
+        case .proceed(let inspected):
+            probedObject = inspected == .unestablished ? nil : inspected
         }
 
         let token = await registry.registerObservations(report.claims)
 
         do {
+            // WHICH FOLDER HOLDS THIS ITEM — READ FROM A DESCRIPTOR, HERE,
+            // ON THIS SIDE OF THE QUEUE HOP (PR #458 review — the P1).
+            //
+            // The deletion resolves exactly one path, the target's parent,
+            // and it resolves it after `removeItemConcurrently` hops to a
+            // background queue — measured at 0.095 / 0.097 / 0.126 ms, which
+            // is an eternity for a `rename(2)` + `mkdir(2)` pair. Nothing
+            // else here binds that folder: `admitContainer` binds the
+            // CONTAINER ROOT to the session snapshot, and a target is a
+            // strict DESCENDANT of it, so for the ordinary
+            // `<dev-root>/proj/node_modules` shape the directory the deletion
+            // actually opens (`proj`) is bound by nothing at all.
+            //
+            // Taken FIRST, before the rechecks below, because everything
+            // after the capture is what the binding covers; taken last it
+            // would cover only the hop. It fails closed and costs nothing to
+            // do so — the removal performs the identical open a moment later,
+            // so an open that fails here would have failed there.
+            let admittedParent = try DepthSafeRemoval.admittedParent(
+                directory: target.deletingLastPathComponent(),
+                displayPath: target.path, provider: provider
+            )
             // TOCTOU narrowing, immediately pre-delete: the SAME no-follow
             // + snapshot-identity admission re-runs (a container swapped
             // between the checks above and here is refused), then the
             // containment chain re-validates.
             let recheck = try pathGuard.admitContainer(origin, snapshot: snapshot)
             try pathGuard.validateRemovableItem(target, inside: recheck)
+            // THE PROBE'S BINDING, FIRST PASS — A PATH CHECK, WHICH IS NOT
+            // THE PROOF (PR #458 review — the P1).
+            //
+            // The comment that stood here claimed "detecting the swap and
+            // then deleting by path anyway is structurally impossible". It
+            // was false: the deletion carried on by path, this check was the
+            // last thing between the sweep and a replacement directory, and
+            // a fixture that wins the race against this one `lstat` deleted
+            // a `Photos Library.photoslibrary` the app never opened while
+            // reporting SUCCESS and the OTHER tree's byte count.
+            //
+            // What is true: the probe holds a DESCRIPTOR, so its verdict is
+            // a fact about an OBJECT, while every check above — container
+            // admission, containment, deny list, mount — is a fact about a
+            // PATH that a replacement at the same name satisfies. Which is
+            // why the verdict now travels INTO the deletion
+            // (`expecting:` below) and is proved there against the inode it
+            // opens. This check is the earlier, cheaper, better-worded
+            // refusal; it is not the one that closes the window.
+            if let probedObject,
+               !probedObjectStillAtTarget(probedObject, target: target) {
+                let detail = "\(target.path): the folder at this path is no "
+                    + "longer the one that was inspected — it was replaced "
+                    + "between the safety check and the deletion; refused, "
+                    + "re-scan required"
+                logRefusal(label: item.displayName, tag: "content-drift",
+                           detail: detail)
+                return (nil, [Self.itemError(item, detail)])
+            }
             if moveToTrash {
                 // A trash failure is an item error — it never falls through
                 // to a permanent delete (R11).
-                try await trash(target)
+                //
+                // AND THE VERDICT GOES HERE TOO (PR #458 review — the P1's
+                // other half). This is the GUI's DEFAULT disposal
+                // (`CacheoutViewModel.moveToTrash = true`), so it is the path
+                // most deletions actually take; before this it ran behind
+                // nothing but the `lstat` above, which is the layer the swap
+                // fixture beats by one syscall. `trashItem` cannot be handed a
+                // descriptor, so `TrashDisposal` proves the object on BOTH
+                // sides of it and undoes a disposal it cannot prove — see that
+                // file for the window that remains and its measurement.
+                if let probedObject {
+                    try await TrashDisposal.dispose(
+                        target, expecting: probedObject, provider: provider,
+                        containedIn: admittedParent,
+                        via: { try await self.trash($0) }
+                    )
+                } else {
+                    // NO LEAF VERDICT — WHICH IS NOT THE SAME AS NOTHING TO
+                    // BIND (PR #458 review — the P1 that survived three
+                    // rounds). The note that stood here justified handing a
+                    // bare URL to the mover with a fact about the ROLLBACK:
+                    // "`admittedParent` is not used here on purpose: this arm
+                    // never rolls anything back, so there is no destination to
+                    // prove." That reasoned about the wrong object. The
+                    // question is not what the UNDO would restore into, it is
+                    // which folder the DISPOSAL resolves the target's name
+                    // in — and `admittedParent`, captured a few lines up from
+                    // a descriptor, answers exactly that. Measured with two
+                    // real `rename(2)`s at the seam, `moveToTrash: true`: the
+                    // stranger's tree went to the Trash and the report read
+                    // `entries=[exactBytes: 4096, .trash]`, `errors=[]`.
+                    //
+                    // So the container binding goes here too, and the
+                    // disposal binds the leaf under it. Once it does, this arm
+                    // rolls back like the other one — which is the second
+                    // reason the old note was wrong about itself.
+                    try await TrashDisposal.dispose(
+                        target, containedIn: admittedParent,
+                        provider: provider,
+                        via: { try await self.trash($0) }
+                    )
+                }
             } else {
                 // Item mode deletes the target ITSELF — never its
                 // contents-with-parent-preserved (R1/R15). The UNRESOLVED
                 // spelling: a symlink target is removed AS a link (R4).
+                //
+                // AND THE VERDICT GOES WITH IT. This is where the binding
+                // actually lands: the removal opens the target and proves
+                // the OPENED INODE is `probedObject` before it unlinks
+                // anything.
                 try await Self.removeItemConcurrently(
-                    at: target, fileManager: fileManager
+                    at: target, expecting: probedObject, provider: provider,
+                    containedIn: admittedParent
                 )
             }
         } catch {
@@ -1185,7 +1543,37 @@ actor CacheCleaner {
                     label: item.displayName, tag: Self.refusalTag(error),
                     detail: "\(target.path): \(error.localizedDescription)"
                 )
+            } else if let failure = error as? DepthSafeRemoval.Failure,
+                      failure.cause == .notTheInspectedObject {
+                // The SAME event as the path check above — same tag, so the
+                // log does not report a swap caught one layer down as
+                // something else entirely.
+                logRefusal(
+                    label: item.displayName, tag: "content-drift",
+                    detail: "\(target.path): \(error.localizedDescription)"
+                )
+            } else if let failure = error as? DepthSafeRemoval.Failure,
+                      failure.cause == .notTheAdmittedContainer {
+                // A DIFFERENT EVENT, SO A DIFFERENT TAG. `content-drift` says
+                // the item changed; this says the item is where it always was
+                // and the FOLDER THAT HOLDS IT was replaced — which is what
+                // the user has to go and look at, and which the cleanup log
+                // must not blur into the other.
+                logRefusal(
+                    label: item.displayName, tag: "container-drift",
+                    detail: "\(target.path): \(error.localizedDescription)"
+                )
+            } else if error is TrashDisposal.Failure {
+                // Same event again, one disposal over: a swap the Trash arm
+                // caught (before its move, or after it and undone) is the same
+                // thing happening to the user as one the permanent arm caught.
+                logRefusal(
+                    label: item.displayName, tag: "content-drift",
+                    detail: "\(target.path): \(error.localizedDescription)"
+                )
             }
+            // Failed deletions never accept: `token` is abandoned, no entry
+            // is produced, and no bytes are reported.
             return (nil, [Self.itemError(item, error.localizedDescription)])
         }
 
@@ -1226,7 +1614,9 @@ actor CacheCleaner {
         authorization: String?
     ) -> WorktreeReclaimPerformer {
         let sizer = self.sizer
-        let fileManager = self.fileManager
+        // The removal seam now needs the provider (it proves the folder it
+        // opens), and the closure must not capture `self`.
+        let provider = self.provider
         let handler = self.trashHandler
         let label = item.displayName
         return WorktreeReclaimPerformer(
@@ -1240,10 +1630,28 @@ actor CacheCleaner {
             },
             gitTimeout: gitTimeout,
             moveToTrash: moveToTrash,
-            trash: { url in try await MainActor.run { try handler(url) } },
-            removeTree: { url in
+            // THE RAW MOVER, AND THAT IS A KNOWN GAP — NOT A DECISION THAT
+            // THIS ARM NEEDS NO BINDING (fn-6 reconciliation; flagged for its
+            // own round, deliberately not widened here).
+            //
+            // Every OTHER item's Trash disposal now goes through
+            // `TrashDisposal.dispose(_:containedIn:provider:via:)`, which
+            // resolves the target's name inside the bound folder and undoes a
+            // disposal it cannot prove. This composite arm still hands the
+            // mover a bare URL, so the GUI's DEFAULT disposal of a stale
+            // worktree is the one deletion path in the app with no container
+            // binding. `_ =` discards the landing URL that seam exists to
+            // answer — the discard is what makes the omission legible.
+            trash: { url in _ = try await MainActor.run { try handler(url) } },
+            removeTree: { url, admittedParent in
+                // `expecting: nil` is STATED, not defaulted (fn-6's item path
+                // states its own the same way): `git_worktrees` registers no
+                // `preDeleteRevalidator`, so this deletion has no leaf verdict
+                // to prove — the binding it does carry is the CONTAINER one
+                // the performer captured before its rechecks.
                 try await Self.removeItemConcurrently(
-                    at: url, fileManager: fileManager
+                    at: url, expecting: nil, provider: provider,
+                    containedIn: admittedParent
                 )
             },
             revalidate: { [self] subject in
@@ -1344,11 +1752,54 @@ actor CacheCleaner {
 
     /// Synchronous disk I/O offloaded to a GCD background queue so the actor
     /// (and the cooperative thread pool) never blocks on a large unlink.
-    nonisolated private static func removeItemConcurrently(at url: URL, fileManager: FileManager) async throws {
+    ///
+    /// THE DELETION IS DESCRIPTOR-RELATIVE, and that is the fix rather than a
+    /// detail (PR #458 review — the stranding class that MOVED). Inspection
+    /// went descriptor-relative and could then read trees past `PATH_MAX`;
+    /// `FileManager.removeItem(at:)` composes an absolute path per entry and
+    /// cannot, so the codebase began producing items that were probed CLEAN
+    /// and COMPLETE and were nonetheless undeletable forever — measured,
+    /// NSCocoaErrorDomain 514 / ENAMETOOLONG, in 0.03 s, every time, with a
+    /// message blaming an "invalid file name". Both halves of one core now
+    /// traverse the same way, so neither can address a tree the other
+    /// cannot: `DepthSafeRemoval` reaches exactly what the probe reaches.
+    ///
+    /// AND THE HOP IS WHY THE INSPECTION VERDICT TRAVELS WITH IT (PR #458
+    /// review — the P1). `expecting` is not plumbing: this queue hop sits
+    /// between the caller's last path check and the deletion, and it is not
+    /// a syscall wide. Measured through this method, from the last
+    /// `identity(of: target)` to the deletion's first question about a
+    /// DESCRIPTOR — which is already past `open(parent)` and `openat(leaf)`,
+    /// so it under-states the window — 0.095 / 0.097 / 0.126 ms over three
+    /// runs before the fix, at the seam
+    /// `testTargetReplacedAfterTheFinalPathCheckIsRefused` still prints.
+    /// That is an eternity for a `rename(2)` + `mkdir(2)` loop, and it is
+    /// where the deletion used to acquire a descriptor it never asked the
+    /// identity of.
+    ///
+    /// AND SO DOES THE CONTAINER BINDING (PR #458 review — the P1 the round
+    /// that built `containedIn:` left at zero call sites). The deletion's ONE
+    /// path resolution is the target's parent, and it happens on the far side
+    /// of this hop: a `rename(2)` pair inside those 0.095–0.126 ms puts a
+    /// stranger's directory at that path, after which every
+    /// descriptor-relative proof below is self-consistent INSIDE THE
+    /// STRANGER. `containedIn` is the identity the caller read from a
+    /// descriptor on THIS side, and it has no default here either — the hop
+    /// is the whole reason the parameter exists, so a caller that reaches it
+    /// without stating a binding must not compile.
+    nonisolated private static func removeItemConcurrently(
+        at url: URL,
+        expecting inspected: UserDataProbeResult.InspectedRoot?,
+        provider: FileSystemIdentityProvider,
+        containedIn admittedParent: DepthSafeRemoval.AdmittedParent
+    ) async throws {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             DispatchQueue.global(qos: .userInitiated).async {
                 do {
-                    try fileManager.removeItem(at: url)
+                    try DepthSafeRemoval.remove(
+                        at: url, expecting: inspected, provider: provider,
+                        containedIn: admittedParent
+                    )
                     continuation.resume()
                 } catch {
                     continuation.resume(throwing: error)
@@ -1358,10 +1809,12 @@ actor CacheCleaner {
     }
 
     /// Move one URL to the Trash via the injectable seam (production:
-    /// `FileManager.trashItem`, which requires the main actor).
-    private func trash(_ url: URL) async throws {
+    /// `FileManager.trashItem`, which requires the main actor), answering
+    /// WHERE IT LANDED — `nil` when the disposal would not say.
+    @discardableResult
+    private func trash(_ url: URL) async throws -> URL? {
         let handler = trashHandler
-        try await MainActor.run { try handler(url) }
+        return try await MainActor.run { try handler(url) }
     }
 
     // MARK: - Logging
@@ -1403,9 +1856,40 @@ actor CacheCleaner {
 
         let entry = "[\(ISO8601DateFormatter.shared.string(from: Date()))] \(message)\n"
 
-        let fd = openat(dirFd, "cleanup.log", O_CREAT | O_WRONLY | O_APPEND | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        // THIS OPEN CANNOT CARRY `O_DIRECTORY` — it creates a regular file —
+        // so it is the WRITE-SIDE twin of the scanner's lock-probe hazard
+        // (PR #459 review r4, the third blocking-open site): `O_WRONLY` on a
+        // FIFO planted at this name blocks until a READER appears. Measured
+        // on this platform: the identical flag set without `O_NONBLOCK` did
+        // not return in 2s against `mkfifo`; every admission and refusal of a
+        // clean logs through here inside this actor, so that block wedges the
+        // clean and every later message to the actor. `O_NONBLOCK` splits the
+        // FIFO into two measured halves, and the flag alone covers only one:
+        //   - no reader: the open fails ENXIO, the `fd != -1` guard drops the
+        //     line — best-effort by design, like every earlier silent return
+        //     in this method;
+        //   - a reader present: the open SUCCEEDS (`fstat` reports `S_IFIFO`),
+        //     so without the kind gate below the log would stream into
+        //     someone else's pipe.
+        // A bound AF_UNIX socket never gets this far (the open fails
+        // EOPNOTSUPP, measured); a device node that opens is refused by the
+        // same kind gate. `O_NONBLOCK` changes nothing for the regular file
+        // this log actually is.
+        let fd = openat(
+            dirFd, "cleanup.log",
+            O_CREAT | O_WRONLY | O_APPEND | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK,
+            0o600
+        )
 
         guard fd != -1 else { return }
+
+        var status = stat()
+        guard fstat(fd, &status) == 0,
+              FileSystemIdentityProvider.fileKind(from: status) == .regularFile
+        else {
+            close(fd)
+            return
+        }
 
         let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
         let data = entry.data(using: .utf8) ?? Data()

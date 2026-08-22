@@ -299,20 +299,108 @@ final class DevRootsStoreTests: XCTestCase {
     }
 
     func testSymlinkLeafRootIsSetAsideAndPassesThroughVerbatim() throws {
-        // A symlink-LEAF root does not participate in dedupe: it is set
-        // aside and passes through verbatim (walk time refuses it with a
-        // classified issue) — even when its TARGET is also declared.
+        // A symlink-LEAF root whose target is NOT itself declared does not
+        // participate in dedupe: it is set aside and passes through
+        // verbatim (walk time refuses it with a classified issue).
         let real = base.appendingPathComponent("real-root")
         try mkdir(real)
         let link = base.appendingPathComponent("link-root")
         try fm.createSymbolicLink(at: link, withDestinationURL: real)
 
-        persist([real.path, link.path])
+        persist([link.path])
+
+        let resolution = makeStore().effectiveRoots(home: fixtureHome)
+        XCTAssertEqual(resolution.keptRoots.map(\.path), [link.path],
+                       "symlink-leaf roots are SET ASIDE, not deduped away")
+        XCTAssertEqual(resolution.issues, [])
+    }
+
+    // MARK: - R8/R16: alias suppression (a symlink alias never shadows the
+    // real root it points at — `matchConfiguredRoot` is FIRST-match)
+
+    /// Both declaration orders, end to end through the very admission the
+    /// alias used to break: alias-first is the reviewer's scenario (the
+    /// alias matched first and `admitContainer`'s no-follow gate then
+    /// refused it without trying the real root), real-first is the control.
+    func testSymlinkAliasNeverShadowsItsDeclaredTargetAtDeleteTime() throws {
+        let real = base.appendingPathComponent("real-root")
+        let project = real.appendingPathComponent("proj/build")
+        try mkdir(project)
+        let alias = base.appendingPathComponent("alias-root")
+        try fm.createSymbolicLink(at: alias, withDestinationURL: real)
+
+        for declared in [[alias.path, real.path], [real.path, alias.path]] {
+            persist(declared)
+            let provider = FileSystemIdentityProvider()
+            let roots = makeStore(provider: provider)
+                .effectiveRoots(home: fixtureHome).keptRoots
+            let pathGuard = PathGuard(
+                home: fixtureHome, containerRoots: roots, provider: provider
+            )
+            let sessionSnapshot = ContainerSnapshot.capture(
+                roots: roots, provider: provider
+            )
+
+            // The real root is what the walker walks and stamps as every
+            // item's `originRoot` — delete-time admission must accept it in
+            // EITHER declaration order.
+            let container = try pathGuard.admitContainer(
+                real, snapshot: sessionSnapshot
+            )
+            XCTAssertNoThrow(
+                try pathGuard.validateRemovableItem(project, inside: container),
+                "items found under \(real.path) must stay cleanable "
+                    + "(declared \(declared))"
+            )
+        }
+    }
+
+    func testSymlinkAliasOfADeclaredRealRootIsDroppedWithAClassifiedIssue()
+        throws
+    {
+        let real = base.appendingPathComponent("real-root")
+        try mkdir(real)
+        let alias = base.appendingPathComponent("alias-root")
+        try fm.createSymbolicLink(at: alias, withDestinationURL: real)
+
+        persist([alias.path, real.path])
+
+        let resolution = makeStore().effectiveRoots(home: fixtureHome)
+        // The alias is dropped; the REAL root survives VERBATIM (its
+        // declared spelling, never the canonical form) even though the
+        // alias was declared first.
+        XCTAssertEqual(resolution.keptRoots.map(\.path), [real.path],
+                       "an unusable alias must never sit in the kept set "
+                       + "ahead of the usable root it resolves to")
+        // Never a silent drop: the user learns the declaration is redundant.
+        let issue = try XCTUnwrap(resolution.issues.first)
+        XCTAssertEqual(resolution.issues.count, 1)
+        XCTAssertEqual(issue.kind, .symlinkRoot)
+        XCTAssertEqual(issue.kind.wireString, "symlink_root")
+        XCTAssertEqual(issue.url, alias)
+        XCTAssertTrue(issue.detail.contains(real.path),
+                      "the issue must name the root that already covers it")
+    }
+
+    /// The leaf-resolution doctrine survives the alias suppression: a
+    /// symlink LEAF is never resolved INTO the kept set. Two aliases of the
+    /// same real directory, that directory NOT declared — nothing is
+    /// dropped, and no canonical (leaf-resolved) spelling appears.
+    func testAliasSuppressionNeverResolvesLeavesIntoTheKeptSet() throws {
+        let real = base.appendingPathComponent("real-root")
+        try mkdir(real)
+        let first = base.appendingPathComponent("alias-one")
+        let second = base.appendingPathComponent("alias-two")
+        try fm.createSymbolicLink(at: first, withDestinationURL: real)
+        try fm.createSymbolicLink(at: second, withDestinationURL: real)
+
+        persist([first.path, second.path])
 
         let resolution = makeStore().effectiveRoots(home: fixtureHome)
         XCTAssertEqual(resolution.keptRoots.map(\.path),
-                       [real.path, link.path],
-                       "symlink-leaf roots are SET ASIDE, not deduped away")
+                       [first.path, second.path],
+                       "no declared root covers these leaves — they pass "
+                       + "through verbatim for the walk-time gate to class")
         XCTAssertEqual(resolution.issues, [])
     }
 

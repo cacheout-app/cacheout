@@ -717,6 +717,70 @@ final class CLIGateTests: XCTestCase {
 
     // MARK: - Scan envelope (R2, R8)
 
+    /// F10 (PR #459 review r3): `CacheScanner.scanAll` must impose a TOTAL
+    /// order, so two scans of one fixture cannot disagree.
+    ///
+    /// This is the root cause of an observed intermittent failure in
+    /// `testScanEnvelopeCategoriesRowsAreSchema3FieldForField` below —
+    /// reproduced at 3 failures in 220 filtered runs (~1.4%), always an
+    /// ordering difference and never a value one: `empty_cat` and
+    /// `missing_cat`, both 0 bytes, swapped between the two independent scans
+    /// that cell compares. `scanAll` appended results in task-group COMPLETION
+    /// order and then sorted on `sizeBytes` alone, which is only a PARTIAL
+    /// order, so tied rows came out in whatever order the tasks finished — 17
+    /// minority orderings per 2000 scans of this exact fixture (0.85%), which
+    /// predicts the ~1.7% two-scan disagreement rate observed.
+    ///
+    /// Both halves PRE-DATE this PR: the cell and the sorting line are both
+    /// present verbatim at merge base f7b2087, so this is not a regression
+    /// introduced here — it is a known flake being closed rather than left
+    /// undescribed. (r4 correction of the sentence that stood here and of
+    /// fc006ab's commit body, which repeated it: both claimed `git diff
+    /// f7b2087..HEAD` "touches neither file" — false the moment it was
+    /// written, because fc006ab, the commit CARRYING the claim, is what
+    /// modified both files. Measured: `git diff --stat f7b2087..HEAD --
+    /// Sources/Cacheout/Scanner/CacheScanner.swift
+    /// Sources/Cacheout/CLIHandler.swift` → "2 files changed, 29
+    /// insertions(+), 3 deletions(-)", all of it fc006ab's own fix. The
+    /// pre-existence claim stands on the merge-base FILE CONTENTS, never on
+    /// an untouched diff.)
+    ///
+    /// The fixture is arranged so a single run is usually enough to catch a
+    /// regression rather than needing luck: `empty_cat` sorts BEFORE
+    /// `missing_cat` by slug, while a missing category resolves instantly and
+    /// therefore almost always COMPLETES first. The repetition is belt to that
+    /// braces.
+    func testEqualSizeCategoryRowsComeBackInOneStableOrder() async throws {
+        let measuredRoot = base.appendingPathComponent("stable-measured")
+        try fm.createDirectory(
+            at: measuredRoot, withIntermediateDirectories: true
+        )
+        try Data(repeating: 0xCD, count: 4096).write(
+            to: measuredRoot.appendingPathComponent("f.bin")
+        )
+        let emptyRoot = base.appendingPathComponent("stable-empty")
+        try fm.createDirectory(
+            at: emptyRoot, withIntermediateDirectories: true
+        )
+        // Declared in an order that is neither the expected one nor the
+        // likely completion one.
+        let categories = [
+            makeCategory(name: "missing_cat"),
+            makeCategory(name: "measured_cat", path: measuredRoot.path),
+            makeCategory(name: "empty_cat", path: emptyRoot.path),
+        ]
+
+        let scanner = CacheScanner(home: fixtureHome)
+        for iteration in 1...20 {
+            let slugs = await scanner.scanAll(categories).map(\.category.slug)
+            XCTAssertEqual(
+                slugs, ["measured_cat", "empty_cat", "missing_cat"],
+                "size descending, then slug ascending — every 0-byte row has "
+                    + "a defined place (iteration \(iteration))"
+            )
+        }
+    }
+
     func testScanEnvelopeCategoriesRowsAreSchema3FieldForField() async throws {
         let measuredRoot = base.appendingPathComponent("measured-root")
         try fm.createDirectory(at: measuredRoot, withIntermediateDirectories: true)
@@ -1043,18 +1107,35 @@ final class CLIGateTests: XCTestCase {
                            "argv arrays never appear in any row")
         }
 
-        // ALL SEVEN ScanIssue.Kind wire strings through the scanner_errors
-        // row builder — exact rows: the five filesystem kinds carry their
-        // real `path`; the non-filesystem kinds (`malformed_outcome`,
-        // `config_invalid`) have NO path key at all; `tcc_denied` ALONE
-        // additionally carries `grant_hint` (macOS denies CLI processes
-        // silently — the row must say what to do about it).
+        // ALL TWELVE ScanIssue.Kind wire strings through the scanner_errors
+        // row builder (the count was stale at "seven" before PR #459 codex
+        // r11 — `enumeration_truncated` and `config_invalid` had already
+        // landed; codex r13 added two more, r15 one) — exact rows: the nine
+        // non-TCC filesystem kinds below carry
+        // their real `path`; `tcc_denied` carries its path AND, ALONE, a
+        // `grant_hint` (macOS denies CLI processes silently, so the row must
+        // say what to do about it); the two non-filesystem kinds
+        // (`malformed_outcome`, `config_invalid`) have NO path key at all.
         let url = URL(fileURLWithPath: "/tmp/wire-fixture-root")
         let filesystemKinds: [(ScanIssue.Kind, String)] = [
             (.containerRefused, "container_refused"),
+            // ADDED PR #459 codex r11 — a WIRE ADDITION on schema 4, which
+            // this release already breaks; consumers tolerate unknown kinds
+            // by contract.
+            (.mountedVolumeRoot, "mounted_volume_root"),
+            // ADDED PR #459 codex r15 — the construction-time verdict, whose
+            // remedy is a relaunch rather than a re-scan.
+            (.mountedVolumeRootAtRegistration,
+             "mounted_volume_root_at_registration"),
+            // ADDED PR #459 codex r13 — two more WIRE ADDITIONS on schema 4,
+            // splitting the two conditions `container_refused` and
+            // `symlink_root` were mis-labelling on `ephemeral_tmp`.
+            (.policyRefusedRoot, "policy_refused_root"),
             (.symlinkRoot, "symlink_root"),
+            (.nonDirectoryRoot, "non_directory_root"),
             (.permissionDenied, "permission_denied"),
             (.unreadable, "unreadable"),
+            (.enumerationTruncated, "enumeration_truncated"),
         ]
         for (kind, wire) in filesystemKinds {
             let row = CLIHandler.scannerErrorRowJSON(
@@ -2247,6 +2328,59 @@ final class CLIGateTests: XCTestCase {
         }
     }
 
+    /// AN EPHEMERAL TEMP ROOT IS A LEGAL `--dev-root` VALUE (PR #459 review
+    /// r2) — the seam where round 1's regression actually lived.
+    ///
+    /// `--dev-root` is a whole-set REPLACEMENT and this helper promotes ANY
+    /// `.containerRefused` in the resolution to INVALID_ARGUMENTS for the
+    /// entire invocation. Round 1 taught `DevRootsStore` to manufacture that
+    /// refusal for a path the shared policy admits, so
+    /// `--cli scan --dev-root /private/tmp` returned `{"ok": false, "code":
+    /// "INVALID_ARGUMENTS", … "Nothing was scanned."}` — every scanner, not
+    /// just `build_artifacts` — and a sibling `--dev-root ~/Documents` in the
+    /// same invocation died with it.
+    ///
+    /// The literal `/private/tmp` is deliberate: it is a CONSTANT member of
+    /// `EphemeralTempRoots.resolve()`, so this exercises an exact-root
+    /// collision with no machine-specific value. `devRootsOverride`
+    /// constructs its own `DevRootsStore` with no temp-root seam, so a
+    /// fixture subdirectory would be NESTED rather than equal and would stay
+    /// green if a store-level refusal re-landed. This goes red.
+    func testAnEphemeralTempRootIsALegalDevRootValue() throws {
+        let documents = fixtureHome.appendingPathComponent("Documents")
+        try fm.createDirectory(at: documents, withIntermediateDirectories: true)
+
+        switch CLIHandler.devRootsOverride(
+            from: ["/private/tmp"], occurrences: 1, home: fixtureHome
+        ) {
+        case .failure(let error):
+            XCTFail("/private/tmp is a legal dev root: \(error.message)")
+        case .success(let resolution):
+            XCTAssertEqual(
+                resolution?.keptRoots.map(\.path), ["/private/tmp"],
+                "the root is kept and will be walked"
+            )
+            XCTAssertEqual(resolution?.issues.count, 0,
+                           "\(resolution?.issues ?? [])")
+        }
+
+        // AND IT DOES NOT TAKE ITS SIBLINGS DOWN WITH IT: the promotion is
+        // whole-invocation, so one manufactured refusal killed every other
+        // root in the same command line.
+        switch CLIHandler.devRootsOverride(
+            from: [documents.path, "/private/tmp"],
+            occurrences: 2, home: fixtureHome
+        ) {
+        case .failure(let error):
+            XCTFail("neither root may be refused: \(error.message)")
+        case .success(let resolution):
+            XCTAssertEqual(
+                resolution?.keptRoots.map(\.path),
+                [documents.path, "/private/tmp"]
+            )
+        }
+    }
+
     /// REPLACEMENT semantics (R8): the flag's values are the WHOLE effective
     /// set — the persisted list and its seeds are not consulted, nothing is
     /// written — with exact-canonical-duplicate dedupe (declared spellings
@@ -2885,13 +3019,15 @@ final class CLIAcknowledgementTests: XCTestCase {
 
     private func makeRuntime(
         devRoots roots: [URL],
-        probeEntryLimit: Int = ValuablesDetector.defaultProbeEntryLimit
+        probeBudget: ValuablesProbeBudget = .censusProportionate(
+            floor: ValuablesDetector.defaultProbeEntryLimit
+        )
     ) throws -> SpaceScannerRuntime {
         let scanner = BuildArtifactsScanner(
             home: fixtureHome,
             devRoots: DevRootsStore(defaults: defaults)
                 .effectiveRoots(replacing: roots, home: fixtureHome),
-            valuablesProbeEntryLimit: probeEntryLimit
+            valuablesProbeBudget: probeBudget
         )
         return try SpaceScannerRuntime(
             scanners: [scanner], categories: [], home: fixtureHome,
@@ -3066,7 +3202,7 @@ final class CLIAcknowledgementTests: XCTestCase {
             "rust-a", in: dev, valuables: ["App.dmg"]
         )
         let deps = makeDeps(
-            try makeRuntime(devRoots: [dev], probeEntryLimit: 1)
+            try makeRuntime(devRoots: [dev], probeBudget: .fixed(1))
         )
 
         let dryRun = try successPayload(await clean(
@@ -3076,8 +3212,16 @@ final class CLIAcknowledgementTests: XCTestCase {
 
         XCTAssertFalse(planned.keys.contains("acknowledgement_token"),
                        "an incomplete probe is tokenless on EVERY surface")
+        // …and the note names THIS cause's remedy. A pinned bound that ran
+        // out is the budget cause, whose remedy is a retry once the tree
+        // settles — never the obstruction's "re-scan", which cannot move a
+        // bound. The two notes are separate strings on purpose.
         XCTAssertEqual(planned["acknowledgement_note"] as? String,
+                       CLIHandler.growingTreePlanNote)
+        XCTAssertEqual(CLIHandler.incompleteProbeNote(for: .obstruction),
                        CLIHandler.incompleteProbePlanNote)
+        XCTAssertNotEqual(CLIHandler.growingTreePlanNote,
+                          CLIHandler.incompleteProbePlanNote)
         XCTAssertTrue(fm.fileExists(atPath: valuable.path))
     }
 

@@ -10,8 +10,17 @@
 /// Scanner `displayName` + item count + section total.
 ///
 /// ## Quick Actions
-/// - **Select Stale (30d+)**: only where staleness applies to the scanner's
-///   items (`isStale == nil` = control hidden/inapplicable)
+/// - **Select Stale**: only where staleness applies to the scanner's
+///   items (`isStale == nil` = control hidden/inapplicable). The label makes
+///   NO numeric claim on purpose (PR #459 review r4, codex C2): each scanner
+///   judges staleness by its OWN threshold (build artifacts a fixed 30 days —
+///   `ReclaimableItem.isStale(daysSinceModified:)`, no knob; orphaned caches
+///   a configurable 60-day default; ephemeral temp a configurable 7-day
+///   default), and
+///   the retired 30-day parenthetical was false in the shipped DEFAULT
+///   configuration the moment a sub-30-day scanner registered. The per-item
+///   age is stated where it is true: the row's evidence string and the
+///   confirmation sheet.
 /// - **Select All** / **Deselect All**: section-scoped
 ///
 /// ## Rows
@@ -56,13 +65,18 @@ struct ScannerItemSection: View {
                         .foregroundStyle(.purple)
                     Text(section.displayName)
                         .font(.headline)
-                    Text("(\(section.items.count) found)")
+                    // "(0 found)" is an affirmative claim about a completed
+                    // inspection — `headerCountLabel` withholds it (and the
+                    // total below it) until one has happened.
+                    Text("(\(section.headerCountLabel))")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     Spacer()
-                    Text(viewModel.formattedTotalSize(forScanner: section.scannerID))
-                        .font(.body.monospacedDigit().bold())
-                        .foregroundStyle(.purple)
+                    if !section.isAwaitingFirstScan {
+                        Text(viewModel.formattedTotalSize(forScanner: section.scannerID))
+                            .font(.body.monospacedDigit().bold())
+                            .foregroundStyle(.purple)
+                    }
                 }
                 .padding(.horizontal, 10)
                 .padding(.vertical, 8)
@@ -85,6 +99,32 @@ struct ScannerItemSection: View {
             // Classified scan problems (R14/D6): a denied search root is
             // information, never a silent skip — and a malformed outcome is
             // a visible failure, never a silent retention.
+            //
+            // RESIDUAL, RECORDED AT MEASURED SCOPE (PR #459 codex r10, D6).
+            // This call is the LAST link before the user's eye — every
+            // per-item scanner reaches it from `ContentView.swift:203-208`,
+            // and every disclosure the scanners work to produce (fn-6.1's
+            // `.symlinkRoot` alias drop, denied roots, truncated listings, a
+            // malformed outcome) is displayed by this line and by nothing
+            // else. It is NOT covered by any cell: measured at the r9 tip,
+            // replacing it with `EmptyView()` left the FULL suite green at
+            // 1172/2/0. The cause is structural rather than an oversight —
+            // SwiftUI bodies are assertion-dead (`ScanIssueRowPresentation`
+            // below exists BECAUSE of that) and this repo has no view-test
+            // harness, so no assertion can reach this expression.
+            //
+            // What IS pinned is the chain up to here, each by a named cell:
+            // resolution raises the issue, the scanner carries it
+            // (`testUserInitiatedLeadsWithTheSameResolutionIssues`), the
+            // production factory hands it to the registered scanner on BOTH
+            // arms (the two `…CarriesResolutionIssues…` /
+            // `…OwnResolutionArmCarriesItsIssuesToo` cells in
+            // `EphemeralTempRegistrationTests`), and each row's
+            // wording/location/remedy is derived testably
+            // below. The gap is the RENDERING, and only that. Building a view
+            // harness is out of scope for this round; the honest statement is
+            // that the chain is evidenced up to the view boundary and not
+            // across it, so a refactor of this line would ship silently.
             if isExpanded && !section.isScanning && !section.issues.isEmpty {
                 ScanIssuesBlock(issues: section.issues)
             }
@@ -93,7 +133,7 @@ struct ScannerItemSection: View {
                 // Quick actions (section-scoped)
                 HStack(spacing: 12) {
                     if section.supportsStaleness {
-                        Button("Select Stale (30d+)") {
+                        Button("Select Stale") {
                             viewModel.selectStale(inScanner: section.scannerID)
                         }
                         .font(.caption)
@@ -129,18 +169,44 @@ struct ScannerItemSection: View {
                 }
             }
 
-            // "Found none" is claimed only when the scan had no classified
-            // problems — a denied root is NOT "nothing there" (R14/D6).
-            if isExpanded && !section.isScanning
-                && section.items.isEmpty
-                && section.issues.isEmpty {
+            // NEVER INSPECTED — the only empty state this section renders
+            // (PR #459 codex r11, DISCLOSURE).
+            //
+            // The RETIRED block here claimed "Nothing found" under exactly
+            // `!isScanning && items.isEmpty && issues.isEmpty`, which is the
+            // negation of `ContentView`'s own render gate — the section was
+            // never constructed in that state, so the affirmative empty
+            // result was unreachable through the app's ONE call site
+            // (`ContentView.swift`, the sole `ScannerItemSection(` in the
+            // repo). What the user actually saw for a never-scanned scanner
+            // was the same thing they saw for a scanner that found nothing:
+            // no section at all. Two different facts, one silence.
+            //
+            // `isDisplayed` now admits the never-inspected case and this
+            // block says so. A scanner that ran and found nothing is still
+            // hidden, so an ABSENT section means that and nothing else.
+            //
+            // AND THE OUTER GATE NOW ADMITS IT TOO (PR #459 codex r14). The
+            // sentence that stood here said the window-level empty state
+            // "says in so many words that no scan has run"; it says "Click
+            // Scan to find caches", which is an invitation, names no
+            // scanner, and is what a clean machine saw INSTEAD of this
+            // block — `hasDisplayableScanOutput` read false with every
+            // participating scanner's outcome empty, so the results list
+            // that would have built this section was never built.
+            // `CacheoutViewModel.hasAwaitingFirstScanSection` is that
+            // gate's share of the same predicate.
+            if isExpanded && section.isAwaitingFirstScan {
                 VStack(spacing: 8) {
-                    Image(systemName: "shippingbox")
+                    Image(systemName: "magnifyingglass")
                         .font(.largeTitle)
                         .foregroundStyle(.tertiary)
-                    Text("Nothing found")
+                    Text("Not yet scanned")
                         .font(.callout)
                         .foregroundStyle(.secondary)
+                    Text("Press Scan to inspect \(section.displayName).")
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
                 }
                 .frame(maxWidth: .infinity, alignment: .center)
                 .padding(.vertical, 24)
@@ -228,10 +294,35 @@ struct ScanIssueRowPresentation: Equatable {
     private static func label(for kind: ScanIssue.Kind) -> String {
         switch kind {
         case .containerRefused: return "not a configured search root"
+        // The visible row must state the TRUE condition and the remedy
+        // (PR #459 codex r11): this root IS configured, and the user clears
+        // it by unmounting. Under `.containerRefused` the row said the
+        // opposite and left the remedy in `detail`, which this block shows
+        // only as a hover tooltip.
+        case .mountedVolumeRoot:
+            return "mounted volume; eject or unmount it, then re-scan"
+        // The SAME condition, decided at construction and replayed from
+        // stored resolution issues, so "re-scan" would be a remedy the user
+        // can perform forever without the row ever clearing (PR #459 codex
+        // r15). Only re-running construction re-reads the table.
+        case .mountedVolumeRootAtRegistration:
+            return "mounted volume at launch; unmount it, then relaunch"
+        // The root IS registered — the policy refused to SEARCH it (PR #459
+        // codex r13). No remedy is named because the clauses that reach here
+        // (`/`, a volume root, `$HOME`) do not share one; `detail` carries
+        // which clause fired, in the tooltip.
+        case .policyRefusedRoot:
+            return "refused by the search-root safety policy"
         case .symlinkRoot: return "symlinked — not searched"
+        // Not a symlink and not a directory (PR #459 codex r13): a regular
+        // file, FIFO, socket or device stands there. Under `.symlinkRoot`
+        // this row asserted a symlink the user would never find, while
+        // `detail` — the tooltip — named the real kind.
+        case .nonDirectoryRoot: return "not a directory — not searched"
         case .tccDenied: return "access denied by macOS privacy settings"
         case .permissionDenied: return "permission denied"
         case .unreadable: return "unreadable"
+        case .enumerationTruncated: return "too many entries — partially inspected"
         case .configInvalid: return "invalid saved configuration — defaults in effect"
         // fn-5.3: the SECOND of the two exhaustive switches over
         // `ScanIssue.Kind` in production. The wording says what did NOT

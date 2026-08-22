@@ -840,9 +840,10 @@ final class CategoryScannerTests: XCTestCase {
                 CategoryScanner.registeredID,
                 BuildArtifactsScanner.registeredID,
                 OrphanedCachesScanner.registeredID,
-                // fn-5.6: registered LAST, sharing the dev roots (and the one
-                // git runner) the composition already resolved.
+                // fn-5.6: sharing the dev roots (and the one git runner) the
+                // composition already resolved.
                 GitWorktreeScanner.registeredID,
+                EphemeralTempScanner.registeredID,
             ]
         )
         XCTAssertFalse(
@@ -851,15 +852,22 @@ final class CategoryScannerTests: XCTestCase {
                 + "the RETIRED slug is a bare string here because fn-4.7 "
                 + "deleted the scanner that used to declare it"
         )
+        // fn-6.4 appends the ephemeral temp scanner, whose roots are the
+        // machine's REAL confstr-resolved temp containers — resolved here
+        // through the same declaration the factory uses so the expectation
+        // stays a property of the composition, not of this machine.
+        let tempRoots = EphemeralTempRoots.resolve().roots.map(\.url.path)
         XCTAssertEqual(
             runtime.trustedContainerRoots.map(\.path),
             devRoots.keptRoots.map(\.path)
-                + [home.appendingPathComponent("Library/Caches").path],
+                + [home.appendingPathComponent("Library/Caches").path]
+                + tempRoots,
             "the union is the per-item scanners' declared sets in "
                 + "registration order (the kept dev roots, then the "
-                + "orphaned-caches sweep root) — CategoryScanner contributes "
-                + "no container roots, and git_worktrees declares the SAME "
-                + "dev roots, which the union deduplicates by path"
+                + "orphaned-caches sweep root, then the ephemeral temp "
+                + "roots) — CategoryScanner contributes no container roots, "
+                + "and git_worktrees declares the SAME dev roots, which the "
+                + "union deduplicates by path"
         )
         // The factory reaching here at all asserts the production
         // category-slug/scanner-slug namespace is collision-free (a

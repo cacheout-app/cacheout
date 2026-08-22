@@ -83,6 +83,177 @@ below are both part of that coordination, and the latter BLOCKS this release.
   An inspection that could not finish is treated exactly like a change:
   refused, tokenless, re-scan required. Full contract in PROTOCOL.md and
   `docs/v1/CLI-REFERENCE.md`.
+- **Ephemeral temp files in the GUI and the CLI.** An `ephemeral_tmp`
+  per-item scanner lists STALE first-level entries in the ephemeral
+  locations macOS does not reliably prune: `/private/tmp` and the per-user
+  temp (`…/T`) and cache (`…/C`) containers, resolved from the OS rather
+  than hardcoded. Those three DECLARED locations can resolve to fewer roots:
+  one the OS does not name, or that is missing at scan time, is skipped
+  silently, and one that turns out to be a symlink NAMING another declared
+  root is dropped at resolution with a `symlink_root` issue naming the
+  dropped spelling — the ALIAS goes, never the real root, and the drop is
+  never silent. Resolution reads such a link but never follows it, so nothing
+  a replaced temp root points at is touched while the app is starting up; a
+  link spelled so that Cacheout cannot match it to a declared root is kept
+  instead of dropped, and the scan then refuses it with the same
+  `symlink_root` issue. A MEASURED entry qualifies when its OWN timestamp and its
+  newest REGULAR FILE are both older than the age threshold (default 7 days)
+  and it meets the size floor (default 10 MB) — a directory holding one fresh
+  file deep inside is not stale, so a workspace whose files are still being
+  written, including the running session's own scratch directory, is not
+  listed. Those thresholds gate the MEASURED entries only: a denied or
+  mount-boundary entry is listed as an explicit not-measured row regardless of
+  the floor (D6 — an unverified zero must not render as empty). A NESTED DIRECTORY's own timestamp is deliberately not an input
+  (the same blind spot the sizer accepts) on either side: the inputs are the
+  entry's own mtime and the mtimes of the REGULAR FILES below it. That is a
+  claim about the TIMESTAMP and not about the operations that move one — a
+  nested change can still trip a gate that is not a timestamp: unlinking a
+  file inside a nested directory can take the entry below the SIZE FLOOR, and
+  creating enough subdirectories inside one can push its contents past the
+  INSPECTION BUDGET, and either of those both keeps the entry off the list
+  and refuses it at delete time. An entry a process merely holds open for
+  reading is NOT detected: age is the protection, and every gate is
+  re-established from a held descriptor immediately before deletion.
+  Findings are Review risk, never default-selected, and never part
+  of Quick Clean or `smart-clean`. An ordinary entry another user owns is
+  skipped — sticky-directory rules make them undeletable, so claiming their
+  bytes would be false; the one exception is a mounted volume, whose refusal
+  arm runs ahead of the ownership probe by design and reports the row without
+  entering it. Anything unreadable is reported instead of silently
+  counted as empty. `--cli scan` reports each find as a `scanner_items` row
+  and `--cli clean` accepts `ephemeral_tmp` or `ephemeral_tmp:<item-id>`,
+  with `--confirm` required as everywhere else. **These locations are
+  scanned only on EXPLICIT user-initiated scans** — the app's automatic
+  background refreshes never enumerate them, and a CLI scan is always
+  user-initiated. Until you run one, the app SAYS SO: the section shows
+  "Not yet scanned" instead of a size and a count, so a location nobody has
+  looked at never reads as a location with nothing in it. (Any per-item
+  scanner in that state says the same; a scanner that HAS run and found
+  nothing keeps its section hidden, as before.) That row now appears on a
+  machine where the automatic scan found NOTHING, which is where it matters
+  most — the results list is built whenever some scanner has yet to run, not
+  only when something was found or something went wrong. Previously a clean
+  machine went straight to the window's "Click Scan to find caches" screen
+  and the row was never built at all.
+  Thresholds persist as `cacheout.ephemeralTmp.ageDays` /
+  `cacheout.ephemeralTmp.minSizeMB` and take invocation-scoped
+  `--tmp-age-days` / `--tmp-min-size-mb` overrides on `scan` and `clean`
+  (never persisted; refused on every other command, `smart-clean`
+  included). No schema change: `schema_version` stays 4 and every addition
+  is additive. **A temp entry is re-inspected immediately before it is
+  deleted**, from a descriptor held open for the check, and the check begins
+  by proving the object IS the one the scan inspected: the scan records the
+  entry's filesystem identity and the re-check compares it, so an entry
+  renamed away and replaced under the same name is refused even when the
+  replacement is itself old and idle. If the entry has been replaced, its own
+  directory has changed, a fresh REGULAR FILE has appeared anywhere inside it,
+  it is locked by a running process, it has shrunk below the size threshold
+  since the scan, or its contents could not be re-inspected in full within the
+  entry budget, the deletion is refused
+  with nothing removed and nothing reported freed — re-scan to see its current
+  state. Under the world-writable shared root (`/tmp`) an entry that has
+  changed owner since the scan is refused too; the per-user containers are not
+  owner-checked at delete time, because their `0700` mode leaves no way for
+  another user to place an entry there in the first place. Anything that is no
+  longer a directory or a regular file at that name is refused outright,
+  including a named pipe or socket planted mid-scan — which can no longer stall
+  the scan or the clean either. The check runs on both
+  disposals, and on the Move-to-Trash default it refuses before the item is
+  moved, so a refusal never disturbs your Trash. The proven identity also
+  travels INTO each disposal — for directories and for regular files alike —
+  so a replacement that lands even after the re-check itself is refused at
+  the destructive call: the permanent delete re-proves the object under the
+  folder it verified, and the Trash move proves it on both sides of the move.
+  (Before this, that late window was covered for directories only: a FILE
+  swapped in after the re-check was disposed of with success reported.)
+  **How DEEP a temp entry is costs the re-inspection nothing.** It walks by
+  descriptor, one level at a time, climbing back with `..` and proving at
+  every step that it landed where it left — so its descriptor and stack cost
+  are the same at 320 levels as at one. Before this, the walk recursed and
+  held one open descriptor and one stack frame per level: measured through
+  this path, a valid stale tree 96 levels deep was refused "Too many open
+  files … re-scan required" under a 96-descriptor limit (the kind of limit a
+  launchd-started app runs with), and one 260 levels deep crashed the
+  process outright. The first was worse than it looked — depth does not
+  change between scans, so the re-scan that refusal prescribed produced the
+  identical refusal, for ever, while the scan kept offering the row.
+  A directory MOVED to a different parent while its contents are being
+  re-inspected is now refused (nothing deleted, re-scan to see where it
+  went) instead of having the rest of its level read out of its new home.
+  **Mounted volumes inside temp roots are never entered.** The scan decides
+  from the kernel's own mount table before touching the entry at all — so a
+  dead network volume can no longer wedge the whole scan at first contact —
+  stops its content walk at any mounted boundary it knows of, and shows the
+  entry as a visible not-measured row whose message names the remedy: eject
+  or unmount the volume, then re-scan. Previously the staleness walk
+  descended mounted volumes (measured: 19,545 + 19,500 reads below one
+  22,545-entry mount) and whether a mounted entry appeared at all depended
+  on the volume's own contents. The delete-time re-check likewise refuses
+  to descend onto another filesystem. A volume mounted in the instant
+  between the table read and the walk is still read (metadata only) and is
+  refused by the sizing and delete-time mount gates that always stood.
+  **A volume mounted exactly AT a temp root is refused the same way**: the
+  scan answers from the mount table before any syscall touches the root and
+  reports it as a visible row that names the condition and the remedy —
+  "mounted volume; eject or unmount it, then re-scan" (previously the
+  refusal happened only after several syscalls served by the mounted volume
+  — a hang on an unresponsive hard mount — and never named the remedy).
+  That row is its OWN classification: `scanner_errors[].kind` is
+  `"mounted_volume_root"`, an ADDITION to an enumeration the protocol has
+  always declared extensible (`schema_version` stays 4). It was
+  `"container_refused"` until PR #459 review r11, which made the app's
+  visible label — derived from the kind alone — read "not a configured
+  search root" for a root that IS configured, with the real explanation
+  reachable only by hovering. Consumers keying on `"container_refused"` for
+  this case must add the new string; every other producer of
+  `"container_refused"` is unchanged. The same table read now guards the scan session's
+  container-identity capture and container admission, so a mounted
+  registered root no longer has its identity read at session start or its
+  path resolved when a healthy sibling root is admitted; a root skipped
+  this way stays fail-closed at delete time. A mount landing in the
+  instant between the table read and those steps can still be touched.
+  **A volume already mounted at a temp root when Cacheout STARTS is now
+  refused before the app finishes launching.** Which temp roots exist is
+  decided once, while the app builds itself, on the main thread — and that
+  step used to `lstat` each declared root, a call the mounted volume itself
+  serves, so an unresponsive hard mount could freeze the window before it
+  ever appeared. The same kernel mount table is read first now, and such a
+  root is not registered at all: nothing under it is scanned and no item can
+  claim it. The refusal is a visible row of its own kind,
+  `scanner_errors[].kind == "mounted_volume_root_at_registration"`, reading
+  "mounted volume at launch; unmount it, then relaunch". It is a separate
+  kind from `"mounted_volume_root"` only because the remedy differs: that
+  one is re-decided from a fresh table read on every scan, so unmounting and
+  re-scanning clears it, while this one is decided once per launch and
+  clears only when Cacheout is started again. Another ADDITION to the same
+  extensible enumeration (`schema_version` stays 4). Measured with a
+  table-injected fixture: calls naming the mounted root across app
+  construction went from 5 to 0. Still touched: a volume mounted at a temp
+  root's PARENT directory, and a temp root that is a symlink pointing at a
+  mounted volume.
+  **Two more temp-root refusals get their own classifications** — the same
+  defect shape as `"mounted_volume_root"` above, swept in PR #459 codex r13:
+  the app's visible row label is derived from the kind alone, so a kind
+  shared with a different condition prints a false diagnosis. A temp root
+  the search-root safety policy refuses (`/`, a volume root, or `$HOME`) is
+  now `scanner_errors[].kind == "policy_refused_root"` and reads "refused by
+  the search-root safety policy"; it was `"container_refused"`, whose label
+  "not a configured search root" was false for every firing, since a scanner
+  builds its guard from its own roots. A temp root replaced by a regular
+  file, FIFO, socket or device is now `"non_directory_root"` and reads "not
+  a directory — not searched"; it was `"symlink_root"`, whose label
+  "symlinked — not searched" sent the user hunting for a link that was not
+  there. Both are ADDITIONS to the same extensible enumeration
+  (`schema_version` stays 4). Consumers keying on `"container_refused"` or
+  `"symlink_root"` for these `ephemeral_tmp` cases must add the new strings;
+  a temp root that really IS a symlink still reports `"symlink_root"`, and
+  every producer in every other scanner is unchanged.
+  **The root listing's entry cap now holds on every path.** When the
+  bounded directory read fails, it is retried once (a transiently cleared
+  failure recovers through the same capped read), and the Foundation
+  fallback that classifies a persistent failure now reads lazily and stops
+  at the cap — previously that fallback materialized the entire directory
+  whenever the failure cleared between the two reads.
 - **Configurable dev roots.** Settings gains a dev-roots editor and the CLI a
   repeatable `--dev-root PATH` (invocation-scoped, never persisted). The
   filesystem root, any volume root or mount point, and `$HOME` itself are
@@ -103,6 +274,92 @@ below are both part of that coordination, and the latter BLOCKS this release.
 - **Stable selection across rescans.** Selection is keyed by scanner-scoped
   stable item ids: a rescan preserves both selections and explicit
   deselections. Per-item selection previously reset on every rescan.
+
+### Security
+
+- **The build-artifacts walks are descriptor-anchored: no path resolution
+  below a scan root.** The valuables probe and the project-tree walker used
+  to re-resolve every child by absolute path — a kind `lstat`, a metadata
+  `lstat`, then an open. Any of those could be redirected by a concurrent
+  writer replacing an ANCESTOR directory with a symlink, and neither
+  `O_NOFOLLOW` (which guards only the last component) nor an inode re-proof
+  (whose "vetted" value was itself read through the swapped ancestor) could
+  see it. Both walks now open their root once and derive every child from the
+  descriptor they already hold — `fstatat`/`openat` by single-component
+  basename — so a child's safety is established by containment in a held,
+  vetted parent inode. This matters most on the valuables probe, whose output
+  feeds the acknowledgement token that authorizes a deletion. Live
+  descriptors are bounded (the probe holds at most `clamp((RLIMIT_NOFILE −
+  64)/4, 4, 64)` anchors plus two transients; the tree walker holds at most
+  its depth budget), and exceeding that bound is never a refusal — anchors
+  are released and restored with an identity-verified `..` step, so no tree
+  depth can strand an item the way the retired depth cap did.
+- **The post-walk pass re-proves CONTAINMENT instead of re-resolving a
+  path.** Anchoring the walks was not enough on its own: the scanner threw the
+  walker's vetted descriptor away and kept a bare URL, then re-resolved that
+  absolute path after the whole walk had finished — for the kind gate, the
+  sizing, the valuables probe and the delete-time re-probe. A writer inside
+  the user's own dev root (a `build.rs`, an npm postinstall) that replaced an
+  intermediate directory with a symlink in that window sent all of them
+  somewhere else, and because the valuables probe's output is the
+  acknowledgement token's only preimage, the result was a valid-looking token
+  minted over a tree the artifact directory does not contain. The scan now
+  RETAINS each admitted dev root's descriptor and re-reaches every candidate
+  by single-component `openat` from it, so the artifact directory is proven
+  reachable by containment before one byte of it is read. A component swapped
+  for a symlink, a file, or nothing at all is simply not offered (the same
+  answer a re-scan gives); anything else — permissions, a mount that appeared
+  over the path — becomes a classified, denied, tokenless row rather than a
+  silent drop or a silent trust. Cost: one descriptor per configured dev root,
+  held for the duration of a scan.
+- **Mount boundaries are now discriminated by `f_fsid`.** Every path on an
+  APFS volume group reports the same `st_dev` (measured: `/` and
+  `/System/Volumes/Data` both report 16777230), so the device comparison was
+  blind to exactly the firmlink split it was meant to catch. The descriptor's
+  own `f_fsid` is now the primary signal; the previous path-based signals are
+  kept as an additional, refusal-only backstop.
+- **Resolved consequence.** The probe was made free of `PATH_MAX` — it can
+  inspect and certify a tree whose absolute paths exceed the limit — before
+  the deleter was, and while that gap existed the build-artifacts scanner
+  refused such trees outright so it could not offer a row that only
+  half-deleted. Both deletion routes now handle them (see "Build folders
+  nested deeper than the system path limit" under Fixed), and that refusal is
+  retired.
+- **Known residual.** `DirectorySizer` is still a path-based
+  `FileManager.enumerator` walk, so an ancestor swap landing after the
+  containment descent above can still redirect the SIZING of a build-artifact
+  item. What that yields is bytes, dates and denial classifications — figures
+  an item displays. It cannot mint an acknowledgement token (that comes solely
+  from the descriptor-anchored valuables probe), cannot authorize a deletion,
+  and cannot move the deletion target, which stays the unresolved spelling the
+  cleaner re-admits and the revalidator re-proves. Converting the sizer is
+  tracked separately.
+- **Known residual: content created in a folder Cacheout has already looked
+  inside can still be swept.** Every safety check that binds an OBJECT —
+  the held directory handles, the `..` re-anchors, the final identity
+  re-check — answers "is this the same folder?", and when an app ADDS
+  something (a `Documents` folder, say) to a folder that was already read,
+  the answer is correctly YES: nothing was renamed, nothing was replaced,
+  the folder has the same identity it always had. Identity says which object;
+  it says nothing about what is now inside it. So the inspection reports no
+  user data and no obstruction, and the entry can be moved to the Trash or
+  deleted permanently even though the new content was never looked at.
+  Retiring the depth cap WIDENED this: folders past the old limit used to
+  come back "couldn't finish inspecting" and were therefore never cleanable
+  automatically; they now come back clean, which is the point of the fix and
+  is also what exposes them. It needs a writer into `~/Library/Caches` whose
+  write lands between the pre-delete inspection reading that folder and the
+  deletion itself, on an entry already eligible for automatic cleaning. The
+  window is measured, not assumed: the tail from inspection to deletion is
+  ~0.5 ms and does not grow, but the folder read FIRST stays exposed for the
+  rest of the walk — ~23 µs per entry inspected, so ~20 ms on an 840-entry
+  tree and ~0.46 s projected on a 20,000-entry one. What limits the damage
+  today is that the app's default is Move to Trash, which destroys nothing
+  and is undone with one drag; a permanent delete has no such consolation.
+  Closing it properly means checking for user data DURING the removal — the
+  deletion already walks the tree by open handle and is the only step in a
+  position to refuse what it is about to unlink — and that is tracked
+  separately.
 
 ### Changed
 
@@ -222,6 +479,155 @@ below are both part of that coordination, and the latter BLOCKS this release.
   invocation (`None` for composite-capable cleans) instead of hardcoding one
   for every command. The adopting commit hash going into the status line is
   what closes this gate — and what lets any distribution build run.
+
+### Fixed
+
+- **A background refresh no longer reads the folders it has already decided
+  to skip.** The ephemeral-temp scanner runs only when you ask for a scan, but
+  before each scan Cacheout records the identity of every folder it might
+  later delete from — and it did that for EVERY registered scanner, including
+  ones the refresh had just excluded. So an automatic refresh still made
+  filesystem contact with `/private/tmp` and both per-user temp containers,
+  where a stalled network or disk-image mount can park the call. It now
+  records only the folders belonging to the scanners that session actually
+  runs, which also means a scan narrowed to one scanner touches nothing
+  outside it. Nothing you can clean is affected: a scanner that did not run in
+  the latest scan already could not be cleaned until it runs again.
+- **A temp folder stuffed with directories can no longer make a scan crawl.**
+  The ephemeral-temp scanner advertised two limits — at most 20,000
+  first-level entries per temp folder, and at most 20,000 entries of
+  staleness checking per entry — but the second was handed out afresh to
+  every entry, so the two multiplied to 400 million filesystem probes for one
+  temp folder. `/private/tmp` is writable by anyone on the machine, so any
+  local program could stage that. Each temp folder now has ONE staleness
+  allowance its entries share; when it runs out the folder says so on the
+  results row ("too many entries — partially inspected"), and clearing
+  entries — including cleaning the items listed there — lets a later scan get
+  further. Cancelling a scan is also honoured while an entry is being
+  checked, instead of only between entries.
+- **Deleting a folder nested deeper than the system path limit now works.**
+  Inspection had been made descriptor-relative and could read such trees;
+  permanent deletion still went through `FileManager.removeItem`, which
+  builds an absolute path per entry and cannot. The result was a cache
+  folder reported as inspected and clean that no route in the app could ever
+  remove: it failed instantly, every time, with "the file name is invalid" —
+  a message naming a cause that did not exist, since the names were fine and
+  the DEPTH was the problem. `rm -rf` removed the identical folder in under a
+  second, so the refusal was the app's own. Permanent deletion now traverses
+  by open directory handle the same way, with the same no-follow and
+  mount-boundary rules as the inspection, and a constant number of open
+  handles at any depth. Moving to the Trash was never affected (it is a
+  rename). REMAINING, and now said honestly instead of being blamed on a
+  file name: the SIZE of such a folder still cannot be measured, so it is
+  listed at review risk with "couldn't measure its size: part of it sits
+  deeper than an absolute path can address — deleting it still works", and
+  the bytes it frees are under-reported.
+- **Build folders nested deeper than the system path limit are listed again.**
+  They were withheld on purpose: while permanent deletion went through
+  `FileManager.removeItem`, such a folder could only ever be HALF deleted —
+  the removal unlinked what it reached and then failed (measured: 202 → 181
+  entries, and "0 bytes freed" reported to you) — so offering the row would
+  have offered something no route could finish. Deletion no longer works that
+  way. The permanent route traverses by open directory handle, and Move to
+  Trash — the default — is a rename of the top folder, measured on a real
+  over-limit tree: every entry arrived, nothing was left behind, nothing was
+  half-moved. Both routes remove it whole, so the row is offered again. What
+  is left is a MEASUREMENT limit, not a deletion one, and it is all the row
+  now claims: the size shown is a FLOOR, the row is listed at review risk and
+  never selected automatically, and it says so — "SIZE IS A FLOOR … deleting
+  it still removes it whole; shorten or move the tree … to see its full
+  size". Shorten the tree and it becomes an ordinary fully measured row.
+- **Orphaned-caches delete: a folder replaced after it was inspected is no
+  longer deleted.** The pre-delete safety inspection holds the folder open,
+  which is what stops it following a swap — and also what pins it to the
+  folder it opened. If that folder was renamed away and a NEW one created
+  under the same name, the inspection reported "clean" about the folder it
+  held while the deletion, which works by path, removed the replacement.
+  Every other check in the path (container admission, containment, deny
+  list, mount boundary) is satisfied by the replacement. The inspection now
+  re-checks its own root before accepting a result, and reports WHICH object
+  its verdict is about so the deletion refuses unless that object is still
+  the one at the path. Refusals are clearable by re-scanning.
+- **Orphaned-caches "Move to Trash": the same replaced folder is no longer
+  trashed either.** Move to Trash is ON by default, and it did not go
+  through the deletion that was hardened above — it handed the folder's path
+  to the system Trash, behind nothing but a check that a swap timed one
+  syscall earlier defeats. A folder replaced in that instant was moved to
+  the Trash whole, and the app reported success with the byte count of the
+  folder it had actually inspected. The system Trash takes a path and
+  resolves it itself, so the check cannot be handed the open folder the way
+  the permanent deletion now can; what makes this safe instead is that
+  moving to the Trash destroys nothing. The app now checks the folder it
+  holds open before the move, checks WHAT THE TRASH ACTUALLY TOOK
+  afterwards, and PUTS BACK anything that turns out not to be the inspected
+  folder — reporting zero bytes freed either way. REMAINING: if the put-back
+  cannot be performed because something else has taken the original name,
+  the item stays in the Trash and the error names its path so it can be
+  restored in one drag; and a Trash that will not say where it put an item
+  is refused rather than counted, leaving that item in the Trash too.
+- **Deletes now check the FOLDER THAT HOLDS the item, not only the item.**
+  Every check above the deletion is about the item itself or about the
+  container root you configured; the folder in between — `proj` in
+  `~/Projects/proj/node_modules`, or the cache folder a category's contents
+  are cleaned out of — was checked by nothing. Deletion runs on a background
+  queue and the folder's path is resolved on the far side of that hop, so a
+  folder renamed away and replaced in that window (an app reinstalling its
+  cache directory does exactly this) sent the whole deletion into the
+  replacement: a same-named folder inside it was deleted and the app reported
+  success with the replacement's byte count. Cacheout now reads the holding
+  folder's identity from an open handle BEFORE handing the deletion a path,
+  and the deletion refuses unless the folder it opens is that same one —
+  "the folder that holds this item is no longer the one the safety check
+  admitted", clearable by re-scanning. This covers permanent deletes, category
+  contents cleans, and — see the next entry — Move to Trash. REMAINING: a swap
+  that happens BEFORE that reading is invisible, because both sides then see
+  the replacement and agree about it.
+- **"Move to Trash" now gets that same folder check — including for the items
+  that have no content check of their own.** Move to Trash is ON by default, so
+  it is the disposal most deletions use, and the folder check above landed on
+  permanent deletes only. Two paths still handed the system Trash a bare path:
+  EVERY category contents clean (those run no content inspection at all), and
+  every item from a scanner that does not offer one. For those, a folder
+  renamed away and replaced in that window sent the disposal into the
+  replacement — a same-named folder inside it went to the Trash, and the app
+  reported success with the byte count of the folder it had actually measured.
+  Cacheout now checks the holding folder from an open handle and identifies the
+  item under it immediately before the disposal, then checks what the Trash
+  actually took afterwards; anything it cannot prove is PUT BACK and reported
+  as a refusal, with nothing counted as freed. If the put-back cannot be
+  performed the item stays in the Trash and the error names its path, so it is
+  recoverable in one drag.
+- **"Move to Trash" undo: a put-back will not restore into a folder it cannot
+  prove.** When the Trash turns out to have taken the wrong folder, Cacheout
+  puts it back. That undo held its destination folder open but never checked
+  WHICH folder it was, and the check it ran afterwards went through the same
+  unchecked handle — so it confirmed itself. A folder swap in that window
+  moved your tree out of the Trash and into a stranger's folder while the app
+  reported the item had been PUT BACK. The destination is now checked against
+  the identity taken before the disposal, and when it disagrees nothing is
+  moved at all: the item stays in the Trash, and the error names both the
+  Trash path it is at and the fact that the destination folder changed.
+- **Orphaned-caches probe: deep folders no longer burn CPU quadratically.**
+  The walk re-scanned its whole open-folder stack on every level it
+  descended, so a deeply nested cache close to the inspection budget could
+  stall for a long time even though the number of entries inspected was
+  capped. The accounting is now incremental and bounded by the number of
+  folders held open, never by depth.
+- **Orphaned-caches probe: ancestor-swap disclosure.** The bounded
+  user-data probe resolved each child by absolute path, so a directory
+  replaced by a symlink after its parent had been read (but before the
+  child was vetted) redirected the walk outside `~/Library/Caches` — up to
+  the full 20,000-entry budget — and attributed what it found there to the
+  cache entry. `O_NOFOLLOW` guards only the final component, and the
+  identity re-proof could not help because the identity it compared was
+  already the foreign object's. The probe now holds each parent open and
+  discovers, stats and descends every child relative to that descriptor by
+  single-component basename, at a bounded number of live descriptors. Two
+  side effects are user-visible: trees whose absolute paths exceed
+  `PATH_MAX` are now inspected instead of being refused forever, and mount
+  boundaries are detected by filesystem id rather than by path spelling, so
+  an aliased path can no longer hide one.
+
 
 ## [2.2.0] - 2026-08-06
 

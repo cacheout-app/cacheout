@@ -441,9 +441,20 @@ final class DocumentedContractTests: XCTestCase {
     /// rule must name every NON-filesystem kind.
     func testDocumentedScannerErrorKindsCoverTheWireTaxonomy() throws {
         let text = try protocolDoc()
+        // HAND-MAINTAINED, not `CaseIterable` (noted PR #459 review r2):
+        // `ScanIssue.Kind` carries associated-value-free cases but does not
+        // conform, so a kind added without touching THIS array ships
+        // undocumented with a green suite. Extend both together. The
+        // documented taxonomy is EXTENSIBLE by contract — that is about
+        // CONSUMERS tolerating unknown kinds, not about this list being
+        // allowed to lag.
         let allKinds: [ScanIssue.Kind] = [
-            .containerRefused, .symlinkRoot, .tccDenied, .permissionDenied,
-            .unreadable, .configInvalid, .toolUnavailable, .malformedOutcome,
+            .containerRefused, .mountedVolumeRoot,
+            .mountedVolumeRootAtRegistration, .policyRefusedRoot,
+            .symlinkRoot, .nonDirectoryRoot, .tccDenied,
+            .permissionDenied,
+            .unreadable, .enumerationTruncated, .configInvalid,
+            .toolUnavailable, .malformedOutcome,
         ]
         for kind in allKinds {
             XCTAssertTrue(text.contains("`\"\(kind.wireString)\"`"),
@@ -1053,6 +1064,96 @@ final class DocumentedContractTests: XCTestCase {
         )
     }
 
+    // MARK: - Scanner-threshold flags as documented (fn-6.4, R7/R10)
+
+    /// Both documents publish the `--tmp-*` flag SPELLINGS, their
+    /// scan/clean-only gating, and their DEFAULTS. Each claim is checked
+    /// against the binary that has to honour it — a doc that names a flag the
+    /// gate does not know, or a default the config does not use, fails here.
+    func testDocumentedTempThresholdFlagsMatchTheGateAndTheDefaults() throws {
+        let flags = [CLIHandler.tmpAgeDaysFlag, CLIHandler.tmpMinSizeMBFlag]
+        XCTAssertEqual(flags, ["--tmp-age-days", "--tmp-min-size-mb"],
+                       "the documented flag spellings are frozen")
+
+        for (name, text) in [
+            ("PROTOCOL.md", try protocolDoc()),
+            ("CLI-REFERENCE.md", try cliReference()),
+        ] {
+            for flag in flags {
+                XCTAssertTrue(text.contains("`\(flag) N`"),
+                              "\(name) must publish `\(flag) N`")
+            }
+            XCTAssertTrue(text.contains("cacheout.ephemeralTmp"),
+                          "\(name) must name the persisted keys the flags override")
+        }
+
+        // The documented gating is the real gating: scan/clean accept, every
+        // other command refuses pre-dispatch.
+        for command in CLIHandler.Command.allCases {
+            for flag in flags {
+                let rejected = CLIHandler.rejectedFlag(
+                    for: command, in: [flag, "3"]
+                )?.flag
+                if command == .scan || command == .clean {
+                    XCTAssertNil(rejected, "\(command.rawValue) accepts \(flag)")
+                } else {
+                    XCTAssertEqual(rejected, flag,
+                                   "\(command.rawValue) must refuse \(flag)")
+                }
+            }
+        }
+
+        // The documented defaults are the shipped constants.
+        XCTAssertEqual(EphemeralTempSweepConfig.defaultAgeDays, 7)
+        XCTAssertEqual(EphemeralTempSweepConfig.defaultMinSizeMB, 10)
+        let cli = try cliReference()
+        XCTAssertTrue(cli.contains("`cacheout.ephemeralTmp.ageDays`, never persisted. Default 7"),
+                      "CLI-REFERENCE must publish the 7-day default")
+        XCTAssertTrue(cli.contains("`cacheout.ephemeralTmp.minSizeMB`, never persisted. Default 10"),
+                      "CLI-REFERENCE must publish the 10 MB default")
+
+        // Both are VALUED flags in the one grammar, exactly as documented in
+        // the argument-ordering rule.
+        for flag in flags {
+            XCTAssertTrue(CLIHandler.valuedFlags.contains(flag))
+            for (name, text) in [
+                ("PROTOCOL.md", try protocolDoc()),
+                ("CLI-REFERENCE.md", try cliReference()),
+            ] {
+                XCTAssertTrue(text.contains("`\(flag)`"),
+                              "\(name) must list \(flag) among the valued flags")
+            }
+        }
+    }
+
+    /// The TRIGGER POLICY is user-visible documentation, not an
+    /// implementation note: CATEGORIES tells users background refreshes never
+    /// include the temp locations, CLI-REFERENCE tells them a CLI scan always
+    /// does. The binary half of the claim (zero enumeration on `.automatic`)
+    /// is pinned in the scanner and registration suites.
+    func testDocumentedEphemeralTempTriggerPolicyIsUserVisible() throws {
+        let categories = try document("docs/v1/CATEGORIES.md")
+        XCTAssertTrue(categories.contains("ephemeral_tmp"),
+                      "CATEGORIES must name the scanner slug")
+        XCTAssertTrue(
+            categories.contains("Scanned only when YOU ask"),
+            "CATEGORIES must state the trigger policy in the user's terms"
+        )
+        XCTAssertTrue(
+            categories.lowercased().contains("automatic background\nrefreshes")
+                || categories.lowercased().contains("automatic background refreshes"),
+            "…and say that automatic background refreshes never include it"
+        )
+        XCTAssertTrue(categories.contains("never include it, for any root"),
+                      "…in words a user can act on")
+
+        let cli = try cliReference()
+        XCTAssertTrue(cli.contains("always an explicit user act"),
+                      "CLI-REFERENCE must state CLI scans are user-initiated")
+        XCTAssertTrue(cli.contains("`ephemeral_tmp`"),
+                      "…and name the scanner that follows from it")
+    }
+
     // MARK: - Fixtures
 
     /// A minimal, validator-coherent per-item row for the JSON builders.
@@ -1472,6 +1573,55 @@ final class DocumentedCLIFramingTests: XCTestCase {
                       "the refusal names the misplaced token: \(message)")
         XCTAssertTrue(message.contains("BEFORE"),
                       "…and states the rule: \(message)")
+    }
+
+    /// PROTOCOL.md and CLI-REFERENCE both say the scanner-threshold flags are
+    /// accepted by `scan`/`clean` ONLY and refused PRE-DISPATCH elsewhere,
+    /// naming the flag. Proven at the process boundary on READ-ONLY commands,
+    /// so a gate regression stays side-effect-free.
+    func testTempThresholdFlagsAreScanCleanOnlyAtTheProcessBoundaryFraming()
+        throws
+    {
+        for command in ["version", "disk-info", "memory-stats", "smart-clean"] {
+            for flag in [CLIHandler.tmpAgeDaysFlag, CLIHandler.tmpMinSizeMBFlag] {
+                let run = try runCLI(["--cli", command, flag, "3"])
+                XCTAssertEqual(run.exitCode, 1, "\(command) must refuse \(flag)")
+                XCTAssertEqual(run.stdout, "",
+                               "stdout stays EMPTY when refused: \(command)")
+                let error = try errorEnvelope(run)
+                XCTAssertEqual(error["code"] as? String, "INVALID_ARGUMENTS",
+                               "the only code a threshold refusal produces")
+                let message = (error["message"] as? String) ?? ""
+                XCTAssertTrue(message.contains(flag),
+                              "the refusal names the flag: \(message)")
+                XCTAssertTrue(message.contains(command),
+                              "…the refusing command: \(message)")
+                XCTAssertTrue(message.contains("scan or clean"),
+                              "…and where the flag belongs: \(message)")
+            }
+        }
+    }
+
+    /// A threshold flag written LAST collects no value. Reading that as an
+    /// ABSENT flag would scan with the PERSISTED thresholds the caller meant
+    /// to override — so it is refused, and refused BEFORE the runtime is even
+    /// composed (which is why this cell can name `scan` without walking a
+    /// single temp root).
+    func testTrailingTempThresholdFlagIsRefusedBeforeAnyScanFraming() throws {
+        for flag in [CLIHandler.tmpAgeDaysFlag, CLIHandler.tmpMinSizeMBFlag] {
+            let run = try runCLI(["--cli", "scan", flag])
+            XCTAssertEqual(run.exitCode, 1,
+                           "a valueless \(flag) must be refused")
+            XCTAssertEqual(run.stdout, "",
+                           "stdout stays EMPTY — nothing was scanned")
+            let error = try errorEnvelope(run)
+            XCTAssertEqual(error["code"] as? String, "INVALID_ARGUMENTS")
+            let message = (error["message"] as? String) ?? ""
+            XCTAssertTrue(message.contains(flag),
+                          "names the flag: \(message)")
+            XCTAssertTrue(message.contains("positive integer"),
+                          "says what was missing: \(message)")
+        }
     }
 
     /// The documented tolerance the MCP consumer depends on: a trailing

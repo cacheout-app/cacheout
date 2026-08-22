@@ -11,6 +11,22 @@ All user preferences are stored in `UserDefaults.standard` and persist across ap
 | `cacheout.launchAtLogin` | `Bool` | `false` | Whether to launch at login |
 | `cacheout.lastLowDiskNotification` | `Double` | `0` | Unix timestamp of last low-disk notification |
 
+### Per-item scanner thresholds
+
+Positive integers, read at scan time and NEVER rewritten by the app: a
+stored value this build cannot read (non-numeric, non-integral, boolean,
+zero, negative, or past `Int64`) falls back to the default for that scan and
+is left untouched on disk — it may be meaningful to another build. Each pair
+also has an invocation-scoped CLI override that is never persisted (see
+[CLI-REFERENCE.md](CLI-REFERENCE.md)).
+
+| Key | Type | Default | CLI override | Description |
+|-----|------|---------|--------------|-------------|
+| `cacheout.orphanedCaches.sizeFloorMB` | `Int` | `50` | `--orphan-size-floor-mb N` | Orphaned-caches sweep: stale-large size floor in decimal MB |
+| `cacheout.orphanedCaches.staleAgeDays` | `Int` | `60` | `--orphan-stale-days N` | Orphaned-caches sweep: stale-large age in days |
+| `cacheout.ephemeralTmp.minSizeMB` | `Int` | `10` | `--tmp-min-size-mb N` | Ephemeral temp scanner: entry size floor in decimal MB |
+| `cacheout.ephemeralTmp.ageDays` | `Int` | `7` | `--tmp-age-days N` | Ephemeral temp scanner: staleness age in days — the entry's own timestamp and its newest regular file must both be older than this (nested directory timestamps are not inputs; see CATEGORIES.md) |
+
 ### Scan Interval Options
 
 | Value | Display |

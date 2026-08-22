@@ -47,6 +47,7 @@ final class SpaceScannerIntegrationTests: XCTestCase {
     /// fixture home"), so the gate matches these EXACT registered slugs.
     private static let fixtureSlugs = [
         "fixture_e2e_tree", "fixture_e2e_refusals", "fixture_e2e_cache",
+        "fixture_e2e_alias", "fixture_e2e_aliased",
     ]
 
     /// The RETIRED per-item scanner slug (fn-4.5 unregistered it atomically
@@ -495,10 +496,36 @@ final class SpaceScannerIntegrationTests: XCTestCase {
         )
     }
 
-    /// Every PER-ITEM scanner of a runtime (the aggregate adapter excluded).
+    /// Every PER-ITEM scanner of a runtime that this fixture may drive (the
+    /// aggregate adapter excluded, and `ephemeral_tmp` with it): fn-6.4
+    /// registers the temp scanner over the machine's REAL confstr roots
+    /// (`/private/tmp`, `…/T`, `…/C`), so including it here would walk live
+    /// system state — neither hermetic nor fast. Its registration is asserted
+    /// structurally, and its scan/clean behavior over INJECTED fixture roots
+    /// lives in `EphemeralTempRegistrationTests`.
+    ///
+    /// THE SECOND, LOAD-BEARING HALF THE RATIONALE ABOVE OMITTED (PR #459
+    /// review r1): hermeticity is not the only obstacle, and un-excluding the
+    /// temp scanner would NOT restore a registry-wide invariant here. This
+    /// fixture's `base` is `fm.temporaryDirectory` — i.e. INSIDE the `…/T`
+    /// root — while `ephemeral_tmp` emits FIRST-LEVEL entries only and the
+    /// fixture tree sits several levels below; the fixture is also seconds
+    /// old, so the 7-day age gate would emit nothing regardless. The
+    /// cross-scanner listing question is therefore not answerable in this
+    /// file at all. It is answered in `EphemeralTempRegistrationTests`, over
+    /// injected fixture roots, by `testTwoScannersOverOneRootPublishTheSame
+    /// DirectoryTwice` — which is the CHARACTERIZATION, not a refusal: there
+    /// is no cross-scanner de-duplication anywhere, and round 1's attempt to
+    /// create one at root granularity was reverted in review r2 (it discarded
+    /// the entire build-artifacts walk of the colliding root). The
+    /// `~/Library/Caches` instance of the same class is pinned there too, by
+    /// `testTwoScannersOverOneCachesRootPublishTheSameDirectoryTwice`.
     private func perItemScannerIDs(_ runtime: SpaceScannerRuntime) -> Set<String> {
         Set(runtime.scanners.map(\.id))
-            .subtracting([CategoryScanner.registeredID])
+            .subtracting([
+                CategoryScanner.registeredID,
+                EphemeralTempScanner.registeredID,
+            ])
     }
 
     /// One validated scan of the given scanner subset, collected per scanner
@@ -528,10 +555,18 @@ final class SpaceScannerIntegrationTests: XCTestCase {
 
     /// THE SWAP, proven in ONE run: `build_artifacts` is registered and
     /// addressable, `node_modules` is neither, and the one fixture
-    /// node_modules tree is listed EXACTLY once — under `build_artifacts`.
-    /// No commit exists in which both are registered (double-listing, D4) or
-    /// in which the legacy slug can still emit unmarked, non-revalidated
-    /// items for the same trees (an R17 bypass).
+    /// node_modules tree is listed EXACTLY once BY THE SCANNERS THIS FIXTURE
+    /// DRIVES — under `build_artifacts`. No commit exists in which both are
+    /// registered (double-listing, D4) or in which the legacy slug can still
+    /// emit unmarked, non-revalidated items for the same trees (an R17
+    /// bypass).
+    ///
+    /// SCOPE (PR #459 review r1): the exactly-once claim is proven over the
+    /// `build_artifacts`/`orphaned_caches` pair — `perItemScannerIDs`
+    /// subtracts `categories` and `ephemeral_tmp` from the four registered
+    /// scanners this test asserts below. It is NOT a registry-wide invariant,
+    /// and reading it as one is what left the `build_artifacts` ×
+    /// `ephemeral_tmp` collision untested until it was executed by hand.
     func testAtomicSwapRegistersBuildArtifactsAndRetiresTheNodeModulesSlug() async throws {
         let dev = base.appendingPathComponent("dev")
         let nodeModules = try makeMarkerProject(
@@ -554,6 +589,7 @@ final class SpaceScannerIntegrationTests: XCTestCase {
             // fn-5.6 registered the worktree scanner in the same registry; the
             // swap this test pins is unaffected by later arrivals.
             GitWorktreeScanner.registeredID,
+            EphemeralTempScanner.registeredID,
         ])
         XCTAssertFalse(
             runtime.scanners.contains { $0.id == retiredNodeModulesSlug },
@@ -570,8 +606,12 @@ final class SpaceScannerIntegrationTests: XCTestCase {
         let listedBy = scanned.outcomes.filter { _, outcome in
             outcome.items.contains { $0.url?.path == identityPath(nodeModules) }
         }.keys.sorted()
-        XCTAssertEqual(listedBy, [BuildArtifactsScanner.registeredID],
-                       "exactly one registered scanner lists the tree")
+        XCTAssertEqual(
+            listedBy, [BuildArtifactsScanner.registeredID],
+            "exactly one of the scanners this fixture DRIVES lists the tree "
+                + "— `categories` and `ephemeral_tmp` are excluded, see "
+                + "`perItemScannerIDs`; this is not a registry-wide claim"
+        )
         let buildItems = try XCTUnwrap(
             scanned.outcomes[BuildArtifactsScanner.registeredID]?.items
         )
@@ -732,13 +772,17 @@ final class SpaceScannerIntegrationTests: XCTestCase {
             "the rebuilt runtime walks BOTH configured roots"
         )
         // Still the production registry — the factory rebuilt the same
-        // composition, not a different one.
+        // composition, not a different one. (Every registered per-item
+        // scanner gets a section, whether or not this scan requested it:
+        // `ephemeral_tmp` is here with no items because only
+        // `build_artifacts` was scanned.)
         XCTAssertEqual(
             viewModel.perItemSections.map(\.scannerID),
             [
                 BuildArtifactsScanner.registeredID,
                 OrphanedCachesScanner.registeredID,
                 GitWorktreeScanner.registeredID,
+                EphemeralTempScanner.registeredID,
             ]
         )
     }
@@ -768,6 +812,153 @@ final class SpaceScannerIntegrationTests: XCTestCase {
             deps.runtime.scanners.contains { $0.id == retiredNodeModulesSlug },
             "the CLI composition is the swapped one too"
         )
+    }
+
+    // MARK: - Cross-scanner alias shadowing (review P2, fn-4.5)
+
+    /// The SHARPER half of the alias-shadowing defect a00d657 fixed inside
+    /// the dev-root list: the root a symlink dev root aliases need not be a
+    /// DEV root at all. `~/Library/Caches` enters the runtime union from
+    /// `orphaned_caches`, and the production registry puts `build_artifacts`
+    /// FIRST — so an alias dev root sat ahead of the sweep's own root, and
+    /// `matchConfiguredRoot`'s first-match returned the alias for every
+    /// orphaned-cache origin claim, which `admitContainer`'s no-follow gate
+    /// then refused: every sweep cleanup failed `containerUnavailable`.
+    ///
+    /// Driven through the REAL production composition, in the REAL
+    /// registration order, all the way to a deletion.
+    func testAliasDevRootNeverShadowsAnotherScannersRealRoot() async throws {
+        let provider = FileSystemIdentityProvider()
+        let caches = fixtureHome.appendingPathComponent("Library/Caches")
+        let stale = caches.appendingPathComponent("com.example.gone")
+        try makePayloadTree(at: stale)
+        // A symlink-LEAF dev root whose target is the sweep's root — legal
+        // to configure (the container-root policy admits `~/Library/Caches`)
+        // and never itself walkable.
+        let alias = base.appendingPathComponent("dev-alias")
+        try fm.createSymbolicLink(at: alias, withDestinationURL: caches)
+        XCTAssertEqual(provider.canonicalize(alias).path,
+                       provider.canonicalize(caches).path,
+                       "fixture precondition: the alias resolves onto the "
+                       + "sweep's caches root")
+
+        let runtime = productionRuntime(devRoots: [alias])
+        // The order this defect needs is the PRODUCTION one — asserted, not
+        // assumed, so a future registry reshuffle cannot silently turn this
+        // test into a tautology.
+        let registrationOrder = runtime.scanners.map(\.id)
+        let artifactsIndex = try XCTUnwrap(
+            registrationOrder.firstIndex(of: BuildArtifactsScanner.registeredID)
+        )
+        let sweepIndex = try XCTUnwrap(
+            registrationOrder.firstIndex(of: OrphanedCachesScanner.registeredID)
+        )
+        XCTAssertLessThan(artifactsIndex, sweepIndex,
+                          "the dev-root scanner registers FIRST, so its alias "
+                          + "is what first-match root matching would find")
+        // The union carries at most ONE spelling per canonical location, and
+        // when any spelling is a real directory that is the one kept — an
+        // unusable alias may never sit ahead of the root it shadows.
+        //
+        // Asserted as the PROPERTY rather than as a literal one-element list.
+        // The union legitimately grew when the ephemeral-temp scanner joined
+        // the registry (fn-6) and now also carries its temp roots; pinning the
+        // whole list would fail for the unrelated reason that another scanner
+        // registered, while checking the shadowing property no more closely
+        // than the three assertions below do.
+        let unionPaths = runtime.trustedContainerRoots.map(\.path)
+        XCTAssertTrue(
+            unionPaths.contains(caches.path),
+            "the sweep's REAL root survives in the union: \(unionPaths)"
+        )
+        XCTAssertFalse(
+            unionPaths.contains(alias.path),
+            "the unusable alias is suppressed from the runtime union: "
+                + "\(unionPaths)"
+        )
+        // The general form of "the alias does not shadow the root", and the
+        // half a one-element list could never state once the union has more
+        // than one member: NO canonical location appears twice under two
+        // spellings anywhere in the union.
+        let canonicalUnion = runtime.trustedContainerRoots.map {
+            provider.canonicalize($0).path
+        }
+        XCTAssertEqual(
+            Set(canonicalUnion).count, canonicalUnion.count,
+            "exactly one spelling per canonical location: \(canonicalUnion)"
+        )
+
+        // The sweep's own origin claim must still admit — and clean.
+        let key = ItemKey(
+            scannerID: OrphanedCachesScanner.registeredID, itemID: "stale-fixture"
+        )
+        let snapshot = ContainerSnapshot.capture(
+            roots: runtime.trustedContainerRoots, provider: provider
+        )
+        let report = await runtime.makeCleaner(snapshot: snapshot).clean(
+            items: [Self.removeItemFixture(
+                scanner: OrphanedCachesScanner.registeredID, key: key,
+                name: "gone", origin: caches, target: stale
+            )],
+            moveToTrash: false
+        )
+        XCTAssertEqual(report.errors.map(\.message), [],
+                       "an aliased dev root must not make every "
+                       + "orphaned-cache cleanup fail container-unavailable")
+        XCTAssertEqual(report.entries.map(\.key), [key])
+        XCTAssertFalse(fm.fileExists(atPath: stale.path))
+    }
+
+    /// …and the suppression is ORDER-INDEPENDENT: the alias is dropped
+    /// whether its scanner registers before or after the scanner declaring
+    /// the real directory. Fixture scanners, so the proof is about the union
+    /// itself and not about any one production registry order.
+    func testUnionAliasSuppressionHoldsInBothRegistrationOrders() throws {
+        let provider = FileSystemIdentityProvider()
+        let real = base.appendingPathComponent("real-root")
+        let item = real.appendingPathComponent("victim")
+        try makePayloadTree(at: item)
+        let alias = base.appendingPathComponent("alias-root")
+        try fm.createSymbolicLink(at: alias, withDestinationURL: real)
+
+        let aliasScanner = OutcomeFixtureScanner(
+            id: "fixture_e2e_alias", trustedContainerRoots: [alias],
+            provide: { ScanOutcome(items: [], errors: []) }
+        )
+        let realScanner = OutcomeFixtureScanner(
+            id: "fixture_e2e_aliased", trustedContainerRoots: [real],
+            provide: { ScanOutcome(items: [], errors: []) }
+        )
+
+        for scanners in [[aliasScanner, realScanner], [realScanner, aliasScanner]] {
+            let runtime = try SpaceScannerRuntime(
+                scanners: scanners, categories: [],
+                home: fixtureHome, provider: provider
+            )
+            XCTAssertEqual(runtime.trustedContainerRoots.map(\.path),
+                           [real.path],
+                           "declaration order must not decide whether the "
+                           + "real root is admissible")
+            let pathGuard = PathGuard(
+                home: fixtureHome,
+                containerRoots: runtime.trustedContainerRoots,
+                provider: provider
+            )
+            let snapshot = ContainerSnapshot.capture(
+                roots: runtime.trustedContainerRoots, provider: provider
+            )
+            let container = try pathGuard.admitContainer(real, snapshot: snapshot)
+            XCTAssertNoThrow(
+                try pathGuard.validateRemovableItem(item, inside: container)
+            )
+            // The alias itself grants NOTHING extra: it never widened
+            // admission (its canonical location is the real root's), and it
+            // is no longer a spelling the guard can return.
+            XCTAssertThrowsError(
+                try pathGuard.admitContainer(alias, snapshot: snapshot),
+                "the alias spelling is not a usable container in its own right"
+            )
+        }
     }
 
     /// R17/R6 ordering, proven at the product boundary: a valuable-bearing
@@ -991,7 +1182,7 @@ final class SpaceScannerIntegrationTests: XCTestCase {
         let provider = FileSystemIdentityProvider()
         let truncated = BuildArtifactsScanner(
             home: fixtureHome, devRoots: devRoots([dev]), provider: provider,
-            valuablesProbeEntryLimit: 1
+            valuablesProbeBudget: .fixed(1)
         )
         let runtime = try SpaceScannerRuntime(
             scanners: [

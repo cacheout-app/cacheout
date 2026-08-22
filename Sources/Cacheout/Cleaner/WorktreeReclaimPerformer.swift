@@ -156,7 +156,14 @@ struct WorktreeReclaimPerformer {
     /// it (D16).
     let moveToTrash: Bool
     let trash: (URL) async throws -> Void
-    let removeTree: (URL) async throws -> Void
+    /// The permanent-delete seam. It takes the container binding as a SECOND
+    /// argument (fn-6 reconciliation) because the removal it fronts —
+    /// `DepthSafeRemoval.remove` — proves the folder it opens against an
+    /// identity captured from a descriptor BEFORE the hop onto its background
+    /// queue. Passing the binding rather than deriving it inside the seam is
+    /// what lets the capture happen at the point the ordering requires (see
+    /// the fallback's use site), not wherever the closure happens to run.
+    let removeTree: (URL, DepthSafeRemoval.AdmittedParent) async throws -> Void
     /// The GENERALIZED per-scanner pre-delete revalidator seam (D9), bound to
     /// THIS item's authorization entry by the cleaner. It can only REFUSE,
     /// never widen admission.
@@ -384,12 +391,25 @@ struct WorktreeReclaimPerformer {
         // the trash toggle (a trash failure is an error, NEVER a fall-through
         // to a permanent delete).
         do {
+            // WHICH FOLDER THIS REMOVAL WILL OPEN, bound from a descriptor —
+            // fn-6's doctrine, and its ORDERING verbatim (see the item path in
+            // CacheCleaner): taken FIRST, before the rechecks below, because
+            // everything after the capture is what the binding covers; taken
+            // last it would cover only the hop onto the removal's background
+            // queue. Nothing else here binds that folder — `admitContainer`
+            // binds the container ROOT and the worktree is a strict descendant
+            // of it. It fails closed and costs nothing to do so: the removal
+            // performs the identical open a moment later.
+            let admittedParent = try DepthSafeRemoval.admittedParent(
+                directory: worktreePath.deletingLastPathComponent(),
+                displayPath: worktreePath.path, provider: provider
+            )
             let recheck = try pathGuard.admitContainer(origin, snapshot: snapshot)
             try pathGuard.validateRemovableItem(worktreePath, inside: recheck)
             if moveToTrash {
                 try await trash(worktreePath)
             } else {
-                try await removeTree(worktreePath)
+                try await removeTree(worktreePath, admittedParent)
             }
         } catch {
             if error is PathGuardError {

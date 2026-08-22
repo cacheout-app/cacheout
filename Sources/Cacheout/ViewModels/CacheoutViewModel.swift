@@ -202,11 +202,63 @@ struct ScannerSectionModel: Identifiable {
     let items: [ReclaimableItem]
     let issues: [ScanIssue]
     let isScanning: Bool
+    /// Whether this scanner has an entry in `outcomesByScannerID` — i.e.
+    /// whether it has published a validated outcome at all this session. A
+    /// scanner that RAN and found nothing publishes an EMPTY outcome, so
+    /// this is false only for one that has never been inspected.
+    let hasPublishedOutcome: Bool
     var id: String { scannerID }
 
     /// "Select Stale" renders only where staleness applies to at least one
     /// item (`isStale == nil` = control hidden/inapplicable).
     var supportsStaleness: Bool { items.contains { $0.isStale != nil } }
+
+    /// NEVER INSPECTED, as distinct from INSPECTED AND FOUND NOTHING
+    /// (PR #459 codex r11, DISCLOSURE). `items` and `issues` both fall back
+    /// to `[]` when no outcome exists (`CacheoutViewModel.items(forScanner:)`
+    /// / `issues(forScanner:)`), so an empty section on its own cannot tell
+    /// the two apart — and the ephemeral temp scanner sits in exactly that
+    /// state from launch until the user presses Scan, because
+    /// `EphemeralTempScanner.participates(in:)` returns
+    /// `context.includeProtectedRoots` and a non-participating scanner
+    /// publishes NO outcome (deliberately — that is what keeps an automatic
+    /// refresh from erasing prior findings and ticks).
+    ///
+    /// Three clauses, each load-bearing:
+    /// - `!hasPublishedOutcome` — an outcome ever published means the
+    ///   answer is known, and "nothing" is then a real finding.
+    /// - `!isScanning` — a first scan IN FLIGHT has its own spinner; this
+    ///   state is about the absence of a scan, not its progress.
+    /// - `issues.isEmpty` — a scanner whose only event was
+    ///   `malformedOutcome` has no outcome but DOES have a visible issue
+    ///   (`malformedIssuesByScannerID`), and that is not silence.
+    ///
+    /// `items.isEmpty` is IMPLIED by `!hasPublishedOutcome` and is
+    /// deliberately not restated: a clause no mutation can falsify is not a
+    /// guard.
+    var isAwaitingFirstScan: Bool {
+        !hasPublishedOutcome && !isScanning && issues.isEmpty
+    }
+
+    /// Whether `ContentView` renders this section at all — HOISTED out of
+    /// the view body (PR #459 codex r11) so the visibility rule is
+    /// assertable: SwiftUI bodies are assertion-dead, and this predicate is
+    /// what decides whether the not-yet-scanned disclosure reaches the user
+    /// at all.
+    ///
+    /// The first three clauses are the as-built gate, verbatim; the fourth
+    /// is the fix. A section that HAS been scanned and holds nothing stays
+    /// hidden exactly as before — silence still means "looked, found
+    /// nothing", and it no longer also means "never looked".
+    var isDisplayed: Bool {
+        !items.isEmpty || isScanning || !issues.isEmpty || isAwaitingFirstScan
+    }
+
+    /// The header's parenthetical. "0 found" is an AFFIRMATIVE claim about a
+    /// completed inspection, so a never-inspected section must not make it.
+    var headerCountLabel: String {
+        isAwaitingFirstScan ? "not scanned yet" : "\(items.count) found"
+    }
 }
 
 @MainActor
@@ -568,15 +620,44 @@ class CacheoutViewModel: ObservableObject {
         outcomesByScannerID.values.contains { !$0.items.isEmpty }
     }
 
+    /// Whether ANY per-item scanner has never been inspected — the outer
+    /// gate's share of `ScannerSectionModel.isAwaitingFirstScan`, hoisted
+    /// here for the same reason `isDisplayed` was hoisted onto the section
+    /// model: `ContentView`'s body is assertion-dead, so a visibility rule
+    /// spelled only there cannot be pinned by a cell.
+    var hasAwaitingFirstScanSection: Bool {
+        perItemSections.contains { $0.isAwaitingFirstScan }
+    }
+
     /// What the results list gates on: items OR classified issues OR a
-    /// malformed-outcome surface. An issue-only scan (every root denied,
-    /// zero items) and a first-event malformed scanner both MUST render —
-    /// a denied search root is information, never an empty state (R14/D6),
-    /// and a fail-closed refusal is only fail-closed if it is visible.
+    /// malformed-outcome surface OR a scanner that has never been inspected.
+    /// An issue-only scan (every root denied, zero items) and a first-event
+    /// malformed scanner both MUST render — a denied search root is
+    /// information, never an empty state (R14/D6), and a fail-closed refusal
+    /// is only fail-closed if it is visible.
+    ///
+    /// THE FOURTH CLAUSE IS WHAT MAKES r11's DISCLOSURE REACHABLE (PR #459
+    /// codex r14, DISCLOSURE). r11 taught a never-inspected section to say
+    /// "not scanned yet" and hoisted `isDisplayed` so a cell could pin it,
+    /// then disclosed — and did not close — that this outer gate still could
+    /// not see it. On the machine the disclosure exists for, that gap is
+    /// total: the participating scanners publish EMPTY outcomes (no items, no
+    /// errors, nothing malformed), all three clauses above read false,
+    /// `cachesTab` takes its `emptyState` branch, and the results list —
+    /// with it every section, `isDisplayed` included — is never built. So the
+    /// "not yet scanned" row for `ephemeral_tmp` appeared on exactly the
+    /// machines that did not need it and never on a clean one.
+    ///
+    /// FOLDED HERE RATHER THAN RE-WORDING `emptyState`, because the two are
+    /// different claims. The empty state can only speak for the window; it
+    /// cannot name WHICH scanner has not run, and naming it is the whole
+    /// disclosure. Its own text is a separate, pre-existing matter — see the
+    /// residual recorded at `ContentView.swift`'s gate.
     var hasDisplayableScanOutput: Bool {
         hasResults
             || outcomesByScannerID.values.contains { !$0.errors.isEmpty }
             || !malformedIssuesByScannerID.isEmpty
+            || hasAwaitingFirstScanSection
     }
 
     var hasSelection: Bool { !selectedItemKeys.isEmpty }
@@ -660,6 +741,21 @@ class CacheoutViewModel: ObservableObject {
         + ".pkg, .app, …), so it can't be cleaned yet — scan again and "
         + "retry. It will be SKIPPED by this cleanup."
 
+    /// The same row, blocked because the inspection ran out of its ENTRY
+    /// BUDGET rather than because something obstructed it. The budget starts
+    /// at the folder's own count and DOUBLES until the inspection finishes
+    /// (`ValuablesProbeBudget`), so surviving all of it means the folder is
+    /// CHANGING while it is read — which a retry genuinely can clear, and a
+    /// permissions fix cannot. Two causes, two remedies: telling a user to
+    /// "scan again" for an impediment no scan can move is what the retired
+    /// fixed budget did, and telling one to wait for a build that is not
+    /// running is what a bound derived from a truncated count did (review r8).
+    nonisolated static let growingFolderSheetGuidance =
+        "This folder is changing faster than it can be inspected for release "
+        + "artifacts (.dmg, .pkg, .app, …), so it can't be cleaned yet — let "
+        + "the build finish, then scan again. It will be SKIPPED by this "
+        + "cleanup."
+
     /// The item's DISCLOSED valuables as sheet rows — read DIRECTLY off
     /// fn-4.4's structured field in its STORED canonical order (R3): no
     /// re-probe, no filesystem read, no evidence-string parsing, no re-sort.
@@ -711,7 +807,9 @@ class CacheoutViewModel: ObservableObject {
     ) -> String? {
         guard let disclosure = item.valuablesDisclosure,
               !disclosure.probeComplete else { return nil }
-        return incompleteProbeSheetGuidance
+        return disclosure.incompleteness == .entryBudget
+            ? growingFolderSheetGuidance
+            : incompleteProbeSheetGuidance
     }
 
     /// The keys the confirm action must filter out of BOTH the authorization
@@ -807,7 +905,13 @@ class CacheoutViewModel: ObservableObject {
                     displayName: scanner.displayName,
                     items: items(forScanner: scanner.id),
                     issues: issues,
-                    isScanning: scanningScannerIDs.contains(scanner.id)
+                    isScanning: scanningScannerIDs.contains(scanner.id),
+                    // THE never-inspected signal (PR #459 codex r11): an
+                    // entry exists iff `reconcile` ever ran for this
+                    // scanner, and it runs for an EMPTY outcome too — so
+                    // absence means "no scan has ever reported", never
+                    // "reported nothing".
+                    hasPublishedOutcome: outcomesByScannerID[scanner.id] != nil
                 )
             }
     }
@@ -1305,7 +1409,9 @@ class CacheoutViewModel: ObservableObject {
     /// parallelism, and validation all live inside the runtime.
     ///
     /// - Parameter scannerIDs: SCANNER SUBSET to run (nil — every existing
-    ///   caller — scans all registered scanners, byte-identical behavior).
+    ///   caller — scans all registered scanners that PARTICIPATE in this
+    ///   context; see `SpaceScanner.participates(in:)`, whose default is
+    ///   true, so this is byte-identical for every scanner that always runs).
     ///   A subset session adopts its snapshot atomically exactly like a
     ///   full one, so scanners OUTSIDE the subset keep their PRIOR session
     ///   provenance: fn-2's retention rules leave their items displayed,
@@ -1338,12 +1444,31 @@ class CacheoutViewModel: ObservableObject {
         // than the one whose scanners this session announced.
         let sessionRuntime = runtime
         let sessionRuntimeGeneration = runtimeGeneration
+        // THE SESSION CONTEXT, HOISTED, and the participating set derived
+        // from it ONCE (PR #459 review r1). The pending state and the session
+        // consume the SAME set, so they cannot disagree — a runtime-side
+        // filter alone would leave `scanningScannerIDs` claiming a scanner is
+        // running that never runs, which `perItemSections` renders as a
+        // permanently spinning section.
+        //
+        // A scanner that declines this trigger (`participates(in:)` false) is
+        // simply NOT IN THE SESSION, so `reconcile` never sees an entry for it
+        // and its prior outcome, its prior issues and the user's ticks all
+        // survive. An empty outcome would instead have asserted "there is
+        // nothing there" and wiped all three.
+        let context = ScanContext(trigger: trigger)
         // Pending state covers exactly the scanners this session RUNS —
         // a subset must not hold the guard hostage to scanners that will
         // never report (the runtime invokes only the named subset).
-        scanningScannerIDs = Set(sessionRuntime.scanners.map(\.id).filter {
-            scannerIDs?.contains($0) ?? true
-        })
+        let participating = Set(
+            sessionRuntime.scanners
+                .filter {
+                    (scannerIDs?.contains($0.id) ?? true)
+                        && $0.participates(in: context)
+                }
+                .map(\.id)
+        )
+        scanningScannerIDs = participating
         // New session: outcomes reconciled from here on carry THIS
         // generation's provenance — they pair only with THIS session's
         // snapshot, adopted below at completion (fn-3.4, R9). The
@@ -1358,8 +1483,8 @@ class CacheoutViewModel: ObservableObject {
         diskInfo = await Task.detached { DiskInfo.current() }.value
 
         let session = sessionRuntime.scanValidatedSession(
-            scannerIDs: scannerIDs,
-            context: ScanContext(trigger: trigger)
+            scannerIDs: participating,
+            context: context
         )
         for await event in session.events {
             handle(event, generation: generation)

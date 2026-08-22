@@ -229,7 +229,7 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
                     to: trashRoot.appendingPathComponent(url.lastPathComponent)
                 )
             },
-            removeTree: { url in try fileManager.removeItem(at: url) },
+            removeTree: { url, _ in try fileManager.removeItem(at: url) },
             revalidate: revalidate ?? { _ in nil },
             logRefusal: { _, _ in },
             logCleaned: { _ in }

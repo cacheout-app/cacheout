@@ -158,8 +158,10 @@ struct ItemKey: Hashable, Sendable {
 struct GitWorktreeReclaimPlan: Equatable, Sendable {
 
     /// The two reclaim shapes. They are NOT interchangeable: stale removal
-    /// deletes ONE worktree tree, prune removes EVERY prunable admin
-    /// directory of the repository (a repo-wide side effect — D14).
+    /// deletes ONE worktree tree, prune removes the DISCLOSED,
+    /// delete-time-recomputed prunable set of ONE repository — a
+    /// repository-SCOPED effect, removed directory by directory, never a
+    /// `git worktree prune` whose set git re-enumerates for itself (D14).
     enum Mode: Equatable, Sendable {
         /// `git -C <parent> worktree remove <worktreePath>`, with fn-5.4's
         /// guarded rm + gated prune fallback.
@@ -208,7 +210,7 @@ struct GitWorktreeReclaimPlan: Equatable, Sendable {
     let disclosedAdminDirectories: [URL]
 
     /// Stale-removal plan. The disclosed set is empty BY CONSTRUCTION here —
-    /// a stale item discloses no repo-wide prune set.
+    /// a stale item discloses no repository-level removal set.
     static func removeStaleWorktree(
         worktreePath: URL,
         worktreeAdminEntry: URL,
@@ -319,7 +321,7 @@ struct GitWorktreeReclaimPlan: Equatable, Sendable {
             }
             if !plan.disclosedAdminDirectories.isEmpty {
                 return "a stale-removal plan must disclose no prune set — a "
-                    + "repository-wide prune set belongs to the prune-only "
+                    + "repository-level removal set belongs to the prune-only "
                     + "mode, and undisclosed sweeping is what D14 forbids"
             }
             // The deletion target is the descriptor's, never the plan's: if

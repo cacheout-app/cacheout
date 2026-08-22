@@ -732,9 +732,10 @@ final class GitWorktreeEndToEndTests: XCTestCase {
     }
 
     /// ONE oracle→admin mapping implementation, with BOTH call sites present:
-    /// fn-5.5 discloses the repository-wide side effect with it and fn-5.4
+    /// fn-5.5 discloses the repository's prunable set with it and fn-5.4
     /// recomputes the same set with it. A second implementation would let
-    /// detection and execution disagree about what a prune removes.
+    /// detection and execution disagree about which admin directories the
+    /// removal destroys.
     func testExactlyOneAdminMappingImplementationWithBothCallSites() throws {
         let sources = try productionSwiftFiles()
         var declarations: [String] = []

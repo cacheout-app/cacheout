@@ -773,8 +773,9 @@ final class GitWorktreeInventoryTests: XCTestCase {
 
     func testContainerThatIsNotADirectoryIsIncompleteEvenWithNothingPrunable() throws {
         // A permission denial, an I/O error, or a container that is a FILE
-        // must never read as "nothing to prune" — a repo-wide prune would
-        // still traverse it.
+        // must never read as "nothing to prune" — this mapper's own
+        // enumeration would still traverse it, and a set it cannot account
+        // for is not a set it may call complete.
         let container = base.appendingPathComponent("file-container")
         try "not a directory".write(to: container, atomically: true, encoding: .utf8)
         guard case .incomplete(let reason) = GitWorktreeAdminMapper()
@@ -823,7 +824,7 @@ final class GitWorktreeInventoryTests: XCTestCase {
         let verdict = GitWorktreeAdminMapper()
             .map(prunableRecordsIn: entries, adminContainer: fixture.container)
         guard case .complete(let directories) = verdict else {
-            return XCTFail("git's prune skips locked admin dirs: \(verdict)")
+            return XCTFail("locked admin dirs are excluded, not incomplete: \(verdict)")
         }
         XCTAssertEqual(directories.count, 1, "only the unlocked orphan is disclosed")
     }

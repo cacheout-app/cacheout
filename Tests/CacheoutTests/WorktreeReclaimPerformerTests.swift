@@ -1566,10 +1566,27 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
     }
 
     /// Reachability from REFS ONLY — `--branches --tags --remotes`, never
-    /// `--all`. Measured on git 2.50.1: `rev-list --all` also walks OTHER
-    /// worktrees' HEADs (even under `--single-worktree`), so it reports a
-    /// detached worktree's commit as reachable right up until the worktree is
-    /// removed, which is precisely the fact under test.
+    /// `--all`.
+    ///
+    /// RE-MEASURED on git 2.50.1 (PR #460 codex r2 / D7 — the previous
+    /// parenthetical "even under `--single-worktree`" was FALSE). One
+    /// repository, one detached worktree carrying commit `C`, every command
+    /// run from the parent:
+    ///
+    /// | argv | reports `C` |
+    /// |---|---|
+    /// | `rev-list --all` | YES |
+    /// | `rev-list --all --single-worktree` | YES |
+    /// | `rev-list --single-worktree --all` | no |
+    /// | `rev-list --branches --tags --remotes` | no |
+    ///
+    /// The substantive half — the reason this helper exists — holds: `--all`
+    /// walks OTHER worktrees' HEADs, so it would report a detached worktree's
+    /// commit as reachable right up until the worktree is removed, which is
+    /// precisely the fact under test. What is not true is that
+    /// `--single-worktree` fails to suppress it; it suppresses it when it
+    /// PRECEDES `--all`, because the option must be parsed before the
+    /// pseudo-ref it constrains.
     private func isReachableFromAnyRef(
         _ oid: String, in repository: URL
     ) throws -> Bool {
@@ -2647,9 +2664,10 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
 
     func testASurvivingDisclosedEntryNeverReportsItsBytesAsFreed() async throws {
         // The disclosed-set-SHRINKS fixture: one disclosed entry became
-        // LOCKED since the scan, so git's prune skips it. The item still
-        // executes over the recomputed subset, and the survivor's bytes are
-        // NOT reported freed (verified-removal accounting).
+        // LOCKED since the scan, so the delete-time recompute drops it from
+        // the removal set. The item still executes over the recomputed
+        // subset, and the survivor's bytes are NOT reported freed
+        // (verified-removal accounting).
         let fixture = try makePruneFixture(orphans: ["gone", "locked"])
         let swept = fixture.admin[0]
         let survivor = fixture.admin[1]
@@ -2671,7 +2689,9 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         XCTAssertTrue(outcome.errors.isEmpty, "\(outcome.errors.map(\.message))")
         XCTAssertFalse(fm.fileExists(atPath: swept.path))
         XCTAssertTrue(fm.fileExists(atPath: survivor.path),
-                      "a locked admin dir survives git's own prune")
+                      "a locked admin dir is excluded by the mapper — the "
+                          + "sole enforcement since the repo-wide prune was "
+                          + "retired (D6)")
         let entry = try XCTUnwrap(outcome.entry)
         XCTAssertLessThan(
             entry.bytesFreed, 400_000,

@@ -786,8 +786,8 @@ final class GitWorktreeScannerTests: XCTestCase {
 
         // A prunable record no admin entry maps to. git 2.50.1 cannot produce
         // one (its records are DERIVED from the admin entries), so it is
-        // injected — the repo-wide prune would still remove the unmapped entry,
-        // which is exactly what D14 forbids disclosing around.
+        // injected — a record the disclosure cannot account for is exactly
+        // what D14 forbids disclosing around.
         let realListing = try await listing(of: repository)
         let doctored = Self.porcelain([
             ["worktree \(repository.resolvingSymlinksInPath().path)", "HEAD \(String(repeating: "0", count: 40))", "branch refs/heads/main"],
@@ -957,7 +957,7 @@ final class GitWorktreeScannerTests: XCTestCase {
     func testOracleToAdminMappingFlowsThroughTheOneSharedComponent() throws {
         // ONE implementation, two call sites (fn-5.4's delete-time recompute is
         // the other). A second mapping would let detection and execution
-        // disagree about a repository-wide side effect, so the scanner must
+        // disagree about which admin directories are destroyed, so the scanner must
         // neither enumerate the admin container itself nor re-derive the
         // oracle's argv.
         let text = try scannerSource()

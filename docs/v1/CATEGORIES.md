@@ -490,7 +490,7 @@ git.
 - **Tiers.** Stale candidates are one item each (Review). Separately, each
   repository with registered checkouts that no longer exist on disk gets ONE
   repository-level item for its orphaned worktree registry (Safe — it removes
-  metadata only), disclosing the complete set a prune would remove; if that
+  metadata only), disclosing the complete set it will remove; if that
   set cannot be proven complete, NO item is offered and the reason is
   reported instead. A worktree that is assessed and fails a gate is OMITTED
   from the results entirely rather than listed as an un-deletable row.

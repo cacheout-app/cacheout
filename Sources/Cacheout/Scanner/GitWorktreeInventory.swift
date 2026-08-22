@@ -79,10 +79,11 @@
 ///
 /// ONE implementation, TWO call sites: fn-5.5 (scan-time detection and
 /// disclosure) and fn-5.4 (delete-time recompute plus the final
-/// pre-subprocess check) both call `GitWorktreeAdminMapper`. A second
-/// mapping implementation is the thing this file exists to prevent — a
-/// the set this mapper returns IS the set fn-5.4 removes, so detection and
-/// execution must agree byte for byte about which directories those are.
+/// pre-removal check) both call `GitWorktreeAdminMapper`. A second mapping
+/// implementation is the thing this file exists to prevent: the set this
+/// mapper returns IS the set fn-5.4 removes, directory by directory, so
+/// detection and execution must agree byte for byte about which directories
+/// those are.
 
 import Foundation
 
@@ -431,17 +432,23 @@ struct GitWorktreeGitdirResolver {
 
 /// The ONE spelling of the orphaned-admin oracle listing — the read-only
 /// command whose `prunable` annotations detection (fn-5.5) and execution
-/// (fn-5.4's delete-time recompute and its final pre-subprocess check) both
+/// (fn-5.4's delete-time recompute and its final pre-removal check) both
 /// consume. One argv, like the one mapper below: if detection and execution
-/// asked git differently, they could disagree about a repository-wide side
-/// effect.
+/// asked git differently, they could disagree about which admin directories
+/// the execution then removes.
 ///
 /// `-c gc.worktreePruneExpire=now` is pinned (D10, empirically re-verified on
 /// git 2.50.1): a freshly orphaned checkout is annotated `prunable` even
-/// without the override, but OTHER orphan classes are expire-gated, the 2.39
-/// floor is not locally verifiable, and detection must match the `--expire=now`
-/// the execution prune pins — otherwise a detected fresh orphan survives
-/// execution as a recurring ~0-byte "success".
+/// without the override, but OTHER orphan classes are expire-gated and the
+/// 2.39 floor is not locally verifiable, so without it those classes are
+/// invisible to BOTH sides and never reclaimed at all.
+///
+/// THERE IS NO EXECUTION PRUNE TO MATCH ANY MORE (PR #460 codex r1 / C4, and
+/// this note is the r2 correction of a rationale that outlived it): the
+/// repository-level mode removes the mapped directories itself, so
+/// prunability is decided HERE and nowhere else, and the removal no longer
+/// depends on git honouring an expire policy. The override is pinned on the
+/// single shared argv precisely so the two call sites cannot drift.
 ///
 /// The MUTATION argv (`worktree remove`) deliberately does NOT live here: it
 /// belongs to the one component allowed to mutate,
@@ -483,13 +490,16 @@ enum GitAdminMappingVerdict: Equatable, Sendable {
 ///
 /// fn-5.5 uses it to decide whether a repo's prune item may be disclosed at
 /// all; fn-5.4 uses it to recompute the set at delete time and again
-/// immediately before the prune subprocess. Two implementations would let
-/// detection and execution disagree about a repo-wide side effect.
+/// immediately before the scoped removal. Two implementations would let
+/// detection and execution disagree about which directories are destroyed.
 ///
 /// The admin-ENTRY traversal gates run BEFORE any back-link is read (round
 /// 10 / F3), over EVERY entry of the carried container — not only the ones
-/// that happen to map. A repo-wide prune traverses the whole container, so a
-/// single hostile entry makes the whole disclosure unsafe.
+/// that happen to map. THIS MAPPER traverses the whole container: it
+/// enumerates it and reads each entry's back-link, and its verdict claims
+/// the set is provably COMPLETE. A single entry it cannot account for is
+/// therefore a set it cannot prove complete, whatever the removal later
+/// touches.
 struct GitWorktreeAdminMapper {
 
     private let identity: FileSystemIdentityProvider
@@ -507,8 +517,19 @@ struct GitWorktreeAdminMapper {
     /// the RESOLVER-CARRIED container.
     ///
     /// LOCKED prunable records are excluded WITHOUT making the verdict
-    /// incomplete: git's prune skips locked admin directories, so they are
-    /// not in the removal set and disclosing them would be a lie (D14).
+    /// incomplete: a locked admin directory is not in the removal set, so
+    /// disclosing it would be a lie (D14).
+    ///
+    /// THE `!$0.isLocked` BELOW IS NOW THE SOLE ENFORCEMENT (PR #460 codex
+    /// r2 / D6). It used to be a disclosure rule with a backstop: even a bad
+    /// set could not destroy a locked admin directory, because the execution
+    /// was `git worktree prune` and git's prune skips locked entries. That
+    /// prune is retired (`WorktreeReclaimPerformer.removeAdminDirectories`
+    /// removes the mapped directories itself and knows nothing about locks),
+    /// so nothing downstream re-checks the lock. Weakening, widening or
+    /// short-circuiting this filter now removes locked admin data outright.
+    /// The behaviour is correct and evidenced end to end — a locked orphan
+    /// survives a real clean — but it survives because of THIS LINE.
     func map(
         prunableRecordsIn entries: [GitWorktreeEntry], adminContainer: URL
     ) -> GitAdminMappingVerdict {
@@ -518,8 +539,8 @@ struct GitWorktreeAdminMapper {
         // nothing is prunable — a repository that never had a linked
         // worktree has no container at all. Everything else (a permission
         // denial, an I/O error, a container that is a file or a symlink) is
-        // a container this mapper cannot account for, and a repo-wide prune
-        // would still traverse it.
+        // a container this mapper cannot account for, and its own
+        // enumeration below traverses it regardless.
         switch identity.probeKind(of: adminContainer) {
         case .absent:
             if targets.isEmpty { return .complete(adminDirectories: []) }

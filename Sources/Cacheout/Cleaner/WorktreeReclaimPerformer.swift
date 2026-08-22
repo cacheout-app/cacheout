@@ -210,7 +210,7 @@ struct WorktreeReclaimPerformer {
     let runner: any GitCommandRunning
     /// fn-5.1's SHARED oracle→admin mapper — the SAME implementation fn-5.5
     /// discloses with. A second mapping would let detection and execution
-    /// disagree about a repository-wide side effect.
+    /// disagree about which admin directories the removal destroys.
     let mapper: GitWorktreeAdminMapper
     /// The sizer, as a closure: tests inject a spy and assert ZERO calls on
     /// every refusal path (the admit-before-measure proof).
@@ -588,8 +588,8 @@ struct WorktreeReclaimPerformer {
     /// An UNCONDITIONAL repo-wide prune here would sweep OTHER pre-existing
     /// prunable admin directories this stale item never disclosed — the exact
     /// undisclosed side-effect set D14 forbids. So the prunable set is
-    /// recomputed and the prune runs ONLY when that set is EXACTLY the
-    /// just-deleted worktree's own admin entry.
+    /// recomputed and the SCOPED removal runs ONLY when that set is EXACTLY
+    /// the just-deleted worktree's own admin entry.
     ///
     /// EVERY failure class here is a WARNING, never an error: the bytes are
     /// already freed and the deletion already succeeded (D11) — and the next
@@ -610,7 +610,8 @@ struct WorktreeReclaimPerformer {
         if recomputed.isEmpty {
             // Nothing is prunable. That is the honest no-op UNLESS the admin
             // entry is still on disk (a locked entry is excluded from the
-            // prunable set, and git's own prune would skip it too) — claiming
+            // prunable set by the mapper, which since the repo-wide prune was
+            // retired is the ONLY thing that excludes it — D6) — claiming
             // "orphaned admin data remains" when the directory is gone would
             // be the mirror-image lie.
             guard provider.probeKind(of: adminEntry) != .absent else { return nil }
@@ -710,7 +711,7 @@ struct WorktreeReclaimPerformer {
             // RECURSIVE filesystem mutation over these directories, so the
             // boundary-bearing-recursive-delete rule applies exactly as it
             // does to `removeItem` — and it fails CLOSED here, BEFORE any
-            // claim is registered and before the prune runs. The D13 guard
+            // claim is registered and before the removal runs. The D13 guard
             // checks the leaf and the device; only the sizer can see a
             // boundary NESTED inside.
             if report.rootMountBoundary || !report.mountBoundaries.isEmpty {

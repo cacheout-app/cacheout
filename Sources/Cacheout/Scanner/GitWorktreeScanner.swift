@@ -83,10 +83,13 @@
 ///
 /// ## D13 — the mutation scope is bound to ONE declared root
 ///
-/// `git -C <parent> worktree remove|prune` mutates the PARENT repository's
-/// admin data, so an item may be emitted only when the worktree target, the
-/// parent working directory AND the resolver-carried admin container all lie
-/// inside the SAME declared dev root — the parent alone may EQUAL the root (a
+/// Both modes mutate the PARENT repository's admin data —
+/// `git -C <parent> worktree remove` in stale mode, a direct removal of the
+/// disclosed admin directories in prune mode (there is no `worktree prune`
+/// argv anywhere in the app; PR #460 codex r1 / C4). So an item may be
+/// emitted only when the worktree target, the parent working directory AND
+/// the resolver-carried admin container all lie inside the SAME declared dev
+/// root — the parent alone may EQUAL the root (a
 /// dev root that IS a repository is legal), everything else is a STRICT
 /// descendant. A worktree outside every root, or a parent/admin container
 /// outside the worktree's root, becomes a `.containerRefused` issue and NEVER
@@ -274,7 +277,7 @@ struct GitWorktreeScanner: @unchecked Sendable {
     private let sizer: DirectorySizer
     /// fn-5.1's SHARED oracle→admin mapper — the SAME component fn-5.4 calls at
     /// delete time. A second mapping implementation would let detection and
-    /// execution disagree about a repository-wide side effect.
+    /// execution disagree about which admin directories the removal destroys.
     private let mapper: GitWorktreeAdminMapper
     /// The SHARED runner. fn-5.6 hands this scanner the runtime's ONE instance:
     /// fn-5.1's availability cache is instance-scoped, so a second runner would
@@ -892,12 +895,14 @@ struct GitWorktreeScanner: @unchecked Sendable {
     ///
     /// PROVABLY-COMPLETE-OR-NO-ITEM: the item speaks for a whole repository's
     /// registry, so a disclosure that cannot account for every prunable record
-    /// — or for every entry of the container the removal traverses — would let
+    /// — or for every entry of the container the mapper enumerates — would let
     /// the operation remove something nobody was told about. Every incompleteness
     /// therefore SUPPRESSES the item and publishes what could not be accounted
     /// for. LOCKED prunable entries are the deliberate exception, excluded by
-    /// the mapper WITHOUT suppression: git's prune skips locked admin
-    /// directories, so they are not in the removal set.
+    /// the mapper WITHOUT suppression: they are not in the removal set. That
+    /// exclusion is now the SOLE enforcement of the lock (PR #460 codex r2 /
+    /// D6) — the execution is a direct removal of the mapped directories and
+    /// no longer a `git worktree prune` that would have skipped them anyway.
     private func pruneTier(
         inventory: GitWorktreeInventory,
         parentRepoWorkingDir: URL,
@@ -917,17 +922,18 @@ struct GitWorktreeScanner: @unchecked Sendable {
             issues.append(ScanIssue(
                 url: parentRepoWorkingDir, kind: .unreadable,
                 detail: "orphaned worktree admin data in this repository cannot "
-                    + "be offered for pruning: \(reason) — a repository-wide "
-                    + "prune would remove it too, so no prune item is published"
+                    + "be offered for pruning: \(reason) — the complete set "
+                    + "cannot be accounted for, so no prune item is published"
             ))
             return
         }
         guard !directories.isEmpty else { return } // nothing prunable — no item
 
         // Every disclosed directory is measured BEFORE anything is offered.
-        // A boundary (epic round 9: `worktree prune` is a recursive filesystem
-        // mutation, and the boundary-bearing-recursive-delete doctrine covers
-        // it exactly as it covers `removeItem`) or a sizing denial means the
+        // A boundary (epic round 9: the removal of an admin directory is a
+        // recursive filesystem mutation, and the
+        // boundary-bearing-recursive-delete doctrine covers it exactly as it
+        // covers `removeItem`) or a sizing denial means the
         // directory cannot be safely characterized — and a `.measured` prune
         // item may carry no scanError, so the only honest answer is
         // suppression with a visible issue.

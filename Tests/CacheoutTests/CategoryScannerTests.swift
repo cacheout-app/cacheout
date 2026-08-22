@@ -2145,7 +2145,9 @@ final class CategoryScannerTests: XCTestCase {
         ))
 
         let categoryEvents = events.first { scannerID(of: $0) == "categories" }
-        XCTAssertEqual(outcome(of: categoryEvents!)?.items.map(\.id), ["a"])
+        XCTAssertEqual(
+            outcome(of: try XCTUnwrap(categoryEvents))?.items.map(\.id), ["a"]
+        )
         XCTAssertEqual(probeCount(slug: "a", home: home), 1)
         XCTAssertEqual(
             probeCount(slug: "b", home: home), 0,
@@ -2153,7 +2155,9 @@ final class CategoryScannerTests: XCTestCase {
         )
         // A per-item scanner ignores the filter entirely.
         let fixtureEvents = events.first { scannerID(of: $0) == "fixture_x" }
-        XCTAssertEqual(outcome(of: fixtureEvents!)?.items, [fixtureItem])
+        XCTAssertEqual(
+            outcome(of: try XCTUnwrap(fixtureEvents))?.items, [fixtureItem]
+        )
 
         // nil filter scans all.
         let allEvents = await collect(runtime.scanValidated(

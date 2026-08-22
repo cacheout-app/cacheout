@@ -113,7 +113,7 @@ final class MemlimitWorkaroundTests: XCTestCase {
         XCTAssertNil(call.buffer, "HWM path should not pass a buffer")
     }
 
-    func testHWMPathReportsFailure() {
+    func testHWMPathReportsFailure() throws {
         let mock = MockMemorystatusProvider()
         mock.returnValue = -1
         mock.errnoToSet = 22  // EINVAL
@@ -121,8 +121,7 @@ final class MemlimitWorkaroundTests: XCTestCase {
 
         let (success, error) = workaround.setJetsamLimit(pid: 42, limitMB: 256)
         XCTAssertFalse(success)
-        XCTAssertNotNil(error)
-        XCTAssertTrue(error!.contains("hwm_failed"))
+        XCTAssertTrue(try XCTUnwrap(error).contains("hwm_failed"))
     }
 
     // MARK: - Properties path (128GB bug workaround)
@@ -158,7 +157,7 @@ final class MemlimitWorkaroundTests: XCTestCase {
         XCTAssertEqual(entry.state, 0)
     }
 
-    func testPropertiesPathReportsFailure() {
+    func testPropertiesPathReportsFailure() throws {
         let mock = MockMemorystatusProvider()
         mock.returnValue = -1
         mock.errnoToSet = 1  // EPERM
@@ -166,8 +165,7 @@ final class MemlimitWorkaroundTests: XCTestCase {
 
         let (success, error) = workaround.setJetsamLimit(pid: 99, limitMB: 512)
         XCTAssertFalse(success)
-        XCTAssertNotNil(error)
-        XCTAssertTrue(error!.contains("properties_failed"))
+        XCTAssertTrue(try XCTUnwrap(error).contains("properties_failed"))
     }
 
     // MARK: - Bug detection (KernelProbeBugDetector via MockSystemInfo)

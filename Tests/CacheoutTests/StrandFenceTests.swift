@@ -48,21 +48,55 @@ import XCTest
 /// `testTheFenceReadsEveryTestTargetInTheBundle` fails if either target stops
 /// being read.
 ///
+/// ## And force-unwrap is FORBIDDEN, not merely counted (PR #460 codex r7, D4)
+///
+/// Through r6 `x!` was only INVENTORIED: `testTheForceUnwrapPopulationDoesNotGrow`
+/// pinned the count per file. Pinning a count makes no EXISTING site safe, and
+/// the dangerous population is not the big one — it is the one whose optional
+/// is decided by PRODUCTION code, where the cell exists precisely to catch
+/// production returning nil. PROVEN BY THE r7 REVIEW, whose figures these are
+/// and which this file did not re-run: making
+/// `Sources/CacheoutHelperLib/MemlimitWorkaround.swift:187` return a nil detail
+/// turned `XCTAssertTrue(error!.contains("hwm_failed"))` into
+/// `Fatal error: Unexpectedly found nil`, **signal 5, the total line never
+/// printed, 493 of 1471 cells never ran**, and this PR's own
+/// `WorktreeReclaimPerformerTests` appeared in the log zero times.
+///
+/// So r7 converted that population — 14 sites in `CategoryScannerTests`,
+/// `CompressorTrackerTests`, `PredictiveEngineTests`,
+/// `MemlimitWorkaroundTests`, `EphemeralTempRegistrationTests` and
+/// `EphemeralTempScannerTests` — and turned the fence around: force-unwrap is
+/// an offender UNLESS it matches one of five shapes whose operand cannot be
+/// production-decided, listed with their justifications in
+/// `forceUnwrapAllowances`, or names an implicitly-unwrapped property declared
+/// in the SAME FILE (a `setUp`-assigned fixture, decided by the test).
+/// `testTheForceUnwrapAllowlistIsExactlyWhatItClaims` proves both directions on
+/// synthetic lines, so the allowlist cannot quietly widen.
+///
+/// BOTH CELLS ARE MUTATION-TESTED, because a fence that cannot go red is a
+/// comment. Restoring ONE converted site —
+/// `XCTAssertTrue(error!.contains("hwm_failed"))` in
+/// `MemlimitWorkaroundTests` — reddens
+/// `testNoForceUnwrapCanBeDecidedByProductionCode` naming that exact line;
+/// widening the UTF-8 allowance to `\.data\(using: [^)]*\)!` reddens
+/// `testTheForceUnwrapAllowlistIsExactlyWhatItClaims` on
+/// `text.data(using: .ascii)!`.
+///
 /// ## What this fence does NOT cover, stated rather than implied
 ///
-/// The forbidden set is `try!` and an integer subscript on a named receiver —
-/// the two constructs measured to have stranded THIS suite. Swift has others,
-/// and pretending otherwise is the failure mode this file exists to correct:
-///
-/// - **force-unwrap (`x!`) in statement position** — 86 sites across 17 files
-///   at r6 (the inventory below is the measurement), most of them on
-///   compile-time-constant expressions
-///   (`"…".data(using: .utf8)!`, `TimeZone(identifier: "UTC")!`) or on
-///   `setUp`-assigned implicitly-unwrapped fixtures. Converting them is a
-///   change to nearly every file in the suite and is NOT in this PR. It is
-///   enforced the other way instead: `testTheForceUnwrapPopulationDoesNotGrow`
-///   pins the count PER FILE, so a new one fails and a converted one has to be
-///   deducted. Force-unwrap in MESSAGE position stays forbidden outright.
+/// - **A subscript with a VARIABLE index (`xs[i]`) is NOT matched, and the
+///   forbidden set is a LITERAL integer index only** (PR #460 codex r7, D4).
+///   The r6 wording said "an integer subscript on a named receiver" and
+///   explained the regex only in terms of the receiver, which reads as though
+///   `xs[i]` were covered; it is not, and it traps identically. It is not
+///   matched because a regex cannot tell an ARRAY subscript from a DICTIONARY
+///   one, and a dictionary subscript returns an Optional and cannot trap.
+///   MEASURED at r7: widening the pattern to any identifier index reports
+///   **105** lines across the suite, of which the overwhelming majority are
+///   dictionary reads (`failures[url.path]`, `paths[scanner.registeredID]`,
+///   `environment[key]`) — a fence that is ~90% false positives is a fence
+///   that gets suppressed. `testTheIntegerSubscriptPatternMatchesLiteralIndicesOnly`
+///   pins this scope so the claim and the regex cannot drift apart again.
 /// - **`as!`, `precondition`, `fatalError`, arithmetic overflow, out-of-range
 ///   `Range` subscripts, `Array(repeating:count:)` with a negative count** —
 ///   not scanned at all. No occurrence of any of them has stranded a run here.
@@ -189,14 +223,19 @@ final class StrandFenceTests: XCTestCase {
     ///
     /// `try!` — the throw is usually decided by production code, which is the
     /// regression the cell exists to catch, converted into a process kill.
-    /// An INTEGER SUBSCRIPT on a named receiver — the receiver is usually a
-    /// collection production filled, so "it cannot be empty" is a claim about
-    /// the code under test. A subscript into an array LITERAL (`+ [0]`,
-    /// `[20]`) is not one: the regex requires an identifier, `)` or `]`
-    /// immediately before the bracket.
+    /// A LITERAL-INTEGER SUBSCRIPT on a named receiver — the receiver is
+    /// usually a collection production filled, so "it cannot be empty" is a
+    /// claim about the code under test. TWO exclusions, both deliberate and
+    /// both pinned by `testTheIntegerSubscriptPatternMatchesLiteralIndicesOnly`:
+    /// a subscript into an array LITERAL (`+ [0]`, `[20]`) is not a claim about
+    /// production, so the regex requires an identifier, `)` or `]` immediately
+    /// before the bracket; and a VARIABLE index (`xs[i]`) is not matched at
+    /// all, because no regex can separate it from a dictionary read, which
+    /// cannot trap (see the header, D4).
     private static let statementTraps: [(name: String, pattern: String)] = [
         ("try!", #"\btry!"#),
-        ("integer subscript", #"[A-Za-z0-9_\)\]]\s*\[\s*[0-9]+\s*\]"#),
+        ("literal-integer subscript",
+         #"[A-Za-z0-9_\)\]]\s*\[\s*[0-9]+\s*\]"#),
     ]
 
     func testNoTrappingConstructAnywhereInATestSourceCanStrandTheRun() throws {
@@ -241,77 +280,225 @@ final class StrandFenceTests: XCTestCase {
         )
     }
 
-    // MARK: - The population this fence does NOT convert, pinned so it cannot grow
 
-    /// Statement-position force-unwraps, PER FILE, as measured at PR #460
-    /// codex r6.
+    // MARK: - Force-unwrap: forbidden unless provably not production-decided
+
+    /// The five shapes a force-unwrap may take, each with the reason its
+    /// operand cannot be decided by the code under test (PR #460 codex r7,
+    /// D4). Anything else is an offender; there is no per-file quota and no
+    /// way to add a site without adding a JUSTIFICATION here.
     ///
-    /// This is an INVENTORY, not an approval. `x!` strands exactly like the
-    /// two constructs above; there are simply too many of them, on too many
-    /// provably-constant expressions, to convert inside this PR. Pinning the
-    /// per-file count is the enforcement that fits: a NEW one fails this cell,
-    /// and a CONVERTED one fails it too until the number is deducted — so the
-    /// population can only shrink, and every movement is reviewed.
-    ///
-    /// Implicitly-unwrapped PROPERTY DECLARATIONS (`private var base: URL!`)
-    /// are not force-unwraps and are not counted; the use sites of those
-    /// properties are.
-    private static let forceUnwrapInventory: [String: Int] = [
-        "CacheoutHelperTests/MemlimitWorkaroundTests.swift": 2,
-        "CacheoutHelperTests/SysctlJournalTests.swift": 1,
-        "CacheoutTests/BuildArtifactsScannerTests.swift": 4,
-        "CacheoutTests/CacheoutViewModelTests.swift": 2,
-        "CacheoutTests/CategoryScannerTests.swift": 2,
-        "CacheoutTests/CompressorTrackerTests.swift": 2,
-        "CacheoutTests/DepthSafeRemovalTests.swift": 3,
-        "CacheoutTests/DevRootsSettingsTests.swift": 1,
-        "CacheoutTests/EphemeralTempRegistrationTests.swift": 1,
-        "CacheoutTests/EphemeralTempScannerTests.swift": 3,
-        "CacheoutTests/GitWorktreeScannerTests.swift": 1,
-        "CacheoutTests/HeadlessTests.swift": 35,
-        "CacheoutTests/OrphanedCachesScannerTests.swift": 8,
-        "CacheoutTests/PredictiveEngineTests.swift": 6,
-        "CacheoutTests/RecommendationEngineTests.swift": 2,
-        "CacheoutTests/WorktreeReclaimPerformerTests.swift": 12,
-        "CacheoutTests/WorktreeStalenessAssessorTests.swift": 1,
+    /// A sixth allowance is computed per file rather than listed: a name
+    /// declared in the SAME FILE as an implicitly-unwrapped property
+    /// (`private var home: URL!`) is a `setUp`-assigned fixture. If it is nil
+    /// the FIXTURE failed, which `setUpWithError` already reports, and no
+    /// production return value is involved.
+    static let forceUnwrapAllowances: [(reason: String, pattern: String)] = [
+        ("a UTF-8 encoding of a Swift String, which cannot fail",
+         #"\.data\(using: \.utf8\)!"#),
+        // NOT a raw literal: this pattern needs `"` inside it, and a raw
+        // literal spelling it carries FIVE quote characters on one line, which
+        // leaves `blankingComments`' string tracker open and silently unblanks
+        // every comment below it (measured — it reported this file's own
+        // `/// private var base: URL!` doc line as an offender). Escaped
+        // quotes in an ordinary literal are balanced and are handled.
+        ("a TimeZone from a literal identifier",
+         "TimeZone\\(identifier: \"[^\"]*\"\\)!"),
+        ("the base address of a buffer the cell itself allocated",
+         #"baseAddress!"#),
+        ("the last element of a collection the cell itself filled",
+         #"\.last!"#),
+        ("the pointer `withUnsafe…` hands its own closure",
+         #"\$0!"#),
     ]
 
-    func testTheForceUnwrapPopulationDoesNotGrow() throws {
-        var counts: [String: Int] = [:]
+    /// Every implicitly-unwrapped property name declared in `source`.
+    static func implicitlyUnwrappedNames(in source: String) -> Set<String> {
+        var names: Set<String> = []
+        for line in source.split(
+            separator: "\n", omittingEmptySubsequences: false
+        ) where isImplicitlyUnwrappedDeclaration(String(line)) {
+            guard let match = String(line).range(
+                of: #"(var|let)\s+\w+"#, options: .regularExpression
+            ) else { continue }
+            let declaration = String(line)[match]
+            if let name = declaration.split(separator: " ").last {
+                names.insert(String(name))
+            }
+        }
+        return names
+    }
+
+    /// The character ranges on one line that an allowed force-unwrap may end
+    /// inside.
+    private static func allowedRanges(
+        in line: String, fixtures: Set<String>
+    ) -> [Range<String.Index>] {
+        var patterns = forceUnwrapAllowances.map(\.pattern)
+        for name in fixtures.sorted() {
+            patterns.append(#"\b(self\.)?"# + NSRegularExpression.escapedPattern(for: name) + "!")
+        }
+        var ranges: [Range<String.Index>] = []
+        for pattern in patterns {
+            var cursor = line.startIndex
+            while let hit = line.range(
+                of: pattern, options: .regularExpression,
+                range: cursor..<line.endIndex
+            ) {
+                ranges.append(hit)
+                cursor = hit.upperBound
+            }
+        }
+        return ranges
+    }
+
+    /// The force-unwraps on one line that no allowance covers.
+    static func unjustifiedForceUnwraps(
+        in line: String, fixtures: Set<String>
+    ) -> Int {
+        if isImplicitlyUnwrappedDeclaration(line) { return 0 }
+        let allowed = allowedRanges(in: line, fixtures: fixtures)
+        var offenders = 0
+        var cursor = line.startIndex
+        while let hit = line.range(
+            of: #"[A-Za-z0-9_\)\]]!(?!=)"#, options: .regularExpression,
+            range: cursor..<line.endIndex
+        ) {
+            let bang = line.index(before: hit.upperBound)
+            if !allowed.contains(where: { $0.contains(bang) }) { offenders += 1 }
+            cursor = hit.upperBound
+        }
+        return offenders
+    }
+
+    func testNoForceUnwrapCanBeDecidedByProductionCode() throws {
+        var offenders: [String] = []
+        var scannedFiles = 0
+
         for file in try testSources() {
             let source = Self.blankingLiteralText(
                 Self.blankingComments(
                     try String(contentsOf: file, encoding: .utf8)
                 )
             )
-            var found = 0
-            for line in source.split(
+            scannedFiles += 1
+            let fixtures = Self.implicitlyUnwrappedNames(in: source)
+            for (number, line) in source.split(
                 separator: "\n", omittingEmptySubsequences: false
-            ) {
-                if Self.isImplicitlyUnwrappedDeclaration(String(line)) {
-                    continue
+            ).enumerated() {
+                let count = Self.unjustifiedForceUnwraps(
+                    in: String(line), fixtures: fixtures
+                )
+                if count > 0 {
+                    offenders.append(
+                        "\(target(of: file))/\(file.lastPathComponent):"
+                            + "\(number + 1)"
+                    )
                 }
-                var cursor = line.startIndex
-                while let hit = line.range(
-                    of: #"[A-Za-z0-9_\)\]]!(?!=)"#,
-                    options: .regularExpression,
-                    range: cursor..<line.endIndex
-                ) {
-                    found += 1
-                    cursor = hit.upperBound
-                }
-            }
-            if found > 0 {
-                counts["\(target(of: file))/\(file.lastPathComponent)"] = found
             }
         }
+
+        XCTAssertGreaterThan(
+            scannedFiles, 40,
+            "the fence must actually have read the suite, not an empty listing"
+        )
         XCTAssertEqual(
-            counts, Self.forceUnwrapInventory,
-            "the statement-position force-unwrap inventory moved. A NEW `x!` "
-                + "is refused (use `try XCTUnwrap`); a REMOVED one means the "
-                + "number here is stale and must be deducted."
+            offenders, [],
+            "a force-unwrap whose optional is decided by PRODUCTION code turns "
+                + "the regression it exists to catch into a process kill — "
+                + "measured: 493 of 1471 cells never ran. Use "
+                + "`try XCTUnwrap(x)`, or add the shape to "
+                + "`forceUnwrapAllowances` with the reason it cannot be "
+                + "production-decided."
         )
     }
+
+    /// The allowlist's own regression guard: both directions, on synthetic
+    /// lines, so a widened pattern is caught by this cell rather than by a
+    /// stranded run six months from now.
+    func testTheForceUnwrapAllowlistIsExactlyWhatItClaims() {
+        let fixtures: Set<String> = ["home", "container"]
+        for allowed in [
+            #"let data = "x".data(using: .utf8)!"#,
+            #"private static let utc = TimeZone(identifier: "UTC")!"#,
+            "String(cString: buffer.baseAddress!)",
+            "let fd = fds.last!",
+            "mkfifo($0!, 0o644)",
+            "let root = home!",
+            "let root = self.home!",
+            "for url in [home!, container!] { _ = url }",
+        ] {
+            XCTAssertEqual(
+                Self.unjustifiedForceUnwraps(in: allowed, fixtures: fixtures),
+                0, "must be allowed: \(allowed)"
+            )
+        }
+        for refused in [
+            #"XCTAssertTrue(error!.contains("hwm_failed"))"#,
+            "XCTAssertEqual(prediction!, 61.0)",
+            "let events = outcome(of: categoryEvents!)",
+            "let value = try JSONSerialization.jsonObject(with: payload)!",
+            #"let data = text.data(using: .ascii)!"#,
+            #"let zone = TimeZone(identifier: identifier)!"#,
+            "let root = homeDirectory!",
+        ] {
+            XCTAssertEqual(
+                Self.unjustifiedForceUnwraps(in: refused, fixtures: fixtures),
+                1, "must be refused: \(refused)"
+            )
+        }
+    }
+
+    /// D4(b): the literal-integer subscript pattern's REACH, pinned in both
+    /// directions. The r6 wording implied a variable index was covered; it is
+    /// not, and the reason is in the header. This cell makes the documented
+    /// scope and the regex one fact.
+    func testTheIntegerSubscriptPatternMatchesLiteralIndicesOnly() throws {
+        let pattern = try XCTUnwrap(
+            Self.statementTraps.first { $0.name == "literal-integer subscript" }
+        ).pattern
+        func matches(_ line: String) -> Bool {
+            line.range(of: pattern, options: .regularExpression) != nil
+        }
+        for trapping in [
+            "let call = mock.calls[0]",
+            "let first = outcome.errors[ 12 ]",
+            "let nested = report.entries[0].warning",
+        ] {
+            XCTAssertTrue(matches(trapping), "must be reported: \(trapping)")
+        }
+        for notReported in [
+            // A VARIABLE index traps identically and is NOT reported — the
+            // exclusion this cell exists to make visible rather than imply.
+            "let entry = buffer[index]",
+            "unlinkat(fds[index], segment, AT_REMOVEDIR)",
+            // A dictionary read, which is why the exclusion above exists.
+            "if let code = failures[url.path] { return code }",
+            // An array LITERAL is not a subscript at all, and the regex's
+            // requirement of an identifier, `)` or `]` before the bracket is
+            // what keeps it out.
+            "let padded = suffixes + [0]",
+            "let bounds = [20]",
+        ] {
+            XCTAssertFalse(
+                matches(notReported), "must NOT be reported: \(notReported)"
+            )
+        }
+    }
+
+    // MARK: - The inventory this fence REPLACED
+
+    // `forceUnwrapInventory` + `testTheForceUnwrapPopulationDoesNotGrow` stood
+    // here from r6 to r7: a per-file COUNT of statement-position force-unwraps,
+    // pinned so the population could only shrink. It is deleted rather than
+    // kept alongside `testNoForceUnwrapCanBeDecidedByProductionCode`, for the
+    // reason the review gave when it filed D4 — pinning a count makes no
+    // EXISTING site safe — and for a second one this branch has been fixing
+    // all round: a pinned per-file table is seventeen numbers that go stale on
+    // any edit, which is the D5 class of defect, and the default-deny fence
+    // needs no numbers at all. Every shape the inventory tolerated is now
+    // either converted or listed in `forceUnwrapAllowances` with the reason it
+    // cannot be production-decided.
 
     /// `private var base: URL!` and friends — a TYPE annotation, not an
     /// unwrap.

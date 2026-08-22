@@ -42,7 +42,9 @@ final class EphemeralTempRegistrationTests: XCTestCase {
         fixtureHome = base.appendingPathComponent("home")
         tempRoot = base.appendingPathComponent("shared-temp")
         for url in [base, fixtureHome, tempRoot] {
-            try fm.createDirectory(at: url!, withIntermediateDirectories: true)
+            try fm.createDirectory(
+                at: try XCTUnwrap(url), withIntermediateDirectories: true
+            )
         }
     }
 

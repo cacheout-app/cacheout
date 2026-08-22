@@ -120,7 +120,7 @@ final class PredictiveEngineTests: XCTestCase {
 
     // MARK: - Time-to-Exhaustion: Valid Predictions
 
-    func testValidPredictionWithSteepDecline() async {
+    func testValidPredictionWithSteepDecline() async throws {
         let engine = PredictiveEngine(scanProvider: StubScanProvider())
         let base = Date()
 
@@ -134,10 +134,11 @@ final class PredictiveEngineTests: XCTestCase {
 
         let prediction = await engine.predictTimeToExhaustion()
         XCTAssertNotNil(prediction, "Should return a prediction with steep negative slope")
+        let estimate = try XCTUnwrap(prediction)
 
         // At t=39, available = 500 - 195 = 305 MB, slope = -5 MB/sec
         // Estimated = 305 / 5 = 61 seconds
-        XCTAssertEqual(prediction!, 61.0, accuracy: 2.0,
+        XCTAssertEqual(estimate, 61.0, accuracy: 2.0,
             "Prediction should be approximately 61 seconds")
     }
 
@@ -254,7 +255,7 @@ final class PredictiveEngineTests: XCTestCase {
 
     // MARK: - Process Scan Cache (Deterministic with Stub)
 
-    func testCachePreservesFullScanResult() async {
+    func testCachePreservesFullScanResult() async throws {
         let engine = PredictiveEngine(scanProvider: StubScanProvider())
 
         let scanResult = ProcessMemoryScanner.ScanResult(
@@ -265,14 +266,14 @@ final class PredictiveEngineTests: XCTestCase {
 
         await engine.setCachedScanResult(scanResult)
 
-        let cached = await engine.cachedScanResult
-        XCTAssertNotNil(cached)
-        XCTAssertTrue(cached!.partial, "Partial flag must be preserved in cache")
-        XCTAssertEqual(cached!.source, "proc_pid_rusage")
-        XCTAssertEqual(cached!.processes.count, 1)
+        let stored = await engine.cachedScanResult
+        let cached = try XCTUnwrap(stored)
+        XCTAssertTrue(cached.partial, "Partial flag must be preserved in cache")
+        XCTAssertEqual(cached.source, "proc_pid_rusage")
+        XCTAssertEqual(cached.processes.count, 1)
     }
 
-    func testCachePreservesNonPartialScanResult() async {
+    func testCachePreservesNonPartialScanResult() async throws {
         let engine = PredictiveEngine(scanProvider: StubScanProvider())
 
         let scanResult = ProcessMemoryScanner.ScanResult(
@@ -283,10 +284,10 @@ final class PredictiveEngineTests: XCTestCase {
 
         await engine.setCachedScanResult(scanResult)
 
-        let cached = await engine.cachedScanResult
-        XCTAssertNotNil(cached)
-        XCTAssertFalse(cached!.partial, "Non-partial flag must be preserved")
-        XCTAssertEqual(cached!.source, "privileged_helper")
+        let stored = await engine.cachedScanResult
+        let cached = try XCTUnwrap(stored)
+        XCTAssertFalse(cached.partial, "Non-partial flag must be preserved")
+        XCTAssertEqual(cached.source, "privileged_helper")
     }
 
     func testFirstRequestTriggersScan() async {

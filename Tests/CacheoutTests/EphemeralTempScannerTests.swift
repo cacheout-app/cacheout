@@ -48,7 +48,9 @@ final class EphemeralTempScannerTests: XCTestCase {
         sharedRootURL = base.appendingPathComponent("shared-temp")
         userRootURL = base.appendingPathComponent("user-temp")
         for url in [home, sharedRootURL, userRootURL] {
-            try fm.createDirectory(at: url!, withIntermediateDirectories: true)
+            try fm.createDirectory(
+                at: try XCTUnwrap(url), withIntermediateDirectories: true
+            )
         }
     }
 

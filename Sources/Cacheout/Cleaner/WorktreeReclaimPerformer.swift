@@ -1726,10 +1726,12 @@ struct WorktreeReclaimPerformer {
     // MARK: - The LAST-INSTANT re-proof (PR #460 codex r4)
 
     /// `<admin>/HEAD` as R2 saw it: the bytes, and the inode they were read
-    /// through. The inode matters as much as the bytes — git updates HEAD by
-    /// writing `HEAD.lock` and renaming it over, so ANY HEAD write replaces
-    /// the file (MEASURED, git 2.50.1), and a re-created file with identical
-    /// bytes is still a different object.
+    /// through. The inode matters as much as the bytes — git REPLACES this
+    /// file rather than writing it in place, so the inode moves on every HEAD
+    /// write. MEASURED on git 2.50.1: a commit on a detached head took it
+    /// from 115935185 to 116190333, and a branch switch moved an attached
+    /// worktree's from 115935122 to 116190340. A file re-created with
+    /// identical bytes is still a different object, and this catches it.
     struct HeadWitness: Equatable {
         let identity: FileSystemIdentityProvider.Identity
         let bytes: Data
@@ -1754,11 +1756,13 @@ struct WorktreeReclaimPerformer {
     }
 
     /// Per-worktree HEAD, inside the admin directory. A LINKED worktree's
-    /// HEAD is per-worktree by git's own layout (`git worktree` docs; the
-    /// admin directory holds `HEAD`, `index`, `ORIG_HEAD`, `logs/`,
-    /// `refs/bisect`), so this is the file that moves when the checkout
-    /// commits — verified on git 2.50.1: a commit on a DETACHED head
-    /// rewrites it, a commit on an ATTACHED branch does not.
+    /// HEAD is per-worktree by git's own layout — MEASURED, the admin
+    /// directory of a fresh `git worktree add` holds `HEAD`, `ORIG_HEAD`,
+    /// `commondir`, `gitdir`, `index`, `logs/` and `refs/` — so this is the
+    /// file that moves when the checkout commits. Verified on git 2.50.1: a
+    /// commit on a DETACHED head rewrites it (the bytes ARE the SHA); a
+    /// commit on an ATTACHED branch does not (the bytes stay
+    /// `ref: refs/heads/<branch>` while the branch tip moves).
     static let headFileName = "HEAD"
 
     /// git's OWN representation of a worktree lock: `git worktree lock`
@@ -1776,13 +1780,16 @@ struct WorktreeReclaimPerformer {
     /// subprocess, and the answer is stale the moment the pipe closes — so
     /// the re-establishment cannot be pushed arbitrarily close to the
     /// mutation: something always sits between the last answer and the act.
-    /// MEASURED at r3's ordering, 5 samples, uninstrumented: fallback last
-    /// gate → destructive call, median 77.9 ms; all identity gates done →
-    /// destructive call, median 58.0 ms; primary R1b-done → `worktree remove`
-    /// spawned, median 56.9 ms, containing THREE further subprocess spawns.
-    /// Those windows swallowed a whole `git worktree remove` + `git worktree
-    /// add` at the same path, a `git worktree lock`, and a commit on a
-    /// detached HEAD — each measured destroying real data with `errors == []`.
+    /// MEASURED BY THE r4 REVIEW at r3's ordering, 5 samples each,
+    /// uninstrumented (their numbers, carried here as the baseline this round
+    /// improves on): fallback last gate → destructive call, median 77.9 ms;
+    /// all identity gates done → destructive call, median 58.0 ms; primary
+    /// R1b-done → `worktree remove` spawned, median 56.9 ms, containing THREE
+    /// further subprocess spawns. Those windows swallowed a whole
+    /// `git worktree remove` + `git worktree add` at the same path, a
+    /// `git worktree lock`, and a commit on a detached HEAD, each destroying
+    /// real data with `errors == []` — and all three are reproduced HERE, as
+    /// cells that go red the moment this function is removed.
     ///
     /// The division that closes them is not "run the gates later". It is:
     /// **a proposition whose authority is the filesystem can be re-proved at

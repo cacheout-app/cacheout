@@ -855,8 +855,9 @@ actor CacheCleaner {
     /// debug-build failure at the moment it becomes possible, instead of a
     /// quiet loss of the identity proof; release builds still fall through to
     /// the performer's own re-checks — its delete-time gate re-establishment
-    /// (R0/R1/R2), the G2 clean re-check before the filesystem fallback, the
-    /// oracle recompute in prune mode, and the D13 traversal guard.
+    /// (R0/R1/R2), the G2 clean re-check as the LAST git call before the
+    /// removal, the last-instant filesystem re-proof after it, the oracle
+    /// recompute in prune mode, and the D13 traversal guard.
     nonisolated private func preDeleteRefusal(
         for item: ReclaimableItem, authorization: String?
     ) -> PreDeleteSeamRefusal? {

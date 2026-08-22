@@ -1283,8 +1283,8 @@ struct WorktreeReclaimPerformer {
         container: AdmittedContainer
     ) async -> StaleGateReestablishment {
         // R0 traverses the `-C` target ONLY, and the caller guarded exactly
-        // that path immediately before entering here — the primary arm at
-        // step (7). NO extra guard is added:
+        // that path immediately before entering here — step (7), the ONE
+        // pre-gates guard site since r5. NO extra guard is added:
         // it would be an unevidenced re-run of a check microseconds old, and
         // an unevidenced guard is a defect this project has shipped before.
         if case .refuse(let tag, let detail) =

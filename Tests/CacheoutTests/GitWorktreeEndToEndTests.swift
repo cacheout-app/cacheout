@@ -290,10 +290,13 @@ final class GitWorktreeEndToEndTests: XCTestCase {
     /// committed into before the user clicks clean.
     ///
     /// Every later gate the epic already had passes this shape — the tree is
-    /// still clean, the record is still registered and unlocked, the paths
-    /// are unmoved, and `git worktree remove` itself exits 0 SILENTLY. Only
-    /// re-establishing G3 refuses it, and the commit is on no branch, so
-    /// removal would leave it reachable from nothing at all.
+    /// still clean, the record is still registered and unlocked, and the
+    /// paths are unmoved. Nothing outside G3 stops it: git would have exited
+    /// 0 SILENTLY on this shape when `git worktree remove` was the arm, and
+    /// since PR #460 codex r5 no git refusal is consulted at all — the
+    /// removal is unconditional once the gates pass. So re-establishing G3 is
+    /// the whole protection, and the commit is on no branch, so removal would
+    /// leave it reachable from nothing at all.
     @MainActor
     func testACommitMadeBetweenScanAndCleanRefusesTheDetachedRemoval()
         async throws

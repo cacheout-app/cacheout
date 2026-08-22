@@ -537,7 +537,7 @@ final class PathGuard {
     }
 
     /// Validate a directory that is about to be handed to a SUBPROCESS which
-    /// FOLLOWS it (`git -C <dir>`, `git worktree remove <dir>`) — the D13
+    /// FOLLOWS it (`git -C <dir>`, `git -C <dir> status`) — the D13
     /// guard.
     ///
     /// IT IS NOT RUN IMMEDIATELY BEFORE EVERY SUCH INVOCATION, and the

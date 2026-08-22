@@ -18,9 +18,12 @@
 ///   nothing in the Trash
 /// - The `git_worktree_reclaim` disclosures (fn-5.6/R11):
 ///   `viewModel.gitWorktreeTrashDisclosures` names the selected worktree
-///   items, stale removals apart from repository prunes. git UNLINKS and
-///   PRUNES — neither trashes, whatever the toggle says — so without this
-///   the generic wording would falsely promise recoverability
+///   items, stale removals apart from repository prunes. The CHECKOUT
+///   honours the toggle since PR #460 codex r5 (Cacheout removes it, not
+///   git); the `worktrees/<id>` registry directory that follows it, and every
+///   repository prune, are removed PERMANENTLY whatever the toggle says — so
+///   without this the generic wording would falsely promise recoverability
+///   for the part that has none
 /// - Warning banner when a `.partiallyDenied` category is selected (R18):
 ///   unreadable contents — measured bytes only
 /// - Per-row DISCLOSED release artifacts (fn-4.6, R3): each valuable's

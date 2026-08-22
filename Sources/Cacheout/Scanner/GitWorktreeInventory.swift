@@ -450,9 +450,14 @@ struct GitWorktreeGitdirResolver {
 /// depends on git honouring an expire policy. The override is pinned on the
 /// single shared argv precisely so the two call sites cannot drift.
 ///
-/// The MUTATION argv (`worktree remove`) deliberately does NOT live here: it
-/// belongs to the one component allowed to mutate,
-/// `WorktreeReclaimPerformer` (fn-5.4).
+/// NO MUTATION ARGV LIVES HERE — AND SINCE PR #460 codex r5 THERE IS NO
+/// MUTATION ARGV ANYWHERE. Through r4 this note said the `worktree remove`
+/// argv "belongs to the one component allowed to mutate,
+/// `WorktreeReclaimPerformer`". That builder is gone, and the performer's own
+/// line says so: "It is gone, argv builder and all". The boundary this note
+/// is really about is unchanged — this type ANSWERS questions and never acts,
+/// and the component that acts does the removal itself rather than by
+/// spawning git.
 enum GitWorktreeOracle {
 
     /// The config override that makes every expire-gated orphan class visible.

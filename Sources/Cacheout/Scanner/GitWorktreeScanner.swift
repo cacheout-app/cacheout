@@ -83,11 +83,16 @@
 ///
 /// ## D13 — the mutation scope is bound to ONE declared root
 ///
-/// Both modes mutate the PARENT repository's admin data —
-/// `git -C <parent> worktree remove` in stale mode, a direct removal of the
-/// disclosed admin directories in prune mode (there is no `worktree prune`
-/// argv anywhere in the app; PR #460 codex r1 / C4). So an item may be
-/// emitted only when the worktree target, the parent working directory AND
+/// Both modes mutate the PARENT repository's admin data, and since PR #460
+/// codex r5 BOTH do it the same way — this process removes the directories
+/// itself. Stale mode removes the checkout under
+/// `DepthSafeRemoval`/`TrashDisposal` and then, gated, that worktree's own
+/// admin entry; prune mode removes the disclosed admin directories directly.
+/// There is no `worktree remove` argv and no `worktree prune` argv anywhere
+/// in the app (PR #460 codex r1 / C4, r5 / D1). The contrast this paragraph
+/// used to draw between the two modes' mutation MECHANISMS no longer exists;
+/// the SCOPE argument below never depended on it. So an item may be emitted
+/// only when the worktree target, the parent working directory AND
 /// the resolver-carried admin container all lie inside the SAME declared dev
 /// root — the parent alone may EQUAL the root (a
 /// dev root that IS a repository is legal), everything else is a STRICT
@@ -740,8 +745,8 @@ struct GitWorktreeScanner: @unchecked Sendable {
             return
         }
 
-        // The admin ENTRY (`<adminContainer>/<id>`) that fn-5.4's post-fallback
-        // prune gate identifies as the ONE entry it may sweep.
+        // The admin ENTRY (`<adminContainer>/<id>`) that fn-5.4's
+        // post-removal prune gate identifies as the ONE entry it may sweep.
         guard let adminEntry = resolver.adminDirectory(forWorktreeAt: record.path) else {
             issues.append(ScanIssue(
                 url: record.path, kind: .unreadable,
@@ -1421,9 +1426,10 @@ struct GitWorktreeScanner: @unchecked Sendable {
 /// items, and the performer is where they are enumerated:
 /// `reestablishStaleGates` (R0 repository identity, R1 the re-read porcelain
 /// record's G1/G4 plus the registration, R2 the shared G3 ancestry check),
-/// the G2 clean re-check before the filesystem fallback, the LAST-INSTANT
-/// filesystem re-proof immediately before each destructive act (which
-/// checkout, the lock file, the HEAD file — PR #460 codex r4), the oracle
+/// the G2 clean re-check as the LAST git call before the removal, the
+/// LAST-INSTANT filesystem re-proof immediately before the ONE destructive
+/// act (which checkout, the lock file, the HEAD file — PR #460 codex r4; one
+/// act rather than two since r5 collapsed the arms), the oracle
 /// recompute in prune mode, and the D13 traversal guard, which covers every
 /// path a git invocation traverses with a check that ran after admission and
 /// before that invocation — NOT one guard per invocation, a universal retired

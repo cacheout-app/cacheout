@@ -8,16 +8,32 @@ import XCTest
 /// - Real git builds every repository fixture (hermetic env, `GIT_CONFIG_*`
 ///   pinned to `/dev/null`), and real git executes wherever the behaviour
 ///   under test IS git's.
-/// - The ignored-tree fallback branch is NOT reliably reproducible with real
-///   git (2.50.1 removes such worktrees at exit 0; the field failures were on
-///   ≤2.39), so every fallback cell INJECTS a failing runner result and
-///   asserts NO refusal message and NO version boundary. The populated
-///   submodule refusal is the trigger class real git still produces, and it
-///   has its own cell.
-/// - Injection happens through `InterceptingGitRunner`: one named invocation
-///   is answered synthetically, everything else runs for real — so a fallback
-///   cell still proves branch-ref survival, real prune behaviour and real
-///   porcelain output.
+/// - THERE IS NO FALLBACK ARM TO INJECT A REFUSAL INTO ANY MORE (PR #460
+///   codex r5/r6). Through r4 this header described a doctrine for the
+///   "fallback cell": `git worktree remove` was the primary arm, the
+///   ignored-tree `Directory not empty` refusal it produced on ≤2.39 could
+///   not be reproduced on 2.50.1, so cells INJECTED a failing runner result
+///   to reach the second arm. That machinery went with the arm (`14155bf`),
+///   and this bullet described it for one round after it was deleted. The
+///   check that reproduces is on the PRODUCT, not on this file's own prose:
+///
+///       $ grep -rn 'worktree", "remove' Sources/
+///       Sources/Cacheout/Scanner/SpaceScanner.swift:143:/// `["git", "-C", <parentRepoWorkingDir>, "worktree", "remove", <path>]`;
+///
+///   one hit, in a doc comment that names the builder as RETIRED. No Swift
+///   statement anywhere in `Sources/` spells that argv. This file still
+///   spells it three times, always as FIXTURE setup — the test itself asking
+///   real git to build a state. The field class it was about is
+///   now REFUSED rather than routed: the last gate runs `status --porcelain
+///   --ignored`, so an ignored file that appeared since the scan aborts the
+///   removal (`testAnIgnoredFileThatAppearsInTheGateWindowIsNotDestroyed`),
+///   while an ignored tree that was ALREADY there is removed with the
+///   checkout and has its own boundary cell.
+/// - `InterceptingGitRunner` is still how a cell reaches a WINDOW: its
+///   `intercept` closure runs BEFORE the delegated call, so a test can mutate
+///   the filesystem between two git invocations. What it no longer does on
+///   this path is synthesise a MUTATION's failure, because no git invocation
+///   here mutates anything.
 /// ## THE MUTATION LEDGER, AND A CORRECTION OF RECORD (PR #460 codex r6, D6)
 ///
 /// `7260964`'s commit message published a mutation table against
@@ -776,7 +792,7 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         assertNoForbiddenArgv(runner)
     }
 
-    // MARK: - R5: the guarded fallback + the GATED prune
+    // MARK: - R5: the guarded removal + the GATED prune
 
     /// THE PRODUCT BOUNDARY D2 MADE EXPLICIT: an ignored file that was
     /// ALREADY there when the checks started is removed with the tree.
@@ -900,14 +916,19 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
     /// Work saved WHILE the delete-time gates are running survives, in BOTH
     /// disposal arms.
     ///
-    /// The write is injected on the SECOND `rev-parse --git-common-dir` — R0's
-    /// argv, and the first invocation of the FALLBACK's gate re-establishment
-    /// (the first `--git-common-dir` belongs to the primary arm's, which runs
-    /// before `worktree remove`). Under the r1/r2 order — clean re-check,
-    /// then R0/R1/R1b/R2, then the delete — that instant is AFTER the
-    /// re-check, and the file was destroyed while the performer returned a
-    /// SUCCESS entry with `errors == []` and `warning == nil`. Five git
-    /// subprocesses and two path re-admissions sat in that window.
+    /// The write is injected on the FIRST `merge-base` — R2's last rung,
+    /// which runs after the D2 ignored witness and before the last gate, so
+    /// only the last gate can catch it. (Through r4 this note described an
+    /// injection on the SECOND `rev-parse --git-common-dir`, "the first
+    /// invocation of the FALLBACK's gate re-establishment": there is one arm
+    /// now, so there is no second gate re-establishment, and the second
+    /// `--git-common-dir` belongs to the POST-removal prune recompute — after
+    /// the delete, where an injected write would prove nothing.) Under the
+    /// r1/r2 order — clean re-check, then R0/R1/R1b/R2, then the delete —
+    /// that instant is AFTER the re-check, and the file was destroyed while
+    /// the performer returned a SUCCESS entry with `errors == []` and
+    /// `warning == nil`. Five git subprocesses and two path re-admissions sat
+    /// in that window.
     ///
     /// MUTATION EVIDENCE (PR #460 codex r3): move the
     /// `GitWorktreeCleanCheck.read` switch above `reestablishStaleGates`
@@ -966,8 +987,8 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
             XCTAssertTrue(try branchExists("feature-\(index)", in: repository))
 
             // THE ORDERING, asserted directly: the clean re-check is the LAST
-            // git invocation the fallback makes. Under the old order it was
-            // the first one after the refusal, with five more behind it.
+            // git invocation the removal path makes. Under the old order it
+            // was the first one after the refusal, with five more behind it.
             XCTAssertEqual(
                 bareArgvs(runner).last ?? [],
                 GitWorktreeCleanCheck.arguments(forWorktreeAt: worktree),
@@ -1356,14 +1377,14 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         // fn-6 RECONCILIATION, and the cell that EVIDENCES the binding.
         //
         // fn-6's removal proves the folder it opens against an identity the
-        // caller captured from a descriptor first, so this fallback captures
-        // one before its TOCTOU rechecks. Handing `.unbound` instead still
+        // caller captured from a descriptor first, so the removal path
+        // captures one before its TOCTOU rechecks. Handing `.unbound` instead still
         // compiles and still deletes — measured: replacing the capture with
         // `.unbound` left the whole suite green at 1418/2/0 — so without this
         // cell the binding is a parameter nobody checks.
         //
-        // The capture is the fallback's FIRST descriptor-identity call (the
-        // gates before it are path-based), so a provider that can prove no
+        // The capture is the removal path's FIRST descriptor-identity call
+        // (the gates before it are path-based), so a provider that can prove no
         // descriptor makes exactly that capture fail and nothing else.
         // FAIL-CLOSED is the assertion: the reclaim reports an error and the
         // worktree is still on disk. Under `.unbound` nothing throws, the
@@ -1373,8 +1394,10 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         let plan = staleplan(
             worktree: worktree, membership: try membership(of: worktree, in: repository)
         )
-        // git refuses `remove`, which is what routes this item to the
-        // filesystem fallback in the first place.
+        // A plain wrapping runner: every gate runs for real. (Through r4 this
+        // line said git's `remove` refusal "routes this item to the filesystem
+        // fallback in the first place" — there is no routing and no second arm
+        // now; the removal is the only arm there is.)
         let failing = InterceptingGitRunner(wrapping: realRunner())
 
         let outcome = await perform(
@@ -1445,8 +1468,8 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
     func testAParentReboundBetweenTheDeleteAndThePruneLeavesTheAdminEntry()
         async throws
     {
-        // D3 (PR #460 codex r2): the R0 re-check inside
-        // `gatedPostFallbackPrune` was the ONE unevidenced arm of the three —
+        // D3 (PR #460 codex r2): the R0 re-check inside what is now
+        // `gatedPostRemovalPrune` was the ONE unevidenced arm of the three —
         // deleting it left the whole suite green, which is why this cell
         // exists. (r2 recorded a suite count for that run that matches no
         // state of this branch; it is deleted rather than corrected — the
@@ -1463,7 +1486,7 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         // The rebind is REAL and lands exactly in that window: the
         // interceptor plants the one-line `gitdir:` redirect when the THIRD
         // `--git-common-dir` is about to run, which is
-        // `gatedPostFallbackPrune`'s own R0 — after the fallback's
+        // `gatedPostRemovalPrune`'s own R0 — after the removal's
         // filesystem delete, after the oracle recompute.
         let fixture = try makeBareParentFixture()
         let membership = try membership(of: fixture.worktree, in: fixture.bare)
@@ -1528,7 +1551,7 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
             worktree: worktree, membership: try membership(of: worktree, in: repository)
         )
         let runner = InterceptingGitRunner(wrapping: realRunner())
-        // The gated post-fallback cleanup is now a scoped REMOVAL, so its
+        // The gated post-removal cleanup is a scoped REMOVAL, so its
         // failure class is a removal failure rather than a subprocess one —
         // and it must still be a WARNING, because the tree's bytes are
         // already freed (D11).
@@ -1907,8 +1930,8 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         let runner = InterceptingGitRunner(wrapping: realRunner()) { arguments, _ in
             guard arguments.contains("merge-base") else { return nil }
             guard ancestryCalls.bump() == 1 else { return nil }
-            // THE WINDOW: the fallback's gates have run — entry guard, R0,
-            // R1, R1b — and the clean re-check has not.
+            // THE WINDOW: the delete path's gates have run — entry guard,
+            // R0, R1, R1b — and the clean re-check has not.
             if (try? fileManager.removeItem(at: adminContainer)) != nil,
                (try? fileManager.createSymbolicLink(
                    at: adminContainer, withDestinationURL: outside
@@ -2447,10 +2470,12 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
     }
 
     func testAPathThatIsNoLongerARegisteredWorktreeIsNeverDeleted() async throws {
-        // The "is not a working tree" class, which the fallback used to treat
-        // as an ordinary refusal: git exits 128, the stranger repository
-        // sitting at that path re-checks CLEAN, and the fallback deletes it.
-        // R1 refuses on the REGISTRY, not on git's message text.
+        // The "is not a working tree" class. Through r4 the second arm
+        // treated git's exit 128 as an ordinary refusal, the stranger
+        // repository sitting at that path re-checked CLEAN, and it was
+        // deleted. There is no second arm now, and this is not why the
+        // stranger survives: R1 refuses on the REGISTRY, before any removal,
+        // and never on git's message text.
         let repository = try makeRepository(named: "repo")
         let stranger = container.appendingPathComponent("stranger")
         try fm.createDirectory(at: stranger, withIntermediateDirectories: true)
@@ -2492,10 +2517,13 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
     }
 
     func testAPlanAimedAtTheMainCheckoutIsRefusedByTheReReadRecord() async throws {
-        // G1 at delete time. Without it the sequence is: ancestry passes (the
-        // main checkout IS at the default branch tip), `worktree remove`
-        // refuses with exit 128 ("is a main working tree"), the fallback
-        // re-checks CLEAN — and deletes the user's main checkout.
+        // G1 at delete time, and it is the ONLY thing standing here now.
+        // Through r4 the sequence was: ancestry passes (the main checkout IS
+        // at the default branch tip), `worktree remove` refuses with exit 128
+        // ("is a main working tree"), the second arm re-checks CLEAN — and
+        // deletes the user's main checkout. Since r5 nothing asks git to
+        // refuse at all: the removal is unconditional once the gates pass, so
+        // G1's re-established record is the whole protection.
         let repository = try makeRepository(named: "repo")
         let anchor = try addWorktree(named: "anchor", branch: "anchor", in: repository)
         let real = try membership(of: anchor, in: repository)
@@ -2969,7 +2997,7 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         return true
     }
 
-    /// The clean check is the LAST git call the fallback makes, so an
+    /// The clean check is the LAST git call the removal path makes, so an
     /// interception of it that mutates and then answers CLEAN stages its
     /// attack in exactly the window r3 left open — between the last gate and
     /// the disposal. `.success(Data())` is an empty porcelain listing, i.e.
@@ -3011,7 +3039,7 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
     func testASamePathReAddInsideTheDisposalWindowIsRefused()
         async throws
     {
-        // D1, THE FALLBACK ARM. r3 made G2 the last GATE and argued that
+        // D1. r3 made G2 the last GATE and argued that
         // "the order is safe both ways round for R0/R1/R2 — they read the
         // PARENT's porcelain record". R1b is not in that list and does not
         // read the parent's record: it reads `<worktree>/.git`. So after G2
@@ -3173,13 +3201,14 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
     func testALockTakenAfterTheLastGateStopsThePrimaryRemovalToo()
         async throws
     {
-        // THE SAME WINDOW IN THE OTHER ARM. `merge-base` is the last
-        // subprocess before `git worktree remove`, and MEASURED at r3 that
-        // gap was a median 56.9 ms containing three further spawns. A lock
-        // acquired in it is invisible to R1's record (already read) and to
-        // the HEAD witness (a lock does not move HEAD), so ONLY the
-        // last-instant lock re-proof can refuse — which is what makes this
-        // cell the primary arm's isolated mutation test for it.
+        // THE ANCESTRY WINDOW. `merge-base` is R2's last rung, and MEASURED
+        // at r3 the gap between it and the destruction was a median 56.9 ms
+        // containing three further spawns. A lock acquired in it is invisible
+        // to R1's record (already read) and to the HEAD witness (a lock does
+        // not move HEAD), so ONLY the last-instant lock re-proof can refuse —
+        // which is what makes this cell that re-proof's isolated mutation
+        // test. (Through r4 this note called it "the same window in the OTHER
+        // arm"; there is one arm.)
         let repository = try makeRepository(named: "repo")
         let worktree = try addWorktree(named: "wt", branch: "feature", in: repository)
         let plan = staleplan(
@@ -3212,10 +3241,13 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
     func testAHeadThatMovesAfterTheAncestryCheckIsRefusedInThePrimaryArm()
         async throws
     {
-        // THE HEAD ARM, IN THE PRIMARY ARM'S WINDOW. The witness is taken
+        // THE HEAD PROPOSITION, IN THE ANCESTRY WINDOW. The witness is taken
         // BEFORE R2's ladder, so the comparison at the last instant spans the
-        // whole R2→`worktree remove` window — three subprocesses, MEASURED at
-        // r3 as a median 56.9 ms — and not merely the tail of it.
+        // whole R2→destruction window — three subprocesses, MEASURED at r3 as
+        // a median 56.9 ms — and not merely the tail of it. (The cell's NAME
+        // still says "PrimaryArm": renaming it would lose the r3/r4/r5
+        // mutation history recorded against that name in three commit
+        // messages. There is one arm, and it is this one.)
         //
         // MUTATION: disable the `live == head` comparison in
         // `reproveFromTheFilesystem` and this cell goes RED, with the commit
@@ -4552,9 +4584,11 @@ final class TrashRecorder: @unchecked Sendable {
 // MARK: - Doubles
 
 /// Wraps a REAL runner and answers only the invocations a test names —
-/// everything else executes for real. This is how a fallback cell injects a
-/// failing `worktree remove` while the re-check, the oracle and the prune stay
-/// genuine (the epic forbids relying on git to produce the refusal).
+/// everything else executes for real. Through r4 this was how a cell injected
+/// a failing `worktree remove` to reach the fallback arm; that arm and that
+/// argv are both gone (PR #460 codex r5), so what it synthesises now is a
+/// READ-ONLY gate's failure — a timeout, a nonzero exit, an unavailable git —
+/// while the rest of the sequence stays genuine.
 ///
 /// The `intercept` closure also runs BEFORE the delegated call, so a test can
 /// mutate the filesystem in the window between two git invocations — that is

@@ -1416,11 +1416,19 @@ MCP server callers should enforce a **30-second subprocess timeout** when invoki
 
 **Callers MUST apply NO client-side timeout to any confirmed `clean` whose
 targets can execute `git_worktree_reclaim`.** Not a longer timeout — none.
-A `git worktree remove` on a multi-gigabyte tree is unbounded work, the
-guarded filesystem fallback behind it is unbounded too, and an outer kill
-lands mid-removal: it defeats the CLI's own budget and can leave Cacheout AND
-its git child in partial state. Any finite client-side guess can therefore
-kill a valid clean, which is why no formula is published here.
+Removing a multi-gigabyte checkout is unbounded work, and an outer kill lands
+mid-removal: it defeats the CLI's own budget and can leave Cacheout in partial
+state — a half-deleted tree, or a deleted tree whose registry entry has not
+been removed yet. Any finite client-side guess can therefore kill a valid
+clean, which is why no formula is published here.
+
+*(Corrected PR #460 codex r6. Through r4 this paragraph justified the rule
+with "a `git worktree remove` on a multi-gigabyte tree is unbounded work, the
+guarded filesystem fallback behind it is unbounded too". Since r5 no
+`git worktree remove` runs and there is no fallback: git is read-only on this
+path and Cacheout performs the removal itself. The RULE is unchanged and still
+correct — the work is unbounded because the TREE is unbounded, not because of
+which process walks it.)*
 
 **The trigger rule is decidable by the caller, before it runs anything.**
 Apply the no-timeout rule when ANY of these holds:

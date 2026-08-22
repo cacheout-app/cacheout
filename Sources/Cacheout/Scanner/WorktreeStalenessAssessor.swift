@@ -193,7 +193,7 @@ enum WorktreeAssessmentResult: Equatable, Sendable {
 // MARK: - G2, exported for fn-5.4
 
 /// The G2 clean verdict. `failed` is deliberately distinct from `dirty`: the
-/// gate treats both as "not a candidate", but fn-5.4's pre-fallback re-check
+/// gate treats both as "not a candidate", but fn-5.4's pre-removal re-check
 /// reports them differently to the user (a dirty tree survived on purpose; a
 /// failed check means we could not tell).
 enum WorktreeCleanVerdict: Equatable, Sendable {
@@ -210,8 +210,10 @@ enum WorktreeCleanVerdict: Equatable, Sendable {
 
 /// The G2 check as a standalone, reusable surface.
 ///
-/// fn-5.4's revalidator re-runs it immediately before the guarded filesystem
-/// fallback, so it must be ONE implementation with one argv: a second
+/// fn-5.4's delete path re-runs it as the LAST git call before the removal —
+/// and since PR #460 codex r5 it IS the dirty-tree refusal, because git's own
+/// `--force`-less refusal went with the `worktree remove` arm. So it must be
+/// ONE implementation with one argv: a second
 /// spelling of this check could let the scan and the deletion disagree about
 /// whether a tree is clean.
 enum GitWorktreeCleanCheck {
@@ -405,7 +407,7 @@ enum WorktreeMergedVerdict: Equatable, Sendable {
 
 /// The G3 check as a standalone, reusable surface — the SAME move G2 made.
 ///
-/// fn-5.4's delete path re-runs it immediately before `git worktree remove`
+/// fn-5.4's delete path re-runs it as the LAST git call before the removal
 /// (PR #460 codex r1 / C1), so it must be ONE implementation with one argv
 /// and one routing: a second spelling of the D6 ladder or of the ancestry
 /// decision would let the scan and the deletion disagree about what "merged"

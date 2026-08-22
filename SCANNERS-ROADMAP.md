@@ -231,6 +231,20 @@ Enumerate-and-explain, the counterpart to the curated allowlist:
     re-enumerates the admin container itself, after every gate has already
     answered. The shipped code therefore removes exactly the admin
     directories it disclosed and runs no repository-wide prune.
+  - **CORRECTED AS BUILT AGAIN (PR #460 codex r5/r6).** The bullet's whole
+    "try `git worktree remove` first, fall back to deleting the tree" shape is
+    retired. There is no first arm and no fallback: git is READ-ONLY on the
+    delete path (`rev-parse --git-common-dir`, `worktree list --porcelain`,
+    `status --porcelain --ignored`, the ancestry ladder), and Cacheout removes
+    the checkout itself under `DepthSafeRemoval` — or moves it to the Trash
+    under `TrashDisposal`, which the git arm could never do — with the
+    filesystem re-proved at the last instant. MEASURED, last gate answered →
+    first destruction: 14.87 ms (1 file) / 156.8 ms (2001 files) for
+    `git worktree remove`, against 0.373 ms constant for the shipped removal.
+    The `Directory not empty` field class the bullet was written around is now
+    REFUSED rather than routed: the last gate runs `status --porcelain
+    --ignored`, so an ignored tree that appeared since the scan aborts the
+    removal.
 - Risk: review; `defaultSelected: false`. Never touch a worktree that fails
   any gate; never run `git branch -d`.
 - Run git binary via argv (`/usr/bin/env git …`), no shell, bounded timeout —

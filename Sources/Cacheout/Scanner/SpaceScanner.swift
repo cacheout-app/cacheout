@@ -133,14 +133,19 @@ struct ItemKey: Hashable, Sendable {
 ///
 /// ARGV PROVENANCE (the whole reason this is a plan and not a
 /// `.commands([[String]])` payload): command argv is trusted registry code,
-/// never item input (fn-2.3). The cleaner assembles
-/// `["git", "-C", <parentRepoWorkingDir>, "worktree", "remove", <path>]`
-/// from these fields plus its own constants at execution time (fn-5.4) — and
-/// the repository-level mode assembles no mutating argv at all, removing the
-/// disclosed admin directories directly instead of running a repo-wide
-/// `git worktree prune` whose set git would recompute for itself. So a
-/// forged item can only mis-POINT a fixed command — and every path it could
-/// point at is bound to the item's own admitted container by
+/// never item input (fn-2.3). NEITHER MODE ASSEMBLES A MUTATING ARGV AT ALL
+/// (PR #460 codex r5/r6): the cleaner assembles only READ-ONLY commands from
+/// these fields plus its own constants at execution time — `rev-parse
+/// --git-common-dir`, `worktree list --porcelain`, `status --porcelain
+/// --ignored`, the ancestry ladder — and performs both removals itself, the
+/// checkout under `DepthSafeRemoval`/`TrashDisposal` and the disclosed admin
+/// directories directly. Through r4 stale mode assembled
+/// `["git", "-C", <parentRepoWorkingDir>, "worktree", "remove", <path>]`;
+/// that argv builder is gone (see `WorktreeReclaimPerformer`'s "WHO REMOVES
+/// THE TREE"), as is any repo-wide `git worktree prune` whose set git would
+/// recompute for itself. So a forged item can only mis-POINT a fixed
+/// READ-ONLY command — and every path it could point at is bound to the
+/// item's own admitted container by
 /// `GitWorktreeReclaimPlan.violation(...)`. `.commands` is not an option at
 /// all here: validator checks (f)/(g) require every `.commands` item to carry
 /// a REGISTERED `CacheCategory` whose `cleanCommands` equal the argv, and
@@ -163,8 +168,12 @@ struct GitWorktreeReclaimPlan: Equatable, Sendable {
     /// repository-SCOPED effect, removed directory by directory, never a
     /// `git worktree prune` whose set git re-enumerates for itself (D14).
     enum Mode: Equatable, Sendable {
-        /// `git -C <parent> worktree remove <worktreePath>`, with fn-5.4's
-        /// guarded rm + gated prune fallback.
+        /// Remove ONE linked worktree's checkout — the scan's four gates
+        /// re-established, the filesystem re-proved at the last instant, then
+        /// THIS process removes the tree under `DepthSafeRemoval` (or moves
+        /// it to the Trash), then a GATED removal of that worktree's own
+        /// admin entry. No `git worktree remove` and no second arm: git is
+        /// read-only on this path (PR #460 codex r5).
         case removeStaleWorktree
         /// Repository-level, one item per repo, disclosing the COMPLETE set
         /// it will remove — and removing exactly that set, directory by
@@ -181,9 +190,9 @@ struct GitWorktreeReclaimPlan: Equatable, Sendable {
 
     /// STALE MODE ONLY (nil in prune mode): that worktree's own admin
     /// directory, `<parentAdminContainer>/<id>`, as the fn-5.1 resolver
-    /// derived it. fn-5.4's post-fallback prune gate compares the RECOMPUTED
-    /// prunable set against exactly this entry and prunes only when they are
-    /// the same one directory (epic round 8) — without the carried entry the
+    /// derived it. fn-5.4's post-removal prune gate compares the RECOMPUTED
+    /// prunable set against exactly this entry and removes it only when they
+    /// are the same one directory (epic round 8) — without the carried entry the
     /// gate could not name what it is allowed to sweep.
     let worktreeAdminEntry: URL?
 
@@ -191,7 +200,10 @@ struct GitWorktreeReclaimPlan: Equatable, Sendable {
     /// scan saw it (PR #460 codex r3, closing D3).
     ///
     /// `worktreeAdminEntry` above is a PATH, and a path is not an identity.
-    /// MEASURED on git 2.50.1: `git worktree remove <p>` frees
+    /// MEASURED on git 2.50.1 — the measurement predates r5's replacement of
+    /// the removal arm and is unaffected by it, because what it establishes is
+    /// git's NAME REUSE, not who does the unlinking: `git worktree remove <p>`
+    /// frees
     /// `worktrees/<basename>` and a later `git worktree add <same path>`
     /// TAKES THAT NAME BACK — same spelling, different inode. R1b re-resolved
     /// both sides from paths, so that one re-creation was indistinguishable
@@ -379,7 +391,7 @@ struct GitWorktreeReclaimPlan: Equatable, Sendable {
             }
             guard let adminEntry = plan.worktreeAdminEntry else {
                 return "a stale-removal plan must carry the worktree's admin "
-                    + "entry — the post-fallback prune gate identifies the "
+                    + "entry — the post-removal prune gate identifies the "
                     + "one entry it may sweep by that path"
             }
             if !plan.disclosedAdminDirectories.isEmpty {
@@ -522,9 +534,9 @@ struct GitWorktreeReclaimPlan: Equatable, Sendable {
 // MARK: - Reclaim action
 
 /// How an item's bytes are reclaimed. Dispatch with EXHAUSTIVE switches (no
-/// `default:`) — fn-5 adds a composite case (git worktree remove → fallback
-/// removeItem + prune) and that addition must be a compile-time-visible
-/// change. Do not encode "there are exactly four actions" anywhere.
+/// `default:`) — fn-5 adds a composite case (read-only git gates, then this
+/// process's own removal of the checkout, then a scoped admin-entry removal)
+/// and that addition must be a compile-time-visible change. Do not encode "there are exactly four actions" anywhere.
 enum ReclaimAction: Equatable, Sendable {
     /// Delete the children of every `.measured` root record, keeping the
     /// root directory itself (today's category clean).

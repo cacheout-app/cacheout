@@ -15,9 +15,12 @@ import XCTest
 ///   without command-backed selection; otherwise names ONLY the
 ///   command-backed items (their argv runs regardless of the Trash toggle).
 /// - `CacheoutViewModel.gitWorktreeTrashDisclosures(selectedItems:)` (fn-5.6,
-///   R11/F7) — the same honesty for `git_worktree_reclaim`: git UNLINKS a
-///   worktree and PRUNES admin data, so a Trash-mode confirmation must not
-///   imply recoverability. Stale removals and repository prunes disclose
+///   R11/F7) — the same honesty for `git_worktree_reclaim`: the CHECKOUT
+///   honours the toggle (PR #460 codex r5 — Cacheout performs the removal, so
+///   Move to Trash applies to it), while the `worktrees/<id>` registry
+///   directory and every repository prune are permanent whatever the toggle
+///   says, so a Trash-mode confirmation must not imply recoverability for
+///   them. Stale removals and repository prunes disclose
 ///   SEPARATELY; the two derivations are disjoint by construction.
 /// - `CleanupReport.scannerSections` — per-scanner rollup grouping in
 ///   first-appearance order, pure sums.

@@ -434,6 +434,12 @@ final class GitCommandRunnerTests: XCTestCase {
         }
     }
 
+    /// The CLASSIFIER, not the app's behaviour: since PR #460 codex r5 the
+    /// app issues no mutating git command at all — `worktree remove` and
+    /// `worktree prune` are both gone. What is pinned here is that the
+    /// fail-closed default arm still withholds the read-only relaxations from
+    /// an argv that is not on the read-only allowlist, which is what protects
+    /// the NEXT command anyone adds.
     func testWorktreeMutationsCarryTheMutationProfile() async throws {
         let runner = GitCommandRunner(environment: try emptyPathEnvironment())
         assertMutationProfile(

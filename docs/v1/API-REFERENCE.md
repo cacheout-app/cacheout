@@ -451,9 +451,12 @@ enum ReclaimAction: Equatable, Sendable {
 `.gitWorktreeReclaim` carries a PLAN of structured paths, never argv: the
 cleaner builds the argv from the plan's fields plus registry-controlled
 constants, so command argv stays trusted registry code exactly as it is for
-`.commands`. Two modes — `removeStaleWorktree` (one worktree, git-first with
-a guarded fallback) and `pruneOrphanedAdmin` (repository-level, over a
-provably-complete disclosed set).
+`.commands`. Two modes — `removeStaleWorktree` (one worktree) and `pruneOrphanedAdmin`
+(repository-level, over a provably-complete disclosed set). Every argv the
+cleaner builds is READ-ONLY: both removals are performed by Cacheout itself,
+the checkout under the depth-safe remover or the Trash disposal and the
+disclosed admin directories directly. There is no `git worktree remove` arm
+and no fallback behind one.
 
 ### `AdmissionDescriptor`
 

@@ -53,10 +53,14 @@
 ///   the macOS-14 / Apple-Git-2.39 floor. This applies at delete time too —
 ///   fn-5.4's status re-check and porcelain oracle recompute are read-only
 ///   COMMANDS and carry this profile.
-/// - **Mutation** (`worktree remove`, `worktree prune`): keeps
-///   `-c core.fsmonitor=false` (`worktree remove` runs git's internal clean
-///   check, i.e. the status machinery) but NOT `GIT_OPTIONAL_LOCKS=0` —
-///   mutations need real locking.
+/// - **Mutation** (anything NOT on the read-only allowlist — the fail-closed
+///   default, `GitSafetyProfile.classify`): keeps `-c core.fsmonitor=false`
+///   but NOT `GIT_OPTIONAL_LOCKS=0`, because a mutation needs real locking.
+///   NO COMMAND THE APP ISSUES CLASSIFIES THIS WAY ANY MORE (PR #460 codex
+///   r5/r6): the last two were `worktree remove` and `worktree prune`, and
+///   both are gone — this process performs both removals itself. The profile
+///   stays because it is the DEFAULT arm: an unrecognised or malformed argv
+///   still lands here rather than being granted the read-only relaxations.
 ///
 /// DECIDED and deliberately NOT neutralized, with reasons: `core.hooksPath`
 /// (none of the listed commands run hooks), external diff/textconv drivers
@@ -240,7 +244,8 @@ final class GitCommandRunner: GitCommandRunning, @unchecked Sendable {
 
     /// The argv-side half of the D17 profiles, applied UNCONDITIONALLY —
     /// fsmonitor is the one config-driven external-command executor in this
-    /// command set, and `worktree remove` runs the same status machinery.
+    /// command set, and every command the app issues either IS `status` or
+    /// runs the same status machinery.
     static let fsmonitorNeutralization = "core.fsmonitor=false"
 
     /// The environment-side half of the READ-ONLY profile.

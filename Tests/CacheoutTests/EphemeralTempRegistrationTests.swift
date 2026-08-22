@@ -1913,9 +1913,12 @@ private struct TriggerGatedFixtureScanner: SpaceScanner {
 /// `bump()` returns the NEW value so a caller can act on "the Nth time" in
 /// ONE atomic step — reading `count` after a separate `bump()` is two
 /// operations and can interleave. `WorktreeReclaimPerformerTests` uses that
-/// to fire on the fallback's `rev-parse --git-common-dir`, which is the
-/// SECOND one the performer runs (the primary arm's gate re-establishment
-/// fires the first, before `worktree remove`).
+/// to fire on the Nth invocation of a repeated argv — for example the FIRST
+/// `merge-base`, R2's last rung, which is the window between the ignored
+/// witness and the last gate. (Through r4 this note named "the fallback's
+/// `rev-parse --git-common-dir`, the SECOND one the performer runs"; there is
+/// one arm and one gate re-establishment now, and the second
+/// `--git-common-dir` belongs to the POST-removal prune recompute.)
 final class InvocationCounter: @unchecked Sendable {
     private let lock = NSLock()
     private var value = 0

@@ -563,7 +563,8 @@ git.
   on this.
 - **Move to Trash covers the checkout, not the registry.** The checkout
   follows the toggle — through the previous release it did not, because git
-  did the removing and git unlinks whatever you set. The `worktrees/<id>`
+  did the removing and git unlinks whatever you set. Cacheout does the
+  removing now, so Move to Trash applies to the checkout. The `worktrees/<id>`
   registry directory that follows it is removed permanently either way, and a
   repository prune removes admin directories permanently as well. The
   confirmation sheet says exactly that per selected item, and the cleanup

@@ -134,6 +134,18 @@ below are both part of that coordination, and the latter BLOCKS this release.
   cleanup report records which disposal ran. A removal that succeeded but
   left admin data behind reports a `warning` on its row (the bytes were still
   freed) and the next scan offers the leftovers.
+
+  **And the last check before a Trash move now runs on the same thread the
+  move does.** Moving an item to the Trash has to happen on the app's main
+  thread — that is macOS's rule, not ours — while every safety check ran just
+  before hopping onto it. The gap between the two was therefore however long
+  the main thread was busy, not a fraction of a millisecond: measured through
+  the shipping code with the main thread held for 120 ms, **175.7 ms** passed
+  between the last check and the move. Both the checks and the move now happen
+  on the far side of that hop, with nothing in between: **0.004 ms** under the
+  identical load. This affects every Trash disposal in the app, not only
+  worktrees. Permanent delete was never affected — it re-proves the folder it
+  opens from a handle after its own hop.
 - **`tool_unavailable` scan errors.** When a scanner cannot run an external
   tool it depends on — today `git` for `git_worktrees` — the scan publishes a
   `tool_unavailable` row in `scanner_errors` and withdraws every item that
@@ -496,10 +508,12 @@ below are both part of that coordination, and the latter BLOCKS this release.
 - **BREAKING for MCP callers: NO client-side timeout on a confirmed
   `git_worktrees` clean.** PROTOCOL.md's blanket 30-second subprocess timeout
   now carries one exception, documented in full under "Subprocess Timeout".
-  Cleaning a worktree runs `git worktree remove` on a tree that may be
-  gigabytes, with an unbounded guarded fallback behind it, so ANY finite
-  client-side guess can kill a valid clean mid-removal and leave both
-  Cacheout and its git child in partial state. Callers apply NO timeout when
+  Cleaning a worktree removes a tree that may be gigabytes, so ANY finite
+  client-side guess can kill a valid clean mid-removal and leave Cacheout in
+  partial state. (This entry originally said "runs `git worktree remove` … with
+  an unbounded guarded fallback behind it"; a later entry in this same
+  release replaced that architecture entirely. The rule is unchanged — what
+  is unbounded is the TREE.) Callers apply NO timeout when
   a clean target token equals `git_worktrees`, starts with `git_worktrees:`,
   or names an item whose preflight `scan` row carries
   `"action": "git_worktree_reclaim"` — and, conservatively, when the target
@@ -540,7 +554,7 @@ below are both part of that coordination, and the latter BLOCKS this release.
     (`src/cacheout_mcp/engine.py:465`) wraps EVERY CLI invocation in
     `asyncio.wait_for(proc.communicate(), timeout=120)` (line 475) and raises
     at line 480. A confirmed `git_worktrees` clean therefore gets SIGKILLed
-    at 120 s today — mid-`git worktree remove` on any tree that takes longer.
+    at 120 s today — mid-removal on any tree that takes longer.
   - **Required change:** derive the timeout per invocation and pass `None`
     when the D18 trigger fires (target token `git_worktrees`, a
     `git_worktrees:` prefix, a preflight row whose `action` is
@@ -680,10 +694,12 @@ below are both part of that coordination, and the latter BLOCKS this release.
   actually took afterwards; anything it cannot prove is PUT BACK and reported
   as a refusal, with nothing counted as freed. If the put-back cannot be
   performed the item stays in the Trash and the error names its path, so it is
-  recoverable in one drag. The stale-worktree fallback added in this same
-  release — the disposal the GUI performs when git refuses to remove a
-  worktree — goes through the identical check, so no Trash disposal in the app
-  is handed a bare path.
+  recoverable in one drag. The stale-worktree removal added in this same
+  release — the disposal the GUI performs on a worktree — goes through the
+  identical check, so no Trash disposal in the app is handed a bare path.
+  (Originally written as "the stale-worktree fallback … when git refuses to
+  remove a worktree"; a later entry in this release made that removal the only
+  arm there is, reached unconditionally rather than on a refusal.)
 - **"Move to Trash" undo: a put-back will not restore into a folder it cannot
   prove.** When the Trash turns out to have taken the wrong folder, Cacheout
   puts it back. That undo held its destination folder open but never checked

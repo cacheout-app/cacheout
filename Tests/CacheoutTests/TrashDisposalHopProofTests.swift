@@ -257,6 +257,151 @@ final class TrashDisposalHopProofTests: XCTestCase {
         )
     }
 
+    // ================================================================
+    // MARK: - The landing directory this process may not OPEN (r10, D1)
+    // ================================================================
+
+    /// The deterministic stand-in for the REAL `~/.Trash`: a provider that
+    /// cannot open ONE directory, exactly as TCC denies `~/.Trash` to every
+    /// process without Full Disk Access.
+    ///
+    /// A double LESS capable than production, which is the point — every
+    /// other Trash cell in this suite injects a landing directory whose
+    /// parent is freely openable, and that ONE property is what the
+    /// disposal's after-proof depends on. Measured on this machine, from an
+    /// ordinary CLI process: `open("/Users/<u>/.Trash",
+    /// O_RDONLY|O_DIRECTORY|O_NOFOLLOW)` → -1, errno 1 (EPERM), while `lstat`
+    /// and `open` of `~/.Trash/<name>` both succeed.
+    private final class TrashDeniedProvider: FileSystemIdentityProvider {
+        let denied: String
+        private(set) var refusals = 0
+
+        init(denying directory: URL) {
+            denied = directory.standardizedFileURL.path
+            super.init()
+        }
+
+        override func openDirectoryNoFollow(at url: URL) -> Int32 {
+            guard url.standardizedFileURL.path == denied else {
+                return super.openDirectoryNoFollow(at: url)
+            }
+            refusals += 1
+            errno = EPERM
+            return -1
+        }
+    }
+
+    /// THE DEFECT, DETERMINISTICALLY: a landing the process cannot open is a
+    /// failure to VERIFY, and until r10 it was reported as a failure to
+    /// RESTORE.
+    ///
+    /// The real-composition twin of this cell is
+    /// `GitWorktreeEndToEndTests.testTheTrashDefaultReportsTheCheckoutItReallyMovedToTheTrash`,
+    /// which drives `SpaceScannerRuntime.production` with `moveToTrash` at
+    /// its shipped default and the production `FileManager.trashItem` into
+    /// the real `~/.Trash`. That cell needs no double and is the honest
+    /// proof; it is also silent on any machine WITH Full Disk Access, which
+    /// is why this one exists as well.
+    ///
+    /// MUTATION: delete the `probeLeaf` fallback in `TrashDisposal.facts` and
+    /// this cell fails with `.lastSeenInTrash` — the disposal refuses an
+    /// object that is sitting exactly where it says it is not.
+    func testAnUnopenableLandingIsIdentifiedRatherThanRefused() async throws {
+        let landings = try XCTUnwrap(self.landings)
+        let provider = TrashDeniedProvider(denying: landings)
+        let target = base.appendingPathComponent("victim")
+        try fm.createDirectory(at: target, withIntermediateDirectories: true)
+        try Data("ours".utf8).write(
+            to: target.appendingPathComponent("ours.txt")
+        )
+        let parent = try admittedParent(of: target, provider: provider)
+        let fileManager = fm
+        let landed = landings.appendingPathComponent(target.lastPathComponent)
+
+        try await TrashDisposal.dispose(
+            target, containedIn: parent, provider: provider,
+            via: { url, prove in
+                try prove()
+                try fileManager.moveItem(at: url, to: landed)
+                return landed
+            }
+        )
+
+        XCTAssertGreaterThan(
+            provider.refusals, 0,
+            "the cell must actually have exercised the denied open"
+        )
+        XCTAssertFalse(fm.fileExists(atPath: target.path),
+                       "the disposal really moved it")
+        XCTAssertTrue(
+            fm.fileExists(atPath: landed.appendingPathComponent("ours.txt").path),
+            "…and it is in the landing, intact — which is what the caller "
+                + "reports as freed"
+        )
+    }
+
+    /// AND THE PROOF IS NOT SKIPPED TO GET THERE: the same unopenable
+    /// landing, with a stranger swapped in AFTER the far-side proof, is still
+    /// caught — the fallback IDENTIFIES the landed object rather than
+    /// assuming it.
+    ///
+    /// The refusal it produces is `.strandedInTrash`, not `.lastSeenInTrash`:
+    /// the rollback cannot open the Trash either, so the object cannot be
+    /// moved back — but it IS there, and the cause that names its path is the
+    /// one the user can act on.
+    ///
+    /// MUTATION: restore `.lastSeenInTrash` on `rollBack`'s trash-open arm
+    /// and this cell fails on the cause; delete the `probeLeaf` fallback and
+    /// it fails there too, because nothing is identified at all.
+    func testAnUnopenableLandingStillCatchesAnObjectThatIsNotOurs()
+        async throws
+    {
+        let landings = try XCTUnwrap(self.landings)
+        let provider = TrashDeniedProvider(denying: landings)
+        let target = base.appendingPathComponent("victim")
+        try fm.createDirectory(at: target, withIntermediateDirectories: true)
+        try Data("ours".utf8).write(
+            to: target.appendingPathComponent("ours.txt")
+        )
+        let parent = try admittedParent(of: target, provider: provider)
+        let fileManager = fm
+        let landed = landings.appendingPathComponent(target.lastPathComponent)
+
+        var thrown: Error?
+        do {
+            try await TrashDisposal.dispose(
+                target, containedIn: parent, provider: provider,
+                via: { url, prove in
+                    // The proof passes, and the swap lands in the window no
+                    // proof out here reaches: `trashItem` resolves the URL
+                    // inside itself.
+                    try prove()
+                    try self.swapInAStranger(at: url, directory: true)
+                    try fileManager.moveItem(at: url, to: landed)
+                    return landed
+                }
+            )
+        } catch {
+            thrown = error
+        }
+
+        let failure = try XCTUnwrap(
+            thrown as? TrashDisposal.Failure,
+            "an object that is not ours must be refused even when the "
+                + "landing cannot be opened: \(String(describing: thrown))"
+        )
+        XCTAssertEqual(failure.cause, .strandedInTrash(landed.path))
+        let described = try XCTUnwrap(failure.errorDescription)
+        XCTAssertTrue(described.contains("it is in the Trash at \(landed.path)"),
+                      described)
+        XCTAssertTrue(
+            fm.fileExists(
+                atPath: landed.appendingPathComponent("their-work.txt").path
+            ),
+            "the stranger is where the refusal says it is"
+        )
+    }
+
     // MARK: - The control: an UNDISTURBED hop still disposes
 
     func testAnUndisturbedHopStillDisposesOnEveryArm() async throws {

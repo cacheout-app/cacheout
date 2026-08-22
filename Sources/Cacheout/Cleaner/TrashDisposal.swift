@@ -83,6 +83,36 @@
 //     (`renamex_np(RENAME_EXCL)`, which never clobbers whatever now stands at
 //     the name) and the item is reported as a refusal: no entry, no bytes.
 //
+//  AND THE AFTER-PROOF HAS TO WORK WHERE THE ITEM ACTUALLY LANDS, WHICH IS A
+//  DIRECTORY THIS PROCESS MAY NOT OPEN (PR #460 codex r10, D1). `~/.Trash` is
+//  TCC-protected: measured on this machine (Darwin 25.5) from an ordinary CLI
+//  process, `open("/Users/<u>/.Trash", O_RDONLY|O_DIRECTORY|O_NOFOLLOW)`
+//  returns -1 with errno 1 (EPERM) — while `lstat` and `open` of
+//  `~/.Trash/<name>`, the item this process just moved there, both SUCCEED.
+//  Full Disk Access is the switch, and the GUI does not have it by default.
+//
+//  So for every user without it, the after-proof's descriptor-relative read
+//  (`facts`, which opens the CONTAINING directory and `fstatat`s the name
+//  under it) could not be taken AT ALL, and its `nil` was read as "the Trash
+//  took something nobody inspected". The disposal then rolled back — a
+//  rollback that could not open the Trash either — and the user was told, of
+//  a checkout sitting in the Trash and recoverable in one drag, that it "is
+//  no longer at ~/.Trash/<name>, where the Trash reported putting it", with
+//  entries=0 and 0 bytes reported. REPRODUCED 3/3 through the real production
+//  composition, `moveToTrash` at its shipped default, nothing injected at the
+//  seam, by `GitWorktreeEndToEndTests`'
+//  `testTheTrashDefaultReportsTheCheckoutItReallyMovedToTheTrash`.
+//
+//  IT SURVIVED BECAUSE EVERY TRASH CELL IN THE SUITE INJECTED A `trashHandler`
+//  LANDING IN A FIXTURE DIRECTORY, whose parent is freely openable — the one
+//  property the guard depends on, and the one production does not have. The
+//  fix is in `facts`: when the containing directory cannot be opened the
+//  landed object is still IDENTIFIED, by the single `lstat` the permission
+//  allows, and the comparison the caller makes is unchanged. A failure to
+//  VERIFY is not evidence of a wrong disposal, and it is not a licence to
+//  skip the verification either — see `facts` for why the weaker binding can
+//  never admit what the stronger one would refuse.
+//
 //  THE RESIDUAL, WITH ITS ENDPOINTS AND ITS SIZE MEASURED — not "a syscall
 //  wide", which is what an unmeasured version of this note would have claimed
 //  and which is false.
@@ -234,10 +264,13 @@ enum TrashDisposal {
             /// and it now stands at the original name again — the arrival
             /// was identified under the held destination descriptor.
             case putBack
-            /// PROVED: the object was still at `landed` when the rollback
-            /// re-bound it, and the move itself could not be performed
-            /// (typically the original name is occupied again). The payload
-            /// is where the item is, so the user can finish it in one drag.
+            /// PROVED: an object was still identified at `landed` — by the
+            /// rollback's own re-bind, or by the after-proof that sent it
+            /// here when the Trash directory cannot be opened at all — and
+            /// the move itself could not be performed (the original name is
+            /// occupied again, or this process may not open the Trash). The
+            /// payload is where the item is, so the user can finish it in one
+            /// drag.
             case strandedInTrash(String)
             /// NOT PROVED, so NOTHING WAS MOVED: the object the disposal took
             /// is no longer at the name the disposal reported (it was moved,
@@ -619,13 +652,63 @@ enum TrashDisposal {
     }
 
     /// Kind AND identity of whatever answers to `url`'s NAME inside `url`'s
-    /// directory, read descriptor-relative.
+    /// directory, read descriptor-relative — and, WHEN THAT DIRECTORY CANNOT
+    /// BE OPENED AT ALL, from one no-follow `lstat` of the path instead.
     ///
     /// `nil` is "nothing could be identified here", which is never a match
     /// and never a licence: `nil == bound` is false for every `bound`, so the
     /// caller rolls back, and the rollback refuses to move an object it
-    /// cannot name. Its three `nil` arms are therefore not three guards —
-    /// they are one fail-closed default that the caller's comparison enforces.
+    /// cannot name. Its `nil` arms are therefore not guards — they are one
+    /// fail-closed default that the caller's comparison enforces.
+    ///
+    /// ## THE FALLBACK, AND THE DEFECT IT CLOSES (PR #460 codex r10, D1)
+    ///
+    /// `url` is where the DISPOSAL said it put the item: in production that
+    /// is `~/.Trash/<name>`, and **a process without Full Disk Access cannot
+    /// open `~/.Trash`**. Measured on this machine (Darwin 25.5), from an
+    /// ordinary CLI process: `open("/Users/<u>/.Trash",
+    /// O_RDONLY|O_DIRECTORY|O_NOFOLLOW)` returns -1 with errno 1 (EPERM),
+    /// while `lstat` and `open` of `~/.Trash/<name>` — the item this process
+    /// just moved there — both SUCCEED. TCC denies the directory and permits
+    /// traversal through it.
+    ///
+    /// So the descriptor-relative read failed for EVERY Trash disposal on
+    /// every machine without Full Disk Access, this returned `nil`, and the
+    /// caller read that as "the disposal took something nobody inspected" and
+    /// rolled back — a rollback that then could not open the Trash either, so
+    /// the user was told, of a checkout sitting in the Trash and recoverable
+    /// in one drag, that it "could not be put back — it is no longer at
+    /// `~/.Trash/<name>`, where the Trash reported putting it", with
+    /// `entries=0` and 0 bytes reported. REPRODUCED 3/3 through the real
+    /// production composition (`SpaceScannerRuntime.production` →
+    /// `CacheoutViewModel.clean()`, `moveToTrash` at its shipped default,
+    /// nothing injected at the seam) by
+    /// `GitWorktreeEndToEndTests.testTheTrashDefaultReportsTheCheckoutItReallyMovedToTheTrash`,
+    /// which is red without the fallback and green with it.
+    ///
+    /// A FAILURE TO VERIFY IS NOT EVIDENCE OF A WRONG DISPOSAL, and this is
+    /// not a decision to skip the verification: the fallback still IDENTIFIES
+    /// the landed object, by the one syscall the permission actually allows.
+    /// The comparison the caller makes is unchanged, so a genuinely swapped
+    /// object still mismatches and is still refused
+    /// (`testAnUnopenableLandingStillCatchesAnObjectThatIsNotOurs`).
+    ///
+    /// IT IS NOT RESTRICTED TO THE PERMISSION ERRNOS, deliberately. The
+    /// fallback cannot ADMIT anything the descriptor-relative read would
+    /// refuse — its result is only ever compared for equality against an
+    /// identity bound before the move — so a per-errno gate would add an
+    /// untestable branch and buy nothing. It is reached only when the
+    /// container open has ALREADY failed; while that open succeeds the
+    /// descriptor-relative answer, including its `.absent`, is the only one
+    /// used.
+    ///
+    /// THE ARM THIS RESTORES PARITY WITH: `dispose(_:expecting:…)`'s
+    /// directory path has always identified the landing with `look`, which is
+    /// a DIRECT `open` of `url` and therefore never needed the Trash
+    /// directory. Only the arms that read the landing descriptor-relative —
+    /// the container-bound overload (the GUI's default worktree and
+    /// contents-mode disposal) and the `.nonDirectoryLeaf` arm — were
+    /// unusable without Full Disk Access.
     static func facts(
         at url: URL, provider: FileSystemIdentityProvider
     ) -> FileSystemIdentityProvider.ChildFacts? {
@@ -636,7 +719,12 @@ enum TrashDisposal {
         let fd = provider.openDirectoryNoFollow(
             at: url.deletingLastPathComponent()
         )
-        guard fd >= 0 else { return nil }
+        guard fd >= 0 else {
+            guard case .facts(let facts) = provider.probeLeaf(at: url) else {
+                return nil
+            }
+            return facts
+        }
         defer { close(fd) }
         guard case .facts(let facts) = provider.probeChild(
             inDirectory: fd, named: name, logical: url
@@ -888,10 +976,21 @@ enum TrashDisposal {
               FileSystemIdentityProvider.isSafeComponent(destination)
         else { return .lastSeenInTrash(landed.path) }
 
+        // THE TRASH DIRECTORY CANNOT BE OPENED — which is the ORDINARY case,
+        // not an exotic one: without Full Disk Access this open is EPERM on
+        // every macOS machine (measured — see `facts`). What it means here is
+        // that the put-back cannot be PERFORMED, not that the item is not
+        // where the disposal said. `observed` is non-`nil` on this line — the
+        // caller identified an object at `landed` a moment ago, through
+        // whichever of the two reads was permitted — so the item IS in the
+        // Trash, and `.strandedInTrash` is the cause that says so and gives
+        // the user the path to drag it back from. Reporting
+        // `.lastSeenInTrash` here told them the opposite of what they can see
+        // in the Trash (PR #460 codex r10, D1).
         let trashFD = provider.openDirectoryNoFollow(
             at: landed.deletingLastPathComponent()
         )
-        guard trashFD >= 0 else { return .lastSeenInTrash(landed.path) }
+        guard trashFD >= 0 else { return .strandedInTrash(landed.path) }
         defer { close(trashFD) }
         let containerFD = provider.openDirectoryNoFollow(
             at: target.deletingLastPathComponent()

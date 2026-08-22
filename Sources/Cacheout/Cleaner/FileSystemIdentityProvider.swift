@@ -613,6 +613,49 @@ class FileSystemIdentityProvider {
         ))
     }
 
+    /// The SAME two facts about the object at `url`'s own path, from ONE
+    /// no-follow `lstat` — `probeChild`'s path-resolved twin.
+    ///
+    /// THIS IS NOT A REPLACEMENT FOR `probeChild` AND HAS EXACTLY ONE
+    /// SANCTIONED USE: reading an object inside a directory this process is
+    /// not permitted to OPEN. Measured on this machine (Darwin 25.5), from a
+    /// process without Full Disk Access:
+    ///
+    ///     open("/Users/<u>/.Trash", O_RDONLY|O_DIRECTORY|O_NOFOLLOW)
+    ///         → -1, errno 1 (EPERM)
+    ///     lstat("/Users/<u>/.Trash/<name>")              → 0
+    ///     open("/Users/<u>/.Trash/<name>", O_DIRECTORY)  → a descriptor
+    ///
+    /// TCC denies the DIRECTORY and permits traversal THROUGH it, so a
+    /// descriptor-relative read of a trashed item is impossible for every
+    /// user who has not granted Full Disk Access while a path read is not.
+    /// `TrashDisposal.facts` is the only caller and uses it only where the
+    /// container open has already failed.
+    ///
+    /// WHY THE WEAKER BINDING IS STILL SOUND THERE, STATED RATHER THAN
+    /// ASSUMED: its result is only ever compared for EQUALITY against an
+    /// identity bound before the move, and a difference refuses. A re-pointed
+    /// name resolves to some other inode, which cannot equal the bound one —
+    /// so this call can never ADMIT what the descriptor-relative form would
+    /// refuse. It can only supply the identity the descriptor-relative form
+    /// is not permitted to read.
+    func probeLeaf(at url: URL) -> ChildProbe {
+        var st = stat()
+        guard lstat(url.path, &st) == 0 else {
+            let code = errno
+            return (code == ENOENT || code == ENOTDIR)
+                ? .absent
+                : .failed(errno: code)
+        }
+        return .facts(ChildFacts(
+            kind: Self.fileKind(from: st),
+            identity: Identity(
+                device: UInt64(bitPattern: Int64(st.st_dev)),
+                inode: UInt64(st.st_ino)
+            )
+        ))
+    }
+
     /// The outcome of a descriptor-relative directory open — errno carried
     /// rather than left in the global, which an override could clobber.
     enum DescriptorOpen: Equatable {

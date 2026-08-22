@@ -597,6 +597,22 @@ below are both part of that coordination, and the latter BLOCKS this release.
 
 ### Fixed
 
+- **"Move to Trash" no longer tells you your folder could not be put back
+  while it is sitting in the Trash.** Move to Trash is the shipped default,
+  and after moving an item Cacheout re-identifies it where the Trash said it
+  put it — the check that catches a folder swapped out from under the
+  disposal. That check opened `~/.Trash` itself, and macOS refuses that to
+  every app without Full Disk Access, so on an ordinary Mac it could never be
+  taken: every trashed item was reported as a refusal with nothing freed, and
+  the message said what the Trash took "could not be put back — it is no
+  longer at `~/.Trash/<name>`, where the Trash reported putting it" — about a
+  folder that was at exactly that path, intact, one drag from recovery. The
+  check now identifies the item the way the permission actually allows when
+  the Trash directory cannot be opened, so a real disposal is reported as one
+  and a swapped folder is still caught and refused. When such a refusal
+  happens without Full Disk Access the item cannot be moved back
+  automatically, and the message now says where it is instead of denying it
+  is there.
 - **A background refresh no longer reads the folders it has already decided
   to skip.** The ephemeral-temp scanner runs only when you ask for a scan, but
   before each scan Cacheout records the identity of every folder it might

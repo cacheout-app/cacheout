@@ -2467,6 +2467,50 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         XCTAssertNil(runner.argvs.first { $0.contains("prune") })
     }
 
+    func testAnEntryLockedBetweenTheTwoOracleChecksIsNotRemoved() async throws {
+        // SHRINKAGE IS LEGAL, AND IT IS ALSO BINDING. What gets removed is the
+        // FINAL recomputed set, never the earlier one: an entry the last
+        // oracle answer no longer calls prunable must not be destroyed just
+        // because an earlier answer did.
+        //
+        // A LOCK is the shape that proves it, and it is NOT the fact the
+        // per-object revival probe re-establishes: the checkout is still gone,
+        // so the back-link still reads "orphaned". What changed is that the
+        // user marked the entry do-not-touch — exactly as G4 does for a live
+        // worktree — and the mapper excludes locked entries because git's own
+        // prune skips them too.
+        let fixture = try makePruneFixture(orphans: ["gone"])
+        let orphan = fixture.admin[0]
+        let plan = prunePlan(membership: fixture.membership, disclosed: [orphan])
+
+        let listings = Timeline()
+        let lockFile = orphan.appendingPathComponent("locked")
+        let runner = InterceptingGitRunner(wrapping: realRunner()) { arguments, _ in
+            guard arguments.contains("list") else { return nil }
+            listings.record("list")
+            // THE WINDOW: after the FIRST recompute answered, before the
+            // SECOND one runs. `locked` is how git itself records a lock, and
+            // the porcelain reports it back.
+            if listings.events.count == 2 {
+                try? Data("in use on laptop\n".utf8).write(to: lockFile)
+            }
+            return nil
+        }
+        let outcome = await perform(
+            item(plan, id: "prune"), plan: plan,
+            with: makePerformer(runner: runner)
+        )
+
+        XCTAssertTrue(fm.fileExists(atPath: orphan.path),
+                      "an entry locked after the first check must survive")
+        XCTAssertTrue(fm.fileExists(atPath: lockFile.path),
+                      "…and the lock itself must be untouched")
+        XCTAssertTrue(outcome.errors.isEmpty, "\(outcome.errors.map(\.message))")
+        // The row is still emitted — the execution stays reportable — but it
+        // promises NOTHING, because nothing was freed.
+        XCTAssertEqual(try XCTUnwrap(outcome.entry).bytesFreed, 0)
+    }
+
     func testACheckoutRevivedAfterTheFinalCheckIsNotSwept() async throws {
         // THE PER-OBJECT GATE. The final oracle check answered one subprocess
         // ago; if a checkout came back in between (a remount, a restore, a

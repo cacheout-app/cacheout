@@ -36,6 +36,23 @@
 /// ~94 ms of registry read plus a `status` walk that GROWS with the tree.
 /// The 1-file column is the honest handoff cost, and it is 35× ours.
 ///
+/// That second row is a PROXY — a C harness calling `removefile` directly,
+/// which is not this code. The shipped path was then measured INSTRUMENTED
+/// through the production composition (`CacheCleaner` wiring
+/// `DepthSafeRemoval` / `TrashDisposal`), timing the LAST GIT COMPLETION
+/// BEFORE THE UNLINK against a watcher thread spinning on `lstat` of a
+/// tracked file until ENOENT — never simply "the last git call", because the
+/// gated prune's own invocations run AFTER the unlink:
+///
+/// | disposal | last gate answered → the checkout is gone |
+/// |---|---|
+/// | permanent (`DepthSafeRemoval`) | median **0.373 ms**, 0.315–0.565, n=10 |
+/// | trash (`TrashDisposal`) | median **0.674 ms**, 0.588–16.152, n=10 |
+///
+/// The trash arm's maximum is one outlier from the mover; its median is the
+/// number that describes the arm. Both are compared against 14.87 ms, and
+/// unlike 14.87 ms neither grows with the tree.
+///
 /// **That window is IRREDUCIBLE while git performs the removal** — the
 /// unlink happens inside git's process, so no re-proof of ours can sit
 /// closer. The choice is therefore not "narrow it": it is disclose it, or
@@ -169,9 +186,11 @@
 /// (R1b's own resolver), whether it is locked (`<admin>/locked`), and whether
 /// HEAD moved (`<admin>/HEAD`, when that file corroborates the porcelain
 /// record, or `<admin>/reftable/tables.list` when it cannot). It spawns
-/// nothing, so it opens no window of its own: MEASURED to the UNLINK, the
-/// residual is 0.417 ms (median, n=10) against the 14.87 ms `git worktree
-/// remove` left open. What genuinely needs a subprocess — cleanliness, and
+/// nothing, so it opens no window of its own: MEASURED to the UNLINK through
+/// the production composition, the residual is 0.373 ms (median, n=10) in the
+/// permanent arm and 0.674 ms in the Trash arm, against the 14.87 ms
+/// `git worktree remove` left open. What genuinely needs a subprocess —
+/// cleanliness, and
 /// ancestry when HEAD did not move but a branch tip did — is enumerated as a
 /// RESIDUAL rather than described as closed: see `reproveFromTheFilesystem`
 /// and the "What is left, measured" section.
@@ -1335,39 +1354,54 @@ struct WorktreeReclaimPerformer {
     // 1. **CLEANLINESS (G2).** `git status --porcelain` is the only faithful
     //    answer — the index, `.gitignore` rules, submodules and skip-worktree
     //    entries are not readable from metadata — so it stays a subprocess
-    //    and stays the LAST git call. What remains between the last gate and
-    //    the destructive call is now the re-proof itself, which spawns
-    //    nothing. MEASURED end to end, instrumented, on the two success
-    //    cells: FALLBACK (clean re-check answered → disposal call) median
-    //    0.173 ms, range 0.160–0.227 ms, n=5; PRIMARY (gates answered →
-    //    `worktree remove` spawn) median 0.163 ms, range 0.136–0.239 ms,
-    //    n=10. r3's equivalents were 77.9 ms and 56.9 ms, the latter
-    //    containing three subprocess spawns.
+    //    and stays the LAST git call. What remains between it and the unlink
+    //    is the re-proof, which spawns nothing.
     //
-    //    In the PRIMARY arm cleanliness is not this process's check at all:
-    //    `git worktree remove` runs WITHOUT `--force` and refuses a dirty
-    //    tree itself, inside the mutation, where no window exists.
+    //    MEASURED TO THE UNLINK, INSTRUMENTED, through the production
+    //    composition (`CacheCleaner` wiring `DepthSafeRemoval` /
+    //    `TrashDisposal`; the last git completion BEFORE the unlink against a
+    //    watcher spinning on `lstat` until ENOENT): permanent arm median
+    //    **0.373 ms** (0.315–0.565, n=10), Trash arm median **0.674 ms**
+    //    (0.588–16.152, n=10, one mover outlier). r4 published 0.163 ms and
+    //    0.173 ms for this, but measured to the `worktree remove` SPAWN and
+    //    to the disposal CALL — not to the destruction. Measured to the
+    //    destruction, r4's primary arm was 14.87 ms on a one-file worktree
+    //    and 156.8 ms on a 2001-file one.
     // 2. **ANCESTRY WHEN HEAD DID NOT MOVE BUT ITS TARGET DID.** For an
-    //    ATTACHED worktree the HEAD file names a branch and does not change
-    //    when that branch commits, so a commit made inside the window is not
-    //    detected. It is also not LOST: the commit and the branch ref both
-    //    live in the common git directory, which no arm of this performer
-    //    touches — `git worktree remove` deletes no branch and the fallback
-    //    deletes only the checkout. The DETACHED case, where the same commit
-    //    would be unrecoverable, is fully covered above and refused when it
-    //    cannot be. The default ref moving (`git update-ref refs/heads/main
-    //    <older>`) sits in the same class and the same reasoning.
-    // 3. **THE DISPOSAL CALL ITSELF.** Once `trashItem`/`removeTree` is
+    //    ATTACHED worktree on the FILES backend the HEAD file names a branch
+    //    and does not change when that branch commits, so a commit made
+    //    inside the window is not detected. It is also not LOST: the commit
+    //    and the branch ref both live in the common git directory, which
+    //    nothing here touches — the removal deletes only the checkout. The
+    //    DETACHED case, where the same commit would be unrecoverable, is
+    //    fully covered above and refused when it cannot be. The default ref
+    //    moving (`git update-ref refs/heads/main <older>`) sits in the same
+    //    class and the same reasoning.
+    //
+    //    NOT A RESIDUAL ON THE REFTABLE BACKEND (r5/D3): `tables.list` moves
+    //    on every ref write, including an attached-branch commit, so those
+    //    repositories get a strictly stronger guarantee here. The asymmetry
+    //    is real and is stated rather than smoothed over.
+    // 3. **IGNORED CONTENT THAT WAS ALREADY THERE (r5/D2).** The witness
+    //    compares a SET, so a path present in both readings is destroyed with
+    //    the tree — which is the product, not a defect. Two narrower limits
+    //    ride with it: `--ignored=traditional` collapses an ignored
+    //    DIRECTORY to one line, so a file created inside one is not detected,
+    //    and the comparison is over PATHS, so a change to an ignored file
+    //    that already existed is not detected.
+    // 4. **THE DISPOSAL CALL ITSELF.** Once `TrashDisposal`/`removeTree` is
     //    entered, nothing this process can read changes what it does. That
-    //    window is not removable by any ordering.
+    //    window is not removable by any ordering — it is the 0.373 ms above.
     //
     // The user-facing form of this is in `docs/v1/CATEGORIES.md` and the
-    // CHANGELOG: *"The final re-check before the delete reads the
-    // filesystem, not git: which checkout it is, whether it is locked, and
-    // whether its HEAD moved. Cleanliness is git's answer and is the last
-    // git call — work saved in the millisecond after it is not seen. On a
-    // branch, work committed after the checks still survives on the branch;
-    // a detached worktree whose HEAD cannot be re-read is refused instead."*
+    // CHANGELOG: *"The final check before the delete reads the filesystem,
+    // not git: which checkout it is, whether it is locked, and whether its
+    // HEAD moved. Cleanliness is git's answer and is the last command run, so
+    // work saved in the millisecond after it is not seen. On a branch, work
+    // committed after the checks still survives on the branch; a detached
+    // worktree whose HEAD cannot be re-read is refused instead. Ignored
+    // content that was already in the worktree is destroyed with it; an
+    // ignored file that appears while the checks run refuses the removal."*
 
     /// The D13 guard as a `GateReestablishment`, so a refused traversal reads
     /// like every other delete-time refusal instead of throwing through the
@@ -1888,7 +1922,8 @@ struct WorktreeReclaimPerformer {
     static let lockFileName = "locked"
 
     /// THE LAST-INSTANT RE-PROOF — every gate whose ORACLE IS THE FILESYSTEM
-    /// ITSELF, re-proved immediately before the destructive act in BOTH arms.
+    /// ITSELF, re-proved immediately before the destructive act — and since
+    /// r5 there is exactly one destructive act to be before.
     ///
     /// ## THE GENERAL SHAPE, AND WHY IT IS NOT "MOVE ONE CALL DOWN"
     ///
@@ -1919,7 +1954,8 @@ struct WorktreeReclaimPerformer {
     /// | THE LOCK (G4) | `<admin>/locked` exists | YES — git's own on-disk representation |
     /// | HEAD UNMOVED (R2's premise) | `<admin>/HEAD` bytes + inode, or `<admin>/reftable/tables.list` when that file cannot corroborate (D3) | YES |
     ///
-    /// and the second class is stated, not hidden, in `residualWindow` below.
+    /// and the second class is stated, not hidden, in the "What is left,
+    /// measured" section above.
     ///
     /// ORDER: identity first. The lock file and the HEAD file are read
     /// THROUGH the admin directory, so "which admin directory" must be

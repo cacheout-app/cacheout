@@ -519,11 +519,16 @@ final class CleanSheetPresentationTests: XCTestCase {
         }
     }
 
-    /// THE trash-honesty case: the toggle is ON, and the sheet must still say
-    /// the worktree is unlinked permanently. Before fn-5.6 a composite item
-    /// matched NO disclosure branch and fell to generic wording that reflects
-    /// the toggle — a false promise of recoverability.
-    func testStaleReclaimDisclosesPermanentGitRemovalRegardlessOfTheToggle()
+    /// THE trash-honesty case, CORRECTED AT r5 (PR #460 codex r5, D1/D7).
+    ///
+    /// Through r4 this cell asserted the sheet said "Move to Trash does not
+    /// apply … unlinked permanently", because `git worktree remove` unlinked
+    /// the checkout whatever the toggle said. The removal is Cacheout's own
+    /// now, so the CHECKOUT follows the toggle — and the sheet must say the
+    /// half that still does not: the `worktrees/<id>` registry entry goes
+    /// permanently either way. Before fn-5.6 a composite item matched NO
+    /// disclosure branch at all and fell to generic wording.
+    func testStaleReclaimDisclosesWhichHalfTheTrashToggleCovers()
         throws
     {
         let stale = perItem(
@@ -539,11 +544,15 @@ final class CleanSheetPresentationTests: XCTestCase {
         XCTAssertEqual(disclosures.count, 1, "\(disclosures)")
         let text = try XCTUnwrap(disclosures.first)
         XCTAssertTrue(text.contains("feature-branch"), text)
-        XCTAssertTrue(text.contains("Move to Trash does not apply"), text)
-        XCTAssertTrue(text.contains("unlinked permanently"), text)
-        // The ONE narrow exception is NAMED rather than hidden (D16: only the
-        // guarded fallback honours the toggle, and the report says which ran).
-        XCTAssertTrue(text.contains("fallback"), text)
+        XCTAssertTrue(text.contains("CHECKOUT follows the Move to Trash setting"),
+                      text)
+        XCTAssertTrue(text.contains("removed permanently either way"), text)
+        XCTAssertTrue(text.contains("No branch is deleted"), text)
+        // The retired promise must not survive anywhere in the sentence.
+        XCTAssertFalse(text.contains("Move to Trash does not apply"), text)
+        XCTAssertFalse(text.contains("unlinked"), text)
+        XCTAssertFalse(text.contains("fallback"),
+                       "there is no second arm to name any more: \(text)")
         XCTAssertFalse(text.contains("projectA"),
                        "deletion-cleaned neighbors are NEVER named")
         XCTAssertFalse(text.contains("npm-cache"),

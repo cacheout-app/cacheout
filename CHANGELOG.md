@@ -40,61 +40,100 @@ below are both part of that coordination, and the latter BLOCKS this release.
   privacy prompts for Documents and Desktop now name worktree discovery
   alongside build artifacts, in all three build paths — the prompt describes
   every scanner that actually walks those roots.
-- **Worktree removal runs through git, and says so.** Removal is
-  `git worktree remove` — never `--force`, because git's own refusal of a
-  dirty tree is a check worth keeping. Immediately before that removal — and
-  again before the direct-delete fallback — the gates the scan used are
-  re-established against the live repository: which repository the parent
-  path actually resolves to, and whether the worktree is still registered,
-  still linked, still unlocked and still merged. Anything that changed since
-  the scan refuses, names the action that clears it ("run
-  `git worktree unlock …`", "merge, rebase or push that commit"), and deletes
-  nothing. If git itself refuses the removal, the direct delete runs those
-  same gates first and re-checks the tree for cleanliness LAST, immediately
-  before deleting — so work you save while the checks are running is found,
-  not destroyed — followed by a narrowly gated removal of that worktree's own
-  admin entry. A tree that went dirty in that window is refused; commit,
-  stash or stop writing, re-scan, and it is offered again. The
-  re-establishment also proves WHICH worktree it is about, by identity and
-  not by path: the checkout at the assessed path must still back-link to the
-  admin directory the scan resolved AND that directory must be the same
+- **Worktree removal is Cacheout's own, and git is only asked questions.**
+  It used to be `git worktree remove`, and the entry that described it
+  measured the wrong thing: it called the moment git was LAUNCHED "the
+  destructive call". It is not. git then starts up, reads its registry, runs
+  its own status walk over the whole tree, and only then unlinks — and it
+  never re-reads the facts the checks just established. Measured on git
+  2.50.1: **14.9 ms** (median of ten) between launching git and the first
+  file being gone, on a worktree holding a single tracked file, and the gap
+  GROWS with the tree because git's status walk sits inside it. Cacheout
+  removes the checkout itself now, with the last check immediately in front
+  of it: **0.4 ms** to the same point, and it does not grow. Nothing became
+  removable that was not removable before — every case where git refused
+  already ended in this same delete. What is new is the refusals that gap
+  used to swallow.
+
+  Before the removal, the gates the scan used are re-established against the
+  live repository: which repository the parent path actually resolves to, and
+  whether the worktree is still registered, still linked, still unlocked and
+  still merged. Anything that changed since the scan refuses, names the
+  action that clears it ("run `git worktree unlock …`", "merge, rebase or
+  push that commit"), and deletes nothing. The tree is re-checked for
+  cleanliness LAST, immediately before deleting — so work you save while the
+  checks are running is found, not destroyed — and the delete is followed by
+  a narrowly gated removal of that worktree's own admin entry. A tree that
+  went dirty in that window is refused; commit, stash or stop writing,
+  re-scan, and it is offered again.
+
+  The re-establishment also proves WHICH worktree it is about, by identity
+  and not by path: the checkout at the assessed path must still back-link to
+  the admin directory the scan resolved AND that directory must be the same
   object the scan saw. So a checkout you moved onto that path, and equally
   one you removed and re-created there, is refused rather than removed — the
   replacement is judged on its own merits by the next scan. (This window is
   the desktop app's, where one scan's results stay on screen across your
   click. An earlier draft of this entry said `--cli clean` was protected
   because its re-scan answers a replacement with "unknown item id — rescan
-  and retry"; that was WRONG and is corrected here. Item ids are derived
-  from the scanner and the path, so a replacement at the same path has the
-  same id, and candidacy has no age term — the CLI's re-scan re-judges
-  whatever is at the path, and removes it if all four gates pass on its own
-  merits. It does not detect the substitution.) Immediately before either
-  removal, three further facts are re-read straight from the filesystem —
-  that the checkout is still the assessed one, that nobody has locked it,
-  and that its HEAD has not moved — which costs microseconds rather than
-  further git commands, so effectively nothing happens between the last
-  check and the removal. What that cannot cover is stated rather than
-  implied: cleanliness is git's answer and is the last command run; and on a
-  branch, a commit made while the checks run does not move HEAD — that
-  commit survives on the branch, which no removal here touches. A DETACHED
-  worktree whose HEAD cannot be re-read from disk (repositories using the
-  `reftable` ref format keep no per-worktree HEAD file) is refused outright
-  rather than removed, because a commit lost there would be reachable from
-  nothing; put the work on a branch and re-scan. The repository-level item
-  removes exactly the
-  admin directories it
+  and retry"; that was WRONG and is corrected here. Item ids are derived from
+  the scanner and the path, so a replacement at the same path has the same
+  id, and candidacy has no age term — the CLI's re-scan re-judges whatever is
+  at the path, and removes it if all four gates pass on its own merits. It
+  does not detect the substitution.)
+
+  Immediately before the delete, three further facts are re-read straight
+  from the filesystem — that the checkout is still the assessed one, that
+  nobody has locked it, and that its HEAD has not moved — which costs
+  microseconds rather than further git commands. What that cannot cover is
+  stated rather than implied: cleanliness is git's answer and is the last
+  command run; and on a branch, a commit made while the checks run does not
+  move HEAD — that commit survives on the branch, which no removal here
+  touches. A DETACHED worktree whose HEAD cannot be re-read from disk is
+  refused outright rather than removed, because a commit lost there would be
+  reachable from nothing; put the work on a branch and re-scan.
+
+  A correction to the previous entry, which said repositories using the
+  `reftable` ref format "keep no per-worktree HEAD file". They keep one.
+  Measured on git 2.50.1, `git init --ref-format=reftable` followed by
+  `git worktree add --detach` leaves a `HEAD` file that reads
+  `ref: refs/heads/.invalid`, unchanged in bytes across a detached commit,
+  while git reports a real commit id. The file is there and readable; what it
+  cannot do is corroborate anything. Those repositories are now checked
+  through the worktree's own ref stack instead, which moves on every ref
+  write — and that catches a commit made on an ATTACHED branch too, which the
+  ordinary HEAD file cannot. Through the previous release an attached
+  worktree in such a repository had no HEAD check at all.
+
+  **Files your `.gitignore` hides are now accounted for honestly.** `git
+  status` reports nothing about an ignored path, so the previous entry's
+  promise that "work you save while the checks are running is found" was
+  false for anything ignored — measured, a `secret.env` written in that
+  window was destroyed with the tree and the report showed a plain success.
+  The ignored list is now read before the checks and again immediately before
+  the delete, and a path that APPEARED refuses the removal by name. Ignored
+  content that was ALREADY there is still destroyed with the worktree — that
+  is the point of the feature — and two limits are stated rather than
+  implied: a file created inside a directory that is itself ignored is not
+  detected, and a change to an ignored file that already existed is not
+  detected.
+
+  The repository-level item removes exactly the admin directories it
   disclosed, one at a time — no repository-wide `git worktree prune` runs,
   because git recomputes that command's set for itself after every check has
   already answered, and a second checkout of the same repository that
   vanished in between would be swept without ever having been listed.
   **No branch is ever deleted and repository objects are never touched.**
-  Because git unlinks rather than trashes, the confirmation sheet discloses
-  per selected item that Move to Trash does not apply — stale removals and
-  repository prunes worded separately, and the stale wording naming the one
-  exception, the fallback delete, which does honour the toggle — and the
-  cleanup report records which ran. A removal that succeeded but left admin data behind
-  reports a `warning` on its row (the bytes were still freed) and the next
-  scan offers the leftovers.
+
+  **Move to Trash now applies to the checkout.** It did not before: git
+  unlinked the tree whatever the toggle said, and the app ships with Move to
+  Trash ON, so the most common worktree removal was unconditionally
+  unrecoverable. The `worktrees/<id>` registry directory that follows the
+  checkout is still removed permanently, as is a repository prune, and the
+  confirmation sheet discloses exactly that split per selected item. The
+  cleanup report records which disposal ran. A removal that succeeded but
+  left admin data behind reports a `warning` on its row (the bytes were still
+  freed) and the next scan offers the leftovers.
 - **`tool_unavailable` scan errors.** When a scanner cannot run an external
   tool it depends on — today `git` for `git_worktrees` — the scan publishes a
   `tool_unavailable` row in `scanner_errors` and withdraws every item that

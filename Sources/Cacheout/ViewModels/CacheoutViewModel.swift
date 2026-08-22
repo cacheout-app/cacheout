@@ -1056,24 +1056,25 @@ class CacheoutViewModel: ObservableObject {
     ///
     /// WHY THIS EXISTS AT ALL: the `.commands` disclosure above matches only
     /// `.commands`, so a selected composite item would fall through to the
-    /// sheet's generic wording — which reflects the Move-to-Trash toggle and
-    /// would therefore imply the worktree is recoverable. It is not:
-    /// `git worktree remove` UNLINKS the tree, and the repository-level mode
-    /// removes admin data directly; neither puts anything in the Trash,
-    /// whatever the toggle says (D16, and the `.commands` precedent it
-    /// follows).
+    /// sheet's generic wording, which says nothing about the SECOND thing a
+    /// worktree reclaim removes.
     ///
     /// TWO MODES, TWO DIFFERENT TRUTHS — never one laundered sentence:
     ///
-    /// - **stale removal** — permanent git removal. The ONE narrow exception
-    ///   is named rather than hidden: when git itself REFUSES the removal,
-    ///   fn-5.4 falls back to a guarded filesystem delete, and only THAT path
-    ///   honours the toggle. Which path actually ran is reported per entry in
-    ///   the cleanup report (`disposal`), so the sheet promises the
-    ///   conservative truth and the report tells the specific one.
+    /// - **stale removal** — the CHECKOUT honours the toggle and the admin
+    ///   entry does not. THIS CHANGED AT PR #460 codex r5 (D1/D7): while
+    ///   `git worktree remove` was the primary arm, the checkout was unlinked
+    ///   permanently whatever the toggle said, and this sentence said so.
+    ///   The removal is Cacheout's own now — under a descriptor-bound
+    ///   container and a last-instant re-proof — so Move to Trash applies to
+    ///   the checkout, which is the part a user would want back. The
+    ///   `worktrees/<id>` registry directory that follows it is removed
+    ///   permanently either way, and saying so is the whole point of this
+    ///   disclosure. Which disposal actually ran is reported per entry in the
+    ///   cleanup report (`disposal`).
     /// - **prune-only** — repository ADMIN DATA (the orphaned worktree
-    ///   registry). Branch refs and repository objects survive, and there is
-    ///   no fallback path at all, so it is permanent unconditionally.
+    ///   registry) and nothing else, permanently, whatever the toggle says.
+    ///   Branch refs and repository objects survive.
     ///
     /// Ordered stale-then-prune and returned as separate strings so a
     /// selection containing both never merges two different promises. Empty
@@ -1101,13 +1102,14 @@ class CacheoutViewModel: ObservableObject {
         }
         var disclosures: [String] = []
         if !stale.isEmpty {
-            let verb = stale.count == 1 ? "is" : "are"
+            let verb = stale.count == 1 ? "its" : "their"
+            let noun = stale.count == 1 ? "entry is" : "entries are"
             disclosures.append(
-                "\(stale.joined(separator: ", ")) \(verb) removed by git — "
-                    + "Move to Trash does not apply: the worktree is unlinked "
-                    + "permanently. Only a fallback delete, used when git "
-                    + "itself refuses the removal, honours the toggle; the "
-                    + "cleanup report says which ran."
+                "\(stale.joined(separator: ", ")): the CHECKOUT follows the "
+                    + "Move to Trash setting, but \(verb) git registry "
+                    + "\(noun) removed permanently either way. No branch is "
+                    + "deleted and repository objects are untouched; the "
+                    + "cleanup report records which disposal ran."
             )
         }
         if !prune.isEmpty {

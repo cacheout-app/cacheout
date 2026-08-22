@@ -495,11 +495,13 @@ final class GitWorktreeEndToEndTests: XCTestCase {
         let staleEntry = try XCTUnwrap(report.entries.first { $0.key == stale.key })
         XCTAssertEqual(staleEntry.exactBytes, expectedExact,
                        "freed bytes are the delete-time measurement")
-        // D16: git unlinks — the entry is permanent whatever the toggle said.
+        // D16 as of PR #460 codex r5: the entry follows the toggle, and this
+        // run has it OFF. It was `.permanent` unconditionally while
+        // `git worktree remove` was the arm.
         XCTAssertEqual(staleEntry.disposal, .permanent)
         XCTAssertNil(staleEntry.warning,
-                     "git removed the tree AND its admin entry — nothing left "
-                         + "behind, so no D11 warning")
+                     "the gated prune removed the admin entry too — nothing "
+                         + "left behind, so no D11 warning")
 
         // ---- THE FILESYSTEM AND THE REPOSITORY ---------------------------
         XCTAssertFalse(fm.fileExists(atPath: fixture.merged.path),

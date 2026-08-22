@@ -528,8 +528,8 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
 
     /// D16 AS CORRECTED BY r5 (D1/D7). While `git worktree remove` was the
     /// primary arm this cell asserted the opposite — `.permanent` in a Trash
-    /// run, trash seam never called — because git unlinks whatever the
-    /// toggle says. The GUI ships `moveToTrash = true`, so that made the
+    /// run, trash seam never called — because `git worktree remove` unlinks
+    /// whatever the toggle says. The GUI ships `moveToTrash = true`, so that made the
     /// app's most common worktree removal unconditionally unrecoverable.
     /// This process removes the tree now, so the toggle applies.
     func testTheStaleRemovalHonoursTheTrashToggleNowThatGitIsNotTheRemover()
@@ -4128,6 +4128,7 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
                 + "including every gate re-establishment invocation"
         )
     }
+
 
     func testTheArgvBuildersCarryNoForceAndNoBranchDeletionEver() {
         // The Boundaries, asserted on the BUILDERS themselves so a future

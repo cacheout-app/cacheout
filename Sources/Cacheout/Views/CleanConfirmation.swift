@@ -164,11 +164,14 @@ struct CleanConfirmationSheet: View {
 
             // fn-5.6 (R11/F7): the SAME honesty for the composite reclaim.
             // Without this branch a selected worktree item would fall to the
-            // sheet's generic wording, which reflects the toggle and would
-            // falsely promise recoverability — git unlinks, it does not
-            // trash. Stale removals and repo-level prunes are disclosed
-            // SEPARATELY (they are different promises), so the enumeration is
-            // over the derived strings, not one merged sentence.
+            // sheet's generic wording, which covers only the CHECKOUT — and a
+            // worktree reclaim also removes a `worktrees/<id>` registry
+            // directory, permanently, whatever the toggle says (PR #460 codex
+            // r5 corrects the old reason, "git unlinks, it does not trash":
+            // no git removal runs here any more). Stale removals and
+            // repo-level prunes are disclosed SEPARATELY — they are different
+            // promises — so the enumeration is over the derived strings, not
+            // one merged sentence.
             ForEach(Array(viewModel.gitWorktreeTrashDisclosures.enumerated()),
                     id: \.offset) { _, disclosure in
                 Label(disclosure, systemImage: "exclamationmark.triangle.fill")

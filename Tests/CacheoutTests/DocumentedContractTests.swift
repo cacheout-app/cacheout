@@ -352,8 +352,17 @@ final class DocumentedContractTests: XCTestCase {
     /// PROMISE's shape, which is what regressed.
     func testRecordedCrossRepoGateIsSemanticAndSourceScoped() throws {
         let changelog = try document("CHANGELOG.md")
+        // The second marker is searched INSIDE the tail the first one opens
+        // (PR #460 codex r9, D1). Two independent `range(of:)` searches make
+        // a range whose bounds are in document order only by luck: reorder
+        // the two headings and `..<` TRAPS — `Fatal error: Range requires
+        // lowerBound <= upperBound` — which kills the process, not this cell.
+        // Anchored, an out-of-order document is a nil search and a FAILURE.
         guard let unreleased = changelog.range(of: "## [Unreleased]"),
-              let released = changelog.range(of: "## [2.2.0]") else {
+              let released = changelog.range(
+                of: "## [2.2.0]",
+                range: unreleased.upperBound..<changelog.endIndex
+              ) else {
             return XCTFail("CHANGELOG must carry an [Unreleased] section")
         }
         let section = String(changelog[unreleased.lowerBound..<released.lowerBound])
@@ -558,7 +567,20 @@ final class DocumentedContractTests: XCTestCase {
             text.range(of: "#### Exception: NO client-side timeout"),
             "PROTOCOL.md must carry the composite-clean timeout exception"
         )
-        let end = try XCTUnwrap(text.range(of: "## Alert Schema"))
+        // Anchored to the tail `start` opens, for the reason given at the
+        // CHANGELOG sites above (PR #460 codex r9, D1): MEASURED — lifting
+        // `## Alert Schema` above the exception heading, an ordinary
+        // reorganisation, turned the unanchored form into `Fatal error:
+        // Range requires lowerBound <= upperBound` and xctest died on a
+        // signal, taking every cell sorting after this one with it.
+        let end = try XCTUnwrap(
+            text.range(
+                of: "## Alert Schema",
+                range: start.upperBound..<text.endIndex
+            ),
+            "PROTOCOL.md must carry the Alert Schema section AFTER the "
+                + "timeout exception it bounds"
+        )
         let section = String(text[start.lowerBound..<end.lowerBound])
 
         // THE RULE.
@@ -616,8 +638,17 @@ final class DocumentedContractTests: XCTestCase {
     /// checks the PROMISE's shape.
     func testRecordedTimeoutGateIsBlockingNamedAndVerifiable() throws {
         let changelog = try document("CHANGELOG.md")
+        // The second marker is searched INSIDE the tail the first one opens
+        // (PR #460 codex r9, D1). Two independent `range(of:)` searches make
+        // a range whose bounds are in document order only by luck: reorder
+        // the two headings and `..<` TRAPS — `Fatal error: Range requires
+        // lowerBound <= upperBound` — which kills the process, not this cell.
+        // Anchored, an out-of-order document is a nil search and a FAILURE.
         guard let unreleased = changelog.range(of: "## [Unreleased]"),
-              let released = changelog.range(of: "## [2.2.0]") else {
+              let released = changelog.range(
+                of: "## [2.2.0]",
+                range: unreleased.upperBound..<changelog.endIndex
+              ) else {
             return XCTFail("CHANGELOG must carry an [Unreleased] section")
         }
         let section = String(changelog[unreleased.lowerBound..<released.lowerBound])

@@ -7,7 +7,7 @@ import XCTest
 /// so every cell that sorts after the trap never runs and the total line never
 /// prints. This suite has been stranded that way twice, measured both times.
 ///
-/// ## The three positions, and the order they were closed in
+/// ## The four positions, and the order they were closed in
 ///
 /// 1. **CONDITION** — `TestElementAccess.swift` retired the trapping subscript
 ///    from the condition position and PR #460 codex r3 converted the sites.
@@ -33,6 +33,16 @@ import XCTest
 ///    PropertyListDecoder().decode(…)` strand exactly as hard, and until r6
 ///    NOTHING looked at them: r3's conversion was a convention, and r5's fence
 ///    parsed only `XCTAssert*` argument lists.
+/// 4. **RANGE CONSTRUCTION** (PR #460 codex r9, D1) — `a..<b` is a
+///    constructor with a precondition, and `Range requires lowerBound <=
+///    upperBound` is a `Fatal error` like any other. A range whose two bounds
+///    come from two INDEPENDENT `range(of:)` searches over a document the
+///    tests do not control is ordered only by luck. MEASURED at r9: moving
+///    `## Alert Schema` above `#### Exception: NO client-side timeout` in
+///    `PROTOCOL.md` — an edit that touches no test — killed
+///    `testDocumentedNoClientTimeoutRuleAndItsTriggerAreComplete` with that
+///    fatal error and no `Executed N tests` line. Three sites had the shape;
+///    `testNoIndependentlyLocatedRangePairCanStrandTheRun` fences it.
 ///
 /// ## And it reads BOTH TEST TARGETS (PR #460 codex r6, D3)
 ///
@@ -107,7 +117,9 @@ import XCTest
 ///   subset — 7 lines, not 117 — and its own header states its limits.
 /// - **`as!`, `precondition`, `fatalError`, arithmetic overflow, out-of-range
 ///   `Range` subscripts, `Array(repeating:count:)` with a negative count** —
-///   not scanned at all. No occurrence of any of them has stranded a run here.
+///   not scanned at all. No occurrence of any of them has stranded a run
+///   here. An OUT-OF-ORDER `Range` is no longer in this list: it stranded a
+///   run at r9 and has its own cell (position 4 above).
 /// - **raw string literals (`#"…"#`)** are blanked WHOLE, so a trap inside a
 ///   raw-string interpolation would be missed. No test uses one.
 ///
@@ -772,6 +784,256 @@ final class StrandFenceTests: XCTestCase {
                 offenders(quiet), [], "must NOT be reported: \(quiet)"
             )
         }
+    }
+
+    // MARK: - A Range built from two INDEPENDENT searches (r9, D1)
+
+    /// `a..<b` is not a slice — it is a CONSTRUCTOR with a precondition, and
+    /// `Range requires lowerBound <= upperBound` is a `Fatal error`, so it
+    /// kills the PROCESS exactly like `xs[0]` does. The population that can
+    /// reach it: a range whose two bounds come from two SEPARATE
+    /// `range(of:)` searches over a document the tests do not control.
+    /// Neither search knows about the other, so the moment an ordinary
+    /// reorganisation puts the second marker above the first, the `..<`
+    /// traps.
+    ///
+    /// MEASURED at r9 on this branch: lifting `## Alert Schema` above
+    /// `#### Exception: NO client-side timeout` in `PROTOCOL.md` — an edit
+    /// that touches no test — turned
+    /// `testDocumentedNoClientTimeoutRuleAndItsTriggerAreComplete` into
+    /// `Fatal error: Range requires lowerBound <= upperBound` and xctest died
+    /// on a signal. Three sites had the shape (two over `CHANGELOG.md`, one
+    /// over `PROTOCOL.md`); all three are now anchored.
+    ///
+    /// ## What this cell covers, stated so it cannot drift
+    ///
+    /// - The shape is `A.<bound> ..< B.<bound>` (or `...`) with A and B
+    ///   DIFFERENT bare identifiers. The same name on both sides is one
+    ///   `Range`'s own two ends, ordered by construction, and is not
+    ///   reported.
+    /// - One ALLOWANCE, proved from the source rather than asserted: the
+    ///   BINDING OF `B` THAT THIS USE SEES — the nearest `let`/`var` of that
+    ///   name ABOVE the range construction — searches inside the tail `A`
+    ///   opens, `let B = …range(of: …, range: A.upperBound..<…)`. Then
+    ///   `B.lowerBound >= A.upperBound >= A.lowerBound` for every pairing of
+    ///   bounds, and a document that does not carry the second marker after
+    ///   the first yields nil, which is a FAILING cell rather than a signal.
+    /// - The allowance is POSITIONAL, not file-wide, and that is load-bearing
+    ///   rather than tidiness: `DocumentedContractTests` binds `start`/`end`
+    ///   in two different cells, one anchored and one not. MEASURED at r9 —
+    ///   with a file-wide allowance (the first shape written here) reverting
+    ///   the `PROTOCOL.md` fix left this cell GREEN, because the OTHER cell's
+    ///   anchored `end` laundered it. The nearest-binding rule reports it.
+    /// - An anchor is attributed to the binding it sits in — the last
+    ///   `let`/`var` above it — so an `A.upperBound` anchor belonging to a
+    ///   LATER statement cannot launder an earlier construction.
+    /// - Only a `.lowerBound`/`.upperBound` pair is read. `a..<b` over two
+    ///   plain `String.Index` values is not matched; no test builds one.
+    /// - Scope is `Tests/`, as every cell here: this fence is about what
+    ///   strands the RUN.
+    ///
+    /// `testTheIndependentRangePairFenceIsExactlyWhatItClaims` pins every
+    /// clause above on synthetic sources, in both directions.
+    static let independentRangePairPattern =
+        #"([A-Za-z_]\w*)\.(?:lower|upper)Bound\s*\.\.[.<]\s*([A-Za-z_]\w*)\.(?:lower|upper)Bound"#
+
+    /// One `let`/`var` binding, with the names whose `upperBound` its own
+    /// statement searches from.
+    struct RangeBinding {
+        let name: String
+        /// UTF-16 offset of the binding, comparable with every other offset
+        /// this file takes from `NSRegularExpression`.
+        let offset: Int
+        var anchors: Set<String>
+    }
+
+    /// Every `let`/`var` binding in `source`, in order, each carrying the
+    /// anchors that occur between it and the NEXT binding.
+    static func rangeBindings(in source: String) -> [RangeBinding] {
+        guard let binding = try? NSRegularExpression(
+            pattern: #"\b(?:let|var)\s+(\w+)\s*="#
+        ), let anchor = try? NSRegularExpression(
+            pattern: #"range:\s*(\w+)\.upperBound"#
+        ) else { return [] }
+        let full = NSRange(source.startIndex..., in: source)
+        var bindings: [RangeBinding] = []
+        for match in binding.matches(in: source, range: full) {
+            guard match.numberOfRanges > 1,
+                  let nameRange = Range(match.range(at: 1), in: source)
+            else { continue }
+            bindings.append(RangeBinding(
+                name: String(source[nameRange]),
+                offset: match.range.location,
+                anchors: []
+            ))
+        }
+        for match in anchor.matches(in: source, range: full) {
+            guard match.numberOfRanges > 1,
+                  let nameRange = Range(match.range(at: 1), in: source),
+                  let owner = bindings.lastIndex(
+                    where: { $0.offset < match.range.location }
+                  )
+            else { continue }
+            bindings[owner].anchors.insert(String(source[nameRange]))
+        }
+        return bindings
+    }
+
+    /// `(utf16Offset, description)` for every out-of-order-capable range
+    /// construction in one source.
+    static func unorderedRangePairs(in source: String) -> [(offset: Int, hit: String)] {
+        guard let regex = try? NSRegularExpression(
+            pattern: independentRangePairPattern
+        ) else { return [] }
+        let bindings = rangeBindings(in: source)
+        let full = NSRange(source.startIndex..., in: source)
+        var hits: [(offset: Int, hit: String)] = []
+        for match in regex.matches(in: source, range: full) {
+            guard match.numberOfRanges > 2,
+                  let firstRange = Range(match.range(at: 1), in: source),
+                  let secondRange = Range(match.range(at: 2), in: source)
+            else { continue }
+            let first = String(source[firstRange])
+            let second = String(source[secondRange])
+            if first == second { continue }
+            // The binding of `second` THIS use sees, not any binding of that
+            // name anywhere in the file.
+            let visible = bindings.last {
+                $0.name == second && $0.offset < match.range.location
+            }
+            if visible?.anchors.contains(first) == true { continue }
+            hits.append((match.range.location, "\(first) … \(second)"))
+        }
+        return hits
+    }
+
+    func testNoIndependentlyLocatedRangePairCanStrandTheRun() throws {
+        var offenders: [String] = []
+        var scannedFiles = 0
+
+        for file in try testSources() {
+            let source = Self.blankingLiteralText(
+                Self.blankingComments(
+                    try String(contentsOf: file, encoding: .utf8)
+                )
+            )
+            scannedFiles += 1
+            for hit in Self.unorderedRangePairs(in: source) {
+                guard let index = Range(
+                    NSRange(location: hit.offset, length: 0), in: source
+                )?.lowerBound else { continue }
+                let line = source[source.startIndex..<index]
+                    .filter { $0 == "\n" }.count + 1
+                offenders.append(
+                    "\(target(of: file))/\(file.lastPathComponent):"
+                        + "\(line): \(hit.hit)"
+                )
+            }
+        }
+
+        XCTAssertGreaterThan(
+            scannedFiles, 40,
+            "the fence must actually have read the suite, not an empty listing"
+        )
+        XCTAssertEqual(
+            offenders, [],
+            "a range whose two bounds come from two INDEPENDENT searches "
+                + "traps — `Range requires lowerBound <= upperBound` — the "
+                + "moment the document puts the second marker first, and that "
+                + "kills the PROCESS, not the cell. Search for the second "
+                + "marker inside the first's tail: "
+                + "`range(of: b, range: a.upperBound..<doc.endIndex)`."
+        )
+    }
+
+    /// The new fence's own regression guard: every clause of the doc comment
+    /// above, on synthetic sources, in both directions.
+    func testTheIndependentRangePairFenceIsExactlyWhatItClaims() {
+        func offenders(_ source: String) -> [String] {
+            Self.unorderedRangePairs(in: source).map(\.hit)
+        }
+
+        // Reported: the r9 live sites, both range spellings.
+        XCTAssertEqual(
+            offenders("""
+                let unreleased = changelog.range(of: a)
+                let released = changelog.range(of: b)
+                let section = String(changelog[unreleased.lowerBound..<released.lowerBound])
+                """),
+            ["unreleased … released"]
+        )
+        XCTAssertEqual(
+            offenders("""
+                let start = try XCTUnwrap(text.range(of: a))
+                let end = try XCTUnwrap(text.range(of: b))
+                let section = String(text[start.lowerBound...end.upperBound])
+                """),
+            ["start … end"],
+            "a closed range traps on the same precondition"
+        )
+        XCTAssertEqual(
+            offenders("""
+                let start = doc.range(of: a)
+                let end = doc.range(of: b, range: start.upperBound..<doc.endIndex)
+                let bad = String(doc[end.lowerBound..<start.lowerBound])
+                """),
+            ["end … start"],
+            "the anchor orders start BEFORE end, so the REVERSED pair is "
+                + "still an offender"
+        )
+        // The r9 measurement, as a cell: a SECOND, anchored binding of the
+        // same names elsewhere in the file must not launder this one.
+        XCTAssertEqual(
+            offenders("""
+                func first() {
+                    let start = try XCTUnwrap(text.range(of: a))
+                    let end = try XCTUnwrap(text.range(of: b))
+                    let section = String(text[start.lowerBound..<end.lowerBound])
+                }
+                func second() {
+                    let start = try XCTUnwrap(script.range(of: c))
+                    let end = try XCTUnwrap(
+                        script.range(of: d, range: start.upperBound..<script.endIndex)
+                    )
+                    let function = String(script[start.lowerBound..<end.upperBound])
+                }
+                """),
+            ["start … end"],
+            "the allowance is the NEAREST binding above the use, not any "
+                + "binding of that name in the file"
+        )
+
+        // Not reported, each for the reason the header states.
+        for quiet in [
+            // The later search is anchored inside the earlier one's tail.
+            "let start = try XCTUnwrap(script.range(of: a))\n"
+                + "let end = try XCTUnwrap(\n"
+                + "    script.range(of: b, range: start.upperBound..<script.endIndex)\n"
+                + ")\n"
+                + "let function = String(script[start.lowerBound..<end.upperBound])",
+            // One Range's own two ends.
+            "let text = String(line[hit.lowerBound..<hit.upperBound])",
+            // One-sided: no second bound to be out of order with.
+            "let text = String(line[comment.lowerBound...])",
+            // The second operand is not a Range bound at all.
+            "body: String(source[range.upperBound..<bodyEnd])",
+        ] {
+            XCTAssertEqual(
+                offenders(quiet), [], "must NOT be reported: \(quiet)"
+            )
+        }
+
+        // The anchor belongs to the binding it sits in: one written in a
+        // LATER statement does not reach back.
+        XCTAssertEqual(
+            offenders("""
+                let start = doc.range(of: a)
+                let end = doc.range(of: b)
+                let other = doc.range(of: c, range: start.upperBound..<doc.endIndex)
+                let bad = String(doc[start.lowerBound..<end.lowerBound])
+                """),
+            ["start … end"]
+        )
     }
 
     // MARK: - The inventory this fence REPLACED

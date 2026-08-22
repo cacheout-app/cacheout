@@ -215,10 +215,35 @@ private final class ProbeRecordingProvider: FileSystemIdentityProvider {
         lock.unlock()
         return super.probeKind(of: url)
     }
+
+    /// The DESCRIPTOR seam too (fn-6 reconciliation): the walk probes its root
+    /// by path but every child through this overload, so recording only the
+    /// path one would let "nothing under here was inspected" pass without
+    /// having observed the seam most inspections actually use. The cell's
+    /// POSITIVE half (`a user-initiated scan follows the pointer`) is what
+    /// keeps the negative half from being vacuous either way.
+    override func probeKind(
+        inDirectory parent: Int32, named name: String, logical url: URL
+    ) -> DescriptorKindProbe {
+        lock.lock()
+        probed.append(url.path)
+        lock.unlock()
+        return super.probeKind(inDirectory: parent, named: name, logical: url)
+    }
 }
 
-/// Forces `.failed` lstat probes for exact paths — EPERM cannot be fixtured
-/// from an unentitled process.
+/// Forces `.failed` probes for exact paths — EPERM cannot be fixtured from an
+/// unentitled process.
+///
+/// BOTH SEAMS ARE OVERRIDDEN, and the descriptor one is the load-bearing half
+/// here (fn-6 reconciliation). The walk probes its ROOT by path but every
+/// child through `probeKind(inDirectory:named:logical:)` — so a double that
+/// covers only the path overload silently stops intercepting below the root,
+/// which is where this file's denial fixtures live. It does not fail loudly:
+/// the walk simply succeeds and reports no issue, so the cell asserting the
+/// denial stays VISIBLE goes red with an empty error list rather than a wrong
+/// kind. Matched on the LOGICAL url, which is the spelling `failingPaths`
+/// holds.
 private final class FailingProbeProvider: FileSystemIdentityProvider {
     var failingPaths: Set<String> = []
     var failErrno: Int32 = EPERM
@@ -226,6 +251,13 @@ private final class FailingProbeProvider: FileSystemIdentityProvider {
     override func probeKind(of url: URL) -> KindProbe {
         if failingPaths.contains(url.path) { return .failed(errno: failErrno) }
         return super.probeKind(of: url)
+    }
+
+    override func probeKind(
+        inDirectory parent: Int32, named name: String, logical url: URL
+    ) -> DescriptorKindProbe {
+        if failingPaths.contains(url.path) { return .failed(errno: failErrno) }
+        return super.probeKind(inDirectory: parent, named: name, logical: url)
     }
 }
 

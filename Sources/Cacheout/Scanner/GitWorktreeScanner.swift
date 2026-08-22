@@ -1369,6 +1369,33 @@ struct GitWorktreeScanner: @unchecked Sendable {
 /// composite performer's own re-checks (the clean re-check, the oracle
 /// recompute, the D13 traversal guard) are the delete-time gates for its items.
 ///
+/// `participates(in:)` IS NOT OVERRIDDEN, and that is a decision rather than an
+/// omission (fn-6 reconciliation). fn-6 added the member so a scanner can
+/// decline a TRIGGER outright, and `ephemeral_tmp` declines every
+/// `.automatic` one. This scanner takes the default — it runs in every
+/// session — for two reasons:
+///
+///  1. DECLINING IS ALL-OR-NOTHING, AND THIS SCANNER'S POLICY IS NOT. A
+///     non-participating scanner publishes no outcome at all, deliberately, so
+///     an auto-refresh cannot erase prior findings or the user's ticks. This
+///     scanner's trigger sensitivity is per-ROOT and per-ITEM instead: it skips
+///     PROTECTED roots on `.automatic` (`ProjectTreeWalker.isProtectedRoot`,
+///     the one definition) and defers protected-PARENT assessment on the same
+///     trigger, while still walking the ordinary dev roots. Whole-scanner
+///     deferral would throw away the part that is safe to do in the background
+///     along with the part that is not.
+///  2. A GENUINE DENIAL MUST STAY VISIBLE ON A BACKGROUND SCAN, which is a
+///     thing only a PARTICIPATING scanner can do —
+///     `testGenuineWalkDenialStaysVisibleUnderBothTriggers` asserts the
+///     `.tccDenied` issue arrives under `.automatic` as well as
+///     `.userInitiated`. Declining would make that cell unsatisfiable: no
+///     event, so no issue, and the R9 freshness gate would strand the retained
+///     rows instead.
+///
+/// Nothing here fires a subprocess speculatively: the runner is inert until a
+/// repository is actually discovered, so participating costs a background scan
+/// nothing on a machine with no worktrees.
+///
 /// Registration is fn-5.6's single-site change; conformance lands here so the
 /// outcome can be round-tripped through the runtime's validator by tests before
 /// any user-facing surface can address an item.

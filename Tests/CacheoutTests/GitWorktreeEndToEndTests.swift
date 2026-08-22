@@ -229,8 +229,10 @@ final class GitWorktreeEndToEndTests: XCTestCase {
                 BuildArtifactsScanner.registeredID,
                 OrphanedCachesScanner.registeredID,
                 GitWorktreeScanner.registeredID,
+                EphemeralTempScanner.registeredID,
             ],
-            "the single production registry, with git_worktrees registered"
+            "the single production registry, with git_worktrees registered "
+                + "ahead of fn-6's ephemeral_tmp"
         )
         let scanner = try XCTUnwrap(
             runtime.scanners.compactMap { $0 as? GitWorktreeScanner }.first

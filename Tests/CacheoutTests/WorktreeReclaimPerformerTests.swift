@@ -1046,7 +1046,13 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
             runner: allowing,
             revalidators: [scannerID: PreDeleteRevalidator(
                 requiresRevalidation: { _ in true },
-                revalidate: { _, _ in .allow }
+                // `.unestablished` is STATED, because fn-6 gave `.allow` an
+                // associated binding with NO DEFAULT precisely so a
+                // revalidator holding no descriptor has to say so. This double
+                // inspects nothing, so it has nothing to bind; the cell's
+                // subject is still that an ALLOWING revalidator lets the
+                // reclaim proceed.
+                revalidate: { _, _ in .allow(inspected: .unestablished) }
             )]
         ).clean(items: [marked], moveToTrash: false)
         XCTAssertTrue(report.errors.isEmpty, "\(report.errorLines)")

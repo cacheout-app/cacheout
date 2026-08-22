@@ -164,8 +164,11 @@ final class EphemeralTempRegistrationTests: XCTestCase {
             CategoryScanner.registeredID,
             BuildArtifactsScanner.registeredID,
             OrphanedCachesScanner.registeredID,
+            GitWorktreeScanner.registeredID,
             EphemeralTempScanner.registeredID,
-        ], "the temp scanner is APPENDED — every existing slug keeps its place")
+        ], "the temp scanner is APPENDED — every existing slug keeps its "
+            + "place, including git_worktrees, which fn-5 registered ahead "
+            + "of it")
 
         let scanner = try XCTUnwrap(
             runtime.scanners.compactMap { $0 as? EphemeralTempScanner }.first

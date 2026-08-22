@@ -202,9 +202,7 @@ final class EphemeralTempScannerTests: XCTestCase {
     private func itemsByName(
         _ outcome: ScanOutcome
     ) -> [String: ReclaimableItem] {
-        Dictionary(
-            uniqueKeysWithValues: outcome.items.map { ($0.displayName, $0) }
-        )
+        XCTUniquelyKeyed(outcome.items.map { ($0.displayName, $0) })
     }
 
     /// The outcome must pass fn-2's shared fail-closed validation THROUGH the

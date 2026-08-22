@@ -112,6 +112,8 @@ final class SourceAnchorIntegrityTests: XCTestCase {
          "One invocation, one session (R9): the cleaner ho"),
         ("CLIHandler.swift:426-438",
          "orphanedCachesThresholds: OrphanedCacheClassifie"),
+        ("CacheCleaner.swift:514",
+         "if let entry = outcome.entry { entries.append(en"),
         ("CacheoutApp.swift:58",
          "@StateObject private var viewModel = CacheoutVie"),
         ("CacheoutViewModel.swift:1465-1466",
@@ -152,7 +154,7 @@ final class SourceAnchorIntegrityTests: XCTestCase {
          "Never followed; neither carries content of its o"),
         ("EphemeralTempScanner.swift:771-777",
          "kind: kind == .symlink ? .symlinkRoot : .nonDire"),
-        ("EphemeralTempScannerTests.swift:2975-2977",
+        ("EphemeralTempScannerTests.swift:2973-2975",
          "detail.contains("),
         ("FileSystemIdentityProvider.swift:143",
          "guard !blocksOverflow, allocated >= 0 else { ret"),
@@ -271,10 +273,8 @@ final class SourceAnchorIntegrityTests: XCTestCase {
         for file in sources {
             byName[file.lastPathComponent, default: []].append(file)
         }
-        let expectations = Dictionary(
-            uniqueKeysWithValues: Self.anchorExpectations.map {
-                ($0.anchor, $0.excerpt)
-            }
+        let expectations = XCTUniquelyKeyed(
+            Self.anchorExpectations.map { ($0.anchor, $0.excerpt) }
         )
         let sites = try anchorSites()
         var offenders: [String] = []

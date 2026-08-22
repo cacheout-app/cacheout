@@ -26,7 +26,7 @@ import XCTest
 ///    converts the very failure `XCTUnwrapElement` exists to make survivable
 ///    back into a `SIGILL`. MEASURED on this branch: dropping the issue
 ///    emission in `EphemeralTempScanner.swift:771-777` killed the runner at
-///    `EphemeralTempScannerTests.swift:2975-2977` with `Index out of range` and
+///    `EphemeralTempScannerTests.swift:2973-2975` with `Index out of range` and
 ///    signal 5; the cells after it never ran and the total line never printed.
 /// 3. **STATEMENT** (PR #460 codex r6, D4) — a trap needs no assertion around
 ///    it at all. `let call = mock.calls[0]` and `let state = try!
@@ -43,6 +43,30 @@ import XCTest
 ///    `testDocumentedNoClientTimeoutRuleAndItsTriggerAreComplete` with that
 ///    fatal error and no `Executed N tests` line. Three sites had the shape;
 ///    `testNoIndependentlyLocatedRangePairCanStrandTheRun` fences it.
+///
+/// 5. **KEYED-DICTIONARY CONSTRUCTION** (PR #460 codex r10, D3) —
+///    `Dictionary(uniqueKeysWithValues:)` traps on a duplicate key:
+///    `Fatal error: Duplicate values for key` is a stdlib precondition
+///    (Swift's `NativeDictionary.swift`, line 792 — a stdlib path, not a
+///    repository anchor), and it kills the process exactly
+///    as `xs[0]` does. Eleven sites had the shape and nine of them keyed on a
+///    value PRODUCTION decides — an entry's `displayName`, an entry's
+///    `itemID`, a scanned item's `id` — which is precisely where a regression
+///    puts a second one.
+///
+///    MEASURED AT THIS COMMIT'S PARENT, by mutating ONE production line —
+///    `Sources/Cacheout/Cleaner/CacheCleaner.swift:514`, `if let entry =
+///    outcome.entry { entries.append(entry) }`, appended twice, which is the
+///    shape of SCANNERS-ROADMAP defect D1. With the old constructor at
+///    `CacheCleanerTests:1385` the run died with `Fatal error: Duplicate
+///    values for key: 'cat-exact'`, exit 1, **24 of the 95
+///    `CacheCleanerTests` cells had started and the `Executed N tests` line
+///    never printed** — while the swift-testing footer still printed `✔ Test
+///    run … passed`. With every site converted to `XCTUniquelyKeyed`, the
+///    IDENTICAL mutation produces **15 failing cells out of 138 executed**,
+///    three of which name the duplicated key, and the run finishes.
+///    `testNoUniquelyKeyedDictionaryCanStrandTheRun` fences it; the sites and
+///    the replacement live in `TestElementAccess.swift`.
 ///
 /// ## And it reads BOTH TEST TARGETS (PR #460 codex r6, D3)
 ///
@@ -1062,6 +1086,105 @@ final class StrandFenceTests: XCTestCase {
                 """),
             ["start … end"]
         )
+    }
+
+    // MARK: - Position 5: a KEYED-DICTIONARY constructor (r10, D3)
+
+    /// `Dictionary(uniqueKeysWithValues:)` — the label alone is the offence,
+    /// because it is the only thing that spells this constructor.
+    ///
+    /// The scan runs over sources with comments AND string-literal text
+    /// blanked, which is what lets this fence — and the doc comments that
+    /// explain it — spell the needle without reporting themselves.
+    static let uniquelyKeyedDictionaryNeedle = "uniqueKeysWithValues"
+
+    /// Line numbers (1-based) of every `uniqueKeysWithValues:` in one already
+    /// blanked source.
+    static func uniquelyKeyedDictionaries(in source: String) -> [Int] {
+        var lines: [Int] = []
+        for (offset, line) in source.split(
+            separator: "\n", omittingEmptySubsequences: false
+        ).enumerated() where line.contains(uniquelyKeyedDictionaryNeedle) {
+            lines.append(offset + 1)
+        }
+        return lines
+    }
+
+    func testNoUniquelyKeyedDictionaryCanStrandTheRun() throws {
+        var offenders: [String] = []
+        var scannedFiles = 0
+
+        for file in try testSources() {
+            let source = Self.blankingLiteralText(
+                Self.blankingComments(
+                    try String(contentsOf: file, encoding: .utf8)
+                )
+            )
+            scannedFiles += 1
+            for line in Self.uniquelyKeyedDictionaries(in: source) {
+                offenders.append(
+                    "\(target(of: file))/\(file.lastPathComponent):\(line)"
+                )
+            }
+        }
+
+        XCTAssertGreaterThan(
+            scannedFiles, 40,
+            "the fence must actually have read the suite, not an empty listing"
+        )
+        XCTAssertEqual(
+            offenders, [],
+            "`Dictionary(uniqueKeysWithValues:)` traps on a duplicate key — "
+                + "`Fatal error: Duplicate values for key` is a stdlib "
+                + "precondition — and every site of it in this suite keyed on "
+                + "a value PRODUCTION decides, which is exactly where a "
+                + "regression puts a second one. Use `XCTUniquelyKeyed`, "
+                + "which fails one cell and lets the run finish."
+        )
+    }
+
+    /// The new fence's own regression guard, in both directions.
+    func testTheUniquelyKeyedDictionaryFenceIsExactlyWhatItClaims() {
+        func offenders(_ source: String) -> [Int] {
+            Self.uniquelyKeyedDictionaries(
+                in: Self.blankingLiteralText(Self.blankingComments(source))
+            )
+        }
+
+        // Reported: the live shapes r10 converted, on one line and split.
+        XCTAssertEqual(
+            offenders(
+                "let byID = Dictionary(uniqueKeysWithValues: "
+                    + "report.entries.map { ($0.itemID, $0) })"
+            ),
+            [1]
+        )
+        XCTAssertEqual(
+            offenders(
+                "let bySlug = Dictionary(\n"
+                    + "    uniqueKeysWithValues: outcome.items.map { ($0.id, $0) }\n"
+                    + ")"
+            ),
+            [2],
+            "the label is what is matched, so the multi-line spelling is "
+                + "reported on the line that carries it"
+        )
+
+        // Not reported, each for the reason the header states.
+        for quiet in [
+            // A comment that explains the rule is not a breach of it.
+            "// never Dictionary(uniqueKeysWithValues: pairs)",
+            "/// `Dictionary(uniqueKeysWithValues:)` traps on a duplicate.",
+            // The needle inside string-literal text — a failure message, or
+            // this fence's own scan.
+            "XCTFail(\"do not use uniqueKeysWithValues: here\")",
+            // The non-trapping constructor, which is not this defect.
+            "let byID = Dictionary(pairs, uniquingKeysWith: { first, _ in first })",
+            // The replacement.
+            "let byID = XCTUniquelyKeyed(report.entries.map { ($0.itemID, $0) })",
+        ] {
+            XCTAssertEqual(offenders(quiet), [], "must NOT be reported: \(quiet)")
+        }
     }
 
     // MARK: - The inventory this fence REPLACED

@@ -108,8 +108,8 @@ final class CacheoutViewModelTests: XCTestCase {
         let home = self.fixtureHome!
         // `let` on purpose: the factory below is `@Sendable`, and a captured
         // `var` is a Swift 6 error.
-        let outcomes = Dictionary(
-            uniqueKeysWithValues: Self.reconstructionRootNames.map { name in
+        let outcomes = XCTUniquelyKeyed(
+            Self.reconstructionRootNames.map { name in
                 (
                     "root_\(name)",
                     ScanOutcome(

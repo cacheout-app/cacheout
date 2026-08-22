@@ -640,7 +640,7 @@ final class CategoryScannerTests: XCTestCase {
 
         let outcome = await scanItems(categories: categories, home: home)
 
-        let bySlug = Dictionary(uniqueKeysWithValues: outcome.items.map { ($0.id, $0) })
+        let bySlug = XCTUniquelyKeyed(outcome.items.map { ($0.id, $0) })
         XCTAssertEqual(bySlug["selected_cache"]?.defaultSelected, true)
         XCTAssertEqual(bySlug["unselected_cache"]?.defaultSelected, false)
         for item in outcome.items {
@@ -1686,7 +1686,7 @@ final class CategoryScannerTests: XCTestCase {
             "no production emission may fail the coherence validator"
         )
         let items = try XCTUnwrap(outcome(of: try XCTUnwrapElement(events, 0))?.items)
-        let bySlug = Dictionary(uniqueKeysWithValues: items.map { ($0.id, $0) })
+        let bySlug = XCTUniquelyKeyed(items.map { ($0.id, $0) })
         XCTAssertEqual(bySlug["partial_cache"]?.state, .partiallyDenied)
         XCTAssertEqual(
             Set(bySlug["partial_cache"]?.rootRecords.map(\.status) ?? []),

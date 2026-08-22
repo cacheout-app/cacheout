@@ -82,3 +82,55 @@ struct XCTUnwrapElementFailure: Error, CustomStringConvertible {
         "index \(index) out of range for \(count) elements"
     }
 }
+
+// MARK: - The same rule, one constructor further
+
+/// # `Dictionary(uniqueKeysWithValues:)` is `xs[0]` in a different hat
+///
+/// `Fatal error: Duplicate values for key` is a stdlib PRECONDITION
+/// (`Swift/NativeDictionary.swift`), so a duplicate key kills the PROCESS
+/// exactly as an out-of-range subscript does — and every site that mattered
+/// was keying a dictionary by a value PRODUCTION decides (an entry's
+/// `displayName`, an item's `itemID`, a scanned item's `id`), which is
+/// precisely where a regression puts a second one.
+///
+/// PROVEN BY MUTATION (PR #460 codex r9's review, D3): appending the entry
+/// twice at `CacheCleaner.swift:514` — `if let entry = outcome.entry {
+/// entries.append(entry) }`, the shape of SCANNERS-ROADMAP defect D1 — let
+/// the correct cell fire and survive, and then trapped a LATER cell and took
+/// the rest of the run with it.
+///
+/// So: **in tests, never build a dictionary with `uniqueKeysWithValues:`.**
+/// `XCTUniquelyKeyed` reports the duplicate, fails exactly one cell, and
+/// hands back a last-wins dictionary so the rest of that cell's assertions
+/// still say something. `StrandFenceTests` enforces it.
+
+/// `Dictionary(uniqueKeysWithValues: pairs)` that FAILS THE CELL on a
+/// duplicate key instead of trapping the process.
+///
+/// - Note: the failure is attributed to the caller's file and line, so it
+///   reads exactly like the constructor it replaces. The returned dictionary
+///   is last-wins, which is what `Dictionary(_:uniquingKeysWith:)` would give
+///   — the value is never a licence, because the cell has already failed.
+func XCTUniquelyKeyed<Key: Hashable, Value>(
+    _ pairs: [(Key, Value)],
+    _ message: @autoclosure () -> String = "",
+    file: StaticString = #filePath,
+    line: UInt = #line
+) -> [Key: Value] {
+    var result: [Key: Value] = [:]
+    var duplicates: [Key] = []
+    for (key, value) in pairs where result.updateValue(value, forKey: key) != nil {
+        duplicates.append(key)
+    }
+    if !duplicates.isEmpty {
+        let detail = message()
+        XCTFail(
+            "\(duplicates.count) duplicate key(s) — \(duplicates) — in a "
+                + "\(pairs.count)-pair sequence"
+                + (detail.isEmpty ? "" : " — \(detail)"),
+            file: file, line: line
+        )
+    }
+    return result
+}

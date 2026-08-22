@@ -459,10 +459,8 @@ final class CLIGateTests: XCTestCase {
         let entries = try XCTUnwrap(payload["results"] as? [[String: Any]])
         XCTAssertEqual(entries.count, 4, "every requested target appears, whatever its fate")
 
-        let bySlug = Dictionary(
-            uniqueKeysWithValues: try entries.map {
-                (try XCTUnwrap($0["slug"] as? String), $0)
-            }
+        let bySlug = XCTUniquelyKeyed(
+            try entries.map { (try XCTUnwrap($0["slug"] as? String), $0) }
         )
         XCTAssertEqual(bySlug["m"]?["bytes_would_free"] as? Int64, 4096,
                        "per-entry would-free is exact-only; the 512 estimated bytes are additive")

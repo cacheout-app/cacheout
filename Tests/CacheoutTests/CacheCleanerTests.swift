@@ -1382,7 +1382,7 @@ final class CacheCleanerTests: XCTestCase {
         )
 
         XCTAssertTrue(report.errors.isEmpty, "unexpected errors: \(report.errors)")
-        let byName = Dictionary(uniqueKeysWithValues: report.entries.map { ($0.displayName, $0) })
+        let byName = XCTUniquelyKeyed(report.entries.map { ($0.displayName, $0) })
         XCTAssertEqual(byName["cat-exact"]?.exactBytes, expectedExact)
         XCTAssertEqual(byName["cat-exact"]?.estimatedUpToBytes, 0)
         XCTAssertEqual(byName["cat-links"]?.exactBytes, 0)
@@ -1645,7 +1645,7 @@ final class CacheCleanerTests: XCTestCase {
 
         // Entries carry identity and components sourced from the item's
         // REQUIRED ownership fields — never looked up.
-        let byID = Dictionary(uniqueKeysWithValues: report.entries.map { ($0.itemID, $0) })
+        let byID = XCTUniquelyKeyed(report.entries.map { ($0.itemID, $0) })
         XCTAssertEqual(byID["contents-cat"]?.scannerID, "categories")
         XCTAssertEqual(byID["contents-cat"]?.displayName, "contents-cat")
         XCTAssertEqual(byID["contents-cat"]?.exactBytes, expectedContents)
@@ -2779,7 +2779,7 @@ final class CacheCleanerTests: XCTestCase {
         let report = await cleaner.clean(items: [itemA, itemB], moveToTrash: false)
 
         XCTAssertTrue(report.errors.isEmpty, "unexpected errors: \(report.errors)")
-        let byID = Dictionary(uniqueKeysWithValues: report.entries.map { ($0.itemID, $0) })
+        let byID = XCTUniquelyKeyed(report.entries.map { ($0.itemID, $0) })
         // ITEM-LOCAL registries: each aggregate counts the shared inode's
         // bytes — the preserved fn-1 scope, disclosed by the D8 caveat
         // (unchanged). The first walk sees st_nlink == 2 (estimated); the
@@ -3307,9 +3307,7 @@ final class CacheCleanerTests: XCTestCase {
         _ scanner: EphemeralTempScanner
     ) async -> [String: ReclaimableItem] {
         let outcome = await scanner.scan(context: ScanContext(trigger: .userInitiated))
-        return Dictionary(
-            uniqueKeysWithValues: outcome.items.map { ($0.displayName, $0) }
-        )
+        return XCTUniquelyKeyed(outcome.items.map { ($0.displayName, $0) })
     }
 
     /// The single entry the fixture Trash received, or nil.

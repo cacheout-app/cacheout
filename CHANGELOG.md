@@ -28,6 +28,9 @@ below are both part of that coordination, and the latter BLOCKS this release.
   row carries all four clauses as evidence, with the merge clause hedged
   because `--is-ancestor` structurally misses squash and rebase merges. A
   worktree that fails a gate is omitted rather than listed as an undeletable
+  row, and so is one whose git admin directory cannot be identified at scan
+  time — the check that later proves it is still the same checkout cannot be
+  armed without that, so the scan reports the problem instead of offering the
   row. Separately, each repository whose registered checkouts no longer exist
   on disk gets ONE item for its orphaned worktree registry, disclosing exactly
   the set it will remove. `--cli scan` reports both as `scanner_items` rows

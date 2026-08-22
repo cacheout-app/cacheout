@@ -509,23 +509,42 @@ git.
   admin directory the scan resolved, and that directory must still be the
   same object — so a checkout moved onto that path, or removed and
   re-created there, is refused rather than removed. (That scan-to-click
-  window is the desktop app's. `--cli clean` re-scans in-process before
-  executing, so a replacement is answered by the re-scan with exit 1 /
-  `INVALID_ARGUMENTS`, "Unknown item id … rescan and retry".) If git
-  refuses, those same gates run first and the cleanliness re-check runs
-  LAST, immediately before the direct delete, so work saved while the checks
-  were running is caught rather than destroyed; a tree that went dirty in
-  that window is refused and is offered again after a re-scan. The delete is
-  then followed by a narrowly-gated removal of nothing but that worktree's
-  own admin entry. The
+  window is the desktop app's, where one scan's results stay on screen
+  across your click. `--cli clean` re-scans in-process first, so what it
+  removes is what a fresh scan just judged — but a replacement checkout at
+  the same path inherits the same item id and is removed if it passes all
+  four gates on its own merits. The re-scan re-judges the path; it does not
+  detect the substitution.) If git refuses, those same gates run first and
+  the cleanliness re-check runs LAST, immediately before the direct delete,
+  so work saved while the checks were running is caught rather than
+  destroyed; a tree that went dirty in that window is refused and is offered
+  again after a re-scan. The delete is then followed by a narrowly-gated
+  removal of nothing but that worktree's own admin entry. The
   repository-level item removes exactly the admin directories the scan
   disclosed, one by one — no repository-wide `git worktree prune` runs,
   because git would re-enumerate its own set after every gate had answered.
   **Branch refs and repository objects are never touched** — no branch is
   ever deleted.
-- **Move to Trash does not apply.** git unlinks and prunes; it does not
-  trash. The confirmation sheet says so per selected item, and the cleanup
-  report records what actually happened. If a removal succeeded but left
+- **The final check before the delete reads the filesystem, not git.**
+  Immediately before either removal — git's, or the direct delete — Cacheout
+  re-reads three things it can answer without running a command: that the
+  checkout at that path is still the one that was assessed, that nobody has
+  locked it, and that its HEAD has not moved. Those cost microseconds, so
+  nothing meaningful happens between them and the removal. What they cannot
+  answer honestly: **cleanliness is git's answer** and is the last command
+  run, so work saved in the millisecond after it is not seen; and on a
+  BRANCH, a commit made while the checks run does not move HEAD — that
+  commit is not lost, because removing a worktree never touches the branch
+  or the repository's objects. A DETACHED worktree, where such a commit
+  would be reachable from nothing afterwards, is refused outright whenever
+  its HEAD cannot be re-read (some repositories store refs in a format that
+  keeps no per-worktree HEAD file); put the work on a branch and re-scan.
+- **Move to Trash usually does not apply.** A stale worktree is unlinked by
+  git, permanently; a repository prune removes admin directories one by one,
+  permanently. Only the FALLBACK delete — the one that runs when git itself
+  refuses the removal — honours the Move to Trash toggle. The confirmation
+  sheet says exactly that per selected item, and the cleanup report records
+  which of the two actually ran. If a removal succeeded but left
   admin data behind, the entry carries a warning and the next scan offers the
   leftovers.
 - **Timeouts.** A worktree removal is unbounded work. The CLI bounds each git

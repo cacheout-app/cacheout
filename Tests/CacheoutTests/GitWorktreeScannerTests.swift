@@ -776,6 +776,74 @@ final class GitWorktreeScannerTests: XCTestCase {
         XCTAssertTrue(fm.fileExists(atPath: worktree.path))
     }
 
+    func testASamePathReplacementInheritsTheItemIdAndIsACandidateAtOnce()
+        async throws
+    {
+        // D4 (PR #460 codex r4). Four places — CHANGELOG.md,
+        // docs/v1/CATEGORIES.md, the R1b doc in `WorktreeReclaimPerformer`
+        // and 26e8bdf's own commit message — claimed `--cli clean` is
+        // protected from a same-path replacement because its in-process
+        // re-scan answers one with "Unknown item id … rescan and retry".
+        // THIS CELL IS THE FALSIFICATION, run rather than reasoned:
+        //
+        //   (a) item ids are `SHA256(scannerID + NUL + canonicalPath)`, so a
+        //       replacement AT THE SAME PATH gets the SAME id;
+        //   (b) candidacy is "all four gates pass" with NO age term, so a
+        //       brand-new `git worktree add` on a merged branch is a
+        //       candidate the instant it exists.
+        //
+        // The CLI is therefore exposed to the same class by a different
+        // route, and the corrected claim in those four places is that its
+        // re-scan RE-JUDGES the path rather than DETECTING the substitution.
+        let repository = try makeRepositoryIgnoringPayloads(
+            at: dev.appendingPathComponent("repo")
+        )
+        let path = dev.appendingPathComponent("wt-a")
+        try addWorktree(of: repository, at: path, branch: "a")
+
+        let firstScan = await makeScanner()
+            .scan(context: ScanContext(trigger: .userInitiated))
+        let before = try XCTUnwrap(
+            firstScan.items.first { $0.url?.path.hasSuffix("/wt-a") == true },
+            "the fixture must produce a stale candidate"
+        )
+
+        // The user retires it themselves and adds a NEW checkout at the same
+        // path — a different branch, a different admin directory, seconds old.
+        XCTAssertEqual(
+            try GitFixture.git(
+                ["-C", repository.path, "worktree", "remove", path.path],
+                home: home
+            ).status, 0
+        )
+        XCTAssertEqual(
+            try GitFixture.git(
+                ["-C", repository.path, "worktree", "add", path.path, "-b", "brand-new"],
+                home: home
+            ).status, 0
+        )
+
+        let secondScan = await makeScanner()
+            .scan(context: ScanContext(trigger: .userInitiated))
+        let after = try XCTUnwrap(
+            secondScan.items.first { $0.url?.path.hasSuffix("/wt-a") == true },
+            "the replacement is a candidate the instant it exists — there is "
+                + "no age term in candidacy"
+        )
+        XCTAssertEqual(
+            after.id, before.id,
+            "the replacement inherits the assessed checkout's item id, so "
+                + "`--cli clean <id>` resolves to it and no 'unknown item id' "
+                + "is ever produced"
+        )
+        XCTAssertNotEqual(
+            try plan(of: after).worktreeAdminEntryIdentity,
+            try plan(of: before).worktreeAdminEntryIdentity,
+            "…while it is provably a different checkout: the re-scan JUDGED "
+                + "the replacement, it did not DETECT the substitution"
+        )
+    }
+
     // MARK: - R6: the orphaned-admin tier
 
     func testTwoOrphanedCheckoutsYieldOneMeasuredPruneItemDisclosingBoth()

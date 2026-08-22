@@ -58,9 +58,27 @@ below are both part of that coordination, and the latter BLOCKS this release.
   object the scan saw. So a checkout you moved onto that path, and equally
   one you removed and re-created there, is refused rather than removed — the
   replacement is judged on its own merits by the next scan. (This window is
-  the desktop app's: `--cli clean` re-scans before it executes, so a
-  replacement there is answered by the re-scan with "unknown item id —
-  rescan and retry".) The repository-level item removes exactly the
+  the desktop app's, where one scan's results stay on screen across your
+  click. An earlier draft of this entry said `--cli clean` was protected
+  because its re-scan answers a replacement with "unknown item id — rescan
+  and retry"; that was WRONG and is corrected here. Item ids are derived
+  from the scanner and the path, so a replacement at the same path has the
+  same id, and candidacy has no age term — the CLI's re-scan re-judges
+  whatever is at the path, and removes it if all four gates pass on its own
+  merits. It does not detect the substitution.) Immediately before either
+  removal, three further facts are re-read straight from the filesystem —
+  that the checkout is still the assessed one, that nobody has locked it,
+  and that its HEAD has not moved — which costs microseconds rather than
+  further git commands, so effectively nothing happens between the last
+  check and the removal. What that cannot cover is stated rather than
+  implied: cleanliness is git's answer and is the last command run; and on a
+  branch, a commit made while the checks run does not move HEAD — that
+  commit survives on the branch, which no removal here touches. A DETACHED
+  worktree whose HEAD cannot be re-read from disk (repositories using the
+  `reftable` ref format keep no per-worktree HEAD file) is refused outright
+  rather than removed, because a commit lost there would be reachable from
+  nothing; put the work on a branch and re-scan. The repository-level item
+  removes exactly the
   admin directories it
   disclosed, one at a time — no repository-wide `git worktree prune` runs,
   because git recomputes that command's set for itself after every check has
@@ -69,8 +87,9 @@ below are both part of that coordination, and the latter BLOCKS this release.
   **No branch is ever deleted and repository objects are never touched.**
   Because git unlinks rather than trashes, the confirmation sheet discloses
   per selected item that Move to Trash does not apply — stale removals and
-  repository prunes worded separately — and the cleanup report records what
-  actually happened. A removal that succeeded but left admin data behind
+  repository prunes worded separately, and the stale wording naming the one
+  exception, the fallback delete, which does honour the toggle — and the
+  cleanup report records which ran. A removal that succeeded but left admin data behind
   reports a `warning` on its row (the bytes were still freed) and the next
   scan offers the leftovers.
 - **`tool_unavailable` scan errors.** When a scanner cannot run an external

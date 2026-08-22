@@ -102,11 +102,26 @@ import XCTest
 ///   `statementTraps` cannot widen because a regex cannot tell an ARRAY
 ///   subscript from a DICTIONARY one, and a dictionary subscript returns an
 ///   Optional and cannot trap. MEASURED at r7: widening the pattern to any
-///   identifier index reports **105** lines across the suite (**117** when
-///   re-run at r8 on this branch: `grep -rnE
-///   '[A-Za-z0-9_\)\]]\s*\[\s*[A-Za-z_][A-Za-z0-9_.]*\s*\]' Tests
-///   --include='*.swift' | wc -l`), of which the overwhelming majority are
-///   dictionary reads (`failures[url.path]`, `paths[scanner.registeredID]`,
+///   identifier index reports **105** lines across the suite. TWO
+///   MEASUREMENTS, NOT ONE, AND r8 PUBLISHED THEM AS ONE (PR #460 codex r9,
+///   D2). Re-run at `7e9b2c5`, the r8 head of this branch:
+///
+///   - the RAW grep — `grep -rnE
+///     '[A-Za-z0-9_\)\]]\s*\[\s*[A-Za-z_][A-Za-z0-9_.]*\s*\]' Tests
+///     --include='*.swift' | wc -l` — prints **150**;
+///   - the same pattern over the sources the CELLS actually see, i.e. after
+///     `blankingComments` + `blankingLiteralText`, matches **117** lines.
+///
+///   The gap is the 33 lines where the only match is comment or
+///   string-literal text — including this very bullet, which spells the
+///   pattern out. r8's sentence attached the blanked figure (117) to the raw
+///   command, which produces neither 150 nor 117 at the commit that wrote it
+///   (**140** at `aaf9c03`); the raw grep last printed 117 at `f6a048f`, one
+///   commit earlier, which is where the coincidence came from. Both numbers
+///   are labelled from here on, and the grep is the one anybody can re-run.
+///
+///   Of that population the overwhelming majority are dictionary reads
+///   (`failures[url.path]`, `paths[scanner.registeredID]`,
 ///   `environment[key]`) — a fence that is ~90% false positives is a fence
 ///   that gets suppressed. `testTheIntegerSubscriptPatternMatchesLiteralIndicesOnly`
 ///   pins this scope so the claim and the regex cannot drift apart again.
@@ -114,7 +129,8 @@ import XCTest
 ///   dictionary ambiguity does not exist: when the index name is bound by a
 ///   loop over integers the read IS an array read.
 ///   `testNoLoopBoundIndexSubscriptCanStrandTheRun` covers exactly that
-///   subset — 7 lines, not 117 — and its own header states its limits.
+///   subset — **7 hits on 5 lines**, not 117 — and its own header states
+///   both its limits and how that figure was taken.
 /// - **`as!`, `precondition`, `fatalError`, arithmetic overflow, out-of-range
 ///   `Range` subscripts, `Array(repeating:count:)` with a negative count** —
 ///   not scanned at all. No occurrence of any of them has stranded a run
@@ -534,9 +550,20 @@ final class StrandFenceTests: XCTestCase {
     /// - The index must be a BARE identifier bound in the same file by one of
     ///   `integerIndexBindings`. `xs[i + 1]`, `xs[someCall()]` and an index
     ///   bound any other way (a `var` counter, a function parameter) are NOT
-    ///   matched. Over the whole suite the loop-bound population is 7 lines
-    ///   against 117 for "any identifier index" — the ~90%-dictionary noise
-    ///   r7 measured is exactly what the loop-bound requirement removes.
+    ///   matched. Over the whole suite the loop-bound population is **7 hits
+    ///   on 5 lines** against 117 blanked lines (150 raw grep hits) for "any
+    ///   identifier index" — the ~90%-dictionary noise r7 measured is exactly
+    ///   what the loop-bound requirement removes.
+    ///
+    ///   HOW THAT FIGURE WAS TAKEN, since it is not one command (PR #460
+    ///   codex r9, D6). At `7e9b2c5`: drive THIS cell's own
+    ///   `blankingComments` + `blankingLiteralText`, `integerIndexNames` and
+    ///   `unfencedLoopBoundSubscripts` over every `Tests/**/*.swift` with the
+    ///   allowances DISABLED (`inRange: [:]`, `pointers: []`) and count what
+    ///   comes back. It is 7 hits on 5 lines — two lines carry two hits each
+    ///   — in `DepthSafeRemovalTests`, `HeadlessTests`,
+    ///   `OrphanedCachesScannerTests` (twice) and `RecommendationEngineTests`.
+    ///   "7 lines" is what r8 published; the unit was wrong, not the reach.
     /// - The receiver must be a bare identifier: `xs[i]` and `report.rows[i]`
     ///   are read, `f()[i]` and `xs[0][i]` are not.
     /// - Two allowances, both PROVABLE from the same line rather than
@@ -774,7 +801,8 @@ final class StrandFenceTests: XCTestCase {
                 + "for i in 0..<n { ptr[i] = 0 } }",
             // Not loop-bound to an integer at all — a dictionary read, which
             // returns an Optional and cannot trap. This is the exclusion that
-            // keeps the fence off the 117-line identifier-index population.
+            // keeps the fence off the 117-blanked-line (150 raw grep)
+            // identifier-index population.
             "for (key, value) in extra { environment[key] = value }",
             "if let code = failures[path] { return code }",
             // Not a BARE identifier index, so out of scope by construction.

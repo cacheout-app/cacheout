@@ -319,8 +319,13 @@ enum GitWorktreeCleanCheck {
 
     /// How many porcelain records the output holds — DISPLAY ONLY.
     ///
-    /// The gate decision above is made on the raw bytes (empty vs not), so a
-    /// miscount here can never turn a dirty tree into a clean one. Porcelain
+    /// The gate decision above is made on the NON-IGNORED entry list, not on
+    /// this number and — since `--ignored=traditional` (r5/D2) — no longer on
+    /// "the raw bytes, empty vs not" either, which is what this note claimed
+    /// until PR #460 codex r7. The conclusion is unchanged: a miscount here
+    /// can never turn a dirty tree into a clean one, because `verdict(for:)`
+    /// decides on `entries.isEmpty` and reaches this function only after it
+    /// has already answered `.dirty`. Porcelain
     /// v1 C-quotes paths containing newlines, so line counting is accurate in
     /// practice; the `max(1,…)` floor keeps a pathological all-whitespace
     /// body from reporting "0 entries" for output that already proved the

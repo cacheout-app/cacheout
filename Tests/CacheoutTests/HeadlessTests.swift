@@ -1073,10 +1073,10 @@ final class StatusSocketIntegrationTests: XCTestCase {
     // MARK: - Helper: Send command to Unix socket
 
     private func sendSocketCommand(_ command: String, to path: String) throws -> String {
-        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
-        guard fd >= 0 else {
-            throw NSError(domain: "test", code: Int(errno), userInfo: [NSLocalizedDescriptionKey: "socket() failed"])
-        }
+        // SO_NOSIGPIPE, set at creation (D5): a peer that closes between the
+        // connect and the write below used to raise SIGPIPE and TERMINATE the
+        // whole run — see `TestSocketClient`.
+        let fd = try TestSocketClient.makeStreamSocket()
         defer { close(fd) }
 
         var addr = sockaddr_un()
@@ -1101,10 +1101,15 @@ final class StatusSocketIntegrationTests: XCTestCase {
             throw NSError(domain: "test", code: Int(errno), userInfo: [NSLocalizedDescriptionKey: "connect() failed: errno \(errno)"])
         }
 
-        // Send command
-        let bytes = Array(command.utf8)
-        bytes.withUnsafeBufferPointer { buf in
-            _ = Darwin.write(fd, buf.baseAddress!, buf.count)
+        // Send command. A broken pipe here is now `-1`/EPIPE, so it fails
+        // THIS cell rather than the process.
+        let sent = TestSocketClient.write(Array(command.utf8), to: fd)
+        guard sent.result >= 0 else {
+            throw NSError(
+                domain: "test", code: Int(sent.errno),
+                userInfo: [NSLocalizedDescriptionKey:
+                            "write() failed: errno \(sent.errno)"]
+            )
         }
 
         // Read response

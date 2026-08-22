@@ -561,8 +561,8 @@ final class StatusSocketRecommendationsTests: XCTestCase {
 // MARK: - Test Helpers (socket)
 
 private func sendSocketCommand(_ command: String, to path: String) throws -> String {
-    let fd = socket(AF_UNIX, SOCK_STREAM, 0)
-    guard fd >= 0 else { throw NSError(domain: "socket", code: Int(errno)) }
+    // SO_NOSIGPIPE, set at creation (D5) — see `TestSocketClient`.
+    let fd = try TestSocketClient.makeStreamSocket()
     defer { close(fd) }
 
     var addr = sockaddr_un()
@@ -585,9 +585,9 @@ private func sendSocketCommand(_ command: String, to path: String) throws -> Str
     }
     guard connectResult == 0 else { throw NSError(domain: "connect", code: Int(errno)) }
 
-    let bytes = Array(command.utf8)
-    _ = bytes.withUnsafeBufferPointer { buf in
-        Darwin.write(fd, buf.baseAddress!, buf.count)
+    let sent = TestSocketClient.write(Array(command.utf8), to: fd)
+    guard sent.result >= 0 else {
+        throw NSError(domain: "write", code: Int(sent.errno))
     }
 
     var readBuf = [UInt8](repeating: 0, count: 65536)

@@ -528,9 +528,14 @@ git.
   Cacheout's gates established. Measured on git 2.50.1: **14.9 ms** between
   the moment git is launched and the moment the first file is gone, on a
   worktree containing a single tracked file, and that gap grows with the tree
-  because git's own status walk is inside it. Cacheout's own removal, with
-  the last check sitting immediately in front of it, measures **0.4 ms** to
-  the same point and does not grow. Nothing became removable that was not
+  because git's own status walk is inside it. Cacheout's own removal has no
+  program to start: the last thing in front of it is a re-proof taken from
+  the filesystem on the far side of the disposal hop — **0.03 ms** (permanent
+  delete) and **0.004 ms** (Move to Trash) before the destruction, both
+  measured with the queue that runs it held busy — and it does not grow. The
+  cleanliness answer is not in that re-proof; it is a `git` command, it is
+  the last one run, and what its distance from the destruction actually
+  measures is in the next bullet. Nothing became removable that was not
   removable before: every case where git refused already ended in this same
   delete. What is new is the refusals that gap used to swallow.
 - **The final check before the delete reads the filesystem, not git.**
@@ -539,9 +544,16 @@ git.
   that was assessed, that nobody has locked it, and that its HEAD has not
   moved. Those cost microseconds, so nothing meaningful happens between them
   and the removal. What they cannot answer honestly: **cleanliness is git's
-  answer** and is the last command run, so work saved in the millisecond
-  after it is not seen; and on a BRANCH, a commit made while the checks run
-  does not move HEAD — that commit is not lost, because removing a worktree
+  answer**. It is the last command run, and it cannot be moved next to the
+  destruction, because running a program there would cost more than the gap
+  it closes. So work saved after that answer and before the tree goes is not
+  seen — and that window is the disposal queue's depth, not a fraction of a
+  millisecond. Measured through the shipping code: **185.9 ms** with the main
+  thread carrying 120 ms work items (Move to Trash) and **241.2 ms** with the
+  background pool saturated (permanent delete). On an idle machine it is a
+  fraction of a millisecond. It is a fact about a concurrent writer, not a
+  fixed limit: a re-scan judges the worktree afresh. And on a BRANCH, a
+  commit made while the checks run does not move HEAD — that commit is not lost, because removing a worktree
   never touches the branch or the repository's objects. A DETACHED worktree,
   where such a commit would be reachable from nothing afterwards, is refused
   outright whenever its HEAD cannot be re-read; put the work on a branch and
@@ -553,10 +565,14 @@ git.
   about an ignored path, so this is stated exactly. Ignored content that was
   already in the worktree when the checks began — `node_modules`, `.build`,
   and the rest of what makes a stale worktree worth reclaiming — **is
-  destroyed with it**. An ignored file that APPEARS while the checks are
-  running is caught: the ignored list is read before the checks and again
-  immediately before the delete, and anything new refuses the removal by
-  name. Two limits worth knowing: a file created inside a directory that is
+  destroyed with it**. An ignored file that appears while the GATES are
+  running is caught: the ignored list is read once as a witness before them
+  and again by the last `git status`, and anything new refuses the removal by
+  name. That second reading is the last GIT COMMAND, not the last thing
+  before the delete: an ignored file appearing after it sits in exactly the
+  same window as any other late save described above, and is destroyed with
+  the tree. Two more limits worth knowing: a file created inside a directory
+  that is
   itself ignored is inside a collapsed entry and is not detected, and a
   CHANGE to an ignored file that already existed is not detected either. If a
   worktree holds the only copy of something, move it out rather than relying

@@ -47,13 +47,35 @@
 /// tracked file until ENOENT — never simply "the last git call", because the
 /// gated prune's own invocations run AFTER the unlink:
 ///
-/// | disposal | last gate answered → the checkout is gone |
-/// |---|---|
-/// | permanent (`DepthSafeRemoval`) | median **0.373 ms**, 0.315–0.565, n=10 |
-/// | trash (`TrashDisposal`) | median **0.674 ms**, 0.588–16.152, n=10 |
+/// | disposal | last gate answered → the checkout is gone | main thread |
+/// |---|---|---|
+/// | permanent (`DepthSafeRemoval`) | median **0.373 ms**, 0.315–0.565, n=10 | IDLE |
+/// | trash (`TrashDisposal`) | median **0.674 ms**, 0.588–16.152, n=10 | IDLE |
 ///
-/// The trash arm's maximum is one outlier from the mover; its median is the
-/// number that describes the arm. Both are compared against 14.87 ms, and
+/// THE LOAD CONDITION IS PART OF THOSE FIGURES AND WAS OMITTED (PR #460 codex
+/// r6, D2). Both rows were taken on an IDLE main thread, and only the
+/// permanent row is insensitive to that: it hops to a global CONCURRENT
+/// queue. The trash row hops to the MAIN ACTOR, because `trashItem` requires
+/// it, so its true width is the main thread's QUEUE DEPTH.
+///
+/// AND THE 16.152 ms SAMPLE WAS EXPLAINED AWAY RATHER THAN MEASURED. r5
+/// wrote "the trash arm's maximum is one outlier from the mover; its median
+/// is the number that describes the arm". That attribution is wrong on its
+/// own evidence: the mover is one same-volume `rename(2)` whose measured
+/// spread is 262–456 µs (`TrashDisposal`'s header), which cannot produce
+/// 16 ms, while the hop demonstrably can — MEASURED THIS ROUND through the
+/// production composition with 120 ms work items held on the main thread, the
+/// interval between the last filesystem proof and the mover was median
+/// **175.736 ms** (n=5, 160.352–184.937) with the proof on r5's side of the
+/// hop, against **0.004 ms** (0.004–0.016) with it moved across. A quantity
+/// that moves by four orders of magnitude with main-thread scheduling and by
+/// none with the mover is a scheduling quantity. The median never described
+/// the arm; it described an idle machine.
+///
+/// r6 does not narrow the trash row by making the mover faster — it moves the
+/// PROOF to the far side of the hop (`TrashDisposal.Mover`), so what is left
+/// between the last proof and the destruction is the 0.004 ms above no matter
+/// how deep the main queue is. Both rows are compared against 14.87 ms, and
 /// unlike 14.87 ms neither grows with the tree.
 ///
 /// **That window is IRREDUCIBLE while git performs the removal** — the
@@ -275,6 +297,21 @@ struct WorktreeReclaimOutcome {
     static let none = WorktreeReclaimOutcome(entry: nil, errors: [])
 }
 
+/// A `GateReestablishment.refuse` raised from INSIDE the mover seam (PR #460
+/// codex r6, D1), where the only channel out is `throws`.
+///
+/// It carries the tag and the detail unchanged so the refusal that fires on
+/// the far side of the seam's hop is indistinguishable, in the log and in the
+/// per-item error, from the same refusal firing on the near side. A bare
+/// `Error` would have collapsed both into
+/// `failure(item, error.localizedDescription, tag: nil)` — an untagged
+/// refusal, which is the shape this branch has spent four rounds removing.
+struct LastInstantRefusal: LocalizedError {
+    let tag: String
+    let detail: String
+    var errorDescription: String? { detail }
+}
+
 struct WorktreeReclaimPerformer {
 
     // MARK: - Pinned constants
@@ -385,7 +422,21 @@ struct WorktreeReclaimPerformer {
     /// injection site instead would put the proof in a closure that every
     /// test replaces, which is how a binding becomes a parameter nobody
     /// checks.
-    let trash: (URL) async throws -> URL?
+    ///
+    /// IT TAKES A PROOF AS WELL AS A URL (PR #460 codex r6, D1). It is
+    /// `TrashDisposal.Mover`: the seam must run the handed-in proof on the far
+    /// side of whatever hop it performs, immediately before the move. The
+    /// production seam hops to the main actor (`trashItem` requires it), and
+    /// until r6 EVERY gate this file runs — the clean re-check, the ignored
+    /// witness, the last-instant filesystem re-proof, the disposal's own leaf
+    /// binding — sat on the near side of that hop, so the interval between the
+    /// last of them and the move was the MAIN THREAD'S QUEUE DEPTH rather than
+    /// the 0.674 ms this file used to publish. MEASURED through the production
+    /// composition under 120 ms main-thread work items, n=5: median
+    /// **175.736 ms** before, **0.004 ms** after. The permanent arm never had this shape — it
+    /// hops to a global concurrent queue, and `DepthSafeRemoval` re-proves the
+    /// container from a descriptor on the far side of that hop.
+    let trash: TrashDisposal.Mover
     /// The permanent-delete seam. It takes the container binding as a SECOND
     /// argument (fn-6 reconciliation) because the removal it fronts —
     /// `DepthSafeRemoval.remove` — proves the folder it opens against an
@@ -708,13 +759,50 @@ struct WorktreeReclaimPerformer {
                 // binds it before the move, re-reads it where the mover says
                 // it landed, and PUTS BACK anything it cannot prove: no entry,
                 // no bytes.
+                //
+                // AND THE RE-PROOF CROSSES THE MOVER'S HOP WITH IT (PR #460
+                // codex r6, D1). `reproveFromTheFilesystem` ran a few lines
+                // up, on THIS side of a seam that hops to the main actor
+                // before it moves anything — so the interval between the last
+                // gate and the destruction was the main thread's queue depth,
+                // not the 0.674 ms this file published. It is re-run HERE, in
+                // the closure the seam is contractually required to call
+                // immediately before the move, together with the disposal's
+                // own leaf binding. Identity first, then the leaf: the same
+                // order `reproveFromTheFilesystem` gives its own steps, with
+                // the binding the mover acts on left closest to the move.
                 try await TrashDisposal.dispose(
                     worktreePath, containedIn: admittedParent,
-                    provider: provider, via: trash
+                    provider: provider,
+                    via: { url, proveTheLeaf in
+                        try await trash(url) {
+                            if case .refuse(let tag, let detail) =
+                                reproveFromTheFilesystem(
+                                    worktreePath: worktreePath,
+                                    adminEntry: adminEntry,
+                                    carriedIdentity:
+                                        plan.worktreeAdminEntryIdentity,
+                                    head: head
+                                )
+                            {
+                                throw LastInstantRefusal(
+                                    tag: tag, detail: detail
+                                )
+                            }
+                            try proveTheLeaf()
+                        }
+                    }
                 )
             } else {
                 try await removeTree(worktreePath, admittedParent)
             }
+        } catch let refusal as LastInstantRefusal {
+            // The re-proof that crosses the mover's hop reports through the
+            // SAME tag and the SAME detail as the one on this side of it — a
+            // user must not be able to tell which of the two fired, because
+            // the fact they state is identical.
+            logRefusal(refusal.tag, refusal.detail)
+            return failure(item, refusal.detail, tag: refusal.tag)
         } catch {
             if error is PathGuardError {
                 logRefusal(
@@ -1370,16 +1458,22 @@ struct WorktreeReclaimPerformer {
     //    and stays the LAST git call. What remains between it and the unlink
     //    is the re-proof, which spawns nothing.
     //
-    //    MEASURED TO THE UNLINK, INSTRUMENTED, through the production
-    //    composition (`CacheCleaner` wiring `DepthSafeRemoval` /
-    //    `TrashDisposal`; the last git completion BEFORE the unlink against a
-    //    watcher spinning on `lstat` until ENOENT): permanent arm median
-    //    **0.373 ms** (0.315–0.565, n=10), Trash arm median **0.674 ms**
-    //    (0.588–16.152, n=10, one mover outlier). r4 published 0.163 ms and
+    //    MEASURED TO THE UNLINK, INSTRUMENTED, ON AN IDLE MAIN THREAD,
+    //    through the production composition (`CacheCleaner` wiring
+    //    `DepthSafeRemoval` / `TrashDisposal`; the last git completion BEFORE
+    //    the unlink against a watcher spinning on `lstat` until ENOENT):
+    //    permanent arm median **0.373 ms** (0.315–0.565, n=10), Trash arm
+    //    median **0.674 ms** (0.588–16.152, n=10). r4 published 0.163 ms and
     //    0.173 ms for this, but measured to the `worktree remove` SPAWN and
     //    to the disposal CALL — not to the destruction. Measured to the
     //    destruction, r4's primary arm was 14.87 ms on a one-file worktree
     //    and 156.8 ms on a 2001-file one.
+    //
+    //    THE TRASH ROW'S SPREAD IS MAIN-THREAD SCHEDULING, NOT THE MOVER
+    //    (PR #460 codex r6, D2) — see "WHO REMOVES THE TREE" for the
+    //    correction and the under-load figures (median 175.736 ms with the
+    //    proof on r5's side of the mover's hop, 0.004 ms with it moved
+    //    across, n=5 each).
     // 2. **ANCESTRY WHEN HEAD DID NOT MOVE BUT ITS TARGET DID.** For an
     //    ATTACHED worktree on the FILES backend the HEAD file names a branch
     //    and does not change when that branch commits, so a commit made
@@ -1404,7 +1498,11 @@ struct WorktreeReclaimPerformer {
     //    that already existed is not detected.
     // 4. **THE DISPOSAL CALL ITSELF.** Once `TrashDisposal`/`removeTree` is
     //    entered, nothing this process can read changes what it does. That
-    //    window is not removable by any ordering — it is the 0.373 ms above.
+    //    window is not removable by any ordering — it is the 0.373 ms above
+    //    for the permanent arm, and for the Trash arm the 0.004 ms measured
+    //    UNDER LOAD (PR #460 codex r6, D1) between the re-proof that now runs
+    //    on the far side of the mover's main-actor hop and the move itself.
+    //    What used to sit there was the whole main-thread queue depth.
     //
     // The user-facing form of this is in `docs/v1/CATEGORIES.md` and the
     // CHANGELOG: *"The final check before the delete reads the filesystem,

@@ -277,7 +277,7 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         runner: any GitCommandRunning,
         measure: ((URL, DirectorySizer.Mode, Set<FileSystemIdentityProvider.Identity>) -> SizeReport)? = nil,
         moveToTrash: Bool = false,
-        trash: ((URL) async throws -> URL?)? = nil,
+        trash: TrashDisposal.Mover? = nil,
         removeTree: ((URL, DepthSafeRemoval.AdmittedParent) async throws -> Void)? = nil,
         revalidate: ((ReclaimableItem) -> PreDeleteSeamRefusal?)? = nil,
         gitTimeout: TimeInterval = WorktreeReclaimPerformer.deleteTimeGitTimeout,
@@ -300,7 +300,15 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
             },
             gitTimeout: gitTimeout,
             moveToTrash: moveToTrash,
-            trash: trash ?? { url in
+            // THE DEFAULT DOUBLE HONOURS `TrashDisposal.Mover`'s CONTRACT
+            // (PR #460 codex r6, D1): `prove()` runs immediately before the
+            // move, which is what the production seam does on the far side of
+            // its main-actor hop. A double that skipped it would be MORE
+            // permissive than production — it would move objects the real
+            // seam refuses to move — and this suite's doctrine is that a
+            // double must never be more capable than the thing it stands for.
+            trash: trash ?? { url, prove in
+                try prove()
                 let landed = trashRoot.appendingPathComponent(
                     url.lastPathComponent
                 )
@@ -943,7 +951,8 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
             item(plan), plan: plan,
             with: makePerformer(
                 runner: failing, moveToTrash: true,
-                trash: { _ in
+                trash: { _, prove in
+                    try prove()
                     throw NSError(
                         domain: "fixture", code: 1,
                         userInfo: [NSLocalizedDescriptionKey: "trash refused"]
@@ -1017,7 +1026,12 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
             item(plan), plan: plan,
             with: makePerformer(
                 runner: failing, moveToTrash: true,
-                trash: { url in
+                trash: { url, prove in
+                    // `prove()` FIRST, as the production seam does on the far
+                    // side of its hop — the swap below therefore lands where
+                    // no proof of ours can reach it, which is exactly the
+                    // window this cell exists to pin.
+                    try prove()
                     // The swap the mover cannot be protected from: the
                     // worktree steps aside and the stranger answers to its
                     // name, all after the binding was taken.
@@ -1055,6 +1069,235 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
                 atPath: stash.appendingPathComponent("tracked.txt").path
             ),
             "the worktree the app measured was never disposed of at all"
+        )
+    }
+
+    // MARK: - D1: the mover's hop, MEASURED under main-thread load
+
+    /// Every question this deletion asks the FILESYSTEM, timestamped — so the
+    /// interval between the LAST of them and the mover can be measured
+    /// without instrumenting production at all.
+    ///
+    /// `probeChild` is the one that matters: it is what
+    /// `TrashDisposal.boundLeaf` binds the leaf with, and it is therefore the
+    /// last thing that runs before the move. The other three are recorded too
+    /// so the "last question" is genuinely the last one and not merely the
+    /// last one this class happens to see.
+    private final class HopWindowClock: FileSystemIdentityProvider {
+        private let lock = NSLock()
+        private var lastQuestion: DispatchTime?
+        /// Every `probeChild` for the leaf NAME under measurement, in order.
+        /// The FIRST is the binding taken before the seam is entered; the
+        /// LAST is the one taken on the far side of the seam's hop. Their
+        /// distance IS the hop, which is what proves the load was real.
+        private var leafBindings: [DispatchTime] = []
+        private var leafName = ""
+        private var frozen: (proof: DispatchTime, seam: DispatchTime)?
+
+        func measureLeaf(named name: String) {
+            lock.lock(); leafName = name; lock.unlock()
+        }
+
+        private func note() {
+            lock.lock(); lastQuestion = .now(); lock.unlock()
+        }
+
+        override func identity(of url: URL) -> Identity? {
+            note(); return super.identity(of: url)
+        }
+
+        override func identity(ofDescriptor descriptor: Int32) -> Identity? {
+            note(); return super.identity(ofDescriptor: descriptor)
+        }
+
+        override func probeKind(of url: URL) -> KindProbe {
+            note(); return super.probeKind(of: url)
+        }
+
+        override func probeChild(
+            inDirectory directory: Int32, named name: String,
+            logical: @autoclosure () -> URL
+        ) -> ChildProbe {
+            lock.lock()
+            let now = DispatchTime.now()
+            lastQuestion = now
+            if name == leafName { leafBindings.append(now) }
+            lock.unlock()
+            return super.probeChild(
+                inDirectory: directory, named: name, logical: logical()
+            )
+        }
+
+        /// Called from the injected trash handler — production reaches it
+        /// INSIDE `MainActor.run`, which is the hop this cell is about.
+        func enteredTheSeam() {
+            lock.lock()
+            if frozen == nil, let proof = lastQuestion {
+                frozen = (proof, .now())
+            }
+            lock.unlock()
+        }
+
+        /// Last filesystem question answered → the mover was entered.
+        var windowNanoseconds: UInt64? {
+            lock.lock(); defer { lock.unlock() }
+            guard let frozen,
+                  frozen.seam.uptimeNanoseconds >= frozen.proof.uptimeNanoseconds
+            else { return nil }
+            return frozen.seam.uptimeNanoseconds - frozen.proof.uptimeNanoseconds
+        }
+
+        /// First leaf binding → last leaf binding: the hop itself, and the
+        /// proof that the main thread really was loaded.
+        var hopNanoseconds: UInt64? {
+            lock.lock(); defer { lock.unlock() }
+            guard let first = leafBindings.first, let last = leafBindings.last,
+                  last.uptimeNanoseconds >= first.uptimeNanoseconds
+            else { return nil }
+            return last.uptimeNanoseconds - first.uptimeNanoseconds
+        }
+    }
+
+    /// THE D1 MEASUREMENT (PR #460 codex r6) — and the regression guard that
+    /// keeps the answer true.
+    ///
+    /// THE DEFECT. `FileManager.trashItem` requires the main actor, so
+    /// `CacheCleaner` wraps the mover in `MainActor.run`. Through r5 every
+    /// proof this deletion takes — the clean re-check, the ignored witness,
+    /// the last-instant filesystem re-proof, `TrashDisposal`'s own leaf
+    /// binding — ran on the NEAR side of that hop, so the interval between the
+    /// last of them and the destruction was the MAIN THREAD'S QUEUE DEPTH.
+    /// The file header published "trash … median 0.674 ms", measured idle,
+    /// and called the 16.152 ms sample in the same run an outlier "from the
+    /// mover". It was not: an idle hop is ~0.02 ms and a same-volume mover
+    /// cannot take 16 ms, while main-thread scheduling accounts for it
+    /// exactly.
+    ///
+    /// WHAT THIS CELL DOES. It drives the PRODUCTION composition —
+    /// `CacheCleaner` building its own performer, wiring its own trash seam —
+    /// over a real git worktree, with a 120 ms busy-wait work item pushed onto
+    /// the main thread at every `git status` (the last git call before the
+    /// disposal), and an instrumented provider that timestamps every
+    /// filesystem question. Two numbers come out of each run:
+    ///
+    /// - **the hop** — first leaf binding → last leaf binding. These are the
+    ///   two `boundLeaf` readings that straddle the seam, so this IS the
+    ///   queue delay, and it is asserted LARGE. Without it the cell would
+    ///   pass trivially on an idle machine and measure nothing.
+    /// - **the window** — last filesystem question → the mover is entered. It
+    ///   is asserted SMALL, which is only possible if the proof runs on the
+    ///   FAR side of the hop.
+    ///
+    /// MEASURED, n=5, by
+    ///
+    ///     swift test --filter \
+    ///       testTheTrashProofAndTheMoveAreNotSeparatedByTheMainThreadQueue
+    ///
+    /// pasted from that run's own output:
+    ///
+    ///     MEASURED-TRASH-HOP-MS ["175.321", "164.578", "174.548",
+    ///                            "186.181", "178.629"] median 175.321
+    ///     MEASURED-TRASH-WINDOW-UNDER-LOAD-MS ["0.016", "0.004", "0.004",
+    ///                            "0.004", "0.004"] median 0.004
+    ///
+    /// MUTATION, the r5 shape restored — `try prove()` moved back OUTSIDE
+    /// `MainActor.run` in both `CacheCleaner.trash(_:provingImmediatelyBefore:)`
+    /// and the performer's seam — same command:
+    ///
+    ///     MEASURED-TRASH-HOP-MS ["185.350", "176.090", "160.957",
+    ///                            "162.188", "179.049"] median 176.090
+    ///     MEASURED-TRASH-WINDOW-UNDER-LOAD-MS ["184.937", "175.736",
+    ///                            "160.352", "161.769", "178.649"]
+    ///                            median 175.736
+    ///     XCTAssertLessThan failed: ("175.735709") is not less than ("20.0")
+    ///
+    /// so the cell goes RED on the shape it exists to forbid, and the two
+    /// hop medians (175.3 ms / 176.1 ms) show the load was identical.
+    func testTheTrashProofAndTheMoveAreNotSeparatedByTheMainThreadQueue()
+        async throws
+    {
+        var hops: [Double] = []
+        var windows: [Double] = []
+        let samples = 5
+        for run in 0..<samples {
+            let repository = try makeRepository(named: "repo-\(run)")
+            let worktree = try addWorktree(
+                named: "wt-\(run)", branch: "feature-\(run)", in: repository
+            )
+            let plan = staleplan(
+                worktree: worktree,
+                membership: try membership(of: worktree, in: repository)
+            )
+            let clock = HopWindowClock()
+            clock.measureLeaf(named: worktree.lastPathComponent)
+            // 120 ms of main-thread work, pushed at the LAST git call before
+            // the disposal. `status` runs twice on this path (the ignored
+            // witness and G2), so the main thread is busy across the whole
+            // approach to the hop rather than for one instant of it.
+            let runner = InterceptingGitRunner(
+                wrapping: realRunner(),
+                intercept: { argv, _ in
+                    guard argv.contains("status") else { return nil }
+                    DispatchQueue.main.async {
+                        let until = DispatchTime.now().uptimeNanoseconds
+                            + 120_000_000
+                        while DispatchTime.now().uptimeNanoseconds < until {}
+                    }
+                    return nil
+                }
+            )
+            let landing = trashDirectory.appendingPathComponent(
+                worktree.lastPathComponent
+            )
+            let cleaner = CacheCleaner(
+                home: home,
+                containerRoots: [container],
+                containerSnapshot: ContainerSnapshot.capture(
+                    roots: [container], provider: clock
+                ),
+                provider: clock,
+                trashHandler: { url in
+                    clock.enteredTheSeam()
+                    try FileManager.default.moveItem(at: url, to: landing)
+                    return landing
+                },
+                gitRunner: runner
+            )
+            let report = await cleaner.clean(
+                items: [item(plan, id: "item-\(run)")], moveToTrash: true
+            )
+            XCTAssertEqual(
+                report.errors.map(\.message), [],
+                "the measured run must be a real, successful Trash disposal"
+            )
+            XCTAssertEqual(report.entries.map(\.disposal), [.trash])
+            let hop = try XCTUnwrap(clock.hopNanoseconds)
+            let window = try XCTUnwrap(clock.windowNanoseconds)
+            hops.append(Double(hop) / 1_000_000)
+            windows.append(Double(window) / 1_000_000)
+        }
+        func median(_ values: [Double]) -> Double {
+            values.sorted()[values.count / 2]
+        }
+        print(
+            "MEASURED-TRASH-HOP-MS \(hops.map { String(format: "%.3f", $0) })"
+                + " median \(String(format: "%.3f", median(hops)))"
+        )
+        print(
+            "MEASURED-TRASH-WINDOW-UNDER-LOAD-MS "
+                + "\(windows.map { String(format: "%.3f", $0) })"
+                + " median \(String(format: "%.3f", median(windows)))"
+        )
+        XCTAssertGreaterThan(
+            median(hops), 40,
+            "the main thread was NOT loaded, so this cell measured nothing: "
+                + "hops \(hops)"
+        )
+        XCTAssertLessThan(
+            median(windows), 20,
+            "the last proof and the move are separated by the main thread's "
+                + "queue depth — the proof is on the wrong side of the hop: "
+                + "windows \(windows), hops \(hops)"
         )
     }
 

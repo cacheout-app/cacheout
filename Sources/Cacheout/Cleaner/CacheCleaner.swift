@@ -1182,7 +1182,7 @@ actor CacheCleaner {
                 // a call it cannot be given a descriptor for.
                 try await TrashDisposal.dispose(
                     child, containedIn: admittedParent, provider: provider,
-                    via: { try await self.trash($0) }
+                    via: { try await self.trash($0, provingImmediatelyBefore: $1) }
                 )
             } else {
                 // NO INSPECTION VERDICT TO BIND TO, and the call site says
@@ -1496,7 +1496,7 @@ actor CacheCleaner {
                     try await TrashDisposal.dispose(
                         target, expecting: probedObject, provider: provider,
                         containedIn: admittedParent,
-                        via: { try await self.trash($0) }
+                        via: { try await self.trash($0, provingImmediatelyBefore: $1) }
                     )
                 } else {
                     // NO LEAF VERDICT — WHICH IS NOT THE SAME AS NOTHING TO
@@ -1521,7 +1521,7 @@ actor CacheCleaner {
                     try await TrashDisposal.dispose(
                         target, containedIn: admittedParent,
                         provider: provider,
-                        via: { try await self.trash($0) }
+                        via: { try await self.trash($0, provingImmediatelyBefore: $1) }
                     )
                 }
             } else {
@@ -1637,7 +1637,22 @@ actor CacheCleaner {
             // no-leaf-verdict overload the item and contents arms above use,
             // against the container binding the performer captures before its
             // rechecks.
-            trash: { url in try await MainActor.run { try handler(url) } },
+            // THE PROOF CROSSES THE HOP WITH IT (PR #460 codex r6, D1) —
+            // `TrashDisposal.Mover`'s contract, and the reason this seam takes
+            // two arguments. `trashItem` requires the main actor; the
+            // performer's last-instant re-proof and the disposal's leaf
+            // binding both run on THIS side of that hop, so before this the
+            // interval between them and the move was the main thread's queue
+            // depth (MEASURED, n=5, under 120 ms main-thread work items:
+            // median 175.736 ms then, 0.004 ms now — see
+            // `testTheTrashProofAndTheMoveAreNotSeparatedByTheMainThreadQueue`
+            // for the command and the full samples).
+            trash: { url, prove in
+                try await MainActor.run {
+                    try prove()
+                    return try handler(url)
+                }
+            },
             removeTree: { url, admittedParent in
                 // `expecting: nil` is STATED, not defaulted (fn-6's item path
                 // states its own the same way): `git_worktrees` registers no
@@ -1807,9 +1822,23 @@ actor CacheCleaner {
     /// `FileManager.trashItem`, which requires the main actor), answering
     /// WHERE IT LANDED — `nil` when the disposal would not say.
     @discardableResult
-    private func trash(_ url: URL) async throws -> URL? {
+    private func trash(
+        _ url: URL, provingImmediatelyBefore prove: () throws -> Void
+    ) async throws -> URL? {
         let handler = trashHandler
-        return try await MainActor.run { try handler(url) }
+        // THE PROOF RIDES ACROSS THE HOP (PR #460 codex r6, D1). `trashItem`
+        // requires the main actor, so every caller's last proof used to be
+        // separated from the move by the MAIN THREAD'S QUEUE DEPTH — MEASURED
+        // through the production composition with 120 ms work items held on
+        // the main thread, median 175.736 ms between the last pre-move
+        // `probeChild` and the mover (n=5), against 0.004 ms with the proof
+        // placed here. `TrashDisposal.Mover` is the contract: run `prove()` on the
+        // far side of the hop, immediately before the move, and move nothing
+        // if it throws.
+        return try await MainActor.run {
+            try prove()
+            return try handler(url)
+        }
     }
 
     // MARK: - Logging

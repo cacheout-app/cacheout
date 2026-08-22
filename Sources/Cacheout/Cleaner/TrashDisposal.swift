@@ -93,31 +93,43 @@
 //  question about the opened inode to the instant the disposal seam is
 //  entered, printed by
 //  `testATrashDisposalThatTookTheWrongObjectPutsItBackAndRefuses` as
-//  `MEASURED-TRASH-WINDOW-NS`.
+//  `MEASURED-TRASH-WINDOW-NS` (4166 ns at r6, on an idle main thread, with
+//  the proof now inside the hop; it was ~21–25 µs idle before).
 //
-//  AND IT HAS NO UPPER BOUND, which an earlier version of this note quoted a
-//  five-sample idle range as if it did. That prefix is an `@MainActor` HOP —
-//  `trashItem` talks to Finder — so its width is a SCHEDULING DELAY, not a
-//  syscall cost, and scheduling delays do not have maxima. Measured both
-//  ways, 12 runs each, same machine, same fixture:
+//  THAT PREFIX HAD NO UPPER BOUND — AND SINCE PR #460 codex r6 IT IS NOT WHERE
+//  THE PROOF SITS. The prefix is an `@MainActor` HOP (`trashItem` talks to
+//  Finder), so its width is a SCHEDULING DELAY, not a syscall cost, and
+//  scheduling delays have no maxima. Measured both ways at r5, 12 runs each,
+//  same machine, same fixture, with the proof still on the NEAR side of it:
 //
 //      quiet:     min 21.5 µs   median 24.8 µs   p90 35.5 µs   max 41.2 µs
 //      contended: min 23.7 µs   median 59.7 µs   p90 297 µs    max 1382 µs
 //
 //  (contended = 2×`hw.ncpu` spinners; an incidental sample taken while a
 //  parallel `swift build` was running read 5.60 ms — 170× the quiet max.)
+//  Those figures are CPU contention. Main-thread QUEUE DEPTH is the larger
+//  half and was never measured until r6: under 120 ms work items held on the
+//  main thread the same interval is median 175.736 ms (n=5).
 //
-//  The REST of the window is inside `trashItem`, and its scale is the reason
-//  this file exists. Measured on this machine, on the real home volume: one
-//  `trashItem` call of a 4 KiB directory takes 262 µs (min) / 288 µs (median)
-//  / 456 µs (max) over nine calls, while the ONE syscall that defeats it —
-//  `renamex_np(RENAME_SWAP)` of two directories, the atomic form of the
+//  The earlier version of this note drew the wrong conclusion from its own
+//  numbers — "narrowing the prefix therefore buys nothing" — by comparing the
+//  prefix against the swap syscall and stopping there. What it missed is that
+//  the prefix is not a fixed cost to be compared with anything: it is
+//  UNBOUNDED, and an unbounded interval between a proof and the act it
+//  authorises is not narrowed by argument. `Mover`'s second argument moves the
+//  proof to the FAR side of the hop, which takes the same interval to median
+//  0.004 ms under the identical load. See `Mover` below.
+//
+//  The REST of the window is still inside `trashItem`, and its scale is the
+//  reason this file exists. Measured on this machine, on the real home volume:
+//  one `trashItem` call of a 4 KiB directory takes 262 µs (min) / 288 µs
+//  (median) / 456 µs (max) over nine calls, while the ONE syscall that defeats
+//  it — `renamex_np(RENAME_SWAP)` of two directories, the atomic form of the
 //  fixture's `rename(2)` + `mkdir(2)` — takes 61 µs (min) / 69–83 µs (median)
-//  on the same volume. So the swap fits several times over inside the call
-//  that follows the prefix, and on a BUSY machine it fits inside the prefix
-//  as well. Narrowing the prefix therefore buys nothing, which is precisely
-//  why the load-bearing proof here is the one taken AFTER the disposal: the
-//  window stays open — unboundedly so — and stops deciding the outcome.
+//  on the same volume. So the swap still fits inside the call that follows the
+//  proof, which is why the load-bearing proof here remains the one taken AFTER
+//  the disposal: narrowing the prefix removes the unbounded part of the
+//  window, it does not close the part `trashItem` owns.
 //
 //  WHAT REMAINS AFTER THE PUT-BACK, HONESTLY: the wrongly-taken item is in the
 //  Trash for the width of one `renamex_np`, and if the put-back cannot be
@@ -307,6 +319,44 @@ enum TrashDisposal {
         }
     }
 
+    // MARK: - The mover seam, and the proof that has to cross its hop
+
+    /// THE MOVER SEAM — and the SECOND argument is the whole reason this is a
+    /// named type rather than `(URL) async throws -> URL?` (PR #460 codex r6,
+    /// D1).
+    ///
+    /// `disposal(target, prove)` must call `prove()` **on the far side of
+    /// whatever hop it performs, immediately before the move**, and must not
+    /// move anything if it throws. The seam owner is the only code that knows
+    /// where its mover actually runs, so it is the only code that can put a
+    /// proof there.
+    ///
+    /// WHY. The production mover is `FileManager.trashItem`, which requires
+    /// the main actor, so `CacheCleaner` wraps it in a `MainActor.run`. Every
+    /// proof this file takes before calling the seam is therefore separated
+    /// from the move by the MAIN THREAD'S QUEUE DEPTH, which is not a syscall
+    /// and not a constant. MEASURED through the production composition
+    /// (`CacheCleaner` → `WorktreeReclaimPerformer` → this file, provider
+    /// instrumented so the last pre-move `probeChild` is timestamped, a
+    /// 120 ms work item held on the main thread):
+    ///
+    /// | shape | last proof → the mover is entered (n=5) |
+    /// |---|---|
+    /// | proof before the hop (through r5) | median **175.736 ms**, 160.352–184.937 |
+    /// | proof inside the hop (this) | median **0.004 ms**, 0.004–0.016 |
+    ///
+    /// The load is real in both rows and is asserted to be: the same run
+    /// measures the HOP itself (first leaf binding → last leaf binding) at
+    /// median 175.3 ms and 176.1 ms respectively.
+    ///
+    /// The full figures, the command and the load condition are in
+    /// `WorktreeReclaimPerformerTests`'
+    /// `testTheTrashProofAndTheMoveAreNotSeparatedByTheMainThreadQueue`.
+    ///
+    /// The after-proof still runs and still rolls back — this narrows the
+    /// window the after-proof exists to catch, it does not replace it.
+    typealias Mover = (URL, () throws -> Void) async throws -> URL?
+
     /// Move `target` to the Trash through `disposal`, proving on BOTH sides of
     /// it that the object disposed of is the one `inspected` is a verdict
     /// about.
@@ -326,7 +376,7 @@ enum TrashDisposal {
         expecting inspected: UserDataProbeResult.InspectedRoot,
         provider: FileSystemIdentityProvider,
         containedIn admittedParent: DepthSafeRemoval.AdmittedParent,
-        via disposal: (URL) async throws -> URL?
+        via disposal: Mover
     ) async throws {
         // A NON-DIRECTORY leaf verdict cannot be proved by `look` — its kind
         // gate is an `O_DIRECTORY` open, which can only ever IDENTIFY a
@@ -349,7 +399,20 @@ enum TrashDisposal {
                     path: target.path, cause: .notTheInspectedObject, depth: 0
                 )
             }
-            let landed = try await disposal(target)
+            // AND AGAIN ON THE FAR SIDE OF THE SEAM'S HOP (D1): the binding
+            // above is taken here, the move happens after a main-actor hop,
+            // and the interval between them is the main thread's queue depth.
+            let landed = try await disposal(target) {
+                let atTheInstant = try boundLeaf(
+                    of: target, containedIn: admittedParent, provider: provider
+                )
+                guard atTheInstant == bound else {
+                    throw DepthSafeRemoval.Failure(
+                        path: target.path, cause: .notTheInspectedObject,
+                        depth: 0
+                    )
+                }
+            }
             guard let landed else {
                 throw Failure(path: target.path, cause: .destinationUnknown)
             }
@@ -369,7 +432,12 @@ enum TrashDisposal {
         // (1) The cheap refusal, and the one that keeps the Trash untouched.
         try proveStanding(inspected, at: target, provider: provider)
 
-        let landed = try await disposal(target)
+        // (1b) THE SAME PROOF, ON THE FAR SIDE OF THE SEAM'S HOP (D1). (1) is
+        // taken here; the move happens after a main-actor hop whose length is
+        // the main thread's queue depth, not a syscall.
+        let landed = try await disposal(target) {
+            try proveStanding(inspected, at: target, provider: provider)
+        }
 
         // (2) The disposal happened. From here on the question is not "may we
         // proceed" but "what did it actually take", and every unprovable
@@ -447,13 +515,29 @@ enum TrashDisposal {
         _ target: URL,
         containedIn admittedParent: DepthSafeRemoval.AdmittedParent,
         provider: FileSystemIdentityProvider,
-        via disposal: (URL) async throws -> URL?
+        via disposal: Mover
     ) async throws {
         let bound = try boundLeaf(
             of: target, containedIn: admittedParent, provider: provider
         )
 
-        let landed = try await disposal(target)
+        // AND AGAIN IMMEDIATELY BEFORE THE MOVE, WHEREVER THE MOVER RUNS
+        // (PR #460 codex r6, D1). The binding above is the cheap refusal that
+        // keeps the Trash untouched; this one is the load-bearing one, because
+        // the production seam hops to the main actor and that hop is the main
+        // thread's queue depth. Both readings are the SAME `boundLeaf` under
+        // the SAME proved container, so a difference between them is a swap
+        // inside the hop and nothing else.
+        let landed = try await disposal(target) {
+            let atTheInstant = try boundLeaf(
+                of: target, containedIn: admittedParent, provider: provider
+            )
+            guard atTheInstant == bound else {
+                throw DepthSafeRemoval.Failure(
+                    path: target.path, cause: .notTheInspectedObject, depth: 0
+                )
+            }
+        }
 
         guard let landed else {
             throw Failure(path: target.path, cause: .destinationUnknown)

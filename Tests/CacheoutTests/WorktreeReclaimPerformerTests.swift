@@ -308,6 +308,19 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         ]
     }
 
+    /// The `-C` target of a recorded argv, or `nil` when the argv has no
+    /// `-C` or nothing after it.
+    ///
+    /// NEVER a positional subscript (PR #460 codex r2 / D2): `argv[4]` on a
+    /// runtime-length array turns a regression that shortens an argv into a
+    /// PROCESS abort — every later cell and every later suite silently
+    /// skipped — instead of a named failure.
+    private func dashCTarget(_ argv: [String]) -> String? {
+        guard let index = argv.firstIndex(of: "-C"),
+              argv.indices.contains(index + 1) else { return nil }
+        return argv[index + 1]
+    }
+
     /// Whether an argv belongs to the delete-time gate re-establishment —
     /// used only where a cell needs to say "and NOTHING ELSE ran".
     private func isReestablishment(_ argv: [String]) -> Bool {
@@ -562,30 +575,32 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         // primary invocation and once inside the fallback, immediately
         // before the filesystem delete (that second run is what refuses a
         // lock taken mid-operation).
+        //
+        // ASSERTED AS ONE WHOLE SEQUENCE, never by subscripting (PR #460
+        // codex r2 / D2). The previous shape indexed `bare[5]`,
+        // `bare[7..<12]` and `bare[13]` into a RUNTIME-LENGTH array, so a
+        // regression that dropped one delete-time invocation killed the
+        // PROCESS with "Array index is out of range" — measured twice — and
+        // every alphabetically-later cell and every later suite silently
+        // never ran, behind a per-suite "0 failures" tally. A dropped
+        // invocation must fail a NAMED CELL, and in the file that guards the
+        // deletion path that is not a stylistic preference.
         let bare = bareArgvs(runner)
         let expected = reestablishmentArgvs(worktree: worktree, repository: repository)
-        XCTAssertEqual(Array(bare.prefix(5)), expected, "\(bare)")
-        XCTAssertEqual(
-            bare[5],
-            WorktreeReclaimPerformer.removeArguments(
-                parentRepoWorkingDir: repository, worktreePath: worktree
-            )
-        )
-        XCTAssertEqual(
-            bare[6], GitWorktreeCleanCheck.arguments(forWorktreeAt: worktree)
-        )
-        XCTAssertEqual(Array(bare[7..<12]), expected, "\(bare)")
-        XCTAssertTrue(bare[12].contains("list"), "\(bare[12])")
-        XCTAssertEqual(
-            bare[13],
-            WorktreeReclaimPerformer.commonGitDirArguments(
-                parentRepoWorkingDir: repository
-            )
-        )
         // …and then NOTHING. The gated post-fallback prune is a SCOPED
         // filesystem removal of that worktree's own admin entry, not a
         // repository-wide `git worktree prune` (PR #460 codex r1 / C4).
-        XCTAssertEqual(bare.count, 14, "\(bare)")
+        let fullSequence: [[String]] = expected
+            + [WorktreeReclaimPerformer.removeArguments(
+                parentRepoWorkingDir: repository, worktreePath: worktree
+            )]
+            + [GitWorktreeCleanCheck.arguments(forWorktreeAt: worktree)]
+            + expected
+            + [GitWorktreeOracle.listArguments(forRepositoryAt: repository)]
+            + [WorktreeReclaimPerformer.commonGitDirArguments(
+                parentRepoWorkingDir: repository
+            )]
+        XCTAssertEqual(bare, fullSequence)
         XCTAssertNil(bare.first { $0.contains("prune") }, "\(bare)")
         assertNoForbiddenArgv(runner)
     }
@@ -883,6 +898,77 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         XCTAssertTrue(report.errors.isEmpty)
     }
 
+    func testAParentRebooundBetweenTheFallbackDeleteAndThePruneLeavesTheAdminEntry()
+        async throws
+    {
+        // D3 (PR #460 codex r2): the R0 re-check inside
+        // `gatedPostFallbackPrune` was the ONE unevidenced arm of the three.
+        // MEASURED before this cell existed: removing it left the FULL suite
+        // green at 1450/2/0, exit 0.
+        //
+        // It is not a duplicate of its two siblings. This is the arm where
+        // the RECOMPUTE has already asked `-C <parent>` which entries are
+        // prunable, and the answer is what the scoped removal then acts on —
+        // so a repository re-pointed between the recompute and the removal
+        // means the set being deleted was computed by a repository nobody
+        // was shown.
+        //
+        // The rebind is REAL and lands exactly in that window: the
+        // interceptor plants the one-line `gitdir:` redirect when the THIRD
+        // `--git-common-dir` is about to run, which is
+        // `gatedPostFallbackPrune`'s own R0 — after the fallback's
+        // filesystem delete, after the oracle recompute.
+        let fixture = try makeBareParentFixture()
+        let membership = try membership(of: fixture.worktree, in: fixture.bare)
+        let plan = staleplan(worktree: fixture.worktree, membership: membership)
+        let adminEntry = try XCTUnwrap(plan.worktreeAdminEntry)
+        let victim = try makeOutsideRepository()
+        let victimAdmin = victim.appendingPathComponent(".git")
+            .appendingPathComponent("worktrees")
+            .appendingPathComponent("junkdir")
+        try fm.createDirectory(at: victimAdmin, withIntermediateDirectories: true)
+        let precious = victimAdmin.appendingPathComponent("precious.txt")
+        try Data("PRECIOUS".utf8).write(to: precious)
+
+        let bareRepo = fixture.bare
+        let commonDirCalls = GitCallCounter()
+        let runner = InterceptingGitRunner(wrapping: realRunner()) { arguments, _ in
+            if arguments.contains("remove") {
+                return .failure(exitCode: 128, stderr: "injected refusal")
+            }
+            if arguments.contains("--git-common-dir"),
+               commonDirCalls.next() == 3 {
+                try? Data("gitdir: \(victim.path)/.git\n".utf8)
+                    .write(to: bareRepo.appendingPathComponent(".git"))
+            }
+            return nil
+        }
+
+        let outcome = await perform(
+            item(plan), plan: plan, with: makePerformer(runner: runner)
+        )
+
+        // (a) The DELETION already succeeded, so this is a WARNING and the
+        //     row stays a success (D11).
+        XCTAssertTrue(outcome.errors.isEmpty, "\(outcome.errors.map(\.message))")
+        let entry = try XCTUnwrap(outcome.entry)
+        XCTAssertFalse(fm.fileExists(atPath: fixture.worktree.path))
+        let warning = try XCTUnwrap(entry.warning)
+        XCTAssertTrue(warning.contains("now resolves to git directory"), warning)
+        XCTAssertTrue(warning.contains(victim.path), warning)
+        XCTAssertTrue(
+            warning.contains(WorktreeReclaimPerformer.orphanedAdminWarning),
+            warning
+        )
+        // (b) NOTHING was removed under the rebound repository: the admin
+        //     entry the recompute named is INTACT, and so is the victim's.
+        XCTAssertTrue(fm.fileExists(atPath: adminEntry.path),
+                      "the admin entry must be left for the next scan")
+        XCTAssertTrue(fm.fileExists(atPath: precious.path))
+        XCTAssertEqual(commonDirCalls.observed, 3, "\(runner.argvs)")
+        assertNoForbiddenArgv(runner)
+    }
+
     func testPruneFailureAfterASuccessfulDeleteIsAWarningNotAnError()
         async throws
     {
@@ -1000,10 +1086,20 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
             XCTAssertTrue(message.contains(fragment), "\(name): \(message)")
             XCTAssertTrue(fm.fileExists(atPath: worktree.path),
                           "\(name): the tree must survive")
-            let bare = bareArgvs(runner).filter { !isReestablishment($0) }
-            XCTAssertEqual(bare.count, 2,
-                           "\(name): nothing may run after the abort: \(bare)")
-            XCTAssertTrue(bare[1].contains("status"), "\(name): \(bare)")
+            // The whole non-re-establishment sequence, never a subscript
+            // (PR #460 codex r2 / D2): `bare[1]` after a count assertion
+            // still indexes a runtime-length array, and `XCTAssertEqual`
+            // does not stop the cell.
+            XCTAssertEqual(
+                bareArgvs(runner).filter { !isReestablishment($0) },
+                [
+                    WorktreeReclaimPerformer.removeArguments(
+                        parentRepoWorkingDir: repository, worktreePath: worktree
+                    ),
+                    GitWorktreeCleanCheck.arguments(forWorktreeAt: worktree),
+                ],
+                "\(name): nothing may run after the abort"
+            )
         }
     }
 
@@ -1989,6 +2085,241 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         }
     }
 
+    // MARK: R1b — WHICH worktree the re-read record is about (codex r2 / D1)
+
+    /// The admin directory a live checkout resolves to through its OWN
+    /// `.git` back-link — the production resolver, not a reconstruction.
+    private func liveAdminDirectory(of worktree: URL) throws -> URL {
+        try XCTUnwrap(
+            GitWorktreeGitdirResolver(identity: provider)
+                .adminDirectory(forWorktreeAt: worktree),
+            "no admin directory resolves from \(worktree.path)"
+        )
+    }
+
+    func testAWorktreeMovedOntoTheAssessedPathIsRefusedAndSurvives()
+        async throws
+    {
+        // THE D1 REPRO. The user retires the stale worktree THEMSELVES and
+        // moves a different, live checkout onto the freed path. Every gate
+        // the delete path re-established before this round passes: R0 (the
+        // same repository), R1 (a registered, linked, unlocked record AT
+        // THAT PATH), G2 (clean) and R2 (merged). The performer destroyed
+        // the newcomer and returned a SUCCESS entry with `errors=[]` —
+        // measured — while the plan's carried `worktreeAdminEntry`, the
+        // token that names WHICH checkout was assessed, sat unconsulted.
+        let repository = try makeRepository(named: "repo")
+        let assessed = try addWorktree(named: "wt", branch: "feature", in: repository)
+        let newcomer = try addWorktree(named: "newcomer", branch: "live", in: repository)
+        let plan = staleplan(
+            worktree: assessed,
+            membership: try membership(of: assessed, in: repository)
+        )
+        let carriedAdmin = try XCTUnwrap(plan.worktreeAdminEntry)
+        let newcomerAdmin = try liveAdminDirectory(of: newcomer)
+
+        try git(["-C", repository.path, "worktree", "remove", assessed.path])
+        try git(["-C", repository.path, "worktree", "move",
+                 newcomer.path, assessed.path])
+        // The two facts that make this the hazard: the token is GONE, and
+        // the path is occupied by a different, perfectly healthy checkout.
+        XCTAssertFalse(fm.fileExists(atPath: carriedAdmin.path))
+        XCTAssertTrue(fm.fileExists(atPath: assessed.path))
+        XCTAssertEqual(
+            try liveAdminDirectory(of: assessed).path, newcomerAdmin.path
+        )
+
+        let runner = InterceptingGitRunner(wrapping: realRunner())
+        let outcome = await perform(
+            item(plan), plan: plan, with: makePerformer(runner: runner)
+        )
+
+        XCTAssertNil(outcome.entry, "a success entry would report a lie")
+        let message = try XCTUnwrap(outcome.errors.first?.message)
+        XCTAssertTrue(
+            message.contains("is now the checkout of admin directory"), message
+        )
+        XCTAssertTrue(message.contains(newcomerAdmin.path), message)
+        XCTAssertTrue(message.contains(carriedAdmin.path), message)
+        // The mutation never ran, and the newcomer — tracked content and all
+        // — is still there with its branch.
+        XCTAssertNil(runner.argvs.first { $0.contains("remove") }, "\(runner.argvs)")
+        XCTAssertTrue(fm.fileExists(
+            atPath: assessed.appendingPathComponent("tracked.txt").path
+        ))
+        XCTAssertTrue(try branchExists("live", in: repository))
+        XCTAssertEqual(try porcelainRecordCount(of: repository), 2)
+        assertNoForbiddenArgv(runner)
+    }
+
+    func testTheSameFixtureWithoutTheMoveIsRemovedNormally() async throws {
+        // THE NEGATIVE CONTROL for the cell above: two worktrees, the same
+        // plan, no move — the assessed one is removed and the sibling is
+        // untouched. So the refusal above is the REBINDING, not the shape.
+        let repository = try makeRepository(named: "repo")
+        let assessed = try addWorktree(named: "wt", branch: "feature", in: repository)
+        let sibling = try addWorktree(named: "newcomer", branch: "live", in: repository)
+        let plan = staleplan(
+            worktree: assessed,
+            membership: try membership(of: assessed, in: repository)
+        )
+        let outcome = await perform(
+            item(plan), plan: plan,
+            with: makePerformer(runner: InterceptingGitRunner(wrapping: realRunner()))
+        )
+        XCTAssertTrue(outcome.errors.isEmpty, "\(outcome.errors.map(\.message))")
+        XCTAssertNotNil(outcome.entry)
+        XCTAssertFalse(fm.fileExists(atPath: assessed.path))
+        XCTAssertTrue(fm.fileExists(atPath: sibling.path))
+    }
+
+    func testACheckoutThatNoLongerBacksLinkToAnyAdminDirectoryIsRefused()
+        async throws
+    {
+        // The other R1b class: the record is still registered at the path,
+        // but the object there no longer proves WHICH registration it is —
+        // its `.git` back-link is gone. Fail CLOSED: the authorisation
+        // cannot be tied to an object at all. (A re-scan differs: the admin
+        // directory is now an ORPHAN, i.e. prune-tier material, not a stale
+        // worktree.)
+        let repository = try makeRepository(named: "repo")
+        let worktree = try addWorktree(named: "wt", branch: "feature", in: repository)
+        let plan = staleplan(
+            worktree: worktree,
+            membership: try membership(of: worktree, in: repository)
+        )
+        try fm.removeItem(at: worktree.appendingPathComponent(".git"))
+
+        let runner = InterceptingGitRunner(wrapping: realRunner())
+        let outcome = await perform(
+            item(plan), plan: plan, with: makePerformer(runner: runner)
+        )
+
+        XCTAssertNil(outcome.entry)
+        let message = try XCTUnwrap(outcome.errors.first?.message)
+        XCTAssertTrue(
+            message.contains("no longer resolves through its own `.git` "
+                             + "back-link"), message
+        )
+        XCTAssertNil(runner.argvs.first { $0.contains("remove") }, "\(runner.argvs)")
+        XCTAssertTrue(fm.fileExists(atPath: worktree.path))
+    }
+
+    func testTheSamePathReAddIsTheMeasuredResidualOfTheAdminEntryBinding()
+        async throws
+    {
+        // RESIDUAL, RECORDED AND MEASURED (PR #460 codex r2 / D1).
+        //
+        // R1b binds the re-read record to the plan's carried
+        // `worktreeAdminEntry`, which is a PATH. `git worktree remove` frees
+        // the name `worktrees/<basename>`, and a later `git worktree add` at
+        // the SAME path takes that name back — so the carried spelling
+        // resolves again, to a DIFFERENT directory, and a path binding
+        // cannot tell them apart. This cell measures the mechanism (same
+        // path, different inode) rather than reasoning about it, and then
+        // states the consequence plainly.
+        //
+        // Closing it needs a scan-time IDENTITY carried in
+        // `GitWorktreeReclaimPlan` — fn-6's shape — which is a schema change
+        // this round did not take. WHEN IT IS TAKEN, THIS CELL GOES RED, and
+        // that is the point: the residual note in
+        // `reestablishWorktreeIdentity` must be retired with it.
+        let repository = try makeRepository(named: "repo")
+        let assessed = try addWorktree(named: "wt", branch: "feature", in: repository)
+        // A second worktree keeps the admin CONTAINER alive across the
+        // removal, which is the field shape (git rmdir's an emptied one).
+        try addWorktree(named: "anchor", branch: "anchor", in: repository)
+        let plan = staleplan(
+            worktree: assessed,
+            membership: try membership(of: assessed, in: repository)
+        )
+        let carriedAdmin = try XCTUnwrap(plan.worktreeAdminEntry)
+        let inodeBefore = try XCTUnwrap(provider.identity(of: carriedAdmin))
+
+        try git(["-C", repository.path, "worktree", "remove", assessed.path])
+        try git(["-C", repository.path, "worktree", "add", assessed.path,
+                 "-b", "brand-new"])
+
+        // (a) THE MECHANISM: git reused the name, so the carried spelling is
+        //     live again — pointing at a different directory.
+        let reAdded = try liveAdminDirectory(of: assessed)
+        XCTAssertEqual(reAdded.path, carriedAdmin.path,
+                       "git re-used the freed admin-directory name")
+        XCTAssertNotEqual(
+            try XCTUnwrap(provider.identity(of: carriedAdmin)), inodeBefore,
+            "…while the directory itself is a new object"
+        )
+
+        // (b) THE CONSEQUENCE, stated rather than discovered: R1b passes and
+        //     the brand-new checkout is removed.
+        let outcome = await perform(
+            item(plan), plan: plan,
+            with: makePerformer(runner: InterceptingGitRunner(wrapping: realRunner()))
+        )
+        XCTAssertTrue(outcome.errors.isEmpty, "\(outcome.errors.map(\.message))")
+        XCTAssertNotNil(outcome.entry)
+        XCTAssertFalse(fm.fileExists(atPath: assessed.path))
+    }
+
+    // MARK: The D13 guard sites the oracle listing needs (codex r2 / D4)
+
+    /// Replace `directory` with a SYMLINK to a copy of itself: every byte a
+    /// listing would read is still reachable, and only the no-follow leaf
+    /// check can tell the difference. Called from inside `@Sendable`
+    /// closures, where a throw would be swallowed — so every caller asserts
+    /// the swap took by its EFFECT before asserting anything else.
+    private static func swapToSymlink(_ directory: URL) {
+        let fileManager = FileManager.default
+        let moved = directory.deletingLastPathComponent()
+            .appendingPathComponent(directory.lastPathComponent + "-moved")
+        try? fileManager.moveItem(at: directory, to: moved)
+        try? fileManager.createSymbolicLink(
+            at: directory, withDestinationURL: moved
+        )
+    }
+
+    func testTheRegistryReReadRefusesWhenTheAdminContainerIsSwappedMidFlight()
+        async throws
+    {
+        // D4 (PR #460 codex r2). `git worktree list` does not merely run in
+        // the `-C` target: it ENUMERATES `$GIT_COMMON_DIR/worktrees` to
+        // decide which records are `prunable`. The stale arm's pre-remove
+        // guard covers the parent and the worktree and NOT that container,
+        // so between admission and the registry re-read the container was
+        // unguarded. This cell swaps it for a symlink in exactly that
+        // window, timed off R0's subprocess.
+        let repository = try makeRepository(named: "repo")
+        let worktree = try addWorktree(named: "wt", branch: "feature", in: repository)
+        let membership = try membership(of: worktree, in: repository)
+        let adminContainer = membership.parentAdminContainer
+        let plan = staleplan(worktree: worktree, membership: membership)
+
+        let runner = InterceptingGitRunner(wrapping: realRunner()) { arguments, _ in
+            if arguments.contains("--git-common-dir") {
+                WorktreeReclaimPerformerTests.swapToSymlink(adminContainer)
+            }
+            return nil
+        }
+        let outcome = await perform(
+            item(plan), plan: plan, with: makePerformer(runner: runner)
+        )
+
+        XCTAssertEqual(
+            provider.probeKind(of: adminContainer), .kind(.symlink),
+            "the swap must have taken, or this cell proves nothing"
+        )
+        XCTAssertNil(outcome.entry)
+        let message = try XCTUnwrap(outcome.errors.first?.message)
+        XCTAssertTrue(
+            message.contains("the traversal guard for the worktree-registry "
+                             + "re-read"), message
+        )
+        XCTAssertNil(runner.argvs.first { $0.contains("list") },
+                     "the listing must not have run at all: \(runner.argvs)")
+        XCTAssertNil(runner.argvs.first { $0.contains("remove") })
+        XCTAssertTrue(fm.fileExists(atPath: worktree.path))
+    }
+
     // MARK: - R6: prune-only mode
 
     /// Add a worktree and then DELETE its checkout — the orphaned admin
@@ -2021,6 +2352,57 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
             try makeOrphan(named: $0, in: repository, membership: membership)
         }
         return (repository, membership, admin)
+    }
+
+    func testTheOracleRecomputeRefusesWhenTheAdminContainerIsSwappedMidFlight()
+        async throws
+    {
+        // D4's second half (PR #460 codex r2). The delete-time recompute
+        // fires the SAME `worktree list` argv as R1, so it traverses the
+        // same two paths — and its guard covered only the parent. The
+        // revalidator seam is the one production hook that runs BETWEEN the
+        // first recompute and the final pre-removal one, which is exactly
+        // the window to swap the container in.
+        let fixture = try makePruneFixture(orphans: ["gone"])
+        let orphan = fixture.admin[0]
+        let adminContainer = fixture.membership.parentAdminContainer
+        let plan = prunePlan(membership: fixture.membership, disclosed: [orphan])
+        let runner = InterceptingGitRunner(wrapping: realRunner())
+
+        let outcome = await perform(
+            item(plan, id: "prune"), plan: plan,
+            with: makePerformer(runner: runner, revalidate: { _ in
+                WorktreeReclaimPerformerTests.swapToSymlink(adminContainer)
+                return nil
+            })
+        )
+
+        XCTAssertEqual(
+            provider.probeKind(of: adminContainer), .kind(.symlink),
+            "the swap must have taken, or this cell proves nothing"
+        )
+        XCTAssertNil(outcome.entry)
+        let message = try XCTUnwrap(outcome.errors.first?.message)
+        // NAMED as the guard's refusal, not the mapper's: without the
+        // container in the guard's path list the listing runs, the mapper
+        // then refuses the same symlink for its own reason, and the outer
+        // wording is identical. The inner clause is what discriminates.
+        XCTAssertTrue(
+            message.contains("the traversal guard refused a path the oracle "
+                             + "listing traverses"), message
+        )
+        XCTAssertTrue(
+            message.contains("final pre-prune prunable-set check"), message
+        )
+        XCTAssertTrue(
+            fm.fileExists(atPath: adminContainer
+                .deletingLastPathComponent()
+                .appendingPathComponent(
+                    adminContainer.lastPathComponent + "-moved"
+                )
+                .appendingPathComponent("gone").path),
+            "nothing was pruned"
+        )
     }
 
     func testFreshOrphansAreActuallyRemovedByTheExecutionPrune() async throws {
@@ -2348,7 +2730,7 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         ))
         XCTAssertTrue(try branchExists("feature", in: bare))
         XCTAssertEqual(
-            try XCTUnwrap(staleRunner.argvs.first)[4], bare.path,
+            dashCTarget(try XCTUnwrap(staleRunner.argvs.first)), bare.path,
             "git must be pointed at the bare repository itself"
         )
 
@@ -2378,7 +2760,7 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         // repository itself, and none of them is a mutation: the removal is
         // scoped to the carried admin container (PR #460 codex r1 / C4).
         for argv in pruneRunner.argvs {
-            XCTAssertEqual(argv[4], bare.path, "\(argv)")
+            XCTAssertEqual(dashCTarget(argv), bare.path, "\(argv)")
         }
         XCTAssertNil(pruneRunner.argvs.first { $0.contains("prune") })
         XCTAssertNil(pruneRunner.invocations.first { $0.profile == .mutation })
@@ -2797,6 +3179,25 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
             ),
             .readOnly
         )
+    }
+}
+
+/// A thread-safe call counter for interception closures — a `@Sendable`
+/// closure may not capture a mutable local.
+final class GitCallCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+
+    @discardableResult
+    func next() -> Int {
+        lock.lock(); defer { lock.unlock() }
+        count += 1
+        return count
+    }
+
+    var observed: Int {
+        lock.lock(); defer { lock.unlock() }
+        return count
     }
 }
 

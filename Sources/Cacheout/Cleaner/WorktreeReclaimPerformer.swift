@@ -29,21 +29,38 @@
 ///
 /// ## THE D13 SUBPROCESS-TRAVERSAL AUDIT
 ///
-/// `PathGuard.validateSubprocessTraversalDirectory` re-runs IMMEDIATELY before
-/// EVERY git invocation, over exactly the paths that invocation traverses:
+/// WHAT IS ACTUALLY GUARANTEED (rewritten, PR #460 codex r2 — the previous
+/// wording, "re-runs IMMEDIATELY before EVERY git invocation", was FALSE:
+/// `grep -n guardTraversal` returned six sites and none of them was inside
+/// `reestablishStaleGates`, which fires five invocations of its own):
 ///
-/// | invocation                       | guarded paths                          |
-/// |----------------------------------|----------------------------------------|
-/// | admission (both modes)           | parent (or-equal), admin container; stale mode adds the worktree |
-/// | R0 `rev-parse --git-common-dir`  | parent (`-C`)                          |
-/// | R1 registry re-read (`worktree list`) | parent (`-C`)                     |
-/// | R2 ladder (`symbolic-ref`, `rev-parse --verify`) | parent (`-C`)        |
-/// | R2 ancestry (`merge-base --is-ancestor`) | the worktree (`-C`)            |
-/// | `worktree remove`                | parent (`-C`), the worktree argument   |
-/// | `status` re-check                | the worktree (`-C`) AND the admin container — git follows `<wt>/.git` INTO the admin/common git dir, so a swap in EITHER between the remove failure and the re-check would redirect it (epic round 6) — AND the parent, which the fallback's own R0/R1/R2 re-run traverses |
-/// | oracle recompute (`worktree list`) | parent (`-C`)                        |
-/// | scoped admin removal             | parent (`-C`, traversed by the immediately preceding oracle recompute and by R0), admin container |
-/// | each affected admin dir (prune mode) | the dir itself, strictly           |
+/// **Every path a git invocation traverses is covered by a
+/// `validateSubprocessTraversalDirectory` that ran after admission and
+/// before that invocation** — but NOT necessarily one guard per invocation.
+/// A guard is a PATH check: at the instant it runs, this spelling is a real,
+/// non-symlink, same-device directory canonically inside the admitted
+/// container. It is not a lock and not a handle, so it cannot bind what git
+/// resolves a microsecond later; re-running it narrows a window, it never
+/// closes one. Adding re-runs that no cell can distinguish would only ship
+/// unevidenced guards. What actually closes the scan→delete gap is asking
+/// GIT (R0) and the REGISTRY (R1/R1b) — a repository can be re-pointed while
+/// every path fact above still holds.
+///
+/// The table below is therefore BY GUARD SITE, not by invocation:
+///
+/// | guard site                       | paths                  | the invocations it covers |
+/// |----------------------------------|------------------------|---------------------------|
+/// | admission (both modes)           | parent (or-equal), admin container; stale mode adds the worktree | everything, as the floor |
+/// | pre-`worktree remove` (stale)    | parent, worktree       | R0, R2's ladder + ancestry, and `worktree remove` itself |
+/// | inside R1 (PR #460 codex r2)     | parent, admin container | the `worktree list` re-read — it ENUMERATES `$GIT_COMMON_DIR/worktrees` to answer `prunable`, and the pre-remove guard covers only the parent and the worktree |
+/// | fallback entry                   | worktree, admin container, parent | the `status` re-check (git follows `<wt>/.git` INTO the admin/common git dir, so a swap in EITHER would redirect it — epic round 6) and the fallback's own R0/R1/R1b/R2 |
+/// | inside the oracle recompute      | parent, admin container | the recompute's `worktree list` — same argv, same two paths |
+/// | pre-scoped-removal               | parent, admin container | the scoped admin removal and the R0 immediately before it |
+/// | each affected admin dir (prune mode) | the dir itself, strictly | that directory's own removal |
+///
+/// R2's three subprocesses share one covering guard because
+/// `GitWorktreeMergedCheck` is a shared seam this file does not own; there is
+/// no honest way to interleave a guard between rungs of its ladder.
 ///
 /// ## THE DELETE-TIME GATE RE-ESTABLISHMENT (PR #460 codex r1)
 ///
@@ -53,10 +70,11 @@
 /// deregistered, or committed into between the scan and the click was
 /// destroyed anyway — with an empty error list. `reestablishStaleGates` now
 /// re-proves R0 (repository identity), R1 (G1 + G4 + the registration
-/// itself, from the re-read porcelain record) and R2 (G3, through the shared
-/// `GitWorktreeMergedCheck`) immediately before the mutation, at BOTH
-/// mutating sites: before `worktree remove`, and again inside the fallback
-/// before the filesystem delete.
+/// itself, from the re-read porcelain record), R1b (WHICH worktree that
+/// record is about) and R2 (G3, through the shared `GitWorktreeMergedCheck`)
+/// immediately before the mutation, at BOTH mutating sites: before
+/// `worktree remove`, and again inside the fallback before the filesystem
+/// delete.
 ///
 /// ## RUNNER-RESULT ROUTING IS TOTAL
 ///
@@ -342,9 +360,13 @@ struct WorktreeReclaimPerformer {
 
         // (8) THE DELETE-TIME GATE RE-ESTABLISHMENT. Placed HERE, before the
         // primary invocation, so it covers BOTH arms: the fallback is only
-        // reachable through the `worktree remove` below.
+        // reachable through the `worktree remove` below. It runs its OWN D13
+        // guards, per invocation group (PR #460 codex r2) — the guard at (7)
+        // covers the mutation's two paths and does not cover the admin
+        // container `worktree list` enumerates.
         if case .refuse(let tag, let detail) = await reestablishStaleGates(
-            plan: plan, worktreePath: worktreePath
+            plan: plan, worktreePath: worktreePath, adminEntry: adminEntry,
+            container: container
         ) {
             return failure(item, detail, tag: tag)
         }
@@ -476,7 +498,8 @@ struct WorktreeReclaimPerformer {
         // this delete open, which is the window a lock acquired mid-operation
         // lands in.
         if case .refuse(let tag, let detail) = await reestablishStaleGates(
-            plan: plan, worktreePath: worktreePath
+            plan: plan, worktreePath: worktreePath, adminEntry: adminEntry,
+            container: container
         ) {
             return failure(
                 item,
@@ -965,7 +988,15 @@ struct WorktreeReclaimPerformer {
     ///   re-runs the assessor's OWN gate functions over it. G1 and G4 are not
     ///   properties of file CONTENT — they are structured fields of the
     ///   record — so re-reading the record IS re-establishing them.
+    /// - **R1b (WHICH worktree)** binds that record to the plan's carried
+    ///   `worktreeAdminEntry` before the record is accepted. See
+    ///   `reestablishWorktreeIdentity`.
     /// - **R2 (G3)** re-runs the shared `GitWorktreeMergedCheck`.
+    ///
+    /// Each step runs the D13 traversal guard over exactly the paths its own
+    /// invocation group traverses (PR #460 codex r2). The caller's pre-remove
+    /// guard covers the mutation's paths — parent and worktree — and NOT the
+    /// admin container, which `worktree list` enumerates.
     ///
     /// G2 is deliberately absent here and is NOT an omission: the primary arm
     /// is `git worktree remove` WITHOUT `--force`, whose own dirty-refusal is
@@ -978,28 +1009,88 @@ struct WorktreeReclaimPerformer {
     /// shipped a fail-closed refusal on a fixed cap whose printed remedy was
     /// "re-scan", which could never differ).
     ///
-    /// The caller must already have run the D13 traversal guard over the
-    /// parent AND the worktree: R0/R1 traverse the parent (`-C`), R2
-    /// traverses both.
     private func reestablishStaleGates(
-        plan: GitWorktreeReclaimPlan, worktreePath: URL
+        plan: GitWorktreeReclaimPlan,
+        worktreePath: URL,
+        adminEntry: URL,
+        container: AdmittedContainer
     ) async -> GateReestablishment {
+        // R0 traverses the `-C` target ONLY, and the caller guarded exactly
+        // that path immediately before entering here — the primary arm at
+        // step (7), the fallback at its own entry. NO extra guard is added:
+        // it would be an unevidenced re-run of a check microseconds old, and
+        // an unevidenced guard is a defect this project has shipped before.
         if case .refuse(let tag, let detail) =
             await reestablishParentRepository(plan: plan) {
             return .refuse(tag: tag, detail: detail)
         }
+
+        // R1 IS DIFFERENT, and this guard is the one real gap PR #460 codex
+        // r2 found: `worktree list` also ENUMERATES
+        // `$GIT_COMMON_DIR/worktrees` to answer `prunable`, and the primary
+        // arm's step-(7) guard covers only the parent and the worktree. The
+        // admin container is a path this invocation traverses and nothing
+        // between admission and here re-proves it.
+        if case .refuse(let tag, let detail) = guardGroup(
+            [parentGuardPath(plan), adminContainerGuardPath(plan)],
+            inside: container, invocation: "the worktree-registry re-read"
+        ) {
+            return .refuse(tag: tag, detail: detail)
+        }
         let record: GitWorktreeEntry
         switch await reestablishWorktreeRecord(
-            plan: plan, worktreePath: worktreePath
+            plan: plan, worktreePath: worktreePath, adminEntry: adminEntry
         ) {
         case .refuse(let tag, let detail):
             return .refuse(tag: tag, detail: detail)
         case .record(let entry):
             record = entry
         }
+
+        // R2's ladder runs `-C <parent>` and its ancestry runs
+        // `-C <worktree>` — the two paths the caller guarded on entry, and
+        // no others. Same reasoning as R0: no extra guard.
         return await reestablishAncestry(
             plan: plan, worktreePath: worktreePath, record: record
         )
+    }
+
+    /// The D13 guard as a `GateReestablishment`, so a refused traversal reads
+    /// like every other delete-time refusal instead of throwing through the
+    /// re-establishment.
+    ///
+    /// RETRY: yes — every class the guard refuses (a leaf that became a
+    /// symlink, a path that now canonicalizes outside the admitted
+    /// container, a different device) is a state a re-scan re-evaluates.
+    private func guardGroup(
+        _ paths: [GuardedPath],
+        inside container: AdmittedContainer,
+        invocation: String
+    ) -> GateReestablishment {
+        do {
+            try guardTraversal(paths, inside: container)
+            return .proceed
+        } catch {
+            return .refuse(
+                tag: CacheCleaner.refusalTag(error),
+                detail: "refused: the traversal guard for \(invocation) "
+                    + "rejected a path it must cross "
+                    + "(\(error.localizedDescription)) — nothing was removed. "
+                    + "Re-scan to rebuild this item."
+            )
+        }
+    }
+
+    private func parentGuardPath(_ plan: GitWorktreeReclaimPlan) -> GuardedPath {
+        (label: "parent repository", url: plan.parentRepoWorkingDir,
+         containment: .descendantOrEqual)
+    }
+
+    private func adminContainerGuardPath(
+        _ plan: GitWorktreeReclaimPlan
+    ) -> GuardedPath {
+        (label: "admin container", url: plan.parentAdminContainer,
+         containment: .strictDescendant)
     }
 
     /// **R0** — the repository behind the `-C` target is still the one whose
@@ -1092,7 +1183,7 @@ struct WorktreeReclaimPerformer {
     /// a lock refusal leaves it `locked`; an "is not a working tree" refusal
     /// leaves no record at all.
     private func reestablishWorktreeRecord(
-        plan: GitWorktreeReclaimPlan, worktreePath: URL
+        plan: GitWorktreeReclaimPlan, worktreePath: URL, adminEntry: URL
     ) async -> WorktreeRecordReestablishment {
         let listing = await runner.run(
             GitWorktreeOracle.listArguments(
@@ -1174,7 +1265,92 @@ struct WorktreeReclaimPerformer {
                     + "lock is held."
             )
         }
+        // R1b — LAST, and deliberately after G1/G4. Those two are facts
+        // about the RECORD GIT HOLDS FOR THIS PATH and stay true statements
+        // about it whatever checkout occupies it ("that path is now the
+        // repository's main record" is the precise, actionable message for
+        // a plan aimed at a main checkout, and putting R1b first would
+        // replace it with a vaguer one and leave G1 unevidenced here).
+        // R1b is the condition on ACCEPTING the record, so it runs where
+        // the record is accepted.
+        if case .refuse(let tag, let detail) = reestablishWorktreeIdentity(
+            worktreePath: worktreePath, adminEntry: adminEntry
+        ) {
+            return .refuse(tag: tag, detail: detail)
+        }
         return .record(record)
+    }
+
+    /// **R1b** — WHICH worktree the re-read record is about (PR #460 codex
+    /// r2, C-round-2 D1).
+    ///
+    /// R1 above finds the record by PATH, and a path is not an identity. The
+    /// scan authorised destroying ONE checkout, and the plan carries that
+    /// checkout's own identity token: `worktreeAdminEntry`, the admin
+    /// directory fn-5.1's resolver reached THROUGH the worktree's `.git`
+    /// back-link. Until this round that token was carried and never
+    /// consulted, so after a user retired the stale worktree themselves and
+    /// `git worktree move`d another checkout onto the freed path, the
+    /// performer re-proved all four gates against the newcomer's record and
+    /// destroyed it — measured, with a SUCCESS entry and `errors=[]`.
+    ///
+    /// The re-proof is the same resolver, run the other way from
+    /// `revivedCheckoutRefusal`: `<worktree>/.git` must still be a regular
+    /// FILE, must still point INTO a `worktrees` container, that admin
+    /// directory's `gitdir` must still point BACK at this `.git`, and the
+    /// directory so reached must be the carried one. Nothing here is a
+    /// message match and nothing is a bare spelling comparison —
+    /// `sameLocation` is inode identity when both sides exist.
+    ///
+    /// UNLIKE `revivedCheckoutRefusal` THIS ONE FAILS CLOSED on every
+    /// ambiguity, and the asymmetry is deliberate: there the oracle had
+    /// already proved the entry prunable and an unreadable back-link could
+    /// only ADD a refusal, whereas here an unreadable back-link means the
+    /// authorisation cannot be tied to an object at all.
+    ///
+    /// RETRY: yes, and it can differ. Every class refused here is a change a
+    /// re-scan re-evaluates from scratch — the checkout now at that path
+    /// becomes its own candidate, or fails the four gates on its own merits,
+    /// or is not offered at all.
+    ///
+    /// RESIDUAL, MEASURED (git 2.50.1, this machine): a user who removes the
+    /// stale worktree and then re-adds one AT THE SAME PATH gets an admin
+    /// directory of the SAME NAME back (`worktrees/<basename>` is freed by
+    /// the removal and reused by the add; the two directories' inodes
+    /// differed, 110794887 → 110794910). The plan carries a PATH, not the
+    /// scan-time inode, so that one re-creation is indistinguishable here.
+    /// Closing it needs a scan-time identity carried in
+    /// `GitWorktreeReclaimPlan` — the fn-6 shape — which is a schema change
+    /// this round did not take. The `git worktree move` and
+    /// `add-under-a-different-path` shapes ARE closed, and those are the ones
+    /// that were measured destroying live work.
+    private func reestablishWorktreeIdentity(
+        worktreePath: URL, adminEntry: URL
+    ) -> GateReestablishment {
+        let resolver = GitWorktreeGitdirResolver(identity: provider)
+        guard let live = resolver.adminDirectory(forWorktreeAt: worktreePath)
+        else {
+            return .refuse(
+                tag: "worktree-identity-unresolvable",
+                detail: "refused: \(worktreePath.path) no longer resolves "
+                    + "through its own `.git` back-link to an admin directory "
+                    + "— the checkout the scan assessed is not provably the "
+                    + "one at that path now; nothing was removed. Re-scan to "
+                    + "see what is actually there."
+            )
+        }
+        guard provider.sameLocation(live, adminEntry) else {
+            return .refuse(
+                tag: "worktree-identity-rebound",
+                detail: "refused: \(worktreePath.path) is now the checkout of "
+                    + "admin directory \(live.path), not the assessed "
+                    + "\(adminEntry.path) — a DIFFERENT worktree occupies the "
+                    + "path this item was authorised against; nothing was "
+                    + "removed. Re-scan; whatever is there now is judged on "
+                    + "its own merits."
+            )
+        }
+        return .proceed
     }
 
     /// **R2** — G3, re-run through the SHARED `GitWorktreeMergedCheck`.
@@ -1232,17 +1408,18 @@ struct WorktreeReclaimPerformer {
     private func recomputePrunableSet(
         plan: GitWorktreeReclaimPlan, container: AdmittedContainer
     ) async -> PrunableSetRecompute {
-        // The recompute is `git -C <parent> worktree list` — the guard runs
-        // over the parent it traverses.
+        // The recompute is `git -C <parent> worktree list` — the SAME argv
+        // R1 fires, so it traverses the same two paths: the `-C` target, and
+        // the admin container the listing ENUMERATES to answer `prunable`
+        // (PR #460 codex r2; the container was previously unguarded here).
         do {
             try guardTraversal([
-                (label: "parent repository", url: plan.parentRepoWorkingDir,
-                 containment: .descendantOrEqual),
+                parentGuardPath(plan), adminContainerGuardPath(plan),
             ], inside: container)
         } catch {
             return .failed(
-                "the traversal guard refused the parent repository "
-                    + "(\(error.localizedDescription))"
+                "the traversal guard refused a path the oracle listing "
+                    + "traverses (\(error.localizedDescription))"
             )
         }
 

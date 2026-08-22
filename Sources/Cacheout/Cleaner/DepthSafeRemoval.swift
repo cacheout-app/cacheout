@@ -128,30 +128,38 @@
 //     `rename(2)`s one step earlier and the deletion proceeds inside the
 //     stranger.
 //
-//  4. A NON-DIRECTORY leaf. `.noDirectoryTree` carries no identity and does
-//     not separate "nothing was there" from "something that is not a
-//     directory was there", so any non-directory at the name satisfies it —
-//     the kernel refuses only a DIRECTORY appearing there, which is a kind
-//     check and not an identity one. Measured and pinned by
-//     `testANonDirectoryVerdictCannotTellAbsenceFromAReplacement`. What
-//     closes it is a shape change to `PreDeleteInspectedObject` and its
-//     producer, not anything this file can do alone.
+//  4. A NON-DIRECTORY leaf under a `.noDirectoryTree` verdict. That case
+//     carries no identity and does not separate "nothing was there" from
+//     "something that is not a directory was there", so any non-directory at
+//     the name satisfies it — the kernel refuses only a DIRECTORY appearing
+//     there, which is a kind check and not an identity one. Measured and
+//     pinned by `testANonDirectoryVerdictCannotTellAbsenceFromAReplacement`.
 //
-//     ITS SCOPE, STATED RATHER THAN LEFT TO BE INFERRED: this is a residual
-//     of the VERDICT type, so it applies wherever a `PreDeleteInspectedObject`
-//     is the binding — this file's `expecting:` and
-//     `TrashDisposal.dispose(_:expecting:…)`. It does NOT apply to
-//     `TrashDisposal.dispose(_:containedIn:…)`, which binds by `fstatat`
-//     under a proved container and therefore carries kind AND identity for
-//     non-directory leaves too. A future note here must not generalise "the
-//     Trash arm binds the same way" in either direction: the two arms bind
-//     differently, on purpose, because they have different facts available.
+//     ITS SCOPE, STATED RATHER THAN LEFT TO BE INFERRED (re-measured PR #459
+//     review r5): it is a residual of that one CASE, not of the verdict
+//     type. `.nonDirectoryLeaf(Identity)` closed it for every producer that
+//     HOLDS the leaf's identity — `EphemeralTempScanner`'s revalidator,
+//     whose regular-file arm is that case's only producer today — by making
+//     this file's `ENOTDIR` arm `fstatat` the leaf against the carried
+//     identity and `TrashDisposal.dispose(_:expecting:…)` bind the same
+//     facts on both sides of the move. What remains on `.noDirectoryTree`
+//     is exactly its one remaining producer, the probe whose root open
+//     FAILED (`OrphanedCachesScanner.swift` — ENOENT/ENOTDIR, so it never
+//     had an identity to carry), plus this file's one-syscall
+//     `fstatat`→`unlinkat` window (no `funlinkat(2)` on macOS; residual 2's
+//     shape, one leaf, never a tree). None of it applies to
+//     `TrashDisposal.dispose(_:containedIn:…)`, which always bound by
+//     `fstatat` under a proved container. A future note here must not
+//     generalise "the Trash arm binds the same way" in either direction:
+//     the arms bind differently, on purpose, because they have different
+//     facts available.
 //
 //  POSIX offers no primitive that closes 1, 2 or 3: there is no way to pin a
 //  directory to its parent for the duration of a read, no way to remove a
 //  directory by descriptor, and no way to hand a deletion the descriptor an
-//  admission opened instead of the path it was opened from. 4 is two cases
-//  on a shared type.
+//  admission opened instead of the path it was opened from. What is left of
+//  4 is one identity-free case kept for the one producer that never held an
+//  identity, plus the missing `funlinkat(2)`.
 
 import Foundation
 
@@ -398,32 +406,56 @@ enum DepthSafeRemoval {
             }
             // Symlink, regular file, fifo, socket, device: one unlink, and
             // never a resolution through it.
-            //
-            // THE ONLY BINDING THIS ARM HAS IS A KIND CHECK, AND THAT IS A
-            // RESIDUAL, NOT A PROOF (PR #458 review — say what the code
-            // does, not what one would like it to do). A verdict of
-            // `.noDirectoryTree` is about the ABSENCE of a tree at this
-            // name, and `unlinkat` WITHOUT `AT_REMOVEDIR` cannot remove a
-            // directory — measured on this platform: `EPERM` — so a
-            // DIRECTORY created here between the failed open and the unlink
-            // is refused by the kernel rather than by a re-check that would
-            // have its own window.
-            //
-            // What the kernel cannot refuse is a different NON-directory:
-            // the verdict carries neither the leaf's identity nor whether
-            // anything was there at all, so an absence the probe saw and a
-            // stranger's file the deletion finds are the same value.
-            // Measured and pinned by
-            // `testANonDirectoryVerdictCannotTellAbsenceFromAReplacement`.
-            // Closing it is a change to `PreDeleteInspectedObject`
-            // (`SpaceScanner.swift`) and its producer
-            // (`OrphanedCachesScanner.swift`) — an `absent` case and a
-            // `nonDirectoryLeaf(Identity)` case — after which this arm
-            // `fstatat`s the leaf against that identity and the Trash arm
-            // binds the same way. It is not something this file can assert
-            // its way out of.
             if let inspected {
-                guard case .noDirectoryTree = inspected else {
+                switch inspected {
+                case .noDirectoryTree:
+                    // The IDENTITY-FREE verdict — its one remaining producer
+                    // is the probe whose root open FAILED and never held an
+                    // identity to carry (`OrphanedCachesScanner.swift`).
+                    // THE ONLY BINDING THIS ARM HAS IS A KIND CHECK, AND
+                    // THAT IS A RESIDUAL, NOT A PROOF (PR #458 review):
+                    // `unlinkat` WITHOUT `AT_REMOVEDIR` cannot remove a
+                    // directory — measured on this platform: `EPERM` — so a
+                    // DIRECTORY created here since the failed open is refused
+                    // by the kernel. What the kernel cannot refuse is a
+                    // different NON-directory: this verdict carries neither
+                    // the leaf's identity nor whether anything was there at
+                    // all, so an absence the probe saw and a stranger's file
+                    // the deletion finds are the same value. Measured and
+                    // pinned by
+                    // `testANonDirectoryVerdictCannotTellAbsenceFromAReplacement`.
+                    // A producer that HOLDS the leaf's identity must say
+                    // `.nonDirectoryLeaf` instead and take the arm below.
+                    break
+                case .nonDirectoryLeaf(let expected):
+                    // THE LEAF IS PROVED BEFORE IT IS UNLINKED (PR #459
+                    // review r5). One `fstatat` under the PROVED parent
+                    // descriptor — a single resolution no rename can
+                    // re-point — compared against the identity the
+                    // revalidator verified on its held descriptor. Absence,
+                    // a probe failure, and a different object are all
+                    // refusals: unprovable is never unlinked.
+                    //
+                    // RESIDUAL, macOS has no `funlinkat(2)`: between this
+                    // `fstatat` and the `unlinkat` below there is a
+                    // one-syscall window in the proved parent — the same
+                    // shape as residual 2 (the final `rmdir`), and like it
+                    // the cost is bounded to ONE leaf at this name, never a
+                    // tree (a directory swapped in fails the `unlinkat`
+                    // itself). An `O_NOFOLLOW` open + `fstat` would buy
+                    // nothing: the unlink still acts on the NAME.
+                    switch provider.probeChild(
+                        inDirectory: parentFd, named: leafName, logical: url
+                    ) {
+                    case .facts(let facts) where facts.identity == expected:
+                        break
+                    case .facts, .absent, .failed:
+                        throw Failure(
+                            path: url.path, cause: .notTheInspectedObject,
+                            depth: 0
+                        )
+                    }
+                case .directory, .unestablished:
                     throw Failure(
                         path: url.path, cause: .notTheInspectedObject,
                         depth: 0
@@ -578,6 +610,10 @@ enum DepthSafeRemoval {
         // No inspection ran (contents mode): nothing to bind to. The caller
         // states this explicitly.
         guard let inspected else { return }
+        // Only a `.directory` verdict about THIS inode admits an opened
+        // directory: `.noDirectoryTree`, `.nonDirectoryLeaf` and
+        // `.unestablished` all say a directory here is NOT the inspected
+        // object, and the `guard case` refuses each of them.
         guard case .directory(let expected) = inspected,
               provider.identity(ofDescriptor: root) == expected else {
             throw Failure(
@@ -679,7 +715,7 @@ enum DepthSafeRemoval {
         // is the same answer for the trees it could NOT measure, which is
         // exactly the population this file exists for.
         try refuseATreeThatAlreadyContainsAMount(
-            root: current, displayPath: displayPath
+            root: current, displayPath: displayPath, provider: provider
         )
 
         /// Subdirectory names not yet descended into, one BOUNDED batch per
@@ -1128,12 +1164,14 @@ enum DepthSafeRemoval {
     /// exactly the over-`PATH_MAX` trees this file exists to delete, with a
     /// re-scan remedy that could never clear it.
     private static func refuseATreeThatAlreadyContainsAMount(
-        root: Int32, displayPath: String
+        root: Int32, displayPath: String,
+        provider: FileSystemIdentityProvider
     ) throws {
         guard let rootPath = canonicalPath(of: root) else { return }
         let prefix = rootPath.hasSuffix("/") ? rootPath : rootPath + "/"
         var shallowest: String?
-        for mountPoint in mountPoints() where mountPoint.hasPrefix(prefix) {
+        for mountPoint in provider.mountPointPaths()
+        where mountPoint.hasPrefix(prefix) {
             if shallowest == nil
                 || mountPoint.utf8.count < shallowest!.utf8.count {
                 shallowest = mountPoint
@@ -1157,30 +1195,10 @@ enum DepthSafeRemoval {
         return String(cString: buffer)
     }
 
-    /// Every mount point on this machine, as the kernel spells it.
-    ///
-    /// `getfsstat` with a buffer of our own rather than `getmntinfo`, which
-    /// returns a pointer to a STATIC buffer: permanent deletions run on a
-    /// background queue and more than one can be in flight.
-    static func mountPoints() -> [String] {
-        let needed = getfsstat(nil, 0, MNT_NOWAIT)
-        guard needed > 0 else { return [] }
-        // Room for filesystems mounted between the two calls; anything past
-        // it is simply not seen by THIS preflight, and the per-child guard
-        // still refuses it.
-        let capacity = Int(needed) + 8
-        let table = UnsafeMutablePointer<statfs>.allocate(capacity: capacity)
-        defer { table.deallocate() }
-        let got = getfsstat(
-            table, Int32(capacity * MemoryLayout<statfs>.stride), MNT_NOWAIT
-        )
-        guard got > 0 else { return [] }
-        return (0..<Int(got)).map { index in
-            withUnsafeBytes(of: &table[index].f_mntonname) { raw in
-                String(cString: raw.bindMemory(to: CChar.self).baseAddress!)
-            }
-        }
-    }
+    // The kernel-mount-table read (`getfsstat(MNT_NOWAIT)`) lives on
+    // `FileSystemIdentityProvider.mountPointPaths()` since PR #459 r5 — the
+    // ephemeral-temp scanner needs the identical stall-free primitive, and
+    // two spellings of one table read is how the two would drift.
 
     /// `.` and `..` by BYTES — the two names the traversal must never take.
     private static func isDotEntry(_ name: RawName, length: Int) -> Bool {

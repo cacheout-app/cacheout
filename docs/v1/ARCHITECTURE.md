@@ -21,6 +21,7 @@ business logic (scanning/cleaning), state management, and presentation.
 │  SpaceScannerRuntime (registry + validated scan stream)     │
 │    CategoryScanner ──► CacheScanner (actor)                 │
 │    BuildArtifactsScanner │ OrphanedCachesScanner            │
+│    EphemeralTempScanner                                     │
 │    CacheCleaner (actor)                                     │
 ├─────────────────────────────────────────────────────────────┤
 │                     Data Models                             │
@@ -56,6 +57,8 @@ Sources/Cacheout/
 │   ├── BuildArtifactsScanner.swift     # Project build-artifact scanner (SpaceScanner)
 │   ├── ValuablesDetector.swift         # Release-artifact probe + acknowledgement tokens
 │   ├── OrphanedCachesScanner.swift     # First-level ~/Library/Caches sweep (SpaceScanner)
+│   ├── EphemeralTempRoots.swift        # confstr-resolved temp roots + their sweep config
+│   ├── EphemeralTempScanner.swift      # First-level ephemeral temp sweep (SpaceScanner)
 │   └── SpaceScanner.swift              # SpaceScanner protocol, ReclaimableItem model, SpaceScannerRuntime
 ├── Cleaner/
 │   ├── CacheCleaner.swift              # Guarded deletion/trash + InodeAccountingRegistry (actors)
@@ -88,7 +91,8 @@ These actors provide thread-safe business logic:
 | Actor | Purpose | Key Methods |
 |-------|---------|-------------|
 | `CacheScanner` | Parallel category scanning (sizing delegated to `DirectorySizer`) | `scanAll()`, `scanCategory()` |
-| `BuildArtifactsScanner` | Project build-artifact discovery over the dev roots (a `SpaceScanner`; a value type, listed here beside its peers) | `scan(context:)`, `preDeleteRevalidator(provider:)` |
+| `BuildArtifactsScanner` | Project build-artifact discovery over the dev roots (a `SpaceScanner`; a value type, listed here beside its peers) | `scan(context:)`, `preDeleteRevalidator` |
+| `EphemeralTempScanner` | Stale first-level entries in the three ephemeral temp roots (a `SpaceScanner`; a value type, listed here beside its peers). Runs on user-initiated scans only | `participates(in:)`, `scan(context:)`, `preDeleteRevalidator` |
 | `CacheCleaner` | Guarded deletion, freed-bytes accounting, logging | `clean(items:moveToTrash:)`, `runCleanCommand()` |
 | `InodeAccountingRegistry` | Per-operation claim-based freed-bytes settlement | `registerObservations(_:)`, `acceptSuccessful(_:)` |
 
@@ -276,8 +280,9 @@ settings change.
 Cacheout used to have two parallel scanning stacks: the data-driven
 `CacheCategory` aggregate registry and a bespoke node_modules scanner (own
 item model, own views, own cleaner branch — and absent from the CLI
-entirely). The planned scanners (build artifacts, git worktrees, temp dirs,
-orphaned caches) are all per-item by nature; replicating that pattern for
+entirely). The per-item scanners (build artifacts, orphaned caches,
+ephemeral temp files, and git worktrees still to come) are all per-item by
+nature; replicating that pattern for
 each would mean ~6 touch-points per scanner and guaranteed drift — the
 pre-unification CLI gap (node_modules was never wired into the CLI at all)
 is the proof. The bespoke scanner has since been subsumed by
@@ -340,13 +345,51 @@ the same admission as everything else.
 
 ### Why two canonicalization rules?
 
-Roots are resolved fully with `realpath(3)` — a symlink root is judged and
-walked by its real location, so an inadmissible target can't hide behind a
-link. Deletion-target *leaves* are never resolved: only the deepest existing
-ancestor is canonicalized, and deletion uses the unresolved URL — removing a
-symlink child deletes the link, never its target.
-(`URL.resolvingSymlinksInPath()` is not used for admission decisions: it is
-lexically wrong past a symlink and misses `/private` aliasing.)
+Full `realpath(3)` resolution is used where the result feeds a **deny check**
+— `admitDeletionRoot`, `matchConfiguredRoot`, alias-shadow keys — so an
+inadmissible target can't hide behind a link, and two spellings of one
+location collapse onto one comparison value.
+
+It is **not** used where the result becomes a **trusted container root**.
+There, only the deepest existing ancestor is canonicalized and the leaf is
+appended unresolved (`resolveTargetKeepingLeaf`). The deny list refuses `/`,
+volume roots and `$HOME` itself, but not their children — `~/Documents` is a
+legal container — so resolving a symlink leaf would register the link's
+destination as a trusted root and admit an arbitrary directory. Keeping the
+leaf means the declared spelling stays the link, which the scanners' no-follow
+(`lstat`) root gates see and refuse with a visible `symlinkRoot` issue, and
+which `ContainerSnapshot.capture` binds by the link's own identity at delete
+time. On stock macOS the two rules agree for every shipped root: the symlinks
+into `/var/folders/…/{C,T}` are ancestors (`/var` → `private/var`), which the
+parent chain still resolves.
+
+This is closed **at the leaf only** — a disclosed residual, not a hole an
+unprivileged process can reach on the shipped roots. Intermediate components
+are still resolved, so the same escalation survives one component up:
+measured end to end, a symlink at an intermediate with a real directory
+behind it registered that directory as a trusted container root, raised no
+issue, and the permanent-disposal arm deleted a file under it. Reaching it
+needs write permission on an intermediate's *parent*, and every such parent
+on the shipped chains is root-owned `drwxr-xr-x root:wheel` (`/`, `/private`,
+`/private/var`, `/private/var/folders`, and the `/private/var/folders/<xx>`
+prefix directory). The per-user bucket directory below those is user-owned,
+but it is the parent of the *leaf* — the component the leaf rule already
+protects. So the residual needs root, or a relocated container whose chain
+has a user-writable intermediate parent. No rationale is recorded here for the
+alternative — leaving the parent chain unresolved as well — because the one
+this section used to give was false: it said one container would then have two
+*registered* spellings, and resolution appends exactly one URL per declared
+root, so that state cannot arise. Measured instead, with a root declared
+unresolved end to end: one registered root, the entry listed, the outcome
+validated, and the permanent arm deleted it — while the item carried a
+canonical `/private/var/…` identity beside a declared `/var/…` origin. What
+that split costs has not been measured.
+
+Deletion-target *leaves* follow the same rule and for the same reason:
+deletion uses the unresolved URL, so removing a symlink child deletes the
+link, never its target. (`URL.resolvingSymlinksInPath()` is not used for
+admission decisions: it is lexically wrong past a symlink and misses
+`/private` aliasing.)
 
 ### Why does DirectorySizer have two modes?
 
@@ -399,7 +442,17 @@ to defer update checks until a signed appcast URL is configured in Info.plist.
 
 ## Security Model
 
-- **No admin privileges**: Only accesses user-space directories (`~/Library/`, `~/.`)
+- **No admin privileges**: everything runs as the invoking user, with no
+  helper and no elevation on any scan or clean path. The reach is user-space
+  caches (`~/Library/`, `~/.`), the configured dev roots, and — since the
+  ephemeral temp scanner — the world-writable `/private/tmp` plus this
+  user's own `…/T` and `…/C` containers under `/private/var/folders`. Those
+  temp roots are read only on user-initiated scans, and an ORDINARY entry
+  another user owns is skipped rather than listed (sticky-directory rules
+  make it undeletable, so claiming its bytes would be a lie). The one
+  exception is a mounted volume: that arm runs ahead of the ownership probe
+  by design — so the volume is refused WITHOUT being entered — and the entry
+  is reported as a visible not-measured row whoever owns it
 - **No network access**: No analytics, telemetry, or phoning home
 - **PathGuard admission on every destructive path**: category roots, contained
   children, per-item scanner targets, and cleanCommands roots are admitted against
@@ -415,7 +468,9 @@ to defer update checks until a signed appcast URL is configured in Info.plist.
   before any surface can address their items, and the cleaner independently
   refuses the same malformed shapes at dispatch (defense in depth)
 - **TCC-respecting scans**: privacy-protected roots (Documents / Desktop /
-  Downloads) are enumerated only on user-initiated scans, with usage strings
+  Downloads) — and the ephemeral temp roots, which are same-user-writable and
+  therefore cannot honor the background no-prompt guarantee — are enumerated
+  only on user-initiated scans, with usage strings
   in the Info.plist; the CLI surfaces denials as `scan_error` + `grant_hint`
   instead of reading zero
 - **Sandboxed shell commands**: Probe commands run with a restricted PATH and 2s timeout

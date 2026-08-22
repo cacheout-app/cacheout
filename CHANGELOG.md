@@ -41,6 +41,177 @@ and docs/v1/CLI-REFERENCE.md) — the pre-release `node_modules` →
   An inspection that could not finish is treated exactly like a change:
   refused, tokenless, re-scan required. Full contract in PROTOCOL.md and
   `docs/v1/CLI-REFERENCE.md`.
+- **Ephemeral temp files in the GUI and the CLI.** An `ephemeral_tmp`
+  per-item scanner lists STALE first-level entries in the ephemeral
+  locations macOS does not reliably prune: `/private/tmp` and the per-user
+  temp (`…/T`) and cache (`…/C`) containers, resolved from the OS rather
+  than hardcoded. Those three DECLARED locations can resolve to fewer roots:
+  one the OS does not name, or that is missing at scan time, is skipped
+  silently, and one that turns out to be a symlink NAMING another declared
+  root is dropped at resolution with a `symlink_root` issue naming the
+  dropped spelling — the ALIAS goes, never the real root, and the drop is
+  never silent. Resolution reads such a link but never follows it, so nothing
+  a replaced temp root points at is touched while the app is starting up; a
+  link spelled so that Cacheout cannot match it to a declared root is kept
+  instead of dropped, and the scan then refuses it with the same
+  `symlink_root` issue. A MEASURED entry qualifies when its OWN timestamp and its
+  newest REGULAR FILE are both older than the age threshold (default 7 days)
+  and it meets the size floor (default 10 MB) — a directory holding one fresh
+  file deep inside is not stale, so a workspace whose files are still being
+  written, including the running session's own scratch directory, is not
+  listed. Those thresholds gate the MEASURED entries only: a denied or
+  mount-boundary entry is listed as an explicit not-measured row regardless of
+  the floor (D6 — an unverified zero must not render as empty). A NESTED DIRECTORY's own timestamp is deliberately not an input
+  (the same blind spot the sizer accepts) on either side: the inputs are the
+  entry's own mtime and the mtimes of the REGULAR FILES below it. That is a
+  claim about the TIMESTAMP and not about the operations that move one — a
+  nested change can still trip a gate that is not a timestamp: unlinking a
+  file inside a nested directory can take the entry below the SIZE FLOOR, and
+  creating enough subdirectories inside one can push its contents past the
+  INSPECTION BUDGET, and either of those both keeps the entry off the list
+  and refuses it at delete time. An entry a process merely holds open for
+  reading is NOT detected: age is the protection, and every gate is
+  re-established from a held descriptor immediately before deletion.
+  Findings are Review risk, never default-selected, and never part
+  of Quick Clean or `smart-clean`. An ordinary entry another user owns is
+  skipped — sticky-directory rules make them undeletable, so claiming their
+  bytes would be false; the one exception is a mounted volume, whose refusal
+  arm runs ahead of the ownership probe by design and reports the row without
+  entering it. Anything unreadable is reported instead of silently
+  counted as empty. `--cli scan` reports each find as a `scanner_items` row
+  and `--cli clean` accepts `ephemeral_tmp` or `ephemeral_tmp:<item-id>`,
+  with `--confirm` required as everywhere else. **These locations are
+  scanned only on EXPLICIT user-initiated scans** — the app's automatic
+  background refreshes never enumerate them, and a CLI scan is always
+  user-initiated. Until you run one, the app SAYS SO: the section shows
+  "Not yet scanned" instead of a size and a count, so a location nobody has
+  looked at never reads as a location with nothing in it. (Any per-item
+  scanner in that state says the same; a scanner that HAS run and found
+  nothing keeps its section hidden, as before.) That row now appears on a
+  machine where the automatic scan found NOTHING, which is where it matters
+  most — the results list is built whenever some scanner has yet to run, not
+  only when something was found or something went wrong. Previously a clean
+  machine went straight to the window's "Click Scan to find caches" screen
+  and the row was never built at all.
+  Thresholds persist as `cacheout.ephemeralTmp.ageDays` /
+  `cacheout.ephemeralTmp.minSizeMB` and take invocation-scoped
+  `--tmp-age-days` / `--tmp-min-size-mb` overrides on `scan` and `clean`
+  (never persisted; refused on every other command, `smart-clean`
+  included). No schema change: `schema_version` stays 4 and every addition
+  is additive. **A temp entry is re-inspected immediately before it is
+  deleted**, from a descriptor held open for the check, and the check begins
+  by proving the object IS the one the scan inspected: the scan records the
+  entry's filesystem identity and the re-check compares it, so an entry
+  renamed away and replaced under the same name is refused even when the
+  replacement is itself old and idle. If the entry has been replaced, its own
+  directory has changed, a fresh REGULAR FILE has appeared anywhere inside it,
+  it is locked by a running process, it has shrunk below the size threshold
+  since the scan, or its contents could not be re-inspected in full within the
+  entry budget, the deletion is refused
+  with nothing removed and nothing reported freed — re-scan to see its current
+  state. Under the world-writable shared root (`/tmp`) an entry that has
+  changed owner since the scan is refused too; the per-user containers are not
+  owner-checked at delete time, because their `0700` mode leaves no way for
+  another user to place an entry there in the first place. Anything that is no
+  longer a directory or a regular file at that name is refused outright,
+  including a named pipe or socket planted mid-scan — which can no longer stall
+  the scan or the clean either. The check runs on both
+  disposals, and on the Move-to-Trash default it refuses before the item is
+  moved, so a refusal never disturbs your Trash. The proven identity also
+  travels INTO each disposal — for directories and for regular files alike —
+  so a replacement that lands even after the re-check itself is refused at
+  the destructive call: the permanent delete re-proves the object under the
+  folder it verified, and the Trash move proves it on both sides of the move.
+  (Before this, that late window was covered for directories only: a FILE
+  swapped in after the re-check was disposed of with success reported.)
+  **How DEEP a temp entry is costs the re-inspection nothing.** It walks by
+  descriptor, one level at a time, climbing back with `..` and proving at
+  every step that it landed where it left — so its descriptor and stack cost
+  are the same at 320 levels as at one. Before this, the walk recursed and
+  held one open descriptor and one stack frame per level: measured through
+  this path, a valid stale tree 96 levels deep was refused "Too many open
+  files … re-scan required" under a 96-descriptor limit (the kind of limit a
+  launchd-started app runs with), and one 260 levels deep crashed the
+  process outright. The first was worse than it looked — depth does not
+  change between scans, so the re-scan that refusal prescribed produced the
+  identical refusal, for ever, while the scan kept offering the row.
+  A directory MOVED to a different parent while its contents are being
+  re-inspected is now refused (nothing deleted, re-scan to see where it
+  went) instead of having the rest of its level read out of its new home.
+  **Mounted volumes inside temp roots are never entered.** The scan decides
+  from the kernel's own mount table before touching the entry at all — so a
+  dead network volume can no longer wedge the whole scan at first contact —
+  stops its content walk at any mounted boundary it knows of, and shows the
+  entry as a visible not-measured row whose message names the remedy: eject
+  or unmount the volume, then re-scan. Previously the staleness walk
+  descended mounted volumes (measured: 19,545 + 19,500 reads below one
+  22,545-entry mount) and whether a mounted entry appeared at all depended
+  on the volume's own contents. The delete-time re-check likewise refuses
+  to descend onto another filesystem. A volume mounted in the instant
+  between the table read and the walk is still read (metadata only) and is
+  refused by the sizing and delete-time mount gates that always stood.
+  **A volume mounted exactly AT a temp root is refused the same way**: the
+  scan answers from the mount table before any syscall touches the root and
+  reports it as a visible row that names the condition and the remedy —
+  "mounted volume; eject or unmount it, then re-scan" (previously the
+  refusal happened only after several syscalls served by the mounted volume
+  — a hang on an unresponsive hard mount — and never named the remedy).
+  That row is its OWN classification: `scanner_errors[].kind` is
+  `"mounted_volume_root"`, an ADDITION to an enumeration the protocol has
+  always declared extensible (`schema_version` stays 4). It was
+  `"container_refused"` until PR #459 review r11, which made the app's
+  visible label — derived from the kind alone — read "not a configured
+  search root" for a root that IS configured, with the real explanation
+  reachable only by hovering. Consumers keying on `"container_refused"` for
+  this case must add the new string; every other producer of
+  `"container_refused"` is unchanged. The same table read now guards the scan session's
+  container-identity capture and container admission, so a mounted
+  registered root no longer has its identity read at session start or its
+  path resolved when a healthy sibling root is admitted; a root skipped
+  this way stays fail-closed at delete time. A mount landing in the
+  instant between the table read and those steps can still be touched.
+  **A volume already mounted at a temp root when Cacheout STARTS is now
+  refused before the app finishes launching.** Which temp roots exist is
+  decided once, while the app builds itself, on the main thread — and that
+  step used to `lstat` each declared root, a call the mounted volume itself
+  serves, so an unresponsive hard mount could freeze the window before it
+  ever appeared. The same kernel mount table is read first now, and such a
+  root is not registered at all: nothing under it is scanned and no item can
+  claim it. The refusal is a visible row of its own kind,
+  `scanner_errors[].kind == "mounted_volume_root_at_registration"`, reading
+  "mounted volume at launch; unmount it, then relaunch". It is a separate
+  kind from `"mounted_volume_root"` only because the remedy differs: that
+  one is re-decided from a fresh table read on every scan, so unmounting and
+  re-scanning clears it, while this one is decided once per launch and
+  clears only when Cacheout is started again. Another ADDITION to the same
+  extensible enumeration (`schema_version` stays 4). Measured with a
+  table-injected fixture: calls naming the mounted root across app
+  construction went from 5 to 0. Still touched: a volume mounted at a temp
+  root's PARENT directory, and a temp root that is a symlink pointing at a
+  mounted volume.
+  **Two more temp-root refusals get their own classifications** — the same
+  defect shape as `"mounted_volume_root"` above, swept in PR #459 codex r13:
+  the app's visible row label is derived from the kind alone, so a kind
+  shared with a different condition prints a false diagnosis. A temp root
+  the search-root safety policy refuses (`/`, a volume root, or `$HOME`) is
+  now `scanner_errors[].kind == "policy_refused_root"` and reads "refused by
+  the search-root safety policy"; it was `"container_refused"`, whose label
+  "not a configured search root" was false for every firing, since a scanner
+  builds its guard from its own roots. A temp root replaced by a regular
+  file, FIFO, socket or device is now `"non_directory_root"` and reads "not
+  a directory — not searched"; it was `"symlink_root"`, whose label
+  "symlinked — not searched" sent the user hunting for a link that was not
+  there. Both are ADDITIONS to the same extensible enumeration
+  (`schema_version` stays 4). Consumers keying on `"container_refused"` or
+  `"symlink_root"` for these `ephemeral_tmp` cases must add the new strings;
+  a temp root that really IS a symlink still reports `"symlink_root"`, and
+  every producer in every other scanner is unchanged.
+  **The root listing's entry cap now holds on every path.** When the
+  bounded directory read fails, it is retried once (a transiently cleared
+  failure recovers through the same capped read), and the Foundation
+  fallback that classifies a persistent failure now reads lazily and stops
+  at the cap — previously that fallback materialized the entire directory
+  whenever the failure cleared between the two reads.
 - **Configurable dev roots.** Settings gains a dev-roots editor and the CLI a
   repeatable `--dev-root PATH` (invocation-scoped, never persisted). The
   filesystem root, any volume root or mount point, and `$HOME` itself are
@@ -199,6 +370,29 @@ and docs/v1/CLI-REFERENCE.md) — the pre-release `node_modules` →
 
 ### Fixed
 
+- **A background refresh no longer reads the folders it has already decided
+  to skip.** The ephemeral-temp scanner runs only when you ask for a scan, but
+  before each scan Cacheout records the identity of every folder it might
+  later delete from — and it did that for EVERY registered scanner, including
+  ones the refresh had just excluded. So an automatic refresh still made
+  filesystem contact with `/private/tmp` and both per-user temp containers,
+  where a stalled network or disk-image mount can park the call. It now
+  records only the folders belonging to the scanners that session actually
+  runs, which also means a scan narrowed to one scanner touches nothing
+  outside it. Nothing you can clean is affected: a scanner that did not run in
+  the latest scan already could not be cleaned until it runs again.
+- **A temp folder stuffed with directories can no longer make a scan crawl.**
+  The ephemeral-temp scanner advertised two limits — at most 20,000
+  first-level entries per temp folder, and at most 20,000 entries of
+  staleness checking per entry — but the second was handed out afresh to
+  every entry, so the two multiplied to 400 million filesystem probes for one
+  temp folder. `/private/tmp` is writable by anyone on the machine, so any
+  local program could stage that. Each temp folder now has ONE staleness
+  allowance its entries share; when it runs out the folder says so on the
+  results row ("too many entries — partially inspected"), and clearing
+  entries — including cleaning the items listed there — lets a later scan get
+  further. Cancelling a scan is also honoured while an entry is being
+  checked, instead of only between entries.
 - **Deleting a folder nested deeper than the system path limit now works.**
   Inspection had been made descriptor-relative and could read such trees;
   permanent deletion still went through `FileManager.removeItem`, which

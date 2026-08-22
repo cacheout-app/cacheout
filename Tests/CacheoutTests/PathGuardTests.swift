@@ -490,6 +490,122 @@ final class PathGuardTests: XCTestCase {
         )
     }
 
+    /// An OVER-MOUNTED registered root is omitted from the session snapshot
+    /// WITHOUT the identity `lstat` (PR #459 review r6, codex C2 —
+    /// AVAILABILITY): that lstat is served by the mounted filesystem — first
+    /// contact — so on an unresponsive hard mount it would park EVERY
+    /// session at capture, before any scanner task launches and on every
+    /// trigger, including ones the mounted root's scanner does not even
+    /// participate in. Omission is fail-closed by the same rule as absence:
+    /// delete-time container admission refuses a root the snapshot does not
+    /// carry.
+    func testCaptureSkipsATableMountedRootWithoutTouchingIt() throws {
+        let mountedRoot = fixtureHome.appendingPathComponent("over-mounted")
+        let plainRoot = fixtureHome.appendingPathComponent("plain")
+        try mkdir(mountedRoot)
+        try mkdir(plainRoot)
+
+        final class TableMountedRootForbiddingProvider:
+            FileSystemIdentityProvider, @unchecked Sendable {
+            var mountedRootPath = ""
+            override func mountPointPaths() -> [String] { [mountedRootPath] }
+            override func identity(of url: URL) -> Identity? {
+                if url.path == mountedRootPath {
+                    XCTFail("capture lstat'ed the over-mounted root — first "
+                            + "contact with the mounted filesystem")
+                }
+                return super.identity(of: url)
+            }
+        }
+        let provider = TableMountedRootForbiddingProvider()
+        provider.mountedRootPath = mountedRoot.path
+
+        let sessionSnapshot = ContainerSnapshot.capture(
+            roots: [mountedRoot, plainRoot], provider: provider
+        )
+
+        // The mounted root is omitted; the sibling is captured normally.
+        XCTAssertNil(sessionSnapshot.identity(forRootPath: mountedRoot.path))
+        XCTAssertNotNil(sessionSnapshot.identity(forRootPath: plainRoot.path))
+
+        // Fail-closed: delete-time admission refuses the omitted root and
+        // still admits the captured sibling.
+        let pathGuard = makeGuard(containers: [mountedRoot, plainRoot])
+        XCTAssertThrowsError(
+            try pathGuard.admitContainer(mountedRoot, snapshot: sessionSnapshot)
+        ) { error in
+            XCTAssertEqual(
+                error as? PathGuardError,
+                .containerUnavailable(path: mountedRoot.path)
+            )
+        }
+        XCTAssertNoThrow(
+            try pathGuard.admitContainer(plainRoot, snapshot: sessionSnapshot)
+        )
+    }
+
+    /// THE TABLE PREFLIGHT'S REFUSAL ARM, hermetic (PR #459 review r6,
+    /// codex C2; this cell added in the r6 verify pass — deleting the arm
+    /// had left the full suite green): a url the mount table names is
+    /// refused `.deniedVolumeRoot` by BOTH admission modes BEFORE
+    /// `canonicalize` (realpath) makes first contact with the mounted
+    /// filesystem. Without the arm the refusal still happens — the match
+    /// loop skips the table-mounted CONFIGURED root, so the url falls out
+    /// as `.notAConfiguredContainer` — but only AFTER a realpath of the
+    /// mounted url, which is exactly the stall the arm exists to prevent,
+    /// and under a classification whose message never names the unmount
+    /// remedy.
+    func testATableMountedURLIsRefusedDeniedVolumeRootBeforeRealpath() throws {
+        let mountedRoot = fixtureHome.appendingPathComponent("table-mounted")
+        try mkdir(mountedRoot)
+
+        final class CanonicalizeForbiddingTableProvider:
+            FileSystemIdentityProvider, @unchecked Sendable {
+            var mountedRootPath = ""
+            override func mountPointPaths() -> [String] { [mountedRootPath] }
+            override func canonicalize(_ url: URL) -> URL {
+                if url.path == mountedRootPath
+                    || url.path.hasPrefix(mountedRootPath + "/") {
+                    XCTFail("canonicalize (realpath) made first contact "
+                            + "with the table-mounted url: \(url.path)")
+                }
+                return super.canonicalize(url)
+            }
+        }
+        let provider = CanonicalizeForbiddingTableProvider()
+        provider.mountedRootPath = mountedRoot.path
+
+        // The url is itself a CONFIGURED root: the match loop would find it
+        // if the preflight did not throw first.
+        let pathGuard = makeGuard(
+            containers: [mountedRoot], provider: provider
+        )
+
+        XCTAssertThrowsError(
+            try pathGuard.admitSearchRoot(mountedRoot)
+        ) { error in
+            XCTAssertEqual(
+                error as? PathGuardError,
+                .deniedVolumeRoot(path: mountedRoot.path)
+            )
+        }
+
+        // Delete time, in the scan-to-clean mount race's exact shape: the
+        // snapshot was captured BEFORE the mount (default provider — the
+        // root's identity IS in it), so it is THIS preflight, not any
+        // capture-time skip, that refuses the root stall-free.
+        let sessionSnapshot = snapshot(of: [mountedRoot])
+        XCTAssertNotNil(sessionSnapshot.identity(forRootPath: mountedRoot.path))
+        XCTAssertThrowsError(
+            try pathGuard.admitContainer(mountedRoot, snapshot: sessionSnapshot)
+        ) { error in
+            XCTAssertEqual(
+                error as? PathGuardError,
+                .deniedVolumeRoot(path: mountedRoot.path)
+            )
+        }
+    }
+
     // MARK: - Device rules (injected provider, R15)
 
     /// Provider that reports a fake device id for every path at/under a
@@ -921,7 +1037,9 @@ final class PathGuardTests: XCTestCase {
         // THE NO-REGRESSION CELL: the policy runs on every configured root
         // of every registered scanner, so the production union itself has to
         // pass it — seeded dev roots (several of them protected first-level
-        // children) plus the orphaned-caches sweep root.
+        // children), the orphaned-caches sweep root, and (fn-6.4) the
+        // machine's REAL confstr-resolved ephemeral temp roots, which are the
+        // first registered roots that live OUTSIDE `$HOME`.
         let suiteName = "PathGuardTests-\(UUID().uuidString)"
         let suite = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         defer { suite.removePersistentDomain(forName: suiteName) }
@@ -934,7 +1052,18 @@ final class PathGuardTests: XCTestCase {
         let roots = runtime.trustedContainerRoots
         // Non-vacuity: the union must actually carry the seeded roots AND a
         // protected first-level child (the case the policy must NOT reject).
-        XCTAssertEqual(roots.count, DevRootsStore.seedRootNames.count + 1)
+        // The temp roots are counted through their own declaration, so the
+        // expectation stays a property of the composition rather than of this
+        // machine's confstr answers.
+        let tempRoots = EphemeralTempRoots.resolve(provider: provider).roots
+        XCTAssertEqual(
+            roots.count,
+            DevRootsStore.seedRootNames.count + 1 + tempRoots.count
+        )
+        XCTAssertTrue(
+            tempRoots.contains { $0.url.path == "/private/tmp" },
+            "the shared temp root is always in the declared set"
+        )
         XCTAssertTrue(
             roots.contains { $0.path == fixtureHome.appendingPathComponent("Documents").path },
             "~/Documents is a seeded dev root — the legal protected child"
@@ -971,6 +1100,72 @@ final class PathGuardTests: XCTestCase {
             if mountPointPaths.contains(url.path) { return true }
             return super.isMountPoint(url)
         }
+    }
+
+    // MARK: - Ownership probe (fn-6.2, epic D12)
+
+    /// The probe feeds the ephemeral-temp scanner's sticky-root gate, and its
+    /// three-way split is the whole point: a `uid_t?` would collapse absence,
+    /// races and denials into one silent nil, hiding present-but-denied
+    /// entries against the visible-denial doctrine.
+
+    func testOwnerProbeReportsTheCurrentUserForOwnFixtures() throws {
+        let file = fixtureHome.appendingPathComponent("owned.txt")
+        try Data("x".utf8).write(to: file)
+
+        XCTAssertEqual(
+            FileSystemIdentityProvider().ownerProbe(of: file),
+            .owner(geteuid())
+        )
+    }
+
+    func testOwnerProbeIsAbsentForAMissingPath() {
+        XCTAssertEqual(
+            FileSystemIdentityProvider().ownerProbe(
+                of: fixtureHome.appendingPathComponent("nothing-here")
+            ),
+            .absent
+        )
+    }
+
+    /// NO-FOLLOW: a DANGLING symlink still reports the LINK's own owner — a
+    /// `stat`-based probe would fail with ENOENT here. A link's owner is the
+    /// link's, never its target's.
+    func testOwnerProbeDoesNotFollowSymlinks() throws {
+        let link = fixtureHome.appendingPathComponent("dangling")
+        try fm.createSymbolicLink(
+            at: link,
+            withDestinationURL: fixtureHome.appendingPathComponent("gone")
+        )
+
+        XCTAssertEqual(
+            FileSystemIdentityProvider().ownerProbe(of: link),
+            .owner(geteuid())
+        )
+    }
+
+    /// A present entry whose OWNERSHIP cannot be established is `.failed` with
+    /// the errno RETAINED — the caller classifies it (EACCES ⇒ permission
+    /// denied) and keeps it visible instead of silently excluding it.
+    func testOwnerProbeRetainsErrnoWhenTheParentDeniesSearch() throws {
+        try XCTSkipIf(geteuid() == 0, "chmod-000 denies nothing under euid 0")
+        let directory = fixtureHome.appendingPathComponent("sealed")
+        try mkdir(directory)
+        let child = directory.appendingPathComponent("inside.txt")
+        try Data("x".utf8).write(to: child)
+        try fm.setAttributes(
+            [.posixPermissions: 0o000], ofItemAtPath: directory.path
+        )
+        addTeardownBlock { [fm] in
+            try? fm.setAttributes(
+                [.posixPermissions: 0o755], ofItemAtPath: directory.path
+            )
+        }
+
+        XCTAssertEqual(
+            FileSystemIdentityProvider().ownerProbe(of: child),
+            .failed(errno: EACCES)
+        )
     }
 
     // MARK: - Small helper

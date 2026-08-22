@@ -64,15 +64,22 @@ Cacheout --cli disk-info
 ### `scan`
 
 Run every registered scanner (the built-in cache categories plus the
-per-item scanners `build_artifacts` and `orphaned_caches`) and report the
+per-item scanners `build_artifacts`, `orphaned_caches` and `ephemeral_tmp`)
+and report the
 schema-4 envelope. The
 registry in `Sources/Cacheout/Scanner/Categories.swift` is the source of
 truth for which categories exist — see [CATEGORIES.md](CATEGORIES.md) for
 the full list.
 
+A CLI scan is always an explicit user act, so it runs USER-INITIATED: every
+registered scanner participates, `ephemeral_tmp` included. That scanner
+defers entirely on the app's automatic background refreshes (see
+[CATEGORIES.md](CATEGORIES.md)), so `--cli scan` always covers it.
+
 ```bash
 Cacheout --cli scan
 Cacheout --cli scan --orphan-size-floor-mb 100 --orphan-stale-days 30
+Cacheout --cli scan --tmp-age-days 14 --tmp-min-size-mb 50
 Cacheout --cli scan --dev-root ~/dev --dev-root /Volumes/Work/code
 ```
 
@@ -82,12 +89,16 @@ Cacheout --cli scan --dev-root ~/dev --dev-root /Volumes/Work/code
 |------|-------------|
 | `--orphan-size-floor-mb N` | Orphaned-caches sweep: stale-large size floor in DECIMAL megabytes (positive integer) for this invocation only — overrides the persisted `cacheout.orphanedCaches.sizeFloorMB`, never persisted. Default 50 |
 | `--orphan-stale-days N` | Orphaned-caches sweep: stale-large age in days (positive integer) for this invocation only — overrides the persisted `cacheout.orphanedCaches.staleAgeDays`, never persisted. Default 60 |
+| `--tmp-age-days N` | Ephemeral temp scanner: staleness age in days (positive integer) for this invocation only — overrides the persisted `cacheout.ephemeralTmp.ageDays`, never persisted. Default 7 |
+| `--tmp-min-size-mb N` | Ephemeral temp scanner: entry size floor in DECIMAL megabytes (positive integer) for this invocation only — overrides the persisted `cacheout.ephemeralTmp.minSizeMB`, never persisted. Default 10 |
 | `--dev-root PATH` | REPEATABLE. The dev roots the `build_artifacts` scanner walks, for this invocation only — see the precedence and path-form rules below. Never persisted |
 
-Zero, negative, non-numeric, or overflowing flag values are refused with
-`INVALID_ARGUMENTS`. The two sweep flags are accepted by `scan` and `clean`
-only; every other command refuses them with `INVALID_ARGUMENTS` rather than
-silently ignoring them.
+Zero, negative, non-numeric, repeated, and overflowing flag values are
+refused with `INVALID_ARGUMENTS` — and so is a threshold flag written last
+with no value, since reading it as an absent flag would scan with the
+persisted thresholds you meant to override. The four threshold flags are
+accepted by `scan` and `clean` only; every other command refuses them with
+`INVALID_ARGUMENTS` rather than silently ignoring them.
 
 #### `--dev-root` (build-artifacts dev roots)
 
@@ -227,6 +238,7 @@ Cacheout --cli clean xcode_derived_data --dry-run
 | `--confirm` | Actually delete. Without it (and without `--dry-run`) the command refuses: exit 1, empty stdout, `CONFIRMATION_REQUIRED` on stderr with the cleaning plan in `details` |
 | `--dry-run` | Preview what would be cleaned without deleting (wins even beside `--confirm`) |
 | `--orphan-size-floor-mb N` / `--orphan-stale-days N` | Invocation-scoped orphaned-caches sweep thresholds (same semantics as on `scan`; never persisted). Accepted by `scan` and `clean` ONLY — every other command (including `smart-clean`, which is category-only) refuses them with `INVALID_ARGUMENTS` |
+| `--tmp-age-days N` / `--tmp-min-size-mb N` | Invocation-scoped ephemeral temp-scanner thresholds (same semantics as on `scan`; never persisted). `clean` re-scans before deleting, so these decide which entries a bare `ephemeral_tmp` target covers. Accepted by `scan` and `clean` ONLY — every other command (including `smart-clean`) refuses them with `INVALID_ARGUMENTS` |
 | `--dev-root PATH` | REPEATABLE. Invocation-scoped dev roots for the `build_artifacts` scanner (same precedence, path-form and policy rules as on [`scan`](#-dev-root-build-artifacts-dev-roots); never persisted). Accepted by `scan` and `clean` ONLY — every other command refuses it with `INVALID_ARGUMENTS` |
 | `--acknowledge-valuables SLUG:ITEM_ID:TOKEN` | REPEATABLE, one entry per item. Authorizes deleting an item that discloses release artifacts. Accepted by `clean` ONLY — every other command refuses it with `INVALID_ARGUMENTS`. See [Release-artifact acknowledgement](#release-artifact-acknowledgement) |
 
@@ -434,7 +446,8 @@ A positional token appearing after the first `--`-prefixed token is refused
 with `INVALID_ARGUMENTS` naming it (before schema 4 it was silently dropped).
 Flags whose next token is their VALUE consume that token, so it is never
 mistaken for a target: `--acknowledge-valuables`, `--dev-root`,
-`--orphan-size-floor-mb`, `--orphan-stale-days`, `--format`, `--top`,
+`--orphan-size-floor-mb`, `--orphan-stale-days`, `--tmp-age-days`,
+`--tmp-min-size-mb`, `--format`, `--top`,
 `--target-pid`, `--target-name`. Unknown flags are tolerated and ignored, so
 a wrapper appending e.g. `--format json` to every invocation stays valid.
 
@@ -459,8 +472,10 @@ Cacheout --cli smart-clean 10.0 --dry-run
 
 **Behavior:**
 1. Scans all categories (the aggregate category scanner ONLY — per-item
-   scanners like `build_artifacts` are never part of smart-clean; explicit
-   `clean` addressing is the only way to delete their items)
+   scanners such as `build_artifacts`, `orphaned_caches` and
+   `ephemeral_tmp` are never part of smart-clean; explicit
+   `clean` addressing is the only way to delete their items, and their
+   threshold flags are refused here with `INVALID_ARGUMENTS`)
 2. Keeps only cleanly-measured categories with bytes — `denied` and
    `partiallyDenied` scans are skipped (the auto path never rides on a
    floor measurement), as are Caution-level categories and items not
@@ -682,6 +697,7 @@ Per-item scanner slugs (usable bare or as `<slug>:<item-id>`):
 |------|---------|
 | `build_artifacts` | Project build-artifact directories under your dev roots — `target/`, `node_modules/`, `.venv/`, `build/`, … each proven by an ecosystem marker file (item ids from `scan`'s `scanner_items`; see [CATEGORIES.md](CATEGORIES.md)) |
 | `orphaned_caches` | First-level `~/Library/Caches` sweep — leaked, orphaned, and stale cache entries (item ids from `scan`'s `scanner_items`; see [CATEGORIES.md](CATEGORIES.md)) |
+| `ephemeral_tmp` | First-level sweep of the ephemeral temp locations macOS does not reliably prune — `/private/tmp` and the per-user `…/T` / `…/C` containers. Stale entries only, never auto-selected (item ids from `scan`'s `scanner_items`; see [CATEGORIES.md](CATEGORIES.md)) |
 
 The `node_modules` slug that shipped in unreleased schema-4 work is
 **retired**: `build_artifacts` covers every directory it found (and more).

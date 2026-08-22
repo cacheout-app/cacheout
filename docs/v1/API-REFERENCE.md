@@ -515,9 +515,11 @@ struct ReclaimableItem: Equatable, Sendable {
 | `admission` | `AdmissionDescriptor` | Which PathGuard mode applies at the chokepoint |
 | `defaultSelected` | `Bool` | GUI initial selection — applied ONLY when a key is emitted for the first time |
 | `automaticCleanEligible` | `Bool` | `false` excludes the item from Quick Clean AND CLI smart-clean (every per-item scanner row ships `false` — CLI-visible is not auto-cleanable) |
-| `isStale` | `Bool?` | nil = staleness not applicable OR unknowable ("Select Stale" operates on `isStale == true`); the 30-day threshold is `ReclaimableItem.isStale(daysSinceModified:)` |
+| `isStale` | `Bool?` | nil = staleness not applicable OR unknowable ("Select Stale" operates on `isStale == true`); the threshold is per-scanner — build artifacts use the fixed 30-day `ReclaimableItem.isStale(daysSinceModified:)` helper, orphaned caches a 60-day default, ephemeral temp a 7-day default |
 | `valuablesDisclosure` | `ValuablesDisclosure?` | ADDITIVE. What the release-artifact probe SAW, plus its completeness flag. DISCLOSURE, never consent — acknowledgement lives only in the per-clean authorization context |
 | `requiresPreDeleteRevalidation` | `Bool` | ADDITIVE, scanner-agnostic. `true` means the item MUST be re-inspected immediately before deletion; a cleaner holding no revalidator for its scanner refuses it fail-closed |
+| `artifactProof` | `BuildArtifactProof?` | ADDITIVE. The structural property that made this item a candidate, so the OWNING scanner's revalidator can re-prove it rather than trust the scan. nil for every scanner but `build_artifacts`. Never on any wire |
+| `scannedTargetIdentity` | `Identity?` | ADDITIVE. The (device, inode) the SCAN saw at the deletion target, so the owning scanner's revalidator can prove the object it opens IS the one that was scanned rather than whatever now answers to the name. nil for every scanner but `ephemeral_tmp`; a revalidator that requires it fails closed on nil. Never on any wire |
 | `key` | `ItemKey` | Computed composite identity |
 | `allocatedBytes` | `Int64` | COMPUTED component sum — display convenience only, never stored |
 
@@ -551,9 +553,25 @@ Two-surface rule: impediments attributable to an emitted item ride the item's
 `state`/`scanError`; only root/scanner-level problems with no recognized
 candidate land in `ScanOutcome.errors`. `Kind` is EXTENSIBLE — never write
 consumers that assume the case list is closed. Wire strings (frozen):
-`container_refused`, `symlink_root`, `tcc_denied`, `permission_denied`,
-`unreadable`, `malformed_outcome`. `.malformedOutcome` is synthesized ONLY by
-the runtime's validation, never by scanners.
+`container_refused`, `mounted_volume_root`, `policy_refused_root`,
+`symlink_root`, `non_directory_root`, `tcc_denied`,
+`permission_denied`,
+`unreadable`, `enumeration_truncated`, `config_invalid`, `malformed_outcome`. `.malformedOutcome` is
+synthesized ONLY by the runtime's validation, never by scanners.
+`mounted_volume_root` is a registered root with another volume mounted at
+it — NOT a refusal of the root, and clearable by unmounting (added PR #459
+review r11; the GUI's visible row label is derived from the kind alone, so
+reporting it as `container_refused` printed "not a configured search root"
+for a root that IS configured).
+`policy_refused_root` and `non_directory_root` (added PR #459 codex r13)
+close the two siblings of that same defect on `ephemeral_tmp`: a scanner
+builds its `PathGuard` from its own roots, so a root the policy refuses was
+configured and `container_refused`'s label was false for every firing; and
+`symlink_root`'s label ("symlinked — not searched") was false for a root
+replaced by a regular file, FIFO, socket or device.
+`config_invalid` was missing from this list while the binary could emit it
+(fixed in PR #459 review r2; `DocumentedContractTests` only reads
+PROTOCOL.md, which did list it, so nothing caught the drift).
 
 ### `SpaceScanner` (protocol)
 
@@ -562,14 +580,28 @@ protocol SpaceScanner: Sendable {
     var id: String { get }                       // stable slug, [a-z0-9_]+
     var displayName: String { get }
     var trustedContainerRoots: [URL] { get }     // declared at REGISTRATION
+    var preDeleteRevalidator: PreDeleteRevalidator? { get }  // default nil
+    func participates(in context: ScanContext) -> Bool       // default true
     func scan(context: ScanContext) async -> ScanOutcome
 }
 ```
 
+`preDeleteRevalidator` and `participates(in:)` carry protocol-extension
+defaults, so a scanner that wants neither implements neither.
+
+`participates(in:)` is how a scanner declines a whole session — never by
+returning an empty `ScanOutcome`, which asserts "I looked and there is nothing
+there" and makes the consumer replace the scanner's rows, issues and the user's
+selections. `SpaceScannerRuntime.scanValidatedSession` filters on it, so a
+declining scanner produces no task and no event at all: every caller of a
+session (the ViewModel, `CLIHandler.collectValidatedScan`, and any future one)
+gets the deferral without opting in.
+
 Adding a scanner = implement this + register with the runtime — nothing else:
 the runtime derives delete-time admission from registration. Conformers:
 `CategoryScanner` (id `categories`), `BuildArtifactsScanner`
-(id `build_artifacts`), `OrphanedCachesScanner` (id `orphaned_caches`).
+(id `build_artifacts`), `OrphanedCachesScanner` (id `orphaned_caches`),
+`EphemeralTempScanner` (id `ephemeral_tmp`).
 
 ### `ValidatedScannerEvent` / `SpaceScannerRegistrationError`
 
@@ -600,7 +632,8 @@ struct SpaceScannerRuntime {
     let trustedContainerRoots: [URL]  // union of scanner declarations
 
     init(scanners:categories:home:provider:) throws
-    static func production(home:provider:orphanedCachesThresholds:) -> SpaceScannerRuntime
+    static func production(home:provider:orphanedCachesThresholds:devRoots:
+                           ephemeralTempThresholds:) -> SpaceScannerRuntime
     func makeCleaner(snapshot: ContainerSnapshot? = nil,
                      trashHandler:) -> CacheCleaner
     func scanValidated(scannerIDs: Set<String>? = nil,
@@ -614,7 +647,7 @@ struct SpaceScannerRuntime {
 | Member | Description |
 |--------|-------------|
 | `init` | Registration + FOLDED validation as one check: scanner-id slug syntax, scanner-id uniqueness, category-slug syntax, and the combined category-slug/scanner-slug namespace collision check (covers the frozen `categories` id). Injectable for tests — registering a fixture scanner requires zero production edits |
-| `production()` | The production registry — the single place scanners are registered (`CategoryScanner` + `BuildArtifactsScanner` + `OrphanedCachesScanner` today). `orphanedCachesThresholds` threads the sweep's invocation-scoped config and `devRoots` the build-artifact roots (nil resolves defaults → UserDefaults) |
+| `production()` | The production registry — the single place scanners are registered (`CategoryScanner` + `BuildArtifactsScanner` + `OrphanedCachesScanner` + `EphemeralTempScanner`, in that order). `orphanedCachesThresholds` threads the sweep's invocation-scoped config, `devRoots` the build-artifact roots, and `ephemeralTempThresholds` the temp scanner's (nil resolves defaults → UserDefaults inside the factory). The temp scanner's ROOTS are not a parameter: `EphemeralTempRoots.resolve(provider:)` is the closed declaration |
 | `makeCleaner(snapshot:trashHandler:)` | Builds the `CacheCleaner` whose PathGuard container roots are the runtime union — delete-time container admission covers exactly what registration declared, never anything an item claims. `snapshot` is the producing scan session's `ContainerSnapshot` (`ValidatedScanSession.snapshot`); nil FAIL-CLOSES every `.removeItem` deletion (`container-unavailable`) — items must be cleaned with the session that produced them |
 | `scanValidatedSession(scannerIDs:context:)` | The scan-and-validate entry point returning one SESSION: the progressive validated event stream, the producer handle (`untilProducerFinishes()`), and the session's `ContainerSnapshot` — every registered container root's no-follow (device, inode), captured BEFORE any scanner task launches (absent roots omitted). Delete-time `.removeItem` admission is identity-bound to this snapshot |
 | `scanValidated(scannerIDs:context:)` | Thin wrapper over `scanValidatedSession` returning just the event stream. The scan `TaskGroup` and ALL validation live inside; each event is one scanner's validated outcome or its synthesized `malformedOutcome` issue, yielded in completion order. `scannerIDs` scopes to a scanner subset (nil = all); the context's `categoryFilter` gives category-granular scoping inside `CategoryScanner`. Consumers pick scope and consumption style, never validation |
@@ -650,6 +683,25 @@ zero churn to the category entries (scanning delegates to the existing
 | `item(from:rootRecords:)` (static) | The one place aggregate items are built: id = category slug, byte components/state/error/root records straight from the `ScanResult` — no re-measurement, no re-evaluation of `resolvedPaths` |
 | `declaredDisplayPath(of:)` (static) | The category's declared spelling for honest missing/unresolved presentation |
 
+### `EphemeralTempScanner`
+
+**Files:** `Sources/Cacheout/Scanner/EphemeralTempScanner.swift`,
+`Sources/Cacheout/Scanner/EphemeralTempRoots.swift`
+
+The `SpaceScanner` over the three ephemeral temp roots — one item per STALE
+first-level entry, `risk: .review`, `defaultSelected: false`,
+`automaticCleanEligible: false`, `action: .removeItem`.
+
+| Member | Description |
+|--------|-------------|
+| `registeredID` (static) | The scanner slug `ephemeral_tmp` — the CLI address prefix and the GUI section key |
+| `trustedContainerRoots` | The declared root spellings, fixed at REGISTRATION — what registration hands delete-time admission. One spelling per root, resolved once by `EphemeralTempRoots.resolve`: canonical parent chain, leaf left UNRESOLVED, so a root whose own leaf is a symlink is NOT canonical |
+| `participates(in:)` | Where the trigger policy lives: `true` only for `.userInitiated`. On `.automatic` the runtime leaves the scanner OUT of the session entirely — no task, no event, so previously displayed temp rows, their issues and the user's ticks all survive the refresh |
+| `scan(context:)` | Ignores `categoryFilter`. Repeats the trigger gate as defense in depth for a caller that constructs a scanner and bypasses the runtime; that arm returns an empty outcome, which is why it is a last resort and not the policy |
+| `preDeleteRevalidator` | Declared for EVERY temp item. Re-inspects the entry from one held descriptor immediately before deletion: it proves the object is the one the scan inspected (device+inode), refuses anything that is no longer a directory or regular file, re-checks staleness and the advisory lock, and re-checks ownership only under a `.worldWritable` root |
+| `EphemeralTempRoots.resolve(provider:confstrPath:)` | The closed 3-root declaration resolved once, returning `EphemeralTempRootsResolution { roots, issues }`: `/private/tmp` plus the `confstr(3)` temp/cache containers, trailing slash normalized, PARENT CHAIN canonicalized with the leaf left unresolved (a symlink standing at a container's own name must stay visible to the scanner's no-follow root gate, not be replaced by its destination — closed AT THE LEAF only; intermediate components are still resolved, a residual ARCHITECTURE.md records at measured scope). Real-directory spellings of one location de-dupe by inode identity of a fully canonical comparison key; a non-directory spelling that aliases one of them is DROPPED with a `symlinkRoot` issue rather than kept ahead of it, and the scanner rides those issues on every inspecting outcome. A failed lookup drops that root silently — never a hardcoded `/var/folders` guess |
+| `EphemeralTempSweepConfig` | Keys `cacheout.ephemeralTmp.ageDays` / `cacheout.ephemeralTmp.minSizeMB`, defaults 7 days / 10 MB, layered defaults → UserDefaults → CLI override; an invalid persisted value falls back WITHOUT being rewritten |
+
 ---
 
 ## Actors
@@ -664,7 +716,7 @@ Thread-safe scanner that discovers and measures cache categories in parallel.
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| `scanAll` | `func scanAll(_ categories: [CacheCategory]) async -> [ScanResult]` | Scan all categories concurrently. Returns results sorted by size descending. |
+| `scanAll` | `func scanAll(_ categories: [CacheCategory]) async -> [ScanResult]` | Scan all categories concurrently. Returns results sorted by size descending, ties broken by category slug ascending — a TOTAL order, so two scans of the same input never disagree (every missing and every empty category ties at 0 bytes). |
 | `scanCategory` | `func scanCategory(_ category: CacheCategory) async -> ScanResult` | Scan a single category. Admits each resolved root before sizing (refusal = scan error, never a walk); returns state, split components, and count. |
 
 Sizing is delegated to `DirectorySizer` (`Sources/Cacheout/Scanner/DirectorySizer.swift`) —

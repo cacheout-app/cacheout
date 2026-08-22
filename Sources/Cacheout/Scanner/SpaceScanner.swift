@@ -283,6 +283,24 @@ struct ReclaimableItem: Equatable, Sendable {
     /// travel on the item itself.
     let artifactProof: BuildArtifactProof?
 
+    /// ADDITIVE (PR #459 review r2) — the (device, inode) the SCAN saw at this
+    /// item's deletion target, so the owning scanner's delete-time revalidator
+    /// can prove the object it opens is THE OBJECT THAT WAS SCANNED rather
+    /// than whatever now answers to the same name.
+    ///
+    /// `nil` for every scanner that records none (every scanner but
+    /// `ephemeral_tmp` today) — absent, never a fake "same object". A
+    /// revalidator that treats it as REQUIRED must fail closed on `nil`; one
+    /// that ignores it is unaffected.
+    ///
+    /// The `artifactProof` precedent, one field-set later, and it rides the
+    /// ITEM for the same reason: a revalidator is a `Sendable` VALUE captured
+    /// at REGISTRATION, before any scan runs, so it can hold no per-item scan
+    /// state. Re-deriving it from the path at delete time is not a substitute
+    /// — the path is exactly what a replacement keeps. Not an authorization,
+    /// not a display surface, never on any wire.
+    let scannedTargetIdentity: FileSystemIdentityProvider.Identity?
+
     /// EXPLICIT memberwise initializer (fn-4.4): the additive fields above
     /// default, so no existing construction site changes — the
     /// `logicalBytes` additive precedent, one field-set later. Every stored
@@ -311,7 +329,8 @@ struct ReclaimableItem: Equatable, Sendable {
         isStale: Bool?,
         valuablesDisclosure: ValuablesDisclosure? = nil,
         requiresPreDeleteRevalidation: Bool = false,
-        artifactProof: BuildArtifactProof? = nil
+        artifactProof: BuildArtifactProof? = nil,
+        scannedTargetIdentity: FileSystemIdentityProvider.Identity? = nil
     ) {
         self.id = id
         self.scannerID = scannerID
@@ -336,6 +355,7 @@ struct ReclaimableItem: Equatable, Sendable {
         self.valuablesDisclosure = valuablesDisclosure
         self.requiresPreDeleteRevalidation = requiresPreDeleteRevalidation
         self.artifactProof = artifactProof
+        self.scannedTargetIdentity = scannedTargetIdentity
     }
 
     /// The composite cross-scanner identity.
@@ -361,15 +381,18 @@ struct ReclaimableItem: Equatable, Sendable {
             .joined()
     }
 
-    /// The ONE 30-day staleness threshold behind every item's `isStale`
-    /// field and the GUI's "Select Stale (30d+)" section action — inherited
-    /// VERBATIM from the retired `NodeModulesItem` (fn-4.7), which was its
-    /// only home while node_modules was the only per-item scanner. It lives
-    /// on the item model now because the field it decides does: a scanner
-    /// that dates its content maps days-since to this predicate, and one
-    /// threshold means the badge and the selection policy can never drift.
-    /// `nil` days (nothing dated) is NEVER stale — an unknown age must not
-    /// read as an old one.
+    /// The 30-day staleness predicate behind `build_artifacts`' `isStale`
+    /// field — inherited VERBATIM from the retired `NodeModulesItem`
+    /// (fn-4.7), which was its only home while node_modules was the only
+    /// per-item scanner. It is NOT the one threshold behind every `isStale`
+    /// (that sentence stood here and was false: the orphaned-caches scanner
+    /// sets the field from its own 60-day-default classifier tier and the
+    /// ephemeral-temp scanner from its own 7-day-default cutoff — neither calls
+    /// this). The GUI's "Select Stale" section action reads the BOOL, never
+    /// an age: staleness means "stale by the scanner that judged it", and
+    /// the per-item age lives in the row's evidence string. `nil` days
+    /// (nothing dated) is NEVER stale — an unknown age must not read as an
+    /// old one.
     static func isStale(daysSinceModified days: Int?) -> Bool {
         guard let days else { return false }
         return days > 30
@@ -378,10 +401,17 @@ struct ReclaimableItem: Equatable, Sendable {
 
 // MARK: - Scan outcome & issues
 
-/// A classified, non-fatal root/scanner-level problem that produced NO item.
+/// A classified, non-fatal root- or scanner-level problem, reported ALONGSIDE
+/// whatever the scan did produce rather than on an item.
+///
 /// Two-surface rule (epic contract): impediments attributable to an emitted
-/// item ride the item's `state`/`scanError`; only root/scanner-level
-/// problems with no recognized candidate land here.
+/// item ride the item's `state`/`scanError`; only root/scanner-level problems
+/// with no recognized candidate land here.
+///
+/// It does NOT mean "produced no item", which is what this comment used to say
+/// (corrected PR #459 review r2): `.configInvalid` reports an unparsable
+/// persisted value while the resolution falls back to the seeds, and those
+/// seeds produce items in the very same outcome.
 struct ScanIssue: Equatable, Sendable {
     /// EXTENSIBLE taxonomy (proven by `malformedOutcome`) — never write
     /// consumers that assume the case list is closed. Generalizes the
@@ -389,14 +419,87 @@ struct ScanIssue: Equatable, Sendable {
     enum Kind: Equatable, Sendable {
         /// `PathGuard.admitContainer` refused the search root.
         case containerRefused
-        /// The search root is a symlink (or not a real directory).
+        /// A REGISTERED search root that the kernel's mount table names as a
+        /// mount point: another volume stands at that path, so what is there
+        /// belongs to that volume and is not the root's own contents. The
+        /// root is NOT refused as a root — it is registered and admissible —
+        /// and the condition is CLEARABLE by the user: unmount, re-scan.
+        ///
+        /// Its own kind because the GUI's visible row label is derived from
+        /// the kind alone (`ScanIssueRowPresentation.label(for:)`), and
+        /// `.containerRefused`'s label — "not a configured search root" —
+        /// states the opposite of the truth here and names no remedy
+        /// (PR #459 codex r11, DISCLOSURE). A FILESYSTEM kind: `url` names
+        /// the over-mounted root.
+        case mountedVolumeRoot
+        /// A DECLARED root the kernel's mount table already named when the
+        /// runtime was CONSTRUCTED, so the root was never registered at all
+        /// (`EphemeralTempRoots.resolve`). Nothing under it is scanned, and
+        /// no item can claim it as an origin container.
+        ///
+        /// Its own kind, and not `.mountedVolumeRoot`, because the two
+        /// differ in the one thing a kind-derived label must get right — the
+        /// REMEDY (PR #459 codex r15, DISCLOSURE). `.mountedVolumeRoot` is
+        /// re-derived from a fresh table read on every scan, so its label's
+        /// "then re-scan" is true. This one is decided ONCE per runtime and
+        /// then replayed onto every inspecting outcome from stored
+        /// `resolutionIssues`, so a re-scan can never clear it however many
+        /// times the user unmounts and retries; only re-running construction
+        /// can (relaunching the app, or a fresh CLI invocation). A
+        /// FILESYSTEM kind: `url` names the over-mounted root.
+        case mountedVolumeRootAtRegistration
+        /// A REGISTERED search root that this scanner's own `PathGuard`
+        /// refused as a search root — `/`, a volume root, or `$HOME` in any
+        /// spelling. The root IS one of the guard's `containerRoots` (a
+        /// scanner constructs its guard FROM its own roots), so the refusal
+        /// is a POLICY verdict, never a "you did not configure this".
+        ///
+        /// Its own kind for the same reason `.mountedVolumeRoot` is
+        /// (PR #459 codex r13, DISCLOSURE): the GUI's visible row label is
+        /// derived from the kind alone, and `.containerRefused`'s label —
+        /// "not a configured search root" — is false for every firing of
+        /// this arm. WHICH policy clause refused it rides `detail`; no
+        /// remedy is claimed in the label because the causes do not share
+        /// one. A FILESYSTEM kind: `url` names the refused root.
+        case policyRefusedRoot
+        /// The search root is a SYMLINK — and only a symlink. Its target may
+        /// sit anywhere, so the no-follow root gate never traverses it.
+        ///
+        /// NARROWED in PR #459 codex r13 (DISCLOSURE): this kind's single GUI
+        /// label is the fixed sentence "symlinked — not searched", so a root
+        /// that is a regular file, FIFO, socket or device must NOT arrive
+        /// here — it carries `.nonDirectoryRoot` instead.
         case symlinkRoot
+        /// The search root exists and is NOT a symlink, but is not a
+        /// directory either: a regular file, FIFO, socket or device stands
+        /// where a directory is required, so nothing is traversed.
+        ///
+        /// Split out of `.symlinkRoot` in PR #459 codex r13 (DISCLOSURE):
+        /// the visible row is derived from the kind alone, so these objects
+        /// were all being diagnosed as "symlinked" while the object's real
+        /// kind reached the user only through `detail`'s hover tooltip. A
+        /// FILESYSTEM kind: `url` names the root.
+        case nonDirectoryRoot
         /// macOS TCC (privacy) denial — EPERM under the Cocoa error.
         case tccDenied
         /// BSD permission denial — EACCES.
         case permissionDenied
         /// Enumeration or metadata failure that is not a permission problem.
         case unreadable
+        /// A root's inspection hit an ENTRY CAP: everything listed is real,
+        /// but MORE remained uninspected (PR #459 review r4, codex C3 — the
+        /// bound that keeps a world-writable root's population from stalling
+        /// the scan). A FILESYSTEM kind: `url` names the truncated root.
+        /// TWO caps reach it in the ephemeral-temp scanner — the first-level
+        /// listing's, and the shared pre-filter allowance its candidates spend
+        /// (PR #459 codex r16) — and the label below is true of both.
+        ///
+        /// A cap hit ONLY (narrowed in PR #459 review r7, codex C2). A
+        /// listing that stopped because the READ failed is a denial and
+        /// carries `.unreadable` instead — this kind's single GUI label is
+        /// the fixed sentence "too many entries — partially inspected", so
+        /// admitting any other cause here would make that label a lie.
+        case enumerationTruncated
         /// A PERSISTED configuration value this build cannot parse (fn-4,
         /// R8/R16 — e.g. a `devRoots` array whose shape is invalid). The
         /// scanner fell back to its defaults WITHOUT rewriting the stored
@@ -421,10 +524,16 @@ struct ScanIssue: Equatable, Sendable {
         var wireString: String {
             switch self {
             case .containerRefused: return "container_refused"
+            case .mountedVolumeRoot: return "mounted_volume_root"
+            case .mountedVolumeRootAtRegistration:
+                return "mounted_volume_root_at_registration"
+            case .policyRefusedRoot: return "policy_refused_root"
             case .symlinkRoot: return "symlink_root"
+            case .nonDirectoryRoot: return "non_directory_root"
             case .tccDenied: return "tcc_denied"
             case .permissionDenied: return "permission_denied"
             case .unreadable: return "unreadable"
+            case .enumerationTruncated: return "enumeration_truncated"
             case .configInvalid: return "config_invalid"
             case .malformedOutcome: return "malformed_outcome"
             }
@@ -478,11 +587,25 @@ enum PreDeleteInspectedObject: Equatable, Sendable {
     /// A real directory was opened and walked; this is the `fstat` identity
     /// of the descriptor the whole walk was anchored to.
     case directory(FileSystemIdentityProvider.Identity)
+    /// A NON-directory leaf (regular file, or a link the producer chose to
+    /// verify) was opened and inspected; this is the `fstat` identity of the
+    /// descriptor the inspection held. The disposal must prove the leaf it
+    /// destroys IS this object — `DepthSafeRemoval`'s `ENOTDIR` arm compares
+    /// an `fstatat` under the proved parent, and `TrashDisposal` binds the
+    /// same facts on both sides of the move (PR #459 review r5: the file arm
+    /// of the temp revalidator verified exactly this identity and then
+    /// discarded it into `.noDirectoryTree`, so a replacement landing after
+    /// the re-check was destroyed on both arms with success reported).
+    case nonDirectoryLeaf(FileSystemIdentityProvider.Identity)
     /// The root open reported `ENOENT`/`ENOTDIR`: there is no directory TREE
     /// of ours at that name — absent, symlink, regular file, special file —
     /// and deletion removes the leaf as-is. The clean verdict is about the
     /// ABSENCE of a tree, so a directory appearing at that name since voids it
-    /// just as surely as a swapped inode.
+    /// just as surely as a swapped inode. A producer that HOLDS the leaf's
+    /// identity must say `.nonDirectoryLeaf` instead; this case is for the
+    /// probe whose root open FAILED and therefore never had an identity to
+    /// carry (`OrphanedCachesScanner`), and it keeps that probe's disclosed
+    /// residual: any non-directory at the name satisfies it.
     case noDirectoryTree
     /// Nothing was established: either the inspection refused before it could
     /// bind anything, or this revalidator has no object binding to offer at
@@ -604,6 +727,38 @@ protocol SpaceScanner: Sendable {
     /// injected into the cleaner's constructor; never read off items, never
     /// global state.
     var preDeleteRevalidator: PreDeleteRevalidator? { get }
+    /// Does this scanner RUN AT ALL in a session with this context? —
+    /// DEFAULT TRUE, so a scanner that always runs changes zero lines.
+    ///
+    /// LOAD-BEARING DISTINCTION, and the reason this member exists at all
+    /// (PR #459 review r1): returning `false` means THIS SCANNER WAS NOT RUN,
+    /// which is materially different from returning an empty `ScanOutcome`.
+    /// `ScanOutcome` has exactly `items` + `errors`, so an empty one is
+    /// indistinguishable on the wire from "I looked at every root and there
+    /// is nothing there" — and the consumer treats it as exactly that:
+    /// `CacheoutViewModel.reconcile` REPLACES the scanner's whole entry, so
+    /// the prior items vanish, the prior issues vanish with them, and
+    /// `pruneVanishedSelections` then drops the user's ticks because their
+    /// keys are no longer live.
+    ///
+    /// A scanner that declines a trigger must therefore say so HERE rather
+    /// than by returning empty from `scan`. Non-participation reuses the
+    /// existing session-subset machinery: `reconcile` never sees an entry for
+    /// it, its prior outcome and the user's selections survive, and the R9
+    /// freshness gate (`isBlockedFromDestructivePaths`) makes those retained
+    /// rows visible-but-non-cleanable until the scanner succeeds in a later
+    /// completed session.
+    ///
+    /// WHERE IT IS ENFORCED, named exactly (PR #459 review r2 — the previous
+    /// wording said "the runtime never invokes the scanner" while the runtime
+    /// did not consult this member at all, and the only enforcement in the
+    /// repo was `CacheoutViewModel.scan`): `scanValidatedSession` filters on
+    /// `scannerIDs` AND on this predicate, so EVERY caller of the session —
+    /// the ViewModel, `CLIHandler.collectValidatedScan`, and any future one —
+    /// gets the deferral without opting in. A scanner may still keep its own
+    /// guard inside `scan` for a caller that bypasses the runtime entirely;
+    /// that is defense in depth, not the enforcement point.
+    func participates(in context: ScanContext) -> Bool
     func scan(context: ScanContext) async -> ScanOutcome
 }
 
@@ -611,6 +766,10 @@ extension SpaceScanner {
     /// The default: no delete-time revalidation. Every scanner that existed
     /// before fn-4.8 inherits this unchanged.
     var preDeleteRevalidator: PreDeleteRevalidator? { nil }
+
+    /// The default: every session, every trigger. Every scanner that existed
+    /// before this member inherits it unchanged.
+    func participates(in context: ScanContext) -> Bool { true }
 }
 
 // MARK: - Runtime
@@ -630,13 +789,15 @@ enum ValidatedScannerEvent: Sendable {
 /// The producer is private — a consumer can WAIT for it, never steer it
 /// (stream termination remains the one cancellation path).
 struct ValidatedScanSession {
-    /// The session's container-identity snapshot (fn-3.4, R9): every
-    /// REGISTERED container root's no-follow (device, inode), captured
-    /// BEFORE any scanner task launched — so anything swapped DURING the
-    /// scan already mismatches at delete time. Cleaning this session's
-    /// items must go through `makeCleaner(snapshot:)` with THIS snapshot;
-    /// capture is part of the session on purpose (a consumer cannot
-    /// misorder it), and absent roots are omitted (fail-closed downstream).
+    /// The session's container-identity snapshot (fn-3.4, R9): the no-follow
+    /// (device, inode) of each container root this session's PARTICIPATING
+    /// scanners can reach (`sessionContainerRoots`, PR #459 codex r16 —
+    /// before that it was every registered root), captured BEFORE any
+    /// scanner task launched — so anything swapped DURING the scan already
+    /// mismatches at delete time. Cleaning this session's items must go
+    /// through `makeCleaner(snapshot:)` with THIS snapshot; capture is part
+    /// of the session on purpose (a consumer cannot misorder it), and absent
+    /// roots are omitted (fail-closed downstream).
     let snapshot: ContainerSnapshot
     /// Progressive validated events — the identical frozen contract
     /// `scanValidated` returns (that API is now a thin wrapper over this).
@@ -695,6 +856,13 @@ struct SpaceScannerRuntime {
     /// PRODUCING scanner's own declaration through this map, never the
     /// union.
     private let declaredContainerRoots: [String: [URL]]
+
+    /// DECLARED path -> canonical path, for every root any scanner declared
+    /// (union survivors and alias-suppressed drops alike), captured at
+    /// registration from `suppressingAliasShadows`' single probe pass.
+    /// Read ONLY by `sessionContainerRoots`, which uses it to decide the
+    /// snapshot's capture set without a session-time realpath.
+    private let containerRootCanonicalKeys: [String: String]
 
     /// The AUTHORITATIVE category registry, keyed by slug — registered at
     /// composition time alongside the scanners. Category-backed items are
@@ -778,8 +946,9 @@ struct SpaceScannerRuntime {
 
         self.scanners = scanners
         self.registeredCategories = registered
-        self.trustedContainerRoots = union
+        self.trustedContainerRoots = union.roots
         self.declaredContainerRoots = declared
+        self.containerRootCanonicalKeys = union.canonicalKeys
         self.preDeleteRevalidators = revalidators
         self.home = home
         self.provider = provider
@@ -837,7 +1006,7 @@ struct SpaceScannerRuntime {
     /// covering root is a dev root as well).
     private static func suppressingAliasShadows(
         in roots: [URL], provider: FileSystemIdentityProvider
-    ) -> [URL] {
+    ) -> (roots: [URL], canonicalKeys: [String: String]) {
         // Probed ONCE per root: the canonical comparison KEY, and whether the
         // DECLARED spelling is itself a real directory (leaf lstat no-follow)
         // — the same probe pair, with the same meaning, as fn-4.1's dev-root
@@ -854,9 +1023,27 @@ struct SpaceScannerRuntime {
         // pass the reality gate, so neither shadows the other, and dropping
         // either would change which declared spelling the identity binding
         // keys off for no safety gain.
-        return probed
-            .filter { $0.isDirectory || !coveredByRealDirectory.contains($0.key) }
-            .map(\.declared)
+        return (
+            roots: probed
+                .filter { $0.isDirectory || !coveredByRealDirectory.contains($0.key) }
+                .map(\.declared),
+            // THE SAME PROBE'S KEYS, carried out rather than recomputed (PR
+            // #459 codex r16). `sessionContainerRoots` needs to know which
+            // union entries a participating scanner's declared root can
+            // MATCH, and matching is by canonical identity
+            // (`PathGuard.matchConfiguredRoot`, PathGuard.swift:462-469), not
+            // by spelling. Re-canonicalizing at session time would pay this
+            // construction's realpath bill again — per session, per trigger,
+            // on exactly the roots the participation gate exists to leave
+            // alone. Keyed by DECLARED path and kept for every declared root
+            // including the ones dropped above: a participating scanner whose
+            // own spelling was suppressed still reaches the covering entry
+            // through this map.
+            canonicalKeys: Dictionary(
+                probed.map { ($0.declared.path, $0.key) },
+                uniquingKeysWith: { first, _ in first }
+            )
+        )
     }
 
     /// The production registry — the single place scanners are registered.
@@ -900,11 +1087,62 @@ struct SpaceScannerRuntime {
     ///   roots (and the walker's roots); `issues` ride EVERY scan outcome,
     ///   so a policy-rejected persisted root stays visible while never
     ///   registering or walking (R16).
+    /// - Parameter ephemeralTempThresholds: the ephemeral temp scanner's size
+    ///   floor + stale age (fn-6, R7). `nil` — the GUI's composition —
+    ///   resolves defaults → UserDefaults HERE, exactly like
+    ///   `orphanedCachesThresholds`; the CLI passes an invocation-scoped
+    ///   layering that folds in its `--tmp-*` flags (never persisted).
+    ///   Construction state by frozen contract: thresholds do not ride
+    ///   `ScanContext`.
+    /// - Parameter ephemeralTempRoots: fn-6.1's `{roots, issues}` resolution.
+    ///   `nil` — every shipped composition, GUI and CLI alike — calls
+    ///   `EphemeralTempRoots.resolve(provider:)` here; `roots` become the
+    ///   scanner's declared `trustedContainerRoots` and `issues` ride every
+    ///   inspecting scan's outcome, so a spelling resolution DROPPED stays
+    ///   visible without being registered or walked.
+    ///
+    ///   The parameter shape is copied from `devRoots:` above — an optional
+    ///   whole resolution, defaulted `nil`, `??`-resolved at this site. Two
+    ///   differences, both real, and each anchor below was re-opened in PR
+    ///   #459 codex r10 (the previous wording cited the FORWARDER'S OWN
+    ///   parameter and its pass-through as if they were callers, and omitted
+    ///   the GUI entirely). First: `devRoots` is passed NON-NIL by both
+    ///   shipped surfaces — the GUI unconditionally
+    ///   (`CacheoutViewModel.swift:489`, a non-optional `DevRootsResolution`)
+    ///   and the CLI whenever `--dev-root` is given
+    ///   (`CLIHandler.swift:206` and `:220`, through the forwarder whose own
+    ///   parameter is declared at `:427` and passed through at `:433`) —
+    ///   whereas nothing outside the test suite passes `ephemeralTempRoots:`:
+    ///   confstr(3) is the only production source, and there is no persisted
+    ///   store and no CLI flag behind it. Second: `DevRootsResolution`
+    ///   carries bare `[URL]` roots while this carries `[EphemeralTempRoot]`
+    ///   records.
+    /// - Parameter ephemeralTempConfstrPath: the `confstr(3)` seam the `nil`
+    ///   arm of `ephemeralTempRoots:` resolves THROUGH (fn-6.1). Defaulted to
+    ///   the real `confstr(3)`, so every shipped caller is unchanged.
+    ///
+    ///   It exists because of D4 (PR #459 codex r10): the `nil` arm is the
+    ///   one BOTH shipped compositions take — neither
+    ///   `CacheoutViewModel.production` (`CacheoutViewModel.swift:483-499`)
+    ///   nor `CLIHandler.CLIRuntimeDependencies.production`
+    ///   (`CLIHandler.swift:426-438`) passes `ephemeralTempRoots:` — and its
+    ///   `issues` half was UNEVIDENCED: replacing this site with a version
+    ///   that kept `roots` and dropped `issues` left the whole suite green at
+    ///   1172/2/0, because the live `resolve()` on the test host produces
+    ///   `issues == []` and the `ephemeralTempRoots:` seam bypasses this arm
+    ///   entirely. Stubbing confstr(3) — and NOTHING else; the symlink, the
+    ///   probing and the drop are all real — is what lets a cell drive the
+    ///   production arm into producing a `.symlinkRoot` drop and assert it
+    ///   arrives.
     static func production(
         home: URL = FileManager.default.homeDirectoryForCurrentUser,
         provider: FileSystemIdentityProvider = FileSystemIdentityProvider(),
         orphanedCachesThresholds: OrphanedCacheClassifier.Thresholds? = nil,
-        devRoots: DevRootsResolution? = nil
+        devRoots: DevRootsResolution? = nil,
+        ephemeralTempRoots: EphemeralTempRootsResolution? = nil,
+        ephemeralTempConfstrPath: EphemeralTempRoots.ConfstrResolver =
+            EphemeralTempRoots.confstrPath(_:),
+        ephemeralTempThresholds: EphemeralTempSweepConfig.Thresholds? = nil
     ) -> SpaceScannerRuntime {
         let categories = CacheCategory.allCategories
         let categoryScanner = CategoryScanner(
@@ -929,9 +1167,29 @@ struct SpaceScannerRuntime {
                 ?? OrphanedCachesSweepConfig.resolvedThresholds(),
             installedAppStatus: { installedAppResolver.status(ofBundleID: $0) }
         )
+        // fn-6: registration is the ONLY admission-widening lever — declaring
+        // the resolved temp roots here is what puts them in the session
+        // snapshot and in delete-time container admission. A root that
+        // confstr could not resolve is simply absent from the set (never a
+        // hardcoded `/var/folders` guess), and the scanner defers entirely on
+        // `.automatic` triggers, so registering it costs a background scan
+        // nothing.
+        let resolvedTempRoots = ephemeralTempRoots
+            ?? EphemeralTempRoots.resolve(
+                provider: provider, confstrPath: ephemeralTempConfstrPath
+            )
+        let ephemeralTempScanner = EphemeralTempScanner(
+            roots: resolvedTempRoots.roots,
+            resolutionIssues: resolvedTempRoots.issues,
+            home: home,
+            thresholds: ephemeralTempThresholds
+                ?? EphemeralTempSweepConfig.resolvedThresholds(),
+            provider: provider
+        )
         return try! SpaceScannerRuntime(
             scanners: [
                 categoryScanner, buildArtifactsScanner, orphanedCachesScanner,
+                ephemeralTempScanner,
             ],
             categories: categories,
             home: home,
@@ -1660,6 +1918,75 @@ struct SpaceScannerRuntime {
 
     // MARK: Validated-scan entry point
 
+    /// The union roots a session whose participating scanners are `selected`
+    /// must snapshot — the capture set of `ContainerSnapshot.capture` (PR
+    /// #459 codex r16, AVAILABILITY).
+    ///
+    /// WHY IT IS NOT THE WHOLE UNION. Capture costs one `lstat` per captured
+    /// root, and an `lstat` OF a root is first contact with whatever is
+    /// mounted there. Capturing every REGISTERED root meant an `.automatic`
+    /// refresh still touched `/private/tmp` and both per-user temp roots
+    /// after `participates(in:)` had already decided the temp scanner would
+    /// not run — the scanner's explicit-only contract stopped the task, the
+    /// event and the item, and left the filesystem access. A scanner-subset
+    /// session touched roots the caller never asked about the same way. The
+    /// mount-table preflight inside `capture` skips a root the table NAMES,
+    /// so what remains is the racing case (a mount landing after that read)
+    /// — small, but paid on every trigger for a scanner that will not run.
+    ///
+    /// WHY IT CANNOT STRAND A LATER CLEAN. Omission from the snapshot is
+    /// fail-closed: `PathGuard.admitContainer` refuses a root it cannot find
+    /// there (PathGuard.swift:400-403). Both consumers already refuse the
+    /// same items for an independent reason:
+    ///
+    /// - the ViewModel gates every destructive path on the scanner's
+    ///   outcome generation equalling the ADOPTED one
+    ///   (`isBlockedFromDestructivePaths`, CacheoutViewModel.swift:588-592).
+    ///   A non-participating scanner delivers no event, so its retained rows
+    ///   keep the older generation while adoption moves on
+    ///   (CacheoutViewModel.swift:1465-1466) — they are already
+    ///   visible-but-non-cleanable before this filter sees them;
+    /// - the CLI resolves the items it cleans FROM the same collected
+    ///   session (CLIHandler.swift:2123 and :2442 pass that session's
+    ///   snapshot), so it can only ever hold items a participating scanner
+    ///   produced.
+    ///
+    /// And a participating scanner's own items are covered exactly, because
+    /// scan-time validation binds every container item's origin claim to the
+    /// PRODUCING scanner's declared roots (`structuralViolation`'s ORIGIN
+    /// BINDING arm, in this file).
+    ///
+    /// WHY CANONICAL KEYS AND NOT JUST PATHS. Delete-time root matching is by
+    /// canonical identity over the whole union, returning the FIRST match
+    /// (PathGuard.swift:462-469), and the snapshot is keyed by THAT root's
+    /// declared spelling. So a participating scanner's claim can legitimately
+    /// key off a union entry only a NON-participating scanner declared — an
+    /// alias spelling of the same location, including the case where the
+    /// participating scanner's own spelling was dropped by
+    /// `suppressingAliasShadows`. Filtering by declared path alone would have
+    /// turned those admissions into `containerUnavailable`; the registration
+    /// -captured `containerRootCanonicalKeys` pull the covering entry in
+    /// without a session-time realpath.
+    private func sessionContainerRoots(
+        for selected: [any SpaceScanner]
+    ) -> [URL] {
+        let declaredPaths = Set(
+            selected
+                .flatMap { declaredContainerRoots[$0.id] ?? [] }
+                .map(\.path)
+        )
+        let reachableKeys = Set(
+            declaredPaths.compactMap { containerRootCanonicalKeys[$0] }
+        )
+        return trustedContainerRoots.filter { root in
+            if declaredPaths.contains(root.path) { return true }
+            guard let key = containerRootCanonicalKeys[root.path] else {
+                return false
+            }
+            return reachableKeys.contains(key)
+        }
+    }
+
     /// The ONE scan-and-validate API (epic rounds 8-10, FROZEN shape): a
     /// progressive validated EVENT STREAM — each event is one scanner's
     /// validated outcome or its synthesized `malformedOutcome` issue. The
@@ -1694,19 +2021,36 @@ struct SpaceScannerRuntime {
         scannerIDs: Set<String>? = nil,
         context: ScanContext
     ) -> ValidatedScanSession {
-        // Container-identity capture is PART OF the session (fn-3.4, R9 —
-        // a consumer cannot misorder it): every REGISTERED root, before
-        // any scanner task launches, so a container swapped mid-scan
-        // mismatches at delete time. ALL registered roots on purpose, even
-        // under a scanner subset — capture is cheap (one lstat per root)
-        // and a subset-blind snapshot can never pair a root with the wrong
-        // session.
-        let snapshot = ContainerSnapshot.capture(
-            roots: trustedContainerRoots, provider: provider
-        )
+        // TWO independent filters, and the second is the PROTOCOL's rather
+        // than the caller's (PR #459 review r2). `scannerIDs` is what the
+        // caller asked for; `participates(in:)` is what the scanner will
+        // answer to. Until this round the participation contract was
+        // documented as "the runtime never invokes the scanner" while the ONLY
+        // enforcement point in the repo was `CacheoutViewModel.scan` — so
+        // `CLIHandler.collectValidatedScan`, which calls this method directly,
+        // WOULD have invoked a declining scanner. Latent only because every
+        // CLI `ScanContext` is `.userInitiated` today; a contract enforced by
+        // one of its two callers is not enforced.
+        //
+        // A declining scanner is simply absent from the session: no task, no
+        // event, and so no `.outcome` a consumer could read as "I looked at
+        // every root and there is nothing there".
+        //
+        // DERIVED BEFORE THE CAPTURE BELOW, and that ordering is the point
+        // (PR #459 codex r16, AVAILABILITY) — see `sessionContainerRoots`.
         let selected = scanners.filter { scanner in
-            scannerIDs?.contains(scanner.id) ?? true
+            (scannerIDs?.contains(scanner.id) ?? true)
+                && scanner.participates(in: context)
         }
+        // Container-identity capture is PART OF the session (fn-3.4, R9 —
+        // a consumer cannot misorder it): before any scanner task launches,
+        // so a container swapped mid-scan mismatches at delete time. A root
+        // the kernel table names as a mount point is skipped WITHOUT the
+        // lstat (PR #459 review r6 codex C2 — that lstat is first contact
+        // with the mounted filesystem).
+        let snapshot = ContainerSnapshot.capture(
+            roots: sessionContainerRoots(for: selected), provider: provider
+        )
         let registeredCategories = self.registeredCategories
         let declaredContainerRoots = self.declaredContainerRoots
         let preDeleteRevalidators = self.preDeleteRevalidators

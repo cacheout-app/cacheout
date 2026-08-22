@@ -496,10 +496,36 @@ final class SpaceScannerIntegrationTests: XCTestCase {
         )
     }
 
-    /// Every PER-ITEM scanner of a runtime (the aggregate adapter excluded).
+    /// Every PER-ITEM scanner of a runtime that this fixture may drive (the
+    /// aggregate adapter excluded, and `ephemeral_tmp` with it): fn-6.4
+    /// registers the temp scanner over the machine's REAL confstr roots
+    /// (`/private/tmp`, `…/T`, `…/C`), so including it here would walk live
+    /// system state — neither hermetic nor fast. Its registration is asserted
+    /// structurally, and its scan/clean behavior over INJECTED fixture roots
+    /// lives in `EphemeralTempRegistrationTests`.
+    ///
+    /// THE SECOND, LOAD-BEARING HALF THE RATIONALE ABOVE OMITTED (PR #459
+    /// review r1): hermeticity is not the only obstacle, and un-excluding the
+    /// temp scanner would NOT restore a registry-wide invariant here. This
+    /// fixture's `base` is `fm.temporaryDirectory` — i.e. INSIDE the `…/T`
+    /// root — while `ephemeral_tmp` emits FIRST-LEVEL entries only and the
+    /// fixture tree sits several levels below; the fixture is also seconds
+    /// old, so the 7-day age gate would emit nothing regardless. The
+    /// cross-scanner listing question is therefore not answerable in this
+    /// file at all. It is answered in `EphemeralTempRegistrationTests`, over
+    /// injected fixture roots, by `testTwoScannersOverOneRootPublishTheSame
+    /// DirectoryTwice` — which is the CHARACTERIZATION, not a refusal: there
+    /// is no cross-scanner de-duplication anywhere, and round 1's attempt to
+    /// create one at root granularity was reverted in review r2 (it discarded
+    /// the entire build-artifacts walk of the colliding root). The
+    /// `~/Library/Caches` instance of the same class is pinned there too, by
+    /// `testTwoScannersOverOneCachesRootPublishTheSameDirectoryTwice`.
     private func perItemScannerIDs(_ runtime: SpaceScannerRuntime) -> Set<String> {
         Set(runtime.scanners.map(\.id))
-            .subtracting([CategoryScanner.registeredID])
+            .subtracting([
+                CategoryScanner.registeredID,
+                EphemeralTempScanner.registeredID,
+            ])
     }
 
     /// One validated scan of the given scanner subset, collected per scanner
@@ -529,10 +555,18 @@ final class SpaceScannerIntegrationTests: XCTestCase {
 
     /// THE SWAP, proven in ONE run: `build_artifacts` is registered and
     /// addressable, `node_modules` is neither, and the one fixture
-    /// node_modules tree is listed EXACTLY once — under `build_artifacts`.
-    /// No commit exists in which both are registered (double-listing, D4) or
-    /// in which the legacy slug can still emit unmarked, non-revalidated
-    /// items for the same trees (an R17 bypass).
+    /// node_modules tree is listed EXACTLY once BY THE SCANNERS THIS FIXTURE
+    /// DRIVES — under `build_artifacts`. No commit exists in which both are
+    /// registered (double-listing, D4) or in which the legacy slug can still
+    /// emit unmarked, non-revalidated items for the same trees (an R17
+    /// bypass).
+    ///
+    /// SCOPE (PR #459 review r1): the exactly-once claim is proven over the
+    /// `build_artifacts`/`orphaned_caches` pair — `perItemScannerIDs`
+    /// subtracts `categories` and `ephemeral_tmp` from the four registered
+    /// scanners this test asserts below. It is NOT a registry-wide invariant,
+    /// and reading it as one is what left the `build_artifacts` ×
+    /// `ephemeral_tmp` collision untested until it was executed by hand.
     func testAtomicSwapRegistersBuildArtifactsAndRetiresTheNodeModulesSlug() async throws {
         let dev = base.appendingPathComponent("dev")
         let nodeModules = try makeMarkerProject(
@@ -552,6 +586,7 @@ final class SpaceScannerIntegrationTests: XCTestCase {
             CategoryScanner.registeredID,
             BuildArtifactsScanner.registeredID,
             OrphanedCachesScanner.registeredID,
+            EphemeralTempScanner.registeredID,
         ])
         XCTAssertFalse(
             runtime.scanners.contains { $0.id == retiredNodeModulesSlug },
@@ -568,8 +603,12 @@ final class SpaceScannerIntegrationTests: XCTestCase {
         let listedBy = scanned.outcomes.filter { _, outcome in
             outcome.items.contains { $0.url?.path == identityPath(nodeModules) }
         }.keys.sorted()
-        XCTAssertEqual(listedBy, [BuildArtifactsScanner.registeredID],
-                       "exactly one registered scanner lists the tree")
+        XCTAssertEqual(
+            listedBy, [BuildArtifactsScanner.registeredID],
+            "exactly one of the scanners this fixture DRIVES lists the tree "
+                + "— `categories` and `ephemeral_tmp` are excluded, see "
+                + "`perItemScannerIDs`; this is not a registry-wide claim"
+        )
         let buildItems = try XCTUnwrap(
             scanned.outcomes[BuildArtifactsScanner.registeredID]?.items
         )
@@ -730,10 +769,17 @@ final class SpaceScannerIntegrationTests: XCTestCase {
             "the rebuilt runtime walks BOTH configured roots"
         )
         // Still the production registry — the factory rebuilt the same
-        // composition, not a different one.
+        // composition, not a different one. (Every registered per-item
+        // scanner gets a section, whether or not this scan requested it:
+        // `ephemeral_tmp` is here with no items because only
+        // `build_artifacts` was scanned.)
         XCTAssertEqual(
             viewModel.perItemSections.map(\.scannerID),
-            [BuildArtifactsScanner.registeredID, OrphanedCachesScanner.registeredID]
+            [
+                BuildArtifactsScanner.registeredID,
+                OrphanedCachesScanner.registeredID,
+                EphemeralTempScanner.registeredID,
+            ]
         )
     }
 
@@ -809,10 +855,33 @@ final class SpaceScannerIntegrationTests: XCTestCase {
         // The union carries at most ONE spelling per canonical location, and
         // when any spelling is a real directory that is the one kept — an
         // unusable alias may never sit ahead of the root it shadows.
+        //
+        // Asserted as the PROPERTY rather than as a literal one-element list.
+        // The union legitimately grew when the ephemeral-temp scanner joined
+        // the registry (fn-6) and now also carries its temp roots; pinning the
+        // whole list would fail for the unrelated reason that another scanner
+        // registered, while checking the shadowing property no more closely
+        // than the three assertions below do.
+        let unionPaths = runtime.trustedContainerRoots.map(\.path)
+        XCTAssertTrue(
+            unionPaths.contains(caches.path),
+            "the sweep's REAL root survives in the union: \(unionPaths)"
+        )
+        XCTAssertFalse(
+            unionPaths.contains(alias.path),
+            "the unusable alias is suppressed from the runtime union: "
+                + "\(unionPaths)"
+        )
+        // The general form of "the alias does not shadow the root", and the
+        // half a one-element list could never state once the union has more
+        // than one member: NO canonical location appears twice under two
+        // spellings anywhere in the union.
+        let canonicalUnion = runtime.trustedContainerRoots.map {
+            provider.canonicalize($0).path
+        }
         XCTAssertEqual(
-            runtime.trustedContainerRoots.map(\.path),
-            [caches.path],
-            "the unusable alias is suppressed from the runtime union"
+            Set(canonicalUnion).count, canonicalUnion.count,
+            "exactly one spelling per canonical location: \(canonicalUnion)"
         )
 
         // The sweep's own origin claim must still admit — and clean.

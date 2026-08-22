@@ -1072,6 +1072,15 @@ actor CacheCleaner {
         switch inspected {
         case .directory(let identity):
             return provider.identity(of: target) == identity
+        case .nonDirectoryLeaf(let identity):
+            // Same comparison as the `.directory` arm — `identity(of:)` is
+            // an `lstat`, so a symlink compares as the LINK — and, like the
+            // whole method, this is the cheap early refusal, NOT the proof:
+            // the load-bearing bindings are the removal's `fstatat` under
+            // the proved parent and `TrashDisposal`'s two-sided leaf
+            // binding. `nil` (absent/unreadable) is not a match; the
+            // disposal's own arms produce the item-keyed error.
+            return provider.identity(of: target) == identity
         case .noDirectoryTree:
             // The clean verdict rested on there being no directory TREE of
             // ours at that name (absent, symlink, regular file, special) —
@@ -1567,9 +1576,40 @@ actor CacheCleaner {
 
         let entry = "[\(ISO8601DateFormatter.shared.string(from: Date()))] \(message)\n"
 
-        let fd = openat(dirFd, "cleanup.log", O_CREAT | O_WRONLY | O_APPEND | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        // THIS OPEN CANNOT CARRY `O_DIRECTORY` — it creates a regular file —
+        // so it is the WRITE-SIDE twin of the scanner's lock-probe hazard
+        // (PR #459 review r4, the third blocking-open site): `O_WRONLY` on a
+        // FIFO planted at this name blocks until a READER appears. Measured
+        // on this platform: the identical flag set without `O_NONBLOCK` did
+        // not return in 2s against `mkfifo`; every admission and refusal of a
+        // clean logs through here inside this actor, so that block wedges the
+        // clean and every later message to the actor. `O_NONBLOCK` splits the
+        // FIFO into two measured halves, and the flag alone covers only one:
+        //   - no reader: the open fails ENXIO, the `fd != -1` guard drops the
+        //     line — best-effort by design, like every earlier silent return
+        //     in this method;
+        //   - a reader present: the open SUCCEEDS (`fstat` reports `S_IFIFO`),
+        //     so without the kind gate below the log would stream into
+        //     someone else's pipe.
+        // A bound AF_UNIX socket never gets this far (the open fails
+        // EOPNOTSUPP, measured); a device node that opens is refused by the
+        // same kind gate. `O_NONBLOCK` changes nothing for the regular file
+        // this log actually is.
+        let fd = openat(
+            dirFd, "cleanup.log",
+            O_CREAT | O_WRONLY | O_APPEND | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK,
+            0o600
+        )
 
         guard fd != -1 else { return }
+
+        var status = stat()
+        guard fstat(fd, &status) == 0,
+              FileSystemIdentityProvider.fileKind(from: status) == .regularFile
+        else {
+            close(fd)
+            return
+        }
 
         let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
         let data = entry.data(using: .utf8) ?? Data()

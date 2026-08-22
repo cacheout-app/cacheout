@@ -432,6 +432,192 @@ final class DevRootsSettingsTests: XCTestCase {
                        "a BSD-permission denial has no System Settings remedy")
     }
 
+    /// AN OVER-MOUNTED ROOT SAYS SO, IN THE VISIBLE ROW (PR #459 codex r11,
+    /// P2 DISCLOSURE).
+    ///
+    /// `ScanIssuesBlock` renders `row.text` and relegates `issue.detail` to
+    /// a `.help` tooltip, so whatever the KIND maps to is the whole visible
+    /// diagnosis. Under `.containerRefused` this row read "not a configured
+    /// search root" — false for a root that is registered and admissible —
+    /// and named no remedy at all, while the true condition and the fix sat
+    /// in the hover text.
+    ///
+    /// The two kinds are asserted TOGETHER and must differ in both halves:
+    /// the mounted row states the condition AND its remedy, and the refusal
+    /// row is left exactly as it was, because `DevRootsStore` (a
+    /// policy-rejected persisted root) and `ProjectTreeWalker` (a scan-time
+    /// admission refusal) still render through it. `EphemeralTempScanner`'s
+    /// own `admitSearchRoot` catch was the THIRD such producer until PR #459
+    /// codex r13 moved it to `.policyRefusedRoot`; the cell below is that
+    /// half.
+    func testAMountedRootRowStatesTheConditionAndTheRemedyRefusalRowUnchanged() throws {
+        let root = URL(fileURLWithPath: "/private/tmp")
+        let mounted = ScanIssueRowPresentation(
+            issue: ScanIssue(
+                url: root, kind: .mountedVolumeRoot,
+                detail: "Shared temp is a mounted volume — not scanned; its "
+                    + "contents belong to that volume. "
+                    + EphemeralTempScanner.mountRemedy
+            ),
+            home: fixtureHome
+        )
+        XCTAssertEqual(mounted.location, "/private/tmp",
+                       "the row NAMES the over-mounted root")
+        XCTAssertEqual(
+            mounted.label, "mounted volume; eject or unmount it, then re-scan"
+        )
+        XCTAssertEqual(
+            mounted.text,
+            "/private/tmp — mounted volume; eject or unmount it, then re-scan",
+            "the VISIBLE line carries both the condition and the remedy"
+        )
+        XCTAssertFalse(
+            mounted.label.contains("not a configured search root"),
+            "the root IS configured — that sentence was the defect"
+        )
+        XCTAssertFalse(mounted.showsSettingsLink,
+                       "Full Disk Access cannot unmount a volume")
+
+        // The OTHER producers of `.containerRefused` are untouched: same
+        // kind, same fixed label as before this change.
+        let refusal = ScanIssueRowPresentation(
+            issue: ScanIssue(
+                url: root, kind: .containerRefused, detail: "refused: …"
+            ),
+            home: fixtureHome
+        )
+        XCTAssertEqual(refusal.label, "not a configured search root")
+        XCTAssertNotEqual(refusal.label, mounted.label,
+                          "two conditions, two sentences")
+
+        // ONE CONDITION, TWO REMEDIES (PR #459 codex r15). The mount can
+        // also be standing when the app STARTS, in which case fn-6.1 refuses
+        // the root before registering it — a verdict made once per runtime
+        // and replayed from stored resolution issues, so the row above's
+        // "then re-scan" would send the user round a loop that never clears
+        // it. Same condition, different kind, and the labels must differ in
+        // exactly that half.
+        let atRegistration = ScanIssueRowPresentation(
+            issue: ScanIssue(
+                url: root, kind: .mountedVolumeRootAtRegistration,
+                detail: "Shared temp is a mounted volume — the root was not "
+                    + "registered, so nothing under it is scanned; its "
+                    + "contents belong to that volume. "
+                    + EphemeralTempRoots.registrationMountRemedy
+            ),
+            home: fixtureHome
+        )
+        XCTAssertEqual(
+            atRegistration.label,
+            "mounted volume at launch; unmount it, then relaunch"
+        )
+        XCTAssertEqual(
+            atRegistration.text,
+            "/private/tmp — mounted volume at launch; unmount it, "
+                + "then relaunch"
+        )
+        XCTAssertFalse(
+            atRegistration.label.contains("re-scan"),
+            "a re-scan cannot clear a verdict made once per runtime"
+        )
+        XCTAssertNotEqual(atRegistration.label, mounted.label,
+                          "one condition, two remedies, two sentences")
+        XCTAssertFalse(atRegistration.showsSettingsLink,
+                       "Full Disk Access cannot unmount a volume")
+    }
+
+    /// THE SIBLINGS OF THAT SAME DEFECT (PR #459 codex r13, P2 DISCLOSURE) —
+    /// asserted on the SAME derivation, `ScanIssueRowPresentation`, which is
+    /// the whole visible diagnosis because `ScanIssuesBlock` renders
+    /// `row.text` and hangs `issue.detail` off `.help(…)`.
+    ///
+    /// Two kinds whose fixed label was untrue for a producer:
+    ///
+    /// - `.symlinkRoot` reads "symlinked — not searched", but
+    ///   `EphemeralTempScanner`'s no-follow root gate emitted it for EVERY
+    ///   non-directory — a regular file, FIFO, socket or device sent the
+    ///   user hunting for a link that is not there. Now `.nonDirectoryRoot`.
+    /// - `.containerRefused` reads "not a configured search root", but that
+    ///   scanner constructs its `PathGuard` with
+    ///   `containerRoots: roots.map(\.url)` and then iterates those same
+    ///   roots, so the root reaching its `admitSearchRoot` catch is ALWAYS
+    ///   configured. Now `.policyRefusedRoot`.
+    ///
+    /// Both halves are pinned in both directions: the new labels are exact,
+    /// and the two OLD kinds still render exactly what they rendered before
+    /// — `.symlinkRoot` is still produced by four other call sites
+    /// (`EphemeralTempRoots`, `DevRootsStore`, `ProjectTreeWalker`,
+    /// `OrphanedCachesScanner`) and `.containerRefused` by two
+    /// (`DevRootsStore`, `ProjectTreeWalker`).
+    func testNonDirectoryAndPolicyRefusedRootsGetTheirOwnVisibleSentences() throws {
+        let root = URL(fileURLWithPath: "/private/tmp")
+
+        let nonDirectory = ScanIssueRowPresentation(
+            issue: ScanIssue(
+                url: root, kind: .nonDirectoryRoot,
+                detail: "Shared temp is not a real directory (special file) "
+                    + "— never traversed"
+            ),
+            home: fixtureHome
+        )
+        XCTAssertEqual(nonDirectory.location, "/private/tmp",
+                       "the row NAMES the root")
+        XCTAssertEqual(nonDirectory.label, "not a directory — not searched")
+        XCTAssertEqual(
+            nonDirectory.text, "/private/tmp — not a directory — not searched"
+        )
+        XCTAssertFalse(
+            nonDirectory.label.contains("symlink"),
+            "a FIFO/socket/device/regular file is not a symlink — asserting "
+                + "one was the defect"
+        )
+        XCTAssertFalse(nonDirectory.showsSettingsLink,
+                       "Full Disk Access cannot turn a FIFO into a directory")
+
+        let policyRefused = ScanIssueRowPresentation(
+            issue: ScanIssue(
+                url: root, kind: .policyRefusedRoot,
+                detail: "Refusing to touch the home directory: /private/tmp"
+            ),
+            home: fixtureHome
+        )
+        XCTAssertEqual(policyRefused.location, "/private/tmp")
+        XCTAssertEqual(policyRefused.label,
+                       "refused by the search-root safety policy")
+        XCTAssertEqual(
+            policyRefused.text,
+            "/private/tmp — refused by the search-root safety policy"
+        )
+        XCTAssertFalse(
+            policyRefused.label.contains("not a configured search root"),
+            "the root IS configured — that sentence was the defect"
+        )
+        XCTAssertFalse(policyRefused.showsSettingsLink,
+                       "no settings link that cannot help")
+
+        // THE OTHER PRODUCERS ARE UNCHANGED: same kind, same fixed label as
+        // before this split, and each label distinct from its new sibling.
+        let symlink = ScanIssueRowPresentation(
+            issue: ScanIssue(
+                url: root, kind: .symlinkRoot, detail: "is a symlink"
+            ),
+            home: fixtureHome
+        )
+        XCTAssertEqual(symlink.label, "symlinked — not searched")
+        XCTAssertNotEqual(symlink.label, nonDirectory.label,
+                          "two conditions, two sentences")
+
+        let refused = ScanIssueRowPresentation(
+            issue: ScanIssue(
+                url: root, kind: .containerRefused, detail: "refused: …"
+            ),
+            home: fixtureHome
+        )
+        XCTAssertEqual(refused.label, "not a configured search root")
+        XCTAssertNotEqual(refused.label, policyRefused.label,
+                          "two conditions, two sentences")
+    }
+
     /// END TO END through the REAL scanner: a policy-rejected persisted root
     /// and a corrupt stored value both reach the GUI section as VISIBLE
     /// issue rows — never a zero-byte item row, never an empty section.

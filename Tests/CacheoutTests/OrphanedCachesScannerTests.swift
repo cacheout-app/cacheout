@@ -2463,8 +2463,45 @@ final class OrphanedCachesScannerTests: XCTestCase {
         guard getrlimit(RLIMIT_NOFILE, &original) == 0 else {
             throw XCTSkip("getrlimit failed")
         }
+
+        // MEASURED FROM WHAT THE PROCESS ALREADY HOLDS, never hardcoded.
+        //
+        // XCTest, dispatch and Swift Concurrency keep a drifting number of
+        // ANONYMOUS descriptors (sockets, pipes, kqueues — measured: not one
+        // of them has an `F_GETPATH`, so none is a leak of this walk's) that
+        // grows with the size of the suite. Measured at this test's entry:
+        // 93 before the fn-6 branch merged, 104–109 after, against the 96
+        // this test used to hardcode.
+        //
+        // Once that ambient count passes the ceiling, EVERY `open` fails
+        // before the walk takes a single step, and the wreckage is an exact
+        // impostor of the regression this test exists to catch — an
+        // obstruction set of `[.transientFailure]` and a descriptor peak of
+        // 0. A fixed ceiling therefore stops testing the walk at all, and
+        // does it by silently turning green into a false red.
+        //
+        // The criterion is a ceiling FAR BELOW THE TREE DEPTH, not a
+        // particular integer: the walk must read 500 levels while never
+        // holding more than a handful of handles. Measuring the live count
+        // and adding a small margin preserves that exactly, and makes the
+        // test independent of how many tests ran before it.
+        var liveDescriptors = 0
+        let scanBound = Int32(clamping: min(original.rlim_cur, 65536))
+        for fd in 0..<scanBound where fcntl(fd, F_GETFD) != -1 {
+            liveDescriptors += 1
+        }
+        let ceiling = liveDescriptors + 32
+        // Both halves of "lowered UNDER the depth" have to still be true, so
+        // neither is assumed: the ceiling must really be a reduction, and it
+        // must stay an order of magnitude under the 500 levels below it.
+        // Skipping beats asserting a criterion the environment has voided.
+        try XCTSkipUnless(
+            rlim_t(ceiling) < original.rlim_cur && ceiling < 500,
+            "ambient descriptor use (\(liveDescriptors)) leaves no room to "
+                + "lower the limit under a 500-deep tree"
+        )
         var lowered = original
-        lowered.rlim_cur = 96
+        lowered.rlim_cur = rlim_t(ceiling)
         guard setrlimit(RLIMIT_NOFILE, &lowered) == 0 else {
             throw XCTSkip("setrlimit failed: \(errno)")
         }

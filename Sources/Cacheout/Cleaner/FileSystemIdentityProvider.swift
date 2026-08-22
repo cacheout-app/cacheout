@@ -205,6 +205,46 @@ class FileSystemIdentityProvider {
         return mountedOn == url.path
     }
 
+    /// Every mount point on this machine, as the kernel spells it — the ONE
+    /// stall-free mount detector (PR #459 review r5, lifted from
+    /// `DepthSafeRemoval` so the scanner and the removal share a single
+    /// spelling).
+    ///
+    /// `getfsstat(MNT_NOWAIT)` reads the kernel's own mount table and touches
+    /// no filesystem. That property is load-bearing: `lstat(2)` or
+    /// `statfs(2)` OF a mount point cross INTO the mounted filesystem (the
+    /// getattr is served by the foreign fs), so on a hard-mounted
+    /// unresponsive volume they block in the kernel — a detector built on
+    /// them would hang exactly where it is needed. Only the table answers
+    /// without first contact.
+    ///
+    /// A buffer of our own rather than `getmntinfo`, which returns a pointer
+    /// to a STATIC buffer: scans and permanent deletions run concurrently.
+    ///
+    /// An INSTANCE method on purpose: it is the hermetic override point for
+    /// mount fixtures no real `hdiutil` volume backs (the same rule as every
+    /// other probe on this type).
+    func mountPointPaths() -> [String] {
+        let needed = getfsstat(nil, 0, MNT_NOWAIT)
+        guard needed > 0 else { return [] }
+        // Room for filesystems mounted between the two calls; anything past
+        // it is simply not seen by THIS read, and the callers' later guards
+        // still hold (the removal's per-child mount comparison; the
+        // scanner's candidate-device arm).
+        let capacity = Int(needed) + 8
+        let table = UnsafeMutablePointer<statfs>.allocate(capacity: capacity)
+        defer { table.deallocate() }
+        let got = getfsstat(
+            table, Int32(capacity * MemoryLayout<statfs>.stride), MNT_NOWAIT
+        )
+        guard got > 0 else { return [] }
+        return (0..<Int(got)).map { index in
+            withUnsafeBytes(of: &table[index].f_mntonname) { raw in
+                String(cString: raw.bindMemory(to: CChar.self).baseAddress!)
+            }
+        }
+    }
+
     /// Can this directory's ENTRIES be read — i.e. would a walk that reached
     /// it be able to enumerate what is inside?
     ///
@@ -262,6 +302,43 @@ class FileSystemIdentityProvider {
     final func kind(of url: URL) -> FileKind? {
         if case .kind(let kind) = probeKind(of: url) { return kind }
         return nil
+    }
+
+    // MARK: - Ownership (fn-6.2, epic D12 — override point for tests)
+
+    /// Errno-aware OWNERSHIP probe result. Deliberately NOT a `uid_t?`: a nil
+    /// would collapse three outcomes a caller must route differently —
+    /// absence (a benign race), a permission/IO failure (which has to stay
+    /// VISIBLE, per the app's no-silent-zero doctrine), and a genuinely
+    /// observed foreign owner. Mirrors `KindProbe`'s split exactly.
+    enum OwnerProbe: Equatable {
+        /// The owning uid actually read from the entry itself (no-follow).
+        case owner(uid_t)
+        /// ENOENT/ENOTDIR — the path simply is not there.
+        case absent
+        /// `lstat` failed for a reason other than absence (EACCES, EPERM, …).
+        case failed(errno: Int32)
+    }
+
+    /// `st_uid` of the object at `url` ITSELF (`lstat`, no-follow — a
+    /// symlink's owner is the link's, never its target's), with errno
+    /// retained on failure.
+    ///
+    /// Its one consumer today is the ephemeral-temp scanner's sticky-root
+    /// ownership gate (epic D12): under a world-writable temp root, another
+    /// user's entry is readable yet UNDELETABLE by sticky-directory rules, so
+    /// listing it would claim reclaimable bytes known false at scan time.
+    /// This is the override point for tests — a genuine cross-user fixture
+    /// cannot be created from a single uid.
+    func ownerProbe(of url: URL) -> OwnerProbe {
+        var st = stat()
+        guard lstat(url.path, &st) == 0 else {
+            let code = errno
+            return (code == ENOENT || code == ENOTDIR)
+                ? .absent
+                : .failed(errno: code)
+        }
+        return .owner(st.st_uid)
     }
 
     // MARK: - Descriptor-relative traversal (the no-path family)
@@ -421,6 +498,20 @@ class FileSystemIdentityProvider {
             device: UInt64(bitPattern: Int64(st.st_dev)),
             inode: UInt64(st.st_ino)
         )
+    }
+
+    /// `st_uid` of an OPEN descriptor — the descriptor-shaped twin of
+    /// `ownerProbe(of:)`, read from the object the caller is already holding
+    /// rather than from a path that can be re-pointed underneath it.
+    ///
+    /// `nil` when `fstat` fails on a descriptor we hold, which callers MUST
+    /// treat as unprovable (never as "ours"). Override point for the hermetic
+    /// foreign-ownership case: a real cross-uid fixture needs a second user
+    /// account, so injecting here is how that gate is exercised at all.
+    func ownerUID(ofDescriptor fd: Int32) -> UInt32? {
+        var st = stat()
+        guard fstat(fd, &st) == 0 else { return nil }
+        return st.st_uid
     }
 
     /// `fstatfs`/`fstat` of an OPEN descriptor → its mount identity. `nil`
@@ -601,6 +692,34 @@ class FileSystemIdentityProvider {
             return canonicalize(url)
         }
         return canonicalize(parent).appendingPathComponent(leaf)
+    }
+
+    // MARK: - Symlink content (read, never followed)
+
+    /// The LITERAL content of the symlink at `url` — one `readlink(2)`.
+    ///
+    /// The difference from `canonicalize`/`resolveTargetKeepingLeaf` is the
+    /// whole point: `readlink(2)` walks the link's ANCESTORS and then reads
+    /// the link's own data. It never names the destination, so it cannot
+    /// block on an unresponsive destination volume and cannot reach a
+    /// destination the process has no right to. What comes back is a
+    /// STRING — possibly relative, possibly non-canonical, possibly pointing
+    /// at nothing — and callers must treat it as such: turning it into a
+    /// canonical path is exactly the resolution this call exists to avoid.
+    ///
+    /// `nil` on every failure, including `EINVAL` for a path that is not a
+    /// symlink. Truncation is not a case: `symlink(2)` refuses a target
+    /// longer than `PATH_MAX - 1` (measured on this machine, Darwin 25.5: a
+    /// 2000-byte target is refused `ENAMETOOLONG` (63)), so a link the kernel
+    /// accepted always fits the buffer below.
+    func symlinkTarget(of url: URL) -> String? {
+        var buffer = [CChar](repeating: 0, count: Int(PATH_MAX))
+        // `readlink` does NOT NUL-terminate; one byte is held back so the
+        // terminator below is always in bounds.
+        let written = readlink(url.path, &buffer, buffer.count - 1)
+        guard written > 0 else { return nil }
+        buffer[written] = 0
+        return String(cString: buffer)
     }
 
     // MARK: - Location comparison

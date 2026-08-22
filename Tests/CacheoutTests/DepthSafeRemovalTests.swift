@@ -833,16 +833,23 @@ final class DepthSafeRemovalTests: XCTestCase {
     /// saw nothing, a file appeared, and it is unlinked with success
     /// reported.
     ///
-    /// WHAT CLOSES IT is a shape this file cannot introduce alone, because
-    /// the type is `PreDeleteInspectedObject` in `SpaceScanner.swift` and its
-    /// producer is `OrphanedCachesScanner.swift:1421`: split the case into an
-    /// ABSENCE (`case absent`) and an OBSERVED leaf carrying its identity
-    /// (`case nonDirectoryLeaf(FileSystemIdentityProvider.Identity)`, from
-    /// the `fstatat` the probe already has at hand), then both disposals bind
-    /// to the actual probe result — this one with `fstatat(parentFd, leaf,
-    /// AT_SYMLINK_NOFOLLOW)` before the `unlinkat`, and `TrashDisposal.prove`
-    /// with the sighting it already takes. Until then this is the honest
-    /// scope, and this test goes RED when the shape lands.
+    /// ITS REMAINING SCOPE (re-measured PR #459 review r5, when
+    /// `nonDirectoryLeaf(Identity)` landed): the identity-carrying case now
+    /// exists, `DepthSafeRemoval`'s `ENOTDIR` arm `fstatat`s the leaf against
+    /// it, and `TrashDisposal.dispose(_:expecting:…)` binds the same facts on
+    /// both sides of the move — so every producer that HOLDS a leaf identity
+    /// (`EphemeralTempScanner`'s revalidator, the case's only producer) is
+    /// closed, and the refusal is pinned by the four
+    /// `…AtTheDisposalIsRefused…` cells in `CacheCleanerTests`. What
+    /// this test pins is what REMAINS on `.noDirectoryTree`: its one
+    /// remaining producer is `OrphanedCachesScanner`'s probe arm whose root
+    /// open FAILED with `ENOENT`/`ENOTDIR` (the `rootDescriptor < 0` guard —
+    /// re-grep `.complete(inspected: .noDirectoryTree)` before trusting a
+    /// line number), which never held an identity to carry, so for that
+    /// producer an absence the probe saw and a stranger's file the deletion
+    /// finds are still the same value. This test goes RED only if
+    /// `.noDirectoryTree` itself ever grows an identity — at which point it
+    /// must be rewritten as the refusal it has become.
     func testANonDirectoryVerdictCannotTellAbsenceFromAReplacement() throws {
         let target = base.appendingPathComponent("was-absent")
         XCTAssertFalse(exists(target), "fixture: the probe saw an absence")

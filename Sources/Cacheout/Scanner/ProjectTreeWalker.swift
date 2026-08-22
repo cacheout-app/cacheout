@@ -192,6 +192,19 @@ struct ProjectTreeWalker {
     ///     TCC-protected roots are skipped entirely — deliberately silent,
     ///     a policy skip is not a scan problem (the as-built R9 doctrine).
     ///     User-initiated scans pass true.
+    ///
+    ///     SILENCE HERE IS NOT COST-FREE, and this doc used to imply it was
+    ///     (PR #459 review r1). The skip is PER-ROOT while participation is
+    ///     per-SCANNER, so `build_artifacts` still returns a normal outcome
+    ///     that simply omits the skipped root's findings — and because
+    ///     `CacheoutViewModel.reconcile` replaces a scanner's whole entry,
+    ///     an automatic refresh erases previously displayed findings from a
+    ///     protected dev root together with the user's selections. MEASURED
+    ///     on a dev root under `~/Documents` (a DEFAULT seed). The
+    ///     per-scanner participation contract
+    ///     (`SpaceScanner.participates(in:)`) fixed the temp scanner's
+    ///     whole-scanner case; this per-root case needs the same treatment
+    ///     at root granularity and does not have it yet.
     ///   - consumers: verdict-returning event receivers (see
     ///     `ProjectTreeConsumer`). All of them see every event of every
     ///     kept root — ONE walk, N consumers.

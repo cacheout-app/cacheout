@@ -1,0 +1,3089 @@
+/// # EphemeralTempScanner — Ephemeral Temp-Dir Enumeration Core (fn-6.2)
+///
+/// One `ReclaimableItem` per STALE first-level entry of the three ephemeral
+/// temp roots fn-6.1 resolves (`/private/tmp`, the per-user `…/T` and `…/C`
+/// containers). Field basis: 2.4G of month-old agent-session scratchpads under
+/// `/private/tmp/claude-501/` survived a month and several reboots, because
+/// the BSD `periodic` reaper is gone from modern macOS and nothing replaced it
+/// for that location.
+///
+/// The scanner CONSUMES fn-6.1 (`EphemeralTempRoot`, `EphemeralTempSweepConfig`)
+/// and the as-built substrate (`DirectorySizer`, `PathGuard`,
+/// `FileSystemIdentityProvider`, the fn-2 item model). Registration, CLI flags
+/// and docs are fn-6.4's; deletion semantics are fn-6.3's — nothing here.
+///
+/// A value type, not a Swift `actor`, deliberately: the epic's word "actor"
+/// names the scanner UNIT, and the canonical per-item template it pins
+/// (`OrphanedCachesScanner`, and `BuildArtifactsScanner` beside it) is an
+/// all-immutable `@unchecked Sendable` struct. There is no mutable state to
+/// isolate here, and real actor isolation would add hops the `SpaceScanner`
+/// protocol does not ask for.
+///
+/// ## Stage order (PINNED — epic r3 F6, extended r4/r5)
+///
+/// scanner-wide trigger gate → per-root gate/admission/listing → per-entry
+/// kind dispatch → ownership gate → staleness pre-filter → cooperative lock
+/// probe → `.deletionTarget` sizing → freshness re-check → outcome mapping.
+///
+/// Two orderings inside it are load-bearing: a candidate already known IN USE
+/// is never traversed or sized, and the post-sizing re-checks run BEFORE the
+/// outcome mapping — a tree that is fresh BY EITHER HALF of the staleness rule
+/// offers nothing to reclaim, so it is not listed even when its sizing hit
+/// denials (those denials still surface through the per-root accounting).
+///
+/// BOTH halves are re-checked after sizing (PR #459 review r1): the entry's
+/// OWN mtime, which is a REQUIRED input of the two-stage rule and which the
+/// sizer never reads, and `SizeReport.newestContentDate`, which merges
+/// regular-file mtimes only. Re-checking only the second left the first
+/// decided by timing alone — the same filesystem fact yielding "silently
+/// excluded" or "STALE and bulk-selectable" depending on which side of one
+/// `lstat` the change landed.
+///
+/// ## Trigger policy (epic D11 r5 — the WHOLE scanner)
+///
+/// The scanner runs ONLY on `.userInitiated` scans. On `.automatic` it defers
+/// for ALL THREE roots: no enumeration, no sizing, no items, no issues. The
+/// condition is the derived `ScanContext.includeProtectedRoots`, reused
+/// deliberately rather than re-derived.
+///
+/// HOW THE DEFERRAL IS EXPRESSED (PR #459 review r1). By NON-PARTICIPATION
+/// (`participates(in:)`), not by returning an empty outcome. An empty
+/// `ScanOutcome` carries no "not inspected" representation — it is
+/// indistinguishable from "the roots are empty" — and the consumer acted on
+/// that reading: `CacheoutViewModel.reconcile` replaces the scanner's whole
+/// entry, so an automatic refresh erased the previously displayed temp
+/// findings, their issues AND the user's selections while every file was
+/// still on disk. Non-participation reuses the session-subset machinery: the
+/// scanner is not run, the prior outcome and its ticks stay, and the R9
+/// freshness gate keeps those retained rows visible-but-non-cleanable until
+/// the next completed user-initiated session. The `scan` guard remains as
+/// defense-in-depth for direct invocation.
+///
+/// The temp roots are not themselves TCC-gated, so the reason is different:
+/// TCC authorization is per-PROCESS/code-identity, NOT per-UID. A same-UID
+/// process with lesser filesystem authorization can stage the swap windows
+/// below inside these same-user-writable roots and steer a PATH-BASED
+/// enumerator into a TCC-protected tree — which would fire a privacy prompt
+/// from a background refresh, and the background no-prompt guarantee
+/// (`ScanTrigger`, `SpaceScanner.swift:40-51`) is absolute.
+///
+/// ## Swap windows: what is closed, what is an ACCEPTED residual (epic D10)
+///
+/// Sizing uses `DirectorySizer.Mode.deletionTarget`, NEVER `.scanRoot`:
+/// `.scanRoot` fully resolves the leaf before dispatch
+/// (`DirectorySizer.swift:50-52`), so an entry swapped directory→symlink
+/// between the pre-filter gates and sizing would make the sizer enumerate an
+/// arbitrary EXTERNAL target. `.deletionTarget` lstat-dispatches the leaf
+/// without following it (`:53-56`). That closes the BETWEEN-STAGES window —
+/// and nothing more. Three windows REMAIN, and are accepted residuals:
+///
+/// - **W1** pre-filter lstat → pre-filter walk;
+/// - **W2** the sizer's own `probeKind` → its path-based enumerator open, plus
+///   Foundation's per-level descent (deep enumeration descends BY PATH);
+/// - **W3** the root-level `probeKind` gate → the bounded `readdir` root
+///   listing — the roots themselves are same-user-replaceable.
+///
+/// What a swap landing inside these can and cannot do (PR #459 review r4 —
+/// the previous census said "never deletion" of a same-kind swap, which was
+/// measured false before the identity pin existed):
+///
+/// - A CANDIDATE swapped between stage 1's staleness `lstat` and the
+///   post-sizing re-read is SILENTLY SKIPPED, not emitted: stage 1's
+///   (device, inode) is carried as `gatedIdentity` and the stage-(6a) re-read
+///   must match it, so the scan record can only ever name the object stage 1
+///   gated, the lock probe cleared and the sizer walked.
+/// - What survives inside W1/W2: external metadata ENUMERATION INTO SIZING,
+///   and — for an ABA revert, where the gated inode stands at the name at
+///   both observations with a different tree in between — a MIXED size figure
+///   on the object stage 1 really did gate. Disclosure, not deletion of an
+///   unvetted object.
+/// - Deletion is BOUND to the recorded object for both kinds: admission
+///   re-runs no-follow (`CacheCleaner.removeGuardedItem`'s `admitContainer` +
+///   `validateRemovableItem` pair), deletion removes the UNRESOLVED leaf
+///   (`removeItemConcurrently`, and `TrashDisposal` on the other arm), this
+///   scanner's `preDeleteRevalidator` (foot of this file) re-establishes the
+///   entry's own gates from a HELD DESCRIPTOR immediately before the
+///   destructive call and refuses any object whose identity is not the
+///   scan-recorded one — and the `.allow` CARRIES that identity
+///   (`.directory` / `.nonDirectoryLeaf`) so each disposal arm re-proves the
+///   object it acts on past the revalidator's own window (PR #459 review r5:
+///   before the leaf case carried it, a file swapped in after the re-check
+///   was destroyed on both arms with success reported). What remains is
+///   disclosed where it lives: the permanent leaf arm's one-syscall
+///   `fstatat`→`unlinkat` window (`DepthSafeRemoval`, residual 2's shape)
+///   and the Trash arm's post-move-detected swap, which is rolled back.
+///
+/// The path-based-substrate residual class exists in every as-built per-item
+/// scanner (`OrphanedCachesScanner.swift:230-233`, the "RESIDUAL, STATED:
+/// `DirectorySizer` is still path-based" note — the anchor here previously
+/// pointed at :334-355, which documents the probe-verdict identity binding,
+/// a different subject; PR #459 review r4). Descriptor (fd) anchoring
+/// is the recorded deferred alternative — it is shared-substrate surgery on
+/// `DirectorySizer` and belongs to a roadmap-level hardening that benefits all
+/// per-item scanners at once. NOTHING here claims a swap is impossible.
+///
+/// ## In-use detection: honest scope (epic D2 revised)
+///
+/// The AGE gate is the primary in-use defense. The cooperative lock probe is a
+/// narrow supplement: `open(O_RDONLY|O_CLOEXEC|O_NOFOLLOW|O_NONBLOCK)` + a kind
+/// gate on the descriptor + `flock(LOCK_EX|LOCK_NB)` detects only ADVISORY
+/// `flock` holders on the top-level candidate inode ITSELF. A process holding a
+/// DESCENDANT file open for ordinary reading is NOT detected — v1 has no fd
+/// enumeration (deferred: O(pids×fds), partial without root). EWOULDBLOCK is
+/// the ONLY in-use signal; an open FAILURE is never "in use". `O_NONBLOCK` is
+/// there because this open cannot carry `O_DIRECTORY` (regular-file candidates
+/// must open too), so without it a FIFO planted at a candidate name wedges the
+/// scan forever — see `cooperativeLockProbe`.
+///
+/// ## Denial classification by OPERATION + PROVENANCE (epic D8 r6)
+///
+/// A blanket "temp-root EPERM means permission-denied" rewrite is RETRACTED
+/// (it was wrong twice: the residual windows mean traversal can genuinely land
+/// in a TCC-protected tree, and sticky-directory semantics govern
+/// unlink/rename — not lstat traversal). Classification happens at THIS
+/// layer; `DirectorySizer`'s classification is unchanged (r4 extracted its
+/// chain walk as `underlyingPOSIXCode(of:)` for the root-listing catch — a
+/// pure additive refactor; the sentence here used to say "untouched", which
+/// that refactor ended). By operation class:
+///
+/// - **(a) chain-bearing traversal errors** (this scanner's own Foundation
+///   throws) apply `DirectorySizer.classifyDenial`'s `NSUnderlyingErrorKey`
+///   signal: chain-EPERM ⇒ `.tccDenied` PRESERVED (a real grant hint),
+///   chain-EACCES or bare Cocoa 257 ⇒ `.permissionDenied`, else `.unreadable`.
+/// - **(b) raw-errno probes** (`probeKind`, the pre-filter's lstat/opendir,
+///   `ownerProbe`, the lock probe's `open`): EACCES ⇒ `.permissionDenied`
+///   (unambiguous); EPERM ⇒ NEUTRAL `.unreadable` — the cause is NOT
+///   establishable from a bare errno, so neither `.tccDenied` nor
+///   `.permissionDenied` may be asserted; anything else ⇒ `.unreadable`.
+/// - **(c) post-sizing `SizeDenial`s**: `.permission` ⇒ permission-denied;
+///   `.tcc` ⇒ NEUTRAL `.other`-kind `ScanError` with the detail preserved,
+///   because `SizeDenial.Kind.tcc` CONFLATES chain-proven denials
+///   (`classifyDenial`'s `case .some(Int(EPERM))` arm,
+///   `DirectorySizer.swift:483`) with raw-probe guesses
+///   (`denial(forFailedProbe:errno:)`'s `case EPERM`, :545); the only
+///   surviving discriminator is a detail STRING, and classification derived
+///   from message text is forbidden house doctrine (`CacheCleaner.refusalTag`
+///   :1402 switches the TYPED error). Anchors re-verified r10 — the three
+///   that stood here pointed at a sparse-accounting comment, a hardlink
+///   comment and an unrelated line (R3-V5); re-grep before trusting these
+///   too (SCANNERS-ROADMAP doctrine).
+///
+/// ENOENT on a child is a purely OBSERVABLE race contract: silently skipped —
+/// no item, no denial, no issue. There is no race counter.
+///
+/// ## Own-process safety (epic D9)
+///
+/// The AGE gate, and nothing else. The formerly-planned own-temp inode
+/// exclusion was INERT — this app is not sandboxed, so `NSTemporaryDirectory()`
+/// IS the `T` root and a first-level candidate can never share its parent
+/// container's inode. Verified at implementation: `Sources/` has ZERO
+/// `NSTemporaryDirectory`/`FileManager.temporaryDirectory` call sites, so the
+/// app creates no first-level `T` artifacts at all; anything the running
+/// session writes is fresh by construction.
+
+import Foundation
+import Darwin
+
+/// `@unchecked Sendable` under the house scanner discipline: every stored
+/// property is an immutable `let`; `FileSystemIdentityProvider`,
+/// `DirectorySizer` and `PathGuard` hold no mutable state; every stored
+/// closure is `@Sendable` by type.
+struct EphemeralTempScanner: @unchecked Sendable {
+
+    /// Stable scanner slug — the CLI address prefix (`ephemeral_tmp:<item-id>`),
+    /// the GUI section key, and the `stableID` preimage's scanner half. Matches
+    /// the address grammar `[a-z0-9_]+`. PERMANENT external contract;
+    /// registration lands in fn-6.4.
+    static let registeredID = "ephemeral_tmp"
+
+    /// The ONE sizing mode every candidate is measured with (see the header:
+    /// `.scanRoot` would resolve a swapped leaf and enumerate outside the
+    /// root). Named once so no call site can drift.
+    static let candidateSizingMode: DirectorySizer.Mode = .deletionTarget
+
+    /// PRODUCTION cap on the staleness pre-filter's inspected entries, PER
+    /// CANDIDATE. It bounds worst-case work on a hostile or enormous tree; it
+    /// is NOT a sample. A cap hit means NOT stale (refusing to list is the
+    /// safe direction), so the value has to be comfortably above real field
+    /// payloads — a month-old multi-GB scratchpad holds thousands of files,
+    /// and calling it "not stale" because the walk gave up would make the
+    /// scanner useless exactly where it exists to help.
+    ///
+    /// PER CANDIDATE IS NOT A SCAN BOUND, which is why
+    /// `defaultPrefilterRootBudget` exists beside it (PR #459 codex r16).
+    static let defaultPrefilterEntryLimit = 20_000
+
+    /// PRODUCTION cap on the pre-filter work ONE ROOT may spend across ALL of
+    /// its candidates (PR #459 codex r16 — AVAILABILITY). The two caps above
+    /// and below this one did not compose: the root listing admits up to
+    /// `defaultRootEntryLimit` first-level entries and each one that reaches
+    /// the pre-filter received a FRESH `defaultPrefilterEntryLimit` budget, so
+    /// one root's advertised bounds multiplied to 20,000 x 20,000 = 400
+    /// million subtree probes — and `/private/tmp` is world-writable, so any
+    /// local process can stage that population.
+    ///
+    /// MEASURED (PR #459 codex r16, this machine, through the shipped walk):
+    /// 0.64 us per probe on a warm 205k-file staging (200,000 probes in
+    /// 0.129 s; 100,000 in 0.063 s — linear), 0.78 us when every budgeted
+    /// entry is a directory, and 2.3 us on a 601k-file staging where the
+    /// cache no longer holds the tree (30 candidates x 20,000 = 1.389 s).
+    /// EXTRAPOLATED from the 2.3 us figure, 400 million probes is ~15 minutes
+    /// for ONE root; at this cap it is ~4.6 s.
+    ///
+    /// 2,000,000 = 100x the per-candidate cap. The per-candidate cap's own
+    /// reasoning applies to the product: real machines measured 14/213/401
+    /// first-level entries across the three roots, so a legitimate population
+    /// would have to average 5,000 walked entries in EVERY one of 400
+    /// candidates to reach it.
+    ///
+    /// PER ROOT, NOT PER SCAN, deliberately. A scan-wide budget would let the
+    /// world-writable shared root consume the whole allowance before the
+    /// per-user roots — where the user's own reclaimable payload lives — were
+    /// looked at, which hands an attacker-controlled directory a way to
+    /// silence the rest of the scanner. Three roots therefore bound the scan
+    /// at 3x this value.
+    ///
+    /// NOT A DETERMINISTIC STRAND, by the same argument
+    /// `defaultRootEntryLimit` makes: exhaustion gates only the VISIBILITY of
+    /// candidates the walk never reached, never the deletion of an emitted
+    /// item, and it is consumed by entries that EXIST — cleaning the listed
+    /// items removes entries that were charged to it, so a later scan reaches
+    /// further. The honest caveat is the same one too: if the budget was
+    /// consumed entirely by candidates that hit the per-candidate cap (none
+    /// of which are listed), a clean removes nothing and only external
+    /// clearing moves the population. A retry CAN differ; it is not
+    /// guaranteed to.
+    static let defaultPrefilterRootBudget = 2_000_000
+
+    /// PRODUCTION cap on the first-level ROOT listing (PR #459 review r4,
+    /// codex C3 — AVAILABILITY). `/private/tmp` is world-writable, so any
+    /// local user controls this population, and the eager
+    /// `contentsOfDirectory` listing plus the per-name sort ran as ONE
+    /// uninterruptible synchronous stretch on the scan's cooperative-pool
+    /// worker — measured on a staged ~494k-entry root in the r4 session:
+    /// 6.8 s list + 16.4 s sort, transient RSS 5.7 MB → 8.24 GB, with no
+    /// cancellation point anywhere inside. The bounded `readdir` read at
+    /// this cap on the SAME root: 99 ms, +2 MB. Real machines measured
+    /// 14/213/401 first-level entries across the three roots, so the cap is
+    /// ~50× the largest observed population. A cap hit is DISCLOSED as a
+    /// root-level issue, and it is NOT a deterministic strand: it gates only
+    /// the VISIBILITY of never-listed entries (never the deletion of an
+    /// emitted item), and cleaning the listed items shrinks the population
+    /// WHEN the listed prefix yields items — if every listed entry is fresh
+    /// or below the size floor, a clean removes nothing and only external
+    /// clearing moves the population. Unlike the orphaned-caches fixed depth
+    /// cap, a retry here CAN differ.
+    static let defaultRootEntryLimit = 20_000
+
+    // MARK: - Seams
+
+    /// The cooperative candidate-lock probe's outcome (epic D2 revised).
+    enum LockProbe: Equatable {
+        /// No advisory `flock` holder on the candidate inode — the lock was
+        /// taken and immediately dropped. NOT a claim about descendants.
+        case available
+        /// EWOULDBLOCK — the ONE in-use signal.
+        case inUse
+        /// NOTHING THIS SCANNER LISTS STANDS AT THE NAME ANY MORE — the
+        /// silent-skip disposition, shared by two arms. (PR #459 review r4:
+        /// the r3 doc here claimed all three special kinds arrive through a
+        /// successful open and share this disposition — measured false for
+        /// sockets, twice over. Per kind, under this exact flag set:)
+        ///
+        /// - The open FAILED benignly: ENOENT/ENOTDIR (gone) or ELOOP
+        ///   (swapped to a symlink after dispatch — `O_NOFOLLOW` refusing to
+        ///   open it is the point).
+        /// - The open SUCCEEDED but `fstat` reports a kind this scanner never
+        ///   lists. Which kinds actually get here, measured:
+        ///   - a FIFO opens under `O_NONBLOCK` and fstats `S_IFIFO` — skipped;
+        ///   - a device node whose driver admits the open fstats
+        ///     `S_IFCHR`/`S_IFBLK` (measured: `/dev/null`) — skipped; one
+        ///     whose driver refuses (measured: `/dev/tty` with no controlling
+        ///     terminal, ENXIO) is `.failed`, the visible denial accounting;
+        ///   - a bound AF_UNIX SOCKET never reaches this arm at all:
+        ///     `open(2)` fails EOPNOTSUPP (errno 102, measured, with and
+        ///     without `O_NONBLOCK`), so a socket is `.failed` — a VISIBLE
+        ///     refusal, not this silent skip.
+        ///   Root-level `probeKind` already skips `.other` silently, so the
+        ///   kinds that DO open get the same disposition when they arrive in
+        ///   the swap window between that probe and this one.
+        case vanished
+        /// The `open` failed for another reason — NEVER "in use"; routed to
+        /// the same denial accounting as any other raw-errno probe.
+        case failed(errno: Int32)
+    }
+
+    /// Injection seam for the lock probe — one branch per test cell.
+    typealias LockProber = @Sendable (URL) -> LockProbe
+
+    /// Injection seam for the ONE first-level enumeration per root. Exists so
+    /// the trigger gate's "nothing was enumerated at all" contract is
+    /// ASSERTABLE, and so the chain-bearing denial class (a Cocoa error
+    /// wrapping a POSIX one) can be exercised — a real single-uid fixture can
+    /// produce a chain-EACCES throw but never a chain-EPERM one.
+    ///
+    /// The shape is BOUNDED BY CONSTRUCTION (PR #459 review r4, codex C3):
+    /// the previous `(URL) throws -> [URL]` return type forced every
+    /// implementation — injected or production — to materialize the full
+    /// array before the scanner saw one entry. Basenames and a truncation
+    /// CAUSE, never URLs: the scan rebuilds each entry under the DECLARED
+    /// root spelling anyway. The cause (rather than the `Bool` that
+    /// stood here until r7, codex C2) is what lets the root arm say WHY the
+    /// listing stopped instead of inferring it from the entry count.
+    typealias DirectoryLister = @Sendable (URL, Int) throws
+        -> (names: [String], truncation: BoundedRead.Truncation?)
+
+    /// Injection seam for stage-2 sizing. Carries the MODE so a test can
+    /// assert what production passes (`.deletionTarget`), and gives the
+    /// between-stages fixtures (symlink swap, late-arriving fresh file, the
+    /// post-sizing outcome rows) their staging point.
+    typealias CandidateSizer = @Sendable (URL, DirectorySizer.Mode) -> SizeReport
+
+    /// Injection seam for the pre-filter walk's SUBTREE reads (r7, codex C2).
+    /// Production is `boundedChildNames(of:limit:)` verbatim; it exists so
+    /// the walk's per-CAUSE disposition — a failed `readdir` disclosed, a
+    /// vanished branch skipped silently, a cap hit dropped silently — is
+    /// drivable DETERMINISTICALLY, which a real mid-`readdir` failure is not
+    /// (staging one needs a volume yanked inside the read).
+    ///
+    /// The double is strictly LESS capable than production: it can only
+    /// return values `boundedChildNames` itself returns.
+    ///
+    /// EVIDENCE STATUS, stated honestly. The DISPOSITION of each cause is
+    /// suite-covered through this seam. That production actually EMITS
+    /// `.readFailed` is NOT: measured for r7, a `DIR` handle held open and
+    /// idle across a force-detached HFS+ RAM disk yields errno 22 (EINVAL)
+    /// mid-directory, but eight threads hot-looping the real read across the
+    /// same teardown produced 1,602 complete reads and ZERO interrupted ones
+    /// — the unmount lands between reads, and this function never leaves a
+    /// handle idle. `testACleanReadIsNeverMisreadAsAFailedOne` pins the other
+    /// direction (a stale errno must not fabricate a failure). Do not call
+    /// the errno carry suite-covered.
+    typealias BoundedChildReader = @Sendable (URL, Int) -> BoundedRead
+
+    // MARK: - Stored state (all construction state — never `ScanContext`)
+
+    /// The resolved roots, DECLARED spellings verbatim (fn-6.1 — canonical
+    /// parent chain, leaf unresolved, so a root whose leaf is a symlink is
+    /// NOT canonical). Injectable: no unit test ever reads a real temp root.
+    let roots: [EphemeralTempRoot]
+    /// Classified issues fn-6.1's resolution produced for the spellings it
+    /// DROPPED — today exactly one shape, an alias of a root declared
+    /// separately as a real directory. They ride every INSPECTING scan's
+    /// outcome (the `DevRootsResolution` data path,
+    /// `BuildArtifactsScanner.swift:378-382`), so a dropped spelling stays
+    /// visible while never being registered or walked. The deferral arm
+    /// emits nothing at all, by the trigger contract below.
+    let resolutionIssues: [ScanIssue]
+    /// Anchor for this scanner's own `PathGuard` (injectable — zero real
+    /// `$HOME` reads in tests).
+    let home: URL
+    /// Size floor + stale age, resolved at CONSTRUCTION by frozen contract
+    /// (thresholds never ride `ScanContext`).
+    let thresholds: EphemeralTempSweepConfig.Thresholds
+
+    private let provider: FileSystemIdentityProvider
+    /// This scanner's OWN guard, whose container roots are exactly its
+    /// declared `trustedContainerRoots` (scan-time admission is read-only and
+    /// snapshot-free).
+    private let pathGuard: PathGuard
+    private let sizer: DirectorySizer
+    private let prefilterEntryLimit: Int
+    /// Cap on the first-level root listing (see `defaultRootEntryLimit`).
+    private let rootEntryLimit: Int
+    /// Pre-filter work one ROOT may spend across all its candidates (see
+    /// `defaultPrefilterRootBudget`).
+    private let prefilterRootBudget: Int
+    /// Injected clock — a PROVIDER, not a `Date`: the scanner is long-lived
+    /// and each scan dates content against its own "now".
+    private let now: @Sendable () -> Date
+    private let lockProbe: LockProber
+    private let listDirectory: DirectoryLister
+    /// The pre-filter walk's subtree reader (production default).
+    private let readChildNames: BoundedChildReader
+    /// `nil` in production — the real `DirectorySizer` is called directly.
+    private let candidateSizer: CandidateSizer?
+
+    init(
+        roots: [EphemeralTempRoot],
+        resolutionIssues: [ScanIssue] = [],
+        home: URL = FileManager.default.homeDirectoryForCurrentUser,
+        thresholds: EphemeralTempSweepConfig.Thresholds =
+            EphemeralTempSweepConfig.defaultThresholds,
+        provider: FileSystemIdentityProvider = FileSystemIdentityProvider(),
+        prefilterEntryLimit: Int =
+            EphemeralTempScanner.defaultPrefilterEntryLimit,
+        rootEntryLimit: Int = EphemeralTempScanner.defaultRootEntryLimit,
+        prefilterRootBudget: Int =
+            EphemeralTempScanner.defaultPrefilterRootBudget,
+        now: @escaping @Sendable () -> Date = { Date() },
+        // Closure literals, not bare static-function references: a static
+        // `func` value is not inferred `@Sendable`, and the warning it raises
+        // is a real Swift 6 error in waiting.
+        lockProbe: @escaping LockProber = {
+            EphemeralTempScanner.cooperativeLockProbe($0)
+        },
+        listDirectory: @escaping DirectoryLister = {
+            try EphemeralTempScanner.boundedFirstLevelNames(of: $0, limit: $1)
+        },
+        readChildNames: @escaping BoundedChildReader = {
+            EphemeralTempScanner.boundedChildNames(of: $0, limit: $1)
+        },
+        candidateSizer: CandidateSizer? = nil
+    ) {
+        self.roots = roots
+        self.resolutionIssues = resolutionIssues
+        self.home = home
+        self.thresholds = thresholds
+        self.provider = provider
+        self.pathGuard = PathGuard(
+            home: home, containerRoots: roots.map(\.url), provider: provider
+        )
+        self.sizer = DirectorySizer(provider: provider)
+        self.prefilterEntryLimit = prefilterEntryLimit
+        self.rootEntryLimit = rootEntryLimit
+        self.prefilterRootBudget = prefilterRootBudget
+        self.now = now
+        self.lockProbe = lockProbe
+        self.listDirectory = listDirectory
+        self.readChildNames = readChildNames
+        self.candidateSizer = candidateSizer
+    }
+
+    /// The PRODUCTION first-level listing — BOUNDED ON EVERY PATH (PR #459
+    /// review r4 codex C3; the failure arm's eager fallback was closed r6,
+    /// codex C1): a `readdir` loop that stops at `limit`, never the eager
+    /// `contentsOfDirectory` (both of its overloads materialize the WHOLE
+    /// directory before any cap can apply — `boundedChildNames`'s own trap
+    /// note; measured r4 on a staged ~494k-entry root, the eager list + sort
+    /// ran 6.8 s + 16.4 s uninterruptible with an 8.24 GB transient RSS,
+    /// while this read at the 20,000 cap returned in 99 ms holding +2 MB).
+    /// `readdir` skips nothing, preserving the retired listing's
+    /// `options: []` semantics — dotfile scratch directories are real
+    /// payload (the sweep-scanner lesson: a hidden-file skip hid a 23G
+    /// class).
+    ///
+    /// The FAILURE arm retries the SAME bounded read once — a failure that
+    /// clears between the two calls (the open-failed-then-cleared race)
+    /// recovers here, still through the `readdir` loop — and only a second
+    /// consecutive failure falls through to `lazyChainHarvest`, which exists
+    /// to produce the chain-bearing Cocoa error the class-(a) denial
+    /// classification needs (a raw `opendir` errno is class (b) and may not
+    /// claim TCC). The harvest reads LAZILY and stops at `limit` too, so
+    /// even a failure that clears again mid-harvest cannot reopen the bound
+    /// (r6, codex C1 — the eager `contentsOfDirectory` fallback that stood
+    /// here materialized the whole directory whenever the race was won).
+    static func boundedFirstLevelNames(
+        of root: URL, limit: Int
+    ) throws -> (names: [String], truncation: BoundedRead.Truncation?) {
+        try boundedFirstLevelNames(
+            of: root, limit: limit,
+            boundedRead: { boundedChildNames(of: $0, limit: $1) },
+            chainHarvest: { try lazyChainHarvest(of: $0, limit: $1) }
+        )
+    }
+
+    /// The seam-parameterized core of `boundedFirstLevelNames`. The closures
+    /// exist so the failed-then-cleared ordering is drivable
+    /// DETERMINISTICALLY — the natural race window is the handful of
+    /// instructions between two consecutive `opendir` calls, so a real
+    /// staging is probabilistic per attempt, though not rare: a chmod-000/755
+    /// flipper racing the REAL reads staged it in 200 of 1,223 attempts
+    /// (~16% per attempt, measured for PR #459 r6 verify; the flipper cell
+    /// keeps that staging green). The production defaults above are
+    /// evidenced separately — the success path by the bounded-listing cells,
+    /// the double-failure path by the chmod-000 chain-error cell.
+    static func boundedFirstLevelNames(
+        of root: URL, limit: Int,
+        boundedRead: (URL, Int) -> BoundedRead,
+        chainHarvest: (URL, Int) throws
+            -> (names: [String], truncation: BoundedRead.Truncation?)
+    ) throws -> (names: [String], truncation: BoundedRead.Truncation?) {
+        if case .names(let names, let truncation) = boundedRead(root, limit) {
+            return (names, truncation)
+        }
+        // The BOUNDED RETRY (r6, codex C1): the common recovery from a
+        // transient open failure stays inside the readdir loop and never
+        // touches Foundation.
+        if case .names(let names, let truncation) = boundedRead(root, limit) {
+            return (names, truncation)
+        }
+        return try chainHarvest(root, limit)
+    }
+
+    /// The CHAIN-ERROR HARVEST arm of `boundedFirstLevelNames`, and nothing
+    /// else — reached only after TWO consecutive bounded-read failures. It
+    /// re-asks through Foundation because denial classification is licensed
+    /// by Foundation PROVENANCE, and it asks through `FileManager.enumerator`
+    /// rather than `contentsOfDirectory` (PR #459 review r6, codex C1): the
+    /// enumerator surfaces the SAME chain-bearing error for an unreadable
+    /// directory (measured this round: NSCocoaErrorDomain 257 wrapping
+    /// NSPOSIXErrorDomain/EACCES from both APIs on a mode-000 fixture) while
+    /// reading lazily, so when the failure has cleared and the read SUCCEEDS
+    /// this loop consumes at most `limit + 1` entries (measured this round:
+    /// take-5 of a staged 60,000-entry directory ran 0.4 ms at +0.0 MB RSS
+    /// where the eager list it replaces materialized all 60,000 at
+    /// +42.5 MB). A mid-iteration failure throws rather than returning a
+    /// partial listing as complete — fail-visible, matching the "could not
+    /// be listed" disposition of the caller's catch.
+    ///
+    /// Its ONLY truncation cause is `.budget`: the loop stops at `limit` and
+    /// a mid-iteration failure THROWS rather than returning a short listing,
+    /// so a partial harvest is never reported as a cap hit.
+    static func lazyChainHarvest(
+        of root: URL, limit: Int
+    ) throws -> (names: [String], truncation: BoundedRead.Truncation?) {
+        var harvested: Error?
+        guard let enumerator = FileManager.default.enumerator(
+            at: root, includingPropertiesForKeys: nil,
+            options: [.skipsSubdirectoryDescendants],
+            errorHandler: { _, error in
+                harvested = error
+                return false
+            }
+        ) else {
+            // Foundation would not even construct the enumerator and gave no
+            // error to harvest. Never ENOENT-shaped (an invented absence
+            // would be a SILENT skip at the caller); `.fileReadUnknown`
+            // classifies as a neutral visible denial.
+            throw CocoaError(
+                .fileReadUnknown, userInfo: [NSFilePathErrorKey: root.path]
+            )
+        }
+        var names: [String] = []
+        var truncation: BoundedRead.Truncation?
+        for case let entry as URL in enumerator {
+            if names.count >= limit {
+                truncation = .budget
+                break
+            }
+            names.append(entry.lastPathComponent)
+        }
+        if let harvested { throw harvested }
+        return (names, truncation)
+    }
+
+    // MARK: - Protocol surface (the conformance sits at the foot of this file)
+
+    var id: String { Self.registeredID }
+    var displayName: String { "Ephemeral Temp Files" }
+
+    /// The declared root spellings, fixed at REGISTRATION — this is HOW
+    /// the container reaches the cleaner (the runtime unions scanner-declared
+    /// roots into PathGuard's delete-time admission; nothing item-side can
+    /// widen it). fn-6.1 resolved each root exactly once — canonical parent
+    /// chain, UNRESOLVED leaf — so the origin claim on every item, the root
+    /// records, and the identity parent chains all speak ONE spelling, and a
+    /// symlink standing at a container's own name is still visible to the
+    /// no-follow root gate below rather than replaced by its destination.
+    var trustedContainerRoots: [URL] { roots.map(\.url) }
+
+    /// THE TRIGGER POLICY, EXPRESSED AS NON-PARTICIPATION (PR #459 review r1).
+    /// A pure predicate: it walks no root, opens nothing and checks no
+    /// cancellation.
+    ///
+    /// This is where the `.automatic` deferral lives. Returning an empty
+    /// `ScanOutcome` from `scan` instead is what the scanner used to do, and
+    /// it was not a deferral at all: an empty outcome ASSERTS the roots are
+    /// empty, and the consumer believed it — `reconcile` replaced the
+    /// scanner's whole entry, so a user who scanned, saw the temp findings and
+    /// ticked some watched the section empty itself, the issues disappear and
+    /// the ticks drop at the next automatic refresh, while every file was
+    /// still on disk and no temp root had been opened.
+    func participates(in context: ScanContext) -> Bool {
+        context.includeProtectedRoots
+    }
+
+    /// One scan: trigger gate → per root (gate, admit, list) → per entry
+    /// (dispatch, ownership, staleness, lock, size, freshness, map).
+    ///
+    /// `context.categoryFilter` is ignored (it scopes `CategoryScanner` only).
+    /// Cancellation is checked between roots and between entries — partial
+    /// results are returned rather than discarded.
+    func scan(context: ScanContext) async -> ScanOutcome {
+        // TRIGGER GATE (epic D11 r5) — the WHOLE scanner, all three roots.
+        //
+        // DEFENSE IN DEPTH FOR A CALLER THAT BYPASSES THE RUNTIME (PR #459
+        // review r2). The enforcement point is `SpaceScannerRuntime
+        // .scanValidatedSession`, which filters on `participates(in:)` for
+        // EVERY caller of a session; this guard is what makes the
+        // no-enumeration promise hold for code that constructs a scanner and
+        // calls `scan` directly, which the tests do and which nothing stops a
+        // future call site from doing. Do not delete it on the ground that the
+        // session layer handles it: the session layer handles SESSIONS.
+        //
+        // Note what an empty outcome does and does not say: it carries no "not
+        // inspected" representation, so it cannot express a deferral to a
+        // consumer — which is the reason the participation seam exists and why
+        // this arm is a last resort rather than the policy.
+        //
+        // The comment that stood here called this "exactly like a skipped
+        // TCC-protected search root". Mechanically true, and that is the
+        // problem rather than the reassurance: the TCC skip
+        // (`ProjectTreeWalker`'s bare `continue`) erases previously displayed
+        // build-artifacts findings and their selections on an automatic
+        // refresh in the same way, measured, whenever a dev root sits under a
+        // protected directory. That is a separate defect, not a precedent.
+        guard context.includeProtectedRoots else {
+            return ScanOutcome(items: [], errors: [])
+        }
+
+        let now = self.now()
+        // STRICTLY older than this instant is stale; at-or-after it is fresh.
+        // The same boundary governs the pre-filter and the post-sizing
+        // freshness re-check, so the two can never disagree.
+        let cutoff = now.addingTimeInterval(-thresholds.staleAge)
+        let euid = geteuid()
+
+        // THE KERNEL MOUNT TABLE, harvested ONCE per scan (PR #459 review
+        // r5, codex C2 — AVAILABILITY). A candidate that IS a mount point
+        // must be refused BEFORE the stage-(1) `lstat` ever runs: an `lstat`
+        // (or `statfs`) OF a mount point crosses INTO the mounted filesystem
+        // — the getattr is served by the foreign fs — so on a hard-mounted
+        // unresponsive volume that one syscall parks the scan's
+        // cooperative-pool worker forever (no cancellation point can run,
+        // the task group never drains, and the view model's re-entrancy
+        // guard then wedges every later scan AND clean; the lock probe's
+        // comment documents the same wedge shape for a FIFO). Only the
+        // kernel's own table (`getfsstat(MNT_NOWAIT)`,
+        // `FileSystemIdentityProvider.mountPointPaths` — the primitive
+        // `DepthSafeRemoval`'s whole-tree preflight reads) answers without
+        // first contact. Measured before this arm existed: the prefilter
+        // walk descended a mounted volume at 19,545 `lstat`s + 19,500
+        // second `lstat`s under a 22,545-entry mount, and the same mount
+        // was a visible denied row at 303 stale entries but a SILENT skip
+        // at 22,545 — foreign content steering scan output. The same
+        // snapshot answers for the ROOTS themselves (r6, codex C2): the
+        // over-mounted-root arm at the head of the loop below refuses a
+        // root the table names before ANY syscall touches it.
+        let mountTable = provider.mountPointPaths()
+
+        var items: [ReclaimableItem] = []
+        // Resolution's own classified drops lead EVERY inspecting outcome
+        // (fn-6.1's alias suppression). Placed after the trigger gate on
+        // purpose: a deferred scan reports nothing at all, and these are
+        // registration facts, not findings about what this scan saw.
+        var issues: [ScanIssue] = resolutionIssues
+        // One denial per filesystem object per scan — a candidate that failed
+        // at the ownership gate must not be counted again by a later stage.
+        var deniedPaths = Set<String>()
+        // Dedupe by the LEAF-PRESERVING identity, consulted BEFORE the
+        // expensive stages so one filesystem object is locked and sized at
+        // most once per scan even when two declared roots alias each other.
+        var seenIdentities = Set<String>()
+
+        func record(_ cause: DenialCause, at url: URL, _ note: String) {
+            guard deniedPaths.insert(url.path).inserted else { return }
+            issues.append(Self.denialIssue(cause, at: url, note: note))
+        }
+
+        for root in roots {
+            if Task.isCancelled { break }
+
+            // THE OVER-MOUNTED-ROOT ARM (PR #459 review r6, codex C2 —
+            // AVAILABILITY): a volume mounted EXACTLY at this root, answered
+            // from the table snapshot above by pure string membership (the
+            // kernel spells `f_mntonname` canonically, which is the spelling
+            // fn-6.1 declares whenever the root's own leaf is a real
+            // directory — the only case where a mount AT the root can hang
+            // anything, since `lstat` of a symlink leaf never crosses into
+            // the mount and the kind gate below refuses it). Every
+            // root-touching syscall below
+            // this line — the kind gate's `lstat`, `admitSearchRoot`'s
+            // realpath/lstat/statfs, `rootDevice`, the listing — is served
+            // BY the mounted filesystem when the root IS a mount point, so
+            // on an unresponsive hard mount the FIRST of them parks the
+            // scan's cooperative-pool worker forever (the harvest comment
+            // above documents the wedge shape). Before this arm the refusal
+            // itself already happened — PathGuard's volume-root deny fired
+            // inside `admitSearchRoot` — but only AFTER five foreign-fs
+            // contacts, and its generic wording never said unmounting clears
+            // it. Roots get ISSUES, not rows (the symlink-root precedent);
+            // the message names the same remedy as the candidate mount rows.
+            //
+            // What reaches this arm is a mount that landed AFTER the runtime
+            // was built (PR #459 codex r15). One already standing at
+            // construction never becomes a root of this scanner at all:
+            // fn-6.1 reads the same table before its own first probe and
+            // drops the root with `.mountedVolumeRootAtRegistration`, whose
+            // remedy is a relaunch rather than the re-scan this arm's kind
+            // promises.
+            //
+            // Residuals, at measured scope: a mount landing AFTER the
+            // harvest above makes first contact at the kind gate below (no
+            // table re-read can close that race — the same racing class the
+            // candidate arms accept, except here the consequence is the
+            // hang, not only disclosure); and at DELETE time the same
+            // racing window recurs, one table later: admission re-reads the
+            // kernel table first (`admitContainer`'s opening act is
+            // `matchConfiguredRoot`, whose preflight throws
+            // `.deniedVolumeRoot` for a table-mounted origin root ahead of
+            // its own realpath — and target validation, the sizer, and the
+            // revalidator's `open` never run once admission throws), so a
+            // mount landing between scan and clean is refused stall-free,
+            // and only one landing between THAT table read and the child
+            // lookups behind it can still block them.
+            if mountTable.contains(root.url.path) {
+                // `.mountedVolumeRoot`, NOT `.containerRefused` (PR #459
+                // codex r11, DISCLOSURE): this root is registered and
+                // admissible — nothing refused it as a root — and the GUI
+                // derives its VISIBLE row label from the kind alone, so
+                // under `.containerRefused` the ordinary row read "not a
+                // configured search root" (false here) while the true
+                // condition and the remedy lived only in `detail`, which
+                // `ScanIssuesBlock` shows as a hover tooltip.
+                issues.append(ScanIssue(
+                    url: root.url, kind: .mountedVolumeRoot,
+                    detail: "\(root.label) is a mounted volume — not "
+                        + "scanned; its contents belong to that volume. "
+                        + Self.mountRemedy
+                ))
+                continue
+            }
+
+            // ROOT GATE, no-follow (R11 + the symlink-root rule). Scan-time
+            // ABSENCE is a SILENT skip — including the construction-to-scan
+            // disappearance race AND absence landing in this probe's own
+            // probe-to-list window (r4, codex C5: the listing catch below
+            // holds up the second half — it used to report a vanished root
+            // as `.unreadable`): temp roots churn by design, and a spurious
+            // issue for a legitimately vanished root trains users to ignore
+            // issues. A PRESENT but unreadable root is the opposite case and
+            // must stay visible (a silent zero there is the TCC-silent-zero
+            // defect class fn-1 exists to prevent).
+            switch provider.probeKind(of: root.url) {
+            case .absent:
+                continue
+            case .failed(let code):
+                record(.rawErrno(code), at: root.url,
+                       "\(root.label) could not be inspected")
+                continue
+            case .kind(.directory):
+                break
+            case .kind(let kind):
+                // TWO kinds, by what is actually standing there (PR #459
+                // codex r13, DISCLOSURE). `.symlinkRoot`'s single GUI label
+                // is the fixed sentence "symlinked — not searched", so a
+                // root replaced by a regular file, FIFO, socket or device
+                // was given a false diagnosis in the ordinary results row
+                // while its real kind — already in `detail` below — reached
+                // the user only by hovering.
+                issues.append(ScanIssue(
+                    url: root.url,
+                    kind: kind == .symlink ? .symlinkRoot : .nonDirectoryRoot,
+                    detail: "\(root.label) is not a real directory "
+                        + "(\(Self.describe(kind))) — never traversed"
+                ))
+                continue
+            }
+
+            // Scan-time traversal admission (read-only, snapshot-free): the
+            // shared container-root policy refuses `/`, volume roots and
+            // `$HOME` in any spelling, from ONE definition.
+            do {
+                _ = try pathGuard.admitSearchRoot(root.url)
+            } catch {
+                // `.policyRefusedRoot`, NOT `.containerRefused` (PR #459
+                // codex r13, DISCLOSURE — the sibling of r11's mount case).
+                // This scanner builds its guard with
+                // `containerRoots: roots.map(\.url)` (the initializer
+                // above), and this loop iterates THOSE roots, so the root
+                // reaching this catch is always one of the guard's own
+                // configured roots. `.containerRefused`'s fixed GUI label —
+                // "not a configured search root" — is therefore false for
+                // every firing here; the truth is that the safety policy
+                // refuses to search it. WHICH clause refused rides `detail`.
+                issues.append(ScanIssue(
+                    url: root.url, kind: .policyRefusedRoot,
+                    detail: error.localizedDescription
+                ))
+                continue
+            }
+
+            // The two per-root mount facts (PR #459 review r5, codex C2).
+            // `mountsUnderRoot` is the stall-free arm: kernel-spelled mount
+            // points strictly under this root (fn-6.1 resolves the root's
+            // PARENT CHAIN once, and the walk composes children from that
+            // spelling without following links, so the two spellings agree.
+            // A root whose own leaf is a symlink never reaches this line —
+            // the no-follow root gate above refused it). `rootDevice` is the
+            // racing-mount arm's baseline: one `lstat` of the ROOT itself —
+            // foreign only when a mount lands on the root AFTER the
+            // over-mounted-root arm's table check above (r6, codex C2: in
+            // that racing window this lstat is also the scan's first,
+            // possibly hanging, contact, and the foreign baseline blinds
+            // the racing-device arm for this root's candidates, whose
+            // entries share the foreign device — disclosure-class; the
+            // delete-time gates behind it hold). A `nil` rootDevice (the
+            // root vanished since its gate) skips only that arm — the table
+            // arm still stands, and the sizer/cleaner mount gates behind it
+            // are unchanged.
+            let mountsUnderRoot = Self.mountPoints(
+                in: mountTable, strictlyUnder: root.url
+            )
+            let rootDevice = provider.deviceID(of: root.url)
+
+            let listing: (names: [String], truncation: BoundedRead.Truncation?)
+            do {
+                listing = try listDirectory(root.url, rootEntryLimit)
+            } catch {
+                // TWO dispositions (PR #459 review r4, codex C5 — this catch
+                // used to make every throw visible, so a root vanishing in
+                // the probe-to-list window produced exactly the spurious
+                // issue R11 exists to prevent):
+                //
+                // 1. ABSENCE — chain-ENOENT/ENOTDIR, the same definition
+                //    `probeKind` uses — is the R11 SILENT skip at ANY
+                //    scan-time instant, matching every other seam in this
+                //    file (kind dispatch, ownership, the pre-filter walk,
+                //    the lock probe, the post-sizing re-read). The code is
+                //    recovered from the error already in hand via the house
+                //    chain walk — never a re-probe (a second racy read that
+                //    misclassifies a recreated name) and never message text.
+                if let code = DirectorySizer.underlyingPOSIXCode(of: error),
+                   code == ENOENT || code == ENOTDIR {
+                    continue
+                }
+                // 2. A root that IS present but refuses enumeration is a
+                //    classified, VISIBLE issue — never empty-looking
+                //    success. This is the one chain-bearing operation class
+                //    (a), so a provenance-backed TCC signal is preserved.
+                record(.cocoaChain(error), at: root.url,
+                       "\(root.label) could not be listed")
+                continue
+            }
+
+            // A truncated listing is DISCLOSED, never silent (the silent
+            // half would be a bounded cousin of the TCC-silent-zero class).
+            // Not a strand: the cap gates only the VISIBILITY of never-listed
+            // entries — no emitted item's deletion ever waits on it — and
+            // temp populations churn by design, so cleaning the listed items
+            // itself lets a later scan see further. The wording states that
+            // FACT and never promises a bare "re-scan and retry" (the
+            // deterministic-bound lesson: promise a retry only where a retry
+            // can differ, and say WHY it can).
+            //
+            // The KIND and the sentence follow the CAUSE, never the entry
+            // count (r7, codex C2). The count heuristic that stood here was a
+            // guess: a `readdir` failure landing exactly at the cap printed
+            // "holds more than N first-level entries" though nothing beyond N
+            // was ever proven to exist — and `.enumerationTruncated`'s only
+            // GUI label is the fixed sentence "too many entries — partially
+            // inspected", which is simply false for a failed read. So a read
+            // failure takes the same CLASSIFIED denial route the per-entry
+            // arms use — `record` -> `classify`, which maps EACCES to
+            // `.permissionDenied` and EPERM (with every other errno) to
+            // `.unreadable`; naming only one of the two here would be a
+            // claim the code does not make. `.enumerationTruncated` now
+            // means a cap hit and nothing else.
+            switch listing.truncation {
+            case .budget:
+                issues.append(ScanIssue(
+                    url: root.url, kind: .enumerationTruncated,
+                    detail: "\(root.label) holds more than \(rootEntryLimit) "
+                        + "first-level entries — only the first "
+                        + "\(rootEntryLimit) the directory returned were "
+                        + "inspected; clearing entries, including cleaning "
+                        + "the items listed here, lets a later scan see the "
+                        + "rest"
+                ))
+            case .readFailed(let code):
+                record(.rawErrno(code), at: root.url,
+                       "\(root.label) could not be enumerated completely — "
+                        + "only \(listing.names.count) first-level entries "
+                        + "were read; what follows covers those")
+            case .undecodableName:
+                issues.append(ScanIssue(
+                    url: root.url, kind: .unreadable,
+                    detail: "\(root.label) could not be enumerated completely "
+                        + "— an entry name is not valid text, so only the "
+                        + "\(listing.names.count) first-level entries read "
+                        + "before it were inspected"
+                ))
+            case .none:
+                break
+            }
+
+            // THE PRE-FILTER ALLOWANCE THIS ROOT'S CANDIDATES SHARE (PR #459
+            // codex r16 — AVAILABILITY). Declared HERE, once per root, which
+            // is the whole fix: it used to be re-created per candidate, so
+            // the root-listing cap and the per-candidate cap multiplied
+            // instead of composing. See `defaultPrefilterRootBudget`.
+            var budget = PrefilterBudget(remaining: prefilterRootBudget)
+
+            // utf8-lexicographic, the same comparator the pre-filter walk
+            // uses — never the locale-collating String `<`, whose cost on an
+            // adversarial population was the measured 16 s sort tail.
+            for name in listing.names.sorted(by: {
+                $0.utf8.lexicographicallyPrecedes($1.utf8)
+            }) {
+                if Task.isCancelled { break }
+                // Build under the DECLARED root spelling: the listing hands
+                // back bare basenames, and identity/display/deletion must all
+                // speak the root spelling this scanner declared.
+                let entry = root.url.appendingPathComponent(name)
+
+                // (0) MOUNT-TABLE REFUSAL — decided from the kernel's table
+                // BEFORE any syscall touches the entry (see the harvest
+                // above for why first contact is the hazard; this is
+                // deliberately ahead of the ownership gate too, because the
+                // gate's own `lstat` would BE that first contact). The row
+                // is PRESENT-BUT-DENIED per R11 — the R12 table already
+                // chose that for mount candidates that reached the sizer;
+                // this makes it deterministic instead of population-
+                // dependent (measured: the same mount was visible-denied or
+                // silently absent depending on the foreign entry count).
+                // NOT a strand (the deterministic-bound rule): unmounting is
+                // a real remedy and the row's message says so.
+                // `resolveTargetKeepingLeaf` resolves only the PARENT chain
+                // — the root, whose own leaf the no-follow gate above proved
+                // a real directory, so ITS spelling is fully canonical by
+                // then — so it touches nothing foreign.
+                if mountsUnderRoot.contains(entry.path) {
+                    let identity = provider.resolveTargetKeepingLeaf(entry)
+                    guard seenIdentities.insert(identity.path).inserted else {
+                        continue
+                    }
+                    items.append(Self.mountRow(
+                        entry: entry, identity: identity, root: root,
+                        boundary: entry
+                    ))
+                    continue
+                }
+
+                // (1) KIND DISPATCH, no-follow.
+                let kind: FileSystemIdentityProvider.FileKind
+                switch provider.probeKind(of: entry) {
+                case .absent:
+                    // ENOENT contract: no item, no denial, no issue.
+                    continue
+                case .failed(let code):
+                    record(.rawErrno(code), at: entry,
+                           "temp entry could not be inspected")
+                    continue
+                case .kind(let probed):
+                    kind = probed
+                }
+                switch kind {
+                case .directory, .regularFile:
+                    break
+                case .symlink, .other:
+                    // Sockets/FIFOs/devices and symlinks are skipped SILENTLY
+                    // at root level (epic D4): `/private/tmp` holds live
+                    // top-level sockets, and a symlink's target is not ours.
+                    continue
+                }
+
+                // Identity FIRST (leaf-preserving): the dedupe key, the
+                // display identity and the `stableID` preimage are all this
+                // one derivation — canonical PARENT chain + UNRESOLVED leaf.
+                let identity = provider.resolveTargetKeepingLeaf(entry)
+                guard seenIdentities.insert(identity.path).inserted else {
+                    continue
+                }
+
+                // (2) OWNERSHIP GATE — world-writable root only (epic D12).
+                if root.writability == .worldWritable {
+                    switch provider.ownerProbe(of: entry) {
+                    case .owner(let uid) where uid != euid:
+                        // Genuinely OBSERVED foreign ownership: silently
+                        // excluded. Sticky-directory rules make it
+                        // undeletable, so an item would claim bytes the
+                        // cleaner deterministically cannot free — and a
+                        // per-entry issue for ordinary multi-user background
+                        // noise would bury the real denials below.
+                        continue
+                    case .owner:
+                        break
+                    case .absent:
+                        // Same silent contract as ENOENT-on-child.
+                        continue
+                    case .failed(let code):
+                        record(.rawErrno(code), at: entry,
+                               "temp entry ownership could not be established")
+                        continue
+                    }
+                }
+
+                // (3) STALENESS PRE-FILTER (stage 1).
+                let verdict: StalenessVerdict
+                switch kind {
+                case .directory:
+                    verdict = directoryStaleness(
+                        of: entry, cutoff: cutoff, rootDevice: rootDevice,
+                        mountsUnderRoot: mountsUnderRoot, budget: &budget
+                    )
+                case .regularFile:
+                    // No mount arm for files: a mount point is always a
+                    // directory, and a first-level file shares the root's
+                    // device by construction.
+                    verdict = fileStaleness(of: entry, cutoff: cutoff)
+                case .symlink, .other:
+                    continue // unreachable — filtered above
+                }
+                // The (device, inode) STAGE 1 GATED — what the lock probe
+                // clears and the sizing walk is ABOUT. Stage (6a) proves its
+                // own re-read against this, which is what binds the emitted
+                // report to the object the whole pipeline inspected (PR #459
+                // review r4, codex C1).
+                let gatedIdentity: FileSystemIdentityProvider.Identity
+                switch verdict {
+                case .notStale, .vanished:
+                    continue
+                case .mountPoint:
+                    // The RACING-MOUNT arm's terminal: same row as the
+                    // table arm above (the table missed it — mounted after
+                    // the harvest, or spelled past it), and nothing after
+                    // stage 1's one `lstat` touches the volume: no walk, no
+                    // lock probe, no sizing.
+                    items.append(Self.mountRow(
+                        entry: entry, identity: identity, root: root,
+                        boundary: entry
+                    ))
+                    continue
+                case .mountBoundary(let boundary):
+                    // A volume mounted strictly BELOW the candidate: the
+                    // walk stopped AT the boundary (nothing below it was
+                    // read) and the candidate is the same deterministic
+                    // denied row, never sized.
+                    items.append(Self.mountRow(
+                        entry: entry, identity: identity, root: root,
+                        boundary: boundary
+                    ))
+                    continue
+                case .denied(let url, let cause):
+                    record(cause, at: url,
+                           "staleness of \(entry.lastPathComponent) could not "
+                            + "be established")
+                    continue
+                case .stale(_, let identity):
+                    // The payload date is deliberately DROPPED here: stage 1
+                    // read it before the pre-filter walk and before sizing, and
+                    // stage (6a) below re-reads it afterwards. Carrying the
+                    // pre-walk value forward is what made the evidence string
+                    // report an mtime that was already false. The IDENTITY is
+                    // the opposite case: it must be the PRE-walk observation,
+                    // because it exists to prove the post-sizing read saw the
+                    // same object stage 1 did.
+                    gatedIdentity = identity
+                }
+
+                // (4) COOPERATIVE LOCK PROBE — after the pre-filter, BEFORE
+                // sizing: a candidate already known in use is never traversed
+                // or sized.
+                switch lockProbe(entry) {
+                case .available:
+                    break
+                case .inUse:
+                    continue
+                case .vanished:
+                    continue
+                case .failed(let code):
+                    record(.rawErrno(code), at: entry,
+                           "temp entry could not be opened for the in-use check")
+                    continue
+                }
+
+                // (5) SIZING — always `.deletionTarget` (see `measure`).
+                let report = measure(entry)
+
+                // (6a) OWN-MTIME RE-PROBE (PR #459 review r1). The stage-1
+                // truth table makes the entry's OWN mtime a REQUIRED input —
+                // "fresh own mtime + all contents old" is NOT stale — and
+                // stage 1 read it ONCE, before the pre-filter walk and before
+                // the entire sizing walk. `SizeReport.newestContentDate`
+                // cannot cover for it: it merges REGULAR-FILE mtimes only
+                // (`DirectorySizer.recordRegularFile` is its sole writer), so
+                // a `mkdir`/`unlink`/`rename`/symlink/socket landing in the
+                // candidate during sizing bumps the entry's own mtime and
+                // contributes NOTHING to `newestContentDate`.
+                //
+                // Without this, the identical filesystem fact yielded opposite
+                // verdicts on timing alone: "not stale, silently excluded" one
+                // microsecond before the stage-1 read, "STALE, badged and
+                // BULK-selectable" one microsecond after. `isStale` is the key
+                // of the section's one-click "Select Stale" button, so
+                // its honesty is load-bearing.
+                //
+                // The same no-follow read (`leafDate` → `lstat`) and the SAME
+                // `cutoff`, so the two halves can never disagree on the
+                // boundary. It is placed BEFORE the content check so the cheap
+                // single `lstat` short-circuits and so a suppression names the
+                // right cause.
+                //
+                // CLAIM SCOPE: this NARROWS the window from
+                // "pre-filter → end of sizing" to "end of sizing → emission".
+                // It does not close it — the mtime can change between emission
+                // and the user's click — and like every other read in this
+                // scanner it is path-based (W1/W2/W3).
+                let sizedOwnDate: Date
+                // THE SCAN'S RECORDED IDENTITY (PR #459 review r2, pinned r4)
+                // — read from the SAME `lstat` as the re-probed mtime, so the
+                // two can never describe different objects, and PROVEN EQUAL
+                // to `gatedIdentity` below, so it is also the object stage 1
+                // gated, the lock probe cleared and the sizer walked. It rides
+                // the item to the delete-time re-check, which refuses any
+                // OTHER object standing at this name. What stays open after
+                // the pin: an ABA revert (the same inode observed here and at
+                // stage 1 with a different tree standing in between — the
+                // accepted path-based W2 interior, whose worst case is a mixed
+                // size figure on the object stage 1 really did gate) and the
+                // emission→click window the delete-time re-check covers.
+                let sizedIdentity: FileSystemIdentityProvider.Identity
+                switch leafDate(of: entry) {
+                case .vanished:
+                    // The observable-race contract, unchanged: no item, no
+                    // denial, no issue.
+                    continue
+                case .failed(let cause):
+                    // FAIL CLOSED, matching stage 1's direction exactly: an
+                    // unprovable staleness is "not stale, and VISIBLE". A
+                    // permission change or an out-of-domain metadata read
+                    // mid-scan must not silently downgrade to "still stale".
+                    record(cause, at: entry,
+                           "staleness of \(entry.lastPathComponent) could not "
+                            + "be re-established after sizing")
+                    continue
+                case .dated(let own, _, let probed):
+                    // THE IDENTITY PIN (PR #459 review r4, codex C1). This
+                    // `lstat` is a fresh resolution of the NAME. Without the
+                    // pin, a same-kind swap landing anywhere from stage 1's
+                    // read through this one bound the REPLACEMENT's identity
+                    // to a report that sized the ORIGINAL (or a mix), and the
+                    // delete-time identity re-check then "proved" exactly the
+                    // wrong object — measured: an old, unlocked, user-owned
+                    // 8 KiB directory renamed onto a sized 64 KiB name was
+                    // emitted with the original's bytes and revalidated
+                    // `.allow` on the replacement's inode. A mismatch is the
+                    // vanished/silent-skip contract: nothing the scan gated
+                    // stands at the name, and a re-scan sees whatever does.
+                    guard probed == gatedIdentity else { continue }
+                    guard own < cutoff else {
+                        // Same shape as the content arm below: suppressed as
+                        // fresh, with any sizing denials still surfaced so
+                        // visibility survives without a lying row.
+                        if let ranked = Self.rankedDenial(report.denials) {
+                            record(.sizing(ranked), at: entry,
+                                   "\(entry.lastPathComponent) was excluded "
+                                    + "because it was modified while it was "
+                                    + "being measured, but part of it could "
+                                    + "not be read")
+                        }
+                        continue
+                    }
+                    sizedOwnDate = own
+                    sizedIdentity = probed
+                }
+
+                // (6) FRESHNESS RE-CHECK, before any outcome mapping. Positive
+                // evidence of freshness disqualifies the candidate REGARDLESS
+                // of report cleanliness: an item exists to offer deletion of
+                // stale payload, and a fresh tree offers none. A nil
+                // `newestContentDate` (nothing was enumerable) is not
+                // evidence and passes through to the mapping.
+                if let newest = report.newestContentDate, newest >= cutoff {
+                    // Visibility survives without a lying item row: the
+                    // suppressed candidate's sizing denials still surface.
+                    if let ranked = Self.rankedDenial(report.denials) {
+                        record(.sizing(ranked), at: entry,
+                               "\(entry.lastPathComponent) was excluded as "
+                                + "fresh, but part of it could not be read")
+                    }
+                    continue
+                }
+
+                // (7) OUTCOME MAPPING (+ the clean-walk floor). `ownDate` is
+                // the RE-READ one: the `newestContentDate == nil` evidence
+                // branch prints "last modified N days ago" from it, and the
+                // pre-filter's value would be a literal false statement about
+                // an entry touched during sizing.
+                if let item = reclaimableItem(
+                    entry: entry, identity: identity, root: root,
+                    report: report, ownDate: sizedOwnDate,
+                    scannedIdentity: sizedIdentity, now: now
+                ) {
+                    items.append(item)
+                }
+            }
+
+            // THE SHARED ALLOWANCE'S ONE DISCLOSURE (PR #459 codex r16),
+            // emitted per ROOT after its candidates, never per candidate — a
+            // hostile population would otherwise produce one row per
+            // un-inspected directory. Same kind as the root-listing cap, whose
+            // fixed GUI label ("too many entries — partially inspected") is
+            // true of this too, and the same honest remedy: cleaning what IS
+            // listed frees allowance a later scan spends further along, and
+            // when nothing is listed only external clearing moves it.
+            if budget.wasCutShort {
+                issues.append(ScanIssue(
+                    url: root.url, kind: .enumerationTruncated,
+                    detail: "\(root.label) needed more than "
+                        + "\(prefilterRootBudget) entries of staleness "
+                        + "checking — the directories after that point were "
+                        + "left un-inspected and are not listed; clearing "
+                        + "entries, including cleaning the items listed here, "
+                        + "lets a later scan reach further"
+                ))
+            }
+        }
+
+        return ScanOutcome(items: items, errors: issues)
+    }
+
+    // MARK: - Stage 2 sizing
+
+    /// Stage-2 sizing through the ONE pinned mode. The seam exists so tests
+    /// can observe the mode and stage between-stages races; production calls
+    /// the shared sizer directly.
+    ///
+    /// WHY `.deletionTarget`, and WHAT IT DOES NOT BUY (epic D10 — the honest
+    /// claim scope, restated at the call site it governs): the mode makes the
+    /// sizer lstat-dispatch the leaf without following it, so an entry swapped
+    /// directory→symlink after the pre-filter verdict sizes 0 and is never
+    /// walked — that BETWEEN-STAGES window is closed. The substrate's own
+    /// windows are NOT: (W1) the pre-filter's lstat → its walk, (W2) the
+    /// sizer's `probeKind` → its path-based enumerator open plus every
+    /// per-level descent, (W3) the root `probeKind` gate → the first-level
+    /// listing. Those are ACCEPTED residuals whose worst case is external
+    /// metadata enumeration into a displayed size — never deletion, which
+    /// re-admits no-follow and removes the unresolved leaf. Nothing here makes
+    /// a swap impossible, and no test may claim it does.
+    private func measure(_ entry: URL) -> SizeReport {
+        if let candidateSizer {
+            return candidateSizer(entry, Self.candidateSizingMode)
+        }
+        return sizer.measure(at: entry, mode: Self.candidateSizingMode)
+    }
+
+    // MARK: - Staleness pre-filter (stage 1, R1)
+
+    /// The pre-filter allowance ONE ROOT's candidates SHARE (PR #459 codex
+    /// r16). Passed `inout` down the one call chain that spends it
+    /// (`directoryStaleness` -> `walkForFreshContent`), so the composition of
+    /// the two independent caps is a single number rather than a product.
+    private struct PrefilterBudget {
+        /// Entries this root may still charge to the pre-filter.
+        var remaining: Int
+        /// True once a walk was CUT SHORT by `remaining` hitting zero with
+        /// work still in hand — never merely because the last entry it was
+        /// entitled to happened to be its last. The disclosure the root
+        /// emits is keyed off this, so an exact-fit scan makes no claim of
+        /// partial inspection.
+        private(set) var wasCutShort = false
+
+        /// Charges `count` entries, floored at zero so an over-charge from a
+        /// read the walk did not finish inspecting cannot make `remaining`
+        /// negative (which `min` would then propagate as a negative read
+        /// limit).
+        mutating func charge(_ count: Int) {
+            remaining = max(0, remaining - count)
+        }
+
+        /// Records that the caller had more to inspect and no allowance left.
+        mutating func cutShort() { wasCutShort = true }
+    }
+
+    /// Stage-1 verdict for one candidate.
+    private enum StalenessVerdict {
+        /// Both inputs held; the payload carries the entry's own mtime for
+        /// evidence when sizing dates nothing, and the (device, inode) the
+        /// SAME stage-1 `lstat` saw — the identity every later stage is
+        /// pinned to (PR #459 review r4, codex C1). The lstat already
+        /// returned it; before the pin it was read and DISCARDED here.
+        case stale(ownDate: Date, identity: FileSystemIdentityProvider.Identity)
+        /// Not listed, silently. The full cause list: a fresh own mtime, a
+        /// fresh file found inside, a cap hit without a fresh hit, an
+        /// undecodable basename mid-read, or a regular file under the floor.
+        /// A FAILED read is deliberately NOT here — it takes `.denied`
+        /// (r7, codex C2).
+        case notStale
+        /// ENOENT on the candidate itself — the observable race contract.
+        case vanished
+        /// The verdict is UNPROVABLE (a denial mid-probe): not stale, and
+        /// visible.
+        case denied(URL, DenialCause)
+        /// The candidate ITSELF is on another filesystem (its stage-1 device
+        /// differs from the root's): a mounted volume the kernel-table arm
+        /// missed. Refused visible — never walked, locked or sized.
+        case mountPoint
+        /// A volume is mounted strictly BELOW the candidate, at this path
+        /// (from the kernel table): the walk stopped at the boundary.
+        /// Refused visible — never sized.
+        case mountBoundary(URL)
+    }
+
+    /// The TWO-stage staleness rule's stage 1 for a DIRECTORY candidate
+    /// (epic D6 — do not collapse it):
+    ///
+    /// | entry own mtime | inspected regular files      | verdict          |
+    /// |-----------------|------------------------------|------------------|
+    /// | old             | all old (walk completed)     | STALE → stage 2  |
+    /// | old             | ≥1 fresh (early exit)        | NOT stale        |
+    /// | fresh           | all old                      | NOT stale        |
+    /// | old             | none (empty tree)            | vacuously stale  |
+    /// | any             | cap hit, no fresh hit        | NOT stale        |
+    /// | any             | undecodable basename         | NOT stale        |
+    /// | any             | branch vanished (ENOENT)     | skipped, silent  |
+    /// | any             | denial mid-probe             | NOT stale + issue|
+    ///
+    /// "Denial mid-probe" covers an `opendir` failure AND a `readdir` failure
+    /// alike (r7, codex C2: the readdir half used to fall into the cap-hit
+    /// row and be dropped silently).
+    ///
+    /// The empty-old-directory cell reaches stage 2 and is then never listed:
+    /// zero allocated bytes cannot meet a positive size floor on a clean walk.
+    /// Special-casing emptiness here would fork the rule for zero payoff.
+    ///
+    /// Intermediate DIRECTORY mtimes are deliberately not inputs (the same
+    /// blind spot the sizer accepts). The entry's OWN mtime IS an input, which
+    /// makes this rule STRICTER than `SizeReport.newestContentDate` — that
+    /// merges regular-file mtimes only and never reads directory mtimes
+    /// (`DirectorySizer.recordRegularFile` is its ONLY writer; the enumerator's
+    /// `.directory` arm records mount boundaries and nothing else).
+    ///
+    /// WHICH HALF IS RE-MEASURED, AND WHEN (PR #459 review r2 — the wording
+    /// here claimed "both halves are measured as of sizing completion", which
+    /// is true of only one of them).
+    ///
+    /// The OWN-MTIME half IS re-measured at sizing completion: `scan` re-reads
+    /// it after the sizing walk with this same `leafDate` and this same
+    /// cutoff. That is what closes the case the previous comment described
+    /// without owning — because `newestContentDate` is blind to the own mtime,
+    /// a `mkdir`/`unlink`/`rename`/symlink/socket landing in the candidate
+    /// DURING sizing used to defeat the stricter half entirely.
+    ///
+    /// The CONTENT half is only as fresh as the walk that collected it.
+    /// `SizeReport.newestContentDate` is accumulated per regular file AS the
+    /// sizing enumerator passes it, and stage 1's `walkForFreshContent` runs
+    /// entirely BEFORE sizing and never re-runs — neither is re-read
+    /// afterwards. So a write to `X/a/b/live.log` after the enumerator has
+    /// left `X/a/b` bumps `b`'s mtime, not `X`'s: the post-sizing own-mtime
+    /// re-probe reads old, `newestContentDate` never saw the file, and the row
+    /// still ships `isStale: true`. Intermediate DIRECTORY mtimes are not
+    /// inputs anywhere in this scanner, which is what leaves that escape open.
+    /// It is narrowed at DELETE time, not here: `preDeleteRevalidator` walks
+    /// the tree again from a held descriptor immediately before removal.
+    private func directoryStaleness(
+        of entry: URL, cutoff: Date, rootDevice: UInt64?,
+        mountsUnderRoot: Set<String>,
+        budget: inout PrefilterBudget
+    ) -> StalenessVerdict {
+        switch leafDate(of: entry) {
+        case .vanished:
+            return .vanished
+        case .failed(let cause):
+            return .denied(entry, cause)
+        case .dated(let ownDate, _, let identity):
+            // THE RACING-MOUNT ARM (PR #459 review r5, codex C2): a volume
+            // mounted onto the candidate after the table harvest presents
+            // ITS OWN device to stage 1's `lstat` (an lstat of a mount
+            // point describes the mounted root), so comparing a CHILD
+            // against the candidate could never catch it — the baseline
+            // must be the ROOT's device, read outside the volume. Checked
+            // BEFORE the staleness gates so visibility never depends on
+            // the foreign volume's content. Residual at measured scope: a
+            // same-`st_dev` mount (APFS volume-group firmlinks present ONE
+            // device — `DirectorySizer`'s R15 header) is caught only by
+            // the table arm and by the sizer/cleaner gates behind it.
+            if let rootDevice, identity.device != rootDevice {
+                return .mountPoint
+            }
+            // Metadata churn on the entry itself disqualifies it before any
+            // walk: the own-mtime input fails, so the contents do not matter.
+            guard ownDate < cutoff else { return .notStale }
+            return walkForFreshContent(
+                entry, cutoff: cutoff, ownDate: ownDate, identity: identity,
+                mountsUnderRoot: mountsUnderRoot, budget: &budget
+            )
+        }
+    }
+
+    /// Stage 1 for a REGULAR-FILE candidate: its OWN allocation must meet the
+    /// floor and its OWN mtime must be older than the cutoff. One no-follow
+    /// `lstat` answers both.
+    private func fileStaleness(
+        of entry: URL, cutoff: Date
+    ) -> StalenessVerdict {
+        switch leafDate(of: entry) {
+        case .vanished:
+            return .vanished
+        case .failed(let cause):
+            return .denied(entry, cause)
+        case .dated(let date, let allocatedBytes, let identity):
+            guard allocatedBytes >= thresholds.sizeFloorBytes,
+                  date < cutoff
+            else { return .notStale }
+            return .stale(ownDate: date, identity: identity)
+        }
+    }
+
+    /// The bounded, EARLY-EXIT, no-follow walk under a directory candidate:
+    /// it stops at the FIRST regular file at-or-newer than the cutoff. Nothing
+    /// here sizes anything — the one sizing walk is stage 2's.
+    ///
+    /// Every not-proven-exhaustive outcome returns NOT stale: refusing to
+    /// list is the safe direction. What differs is DISCLOSURE, and it turns
+    /// on the CAUSE, not on the fact of truncation (r7, codex C2 — these two
+    /// sentences used to contradict each other for a failed `readdir`, and
+    /// the first one silently swallowed what the second promised):
+    ///
+    /// - budget cap, undecodable basename → NOT stale, SILENT. Nothing was
+    ///   denied, and nothing beyond the cap was proven to exist.
+    /// - `opendir`/`readdir` failure that is not ENOENT/ENOTDIR → `.denied`,
+    ///   VISIBLE. The staleness of a tree we cannot read is unprovable, and
+    ///   the denial must be surfaced.
+    /// - ENOENT/ENOTDIR at either point → silent skip: the branch vanished
+    ///   under the walk (R11), which is not an impediment.
+    /// - the shared ROOT budget running out, and CANCELLATION → NOT stale,
+    ///   SILENT, for the same reason as the per-candidate cap: nothing was
+    ///   denied. The root budget's exhaustion is disclosed ONCE by the root
+    ///   (`budget.wasCutShort`), never per candidate. Cancellation discloses
+    ///   nothing at all: it is not a property of the tree.
+    ///
+    /// TWO BOUNDS, ONE CLAMP (PR #459 codex r16). `visited` is this
+    /// candidate's own cap; `budget` is the allowance every candidate under
+    /// one root shares. Both are enforced in the SAME place — the `remaining`
+    /// each read is clamped to is the smaller of the two — so the read itself
+    /// can never hand back more than either permits, and the walk charges the
+    /// shared allowance once per read for exactly what it got.
+    ///
+    /// CANCELLATION IS CHECKED HERE, not only between candidates. The scan
+    /// loop's `Task.isCancelled` runs once per candidate, and one candidate
+    /// is up to `prefilterEntryLimit` entries: measured at the production
+    /// 20,000 on a 601k-file staging, that is 46 ms of unabortable work per
+    /// candidate (PR #459 codex r16). The check below is per popped directory
+    /// and per name.
+    private func walkForFreshContent(
+        _ root: URL, cutoff: Date, ownDate: Date,
+        identity: FileSystemIdentityProvider.Identity,
+        mountsUnderRoot: Set<String>,
+        budget: inout PrefilterBudget
+    ) -> StalenessVerdict {
+        var visited = 0
+        var stack: [URL] = [root]
+
+        while let directory = stack.popLast() {
+            if Task.isCancelled { return .notStale }
+            let remaining = min(prefilterEntryLimit - visited, budget.remaining)
+            guard remaining > 0 else {
+                // A directory was popped and never read: there WAS more to
+                // inspect. Attribute it — only the shared allowance is
+                // disclosed, and only when it is the binding one.
+                if budget.remaining <= 0 { budget.cutShort() }
+                return .notStale
+            }
+
+            switch readChildNames(directory, remaining) {
+            case .failed(let code):
+                if code == ENOENT || code == ENOTDIR {
+                    // The branch vanished mid-walk — the benign race, skipped
+                    // like any other ENOENT.
+                    continue
+                }
+                return .denied(directory, .rawErrno(code))
+            case .names(let names, let truncation):
+                // CHARGED HERE, ONCE, for everything the read handed back —
+                // before the disposition below, which has arms that return
+                // (PR #459 codex r16: charging inside the per-name loop left
+                // the `.budget` arm consuming allowance it never paid for, so
+                // the shared bound could never be reached at all and never
+                // disclosed). Deliberately charges names an early return does
+                // not go on to inspect: over-charging can only tighten the
+                // bound, and it keeps the unit "entries this walk asked the
+                // filesystem for".
+                let boundByAllowance = remaining == budget.remaining
+                budget.charge(names.count)
+                // Dispose PER CAUSE, never on a blanket flag (r7, codex C2).
+                // Both directions are "not stale" — the difference is whether
+                // the user is TOLD, and a refusal nobody is told about reads
+                // as "nothing there" (D6).
+                switch truncation {
+                case .readFailed(let code):
+                    // ENOENT/ENOTDIR mid-read is the branch vanishing under
+                    // the walk: the SAME silent disposition the `opendir` arm
+                    // six lines up gives it, and R11's "absence is a silent
+                    // skip at any instant". Everything else — EACCES, EPERM,
+                    // EIO, the measured EINVAL of a yanked volume, the whole
+                    // network/removable family — is a tree we could not read,
+                    // and the denial must be VISIBLE.
+                    if code == ENOENT || code == ENOTDIR { continue }
+                    return .denied(directory, .rawErrno(code))
+                case .budget:
+                    // A cap hit denied nothing: it leaves "every file is old"
+                    // unproven, so the safe direction wins SILENTLY. Turning
+                    // the cap hit into a denial row is the false-denial defect
+                    // r5 codex C5 fixed;
+                    // `testPrefilterCapHitWithoutFreshHitIsNotListed` pins it.
+                    //
+                    // WHICH cap it was decides the ROOT's disclosure (PR #459
+                    // codex r16). The read was clamped to `remaining`, the
+                    // smaller of the per-candidate cap and the shared
+                    // allowance; only when the allowance was the binding one
+                    // does the root say it was cut short.
+                    if boundByAllowance { budget.cutShort() }
+                    return .notStale
+                case .undecodableName:
+                    // A property of the tree rather than an impediment, and
+                    // silent for the same reason.
+                    return .notStale
+                case .none:
+                    break
+                }
+                var pending: [URL] = []
+                for name in names.sorted(by: {
+                    $0.utf8.lexicographicallyPrecedes($1.utf8)
+                }) {
+                    if Task.isCancelled { return .notStale }
+                    // Redundant with the read's own clamp above (which cannot
+                    // hand back more than `prefilterEntryLimit - visited`
+                    // names), kept as the cap's local invariant.
+                    guard visited < prefilterEntryLimit else {
+                        return .notStale
+                    }
+                    visited += 1
+                    let child = directory.appendingPathComponent(name)
+                    // THE WALK'S MOUNT ARM (PR #459 review r5, codex C2):
+                    // membership in the kernel table, checked BEFORE the
+                    // per-child `lstat` — zero syscalls, no first contact
+                    // with the volume, and the whole descent it prevents
+                    // was measured at 19,545 + 19,500 foreign `lstat`s on
+                    // one 22,545-entry mount. The verdict short-circuits to
+                    // the deterministic denied row; nothing below the
+                    // boundary is read. A mount RACING in after the harvest
+                    // is not caught here (its subtree is walked; disclosure
+                    // of foreign metadata into a staleness answer, same
+                    // class as the accepted W1/W2 reads) — the sizer's R15
+                    // boundary record and both delete-time mount gates
+                    // still stand behind this arm unchanged.
+                    if mountsUnderRoot.contains(child.path) {
+                        return .mountBoundary(child)
+                    }
+                    switch provider.probeKind(of: child) {
+                    case .absent:
+                        continue
+                    case .failed(let code):
+                        return .denied(child, .rawErrno(code))
+                    case .kind(.regularFile):
+                        switch leafDate(of: child) {
+                        case .vanished:
+                            continue
+                        case .failed(let cause):
+                            return .denied(child, cause)
+                        case .dated(let date, _, _):
+                            // The newest-content rule: ONE fresh file
+                            // anywhere below disqualifies the whole entry.
+                            if date >= cutoff { return .notStale }
+                        }
+                    case .kind(.directory):
+                        pending.append(child)
+                    case .kind(.symlink), .kind(.other):
+                        // Never followed; neither carries content of its own
+                        // to date (the sizer ignores them for
+                        // `newestContentDate` too).
+                        continue
+                    }
+                }
+                // Pushed reversed so the DFS drains children in the ascending
+                // order they were sorted into.
+                stack.append(contentsOf: pending.reversed())
+            }
+        }
+        return .stale(ownDate: ownDate, identity: identity)
+    }
+
+    /// One no-follow `lstat` read as "when was this last modified, and how
+    /// much does the leaf itself allocate".
+    private enum LeafDate {
+        /// The mtime, the leaf's own allocation, and the (device, inode) the
+        /// SAME `lstat` saw — one read, so the three can never describe
+        /// different objects (PR #459 review r2: the identity is what the
+        /// delete-time re-check proves the entry against).
+        case dated(
+            Date,
+            allocatedBytes: Int64,
+            identity: FileSystemIdentityProvider.Identity
+        )
+        case vanished
+        case failed(DenialCause)
+    }
+
+    /// `leafMetadata` collapses absence, failure and out-of-domain metadata
+    /// into one nil, so the nil path re-probes: the ENOENT contract and the
+    /// errno classification both depend on telling those apart.
+    private func leafDate(of url: URL) -> LeafDate {
+        if let metadata = provider.leafMetadata(of: url) {
+            return .dated(
+                Self.modificationDate(of: metadata),
+                allocatedBytes: metadata.allocatedBytes,
+                identity: FileSystemIdentityProvider.Identity(
+                    device: metadata.device, inode: metadata.inode
+                )
+            )
+        }
+        switch provider.probeKind(of: url) {
+        case .absent:
+            return .vanished
+        case .failed(let code):
+            return .failed(.rawErrno(code))
+        case .kind:
+            // Present and lstat-able, yet its metadata is outside the pinned
+            // value domains — undatable, so its staleness is unprovable.
+            return .failed(.metadataUnavailable)
+        }
+    }
+
+    /// The integer `lstat` mtime as a `Date`. Nanoseconds are in `[0, 1e9)` by
+    /// `LeafMetadata`'s own domain guarantee.
+    static func modificationDate(
+        of metadata: FileSystemIdentityProvider.LeafMetadata
+    ) -> Date {
+        Date(
+            timeIntervalSince1970: TimeInterval(metadata.modifiedSeconds)
+                + TimeInterval(metadata.modifiedNanoseconds) / 1_000_000_000
+        )
+    }
+
+    /// BOUNDED directory read: at most `limit` basenames plus whether the read
+    /// was PROVEN exhaustive; the errno when the directory could not even be
+    /// opened.
+    ///
+    /// `opendir`/`readdir` rather than `FileManager`, deliberately: both
+    /// `contentsOfDirectory` overloads materialize the WHOLE directory before
+    /// any cap can apply, which would let one hostile directory defeat the
+    /// bound of the very probe whose contract is to stay cheap — the exact
+    /// trap `ValuablesDetector.boundedChildNames` was written for. It is
+    /// re-implemented here rather than shared because that helper is private
+    /// to its own bounded probe and widening it is shared-substrate surgery
+    /// this task does not carry; a later consolidation is the right home.
+    ///
+    /// Three traps this must not fall into: `readdir` returns nil for BOTH
+    /// end-of-stream and error (errno is the only discriminator, so it is
+    /// cleared before every call, and the CAUSE it discriminates is carried
+    /// out — see `Truncation`); an undecodable basename fails CLOSED
+    /// (`String(validatingCString:)` — a U+FFFD-repaired name would address a
+    /// DIFFERENT path, and an `lstat` of that lie would report "absent",
+    /// letting the walk call a tree all-old while a fresh file went
+    /// uninspected); and `.`/`..` are skipped while hidden entries are kept.
+    enum BoundedRead {
+        /// `truncation` is nil when the read was PROVEN exhaustive.
+        case names([String], truncation: Truncation?)
+        /// `opendir`/`fdopendir` itself failed — nothing was read at all.
+        case failed(errno: Int32)
+
+        /// WHY a bounded read stopped short.
+        ///
+        /// The causes are NOT interchangeable and a single `truncated: Bool`
+        /// was a defect (PR #459 review r7, codex C2): a budget cap denied
+        /// NOTHING and must stay silent, while a failed `readdir` is a
+        /// denial mid-probe that the caller has to disclose — collapsing
+        /// them made an EIO/EINVAL mid-walk indistinguishable from a benign
+        /// cap hit, and the candidate was dropped with no item and no issue.
+        /// Both sibling implementations of this primitive already keep the
+        /// two apart (`ValuablesDetector.swift:1752` vs `:1767`;
+        /// `OrphanedCachesScanner.swift:2397-2403`).
+        enum Truncation: Equatable {
+            /// The entry budget ended the read. Nothing was denied — and
+            /// nothing beyond it was PROVEN to exist either, so a caller may
+            /// not infer "there are more entries" from this alone.
+            case budget
+            /// A basename that is not valid UTF-8 — fails closed.
+            case undecodableName
+            /// `readdir` ITSELF failed mid-directory. `errno` is cleared
+            /// before every call, so this is the error, never end-of-stream.
+            case readFailed(errno: Int32)
+        }
+    }
+
+    static func boundedChildNames(
+        of directory: URL, limit: Int
+    ) -> BoundedRead {
+        guard let handle = opendir(directory.path) else {
+            return .failed(errno: errno)
+        }
+        defer { closedir(handle) }
+        var names: [String] = []
+        var truncation: BoundedRead.Truncation?
+        while true {
+            errno = 0
+            guard let entry = readdir(handle) else {
+                // nil means end-of-stream OR error; a cleared errno is the
+                // ONLY discriminator, and the cause is carried out rather
+                // than folded into a bare flag (r7, codex C2).
+                if errno != 0 { truncation = .readFailed(errno: errno) }
+                break
+            }
+            let decoded = withUnsafeBytes(of: entry.pointee.d_name) {
+                raw -> String? in
+                guard let base = raw.bindMemory(to: CChar.self).baseAddress
+                else { return nil }
+                return String(validatingCString: base)
+            }
+            guard let name = decoded, !name.isEmpty else {
+                // Undecodable: the directory is already unproven, and reading
+                // on would let a directory full of such names spend the whole
+                // budget.
+                truncation = .undecodableName
+                break
+            }
+            if name == "." || name == ".." { continue }
+            guard names.count < limit else {
+                truncation = .budget
+                break
+            }
+            names.append(name)
+        }
+        return .names(names, truncation: truncation)
+    }
+
+    // MARK: - Cooperative lock probe (R6, epic D2 revised)
+
+    /// The PRODUCTION probe:
+    /// `open(O_RDONLY|O_CLOEXEC|O_NOFOLLOW|O_NONBLOCK)` — valid for files AND
+    /// directories on Darwin — then a kind gate on the descriptor, then a
+    /// non-blocking exclusive `flock`. EWOULDBLOCK is the only in-use answer;
+    /// a successful lock is dropped immediately (closing the descriptor would
+    /// drop it anyway, but the release is explicit so the scan never holds a
+    /// lock while it sizes).
+    ///
+    /// `O_NONBLOCK` IS AN AVAILABILITY GUARD, NOT A PERFORMANCE HINT
+    /// (PR #459 review r3). This open cannot carry `O_DIRECTORY` — a
+    /// regular-file candidate must open too — so it is the driver's `open`
+    /// that runs, and a FIFO with no writer standing at this name BLOCKS
+    /// FOREVER. Measured on this platform: without `O_NONBLOCK` this exact
+    /// flag set did not return in 3s against `mkfifo`, and a REAL
+    /// `scanner.scan(context:)` driven through it never returned; with the
+    /// flag the open returns immediately and `fstat` reports `S_IFIFO`. The
+    /// scan body runs directly on a Swift cooperative-pool worker with no
+    /// timeout anywhere downstream, so a block here consumes that thread for
+    /// the life of the process and strands the whole scan session (the
+    /// `SpaceScanner` task group never drains, so `CacheoutViewModel`'s
+    /// re-entrancy guard — which gates every later scan AND every `clean()` —
+    /// is never released, and the CLI/MCP consumer hangs identically).
+    /// `/private/tmp` is world-writable: the sticky bit stops another user
+    /// renaming your entry, but once its owner unlinks the name any user may
+    /// `mkfifo` it. This is the scan-time twin of the delete-time re-open in
+    /// `revalidateTempEntry`, which carries the same flag for the same reason.
+    ///
+    /// An `open` FAILURE is never "in use": ENOENT/ENOTDIR/ELOOP are race
+    /// skips (ELOOP means the entry became a symlink after dispatch — the
+    /// no-follow flag refusing to open it is the point), and everything else
+    /// joins the raw-errno denial accounting. Any OTHER `flock` errno means
+    /// "no advisory holder proven" and the candidate proceeds.
+    ///
+    /// Scope, honestly: this sees advisory `flock` holders on the CANDIDATE
+    /// INODE only. It does not and cannot see a process holding a descendant
+    /// file open for ordinary reading. It also cannot bound the time the
+    /// `open` itself takes on a slow or wedged filesystem — `O_NONBLOCK`
+    /// removes the FIFO/device wait, not an unresponsive vnode.
+    static func cooperativeLockProbe(_ url: URL) -> LockProbe {
+        let descriptor = open(
+            url.path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK
+        )
+        guard descriptor >= 0 else {
+            let code = errno
+            if code == ENOENT || code == ENOTDIR || code == ELOOP {
+                return .vanished
+            }
+            return .failed(errno: code)
+        }
+        defer { close(descriptor) }
+
+        // THE KIND GATE ON THE SUCCESSFUL OPEN (PR #459 review r3) — the
+        // scan-time twin of `revalidateTempEntry`'s gate (0). `O_NONBLOCK`
+        // converts "hang" into "opened a FIFO"; without this arm that FIFO
+        // would fall through to the `flock` below, which answers ENOTSUP
+        // (45, MEASURED — not EWOULDBLOCK, 35), so the ternary would report
+        // `.available` and carry a special file on to sizing and emission.
+        // `.vanished` is the right disposition and not a new one: root-level
+        // `probeKind` already skips `.other` silently, and everything this
+        // probe can be asked about arrived through that same filter.
+        var status = stat()
+        guard fstat(descriptor, &status) == 0 else {
+            let code = errno
+            return .failed(errno: code)
+        }
+        switch FileSystemIdentityProvider.fileKind(from: status) {
+        case .regularFile, .directory:
+            break
+        case .symlink, .other:
+            return .vanished
+        }
+
+        if flock(descriptor, LOCK_EX | LOCK_NB) == 0 {
+            flock(descriptor, LOCK_UN)
+            return .available
+        }
+        return errno == EWOULDBLOCK ? .inUse : .available
+    }
+
+    // MARK: - Denial classification (R5, epic D8 r6)
+
+    /// WHERE a denial came from — the operation class its classification is
+    /// derived from (see the file header). Never a bare errno on its own: the
+    /// provenance is what makes `.tccDenied` assertable or not.
+    private enum DenialCause {
+        /// Raw-errno probes: `probeKind`, `ownerProbe`, the pre-filter's
+        /// `lstat`/`opendir`, the lock probe's `open`.
+        case rawErrno(Int32)
+        /// A Foundation throw carrying the Cocoa/POSIX `NSUnderlyingErrorKey`
+        /// chain — the ONLY provenance-bearing signal available.
+        case cocoaChain(Error)
+        /// Present and lstat-able, but its metadata is unusable.
+        case metadataUnavailable
+        /// A `SizeDenial` from the stage-2 walk, folded into the per-root
+        /// accounting (freshness-suppressed candidates).
+        case sizing(SizeDenial)
+    }
+
+    /// The ONE classifier — kind + detail, per operation class. No blanket
+    /// rewrite in either direction (epic D8 r6).
+    private static func classify(
+        _ cause: DenialCause, at url: URL
+    ) -> (kind: ScanIssue.Kind, detail: String) {
+        switch cause {
+        case .rawErrno(let code):
+            let text = String(cString: strerror(code))
+            switch code {
+            case EACCES:
+                // Unambiguous BSD permissions.
+                return (.permissionDenied, "\(url.path): \(text)")
+            case EPERM:
+                // NEUTRAL on purpose: a bare errno carries no provenance, so
+                // neither a privacy denial nor a filesystem refusal may be
+                // asserted. Sticky-directory rules govern unlink/rename — they
+                // prove nothing about an lstat traversal.
+                return (.unreadable, "\(url.path): \(text) — the cause could "
+                        + "not be established (a privacy denial and a "
+                        + "filesystem refusal are indistinguishable here)")
+            default:
+                return (.unreadable, "\(url.path): \(text)")
+            }
+        case .cocoaChain(let error):
+            // The provenance-bearing class: preserve a chain-proven TCC
+            // signal — it is a real grant hint, and rewriting it would
+            // suppress the user's remedy.
+            let denial = DirectorySizer.classifyDenial(error, at: url)
+            switch denial.kind {
+            case .tcc:
+                return (.tccDenied, "\(url.path): \(denial.detail)")
+            case .permission:
+                return (.permissionDenied, "\(url.path): \(denial.detail)")
+            // `.unaddressablePath` joins the neutral arm (PR #458 added the
+            // case; this scanner predates it). It means the tree is nested
+            // deeper than an absolute path can address, so the SIZER could
+            // not read it — `.unreadable` is the honest kind, and the detail
+            // carries the real cause. Deletion is unaffected: the remover is
+            // descriptor-relative and handles such trees whole.
+            case .metadata, .other, .unaddressablePath:
+                return (.unreadable, "\(url.path): \(denial.detail)")
+            }
+        case .metadataUnavailable:
+            return (.unreadable, "\(url.path): metadata unavailable")
+        case .sizing(let denial):
+            // `SizeDenial.Kind.tcc` conflates chain-proven denials with
+            // raw-probe guesses and the only discriminator is a message
+            // string, so it stays NEUTRAL here; the detail is preserved
+            // verbatim so nothing is hidden.
+            switch denial.kind {
+            case .permission:
+                return (.permissionDenied,
+                        "\(denial.url.path): \(denial.detail)")
+            case .tcc, .metadata, .other, .unaddressablePath:
+                return (.unreadable, "\(denial.url.path): \(denial.detail)")
+            }
+        }
+    }
+
+    private static func denialIssue(
+        _ cause: DenialCause, at url: URL, note: String
+    ) -> ScanIssue {
+        let classified = classify(cause, at: url)
+        return ScanIssue(
+            url: url, kind: classified.kind,
+            detail: "\(note) — \(classified.detail)"
+        )
+    }
+
+    /// The denial that wins the item's single `scanError` slot.
+    ///
+    /// `.permission` outranks `.tcc` here — deliberately INVERTED against the
+    /// orphaned-caches precedence, whose rationale ("the TCC grant hint is the
+    /// most actionable error") does not transfer: under epic D8 r6 a
+    /// `.tcc`-kinded `SizeDenial` is NOT assertable as a TCC denial at this
+    /// surface, so it maps to a neutral error, and letting it outrank a
+    /// provably actionable permission denial would hide the actionable one.
+    private static func rankedDenial(_ denials: [SizeDenial]) -> SizeDenial? {
+        denials.first { $0.kind == .permission } ?? denials.first
+    }
+
+    // MARK: - Item mapping (R8 + R12)
+
+    /// One surviving candidate → one `ReclaimableItem`, or `nil` when a CLEAN
+    /// walk left it under the size floor.
+    ///
+    /// POST-SIZING OUTCOME TABLE (R12) — a clean pre-filter does not guarantee
+    /// a clean sizing walk (concurrent churn), and mapping is preferred over
+    /// suppression because visibility is the doctrine here. Spam is
+    /// structurally impossible: systematic denials (other users' 0700 dirs)
+    /// die at the PRE-FILTER, so this table only ever covers the
+    /// pre-filter→sizing race window.
+    ///
+    /// | sizing result                   | state             | components | record            | scanError        |
+    /// |---------------------------------|-------------------|------------|-------------------|------------------|
+    /// | ANY mount boundary              | `.denied`         | ZERO       | `.deniedUnmeasured`| names the boundary|
+    /// | denial(s), measured something   | `.partiallyDenied`| real       | `.measured`       | classified denial |
+    /// | denial(s), measured nothing     | `.denied`         | ZERO       | `.deniedUnmeasured`| classified denial |
+    /// | clean walk                      | `.measured`       | real       | `.measured`       | NONE              |
+    ///
+    /// The mount-boundary row's REACH narrowed in PR #459 r5: a mount known
+    /// to the kernel table or visible in the candidate's stage-1 device
+    /// terminates at `mountRow` before the lock probe and the sizer run, so
+    /// this mapping's boundary arm covers only a mount arriving DURING
+    /// sizing. The terminal row is the same either way.
+    ///
+    /// The size FLOOR is trusted only on a clean walk: an anomaly row is
+    /// emitted regardless of the floor, because an unmeasurable tree cannot be
+    /// honestly floor-evaluated. `.empty` is therefore unreachable — a clean
+    /// walk that measured nothing cannot meet a positive floor (this is what
+    /// keeps the vacuously-stale empty-old-directory cell off the list).
+    private func reclaimableItem(
+        entry: URL,
+        identity: URL,
+        root: EphemeralTempRoot,
+        report: SizeReport,
+        ownDate: Date,
+        scannedIdentity: FileSystemIdentityProvider.Identity,
+        now: Date
+    ) -> ReclaimableItem? {
+        let hasBoundary = report.rootMountBoundary
+            || !report.mountBoundaries.isEmpty
+        let measuredAnything = report.itemCount > 0 || report.measuredBytes > 0
+
+        let state: ScanState
+        if hasBoundary {
+            state = .denied
+        } else if !report.denials.isEmpty {
+            state = measuredAnything ? .partiallyDenied : .denied
+        } else {
+            // CLEAN walk: the only arm the floor governs.
+            guard report.measuredBytes >= thresholds.sizeFloorBytes else {
+                return nil
+            }
+            state = .measured
+        }
+        let deletable = state == .measured || state == .partiallyDenied
+
+        // Exactly ONE root record; `.deniedUnmeasured` iff nothing deletable
+        // was established. `requestedURL` is the UNRESOLVED entry (the
+        // deletion input), `resolvedURL` the leaf-preserving identity the item
+        // also displays — the validator binds all three to one capture.
+        let record = RootScanRecord(
+            requestedURL: entry,
+            resolvedURL: identity,
+            status: state == .denied ? .deniedUnmeasured : .measured
+        )
+
+        return ReclaimableItem(
+            id: ReclaimableItem.stableID(
+                scannerID: Self.registeredID, canonicalPath: identity.path
+            ),
+            scannerID: Self.registeredID,
+            displayName: entry.lastPathComponent,
+            // The byte split rides VERBATIM from the `.deletionTarget` report:
+            // temp roots can hold hardlinks, whose bytes MAY not be freed by
+            // deleting one link — forcing `estimatedUpToBytes` to zero would
+            // claim a certainty the walk did not establish. A non-deletable
+            // state publishes ZERO components: every consumer reads them as
+            // "deletion frees these", and deletion is refused.
+            exactBytes: deletable ? report.exactAllocatedBytes : 0,
+            estimatedUpToBytes: deletable ? report.estimatedUpToBytes : 0,
+            // Only the honest sparse direction (logical exceeding allocated —
+            // deletion frees LESS than the apparent size); block-rounding
+            // noise stays nil.
+            logicalBytes: deletable
+                && report.logicalBytes > report.measuredBytes
+                ? report.logicalBytes : nil,
+            itemCount: deletable ? report.itemCount : 0,
+            url: identity,
+            declaredDisplayPath: entry.path,
+            rootRecords: [record],
+            state: state,
+            scanError: Self.scanError(
+                for: report, candidate: entry, hasBoundary: hasBoundary
+            ),
+            // Temp payload is another process's business until the user says
+            // otherwise: never `.safe`.
+            risk: .review,
+            evidence: Self.evidence(
+                root: root, report: report, ownDate: ownDate, now: now
+            ),
+            rebuildNote: nil,
+            // `.removeItem` — the entry ITSELF is deleted (the Trash toggle is
+            // honored by the cleaner like any other item, fn-6.3).
+            action: .removeItem,
+            admission: .containerItem(
+                originContainer: root.url, requestedTargetURL: entry
+            ),
+            // Never preselected. Note the opt-in is not strictly per entry:
+            // the section ships a "Select Stale" button whose handler
+            // selects EVERY `isStale == true` selectable row in one click
+            // (`ScannerItemSection.swift` → `CacheoutViewModel.selectStale`),
+            // so `isStale` is a BULK-SELECTION KEY and its honesty is
+            // load-bearing.
+            defaultSelected: false,
+            // WHAT THIS FLAG ACTUALLY DOES (PR #459 review r1 — the previous
+            // comment here asserted a mechanism this code does not have).
+            //
+            // It is the CLI SMART-CLEAN EXCLUSION and nothing else: the only
+            // two consumers are `CacheoutViewModel.safeAutoSelectable` (which
+            // also requires `risk == .safe`, so `.review` already excludes
+            // temp items there) and `CLIHandler.smartCleanCandidates`, which
+            // DOES admit `.review` items — so this `false` is the one thing
+            // keeping temp entries out of an unattended smart clean.
+            //
+            // IT HAS NO BEARING ON THE DELETE-TIME REVALIDATOR DISPATCH. That
+            // dispatch (`CacheCleaner.preDeleteOutcome`) reads the scanner-ID
+            // registry and the item's `requiresPreDeleteRevalidation` marker;
+            // it never reads this flag. The ten `build_artifacts` rules ship
+            // `automaticCleanEligible: false` and every one of their items is
+            // revalidated. Temp items are revalidated too — see
+            // `preDeleteRevalidator` at the foot of this file.
+            automaticCleanEligible: false,
+            // Every emitted item passed the two-stage staleness rule AND the
+            // post-sizing freshness re-check. Their AS-OF times differ and the
+            // comment here used to flatten them (PR #459 review r2): the
+            // entry's OWN mtime is re-read at sizing COMPLETION, while the
+            // content half is only as fresh as the walk that collected it —
+            // `newestContentDate` is accumulated per file DURING sizing and
+            // stage 1's walk ran before it. See `directoryStaleness` for the
+            // escape that leaves open. Both are re-established against the
+            // current filesystem immediately before deletion by
+            // `preDeleteRevalidator` — this flag is a scan-time fact, not a
+            // delete-time one.
+            isStale: true,
+            // The BRACES half of the belt-and-braces dispatch: this scanner
+            // declares a revalidator whose applicability is "every temp item",
+            // so every emitted item must carry the marker or
+            // `SpaceScanner.revalidationMarkerViolation` malforms the whole
+            // outcome.
+            requiresPreDeleteRevalidation: true,
+            // THE OBJECT THIS ROW IS ABOUT (PR #459 review r2; r4 closed its
+            // front edge). Without it the delete-time re-check re-established
+            // four PROPERTIES of whatever stood at the name and never asked
+            // whether it was the same thing — a replacement's inode got bound
+            // and destroyed while the row quoted the scanned entry's bytes.
+            // r2's capture point was the POST-sizing lstat, so a swap landing
+            // before it recorded the replacement and the row was a chimera
+            // (the sized object's bytes, the replacement's identity); since
+            // r4 the identity is pinned to STAGE 1's observation, so this
+            // value provably names the object every scan stage inspected.
+            scannedTargetIdentity: scannedIdentity
+        )
+    }
+
+    /// The single `scanError`, TOTAL by construction for every denied-family
+    /// state (a `.denied`/`.partiallyDenied` item with a nil error is a
+    /// state-coherence violation that malforms the WHOLE outcome).
+    ///
+    /// A mount boundary wins the slot per the R12 table: no grant lifts it,
+    /// and it is why the item publishes zero components at all.
+    private static func scanError(
+        for report: SizeReport, candidate: URL, hasBoundary: Bool
+    ) -> ScanError? {
+        if hasBoundary {
+            // Reachable only for a mount that arrives DURING sizing: the
+            // table arm, the candidate-device arm and the walk arm (scan
+            // stages 0/1/3) all terminate earlier with `mountRow`. Same
+            // sentences, same remedy — one event, whichever layer saw it.
+            //
+            // `mountBoundaries.first` is empty exactly when the boundary IS
+            // the candidate root, so the fallback keeps this total.
+            let boundary = report.mountBoundaries.first ?? candidate
+            var message = report.rootMountBoundary
+                ? "\(boundary.path): entry is a mount point — not measured; "
+                    + "deletion would be refused"
+                : "mount boundary at \(boundary.path) — subtree not measured; "
+                    + "deletion would be refused"
+            if report.itemCount > 0 || report.measuredBytes > 0 {
+                let floor = CleanupReport.componentPhrase(
+                    exact: report.exactAllocatedBytes,
+                    estimatedUpTo: report.estimatedUpToBytes
+                )
+                message += " (\(floor) measured beside the boundary is not "
+                    + "reclaimable while the boundary remains)"
+            }
+            message += ". \(mountRemedy)"
+            return ScanError(kind: .other, message: message)
+        }
+        guard let ranked = rankedDenial(report.denials) else { return nil }
+        // Per-kind classification (epic D8 r6, class (c)): a `.permission`
+        // denial is assertable; a `.tcc`-kinded one is NOT at this surface, so
+        // it becomes a NEUTRAL `.other` with its detail preserved verbatim.
+        return ScanError(
+            kind: ranked.kind == .permission ? .permissionDenied : .other,
+            message: "\(ranked.url.path): \(ranked.detail)"
+        )
+    }
+
+    /// The mount row's remedy sentence, spelled ONCE (the deterministic-bound
+    /// rule: a refusal's message must say whether a retry can differ, and for
+    /// a mount it genuinely can — unmounting is a user act that clears it;
+    /// nothing here is a permanent strand).
+    static let mountRemedy =
+        "Eject or unmount the volume, then re-scan to see what stands at "
+        + "this name"
+
+    /// The kernel-spelled mount points strictly under `root` — one table
+    /// filter per root, consumed by the three candidate-side mount arms.
+    /// The EXACT root is excluded DELIBERATELY: the over-mounted-root arm
+    /// at the head of the root loop refuses a table-mounted root from the
+    /// same snapshot before any syscall touches it, so by the time this set
+    /// is consulted the root is known not to be in the table (r6, codex C2).
+    static func mountPoints(
+        in table: [String], strictlyUnder root: URL
+    ) -> Set<String> {
+        let prefix = root.path.hasSuffix("/") ? root.path : root.path + "/"
+        return Set(table.filter { $0.hasPrefix(prefix) })
+    }
+
+    /// One MOUNT row: PRESENT-BUT-DENIED, deterministically (PR #459 review
+    /// r5, codex C2 — the R11 disposition question, answered rather than
+    /// left to the foreign volume's population).
+    ///
+    /// WHY VISIBLE AND NOT A SILENT SKIP: the R12 table already chose
+    /// `.denied` + zero components for a mount candidate that reached the
+    /// sizer, so a mount was ALREADY a visible row — but only when the
+    /// foreign tree happened to be small and all-old enough for the walk to
+    /// finish (measured: 303 stale foreign entries produced the row, 22,545
+    /// — or one fresh file — produced silence). Foreign content must not
+    /// steer scan output. A mounted volume standing where a temp entry was
+    /// expected is a fact the user can act on, and the message names the
+    /// act; `.denied` rows are unselectable in every surface and both
+    /// delete-time mount gates stand behind this row unchanged.
+    ///
+    /// Zero components, `isStale: nil` (no staleness was proven and the row
+    /// must never join Select Stale), `scannedTargetIdentity: nil` (nothing
+    /// was gated for deletion — the row offers none; a forged attempt is
+    /// refused by the cleaner's own mount gate and the revalidator's
+    /// missing-identity refusal, in that order).
+    private static func mountRow(
+        entry: URL, identity: URL, root: EphemeralTempRoot, boundary: URL
+    ) -> ReclaimableItem {
+        let isRootBoundary = boundary.path == entry.path
+        let message = isRootBoundary
+            ? "\(boundary.path): entry is a mount point — not measured; "
+                + "deletion would be refused. \(mountRemedy)"
+            : "mount boundary at \(boundary.path) — subtree not measured; "
+                + "deletion would be refused. \(mountRemedy)"
+        return ReclaimableItem(
+            id: ReclaimableItem.stableID(
+                scannerID: registeredID, canonicalPath: identity.path
+            ),
+            scannerID: registeredID,
+            displayName: entry.lastPathComponent,
+            exactBytes: 0,
+            estimatedUpToBytes: 0,
+            logicalBytes: nil,
+            itemCount: 0,
+            url: identity,
+            declaredDisplayPath: entry.path,
+            rootRecords: [RootScanRecord(
+                requestedURL: entry,
+                resolvedURL: identity,
+                status: .deniedUnmeasured
+            )],
+            state: .denied,
+            scanError: ScanError(kind: .other, message: message),
+            risk: .review,
+            evidence: isRootBoundary
+                ? "a volume is mounted at this entry — its contents belong "
+                    + "to that volume and were not measured"
+                : "a volume is mounted inside this entry — the subtree was "
+                    + "not measured",
+            rebuildNote: nil,
+            action: .removeItem,
+            admission: .containerItem(
+                originContainer: root.url, requestedTargetURL: entry
+            ),
+            defaultSelected: false,
+            automaticCleanEligible: false,
+            isStale: nil,
+            // The marker rides EVERY item of this scanner (the revalidator's
+            // applicability is `{ _ in true }`, and fn-2 validation malforms
+            // an unmarked outcome).
+            requiresPreDeleteRevalidation: true,
+            scannedTargetIdentity: nil
+        )
+    }
+
+    /// The item's one evidence string: where it lives, how old its newest
+    /// dated content is, and the root's NON-CONTRACTUAL OS-cleanup line
+    /// (fn-6.1, epic D7 revised — nothing here promises what macOS will or
+    /// will not delete, and no observed reaper mechanics appear in shipped
+    /// copy).
+    private static func evidence(
+        root: EphemeralTempRoot, report: SizeReport, ownDate: Date, now: Date
+    ) -> String {
+        let ageLine: String
+        if let newest = report.newestContentDate {
+            ageLine = "newest content is \(days(from: newest, to: now)) days old"
+        } else {
+            // Nothing datable was enumerated (an empty, denied or
+            // boundary-voided tree): the entry's own mtime is the honest
+            // figure, and it is labelled as such.
+            ageLine = "last modified \(days(from: ownDate, to: now)) days ago"
+        }
+        return "in \(root.label); \(ageLine); \(root.cleanupEvidence)"
+    }
+
+    /// Whole days between two instants, floored at 0 (a clock that moved
+    /// backwards must not print a negative age).
+    private static func days(from date: Date, to now: Date) -> Int {
+        max(0, Int(now.timeIntervalSince(date) / 86_400))
+    }
+
+    private static func describe(
+        _ kind: FileSystemIdentityProvider.FileKind
+    ) -> String {
+        switch kind {
+        case .regularFile: return "regular file"
+        case .directory: return "directory"
+        case .symlink: return "symlink"
+        case .other: return "special file"
+        }
+    }
+
+    // MARK: - Delete-time revalidation (PR #459 review r1)
+
+    /// This scanner's DELETE-TIME revalidator, following the
+    /// `build_artifacts` precedent exactly (`BuildArtifactsScanner.swift`).
+    ///
+    /// WHY IT EXISTS — the decision it replaces. Epic D1 recorded that these
+    /// items "are simply never applicable" to the revalidation seam because
+    /// they set `automaticCleanEligible: false`, carry no marker and declare
+    /// no revalidator. Only the THIRD conjunct did any work: the dispatch
+    /// (`CacheCleaner.preDeleteOutcome`) is keyed by `item.scannerID` and
+    /// reads the marker; it never reads `automaticCleanEligible` (the ten
+    /// `automaticCleanEligible: false` build-artifact rules whose items ALL
+    /// revalidate are the counter-example in this same repo). So the residual
+    /// was accepted on a mechanism the code did not have, and what actually
+    /// routed temp items around the seam was the nil revalidator alone.
+    ///
+    /// WHAT THE NIL COST. With no verdict the cleaner set `probedObject =
+    /// nil`, which (a) skipped the final identity check entirely, (b) made
+    /// `DepthSafeRemoval.proveInspectedRoot` return without comparing an
+    /// inode, and (c) routed the GUI's DEFAULT Trash disposal to the
+    /// identity-blind `TrashDisposal.dispose(_:containedIn:…)` overload, which
+    /// binds whatever stands at the name NOW. Nothing between the scan and the
+    /// destructive call re-read a single fact about the entry's CONTENT: the
+    /// four gates that made deletion acceptable (ownership, the two-stage
+    /// staleness rule, the cooperative lock probe, the freshness re-check) all
+    /// ran at scan time and none of them re-ran.
+    ///
+    /// WHAT THIS DOES. Every temp item is re-inspected from a HELD
+    /// DESCRIPTOR, in the scan's pinned order, with the object's own identity
+    /// checked first: kind → RECORDED IDENTITY → ownership → own-mtime
+    /// staleness → cooperative `flock` → the size-floor qualification →
+    /// fresh content below (for a directory the floor is judged on the walk's
+    /// own deduped allocated sum, so it comes with the content verdict —
+    /// PR #459 review r4, codex C4: the list here used to omit the floor,
+    /// which the file arm re-checked and the directory arm did not). Any of
+    /// them failing is a fail-closed `.refuse` with a CLEARABLE sentence —
+    /// these conditions are non-deterministic, so the "re-scan" remedy the UI
+    /// prints genuinely can differ (unlike a fixed depth cap, which a re-scan
+    /// reproduces identically for ever).
+    ///
+    /// THE IDENTITY CHECK IS WHAT MAKES THE OTHERS MEAN ANYTHING (PR #459
+    /// review r2). Ownership, staleness, the lock probe and the content walk
+    /// each re-establish a PROPERTY of whatever now answers to the name; only
+    /// `item.scannedTargetIdentity` says it is the same OBJECT. Without it an
+    /// old, unlocked, user-owned tree moved onto the name after the scan
+    /// passed all four gates and was deleted in the scanned entry's place.
+    ///
+    /// WHAT IS ACTUALLY CONSTRUCTION STATE, stated exactly (the comment here
+    /// used to claim "the SAME clock … so scan-time and delete-time can never
+    /// disagree on the boundary"): the THRESHOLDS and the CLOCK SOURCE are
+    /// construction state; the BOUNDARY IS NOT. Production injects
+    /// `now: { Date() }`, so `cutoff = now() - staleAge` is re-evaluated on
+    /// every verdict and ADVANCES between scan and delete — in the PERMISSIVE
+    /// direction, since a later cutoff makes more things count as stale. An
+    /// entry that was stale at scan time is therefore still stale here unless
+    /// it was touched; the boundary can never move the other way. Tests inject
+    /// a fixed clock, which is what pins the thresholds side.
+    ///
+    /// AND THE ALLOW CARRIES A BINDING — FOR BOTH KINDS (PR #459 review r5:
+    /// this paragraph used to describe only `.directory`, while the file arm
+    /// returned an identity-free `.noDirectoryTree` and neither disposal
+    /// could prove the leaf it destroyed). `.directory(identity)` and
+    /// `.nonDirectoryLeaf(identity)` each carry the `fstat` of the descriptor
+    /// this revalidation held open the whole time — not a re-`lstat` of the
+    /// path, which is exactly what an attacker re-points. That is what makes
+    /// `probedObject` non-nil in the cleaner: the removal then proves the
+    /// object it is about to destroy (the opened inode for a directory, an
+    /// `fstatat` under the proved parent for a leaf) and the Trash arm proves
+    /// the object on both sides of the move. A revalidator that refused
+    /// correctly but returned `.unestablished` would bind nothing, and per
+    /// house doctrine that is not a binding at all.
+    var preDeleteRevalidator: PreDeleteRevalidator? {
+        Self.preDeleteRevalidator(
+            roots: roots, thresholds: thresholds, provider: provider,
+            prefilterEntryLimit: prefilterEntryLimit, now: now
+        )
+    }
+
+    /// The revalidator VALUE, constructible without a scanner instance so a
+    /// cleaner built directly (tests, headless paths) can register exactly
+    /// what production registers.
+    ///
+    /// APPLICABILITY: `{ _ in true }` — EVERY temp item, no flag anywhere in
+    /// the predicate (the `build_artifacts` rule verbatim). The predicate is
+    /// pure and does no I/O: it is also called during scan-time validation.
+    static func preDeleteRevalidator(
+        roots: [EphemeralTempRoot],
+        thresholds: EphemeralTempSweepConfig.Thresholds,
+        provider: FileSystemIdentityProvider,
+        prefilterEntryLimit: Int =
+            EphemeralTempScanner.defaultPrefilterEntryLimit,
+        now: @escaping @Sendable () -> Date = { Date() }
+    ) -> PreDeleteRevalidator {
+        // The ownership gate is scoped by the DECLARED writability class, the
+        // same way the scan scopes it — captured here as a plain path set so
+        // the closure stays `Sendable` and reads no scanner state.
+        let worldWritableRoots = Set(
+            roots.filter { $0.writability == .worldWritable }.map(\.url.path)
+        )
+        let staleAge = thresholds.staleAge
+        let sizeFloorBytes = thresholds.sizeFloorBytes
+        let entryLimit = prefilterEntryLimit
+        return PreDeleteRevalidator(
+            requiresRevalidation: { _ in true },
+            revalidate: { item, _ in
+                guard case .containerItem(let origin, let target) =
+                        item.admission
+                else {
+                    // Structurally unreachable (the validator and the cleaner
+                    // both refuse a `.removeItem` item without the container
+                    // descriptor) — fail closed rather than assume a target.
+                    return .refuse(
+                        reason: "refused: a temp item without a "
+                            + "container-item target cannot be re-inspected "
+                            + "before deletion",
+                        valuables: [], acknowledgementToken: nil
+                    )
+                }
+                guard let scanned = item.scannedTargetIdentity else {
+                    // FAIL CLOSED. Every item this scanner emits records one
+                    // (see `reclaimableItem` — since r4 pinned to the object
+                    // STAGE 1 gated, not merely the post-sizing lstat's), so
+                    // an item reaching here without it was not produced by
+                    // this scanner's scan — and an identity the re-check
+                    // cannot compare is one it cannot prove.
+                    return .refuse(
+                        reason: "\(target.path): this temp item carries no "
+                            + "record of the object the scan inspected, so "
+                            + "the delete-time re-check cannot prove it is "
+                            + "still the same one — refused, nothing deleted; "
+                            + "re-scan required",
+                        valuables: [], acknowledgementToken: nil
+                    )
+                }
+                return revalidateTempEntry(
+                    at: target,
+                    scanned: scanned,
+                    ownershipGated: worldWritableRoots.contains(origin.path),
+                    cutoff: now().addingTimeInterval(-staleAge),
+                    sizeFloorBytes: sizeFloorBytes,
+                    entryLimit: entryLimit,
+                    provider: provider
+                )
+            }
+        )
+    }
+
+    /// The delete-time re-inspection of ONE candidate, anchored on a
+    /// descriptor held for the whole verdict.
+    private static func revalidateTempEntry(
+        at target: URL,
+        scanned: FileSystemIdentityProvider.Identity,
+        ownershipGated: Bool,
+        cutoff: Date,
+        sizeFloorBytes: Int64,
+        entryLimit: Int,
+        provider: FileSystemIdentityProvider
+    ) -> PreDeleteVerdict {
+        func refuse(_ reason: String) -> PreDeleteVerdict {
+            .refuse(reason: reason, valuables: [], acknowledgementToken: nil)
+        }
+
+        // THE HELD DESCRIPTOR. One syscall, so there is no window between
+        // deciding what stands here and taking hold of it. `O_NOFOLLOW` is
+        // what makes the answer trustworthy: an entry swapped for a symlink
+        // since the scan fails here (ELOOP) instead of being followed. Valid
+        // for directories AND regular files on Darwin.
+        //
+        // (PR #459 review r3: the sentence that stood here called this "the
+        // same open the scan's own lock probe performs". When it was written
+        // the two flag sets differed by exactly `O_NONBLOCK` — the flag this
+        // very block is about — and the one it named as identical was the one
+        // that could block. `cooperativeLockProbe` now carries `O_NONBLOCK`
+        // too, so the flag sets ARE identical again; naming the relationship
+        // is left to that function's own comment rather than restated here,
+        // where it can drift a second time.)
+        //
+        // `O_NONBLOCK` IS AN AVAILABILITY GUARD, NOT A PERFORMANCE HINT
+        // (PR #459 review r2). This open cannot carry `O_DIRECTORY` — a
+        // regular-file candidate must open too — so it is the driver's `open`
+        // that runs, and a FIFO standing at this name BLOCKS FOREVER waiting
+        // for a writer. Measured on this platform: the identical flag set
+        // without `O_NONBLOCK` did not return in 3s against `mkfifo`; with it
+        // the open returns immediately and `fstat` reports `S_IFIFO`.
+        // `/private/tmp` is world-writable (this scanner's own root comment
+        // notes it holds live top-level sockets), so any user can plant one at
+        // a scanned name. There is no timeout anywhere downstream:
+        // `CacheCleaner` is an `actor` and `preDeleteOutcome` calls
+        // `revalidate` synchronously, so a block here wedges the clean and
+        // every later message to that actor for the life of the process.
+        // `O_NONBLOCK` changes nothing for a directory or a regular file; it
+        // only converts "hang" into "opened, and refused below as the wrong
+        // kind of object". `DepthSafeRemoval` documents the `O_DIRECTORY`
+        // half of the same hazard.
+        let descriptor = open(
+            target.path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK
+        )
+        guard descriptor >= 0 else {
+            let code = errno
+            return refuse(
+                "\(target.path): this temp entry could not be re-opened for "
+                    + "its delete-time re-check "
+                    + "(\(String(cString: strerror(code)))) — refused, "
+                    + "nothing deleted; re-scan required"
+            )
+        }
+        defer { close(descriptor) }
+
+        var status = stat()
+        guard fstat(descriptor, &status) == 0 else {
+            return refuse(
+                "\(target.path): this temp entry would not describe itself at "
+                    + "delete time — refused, nothing deleted; re-scan required"
+            )
+        }
+        // (0) THE KIND GATE, and it is a DELETE-TIME fact (PR #459 review r2).
+        // The comment that stood on the trailing arm called a special file
+        // "unreachable, because the scan never emits one" — a scan-time fact
+        // asserted inside the one function whose entire premise is that
+        // scan-time facts expire. It is reachable: a FIFO opens successfully
+        // under `O_NONBLOCK` (that is what the flag is for), and so does a
+        // device node whose driver admits the open (measured: `/dev/null`);
+        // `fileKind(from:)` maps every non-REG/DIR/LNK `S_IFMT` to `.other`.
+        // (A bound AF_UNIX socket never gets this far — `open(2)` fails
+        // EOPNOTSUPP, errno 102, measured with and without `O_NONBLOCK` — so
+        // it is refused ABOVE at the open, not here; r3's comment claimed it
+        // arrived through a successful open, which was false.) `.symlink` is
+        // the one arm the open really does foreclose — `O_NOFOLLOW` fails
+        // ELOOP — but it costs nothing to refuse both here, and refusing at
+        // the top means the regular-file and directory arms below are
+        // reached only by objects this scanner can actually have listed.
+        let kind = FileSystemIdentityProvider.fileKind(from: status)
+        switch kind {
+        case .regularFile, .directory:
+            break
+        case .symlink, .other:
+            return refuse(
+                "\(target.path): this temp entry is no longer the kind of "
+                    + "object that was scanned — refused, nothing deleted; "
+                    + "re-scan required"
+            )
+        }
+
+        // The IDENTITY that travels in the verdict is read through the
+        // provider, because that is what `DepthSafeRemoval.proveInspectedRoot`
+        // and `TrashDisposal` compare it against — one accessor on both sides,
+        // so a test override can never manufacture a divergence production
+        // cannot produce.
+        guard let identity = provider.identity(ofDescriptor: descriptor) else {
+            return refuse(
+                "\(target.path): this temp entry would not identify itself at "
+                    + "delete time — refused, nothing deleted; re-scan required"
+            )
+        }
+
+        // (0b) IS THIS THE OBJECT THE SCAN INSPECTED? (PR #459 review r2;
+        // literal since r4 — the recorded identity was previously only the
+        // POST-sizing lstat's observation, which a swap during sizing could
+        // make the replacement's; the scan now pins it to stage 1's, so
+        // "the object the scan inspected" means every stage of it.)
+        //
+        // Every other gate in this function re-establishes a PROPERTY of
+        // whatever stands at the name; none of them asks whether it is the
+        // same THING. Without this comparison a replacement was caught only
+        // EMERGENTLY — when it happened to be fresh, locked or foreign-owned.
+        // `mv /some/old/tree /private/tmp/old-scratch` (old, unlocked,
+        // user-owned) passed all four, and the `.allow` below then bound the
+        // REPLACEMENT's inode, so the deletion proved the wrong object and
+        // destroyed it while the row still quoted the scanned entry's bytes
+        // and age.
+        //
+        // Compared against the (device, inode) the SCAN recorded on the item,
+        // read from the descriptor this verdict holds — not a path `lstat`,
+        // which is what a replacement re-points. A directory that was never
+        // replaced keeps its inode, so this refuses only genuine replacement;
+        // a legitimately re-created entry IS a different object and refusing
+        // it is the point. The refusal is CLEARABLE by re-scanning, like every
+        // other refusal here.
+        guard identity == scanned else {
+            return refuse(
+                "\(target.path): a different \(describe(kind)) now stands at "
+                    + "this temp entry's name — it is not the one that was "
+                    + "scanned; refused, nothing deleted. Re-scan to see what "
+                    + "is there now"
+            )
+        }
+
+        // (1) OWNERSHIP, re-established from the HELD DESCRIPTOR (never a
+        // path `stat`, which is what gets re-pointed). Under a world-writable
+        // root a foreign-owned entry is undeletable by sticky-directory rules
+        // anyway; refusing here names the reason instead of letting the
+        // remover fail with a bare errno. An unreadable uid is unprovable, and
+        // unprovable is not "ours".
+        if ownershipGated {
+            guard let owner = provider.ownerUID(ofDescriptor: descriptor),
+                  owner == geteuid()
+            else {
+                return refuse(
+                    "\(target.path): this temp entry no longer belongs to you "
+                        + "— refused, nothing deleted; re-scan required"
+                )
+            }
+        }
+
+        // (2) OWN-MTIME STALENESS, the required half of the two-stage rule
+        // (see `directoryStaleness`'s truth table: a fresh own mtime
+        // disqualifies an entry whose every regular file is old). Writing a
+        // file into a directory bumps the directory's own mtime, so this alone
+        // catches a reactivated scratch directory.
+        guard let metadata = FileSystemIdentityProvider
+            .leafMetadata(from: status)
+        else {
+            return refuse(
+                "\(target.path): this temp entry's modification time is "
+                    + "outside the readable range, so its staleness cannot be "
+                    + "re-established — refused, nothing deleted"
+            )
+        }
+        let ownDate = modificationDate(of: metadata)
+        guard ownDate < cutoff else {
+            return refuse(
+                "\(target.path): this temp entry was modified again after the "
+                    + "scan — it is newer than the staleness threshold; "
+                    + "refused, nothing deleted. Re-scan to see its current "
+                    + "state"
+            )
+        }
+
+        // (3) THE COOPERATIVE LOCK PROBE, on the descriptor already held —
+        // strictly better than the scan's, which had to re-open by path.
+        // EWOULDBLOCK is still the ONLY in-use signal; any other `flock`
+        // failure proves no advisory holder and is not a refusal.
+        if flock(descriptor, LOCK_EX | LOCK_NB) == 0 {
+            flock(descriptor, LOCK_UN)
+        } else if errno == EWOULDBLOCK {
+            return refuse(
+                "\(target.path): this temp entry is locked by a running "
+                    + "process — it is in use again; refused, nothing deleted. "
+                    + "Re-scan once the process has finished"
+            )
+        }
+
+        guard kind == .directory else {
+            // A REGULAR FILE — the only other kind gate (0) admits. It has no
+            // contents to walk; its own allocation is the floor input stage 1
+            // used.
+            guard metadata.allocatedBytes >= sizeFloorBytes else {
+                return refuse(
+                    "\(target.path): this temp file has shrunk below the size "
+                        + "threshold since the scan — refused, nothing "
+                        + "deleted; re-scan required"
+                )
+            }
+            // THE BINDING, file arm (PR #459 review r5). `identity` is the
+            // `fstat` of the descriptor this whole verdict held, already
+            // proven equal to the scan's record above. Until r5 this arm
+            // returned `.noDirectoryTree` — a verdict any non-directory at
+            // the name satisfies — so every gate above ran and the disposal
+            // then destroyed WHATEVER stood there: measured through the
+            // production cleaner, a swap fired after this verdict returned
+            // permanently unlinked a never-scanned file (and, on the Trash
+            // arm, trashed it) with success reported quoting the scanned
+            // file's bytes. Carrying the identity is what makes the
+            // permanent arm's `ENOTDIR` comparison and the Trash arm's
+            // two-sided leaf binding refuse that replacement.
+            return .allow(inspected: .nonDirectoryLeaf(identity))
+        }
+
+        var budget = entryLimit
+        // DELETE-TIME ALLOCATION rides the walk for free (PR #459 review r4,
+        // codex C4): the walk already demands `LeafMetadata` for every
+        // regular file and the probe already returns its identity, so the
+        // sum costs zero extra syscalls and zero budget. Deduped by inode
+        // WITHIN the walk, matching the scan's hardlink accounting
+        // (`DirectorySizer`'s within-walk dedupe).
+        var deleteTimeAllocatedBytes: Int64 = 0
+        var seenInodes = Set<FileSystemIdentityProvider.Identity>()
+        switch freshContentBelow(
+            descriptor: descriptor, at: target, cutoff: cutoff,
+            // The held root's own device — the verified identity's, so the
+            // walk refuses to descend onto any other filesystem.
+            rootDevice: identity.device,
+            budget: &budget, allocatedBytes: &deleteTimeAllocatedBytes,
+            seenInodes: &seenInodes, provider: provider
+        ) {
+        case .allOld:
+            // THE FLOOR, re-established for the DIRECTORY arm too (r4, codex
+            // C4 — the file arm above refused the identical drift while a
+            // directory whose nested payload vanished after the scan sailed
+            // to `.allow`, executing an offer the scan would refuse to make:
+            // the floor is the entry's QUALIFICATION gate for both kinds,
+            // at the scan's stage 1 for files and its outcome mapping for
+            // directories). Evaluated only on `.allOld`, i.e. a walk
+            // proven exhaustive within budget, and the refusal CONVERGES:
+            // a re-scan measures the shrunk tree below the floor and
+            // declines to list it, so the row disappears instead of
+            // re-offering. A partially-denied item reaches here only once
+            // its denial has cleared, at which point a fresh scan would
+            // also decline a below-floor tree — same semantics. Residual at
+            // measured scope: `st_blocks*512` agreed with
+            // `totalFileAllocatedSize` on 3/3 probes (plain, sparse-zero,
+            // decmpfs-compressed); a filesystem where the two straddle the
+            // exact floor could refuse a boundary-sitting offer until
+            // re-scan.
+            guard deleteTimeAllocatedBytes >= sizeFloorBytes else {
+                return refuse(
+                    "\(target.path): this temp directory has shrunk below "
+                        + "the size threshold since the scan — refused, "
+                        + "nothing deleted; re-scan required"
+                )
+            }
+            // THE BINDING. `fstat` of the descriptor this whole verdict
+            // was taken through — the deletion proves the inode it opens
+            // is this one, on both the permanent and the Trash arm.
+            return .allow(inspected: .directory(identity))
+        case .freshContent(let url):
+            return refuse(
+                "\(target.path): fresh content (\(url.lastPathComponent)) "
+                    + "was written inside this temp entry since the scan "
+                    + "— refused, nothing deleted. Re-scan to see its "
+                    + "current state"
+            )
+        case .unprovable(let detail):
+            return refuse(
+                "\(target.path): this temp entry's contents could not be "
+                    + "fully re-inspected at delete time (\(detail)) — "
+                    + "refused, nothing deleted (an inspection that could "
+                    + "not finish is treated like a change since scan); "
+                    + "re-scan required"
+            )
+        }
+    }
+
+    /// The delete-time answer to "is anything below this entry fresh?".
+    private enum DeleteTimeFreshness {
+        /// Every regular file below was proven older than the cutoff.
+        case allOld
+        /// The first at-or-newer regular file, which ends the walk.
+        case freshContent(URL)
+        /// The walk could not be proven exhaustive — a denial, an
+        /// undescribable entry, or the entry budget. NEVER "still stale".
+        case unprovable(String)
+    }
+
+    /// The DESCRIPTOR-RELATIVE twin of `walkForFreshContent`: the same
+    /// early-exit rule (the FIRST regular file at-or-newer than the cutoff
+    /// disqualifies the whole entry) and the same entry budget, but every
+    /// level below the held root is reached by `fstatat`/`openat` on the
+    /// descriptor above it rather than by re-resolving a path. Containment in
+    /// the held parent inode is the proof; nothing here re-reads a path.
+    ///
+    /// ITERATIVE, AND THE DESCRIPTOR BILL IS A CONSTANT (PR #459 codex r14,
+    /// AVAILABILITY). This walk used to recurse, holding one descriptor per
+    /// level of the current DFS path until the deeper call returned, and the
+    /// comment here presented that as a bound ("An `openat` that fails …
+    /// including descriptor exhaustion — makes the verdict UNPROVABLE") when
+    /// it was the hazard. Both halves of that bill were measured on a chain
+    /// of single-component directories staged with `mkdirat`, driven through
+    /// the production revalidator, on the cooperative executor
+    /// `CacheCleaner`'s actor runs on:
+    ///
+    /// - DESCRIPTORS. With `rlim_cur` lowered to 96 (`setrlimit`), depth 88
+    ///   allowed and depth 96 refused with "Too many open files … re-scan
+    ///   required". A launchd-spawned app on this platform sees
+    ///   `rlim_cur = 256` (`OrphanedCachesScanner.defaultDescriptorWindow`'s
+    ///   own measurement), which puts the same wall a little further down.
+    /// - STACK. At the ambient limit, depth 240 allowed and depth 260 died
+    ///   `EXC_BAD_ACCESS (code=2, address=0x16fe8fe50)` with `sp` at
+    ///   `0x16fe8fe70` — a guard-page hit 32 bytes below the stack pointer,
+    ///   the backtrace 250-odd frames of this function at its recursive call.
+    ///   A crash, not a refusal.
+    ///
+    /// AND THE SCAN ACCEPTS EXACTLY THOSE TREES. Stage 1's
+    /// `walkForFreshContent` above is iterative over a `[URL]` stack and
+    /// holds NO descriptor across levels, and its budget charges one entry
+    /// per directory — a 20,000-level chain costs 20,000 of 20,000. Measured
+    /// on the same fixtures: the scan listed the entry at every depth from 8
+    /// to 400. So the scan offered a row the deletion could not take, and the
+    /// refusal it printed said "re-scan required" — a remedy a retry can
+    /// never satisfy, because depth is deterministic. That is the class this
+    /// project already has a lesson for, and this walk was the last instance.
+    ///
+    /// THE SHAPE IS `DepthSafeRemoval.removeTree`'s
+    /// (`DepthSafeRemoval.swift:641-878`): descend by `openat`, CLOSE the
+    /// parent, and climb back with `openat(current, "..")`, proving at every
+    /// step that `..` landed on the identity the walk recorded when it left.
+    /// Peak descriptors: the caller's root, the level the walk stands on, and
+    /// one transient (the enumeration handle, or the child/`..` in flight) —
+    /// four, at any depth. `OrphanedCachesScanner`'s scan-time walk
+    /// (`OrphanedCachesScanner.swift:1387-1691`) is the other in-house
+    /// instance and keeps a WINDOW of live frames rather than one, which buys
+    /// it fewer `..` climbs on wide-and-deep trees; it is not adopted here
+    /// because it costs a frame stack, a live-index list and an unexhausted-
+    /// index list this walk has no width to amortise them over, and because
+    /// the constant form is what makes the peak statable as a number.
+    ///
+    /// WHAT THE CLIMB COSTS IN SAFETY, stated rather than implied. The
+    /// recursion held the parent open, so a `rename(2)` of the level the walk
+    /// stood in could not redirect the rest of that level; here `..` names
+    /// the NEW parent and the identity comparison refuses `.unprovable`
+    /// instead. That is strictly more conservative — a refusal, never a
+    /// wrong answer — and it is CLEARABLE: a rename is a race, so a re-scan
+    /// genuinely can differ.
+    ///
+    /// An `openat` that fails for any reason other than a vanished branch
+    /// still makes the verdict UNPROVABLE, and unprovable refuses. What
+    /// changed is that depth is no longer one of the reasons.
+    ///
+    /// The budget cannot STRAND a real offer, but listed entries DO reach it
+    /// (PR #459 review r4 — the sentence here claimed an entry whose tree
+    /// exceeds the budget "is never listed and never reaches this code",
+    /// conflating scan-time with delete-time tree shape, the precise
+    /// conflation the kind gate's own comment condemns): a listed entry's
+    /// tree can GROW past the budget between scan and delete — mkdir spam in
+    /// a nested subdirectory bumps no root mtime and adds no fresh regular
+    /// file — and then arrives here, where the budget refusal takes it. No
+    /// strand: a re-scan's stage-1 walk declines to list the overgrown tree,
+    /// so the refusal converges.
+    ///
+    /// `allocatedBytes` accumulates the walk's DEDUPED regular-file
+    /// allocation (r4, codex C4) so the caller can re-establish the size
+    /// floor: metadata is already mandatory per regular file, and the probe
+    /// already returns identity — zero extra syscalls, zero budget spent.
+    ///
+    /// `logical` URLs are composed for the refusal message and for the
+    /// provider's test seam only — they address nothing.
+    private static func freshContentBelow(
+        descriptor: Int32,
+        at directory: URL,
+        cutoff: Date,
+        rootDevice: UInt64,
+        budget: inout Int,
+        allocatedBytes: inout Int64,
+        seenInodes: inout Set<FileSystemIdentityProvider.Identity>,
+        provider: FileSystemIdentityProvider
+    ) -> DeleteTimeFreshness {
+        // `current` is the level the walk stands on. At depth 0 it IS the
+        // caller's descriptor, which the caller closes; every level below is
+        // this walk's own and is closed here — including the re-opened root
+        // a full unwind climbs back to, which is a DIFFERENT description of
+        // the same inode and would otherwise leak once per walk.
+        var current = descriptor
+        var currentIsOwned = false
+        defer { if currentIsOwned { close(current) } }
+
+        /// Subdirectory names each level of the CURRENT DFS path still owes a
+        /// descent, DESCENDING so `popLast()` drains them in the ascending
+        /// order they were sorted into — the recursion's `for name in pending`
+        /// order, unchanged. Every name here was already charged against
+        /// `budget`, so the whole stack is bounded by the entry limit.
+        var pending: [[String]] = []
+        /// One entry per level BELOW the root: the basename the walk descended
+        /// through, and the identity its parent must still have when `..`
+        /// lands there.
+        var ascent: [(name: String, parent: FileSystemIdentityProvider.Identity)] = []
+        /// The spelling of the level the walk stands on — ONE URL, pushed and
+        /// popped a component at a time rather than a copy per level.
+        var logical = directory
+
+        switch inspectOneLevel(
+            descriptor: current, at: logical, cutoff: cutoff,
+            rootDevice: rootDevice, budget: &budget,
+            allocatedBytes: &allocatedBytes, seenInodes: &seenInodes,
+            provider: provider
+        ) {
+        case .stop(let verdict): return verdict
+        case .subdirectories(let names): pending.append(names.reversed())
+        }
+
+        while true {
+            if let name = pending[pending.count - 1].popLast() {
+                // Read BEFORE the descent: this is the identity the climb back
+                // out must find, and reading it afterwards would ask the
+                // question of whatever the name resolves to by then.
+                guard let identity = provider.identity(ofDescriptor: current)
+                else {
+                    return .unprovable(
+                        "a directory would not identify itself"
+                    )
+                }
+                let child: Int32
+                // THE CARRYING FORM (PR #459 review r2). The raw-`Int32`
+                // `openChildDirectory` leaves its code in the GLOBAL `errno`,
+                // and `FileSystemIdentityProvider` documents that twin as
+                // existing precisely because "a test override (or any
+                // intervening call) can clobber" it before the caller reads it
+                // — which matters here, where ENOENT/ENOTDIR is a benign
+                // vanished branch and every other code makes the whole verdict
+                // UNPROVABLE, i.e. a refusal.
+                switch provider.openChildDirectoryCarryingErrno(
+                    inDirectory: current, named: name,
+                    logical: logical.appendingPathComponent(name)
+                ) {
+                case .opened(let opened):
+                    child = opened
+                case .failed(let code):
+                    if code == ENOENT || code == ENOTDIR { continue }
+                    return .unprovable(String(cString: strerror(code)))
+                }
+                if currentIsOwned { close(current) }
+                current = child
+                currentIsOwned = true
+                ascent.append((name: name, parent: identity))
+                logical.appendPathComponent(name)
+                switch inspectOneLevel(
+                    descriptor: current, at: logical, cutoff: cutoff,
+                    rootDevice: rootDevice, budget: &budget,
+                    allocatedBytes: &allocatedBytes, seenInodes: &seenInodes,
+                    provider: provider
+                ) {
+                case .stop(let verdict): return verdict
+                case .subdirectories(let names):
+                    pending.append(names.reversed())
+                }
+                continue
+            }
+
+            // This level owes no more descents.
+            pending.removeLast()
+            guard let step = ascent.last else {
+                // Back at the root, every level below it proven old.
+                return .allOld
+            }
+            // `..` IS NOT A PROOF, it is a lookup — the sentence
+            // `DepthSafeRemoval.removeTree` carries at its own climb. A
+            // directory renamed into a foreign parent while the walk stood
+            // inside it makes `..` name THAT parent, and the rest of this
+            // level's names would then be read out of somebody else's tree.
+            // `..` is never a symlink, so `O_NOFOLLOW` buys nothing; the
+            // identity comparison is the whole proof.
+            let up = openat(current, "..", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+            guard up >= 0 else {
+                return .unprovable(String(cString: strerror(errno)))
+            }
+            if currentIsOwned { close(current) }
+            current = up
+            currentIsOwned = true
+            ascent.removeLast()
+            logical.deleteLastPathComponent()
+            guard provider.identity(ofDescriptor: current) == step.parent
+            else {
+                return .unprovable(
+                    "\(step.name) was moved while its contents were being "
+                        + "re-inspected"
+                )
+            }
+        }
+    }
+
+    /// What ONE level's own entries prove: either the walk stops here with a
+    /// verdict, or these are the subdirectories still owed a descent.
+    private enum LevelInspection {
+        case subdirectories([String])
+        case stop(DeleteTimeFreshness)
+    }
+
+    /// Read one already-open directory: date every regular file against the
+    /// cutoff, refuse a child on another filesystem, and collect the
+    /// subdirectory names — descending into none of them.
+    ///
+    /// Takes no ownership of `descriptor` and opens nothing that outlives the
+    /// call, so the caller's peak is its own plus one.
+    private static func inspectOneLevel(
+        descriptor: Int32,
+        at directory: URL,
+        cutoff: Date,
+        rootDevice: UInt64,
+        budget: inout Int,
+        allocatedBytes: inout Int64,
+        seenInodes: inout Set<FileSystemIdentityProvider.Identity>,
+        provider: FileSystemIdentityProvider
+    ) -> LevelInspection {
+        guard budget > 0 else {
+            return .stop(
+                .unprovable("more entries than the inspection budget")
+            )
+        }
+        let read = boundedChildNames(
+            ofDescriptor: descriptor, limit: budget, provider: provider
+        )
+        let names: [String]
+        switch read {
+        case .failed(let code):
+            if code == ENOENT || code == ENOTDIR {
+                // The branch vanished mid-walk — the benign race, and there is
+                // nothing fresh in a branch that is not there. No descents are
+                // owed from a level that is not there either.
+                return .subdirectories([])
+            }
+            return .stop(.unprovable(String(cString: strerror(code))))
+        case .names(let read, let truncation):
+            // EVERY cause refuses here, and every refusal is visible — the
+            // delete-time disposition is unchanged by r7 codex C2. Only the
+            // wording gained the cause it always had in hand.
+            switch truncation {
+            case .budget:
+                return .stop(
+                    .unprovable("more entries than the inspection budget")
+                )
+            case .undecodableName:
+                return .stop(.unprovable(
+                    "a directory holds an entry name that is not valid text"
+                ))
+            case .readFailed(let code):
+                return .stop(.unprovable(
+                    "a directory could not be read in full: "
+                        + String(cString: strerror(code))
+                ))
+            case .none:
+                break
+            }
+            names = read
+        }
+
+        var pending: [String] = []
+        for name in names.sorted(by: {
+            $0.utf8.lexicographicallyPrecedes($1.utf8)
+        }) {
+            guard budget > 0 else {
+                return .stop(
+                    .unprovable("more entries than the inspection budget")
+                )
+            }
+            budget -= 1
+            let child = directory.appendingPathComponent(name)
+            switch provider.probeKind(
+                inDirectory: descriptor, named: name, logical: child
+            ) {
+            case .absent:
+                continue
+            case .failed(let code):
+                return .stop(.unprovable(String(cString: strerror(code))))
+            case .kind(let kind, let childIdentity, let metadata):
+                switch kind {
+                case .regularFile:
+                    guard let metadata else {
+                        return .stop(.unprovable(
+                            "\(name) would not describe its modification time"
+                        ))
+                    }
+                    if modificationDate(of: metadata) >= cutoff {
+                        return .stop(.freshContent(child))
+                    }
+                    // Two links to one inode count once, exactly as the
+                    // scan's sizer counts them (r4, codex C4).
+                    if seenInodes.insert(childIdentity).inserted {
+                        allocatedBytes += metadata.allocatedBytes
+                    }
+                case .directory:
+                    // THE DELETE-TIME MOUNT ARM (PR #459 review r5, codex
+                    // C2): `childIdentity.device` is already in hand from
+                    // the `fstatat` above — zero extra syscalls — and a
+                    // device that differs from the held root's names a
+                    // volume mounted in since `CacheCleaner`'s own sizer
+                    // gate ran. Unprovable ⇒ refused, never descended; the
+                    // refusal CONVERGES (a re-scan emits the entry as a
+                    // denied mount row, so the offer disappears rather than
+                    // re-arming). `DepthSafeRemoval`'s kernel-table
+                    // preflight and per-child mount comparison still stand
+                    // behind this for the permanent arm.
+                    guard childIdentity.device == rootDevice else {
+                        return .stop(.unprovable(
+                            "a volume is mounted at \(name) — its contents "
+                                + "are another filesystem's"
+                        ))
+                    }
+                    pending.append(name)
+                case .symlink, .other:
+                    // Never followed; neither carries content of its own to
+                    // date (the scan's walk ignores them for the same reason).
+                    continue
+                }
+            }
+        }
+        return .subdirectories(pending)
+    }
+
+    /// The BOUNDED read of an already-open directory — `boundedChildNames`'s
+    /// descriptor-relative twin, with the identical three traps handled
+    /// (`readdir` returning nil for both end-of-stream and error; an
+    /// undecodable basename failing CLOSED; `.`/`..` skipped, hidden entries
+    /// kept).
+    ///
+    /// `openSelfForEnumeration` rather than `fdopendir(descriptor)` directly:
+    /// `fdopendir` TAKES OWNERSHIP of the descriptor it is handed and
+    /// `closedir` would close the anchor this walk is standing on.
+    private static func boundedChildNames(
+        ofDescriptor descriptor: Int32, limit: Int,
+        provider: FileSystemIdentityProvider
+    ) -> BoundedRead {
+        let enumeration = provider.openSelfForEnumeration(descriptor)
+        guard enumeration >= 0 else { return .failed(errno: errno) }
+        guard let handle = fdopendir(enumeration) else {
+            let code = errno
+            close(enumeration)
+            return .failed(errno: code)
+        }
+        defer { closedir(handle) }
+        var names: [String] = []
+        var truncation: BoundedRead.Truncation?
+        while true {
+            errno = 0
+            guard let entry = readdir(handle) else {
+                if errno != 0 { truncation = .readFailed(errno: errno) }
+                break
+            }
+            let decoded = withUnsafeBytes(of: entry.pointee.d_name) {
+                raw -> String? in
+                guard let base = raw.bindMemory(to: CChar.self).baseAddress
+                else { return nil }
+                return String(validatingCString: base)
+            }
+            guard let name = decoded, !name.isEmpty else {
+                truncation = .undecodableName
+                break
+            }
+            if name == "." || name == ".." { continue }
+            guard names.count < limit else {
+                truncation = .budget
+                break
+            }
+            names.append(name)
+        }
+        return .names(names, truncation: truncation)
+    }
+}
+
+// MARK: - SpaceScanner conformance
+
+/// Registration is fn-6.4's (`SpaceScannerRuntime.production`); the witnesses
+/// are the members above — including `preDeleteRevalidator`, which this
+/// scanner DOES declare (PR #459 review r1). The runtime captures it at
+/// registration into the scanner-ID-keyed registry the cleaner dispatches on.
+extension EphemeralTempScanner: SpaceScanner {}

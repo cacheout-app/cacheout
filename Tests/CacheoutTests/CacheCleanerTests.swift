@@ -3113,6 +3113,859 @@ final class CacheCleanerTests: XCTestCase {
                       "termination after a bounded refusal is still observed")
     }
 
+    // MARK: - fn-6.3: ephemeral temp-item deletion (R9)
+
+    // The delete path for `ephemeral_tmp` items is FREE: they are ordinary
+    // `.removeItem` participants through `removeGuardedItem`, so this task
+    // adds ZERO production code — these tests PROVE the as-built contract
+    // holds for temp items rather than building a new one.
+    //
+    // The contract (epic D3 REVISED): temp items FOLLOW the Move-to-Trash
+    // toggle exactly like every other item. A failed trash move is an
+    // ITEM-KEYED error that leaves the item in place — there is NO permanent
+    // fallback (`CacheCleaner.swift` R11 comment above the toggle dispatch),
+    // and consequently NOTHING anywhere claims or implies forced permanence.
+    // The earlier "permanent even with Trash on" disclosure was CUT because
+    // it described a degradation the cleaner cannot produce.
+    //
+    // Every fixture below runs the REAL `EphemeralTempScanner` over an
+    // INJECTED fixture root and cleans its REAL items through a cleaner built
+    // by `SpaceScannerRuntime.makeCleaner` — delete-time admission therefore
+    // comes from REGISTRATION (`trustedContainerRoots`) bound to the producing
+    // session's `ContainerSnapshot`, which is the production composition. The
+    // only hand-built items are the FORGED ones the scanner structurally
+    // cannot emit (a root-level target), which exist to prove the guard
+    // refuses them anyway.
+    //
+    // House rules: no test trashes outside its fixture root (the trash seam
+    // MOVES into a fixture-local directory, so "recoverable" is asserted by
+    // reading the moved payload back); the chmod stand-in restores 0755 before
+    // teardown and skips under euid 0.
+
+    /// Fixed scan instant — the scanner takes an injected clock, so no fixture
+    /// depends on wall-clock time and nothing sleeps.
+    private var ephemeralClock: Date { Date(timeIntervalSince1970: 1_800_000_000) }
+
+    /// 7-day stale age (the shipped default) with a small POSITIVE floor so
+    /// fixtures stay cheap — the fn-6.2 test thresholds verbatim.
+    private var ephemeralThresholds: EphemeralTempSweepConfig.Thresholds {
+        EphemeralTempSweepConfig.Thresholds(
+            sizeFloorBytes: 4_096, staleAge: 7 * 86_400
+        )
+    }
+
+    private func canonical(_ url: URL) -> URL {
+        FileSystemIdentityProvider().canonicalize(url)
+    }
+
+    /// Backdate a whole tree — children first, the directory itself LAST (its
+    /// own mtime is a staleness input and writing children bumps it).
+    private func backdateTree(_ url: URL, to date: Date) throws {
+        let fm = FileManager.default
+        if let kind = FileSystemIdentityProvider().kind(of: url),
+           kind == .directory {
+            for child in try fm.contentsOfDirectory(
+                at: url, includingPropertiesForKeys: nil, options: []
+            ) {
+                try backdateTree(child, to: date)
+            }
+        }
+        try fm.setAttributes([.modificationDate: date], ofItemAtPath: url.path)
+    }
+
+    /// A stale first-level temp entry — the field shape the scanner lists: an
+    /// old scratch directory holding one payload file, 30 days behind the
+    /// injected clock.
+    @discardableResult
+    private func stageStaleTempEntry(
+        _ name: String, under root: URL, bytes: Int = 8_192
+    ) throws -> URL {
+        let entry = root.appendingPathComponent(name)
+        try FileManager.default.createDirectory(
+            at: entry, withIntermediateDirectories: true
+        )
+        try writeFile(entry.appendingPathComponent("payload.bin"), bytes: bytes)
+        try backdateTree(entry, to: ephemeralClock.addingTimeInterval(-30 * 86_400))
+        return entry
+    }
+
+    /// The payload bytes `writeFile` wrote — read back out of the fixture
+    /// Trash to prove a trashed entry is RECOVERABLE, not merely gone.
+    private func payloadBytes(_ count: Int = 8_192) -> Data {
+        Data(repeating: 0xAB, count: count)
+    }
+
+    /// A fixture world for the temp fixtures: an injected home (the cleanup
+    /// log's anchor), one world-writable temp root, and a fixture-local Trash.
+    private func makeEphemeralWorld(
+        _ label: String = #function
+    ) throws -> (base: URL, home: URL, root: URL, trash: URL) {
+        let base = try makeTempDir(label)
+        let home = base.appendingPathComponent("home")
+        let root = base.appendingPathComponent("shared-temp")
+        let trash = base.appendingPathComponent("fixture-trash")
+        for url in [home, root, trash] {
+            try FileManager.default.createDirectory(
+                at: url, withIntermediateDirectories: true
+            )
+        }
+        return (base, home, root, trash)
+    }
+
+    /// The scanner over an injected fixture root in the CANONICAL spelling
+    /// fn-6.1 hands production (`/private/var/…`), with the fixed clock.
+    private func makeEphemeralTempScanner(
+        root: URL, home: URL
+    ) -> EphemeralTempScanner {
+        let clock = ephemeralClock
+        return EphemeralTempScanner(
+            roots: [EphemeralTempRoot(
+                url: canonical(root),
+                label: "Shared temp",
+                cleanupEvidence: EphemeralTempRoots.sharedTempEvidence,
+                writability: .worldWritable
+            )],
+            home: home,
+            thresholds: ephemeralThresholds,
+            now: { clock }
+        )
+    }
+
+    /// Registration is the ONLY thing that puts a temp root into delete-time
+    /// admission — the same runtime composition production uses.
+    private func makeEphemeralRuntime(
+        _ scanner: EphemeralTempScanner, home: URL
+    ) throws -> SpaceScannerRuntime {
+        try SpaceScannerRuntime(
+            scanners: [scanner], categories: [], home: home,
+            provider: FileSystemIdentityProvider()
+        )
+    }
+
+    /// The scanner's REAL items for a user-initiated scan, keyed by the
+    /// first-level entry name (`displayName`).
+    private func scannedTempItems(
+        _ scanner: EphemeralTempScanner
+    ) async -> [String: ReclaimableItem] {
+        let outcome = await scanner.scan(context: ScanContext(trigger: .userInitiated))
+        return Dictionary(
+            uniqueKeysWithValues: outcome.items.map { ($0.displayName, $0) }
+        )
+    }
+
+    /// The single entry the fixture Trash received, or nil.
+    private func soleTrashedEntry(in trashDir: URL) throws -> URL? {
+        let contents = try FileManager.default.contentsOfDirectory(
+            at: trashDir, includingPropertiesForKeys: nil, options: []
+        )
+        XCTAssertLessThanOrEqual(contents.count, 1,
+                                 "the fixture Trash holds at most one entry here")
+        return contents.first
+    }
+
+    func testEphemeralTempItemTrashModeMovesEntryIntoFixtureTrashRecoverably() async throws {
+        let world = try makeEphemeralWorld("ephemeral-trash")
+        defer { try? FileManager.default.removeItem(at: world.base) }
+        let target = try stageStaleTempEntry("old-scratch", under: world.root)
+        let expected = measured(target).exactAllocatedBytes
+        XCTAssertGreaterThan(expected, 0, "the fixture must have measurable bytes")
+
+        let scanner = makeEphemeralTempScanner(root: world.root, home: world.home)
+        let items = await scannedTempItems(scanner)
+        let item = try XCTUnwrap(items["old-scratch"],
+                                 "the stale entry must be listed to be deleted")
+
+        let runtime = try makeEphemeralRuntime(scanner, home: world.home)
+        let recorder = TrashRecorder()
+        let cleaner = runtime.makeCleaner(
+            snapshot: sessionSnapshot(of: runtime.trustedContainerRoots),
+            trashHandler: makeTrashSeam(into: world.trash, recorder: recorder)
+        )
+
+        let report = await cleaner.clean(items: [item], moveToTrash: true)
+
+        XCTAssertTrue(report.errors.isEmpty, "unexpected errors: \(report.errors)")
+        // The seam received the item's UNRESOLVED requested target, spelled
+        // under the scanner's ONE canonical root (R3).
+        XCTAssertEqual(
+            recorder.urls.map(\.path),
+            [canonical(world.root).appendingPathComponent("old-scratch").path],
+            "item mode trashes the temp entry itself, in the canonical spelling"
+        )
+        // A no-op recording handler would prove nothing: the source must be
+        // GONE and the payload must be READABLE where the handler put it.
+        XCTAssertFalse(FileManager.default.fileExists(atPath: target.path),
+                       "the trashed entry is gone from the temp root")
+        let recovered = try XCTUnwrap(try soleTrashedEntry(in: world.trash),
+                                      "the entry must land in the fixture Trash")
+        XCTAssertTrue(recovered.lastPathComponent.hasSuffix("-old-scratch"))
+        XCTAssertEqual(
+            try Data(contentsOf: recovered.appendingPathComponent("payload.bin")),
+            payloadBytes(),
+            "a trashed temp entry is RECOVERABLE — its payload bytes survive"
+        )
+        XCTAssertEqual(report.entries.count, 1)
+        XCTAssertEqual(report.entries.first?.scannerID,
+                       EphemeralTempScanner.registeredID)
+        XCTAssertEqual(report.entries.first?.itemID, item.id)
+        XCTAssertEqual(report.entries.first?.exactBytes, expected,
+                       "freed bytes are measured at delete time")
+        // The toggle is HONORED — no forced permanence exists for temp items,
+        // so nothing may report or imply it (epic D3 revised).
+        XCTAssertEqual(report.entries.first?.disposal, .trash)
+        XCTAssertEqual(report.disposal, .trash)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: world.root.path),
+                      "the temp ROOT survives — item mode deletes the entry, never its container")
+    }
+
+    func testEphemeralTempItemPermanentModeRemovesEntryAndNeverTouchesTheTrashSeam() async throws {
+        let world = try makeEphemeralWorld("ephemeral-permanent")
+        defer { try? FileManager.default.removeItem(at: world.base) }
+        let target = try stageStaleTempEntry("old-scratch", under: world.root)
+        let expected = measured(target).exactAllocatedBytes
+
+        let scanner = makeEphemeralTempScanner(root: world.root, home: world.home)
+        let items = await scannedTempItems(scanner)
+        let item = try XCTUnwrap(items["old-scratch"])
+
+        // D1 AS CORRECTED (PR #459 review r1). The comment that stood here
+        // said these three facts routed temp items "around the delete-time
+        // revalidation seam entirely". Only the third conjunct ever did that,
+        // and it is now gone: `automaticCleanEligible` is never read by the
+        // dispatch (`CacheCleaner.preDeleteOutcome` keys on `scannerID` and
+        // the marker), it is the CLI smart-clean exclusion. Temp items now
+        // carry the marker and the scanner declares a revalidator, so they go
+        // THROUGH the seam and the allow carries a descriptor-proven binding
+        // for BOTH kinds — `.directory(identity)` here, `.nonDirectoryLeaf`
+        // for a regular-file entry (PR #459 review r5: until the leaf case
+        // existed, the file arm carried no binding and this sentence was
+        // false for it).
+        XCTAssertFalse(item.automaticCleanEligible,
+                       "the CLI smart-clean exclusion — not a revalidation fact")
+        XCTAssertTrue(item.requiresPreDeleteRevalidation)
+        XCTAssertNotNil(scanner.preDeleteRevalidator)
+
+        let runtime = try makeEphemeralRuntime(scanner, home: world.home)
+        let recorder = TrashRecorder()
+        let cleaner = runtime.makeCleaner(
+            snapshot: sessionSnapshot(of: runtime.trustedContainerRoots),
+            trashHandler: makeTrashSeam(into: world.trash, recorder: recorder)
+        )
+
+        let report = await cleaner.clean(items: [item], moveToTrash: false)
+
+        XCTAssertTrue(report.errors.isEmpty, "unexpected errors: \(report.errors)")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: target.path))
+        XCTAssertTrue(recorder.urls.isEmpty,
+                      "permanent mode never invokes the Trash primitive")
+        XCTAssertNil(try soleTrashedEntry(in: world.trash),
+                     "nothing reaches the Trash in permanent mode")
+        XCTAssertEqual(report.entries.count, 1)
+        XCTAssertEqual(report.entries.first?.exactBytes, expected)
+        XCTAssertEqual(report.entries.first?.disposal, .permanent)
+        XCTAssertEqual(report.disposal, .permanent)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: world.root.path))
+    }
+
+    // MARK: - PR #459 review r1: the delete-time revalidation of temp items
+    //
+    // Every cell below stages a drift BETWEEN the scan and the clean — the
+    // window the GUI leaves wide open, because `CacheoutViewModel.clean()`
+    // passes the selected items straight through and only re-scans AFTER the
+    // deletion. Before this fix nothing in the cleaner re-read one fact about
+    // a temp entry's CONTENT: the four gates that made deletion acceptable
+    // (ownership, the two-stage staleness rule, the cooperative lock probe,
+    // the freshness re-check) all ran at scan time and none re-ran, and the
+    // `nil` revalidator additionally left `probedObject` nil, which skipped
+    // the leaf identity proof and routed the GUI's DEFAULT Trash disposal to
+    // the identity-blind overload.
+    //
+    // SEVERITY, stated exactly: this is a DELETION-SAFETY defect (a tree that
+    // was in use again, or that the app never inspected, was destroyed), not
+    // merely a disclosure one — which is why the assertions below are about
+    // what survives on disk, not about what a row says.
+
+    /// A modification instant that is FRESH against the injected clock. Real
+    /// wall-clock time is far in the PAST of `ephemeralClock`, so a file
+    /// merely written "now" reads as months old here — every fresh fixture
+    /// must say so explicitly.
+    private var ephemeralFreshDate: Date {
+        ephemeralClock.addingTimeInterval(-3_600)
+    }
+
+    private func setModified(_ url: URL, _ date: Date) throws {
+        try FileManager.default.setAttributes(
+            [.modificationDate: date], ofItemAtPath: url.path
+        )
+    }
+
+    /// CONTENT DRIFT, the deep case: the session resumes and writes live work
+    /// into a SUBDIRECTORY, so the entry's own mtime is untouched and only a
+    /// walk below it can see the change. This is the arm the descriptor-
+    /// relative fresh-content walk carries.
+    func testEphemeralTempEntryWithFreshContentWrittenAfterTheScanIsRefused()
+        async throws {
+        let world = try makeEphemeralWorld("ephemeral-content-drift")
+        defer { try? FileManager.default.removeItem(at: world.base) }
+        let target = try stageStaleTempEntry("old-scratch", under: world.root)
+        let nested = target.appendingPathComponent("nested")
+        try FileManager.default.createDirectory(
+            at: nested, withIntermediateDirectories: true
+        )
+        try backdateTree(target, to: ephemeralClock.addingTimeInterval(-30 * 86_400))
+
+        let scanner = makeEphemeralTempScanner(root: world.root, home: world.home)
+        let items = await scannedTempItems(scanner)
+        let item = try XCTUnwrap(items["old-scratch"],
+                                 "the stale entry must be listed to be deleted")
+
+        // THE DRIFT. A fresh file lands two levels down; `nested` and the
+        // entry itself are put back to their old mtimes, so nothing but a
+        // content walk can tell.
+        let fresh = nested.appendingPathComponent("live-work.bin")
+        try Data(repeating: 0x5A, count: 4_096).write(to: fresh)
+        try setModified(fresh, ephemeralFreshDate)
+        try setModified(nested, ephemeralClock.addingTimeInterval(-30 * 86_400))
+        try setModified(target, ephemeralClock.addingTimeInterval(-30 * 86_400))
+
+        let runtime = try makeEphemeralRuntime(scanner, home: world.home)
+        let recorder = TrashRecorder()
+        let cleaner = runtime.makeCleaner(
+            snapshot: sessionSnapshot(of: runtime.trustedContainerRoots),
+            trashHandler: makeTrashSeam(into: world.trash, recorder: recorder)
+        )
+
+        let report = await cleaner.clean(items: [item], moveToTrash: false)
+
+        XCTAssertEqual(report.errors.count, 1,
+                       "the drift is ONE item-keyed refusal: \(report.errors)")
+        XCTAssertEqual(report.errors.first?.key, item.key)
+        let message = try XCTUnwrap(report.errors.first?.message)
+        XCTAssertTrue(message.contains("fresh content"), message)
+        XCTAssertTrue(message.contains("live-work.bin"), message)
+        XCTAssertTrue(report.entries.isEmpty,
+                      "nothing may be billed as freed: \(report.entries)")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fresh.path),
+                      "the live work written after the scan survives")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: target.path))
+    }
+
+    /// OWN-MTIME DRIFT: the entry itself is written into, which bumps its own
+    /// mtime — the required half of the two-stage staleness rule, re-read from
+    /// the HELD DESCRIPTOR rather than from the path.
+    func testEphemeralTempEntryTouchedAfterTheScanIsRefused() async throws {
+        let world = try makeEphemeralWorld("ephemeral-own-mtime-drift")
+        defer { try? FileManager.default.removeItem(at: world.base) }
+        let target = try stageStaleTempEntry("old-scratch", under: world.root)
+
+        let scanner = makeEphemeralTempScanner(root: world.root, home: world.home)
+        let items = await scannedTempItems(scanner)
+        let item = try XCTUnwrap(items["old-scratch"])
+
+        try setModified(target, ephemeralFreshDate)
+
+        let runtime = try makeEphemeralRuntime(scanner, home: world.home)
+        let cleaner = runtime.makeCleaner(
+            snapshot: sessionSnapshot(of: runtime.trustedContainerRoots)
+        )
+
+        let report = await cleaner.clean(items: [item], moveToTrash: false)
+
+        XCTAssertEqual(report.errors.count, 1, "\(report.errors)")
+        let message = try XCTUnwrap(report.errors.first?.message)
+        XCTAssertTrue(message.contains("newer than the staleness threshold"),
+                      message)
+        XCTAssertTrue(report.entries.isEmpty)
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: target.appendingPathComponent("payload.bin").path
+        ), "the re-activated entry is left whole")
+    }
+
+    /// REPLACEMENT: the entry is renamed away and a NEW directory takes its
+    /// name, holding a tree the app never inspected. Both disposal arms must
+    /// refuse, and the Trash arm must refuse BEFORE the mover is touched —
+    /// `recorder.urls.isEmpty` is the load-bearing assertion for that.
+    ///
+    /// THE REPLACEMENT IS DELIBERATELY STALE, UNLOCKED AND OURS (PR #459
+    /// review r2). Round 1's fixture backdated nothing — it stamped the
+    /// stranger's tree with `ephemeralFreshDate`, so the OWN-MTIME gate
+    /// refused it and this cell passed while the revalidator compared no
+    /// identity at all: the test NAME claimed more than the code did. Staged
+    /// old, all four property gates (ownership, own-mtime staleness, `flock`,
+    /// fresh content below) PASS on the replacement, so only the
+    /// recorded-identity comparison can refuse it — which is what makes this
+    /// cell measure the property it is named for.
+    func testEphemeralTempEntryReplacedAfterTheScanIsRefusedOnBothArms()
+        async throws {
+        for moveToTrash in [false, true] {
+            let world = try makeEphemeralWorld(
+                "ephemeral-replaced-\(moveToTrash)"
+            )
+            defer { try? FileManager.default.removeItem(at: world.base) }
+            let target = try stageStaleTempEntry("old-scratch", under: world.root)
+
+            let scanner = makeEphemeralTempScanner(
+                root: world.root, home: world.home
+            )
+            let items = await scannedTempItems(scanner)
+            let item = try XCTUnwrap(items["old-scratch"])
+
+            // THE DRIFT: `rename(entry, entry.bak)` then a fresh `mkdir` at
+            // the same name, filled with a stranger's live work.
+            let stash = world.base.appendingPathComponent("moved-away")
+            try FileManager.default.moveItem(at: target, to: stash)
+            try FileManager.default.createDirectory(
+                at: target, withIntermediateDirectories: true
+            )
+            let stranger = target.appendingPathComponent("stranger.bin")
+            try Data(repeating: 0x7E, count: 4_096).write(to: stranger)
+            // OLD, not fresh: the replacement satisfies every property gate.
+            let old = ephemeralClock.addingTimeInterval(-30 * 86_400)
+            try setModified(stranger, old)
+            try setModified(target, old)
+
+            let runtime = try makeEphemeralRuntime(scanner, home: world.home)
+            let recorder = TrashRecorder()
+            let cleaner = runtime.makeCleaner(
+                snapshot: sessionSnapshot(of: runtime.trustedContainerRoots),
+                trashHandler: makeTrashSeam(into: world.trash, recorder: recorder)
+            )
+
+            let report = await cleaner.clean(
+                items: [item], moveToTrash: moveToTrash
+            )
+
+            XCTAssertEqual(report.errors.count, 1,
+                           "moveToTrash=\(moveToTrash): \(report.errors)")
+            let message = try XCTUnwrap(report.errors.first?.message)
+            XCTAssertTrue(
+                message.contains("a different directory now stands at this "
+                                 + "temp entry's name"),
+                "the refusal must name the IDENTITY mismatch — every other "
+                    + "gate passes on this fixture: \(message)"
+            )
+            XCTAssertTrue(report.entries.isEmpty,
+                          "moveToTrash=\(moveToTrash): \(report.entries)")
+            XCTAssertTrue(
+                FileManager.default.fileExists(atPath: stranger.path),
+                "moveToTrash=\(moveToTrash): the stranger's tree was destroyed"
+            )
+            XCTAssertTrue(recorder.urls.isEmpty,
+                          "moveToTrash=\(moveToTrash): the refusal must land "
+                            + "BEFORE the Trash mover is invoked")
+            XCTAssertNil(try soleTrashedEntry(in: world.trash))
+            XCTAssertTrue(
+                FileManager.default.fileExists(
+                    atPath: stash.appendingPathComponent("payload.bin").path
+                ),
+                "moveToTrash=\(moveToTrash): the inspected tree is untouched too"
+            )
+        }
+    }
+
+    /// Wins the race the drift cells above LOSE: every PATH question — the
+    /// container admission, the containment chain, and the cleaner's final
+    /// `lstat` binding check — answers about the object that WAS there, and
+    /// the deletion then opens the object that IS there. Only a question asked
+    /// of the HELD DESCRIPTOR can refuse, and that question exists only
+    /// because the revalidator's `.allow` now carries a `.directory(identity)`
+    /// binding instead of `.unestablished`.
+    ///
+    /// Modelled on `OrphanedCachesScannerTests`'
+    /// `testTargetReplacedAfterTheFinalPathCheckIsRefused`, which is the same
+    /// race one scanner over.
+    private final class TempRaceWonAtTheFinalCheckProvider:
+        FileSystemIdentityProvider {
+        var target: URL!
+        var stash: URL!
+        var replacement: URL!
+        private var armed = false
+        /// The revalidation's own binding read has happened — everything after
+        /// it is the window this fixture aims at.
+        private var inspected = false
+        private(set) var swapped = false
+        private var frozen: Identity?
+
+        func arm() { armed = true }
+
+        override func identity(ofDescriptor descriptor: Int32) -> Identity? {
+            inspected = true
+            return super.identity(ofDescriptor: descriptor)
+        }
+
+        override func identity(of url: URL) -> Identity? {
+            guard armed, inspected,
+                  url.standardizedFileURL.path
+                      == target.standardizedFileURL.path
+            else { return super.identity(of: url) }
+            if !swapped {
+                frozen = super.identity(of: url)
+                swapped = true
+                try? FileManager.default.moveItem(at: target, to: stash)
+                try? FileManager.default.createDirectory(
+                    at: replacement, withIntermediateDirectories: true
+                )
+            }
+            // Every later path question answers about the object that WAS
+            // there — which is exactly what a path check cannot notice.
+            return frozen
+        }
+    }
+
+    func testEphemeralTempTargetReplacedAfterTheFinalPathCheckIsRefused()
+        async throws {
+        let world = try makeEphemeralWorld("ephemeral-final-check-race")
+        defer { try? FileManager.default.removeItem(at: world.base) }
+        let target = try stageStaleTempEntry("old-scratch", under: world.root)
+
+        let provider = TempRaceWonAtTheFinalCheckProvider()
+        provider.target = canonical(world.root)
+            .appendingPathComponent("old-scratch")
+        provider.stash = world.base.appendingPathComponent("race-moved-away")
+        let strangerTree = canonical(world.root)
+            .appendingPathComponent("old-scratch/Pictures/Photos Library.photoslibrary")
+        provider.replacement = strangerTree
+
+        let clock = ephemeralClock
+        let scanner = EphemeralTempScanner(
+            roots: [EphemeralTempRoot(
+                url: canonical(world.root),
+                label: "Shared temp",
+                cleanupEvidence: EphemeralTempRoots.sharedTempEvidence,
+                writability: .worldWritable
+            )],
+            home: world.home,
+            thresholds: ephemeralThresholds,
+            provider: provider,
+            now: { clock }
+        )
+        let runtime = try SpaceScannerRuntime(
+            scanners: [scanner], categories: [], home: world.home,
+            provider: provider
+        )
+        let items = await scannedTempItems(scanner)
+        let item = try XCTUnwrap(items["old-scratch"])
+
+        provider.arm()
+        let cleaner = runtime.makeCleaner(
+            snapshot: sessionSnapshot(of: runtime.trustedContainerRoots)
+        )
+        let report = await cleaner.clean(items: [item], moveToTrash: false)
+
+        XCTAssertTrue(provider.swapped, "the fixture never armed the swap")
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: strangerTree.path),
+            "the replacement's tree was DELETED — the deletion held a "
+                + "descriptor and never asked it who it was"
+        )
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: provider.stash.appendingPathComponent("payload.bin").path
+            ),
+            "and the inspected tree is untouched too"
+        )
+        XCTAssertTrue(report.entries.isEmpty,
+                      "reported SUCCESS for a tree it never inspected: "
+                        + "\(report.entries)")
+        XCTAssertEqual(report.errors.count, 1, "\(report.errors)")
+        let message = try XCTUnwrap(report.errors.first?.message)
+        XCTAssertTrue(message.contains("no longer the one that was inspected"),
+                      message)
+        _ = target
+    }
+
+    func testEphemeralTempRootItselfAndOutsideTargetsAreRefused() async throws {
+        let world = try makeEphemeralWorld("ephemeral-root-refusal")
+        defer { try? FileManager.default.removeItem(at: world.base) }
+        try stageStaleTempEntry("old-scratch", under: world.root)
+        // A sibling of the root, outside every admitted container.
+        let outside = world.base.appendingPathComponent("outside-entry")
+        try FileManager.default.createDirectory(
+            at: outside, withIntermediateDirectories: true
+        )
+        try writeFile(outside.appendingPathComponent("payload.bin"), bytes: 8_192)
+
+        let scanner = makeEphemeralTempScanner(root: world.root, home: world.home)
+        let runtime = try makeEphemeralRuntime(scanner, home: world.home)
+        let cleaner = runtime.makeCleaner(
+            snapshot: sessionSnapshot(of: runtime.trustedContainerRoots)
+        )
+
+        // FORGED items: the scanner is first-level-only and can never emit a
+        // root-level or outside-the-root target. They exist to prove that the
+        // strict-descendant/deny family refuses them regardless of provenance
+        // — an item's claim never widens admission.
+        let canonicalRoot = canonical(world.root)
+        let rootItem = removableItem(
+            at: canonicalRoot, originContainer: canonicalRoot,
+            displayName: "shared-temp",
+            scannerID: EphemeralTempScanner.registeredID
+        )
+        let outsideItem = removableItem(
+            at: outside, originContainer: canonicalRoot,
+            displayName: "outside-entry",
+            scannerID: EphemeralTempScanner.registeredID
+        )
+
+        let report = await cleaner.clean(
+            items: [rootItem, outsideItem], moveToTrash: false
+        )
+
+        XCTAssertTrue(report.entries.isEmpty)
+        XCTAssertEqual(report.errors.count, 2)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: world.root.path),
+                      "a temp ROOT is never a deletion target")
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: canonicalRoot.appendingPathComponent("old-scratch").path
+            ),
+            "refusing the root leaves its entries untouched"
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: outside.path))
+        let log = logContents(home: world.home)
+        XCTAssertTrue(log.contains("REFUSED [root-itself]"),
+                      "the root refusal is logged with its typed classification, got: \(log)")
+        XCTAssertTrue(log.contains("REFUSED [not-a-descendant]"),
+                      "the outside-target refusal is logged with its typed classification, got: \(log)")
+    }
+
+    func testEphemeralTempTrashFailureIsItemKeyedWithNoPermanentFallback() async throws {
+        let world = try makeEphemeralWorld("ephemeral-trash-failure")
+        defer { try? FileManager.default.removeItem(at: world.base) }
+        let bad = try stageStaleTempEntry("bad-scratch", under: world.root)
+        let good = try stageStaleTempEntry("good-scratch", under: world.root)
+
+        let scanner = makeEphemeralTempScanner(root: world.root, home: world.home)
+        let items = await scannedTempItems(scanner)
+        let badItem = try XCTUnwrap(items["bad-scratch"])
+        let goodItem = try XCTUnwrap(items["good-scratch"])
+
+        let runtime = try makeEphemeralRuntime(scanner, home: world.home)
+        let recorder = TrashRecorder()
+        let cleaner = runtime.makeCleaner(
+            snapshot: sessionSnapshot(of: runtime.trustedContainerRoots),
+            trashHandler: makeTrashSeam(
+                into: world.trash, recorder: recorder,
+                failingNames: ["bad-scratch"]
+            )
+        )
+
+        let report = await cleaner.clean(
+            items: [badItem, goodItem], moveToTrash: true
+        )
+
+        XCTAssertEqual(report.errors.count, 1, "the failed trash is ONE item error")
+        XCTAssertEqual(report.errors.first?.key, badItem.key,
+                       "the error is keyed to the item that failed, not the run")
+        XCTAssertEqual(report.errors.first?.displayName, "bad-scratch")
+        // THE contract: no fallthrough to a permanent delete.
+        XCTAssertTrue(FileManager.default.fileExists(atPath: bad.path),
+                      "a trash failure NEVER falls through to permanent deletion")
+        XCTAssertEqual(
+            try Data(contentsOf: bad.appendingPathComponent("payload.bin")),
+            payloadBytes(),
+            "the failed item is left fully in place — not partially removed"
+        )
+        // Remaining items are unaffected.
+        XCTAssertFalse(FileManager.default.fileExists(atPath: good.path))
+        let recovered = try XCTUnwrap(try soleTrashedEntry(in: world.trash))
+        XCTAssertTrue(recovered.lastPathComponent.hasSuffix("-good-scratch"),
+                      "only the sibling reached the Trash")
+        XCTAssertEqual(recorder.urls.count, 1)
+        XCTAssertEqual(report.entries.count, 1)
+        XCTAssertEqual(report.entries.first?.itemID, goodItem.id)
+        XCTAssertEqual(report.entries.first?.disposal, .trash)
+        XCTAssertEqual(report.disposal, .trash)
+    }
+
+    func testEphemeralTempUndeletableEntryAmongNIsIsolatedAsExactlyOneError() async throws {
+        // The EACCES-class stand-in. A real cross-user sticky-directory EPERM
+        // needs a second uid and cannot be fixtured from one — but note the
+        // asymmetry the epic pins (D8 r6 clause (d)): a DELETION failure under
+        // a sticky root is the one place where operation semantics prove a
+        // non-TCC cause, so a cleaner-side permission failure here is
+        // legitimately permission-flavored, unlike a bare scan-time errno.
+        try XCTSkipIf(geteuid() == 0, "chmod-based failure requires non-root")
+        let world = try makeEphemeralWorld("ephemeral-undeletable")
+        let locked = world.root.appendingPathComponent("locked-scratch")
+        // ONE teardown path, ordered: the 0555 directory is restored to 0755
+        // FIRST, because the recursive fixture removal cannot unlink a payload
+        // inside it and would otherwise leak the whole temp tree. Registered
+        // before the fixture is staged so an early throw still cleans up (both
+        // calls are harmless no-ops against a path that never existed).
+        defer {
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o755], ofItemAtPath: locked.path
+            )
+            try? FileManager.default.removeItem(at: world.base)
+        }
+        let keepA = try stageStaleTempEntry("aaa-scratch", under: world.root)
+        try stageStaleTempEntry("locked-scratch", under: world.root)
+        let keepB = try stageStaleTempEntry("zzz-scratch", under: world.root)
+
+        // r-xr-xr-x AFTER backdating (chmod moves ctime, never mtime): the
+        // entry stays readable — so the scanner still lists it — while its
+        // payload can no longer be unlinked.
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o555], ofItemAtPath: locked.path
+        )
+        // Characterize the fixture rather than trusting it: the raw operation
+        // underneath the cleaner's deletion fails EACCES for THIS user right
+        // now, so the stand-in cannot silently degrade into a no-op.
+        let lockedPayload = locked.appendingPathComponent("payload.bin")
+        let probe = lockedPayload.path.withCString { unlink($0) }
+        XCTAssertEqual(probe, -1, "the fixture must be undeletable")
+        XCTAssertEqual(errno, EACCES, "the stand-in is the EACCES class")
+
+        // CLASSIFY the failure independently, through the SAME operation the
+        // cleaner performs, so the assertion below is locale-independent: the
+        // deletion fails as Cocoa `NSFileWriteNoPermissionError` wrapping the
+        // POSIX EACCES the probe just observed. This is what makes the item
+        // error "classified" rather than merely non-empty.
+        var independentFailure: NSError?
+        do {
+            try FileManager.default.removeItem(at: locked)
+            XCTFail("the locked entry must not be removable")
+        } catch {
+            independentFailure = error as NSError
+        }
+        let classified = try XCTUnwrap(independentFailure)
+        XCTAssertEqual(classified.domain, NSCocoaErrorDomain)
+        XCTAssertEqual(classified.code, NSFileWriteNoPermissionError,
+                       "the deletion failure is permission-classified")
+        XCTAssertEqual(
+            (classified.userInfo[NSUnderlyingErrorKey] as? NSError)?.code,
+            Int(EACCES),
+            "the Cocoa error carries the POSIX EACCES provenance"
+        )
+
+        let scanner = makeEphemeralTempScanner(root: world.root, home: world.home)
+        let items = await scannedTempItems(scanner)
+        XCTAssertEqual(items.count, 3, "all three entries are listed: \(items.keys)")
+        let lockedItem = try XCTUnwrap(items["locked-scratch"])
+
+        let runtime = try makeEphemeralRuntime(scanner, home: world.home)
+        let cleaner = runtime.makeCleaner(
+            snapshot: sessionSnapshot(of: runtime.trustedContainerRoots)
+        )
+
+        let report = await cleaner.clean(
+            items: Array(items.values), moveToTrash: false
+        )
+
+        XCTAssertEqual(report.errors.count, 1,
+                       "exactly one error for the undeletable entry: \(report.errors)")
+        XCTAssertEqual(report.errors.first?.key, lockedItem.key)
+        // The item error carries the PERMISSION-CLASSIFIED failure, in the
+        // DESCRIPTOR-RELATIVE remover's own words (PR #458 replaced
+        // `FileManager.removeItem` here, so the text is no longer Cocoa's
+        // localized sentence but `DepthSafeRemoval`'s `"<place>: <strerror>"`).
+        //
+        // Still locale-independent, and still the same three things pinned:
+        // the errno is EACCES SPECIFICALLY — corroborated by both the raw
+        // `unlink` probe and the independently classified NSError above, which
+        // agree on the provenance — the failing object is NAMED, and the
+        // rendering carries no depth suffix, so the failure is reported AT the
+        // target rather than somewhere below it. A generic deletion error, a
+        // different errno, or an admission refusal all produce different text.
+        XCTAssertEqual(
+            (classified.userInfo[NSUnderlyingErrorKey] as? NSError)?.code,
+            Int(EACCES),
+            "the independent classification still agrees the cause is EACCES"
+        )
+        // Spelled the way the SCANNER was fed the root — the canonical
+        // `/private/var/…` form fn-6.1 hands production, not the `/var/…`
+        // alias `makeTempDir` happens to return.
+        let lockedCanonical = FileSystemIdentityProvider().canonicalize(locked)
+        XCTAssertEqual(report.errors.first?.message,
+                       "\(lockedCanonical.path): "
+                           + "\(String(cString: strerror(EACCES)))",
+                       "the error text is the permission-classified deletion failure")
+        XCTAssertEqual(report.entries.count, 2, "N−1 entries still deleted")
+        for entry in report.entries {
+            XCTAssertEqual(entry.disposal, .permanent)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: keepA.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: keepB.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: locked.path))
+        XCTAssertEqual(
+            try Data(contentsOf: lockedPayload), payloadBytes(),
+            "the undeletable entry is untouched, not partially removed"
+        )
+        // An operational deletion failure is NOT an admission refusal — the
+        // guard never spoke here (the cleanup log's refusal grammar is
+        // reserved for typed PathGuard refusals).
+        XCTAssertFalse(logContents(home: world.home).contains("REFUSED"),
+                       "a permission failure at delete time is not a guard refusal")
+    }
+
+    func testEphemeralTempItemRefusedWithoutTheProducingSessionSnapshot() async throws {
+        let world = try makeEphemeralWorld("ephemeral-no-snapshot")
+        defer { try? FileManager.default.removeItem(at: world.base) }
+        let target = try stageStaleTempEntry("old-scratch", under: world.root)
+
+        let scanner = makeEphemeralTempScanner(root: world.root, home: world.home)
+        let items = await scannedTempItems(scanner)
+        let item = try XCTUnwrap(items["old-scratch"])
+        let runtime = try makeEphemeralRuntime(scanner, home: world.home)
+        // FAIL-CLOSED: a cleaner holding no scan-session snapshot refuses
+        // every `.removeItem` item — temp items included, no exemption.
+        let cleaner = runtime.makeCleaner(snapshot: nil)
+
+        let report = await cleaner.clean(items: [item], moveToTrash: false)
+
+        XCTAssertTrue(report.entries.isEmpty)
+        XCTAssertEqual(report.errors.count, 1)
+        XCTAssertEqual(report.errors.first?.key, item.key)
+        XCTAssertTrue(
+            report.errors.first?.message.contains(
+                "no scan-session container snapshot"
+            ) ?? false,
+            "the refusal names the missing snapshot, got: \(report.errors)"
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: target.path))
+        XCTAssertTrue(
+            logContents(home: world.home).contains("REFUSED [container-unavailable]")
+        )
+    }
+
+    func testEphemeralTempItemRefusedWhenTempRootIsReplacedAfterTheSnapshot() async throws {
+        let world = try makeEphemeralWorld("ephemeral-stale-snapshot")
+        defer { try? FileManager.default.removeItem(at: world.base) }
+        try stageStaleTempEntry("old-scratch", under: world.root)
+
+        let scanner = makeEphemeralTempScanner(root: world.root, home: world.home)
+        let items = await scannedTempItems(scanner)
+        let item = try XCTUnwrap(items["old-scratch"])
+        let runtime = try makeEphemeralRuntime(scanner, home: world.home)
+        let cleaner = runtime.makeCleaner(
+            snapshot: sessionSnapshot(of: runtime.trustedContainerRoots)
+        )
+
+        // Temp roots churn by design, so the rm+mkdir shape is REAL here: the
+        // root is replaced (new inode) at the same path after the capture and
+        // the entry is moved back under it. Every path spelling still matches;
+        // only the snapshot-bound identity does not.
+        let fm = FileManager.default
+        let canonicalRoot = canonical(world.root)
+        let stashed = world.base.appendingPathComponent("stashed-root")
+        try fm.moveItem(at: canonicalRoot, to: stashed)
+        try fm.createDirectory(at: canonicalRoot, withIntermediateDirectories: false)
+        let target = canonicalRoot.appendingPathComponent("old-scratch")
+        try fm.moveItem(at: stashed.appendingPathComponent("old-scratch"), to: target)
+
+        let report = await cleaner.clean(items: [item], moveToTrash: false)
+
+        XCTAssertTrue(report.entries.isEmpty)
+        XCTAssertEqual(report.errors.count, 1)
+        XCTAssertEqual(report.errors.first?.key, item.key)
+        XCTAssertTrue(fm.fileExists(atPath: target.path),
+                      "a stale snapshot refuses — it never deletes through the swapped root")
+        XCTAssertTrue(
+            logContents(home: world.home).contains("REFUSED [container-unavailable]")
+        )
+    }
+
     // MARK: - The folder that HOLDS the target (PR #458 review — the P1)
 
     /// Swaps a directory the cleaner never binds — the target's PARENT — at
@@ -3712,5 +4565,371 @@ final class CacheCleanerTests: XCTestCase {
             message.contains("No such file or directory"), message
         )
         XCTAssertTrue(message.contains(child.path), message)
+    }
+
+    // MARK: - The cleanup log's own open must not block (PR #459 review r4)
+
+    /// A zero-record `.removeContents` item whose refusal is LOGGED — the
+    /// cheapest deterministic path into `appendLog` (`clean()`'s step (3)
+    /// "no-root-records" arm). Shared by the two FIFO cells below.
+    private func loggedRefusalItem(under dir: URL) -> ReclaimableItem {
+        makeItem(
+            id: "zero-record-contents",
+            records: [],
+            action: .removeContents,
+            admission: .category(makeCategory(at: dir, name: "log-fifo-cat"))
+        )
+    }
+
+    /// AVAILABILITY (PR #459 review r4, the third blocking-`open` site): the
+    /// cleanup log's `openat` is `O_WRONLY` and cannot carry `O_DIRECTORY`
+    /// (it creates a regular file), so a FIFO planted at
+    /// `~/.cacheout/cleanup.log` blocks the open until a READER appears —
+    /// measured, the pre-fix flag set did not return in 2s. Every admission
+    /// and refusal logs inside the `CacheCleaner` actor, so that block wedges
+    /// the clean and every later message to the actor. `O_NONBLOCK` converts
+    /// the no-reader open into ENXIO, which the best-effort log drops.
+    func testAFIFOPlantedAtTheCleanupLogDoesNotWedgeTheClean() async throws {
+        let home = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let logDir = home.appendingPathComponent(".cacheout")
+        try FileManager.default.createDirectory(
+            at: logDir, withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        let fifoPath = logDir.appendingPathComponent("cleanup.log").path
+        guard mkfifo(fifoPath, 0o600) == 0 else {
+            return XCTFail("mkfifo failed: \(String(cString: strerror(errno)))")
+        }
+
+        let item = loggedRefusalItem(under: home)
+        let done = expectation(description: "clean returned")
+        let cleaner = CacheCleaner(home: home, containerRoots: [])
+        Task {
+            let report = await cleaner.clean(items: [item], moveToTrash: false)
+            XCTAssertEqual(report.errors.count, 1,
+                           "the refusal itself must still surface")
+            done.fulfill()
+        }
+        await fulfillment(of: [done], timeout: 5)
+
+        var status = stat()
+        XCTAssertEqual(lstat(fifoPath, &status), 0)
+        XCTAssertEqual(status.st_mode & S_IFMT, S_IFIFO,
+                       "the planted FIFO still stands — never replaced")
+    }
+
+    /// The kind gate, evidenced separately from the flag: with a READER
+    /// holding the FIFO open, `O_WRONLY|O_NONBLOCK` SUCCEEDS (measured,
+    /// `fstat` reports `S_IFIFO`) — so without the `fstat` regular-file gate
+    /// the refusal line would stream into someone else's pipe. This cell
+    /// holds a non-blocking reader and asserts the pipe stays EMPTY.
+    func testTheCleanupLogNeverWritesIntoAFIFOEvenWithAReaderPresent() async throws {
+        let home = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let logDir = home.appendingPathComponent(".cacheout")
+        try FileManager.default.createDirectory(
+            at: logDir, withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        let fifoPath = logDir.appendingPathComponent("cleanup.log").path
+        guard mkfifo(fifoPath, 0o600) == 0 else {
+            return XCTFail("mkfifo failed: \(String(cString: strerror(errno)))")
+        }
+        let readerFd = open(fifoPath, O_RDONLY | O_NONBLOCK | O_CLOEXEC)
+        guard readerFd >= 0 else {
+            return XCTFail("reader open failed: \(String(cString: strerror(errno)))")
+        }
+        defer { close(readerFd) }
+
+        let item = loggedRefusalItem(under: home)
+        let cleaner = CacheCleaner(home: home, containerRoots: [])
+        let report = await cleaner.clean(items: [item], moveToTrash: false)
+        XCTAssertEqual(report.errors.count, 1)
+
+        // An empty pipe whose write side is closed reads 0 (EOF) — measured;
+        // EAGAIN would need a live writer holding it open. Any positive count
+        // is log text that leaked into the pipe.
+        var buffer = [UInt8](repeating: 0, count: 4096)
+        let readCount = read(readerFd, &buffer, buffer.count)
+        XCTAssertEqual(
+            readCount, 0,
+            "no bytes may enter the pipe — got \(max(readCount, 0)) bytes: "
+                + String(decoding: buffer.prefix(max(readCount, 0)), as: UTF8.self)
+        )
+    }
+}
+
+// MARK: - The regular-file identity binding, proven at the DISPOSAL itself
+// (PR #459 codex r5, P1).
+//
+// The temp revalidator's file arm verifies the candidate's (device, inode)
+// on a held descriptor; since r5 the `.allow` CARRIES that identity
+// (`.nonDirectoryLeaf`), and these four cells prove the disposal arms refuse
+// a swap that lands PAST every earlier layer: after the revalidator's fd is
+// closed, after the admitted-parent capture, and after the cleaner's final
+// path check. The swap fires inside the disposal's own container proof —
+// the last provider question before the leaf is acted on — so the ONLY
+// thing that can catch it is the leaf binding under the proved parent
+// (`DepthSafeRemoval`'s `ENOTDIR` `fstatat` comparison on the permanent
+// arm, `TrashDisposal.dispose(_:expecting:…)`'s pre-move `boundLeaf`
+// equality on the Trash arm). Before the fix this exact fixture destroyed
+// the never-scanned replacement on both arms with success reported (the
+// r5 investigation's reproduction, run against the unfixed tree).
+extension CacheCleanerTests {
+
+    private final class SwapAtTheDisposalContainerProofProvider:
+        FileSystemIdentityProvider {
+        var target: URL!
+        var stash: URL!
+        /// Creates whatever should stand at the target's name after the move.
+        var plantReplacement: (() -> Void)!
+        private var armed = false
+        private var revalidatorGatesRan = false
+        private var descriptorIdentityCallsAfterGates = 0
+        private(set) var swapped = false
+
+        func arm() {
+            armed = true
+            revalidatorGatesRan = false
+            descriptorIdentityCallsAfterGates = 0
+            swapped = false
+        }
+
+        /// The revalidator's ownership gate — the ONLY production caller of
+        /// this accessor — marks that the file arm's identity comparison has
+        /// already passed on the held descriptor.
+        override func ownerUID(ofDescriptor fd: Int32) -> UInt32? {
+            let real = super.ownerUID(ofDescriptor: fd)
+            if armed { revalidatorGatesRan = true }
+            return real
+        }
+
+        /// Descriptor-identity question #1 after the verdict returns is the
+        /// cleaner's admitted-parent capture; #2 is the DISPOSAL's own
+        /// container proof (`openAdmittedContainer`, reached through
+        /// `DepthSafeRemoval.remove` on the permanent arm and
+        /// `TrashDisposal.boundLeaf` on the Trash arm) — after the final
+        /// path check. The swap lands there, for real; every answer is
+        /// `super`'s real answer (the parent directory's identity is
+        /// unchanged by a leaf swap, so the container proof rightly passes
+        /// and the LEAF binding is the one guard left standing).
+        override func identity(ofDescriptor descriptor: Int32) -> Identity? {
+            if armed, revalidatorGatesRan {
+                descriptorIdentityCallsAfterGates += 1
+                if descriptorIdentityCallsAfterGates == 2, !swapped {
+                    swapped = true
+                    try? FileManager.default.moveItem(at: target, to: stash)
+                    plantReplacement()
+                }
+            }
+            return super.identity(ofDescriptor: descriptor)
+        }
+    }
+
+    /// Shared fixture: one stale top-level regular FILE candidate, scanned by
+    /// the real scanner, cleaned through the runtime-built cleaner, with the
+    /// swap armed to fire at the disposal's container proof.
+    private func runLateFileSwapClean(
+        _ label: String,
+        moveToTrash: Bool,
+        plant: @escaping (URL) -> Void
+    ) async throws -> (
+        report: CleanupReport,
+        target: URL,
+        stash: URL,
+        trash: URL,
+        home: URL,
+        provider: SwapAtTheDisposalContainerProofProvider,
+        recorder: TrashRecorder
+    ) {
+        let world = try makeEphemeralWorld(label)
+        addTeardownBlock {
+            try? FileManager.default.removeItem(at: world.base)
+        }
+        let rawTarget = world.root.appendingPathComponent("old-scratch.tmp")
+        try writeFile(rawTarget, bytes: 8_192)
+        try backdateTree(
+            rawTarget, to: ephemeralClock.addingTimeInterval(-30 * 86_400)
+        )
+        let target = canonical(world.root)
+            .appendingPathComponent("old-scratch.tmp")
+
+        let provider = SwapAtTheDisposalContainerProofProvider()
+        provider.target = target
+        provider.stash = world.base.appendingPathComponent("moved-away.tmp")
+        provider.plantReplacement = { plant(target) }
+
+        let clock = ephemeralClock
+        let scanner = EphemeralTempScanner(
+            roots: [EphemeralTempRoot(
+                url: canonical(world.root),
+                label: "Shared temp",
+                cleanupEvidence: EphemeralTempRoots.sharedTempEvidence,
+                writability: .worldWritable
+            )],
+            home: world.home,
+            thresholds: ephemeralThresholds,
+            provider: provider,
+            now: { clock }
+        )
+        let items = await scannedTempItems(scanner)
+        let item = try XCTUnwrap(
+            items["old-scratch.tmp"],
+            "the stale file must scan as a candidate"
+        )
+        XCTAssertNotNil(item.scannedTargetIdentity,
+                        "the scan records the file's identity")
+
+        let runtime = try SpaceScannerRuntime(
+            scanners: [scanner], categories: [], home: world.home,
+            provider: provider
+        )
+        let recorder = TrashRecorder()
+        let cleaner = runtime.makeCleaner(
+            snapshot: sessionSnapshot(of: runtime.trustedContainerRoots),
+            trashHandler: makeTrashSeam(into: world.trash, recorder: recorder)
+        )
+
+        provider.arm()
+        let report = await cleaner.clean(
+            items: [item], moveToTrash: moveToTrash
+        )
+        XCTAssertTrue(provider.swapped, "the fixture never fired the swap")
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: provider.stash.path),
+            "the SCANNED file sits untouched in the stash — whatever the "
+                + "disposal was asked to take, it was not the scanned object"
+        )
+        return (report, target, provider.stash, world.trash, world.home,
+                provider, recorder)
+    }
+
+    /// The one refusal shape all four cells assert: no entry, one item-keyed
+    /// content-drift error, the replacement SURVIVING at the name, the Trash
+    /// seam never reached.
+    private func assertLateSwapRefused(
+        _ outcome: (
+            report: CleanupReport, target: URL, stash: URL, trash: URL,
+            home: URL, provider: SwapAtTheDisposalContainerProofProvider,
+            recorder: TrashRecorder
+        ),
+        file: StaticString = #filePath, line: UInt = #line
+    ) throws {
+        XCTAssertTrue(outcome.report.entries.isEmpty,
+                      "SUCCESS was reported for an object nobody scanned: "
+                        + "\(outcome.report.entries)", file: file, line: line)
+        XCTAssertEqual(outcome.report.errors.count, 1,
+                       "\(outcome.report.errors)", file: file, line: line)
+        let message = try XCTUnwrap(outcome.report.errors.first?.message,
+                                    file: file, line: line)
+        XCTAssertTrue(message.contains("no longer the one that was inspected"),
+                      message, file: file, line: line)
+        XCTAssertTrue(logContents(home: outcome.home).contains("content-drift"),
+                      "the cleanup log tags the event content-drift",
+                      file: file, line: line)
+        XCTAssertTrue(outcome.recorder.urls.isEmpty,
+                      "the Trash seam was reached: \(outcome.recorder.urls)",
+                      file: file, line: line)
+        XCTAssertNil(try soleTrashedEntry(in: outcome.trash),
+                     file: file, line: line)
+    }
+
+    /// PERMANENT ARM, regular-file replacement: refused by the `ENOTDIR`
+    /// arm's `fstatat`-under-the-proved-parent comparison; the never-scanned
+    /// replacement survives.
+    func testEphemeralTempFileReplacedAtTheDisposalIsRefusedOnThePermanentArm()
+    async throws {
+        let replacementBytes = Data(repeating: 0x5A, count: 6_000)
+        let outcome = try await runLateFileSwapClean(
+            "late-swap-file-permanent", moveToTrash: false
+        ) { target in
+            try? replacementBytes.write(to: target)
+        }
+        try assertLateSwapRefused(outcome)
+        XCTAssertEqual(
+            try Data(contentsOf: outcome.target), replacementBytes,
+            "the never-scanned replacement still stands at the name"
+        )
+    }
+
+    /// TRASH ARM (the GUI default), regular-file replacement: refused by the
+    /// pre-move `boundLeaf` identity comparison, BEFORE the move — the Trash
+    /// is untouched.
+    func testEphemeralTempFileReplacedAtTheDisposalIsRefusedOnTheTrashArm()
+    async throws {
+        let replacementBytes = Data(repeating: 0x5A, count: 6_000)
+        let outcome = try await runLateFileSwapClean(
+            "late-swap-file-trash", moveToTrash: true
+        ) { target in
+            try? replacementBytes.write(to: target)
+        }
+        try assertLateSwapRefused(outcome)
+        XCTAssertEqual(
+            try Data(contentsOf: outcome.target), replacementBytes,
+            "the never-scanned replacement still stands at the name"
+        )
+    }
+
+    /// PERMANENT ARM, symlink planted at the name: the user's link SURVIVES
+    /// (it is not the scanned inode) and its target tree is never entered.
+    func testEphemeralTempSymlinkPlantedAtTheDisposalIsRefusedOnThePermanentArm()
+    async throws {
+        var payload: URL!
+        let outcome = try await runLateFileSwapClean(
+            "late-swap-symlink-permanent", moveToTrash: false
+        ) { target in
+            let base = target.deletingLastPathComponent()
+                .deletingLastPathComponent()
+            let precious = base.appendingPathComponent("precious-docs")
+            payload = precious.appendingPathComponent("thesis.txt")
+            try? FileManager.default.createDirectory(
+                at: precious, withIntermediateDirectories: true
+            )
+            try? Data(repeating: 0x42, count: 1_234).write(to: payload)
+            try? FileManager.default.createSymbolicLink(
+                at: target, withDestinationURL: precious
+            )
+        }
+        try assertLateSwapRefused(outcome)
+        XCTAssertNotNil(
+            try? FileManager.default.destinationOfSymbolicLink(
+                atPath: outcome.target.path
+            ),
+            "the planted link still stands at the name"
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: payload.path),
+                      "and its target tree is untouched")
+    }
+
+    /// TRASH ARM, symlink planted at the name: refused pre-move; the link
+    /// survives, its target tree untouched, the Trash undisturbed.
+    func testEphemeralTempSymlinkPlantedAtTheDisposalIsRefusedOnTheTrashArm()
+    async throws {
+        var payload: URL!
+        let outcome = try await runLateFileSwapClean(
+            "late-swap-symlink-trash", moveToTrash: true
+        ) { target in
+            let base = target.deletingLastPathComponent()
+                .deletingLastPathComponent()
+            let precious = base.appendingPathComponent("precious-docs")
+            payload = precious.appendingPathComponent("thesis.txt")
+            try? FileManager.default.createDirectory(
+                at: precious, withIntermediateDirectories: true
+            )
+            try? Data(repeating: 0x42, count: 1_234).write(to: payload)
+            try? FileManager.default.createSymbolicLink(
+                at: target, withDestinationURL: precious
+            )
+        }
+        try assertLateSwapRefused(outcome)
+        XCTAssertNotNil(
+            try? FileManager.default.destinationOfSymbolicLink(
+                atPath: outcome.target.path
+            ),
+            "the planted link still stands at the name"
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: payload.path),
+                      "and its target tree is untouched")
     }
 }

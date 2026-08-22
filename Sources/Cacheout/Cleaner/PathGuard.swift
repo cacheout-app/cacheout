@@ -111,13 +111,19 @@ struct CategoryAdmissionPolicy {
 
 // MARK: - Scan-session container snapshot (fn-3.4, R9)
 
-/// The no-follow `(device, inode)` identity of every REGISTERED container
-/// root, captured by the runtime's validated-scan entry point BEFORE any
+/// The no-follow `(device, inode)` identity of each container root the
+/// runtime's validated-scan entry point hands `capture`, taken BEFORE any
 /// scanner task launches. Delete-time container admission is IDENTITY-BOUND
 /// to this snapshot: cleaning a set of items must use the snapshot of the
 /// session that PRODUCED them, so a container replaced between scan and
 /// clean — symlink swap, rm+mkdir inode replacement, or an ancestor swap
 /// redirecting the resolved location — mismatches and is refused.
+///
+/// WHICH roots those are is the caller's decision, and it is not every
+/// registered one: `SpaceScannerRuntime.sessionContainerRoots` passes only
+/// the roots the session's PARTICIPATING scanners can reach (PR #459 codex
+/// r16), so a deferred or out-of-subset scanner's roots are never lstat'ed.
+/// That function owns the argument that this cannot strand a clean.
 ///
 /// Absent roots are OMITTED at capture: a root that did not exist when the
 /// session started can never have produced items in it, and a root created
@@ -125,6 +131,20 @@ struct CategoryAdmissionPolicy {
 /// (self-healing). Capture is deliberately part of the SESSION, never of
 /// runtime construction — a container created after app launch but before a
 /// later scan must still be cleanable in that scan's session.
+///
+/// OVER-MOUNTED roots are omitted the same way (PR #459 review r6, codex
+/// C2 — AVAILABILITY): a root the kernel mount table names EXACTLY is
+/// skipped without the identity `lstat`, because that lstat is served by
+/// the FOREIGN filesystem (an lstat of a mount point describes the mounted
+/// root) — on an unresponsive hard mount it would park the session before
+/// any scanner task launches, on EVERY trigger. The omission is fail-closed
+/// by the same rule as absence: nothing under a mounted root is ever
+/// admitted for deletion (and `admitContainer`'s deny list independently
+/// refuses mount-point containers), while the scan side shows the root as
+/// a visible refusal naming the unmount remedy. A mount landing between
+/// this table read and a capture that already passed is the accepted
+/// racing residual — the capture's own lstat can then block; no table
+/// re-read closes it.
 struct ContainerSnapshot: Sendable {
 
     private let identities: [String: FileSystemIdentityProvider.Identity]
@@ -137,11 +157,17 @@ struct ContainerSnapshot: Sendable {
     /// root's declared path spelling). `lstat`-based: a symlink at a root's
     /// path snapshots as the LINK — delete-time admission independently
     /// refuses non-directory containers, so a link identity can never admit.
+    ///
+    /// The kernel-table preflight (`mountPointPaths`, `getfsstat` with
+    /// `MNT_NOWAIT` — no filesystem contact) runs FIRST, so an over-mounted
+    /// root is skipped without ever being lstat'ed (the type comment says
+    /// why, and why skipping is fail-closed).
     static func capture(
         roots: [URL], provider: FileSystemIdentityProvider
     ) -> ContainerSnapshot {
+        let mounted = Set(provider.mountPointPaths())
         var identities: [String: FileSystemIdentityProvider.Identity] = [:]
-        for root in roots {
+        for root in roots where !mounted.contains(root.path) {
             if let identity = provider.identity(of: root) {
                 identities[root.path] = identity
             }
@@ -403,8 +429,38 @@ final class PathGuard {
     private func matchConfiguredRoot(
         _ url: URL
     ) throws -> (matched: URL, resolved: URL) {
+        // THE KERNEL-TABLE PREFLIGHT (PR #459 review r6, codex C2 —
+        // AVAILABILITY). `canonicalize` is realpath(3), whose resolution of
+        // an over-mounted path's final component is served by the MOUNTED
+        // filesystem — first contact, which on an unresponsive hard mount
+        // parks the calling thread. Two arms, answered from the kernel's
+        // own table (`getfsstat(MNT_NOWAIT)` — no filesystem contact)
+        // BEFORE any canonicalization:
+        //
+        // 1. An over-mounted `url` is refused outright, with the SAME
+        //    `.deniedVolumeRoot` the policy check would have reached after
+        //    five foreign-fs syscalls — a mount-point container could never
+        //    admit (`coreDenyCheck` refuses it), so nothing legitimate is
+        //    lost, only the contact.
+        // 2. An over-mounted CONFIGURED root is skipped in the loop, so
+        //    admitting a healthy SIBLING never realpaths the mounted one —
+        //    without this, one dead volume at any registered root wedged
+        //    every other root's admission too.
+        //
+        // The filesystem root `/` is exempt from both: it is always in the
+        // table, is not foreign, and must keep its own
+        // `.deniedFilesystemRoot` classification. Residuals at measured
+        // scope: a mounted ANCESTOR of `url` still resolves through
+        // realpath, and an ALIAS spelling of an over-mounted root falls
+        // through to the resolution it names (both refuse; the alias case
+        // classifies as not-configured once the mounted root is skipped).
+        let mounted = Set(provider.mountPointPaths())
+        if url.path != "/", mounted.contains(url.path) {
+            throw PathGuardError.deniedVolumeRoot(path: url.path)
+        }
         let resolved = provider.canonicalize(url)
-        for root in containerRoots {
+        for root in containerRoots
+        where root.path == "/" || !mounted.contains(root.path) {
             let canonicalRoot = provider.canonicalize(root)
             if provider.sameLocation(resolved, canonicalRoot) {
                 try containerRootPolicyCheck(canonical: canonicalRoot)

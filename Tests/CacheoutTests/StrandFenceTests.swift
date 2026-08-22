@@ -61,7 +61,7 @@ import XCTest
 /// `Fatal error: Unexpectedly found nil`, **signal 5, the total line never
 /// printed, 493 of the 1471 cells AT COMMIT 26c880b never ran**, and this
 /// PR's own `WorktreeReclaimPerformerTests` appeared in the log zero times.
-/// (The suite is 1482 at r8; the figure belongs to the commit it was taken
+/// (The suite is 1486 at r8; the figure belongs to the commit it was taken
 /// at — see `WorktreeReclaimPerformerTests`' class header, D5.)
 ///
 /// So r7 converted that population — 14 sites in `CategoryScannerTests`,

@@ -2429,8 +2429,8 @@ struct WorktreeReclaimPerformer {
         // THE COMMAND AND THE COMMIT ARE BOTH STATED BECAUSE THE TOTAL MOVES
         // (PR #460 codex r7, D5). 1466 is 06c1ad5's total, not this branch's:
         // 0284fd1 took it to 1467, 193b043 to 1470, bcfcb7e to 1471, and r7's
-        // own cells to 1480, and r8's two fence cells to 1482 (`swift
-        // test`, this commit). The half that
+        // own cells to 1480, and r8's six fence and citation cells to 1486
+        // (`swift test`, this commit). The half that
         // survives every
         // commit — and the half a mutation actually establishes — is the ZERO
         // FAILURES.

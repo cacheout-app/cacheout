@@ -75,7 +75,7 @@ import XCTest
 /// `return .unreadable`, and the FULL suite stayed GREEN: `swift test`, run AT
 /// COMMIT 06c1ad5, reported 1466 executed / 2 skipped / 0 failures. The TOTAL
 /// belongs to that commit and not to this branch (PR #460 codex r7, D5) —
-/// 0284fd1 → 1467, 193b043 → 1470, bcfcb7e → 1471, r7 → 1480, r8 → 1482
+/// 0284fd1 → 1467, 193b043 → 1470, bcfcb7e → 1471, r7 → 1480, r8 → 1486
 /// (`swift test`, this commit); what a mutation establishes is the zero failures. That arm was deleted at r6
 /// rather than evidenced; see
 /// `testAReftableWorktreeWhoseHeadFileIsGoneIsRefusedByTheGatesThatRemain` and

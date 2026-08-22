@@ -1058,9 +1058,10 @@ class CacheoutViewModel: ObservableObject {
     /// `.commands`, so a selected composite item would fall through to the
     /// sheet's generic wording — which reflects the Move-to-Trash toggle and
     /// would therefore imply the worktree is recoverable. It is not:
-    /// `git worktree remove` UNLINKS the tree, and `git worktree prune`
-    /// removes admin data; neither puts anything in the Trash, whatever the
-    /// toggle says (D16, and the `.commands` precedent it follows).
+    /// `git worktree remove` UNLINKS the tree, and the repository-level mode
+    /// removes admin data directly; neither puts anything in the Trash,
+    /// whatever the toggle says (D16, and the `.commands` precedent it
+    /// follows).
     ///
     /// TWO MODES, TWO DIFFERENT TRUTHS — never one laundered sentence:
     ///

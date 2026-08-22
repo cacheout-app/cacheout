@@ -22,7 +22,8 @@
 /// 4. **The grep gates** — read over the production source tree: one
 ///    oracle→admin mapping implementation with both call sites, no
 ///    `<wd>/.git/worktrees` reconstruction, no `--force`, no branch deletion,
-///    `--expire=now` on every prune argv, and no git execution outside
+///    NO repository-wide `worktree prune` argv anywhere (the expire override
+///    now rides the oracle listing instead), and no git execution outside
 ///    `GitCommandRunner`.
 ///
 /// HERMETIC BY CONSTRUCTION: the git runner is injected into `production()`
@@ -521,12 +522,19 @@ final class GitWorktreeEndToEndTests: XCTestCase {
         XCTAssertEqual(try branches(of: fixture.repository),
                        ["main", "merged", "dirty", "gone"])
 
-        // The executed prune carried `--expire=now` (D10) and nothing forbidden
-        // reached git anywhere in the run.
-        let executedPrunes = runner.invocations.filter { $0.argv.contains("prune") }
-        XCTAssertFalse(executedPrunes.isEmpty, "the prune item really executed")
-        for executed in executedPrunes {
-            XCTAssertTrue(executed.argv.contains("--expire=now"), "\(executed.argv)")
+        // The prune item really executed — proven by the admin directory
+        // being gone, not by a subprocess appearing — and NO repository-wide
+        // prune ran (PR #460 codex r1 / C4). D10's expire override rides the
+        // oracle listing, which is where prunability is decided.
+        XCTAssertNil(runner.argvs.first { $0.contains("prune") },
+                     "\(runner.argvs)")
+        let listings = runner.invocations.filter { $0.argv.contains("list") }
+        XCTAssertFalse(listings.isEmpty)
+        for listing in listings {
+            XCTAssertTrue(
+                listing.argv.contains(GitWorktreeOracle.pruneExpireOverride),
+                "\(listing.argv)"
+            )
         }
         for invocation in runner.invocations {
             XCTAssertFalse(invocation.argv.contains("--force"),
@@ -647,7 +655,7 @@ final class GitWorktreeEndToEndTests: XCTestCase {
         var pruneOffenders: [String] = []
         var forceSeen = 0
         var reconstructionSeen = 0
-        var pruneArgvSeen = 0
+        var expireOverrideSeen = 0
         var executableSeen = 0
 
         for file in sources {
@@ -682,13 +690,18 @@ final class GitWorktreeEndToEndTests: XCTestCase {
                         executableOffenders.append("\(name): \(line)")
                     }
                 }
-                // D10: a bare prune respects `gc.worktreePruneExpire`, so
-                // detection would offer orphans execution silently leaves.
+                // NO repository-wide prune argv may exist AT ALL any more
+                // (PR #460 codex r1 / C4): `git worktree prune` takes no set,
+                // so it re-enumerates the admin container after every gate has
+                // answered. The repository-level mode removes the disclosed
+                // directories directly instead.
                 if !isComment, line.contains("\"worktree\", \"prune\"") {
-                    pruneArgvSeen += 1
-                    if !line.contains("--expire=now") {
-                        pruneOffenders.append("\(name): \(line)")
-                    }
+                    pruneOffenders.append("\(name): \(line)")
+                }
+                // …and D10's job moved to where prunability is now decided:
+                // the ORACLE listing pins the expire override.
+                if !isComment, line.contains("gc.worktreePruneExpire=now") {
+                    expireOverrideSeen += 1
                 }
             }
         }
@@ -699,7 +712,9 @@ final class GitWorktreeEndToEndTests: XCTestCase {
         XCTAssertEqual(branchOffenders, [], "a branch deletion reached production code")
         XCTAssertEqual(executableOffenders, [],
                        "git is executed outside GitCommandRunner")
-        XCTAssertEqual(pruneOffenders, [], "a prune argv without --expire=now")
+        XCTAssertEqual(pruneOffenders, [],
+                       "a repository-wide `worktree prune` argv reached "
+                           + "production code")
 
         // Non-vacuity: each needle must actually occur somewhere, or the gate
         // is asserting over an empty set.
@@ -708,11 +723,12 @@ final class GitWorktreeEndToEndTests: XCTestCase {
                              "the reconstruction needle found nothing")
         XCTAssertGreaterThan(executableSeen, 0,
                              "the git executable needle found nothing")
-        // The rule is "EVERY prune argv carries --expire=now" (enforced per
-        // line above); this only proves the needle matched something, so a
-        // future second builder is checked rather than assumed away.
-        XCTAssertGreaterThan(pruneArgvSeen, 0,
-                             "the prune argv needle found nothing")
+        // The prune-argv gate is a pure PROHIBITION, so it cannot be
+        // non-vacuous by counting its own needle. What must stay non-vacuous
+        // is the rule that replaced it: the expire override still exists, on
+        // the oracle listing, which is where prunability is decided.
+        XCTAssertGreaterThan(expireOverrideSeen, 0,
+                             "the gc.worktreePruneExpire needle found nothing")
     }
 
     /// ONE oracle→admin mapping implementation, with BOTH call sites present:

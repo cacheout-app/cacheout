@@ -47,9 +47,12 @@ below are both part of that coordination, and the latter BLOCKS this release.
   the scan refuses, names the action that clears it ("run
   `git worktree unlock …`", "merge, rebase or push that commit"), and deletes
   nothing. Only then is the tree re-checked for cleanliness and deleted
-  directly, followed by a narrowly gated `git worktree prune --expire=now`
-  limited to that worktree's own admin entry; the repository-level item
-  prunes exactly the disclosed set.
+  directly, followed by a narrowly gated removal of that worktree's own admin
+  entry. The repository-level item removes exactly the admin directories it
+  disclosed, one at a time — no repository-wide `git worktree prune` runs,
+  because git recomputes that command's set for itself after every check has
+  already answered, and a second checkout of the same repository that
+  vanished in between would be swept without ever having been listed.
   **No branch is ever deleted and repository objects are never touched.**
   Because git unlinks rather than trashes, the confirmation sheet discloses
   per selected item that Move to Trash does not apply — stale removals and

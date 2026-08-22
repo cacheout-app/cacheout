@@ -81,9 +81,8 @@
 /// disclosure) and fn-5.4 (delete-time recompute plus the final
 /// pre-subprocess check) both call `GitWorktreeAdminMapper`. A second
 /// mapping implementation is the thing this file exists to prevent — a
-/// repo-wide `git worktree prune` removes every prunable admin directory, so
-/// detection and execution must agree byte for byte about which ones those
-/// are.
+/// the set this mapper returns IS the set fn-5.4 removes, so detection and
+/// execution must agree byte for byte about which directories those are.
 
 import Foundation
 
@@ -444,8 +443,8 @@ struct GitWorktreeGitdirResolver {
 /// the execution prune pins — otherwise a detected fresh orphan survives
 /// execution as a recurring ~0-byte "success".
 ///
-/// The MUTATION argv (`worktree remove` / `worktree prune`) deliberately does
-/// NOT live here: it belongs to the one component allowed to mutate,
+/// The MUTATION argv (`worktree remove`) deliberately does NOT live here: it
+/// belongs to the one component allowed to mutate,
 /// `WorktreeReclaimPerformer` (fn-5.4).
 enum GitWorktreeOracle {
 
@@ -466,9 +465,10 @@ enum GitWorktreeOracle {
 // MARK: - Shared oracle → admin-directory mapper (epic round 10)
 
 /// Whether the prunable set could be mapped COMPLETELY onto admin
-/// directories. There is no partial answer on purpose: `git worktree prune`
-/// is repo-wide, so a knowingly-incomplete disclosure would let the prune
-/// remove something nobody was told about (D14).
+/// directories. There is no partial answer on purpose: the verdict decides
+/// whether a repository's registry may be offered AT ALL, and a
+/// knowingly-incomplete account of a container the removal traverses would
+/// let the operation touch something nobody was told about (D14).
 enum GitAdminMappingVerdict: Equatable, Sendable {
     /// Every prunable record mapped, and every entry in the container
     /// cleared the traversal gates. Sorted and de-duplicated for

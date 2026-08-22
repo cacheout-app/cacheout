@@ -204,6 +204,7 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         measure: ((URL, DirectorySizer.Mode, Set<FileSystemIdentityProvider.Identity>) -> SizeReport)? = nil,
         moveToTrash: Bool = false,
         trash: ((URL) async throws -> URL?)? = nil,
+        removeTree: ((URL, DepthSafeRemoval.AdmittedParent) async throws -> Void)? = nil,
         revalidate: ((ReclaimableItem) -> PreDeleteSeamRefusal?)? = nil,
         gitTimeout: TimeInterval = WorktreeReclaimPerformer.deleteTimeGitTimeout,
         provider overrideProvider: FileSystemIdentityProvider? = nil
@@ -232,7 +233,7 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
                 try fileManager.moveItem(at: url, to: landed)
                 return landed
             },
-            removeTree: { url, _ in try fileManager.removeItem(at: url) },
+            removeTree: removeTree ?? { url, _ in try fileManager.removeItem(at: url) },
             revalidate: revalidate ?? { _ in nil },
             logRefusal: { _, _ in },
             logCleaned: { _ in }
@@ -581,11 +582,11 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
                 parentRepoWorkingDir: repository
             )
         )
-        XCTAssertEqual(
-            bare[14],
-            WorktreeReclaimPerformer.pruneArguments(parentRepoWorkingDir: repository)
-        )
-        XCTAssertEqual(bare.count, 15, "\(bare)")
+        // …and then NOTHING. The gated post-fallback prune is a SCOPED
+        // filesystem removal of that worktree's own admin entry, not a
+        // repository-wide `git worktree prune` (PR #460 codex r1 / C4).
+        XCTAssertEqual(bare.count, 14, "\(bare)")
+        XCTAssertNil(bare.first { $0.contains("prune") }, "\(bare)")
         assertNoForbiddenArgv(runner)
     }
 
@@ -627,14 +628,12 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         XCTAssertTrue(try branchExists("feature", in: repository),
                       "a reclaim must never take the branch with it")
 
-        let pruneArgv = try XCTUnwrap(
-            runner.argvs.first { $0.contains("prune") }
-        )
-        XCTAssertEqual(
-            pruneArgv,
-            ["git", "-c", "core.fsmonitor=false", "-C", repository.path,
-             "worktree", "prune", "--expire=now"]
-        )
+        // The gated post-fallback cleanup is a SCOPED removal of exactly
+        // that worktree's own admin entry — no repository-wide prune argv
+        // exists to reach (PR #460 codex r1 / C4). Proof is above: the admin
+        // entry is gone, the OTHER registered worktree's entry is not
+        // consulted, and the registry reads clean through git.
+        XCTAssertNil(runner.argvs.first { $0.contains("prune") }, "\(runner.argvs)")
         assertNoForbiddenArgv(runner)
     }
 
@@ -895,23 +894,35 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
             worktree: worktree, membership: try membership(of: worktree, in: repository)
         )
         let runner = InterceptingGitRunner(wrapping: realRunner()) { arguments, _ in
-            if arguments.contains("remove") {
-                return .failure(exitCode: 128, stderr: "injected refusal")
-            }
-            if arguments.contains("prune") {
-                return .failure(exitCode: 3, stderr: "fatal: prune exploded")
-            }
-            return nil
+            arguments.contains("remove")
+                ? .failure(exitCode: 128, stderr: "injected refusal")
+                : nil
         }
-        let report = await makeCleaner(runner: runner)
-            .clean(items: [item(plan)], moveToTrash: false)
+        // The gated post-fallback cleanup is now a scoped REMOVAL, so its
+        // failure class is a removal failure rather than a subprocess one —
+        // and it must still be a WARNING, because the tree's bytes are
+        // already freed (D11).
+        let adminContainerPath = plan.parentAdminContainer.path
+        let fileManager = fm
+        let outcome = await perform(
+            item(plan), plan: plan,
+            with: makePerformer(
+                runner: runner,
+                removeTree: { url, _ in
+                    if url.path.hasPrefix(adminContainerPath) {
+                        throw CocoaError(.fileWriteNoPermission)
+                    }
+                    try fileManager.removeItem(at: url)
+                }
+            )
+        )
 
-        XCTAssertTrue(report.errors.isEmpty,
-                      "a post-delete prune failure is NEVER an ItemError")
-        let entry = try XCTUnwrap(report.entries.first)
+        XCTAssertTrue(outcome.errors.isEmpty,
+                      "a post-delete cleanup failure is NEVER an ItemError")
+        let entry = try XCTUnwrap(outcome.entry)
         XCTAssertGreaterThan(entry.bytesFreed, 0)
         let warning = try XCTUnwrap(entry.warning)
-        XCTAssertTrue(warning.contains("git exit 3"), warning)
+        XCTAssertTrue(warning.contains("could not be removed"), warning)
         XCTAssertTrue(
             warning.contains(WorktreeReclaimPerformer.orphanedAdminWarning),
             warning
@@ -2030,14 +2041,18 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         XCTAssertNil(entry.warning,
                      "the D11 warning is exclusive to stale mode")
 
-        // `--expire=now` on EVERY execution prune, and the mutation profile.
-        let prunes = runner.invocations.filter { $0.argv.contains("prune") }
-        XCTAssertEqual(prunes.count, 1)
-        for prune in prunes {
-            XCTAssertTrue(prune.argv.contains("--expire=now"), "\(prune.argv)")
-            XCTAssertEqual(prune.profile, .mutation)
-            XCTAssertNil(prune.environment[GitCommandRunner.optionalLocksVariable])
-            XCTAssertTrue(prune.argv.contains("core.fsmonitor=false"))
+        // NO repository-wide prune argv exists: the removal is scoped to the
+        // disclosed directories (PR #460 codex r1 / C4). D10's `--expire=now`
+        // job now lives entirely on the ORACLE listing, which is where
+        // prunability is decided — asserted below.
+        XCTAssertNil(runner.argvs.first { $0.contains("prune") }, "\(runner.argvs)")
+        XCTAssertNil(runner.invocations.first { $0.profile == .mutation },
+                     "the prune tier fires no git MUTATION at all")
+        for listing in runner.invocations where listing.argv.contains("list") {
+            XCTAssertTrue(
+                listing.argv.contains(GitWorktreeOracle.pruneExpireOverride),
+                "\(listing.argv)"
+            )
         }
         // TWO read-only oracle recomputes bracket the measurement (round 8).
         let listings = runner.invocations.filter { $0.argv.contains("list") }
@@ -2077,33 +2092,36 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
     func testASuccessEntryIsEmittedEvenWhenZeroBytesCouldBeAccepted()
         async throws
     {
-        // Verified-removal accounting: a scripted exit 0 that removed nothing
-        // accepts nothing — and STILL reports a row, never a silent success.
+        // Verified-removal accounting: a removal seam that reports success
+        // while removing nothing accepts nothing — and STILL reports a row,
+        // never a silent success.
         let fixture = try makePruneFixture(orphans: ["gone"])
         let orphan = fixture.admin[0]
         let plan = prunePlan(membership: fixture.membership, disclosed: [orphan])
-        let runner = InterceptingGitRunner(wrapping: realRunner()) { arguments, _ in
-            arguments.contains("prune") ? .success(stdout: Data()) : nil
-        }
+        let runner = InterceptingGitRunner(wrapping: realRunner())
         let outcome = await perform(
             item(plan, id: "prune"), plan: plan,
-            with: makePerformer(runner: runner)
+            with: makePerformer(runner: runner, removeTree: { _, _ in })
         )
 
         XCTAssertTrue(outcome.errors.isEmpty)
-        let entry = try XCTUnwrap(outcome.entry, "a row is mandatory at exit 0")
+        let entry = try XCTUnwrap(outcome.entry, "a row is mandatory on success")
         XCTAssertEqual(entry.bytesFreed, 0,
                        "a directory still on disk was not freed")
         XCTAssertTrue(fm.fileExists(atPath: orphan.path))
     }
 
     func testEveryFailingPruneClassIsAnErrorAndNeverAWarning() async throws {
-        let cases: [(name: String, outcome: GitCommandOutcome, fragment: String)] = [
-            ("nonzero", .failure(exitCode: 9, stderr: "fatal: prune refused"),
+        // The failure classes of the prune tier, after the removal became
+        // scoped: the two ORACLE classes that decide the set, and the removal
+        // itself. All are ERRORS — the D11 warning channel is exclusive to
+        // stale mode, where the bytes are already freed.
+        let cases: [(name: String, outcome: GitCommandOutcome?, fragment: String)] = [
+            ("oracle-nonzero", .failure(exitCode: 9, stderr: "fatal: list refused"),
              "git exit 9"),
-            ("timeout", .timeout,
-             "prune timed out; the registry may be PARTIALLY cleaned — rescan required"),
-            ("unavailable", .gitUnavailable, "git unavailable at clean time"),
+            ("oracle-timeout", .timeout, "the porcelain oracle timed out"),
+            ("oracle-unavailable", .gitUnavailable, "git is unavailable at clean time"),
+            ("removal", nil, "could not be removed"),
         ]
         for (name, scripted, fragment) in cases {
             // Each case gets its OWN repository, worktree and orphan names —
@@ -2112,12 +2130,20 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
             let fixture = try makePruneFixture(orphans: ["gone-\(name)"], suffix: "-\(name)")
             let orphan = fixture.admin[0]
             let plan = prunePlan(membership: fixture.membership, disclosed: [orphan])
-            let runner = InterceptingGitRunner(wrapping: realRunner()) { arguments, _ in
-                arguments.contains("prune") ? scripted : nil
+            let runner = InterceptingGitRunner(wrapping: realRunner()) { arguments, index in
+                // The FIRST recompute only — a scripted second one would be
+                // testing a different gate.
+                guard let scripted, arguments.contains("list"), index == 1 else { return nil }
+                return scripted
             }
             let outcome = await perform(
                 item(plan, id: "prune"), plan: plan,
-                with: makePerformer(runner: runner)
+                with: makePerformer(
+                    runner: runner,
+                    removeTree: scripted == nil
+                        ? { _, _ in throw CocoaError(.fileWriteNoPermission) }
+                        : nil
+                )
             )
             XCTAssertNil(outcome.entry,
                          "\(name): a failed prune accepts no claims and reports no row")
@@ -2348,33 +2374,145 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         XCTAssertFalse(fm.fileExists(atPath: orphanAdmin.path),
                        "the bare parent's admin entry must actually be pruned")
         XCTAssertEqual(pruneReport.entries.count, 1)
-        let pruneArgv = try XCTUnwrap(
-            pruneRunner.argvs.first { $0.contains("prune") }
-        )
-        XCTAssertEqual(pruneArgv[4], bare.path)
-        XCTAssertTrue(pruneArgv.contains("--expire=now"))
+        // Every git invocation this tier fires is pointed at the BARE
+        // repository itself, and none of them is a mutation: the removal is
+        // scoped to the carried admin container (PR #460 codex r1 / C4).
+        for argv in pruneRunner.argvs {
+            XCTAssertEqual(argv[4], bare.path, "\(argv)")
+        }
+        XCTAssertNil(pruneRunner.argvs.first { $0.contains("prune") })
+        XCTAssertNil(pruneRunner.invocations.first { $0.profile == .mutation })
         assertNoForbiddenArgv(pruneRunner)
     }
 
-    func testNoProductionPathEverRemovesAnAdminDirectoryDirectly() async throws {
-        // The prune tier mutates the registry ONLY through git — a direct rm
-        // would bypass git's own bookkeeping (an alternative the epic
-        // explicitly rejected). Proof: with EVERY git call scripted away, the
-        // admin directories are still on disk afterwards.
-        let fixture = try makePruneFixture(orphans: ["gone"])
-        let orphan = fixture.admin[0]
-        let plan = prunePlan(membership: fixture.membership, disclosed: [orphan])
-        let runner = InterceptingGitRunner(wrapping: realRunner()) { arguments, _ in
-            arguments.contains("prune") ? .success(stdout: Data()) : nil
-        }
-        _ = await perform(
+    func testTheRemovalSetIsExactlyTheRecomputedSetAndNeverTheContainer()
+        async throws
+    {
+        // RETIRED (PR #460 codex r1 / C4): this cell used to assert "the prune
+        // tier mutates the registry ONLY through git — a direct rm would
+        // bypass git's own bookkeeping". That premise is false for THIS
+        // object, and it was MEASURED rather than assumed (git 2.50.1, two
+        // identically-built repositories, one pruned by git and one whose
+        // orphan admin directory was removed directly): IDENTICAL `.git`
+        // trees, IDENTICAL `worktree list --porcelain`, IDENTICAL branch
+        // lists, `git fsck` clean on both, a subsequent
+        // `worktree prune --expire=now` a silent no-op, the surviving live
+        // worktree's `status` fine, and a later `worktree add` fine. The admin
+        // directory IS the bookkeeping, and git's own prune removes it
+        // recursively. What git's prune adds is the RE-ENUMERATION — it takes
+        // no path and no set, so it recomputes one AFTER every gate here has
+        // already answered.
+        //
+        // The invariant that replaces it is the one actually at stake: what is
+        // removed is the recomputed, DISCLOSED set — never whatever else the
+        // container happens to hold.
+        let fixture = try makePruneFixture(orphans: ["disclosed", "undisclosed"])
+        let disclosed = fixture.admin[0]
+        let undisclosed = fixture.admin[1]
+        // Only ONE of the two orphans is disclosed; the other is prunable and
+        // would ride a repository-wide prune.
+        let plan = prunePlan(
+            membership: fixture.membership, disclosed: [disclosed]
+        )
+        let runner = InterceptingGitRunner(wrapping: realRunner())
+        let outcome = await perform(
             item(plan, id: "prune"), plan: plan,
             with: makePerformer(runner: runner)
         )
+
+        // The recompute sees BOTH, one was never disclosed, so the item
+        // refuses outright and removes nothing at all.
+        XCTAssertNil(outcome.entry)
+        XCTAssertTrue(fm.fileExists(atPath: disclosed.path))
+        XCTAssertTrue(fm.fileExists(atPath: undisclosed.path))
         XCTAssertTrue(
-            fm.fileExists(atPath: orphan.path),
-            "with the prune subprocess stubbed out, nothing else may delete it"
+            try XCTUnwrap(outcome.errors.first?.message)
+                .contains("was never disclosed")
         )
+        // …and there is no repository-wide prune argv anywhere to reach.
+        XCTAssertNil(runner.argvs.first { $0.contains("prune") })
+    }
+
+    func testTheDisclosedOrphanIsRemovedWhileItsLiveSiblingSurvives()
+        async throws
+    {
+        // The positive half: the scoped removal takes the disclosed admin
+        // directory and NOTHING else inside the same container — and it
+        // leaves the repository in the state git's own prune would leave,
+        // asserted through git rather than through our own bookkeeping.
+        let fixture = try makePruneFixture(orphans: ["gone"])
+        let orphan = fixture.admin[0]
+        let anchorAdmin = fixture.membership.parentAdminContainer
+            .appendingPathComponent("anchor")
+        XCTAssertTrue(fm.fileExists(atPath: anchorAdmin.path))
+
+        let plan = prunePlan(membership: fixture.membership, disclosed: [orphan])
+        let runner = InterceptingGitRunner(wrapping: realRunner())
+        let outcome = await perform(
+            item(plan, id: "prune"), plan: plan,
+            with: makePerformer(runner: runner)
+        )
+
+        XCTAssertTrue(outcome.errors.isEmpty, "\(outcome.errors.map(\.message))")
+        XCTAssertFalse(fm.fileExists(atPath: orphan.path),
+                       "the disclosed orphan must be REMOVED")
+        XCTAssertTrue(fm.fileExists(atPath: anchorAdmin.path),
+                      "the live worktree's admin entry must survive")
+        XCTAssertEqual(try porcelainRecordCount(of: fixture.repository), 2)
+        XCTAssertEqual(
+            String(decoding: try git(["-C", fixture.repository.path, "fsck"]),
+                   as: UTF8.self),
+            "", "fsck must be clean after a scoped removal"
+        )
+        XCTAssertNil(runner.argvs.first { $0.contains("prune") })
+    }
+
+    func testACheckoutRevivedAfterTheFinalCheckIsNotSwept() async throws {
+        // THE PER-OBJECT GATE. The final oracle check answered one subprocess
+        // ago; if a checkout came back in between (a remount, a restore, a
+        // `git worktree repair`), its admin directory holds live index, reflog
+        // and refs, and destroying it is exactly what `worktree repair` can no
+        // longer undo.
+        let fixture = try makePruneFixture(orphans: ["first", "revived"])
+        let plan = prunePlan(
+            membership: fixture.membership, disclosed: fixture.admin
+        )
+        let revivedAdmin = fixture.admin[1]
+        let revivedCheckout = container.appendingPathComponent("revived")
+        let fileManager = fm
+        let removed = TrashRecorder()
+        // THE WINDOW: removing the FIRST directory revives the SECOND one's
+        // checkout, which is strictly after the final oracle check.
+        let outcome = await perform(
+            item(plan, id: "prune"), plan: plan,
+            with: makePerformer(
+                runner: InterceptingGitRunner(wrapping: realRunner()),
+                removeTree: { url, _ in
+                    removed.record(url)
+                    if removed.urls.count == 1 {
+                        try? fileManager.createDirectory(
+                            at: revivedCheckout, withIntermediateDirectories: true
+                        )
+                        try? Data("gitdir: \(revivedAdmin.path)\n".utf8).write(
+                            to: revivedCheckout.appendingPathComponent(".git")
+                        )
+                    }
+                    try fileManager.removeItem(at: url)
+                }
+            )
+        )
+
+        XCTAssertTrue(
+            fm.fileExists(atPath: revivedAdmin.path),
+            "an admin directory whose checkout came back must not be removed"
+        )
+        XCTAssertTrue(fm.fileExists(
+            atPath: revivedAdmin.appendingPathComponent("gitdir").path
+        ), "…nor any of its live state")
+        XCTAssertNil(outcome.entry, "a refused removal accepts nothing")
+        let message = try XCTUnwrap(outcome.errors.first?.message)
+        XCTAssertTrue(message.contains("is registered again"), message)
+        XCTAssertTrue(message.contains("Re-scan"), message)
     }
 
     // MARK: - R8: the traversal guard in PRUNE mode
@@ -2577,23 +2715,38 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         let remove = WorktreeReclaimPerformer.removeArguments(
             parentRepoWorkingDir: parent, worktreePath: worktree
         )
-        let prune = WorktreeReclaimPerformer.pruneArguments(
-            parentRepoWorkingDir: parent
-        )
         XCTAssertEqual(remove, ["-C", "/dev/repo", "worktree", "remove", "/dev/wt"])
-        XCTAssertEqual(
-            prune, ["-C", "/dev/repo", "worktree", "prune", "--expire=now"]
-        )
-        for argv in [remove, prune] {
+        // `worktree remove` is now the performer's ONLY mutating argv builder
+        // (PR #460 codex r1 / C4): the repository-level mode removes the
+        // disclosed admin directories directly, because
+        // `git worktree prune` recomputes its own set after every gate has
+        // answered. The delete-time re-establishment's builders are all
+        // read-only.
+        let readOnly = [
+            WorktreeReclaimPerformer.commonGitDirArguments(
+                parentRepoWorkingDir: parent
+            ),
+            GitWorktreeMergedCheck.originHeadArguments(parentRepoWorkingDir: parent),
+            GitWorktreeMergedCheck.verifyRefArguments(
+                parentRepoWorkingDir: parent, ref: "refs/heads/main"
+            ),
+            GitWorktreeMergedCheck.ancestryArguments(
+                worktreeAt: worktree, defaultRef: "refs/heads/main"
+            ),
+            GitWorktreeCleanCheck.arguments(forWorktreeAt: worktree),
+        ]
+        for argv in [remove] + readOnly {
             XCTAssertFalse(argv.contains("--force"))
             XCTAssertFalse(argv.contains("-f"))
             XCTAssertFalse(argv.contains("branch"))
             XCTAssertFalse(argv.contains("-d"))
             XCTAssertFalse(argv.contains("-D"))
+            XCTAssertFalse(argv.contains("prune"), "\(argv)")
         }
-        // Both are MUTATIONS by D17 classification; the oracle listing is not.
         XCTAssertEqual(GitSafetyProfile.classify(remove), .mutation)
-        XCTAssertEqual(GitSafetyProfile.classify(prune), .mutation)
+        for argv in readOnly {
+            XCTAssertEqual(GitSafetyProfile.classify(argv), .readOnly, "\(argv)")
+        }
         XCTAssertEqual(
             GitSafetyProfile.classify(
                 GitWorktreeOracle.listArguments(forRepositoryAt: parent)

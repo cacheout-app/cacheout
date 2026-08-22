@@ -5,12 +5,12 @@
 ///
 /// - **`removeStaleWorktree`** — `git -C <parent> worktree remove <path>`
 ///   first (never `--force`), with a guarded filesystem fallback + a GATED
-///   `worktree prune --expire=now` when git refuses with a nonzero exit, the
-///   tree re-checks CLEAN, and the delete-time gate re-establishment below
-///   still passes.
-/// - **`pruneOrphanedAdmin`** — a repository-level
-///   `git -C <parent> worktree prune --expire=now` over the PROVABLY-COMPLETE
-///   admin-directory set the scan disclosed (D14).
+///   removal of that worktree's OWN admin entry when git refuses with a
+///   nonzero exit, the tree re-checks CLEAN, and the delete-time gate
+///   re-establishment below still passes.
+/// - **`pruneOrphanedAdmin`** — a SCOPED removal of exactly the
+///   PROVABLY-COMPLETE admin-directory set the scan disclosed (D14), never a
+///   repository-wide `git worktree prune` (see `removeAdminDirectories`).
 ///
 /// It is a `struct` of injected seams rather than more `CacheCleaner` body so
 /// every gate below is reachable from a test without a real repository: the
@@ -42,7 +42,7 @@
 /// | `worktree remove`                | parent (`-C`), the worktree argument   |
 /// | `status` re-check                | the worktree (`-C`) AND the admin container — git follows `<wt>/.git` INTO the admin/common git dir, so a swap in EITHER between the remove failure and the re-check would redirect it (epic round 6) — AND the parent, which the fallback's own R0/R1/R2 re-run traverses |
 /// | oracle recompute (`worktree list`) | parent (`-C`)                        |
-/// | `worktree prune`                 | parent (`-C`), admin container         |
+/// | scoped admin removal             | parent (`-C`, traversed by the immediately preceding oracle recompute and by R0), admin container |
 /// | each affected admin dir (prune mode) | the dir itself, strictly           |
 ///
 /// ## THE DELETE-TIME GATE RE-ESTABLISHMENT (PR #460 codex r1)
@@ -98,9 +98,10 @@
 /// A failed or aborted removal accepts nothing; its registrations stay
 /// transferable by siblings. Prune mode goes further (D14 round 4): it
 /// measures the RECOMPUTED set at delete time, never the scan-time disclosed
-/// measures, and after exit 0 accepts only the dirs it can VERIFY disappeared
-/// — a disclosed entry that became locked or repaired since the scan survives
-/// the repo-wide prune, and reporting its bytes as freed would be a lie.
+/// measures, and accepts only the dirs it can VERIFY disappeared — a
+/// disclosed entry that became locked or repaired since the scan is not in
+/// the final removal set at all, and reporting its bytes as freed would be a
+/// lie.
 ///
 /// ## DISPOSAL HONESTY (D16)
 ///
@@ -169,15 +170,17 @@ struct WorktreeReclaimPerformer {
         ]
     }
 
-    /// `git -C <parent> worktree prune --expire=now`.
-    ///
-    /// `--expire=now` is LOAD-BEARING (D10): a bare prune respects
-    /// `gc.worktreePruneExpire` (default 3 months) for the expire-gated
-    /// orphan classes, so detection would offer a fresh orphan that execution
-    /// silently left behind — a recurring ~0-byte "success".
-    static func pruneArguments(parentRepoWorkingDir: URL) -> [String] {
-        ["-C", parentRepoWorkingDir.path, "worktree", "prune", "--expire=now"]
-    }
+    // THERE IS NO `pruneArguments`, AND THAT IS THE POINT (PR #460 codex r1).
+    // `git worktree prune` accepts no path, no id and no set — it
+    // re-enumerates the admin container itself, AFTER this process has handed
+    // control away, so no gate here can bind what it will remove. The
+    // repository-level item removes exactly the admin directories it
+    // disclosed, admitted, measured and registered
+    // (`removeAdminDirectories`). D10's `--expire=now` job moved to where it
+    // is now decided: the ORACLE listing pins
+    // `-c gc.worktreePruneExpire=now` (`GitWorktreeOracle.listArguments`), so
+    // prunability is answered by the oracle and the removal never depends on
+    // git honouring an expire policy.
 
     // MARK: - Injected seams
 
@@ -598,12 +601,12 @@ struct WorktreeReclaimPerformer {
             return warning(
                 "the recomputed prunable set is not exactly this worktree's "
                     + "admin entry (\(recomputed.map(\.path).joined(separator: ", "))) "
-                    + "— pruning would have swept admin data this item never "
-                    + "disclosed"
+                    + "— removing it would have swept admin data this item "
+                    + "never disclosed"
             )
         }
 
-        // The guard re-runs over both paths `worktree prune` traverses.
+        // The guard re-runs over both paths the scoped removal covers.
         do {
             try guardTraversal(prunePaths(for: plan), inside: container)
         } catch {
@@ -622,25 +625,15 @@ struct WorktreeReclaimPerformer {
             return warning(detail)
         }
 
-        let prune = await runner.run(
-            Self.pruneArguments(parentRepoWorkingDir: plan.parentRepoWorkingDir),
-            timeout: gitTimeout
-        )
-        switch prune.outcome {
-        case .success:
-            return nil
-        case .failure(let exitCode, let stderr):
-            return warning(
-                "worktree prune failed "
-                    + "(\(GitCommandFailureSummary.describe(exitCode: exitCode, stderr: stderr)))"
-            )
-        case .timeout:
-            return warning(
-                "worktree prune timed out after \(Self.seconds(gitTimeout))s"
-            )
-        case .gitUnavailable:
-            return warning("git became unavailable before the prune ran")
+        // The SCOPED removal (PR #460 codex r1 / C4), over the one directory
+        // the gate above proved this set to be. A repo-wide `worktree prune`
+        // here would re-enumerate the container after the gate and could
+        // sweep a sibling that vanished in between — exactly what the
+        // "exactly this worktree's admin entry" gate above exists to prevent.
+        if let refusal = await removeAdminDirectories(recomputed) {
+            return warning(refusal.detail)
         }
+        return nil
     }
 
     // MARK: - Prune-only mode (repository-level, D14)
@@ -690,7 +683,7 @@ struct WorktreeReclaimPerformer {
             let report = measure(
                 directory, .deletionTarget, await registry.knownIdentities
             )
-            // (5) MOUNT DOCTRINE (epic round 9): `worktree prune` is a
+            // (5) MOUNT DOCTRINE (epic round 9): the removal is a
             // RECURSIVE filesystem mutation over these directories, so the
             // boundary-bearing-recursive-delete rule applies exactly as it
             // does to `removeItem` — and it fails CLOSED here, BEFORE any
@@ -729,11 +722,15 @@ struct WorktreeReclaimPerformer {
         }
 
         // (8) The SECOND oracle check (epic round 8), IMMEDIATELY before the
-        // subprocess: the admission and sizing walks above take time, and an
-        // orphan that appeared DURING them would be pruned outside every set
+        // mutation: the admission and sizing walks above take time, and an
+        // orphan that appeared DURING them would be removed outside every set
         // this item ever checked. Shrinkage stays legal — verified-removal
-        // accounting already handles a survivor.
+        // accounting already handles a survivor — and what is REMOVED is this
+        // final set, never the earlier one (PR #460 codex r1 / C4): removing
+        // a directory the last check no longer calls prunable is exactly the
+        // hazard this check exists to name.
         let checked = Set(recomputed.map(Self.standardPath))
+        let removalSet: [URL]
         switch await recomputePrunableSet(plan: plan, container: container) {
         case .failed(let reason):
             let detail = "refused: the final pre-prune prunable-set check "
@@ -759,9 +756,10 @@ struct WorktreeReclaimPerformer {
                     return failure(item, detail, tag: nil)
                 }
             }
+            removalSet = finalSet
         }
 
-        // (9) The guard re-runs over both paths `worktree prune` traverses.
+        // (9) The guard re-runs over the paths the removal traverses.
         do {
             try guardTraversal(prunePaths(for: plan), inside: container)
         } catch {
@@ -779,30 +777,10 @@ struct WorktreeReclaimPerformer {
             return failure(item, detail, tag: tag)
         }
 
-        let prune = await runner.run(
-            Self.pruneArguments(parentRepoWorkingDir: plan.parentRepoWorkingDir),
-            timeout: gitTimeout
-        )
-        switch prune.outcome {
-        case .success:
-            break
-        case .failure(let exitCode, let stderr):
-            let detail = "worktree prune failed "
-                + "(\(GitCommandFailureSummary.describe(exitCode: exitCode, stderr: stderr)))"
-                + " — nothing was pruned"
-            logRefusal("prune-failed", detail)
-            return failure(item, detail, tag: nil)
-        case .timeout:
-            // git may have pruned SOME entries before the kill: never report
-            // success, never guess bytes.
-            let detail = "prune timed out; the registry may be PARTIALLY "
-                + "cleaned — rescan required"
-            logRefusal("prune-timeout", detail)
-            return failure(item, detail, tag: nil)
-        case .gitUnavailable:
-            let detail = "git unavailable at clean time — nothing was pruned"
-            logRefusal("git-unavailable", detail)
-            return failure(item, detail, tag: nil)
+        // (9c) THE SCOPED REMOVAL.
+        if let refusal = await removeAdminDirectories(removalSet) {
+            logRefusal(refusal.tag, refusal.detail)
+            return failure(item, refusal.detail, tag: nil)
         }
 
         // (10) VERIFIED-REMOVAL acceptance: only directories that actually
@@ -824,6 +802,132 @@ struct WorktreeReclaimPerformer {
             entry: entry(for: item, accepted: accepted, disposal: .permanent),
             errors: []
         )
+    }
+
+    // MARK: - The SCOPED admin-directory removal (PR #460 codex r1 / C4)
+
+    /// Why this is a per-directory removal and not
+    /// `git worktree prune --expire=now`.
+    ///
+    /// `worktree prune` takes no path, no id and no set: git RE-ENUMERATES
+    /// `$GIT_COMMON_DIR/worktrees` itself, after this process has handed
+    /// control away. Every gate above is therefore a SNAPSHOT comparison — it
+    /// can reject a set git reported a moment ago, but it cannot bind the set
+    /// git will compute later. A second registered checkout of the same
+    /// repository that vanishes inside that window is swept undisclosed, and
+    /// the accounting never notices: it iterates the REGISTERED directories,
+    /// so the extra victim contributes no bytes, no row and no warning
+    /// (measured end to end: `errors=[]`, a success entry, and the victim's
+    /// detached-HEAD commit left unreachable).
+    ///
+    /// Removing exactly the directories this item admitted, measured,
+    /// mount-gated and registered makes the disclosure true BY CONSTRUCTION
+    /// rather than by timing. Equivalence to git's own effect was measured on
+    /// git 2.50.1: two identically-built repositories, one pruned by git and
+    /// one whose single orphan admin directory was removed directly, produced
+    /// structurally IDENTICAL `.git` trees, identical `worktree list
+    /// --porcelain`, identical branch lists, a clean `git fsck` on both, and a
+    /// subsequent `worktree prune --expire=now` on the scoped repository was a
+    /// silent no-op. (git also `rmdir`s an emptied `worktrees/`; leaving it is
+    /// harmless — `worktree list`, `status`, `fsck` and a later `worktree add`
+    /// all behave.)
+    ///
+    /// `--expire=now`'s D10 job survives the change: the ORACLE still lists
+    /// with `-c gc.worktreePruneExpire=now`, so prunability is decided by the
+    /// oracle and the removal no longer depends on git honouring an expire
+    /// policy at all.
+    ///
+    /// The removal itself is `DepthSafeRemoval` through the cleaner's own
+    /// seam, under a container binding captured from a DESCRIPTOR immediately
+    /// before it — fn-6's primitive, not a hand-rolled deleter.
+    private func removeAdminDirectories(
+        _ directories: [URL]
+    ) async -> (tag: String, detail: String)? {
+        for directory in directories {
+            if let revived = revivedCheckoutRefusal(for: directory) {
+                return ("prune-checkout-revived", revived)
+            }
+            do {
+                let admittedParent = try DepthSafeRemoval.admittedParent(
+                    directory: directory.deletingLastPathComponent(),
+                    displayPath: directory.path, provider: provider
+                )
+                try await removeTree(directory, admittedParent)
+            } catch {
+                // A mid-loop failure leaves the directories already removed
+                // genuinely gone. Their bytes are NOT reported: this returns
+                // an error and no entry, which under-reports what was freed
+                // rather than over-reporting it. (In practice the set is one
+                // directory — the field shape and the only shape the gated
+                // post-fallback prune can ever have.)
+                return (
+                    CacheCleaner.refusalTag(error),
+                    "refused: the orphaned admin directory \(directory.path) "
+                        + "could not be removed (\(error.localizedDescription))"
+                        + " — the registry may be PARTIALLY cleaned; re-scan."
+                )
+            }
+        }
+        return nil
+    }
+
+    /// PER-OBJECT re-establishment of the fact that made this directory
+    /// prunable, one syscall before it is destroyed.
+    ///
+    /// An admin directory is prunable because its `gitdir` back-link names a
+    /// `<worktree>/.git` that is not there. If a volume remounted, a backup
+    /// was restored, or `git worktree repair` ran between the last oracle
+    /// answer and this instant, the checkout is BACK and its per-worktree
+    /// index, ORIG_HEAD, reflog and refs are live state.
+    ///
+    /// IT CAN ONLY ADD A REFUSAL, NEVER GRANT ONE. The authority that the
+    /// entry is prunable remains the oracle, re-run twice above; every
+    /// ambiguous reading here (an unreadable back-link, a `.git` of the wrong
+    /// kind, a pointer that does not point back) proceeds, because refusing
+    /// on them would strand the ordinary orphan classes git itself prunes for
+    /// reasons other than "the checkout is gone" — a refusal a re-scan could
+    /// never clear. Only a LIVE, mutually-consistent registration refuses.
+    ///
+    /// RETRY: yes, and it clears itself. A revived checkout is no longer
+    /// prunable, so the next scan simply stops offering it.
+    private func revivedCheckoutRefusal(for adminDirectory: URL) -> String? {
+        let backlink = adminDirectory.appendingPathComponent("gitdir")
+        guard let backlinkText = try? String(contentsOf: backlink, encoding: .utf8)
+        else { return nil }
+        guard let dotGit = Self.gitdirTarget(
+            backlinkText, relativeTo: adminDirectory, prefixed: false
+        ) else { return nil }
+        guard provider.probeKind(of: dotGit) == .kind(.regularFile),
+              let pointerText = try? String(contentsOf: dotGit, encoding: .utf8),
+              let named = Self.gitdirTarget(
+                  pointerText, relativeTo: dotGit.deletingLastPathComponent(),
+                  prefixed: true
+              ),
+              provider.sameLocation(named, adminDirectory)
+        else { return nil }
+        return "refused: the checkout at "
+            + "\(dotGit.deletingLastPathComponent().path) is registered again "
+            + "and points back at \(adminDirectory.path) — it is no longer "
+            + "orphaned, so nothing was pruned. Re-scan; a live worktree is "
+            + "never offered here."
+    }
+
+    /// Read a worktree back-link. `prefixed` selects the `gitdir: <path>`
+    /// spelling of a worktree's `.git` FILE; the admin directory's own
+    /// `gitdir` file carries a bare path.
+    private static func gitdirTarget(
+        _ text: String, relativeTo base: URL, prefixed: Bool
+    ) -> URL? {
+        var trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if prefixed {
+            guard trimmed.hasPrefix("gitdir:") else { return nil }
+            trimmed = String(trimmed.dropFirst("gitdir:".count))
+                .trimmingCharacters(in: .whitespaces)
+        }
+        guard !trimmed.isEmpty else { return nil }
+        return trimmed.hasPrefix("/")
+            ? URL(fileURLWithPath: trimmed)
+            : base.appendingPathComponent(trimmed)
     }
 
     // MARK: - Delete-time gate re-establishment (PR #460 codex r1)
@@ -1203,8 +1307,9 @@ struct WorktreeReclaimPerformer {
         return paths
     }
 
-    /// The paths `worktree prune` traverses: the `-C` target and the admin
-    /// container it rewrites.
+    /// The paths the repository-level mutation covers: the `-C` target (the
+    /// oracle recompute and R0 both traverse it immediately before) and the
+    /// admin container the removal rewrites.
     private func prunePaths(for plan: GitWorktreeReclaimPlan) -> [GuardedPath] {
         [
             (label: "parent repository", url: plan.parentRepoWorkingDir,

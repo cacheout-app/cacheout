@@ -499,11 +499,17 @@ git.
   explicit choice. CLI `smart-clean` never runs this scanner.
 - **Deletion sequence.** A stale worktree is removed with
   `git worktree remove` — never `--force`, because git's own refusal of a
-  dirty tree is a safety check worth keeping. If git refuses, the tree is
-  re-checked for cleanliness and only then deleted directly, followed by a
-  narrowly-gated `git worktree prune --expire=now` that may remove nothing
-  but that worktree's own admin entry. The repository-level item runs
-  `git worktree prune --expire=now` over exactly the set the scan disclosed.
+  dirty tree is a safety check worth keeping. Immediately before that removal
+  — and again before the fallback below — the gates the scan used are
+  re-established against the live repository (which repository the parent
+  path resolves to; still registered, still linked, still unlocked, still
+  merged), and anything that changed since the scan refuses with the action
+  that clears it named. If git refuses, the tree is re-checked for
+  cleanliness and only then deleted directly, followed by a narrowly-gated
+  removal of nothing but that worktree's own admin entry. The
+  repository-level item removes exactly the admin directories the scan
+  disclosed, one by one — no repository-wide `git worktree prune` runs,
+  because git would re-enumerate its own set after every gate had answered.
   **Branch refs and repository objects are never touched** — no branch is
   ever deleted.
 - **Move to Trash does not apply.** git unlinks and prunes; it does not

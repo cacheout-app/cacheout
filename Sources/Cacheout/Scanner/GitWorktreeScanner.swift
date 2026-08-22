@@ -10,8 +10,11 @@
 /// - **stale candidates** — one item per merged-clean linked worktree, action
 ///   `.gitWorktreeReclaim` in stale mode;
 /// - **the repo-level prune item** — ONE per repository with orphaned admin
-///   directories, disclosing the PROVABLY-COMPLETE set a repository-wide
-///   `git worktree prune --expire=now` will remove (D14).
+///   directories, disclosing the PROVABLY-COMPLETE set the execution will
+///   remove — and that set is EXACTLY what it removes: fn-5.4 deletes those
+///   directories one by one and never runs a repository-wide
+///   `git worktree prune`, whose set git would re-enumerate after every gate
+///   had already answered (D14).
 ///
 /// ## Discovery: `.git` is SEEN, never descended
 ///
@@ -887,10 +890,10 @@ struct GitWorktreeScanner: @unchecked Sendable {
 
     /// The repository's ONE prune item, or nothing plus a visible issue.
     ///
-    /// PROVABLY-COMPLETE-OR-NO-ITEM: `git worktree prune` is repository-wide,
-    /// so a disclosure that cannot account for every prunable record — or for
-    /// every entry of the container the prune traverses — would let the
-    /// operation remove something nobody was told about. Every incompleteness
+    /// PROVABLY-COMPLETE-OR-NO-ITEM: the item speaks for a whole repository's
+    /// registry, so a disclosure that cannot account for every prunable record
+    /// — or for every entry of the container the removal traverses — would let
+    /// the operation remove something nobody was told about. Every incompleteness
     /// therefore SUPPRESSES the item and publishes what could not be accounted
     /// for. LOCKED prunable entries are the deliberate exception, excluded by
     /// the mapper WITHOUT suppression: git's prune skips locked admin
@@ -1058,7 +1061,8 @@ struct GitWorktreeScanner: @unchecked Sendable {
                 + checkouts.joined(separator: "; "))
         }
         clauses.append(
-            "git worktree prune --expire=now removes exactly this set; branch "
+            "removes exactly \(directories.count == 1 ? "this directory" : "these directories") "
+                + "and nothing else — no repository-wide prune runs; branch "
                 + "refs and repository objects are untouched"
         )
         return clauses.joined(separator: "; ")

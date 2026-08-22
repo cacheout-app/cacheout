@@ -134,9 +134,11 @@ struct ItemKey: Hashable, Sendable {
 /// ARGV PROVENANCE (the whole reason this is a plan and not a
 /// `.commands([[String]])` payload): command argv is trusted registry code,
 /// never item input (fn-2.3). The cleaner assembles
-/// `["git", "-C", <parentRepoWorkingDir>, "worktree", "remove", <path>]` /
-/// `["git", "-C", <parentRepoWorkingDir>, "worktree", "prune", "--expire=now"]`
-/// from these fields plus its own constants at execution time (fn-5.4), so a
+/// `["git", "-C", <parentRepoWorkingDir>, "worktree", "remove", <path>]`
+/// from these fields plus its own constants at execution time (fn-5.4) — and
+/// the repository-level mode assembles no mutating argv at all, removing the
+/// disclosed admin directories directly instead of running a repo-wide
+/// `git worktree prune` whose set git would recompute for itself. So a
 /// forged item can only mis-POINT a fixed command — and every path it could
 /// point at is bound to the item's own admitted container by
 /// `GitWorktreeReclaimPlan.violation(...)`. `.commands` is not an option at
@@ -162,8 +164,9 @@ struct GitWorktreeReclaimPlan: Equatable, Sendable {
         /// `git -C <parent> worktree remove <worktreePath>`, with fn-5.4's
         /// guarded rm + gated prune fallback.
         case removeStaleWorktree
-        /// `git -C <parent> worktree prune --expire=now` — repository-level,
-        /// one item per repo, disclosing the COMPLETE set it will remove.
+        /// Repository-level, one item per repo, disclosing the COMPLETE set
+        /// it will remove — and removing exactly that set, directory by
+        /// directory, never through a repo-wide `git worktree prune`.
         case pruneOrphanedAdmin
     }
 

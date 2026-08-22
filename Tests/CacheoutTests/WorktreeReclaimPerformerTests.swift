@@ -1430,6 +1430,65 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
                       "the tree survives a refused re-check")
     }
 
+    func testTheAdminContainerSwappedInsideTheGateWindowIsRefusedBeforeStatus()
+        async throws
+    {
+        // D7 (PR #460 codex r4). r3 added a `guardTraversal` immediately
+        // before the clean re-check AND a table row asserting it — in the
+        // same commit that rewrote `PathGuard`'s doctrine to say "re-runs no
+        // cell can distinguish would only be unevidenced guards". Deleting
+        // that guard left the whole suite green, so the site was exactly what
+        // the doctrine forbids: asserted, not evidenced.
+        //
+        // This is the window it actually covers, and the sibling cell above
+        // does NOT cover it: that one swaps before the fallback's ENTRY
+        // guard, which refuses first. Here the swap lands AFTER the entry
+        // guard, inside the five subprocesses of the gate re-establishment —
+        // timed off the fallback's own ancestry call (the SECOND one; the
+        // primary arm ran its gates first).
+        //
+        // MUTATION: delete that `guardTraversal` and this cell goes RED —
+        // `git -C <wt> status` executes with `<wt>/.git` pointing into a
+        // container that is now a symlink out of the admitted tree.
+        let repository = try makeRepository(named: "repo")
+        let worktree = try addWorktree(named: "wt", branch: "feature", in: repository)
+        let membership = try membership(of: worktree, in: repository)
+        let plan = staleplan(worktree: worktree, membership: membership)
+        let outside = try makeOutsideRepository()
+        let adminContainer = membership.parentAdminContainer
+
+        let fileManager = fm
+        let ancestryCalls = InvocationCounter()
+        let swapped = InvocationCounter()
+        let runner = InterceptingGitRunner(wrapping: realRunner()) { arguments, _ in
+            if arguments.contains("remove") {
+                return .failure(exitCode: 128, stderr: "injected refusal")
+            }
+            guard arguments.contains("merge-base") else { return nil }
+            guard ancestryCalls.bump() == 2 else { return nil }
+            // THE WINDOW: the fallback's gates have run — entry guard, R0,
+            // R1, R1b — and the clean re-check has not.
+            if (try? fileManager.removeItem(at: adminContainer)) != nil,
+               (try? fileManager.createSymbolicLink(
+                   at: adminContainer, withDestinationURL: outside
+               )) != nil {
+                swapped.bump()
+            }
+            return .success(stdout: Data())
+        }
+        let outcome = await perform(
+            item(plan), plan: plan, with: makePerformer(runner: runner)
+        )
+
+        XCTAssertEqual(swapped.count, 1, "the fixture never staged the swap")
+        XCTAssertNil(outcome.entry)
+        let message = try XCTUnwrapElement(outcome.errors, 0).message
+        XCTAssertTrue(message.contains("not a real directory"), message)
+        XCTAssertNil(bareArgvs(runner).first { $0.contains("status") },
+                     "the re-check must never have executed: \(bareArgvs(runner))")
+        XCTAssertTrue(fm.fileExists(atPath: worktree.path))
+    }
+
     func testADevRootThatIsTheRepositoryIsAdmittedWhileTheRestStayStrict()
         async throws
     {

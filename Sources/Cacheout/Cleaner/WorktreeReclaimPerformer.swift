@@ -58,6 +58,26 @@
 /// queue. The trash row hops to the MAIN ACTOR, because `trashItem` requires
 /// it, so its true width is the main thread's QUEUE DEPTH.
 ///
+/// AND "INSENSITIVE TO THE MAIN THREAD" IS NOT "HAS NO QUEUE" (PR #460 codex
+/// r7, D1). r6 drew the second conclusion from the first and left the
+/// permanent arm's proofs on the near side of its own hop. Its hop is
+/// `DispatchQueue.global(qos: .userInitiated)`, and a queue's depth is not a
+/// syscall either. MEASURED through the production composition with the pool
+/// saturated microseconds before the hop (32 × 120 ms CPU-bound items,
+/// enqueued after the last git call returns, so the removal is behind all of
+/// them), n=3, by
+/// `testTheWindowsThatRemainAreMeasuredUnderLoadInBothArms`:
+///
+/// | permanent arm, last identity/lock/HEAD proof → the removal | median |
+/// |---|---|
+/// | proof on the NEAR side of the hop (through r6) | **242.656 ms**, 240.010–242.738 |
+/// | proof INSIDE the hop (r7) | **0.032 ms**, 0.031–0.048 |
+///
+/// at a measured pool delay of 240.4 ms and 240.2 ms respectively. Under
+/// MAIN-THREAD load the same arm measures 0.040 ms and 0.023 ms — it really
+/// does not wait on that thread, which is why the load that describes it had
+/// to be the one it does wait on.
+///
 /// AND THE 16.152 ms SAMPLE WAS EXPLAINED AWAY RATHER THAN MEASURED. r5
 /// wrote "the trash arm's maximum is one outlier from the mover; its median
 /// is the number that describes the arm". That attribution is wrong on its
@@ -73,10 +93,22 @@
 /// the arm; it described an idle machine.
 ///
 /// r6 does not narrow the trash row by making the mover faster — it moves the
-/// PROOF to the far side of the hop (`TrashDisposal.Mover`), so what is left
-/// between the last proof and the destruction is the 0.004 ms above no matter
-/// how deep the main queue is. Both rows are compared against 14.87 ms, and
-/// unlike 14.87 ms neither grows with the tree.
+/// PROOF to the far side of the hop (`TrashDisposal.Mover`), and r7 does the
+/// same for the permanent arm (`removeTree`'s third argument). What is left
+/// between the last proof and the destruction is then the 0.004 ms / 0.032 ms
+/// above no matter how deep that arm's queue is.
+///
+/// FOR THREE PROPOSITIONS, NOT ALL OF THEM (PR #460 codex r7, D2). Those
+/// figures cover WHICH CHECKOUT this is, whether it is LOCKED and whether
+/// HEAD MOVED — the set `reproveFromTheFilesystem` answers, which is
+/// everything the FILESYSTEM can answer. CLEANLINESS is git's answer, costs a
+/// subprocess, and does NOT cross either hop; its interval under load is the
+/// queue depth, measured at 241.156 ms (permanent, saturated pool) and
+/// 185.864 ms (Trash, 120 ms main-thread items) in the same cell. It is
+/// disclosed as residual 1 below rather than covered by these numbers.
+///
+/// Both rows are compared against 14.87 ms, and unlike 14.87 ms neither grows
+/// with the tree.
 ///
 /// **That window is IRREDUCIBLE while git performs the removal** — the
 /// unlink happens inside git's process, so no re-proof of ours can sit
@@ -1522,8 +1554,30 @@ struct WorktreeReclaimPerformer {
     // 1. **CLEANLINESS (G2).** `git status --porcelain` is the only faithful
     //    answer — the index, `.gitignore` rules, submodules and skip-worktree
     //    entries are not readable from metadata — so it stays a subprocess
-    //    and stays the LAST git call. What remains between it and the unlink
-    //    is the re-proof, which spawns nothing.
+    //    and stays the LAST git call.
+    //
+    //    AND IT DOES NOT CROSS EITHER ARM'S HOP (PR #460 codex r7, D2). The
+    //    two disposal seams run a proof on the far side of their hops; that
+    //    proof is `reproveFromTheFilesystem`, which spawns nothing, and a
+    //    `fork`/`exec` cannot be put there — on the Trash arm the far side is
+    //    the MAIN ACTOR. So this proposition's interval is NOT the 0.004 ms /
+    //    0.032 ms the identity, lock and HEAD propositions enjoy: it is the
+    //    disposal queue's depth. MEASURED under load through the production
+    //    composition by
+    //    `testTheWindowsThatRemainAreMeasuredUnderLoadInBothArms`:
+    //    permanent arm with the global pool saturated microseconds before the
+    //    hop, median **241.156 ms** (240.360–249.808, n=3); Trash arm with
+    //    120 ms main-thread work items, median **185.864 ms**
+    //    (185.785–186.442, n=5). On an unloaded queue the same intervals are
+    //    0.269 ms and 0.674 ms.
+    //
+    //    WHAT THAT COSTS, PLAINLY: work saved into the worktree after
+    //    `status` answered and before the disposal ran is destroyed with the
+    //    tree, and under a loaded queue that interval is hundreds of
+    //    milliseconds rather than a fraction of one. `--ignored` narrows the
+    //    class (an ignored path that APPEARS in the window refuses) but does
+    //    not close it; a re-scan clears it, because it is a fact about a
+    //    concurrent writer and not a deterministic bound.
     //
     //    MEASURED TO THE UNLINK, INSTRUMENTED, ON AN IDLE MAIN THREAD,
     //    through the production composition (`CacheCleaner` wiring
@@ -1563,13 +1617,23 @@ struct WorktreeReclaimPerformer {
     //    DIRECTORY to one line, so a file created inside one is not detected,
     //    and the comparison is over PATHS, so a change to an ignored file
     //    that already existed is not detected.
-    // 4. **THE DISPOSAL CALL ITSELF.** Once `TrashDisposal`/`removeTree` is
-    //    entered, nothing this process can read changes what it does. That
-    //    window is not removable by any ordering — it is the 0.373 ms above
-    //    for the permanent arm, and for the Trash arm the 0.004 ms measured
-    //    UNDER LOAD (PR #460 codex r6, D1) between the re-proof that now runs
-    //    on the far side of the mover's main-actor hop and the move itself.
-    //    What used to sit there was the whole main-thread queue depth.
+    // 4. **THE DISPOSAL CALL ITSELF.** Once the destruction has been entered,
+    //    nothing this process can read changes what it does. That window is
+    //    not removable by any ordering, and it is now the same size in both
+    //    arms because both re-prove on the far side of their own hop:
+    //    **0.004 ms** for the Trash arm, between the re-proof inside the
+    //    mover's main-actor hop and the move (r6, D1, measured under 120 ms
+    //    main-thread work items), and **0.032 ms** for the permanent arm,
+    //    between the re-proof inside `removeItemConcurrently`'s
+    //    `DispatchQueue.global` block and `DepthSafeRemoval`'s container open
+    //    (r7, D1, measured with the pool saturated microseconds before the
+    //    hop).
+    //
+    //    WHAT USED TO SIT THERE WAS THAT ARM'S WHOLE QUEUE DEPTH — measured
+    //    at 175.736 ms for the Trash arm before r6 and 242.656 ms for the
+    //    permanent arm before r7. THE SCOPE IS THE THREE FILESYSTEM
+    //    PROPOSITIONS ONLY; cleanliness is residual 1 and keeps the queue
+    //    depth.
     //
     // The user-facing form of this is in `docs/v1/CATEGORIES.md` and the
     // CHANGELOG: *"The final check before the delete reads the filesystem,

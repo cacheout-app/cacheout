@@ -1433,8 +1433,8 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
             worktree: worktree,
             membership: try membership(of: worktree, in: repository)
         )
-        let home = self.home!
-        let trashRoot = trashDirectory!
+        let home = try XCTUnwrap(self.home)
+        let trashRoot = try XCTUnwrap(trashDirectory)
         let fileManager = fm
         let staged = InvocationCounter()
         let moved = TrashRecorder()
@@ -1505,7 +1505,7 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
             worktree: worktree,
             membership: try membership(of: worktree, in: repository)
         )
-        let home = self.home!
+        let home = try XCTUnwrap(self.home)
         let fileManager = fm
         let staged = InvocationCounter()
         let removed = TrashRecorder()
@@ -1544,6 +1544,401 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         )
         XCTAssertEqual(refusals.tags, ["worktree-locked"])
         XCTAssertEqual(refusals.details, [message])
+    }
+
+
+    // MARK: - The permanent arm's window, measured under load (r7, D1/D2)
+
+    /// Every filesystem question, timestamped, plus the two boundaries this
+    /// cell needs: the last GIT COMPLETION before the destruction (the
+    /// cleanliness gate's, which is D2's quantity) and the destruction
+    /// itself.
+    ///
+    /// THE DESTRUCTION MARKER FOR THE PERMANENT ARM is the first
+    /// `identity(ofDescriptor:)` asked after `<admin>/locked` has been
+    /// probed. `reproveFromTheFilesystem` is the only code that probes that
+    /// name, and the next descriptor-identity question after it is
+    /// `DepthSafeRemoval.openAndProveContainer` — the first act on the far
+    /// side of `removeItemConcurrently`'s hop, one `openat` before the walk
+    /// that unlinks. The marker is keyed on a NAMED file rather than on a
+    /// call count, so it does not drift with tree shape.
+    private final class WindowClock: FileSystemIdentityProvider, @unchecked Sendable {
+        private let lock = NSLock()
+        private var lastQuestion: DispatchTime?
+        private var lastGit: DispatchTime?
+        private var sawLockProbe = false
+        private var proofWindow: (from: DispatchTime, to: DispatchTime)?
+        private var gitWindow: (from: DispatchTime, to: DispatchTime)?
+        /// `true` for the permanent arm, where the descriptor question marks
+        /// the destruction. The Trash arm marks it from the mover instead —
+        /// its own pre-move `boundLeaf` asks a descriptor question on the
+        /// NEAR side, which would freeze the wrong instant.
+        private let marksOnDescriptor: Bool
+
+        init(marksOnDescriptor: Bool) {
+            self.marksOnDescriptor = marksOnDescriptor
+            super.init()
+        }
+
+        func noteGitCompletion() {
+            lock.lock(); lastGit = .now(); lock.unlock()
+        }
+
+        /// The destruction is about to happen: freeze both windows.
+        func destructionReached() {
+            lock.lock()
+            let now = DispatchTime.now()
+            if proofWindow == nil, let from = lastQuestion {
+                proofWindow = (from, now)
+            }
+            if gitWindow == nil, let from = lastGit { gitWindow = (from, now) }
+            lock.unlock()
+        }
+
+        private func note() { lock.lock(); lastQuestion = .now(); lock.unlock() }
+
+        override func identity(of url: URL) -> Identity? {
+            defer { note() }
+            return super.identity(of: url)
+        }
+
+        override func identity(ofDescriptor descriptor: Int32) -> Identity? {
+            lock.lock()
+            let armed = marksOnDescriptor && sawLockProbe
+            lock.unlock()
+            if armed { destructionReached() }
+            defer { note() }
+            return super.identity(ofDescriptor: descriptor)
+        }
+
+        override func probeKind(of url: URL) -> KindProbe {
+            if url.lastPathComponent == "locked" {
+                lock.lock(); sawLockProbe = true; lock.unlock()
+            }
+            defer { note() }
+            return super.probeKind(of: url)
+        }
+
+        override func probeChild(
+            inDirectory directory: Int32, named name: String,
+            logical: @autoclosure () -> URL
+        ) -> ChildProbe {
+            defer { note() }
+            return super.probeChild(
+                inDirectory: directory, named: name, logical: logical()
+            )
+        }
+
+        private func milliseconds(
+            _ window: (from: DispatchTime, to: DispatchTime)?
+        ) -> Double? {
+            guard let window,
+                  window.to.uptimeNanoseconds >= window.from.uptimeNanoseconds
+            else { return nil }
+            return Double(
+                window.to.uptimeNanoseconds - window.from.uptimeNanoseconds
+            ) / 1_000_000
+        }
+
+        /// Last filesystem proof → the destruction.
+        var proofMilliseconds: Double? {
+            lock.lock(); defer { lock.unlock() }
+            return milliseconds(proofWindow)
+        }
+
+        /// Last git completion → the destruction. This is CLEANLINESS: the
+        /// `status --porcelain --ignored` verdict is the last git answer
+        /// before the removal, and nothing re-runs it closer.
+        var cleanlinessMilliseconds: Double? {
+            lock.lock(); defer { lock.unlock() }
+            return milliseconds(gitWindow)
+        }
+    }
+
+    /// Wraps a runner, times every completion, and runs a hook BEFORE
+    /// delegating so a test can put load on a queue at a chosen invocation.
+    private final class TimedRunner: GitCommandRunning, @unchecked Sendable {
+        private let wrapped: any GitCommandRunning
+        private let clock: WindowClock
+        private let before: @Sendable ([String]) -> Void
+        private let after: @Sendable ([String]) -> Void
+
+        init(
+            wrapping wrapped: any GitCommandRunning, clock: WindowClock,
+            before: @escaping @Sendable ([String]) -> Void = { _ in },
+            after: @escaping @Sendable ([String]) -> Void = { _ in }
+        ) {
+            self.wrapped = wrapped
+            self.clock = clock
+            self.before = before
+            self.after = after
+        }
+
+        var defaultTimeout: TimeInterval { wrapped.defaultTimeout }
+
+        func run(
+            _ arguments: [String], timeout: TimeInterval
+        ) async -> GitCommandInvocation {
+            before(arguments)
+            let invocation = await wrapped.run(arguments, timeout: timeout)
+            clock.noteGitCompletion()
+            after(arguments)
+            return invocation
+        }
+    }
+
+    /// How the machine is loaded while the removal approaches its hop.
+    private enum WindowLoad {
+        /// 120 ms work items on the MAIN thread — the load the Trash arm's
+        /// hop waits behind (r6, D1).
+        case mainThread
+        /// 32 × 120 ms CPU-bound items on `DispatchQueue.global(.userInitiated)`
+        /// — the load the PERMANENT arm's hop waits behind, which is the one
+        /// that actually applies to it. libdispatch does not overcommit for
+        /// CPU-bound work, so the pool stays at core count and our block
+        /// queues behind them.
+        case globalQueue
+    }
+
+    /// One measured removal through the PRODUCTION composition. Returns the
+    /// proof window, the cleanliness window, and the queue delay that proves
+    /// the load was real.
+    private func measureOneRemoval(
+        run index: Int, load: WindowLoad, moveToTrash: Bool
+    ) async throws -> (proof: Double, cleanliness: Double, queueDelay: Double) {
+        let repository = try makeRepository(named: "repo-\(index)")
+        let worktree = try addWorktree(
+            named: "wt-\(index)", branch: "feature-\(index)", in: repository
+        )
+        let plan = staleplan(
+            worktree: worktree,
+            membership: try membership(of: worktree, in: repository)
+        )
+        let clock = WindowClock(marksOnDescriptor: !moveToTrash)
+        let delay = QueueDelayWitness()
+        let runner = TimedRunner(
+            wrapping: realRunner(), clock: clock,
+            // THE MAIN-THREAD LOAD GOES IN BEFORE the git call, exactly where
+            // r6 put it: the main queue must already be deep while the checks
+            // approach the hop.
+            before: { arguments in
+                guard case .mainThread = load,
+                      arguments.contains("status") else { return }
+                DispatchQueue.main.async {
+                    let until = DispatchTime.now().uptimeNanoseconds
+                        + 120_000_000
+                    while DispatchTime.now().uptimeNanoseconds < until {}
+                }
+                delay.arm(on: DispatchQueue.main)
+            },
+            // THE POOL LOAD GOES IN AFTER the LAST git call returns, which is
+            // the strictest placement there is: the saturating items are
+            // enqueued microseconds before the removal enqueues its own, so
+            // the removal is behind ALL of them in FIFO order. Loading the
+            // pool earlier lets libdispatch grow it back before the removal
+            // arrives, which measures the recovery rather than the hop.
+            after: { arguments in
+                guard case .globalQueue = load,
+                      arguments.contains("status") else { return }
+                let queue = DispatchQueue.global(qos: .userInitiated)
+                for _ in 0..<32 {
+                    queue.async {
+                        let until = DispatchTime.now().uptimeNanoseconds
+                            + 120_000_000
+                        while DispatchTime.now().uptimeNanoseconds < until {}
+                    }
+                }
+                delay.arm(on: queue)
+            }
+        )
+        let landing = trashDirectory.appendingPathComponent(
+            worktree.lastPathComponent
+        )
+        let cleaner = CacheCleaner(
+            home: home,
+            containerRoots: [container],
+            containerSnapshot: ContainerSnapshot.capture(
+                roots: [container], provider: clock
+            ),
+            provider: clock,
+            trashHandler: { url in
+                clock.destructionReached()
+                try FileManager.default.moveItem(at: url, to: landing)
+                return landing
+            },
+            gitRunner: runner
+        )
+        let report = await cleaner.clean(
+            items: [item(plan, id: "item-\(index)")], moveToTrash: moveToTrash
+        )
+        XCTAssertEqual(
+            report.errors.map(\.message), [],
+            "the measured run must be a real, successful removal"
+        )
+        return (
+            proof: try XCTUnwrap(clock.proofMilliseconds),
+            cleanliness: try XCTUnwrap(clock.cleanlinessMilliseconds),
+            queueDelay: try XCTUnwrap(delay.settled())
+        )
+    }
+
+    /// THE r7 MEASUREMENT (D1 and D2), and the regression guard on it.
+    ///
+    /// r6 moved the last-instant re-proof across the Trash mover's hop and
+    /// asserted the permanent arm "never had this shape". What
+    /// `DepthSafeRemoval` re-proves past that arm's hop is the ADMITTED
+    /// PARENT; WHICH CHECKOUT this is, whether it is LOCKED and whether HEAD
+    /// MOVED are outside its vocabulary, so all three sat on the near side.
+    /// r7 moves them across, and this cell is the measurement r6 did not
+    /// take.
+    ///
+    /// TWO LOADS, because the two arms wait behind DIFFERENT queues. The
+    /// Trash arm hops to the MAIN ACTOR, so main-thread depth is its width;
+    /// the permanent arm hops to `DispatchQueue.global`, so a saturated
+    /// global pool is its width. Both are applied to the permanent arm here:
+    /// D1 asked for the main-thread figure, and the saturation figure is the
+    /// one that actually describes the arm.
+    ///
+    /// AND THE CLEANLINESS WINDOW IS PUBLISHED, NOT MOVED (D2). `git status
+    /// --porcelain --ignored` costs a subprocess and cannot run inside a
+    /// disposal seam without putting a `fork`/`exec` on the main thread, so
+    /// its answer stays on the near side of both hops. Its interval is
+    /// therefore NOT the 0.004 ms the identity/lock/HEAD propositions enjoy,
+    /// and this cell prints it for both arms rather than letting the header's
+    /// summary sentence cover it.
+    ///
+    /// MEASURED, by
+    ///
+    ///     swift test --filter \
+    ///       testTheWindowsThatRemainAreMeasuredUnderLoadInBothArms
+    ///
+    /// pasted from that run's own output at f67992e; the figures are restated
+    /// in the file header's "What is left, measured".
+    ///
+    ///     MEASURED-PERMANENT-PROOF-WINDOW-MAIN-THREAD-LOAD-MS
+    ///         ["0.030", "0.023", "0.022", "0.023", "0.040"]   median 0.023
+    ///     MEASURED-PERMANENT-MAIN-QUEUE-DELAY-MS
+    ///         ["120.011", "133.565", "131.197", "132.619", "127.203"]
+    ///                                                        median 131.197
+    ///     MEASURED-PERMANENT-PROOF-WINDOW-SATURATED-POOL-MS
+    ///         ["0.031", "0.032", "0.048"]                     median 0.032
+    ///     MEASURED-PERMANENT-GLOBAL-QUEUE-DELAY-MS
+    ///         ["241.654", "240.188", "240.140"]               median 240.188
+    ///     MEASURED-PERMANENT-CLEANLINESS-WINDOW-MAIN-THREAD-LOAD-MS
+    ///         ["0.269", "0.254", "0.247", "0.273", "0.429"]   median 0.269
+    ///     MEASURED-PERMANENT-CLEANLINESS-WINDOW-SATURATED-POOL-MS
+    ///         ["240.360", "249.808", "241.156"]               median 241.156
+    ///     MEASURED-TRASH-CLEANLINESS-WINDOW-MAIN-THREAD-LOAD-MS
+    ///         ["185.993", "185.800", "185.785", "185.864", "186.442"]
+    ///                                                        median 185.864
+    ///     MEASURED-TRASH-MAIN-QUEUE-DELAY-MS
+    ///         ["120.012", "120.020", "120.018", "120.009", "120.014"]
+    ///                                                        median 120.014
+    ///
+    /// MUTATION, the r6 shape restored — the permanent arm's proof closure
+    /// emptied to `try await removeTree(worktreePath, admittedParent) { }`,
+    /// same command:
+    ///
+    ///     MEASURED-PERMANENT-PROOF-WINDOW-MAIN-THREAD-LOAD-MS
+    ///         ["0.093", "0.040", "0.045", "0.034", "0.036"]   median 0.040
+    ///     MEASURED-PERMANENT-PROOF-WINDOW-SATURATED-POOL-MS
+    ///         ["242.738", "240.010", "242.656"]               median 242.656
+    ///     MEASURED-PERMANENT-GLOBAL-QUEUE-DELAY-MS
+    ///         ["240.432", "240.424", "242.140"]               median 240.432
+    ///     XCTAssertLessThan failed: ("242.655584") is not less than ("20.0")
+    ///
+    /// WHAT THE TWO RUNS SAY, STATED RATHER THAN SUMMARISED.
+    ///
+    /// - The permanent arm is INSENSITIVE to main-thread depth — 0.040 ms
+    ///   before, 0.023 ms after, against a 120–133 ms main queue. It does not
+    ///   wait on that thread, and r6 was right about that much.
+    /// - It is NOT insensitive to its OWN queue: with the pool loaded
+    ///   microseconds before the hop, the r6 shape left **242.656 ms**
+    ///   between the last identity/lock/HEAD proof and the removal, against
+    ///   **0.032 ms** with the proof moved across. Four orders of magnitude,
+    ///   at an identical measured pool delay (240.4 ms vs 240.2 ms).
+    /// - CLEANLINESS does not move, in either arm, and is not claimed to
+    ///   (D2): 241.156 ms on the saturated permanent arm and 185.864 ms on
+    ///   the loaded Trash arm. `status --porcelain --ignored` is a
+    ///   subprocess; putting a `fork`/`exec` inside a disposal seam — on the
+    ///   MAIN ACTOR, for the Trash arm — would be a worse trade than the
+    ///   window it closes. What is left there is disclosed in "What is left,
+    ///   measured", residual 1, with these numbers.
+    func testTheWindowsThatRemainAreMeasuredUnderLoadInBothArms()
+        async throws
+    {
+        var mainLoadProof: [Double] = []
+        var mainLoadClean: [Double] = []
+        var mainLoadDelay: [Double] = []
+        for run in 0..<5 {
+            let sample = try await measureOneRemoval(
+                run: run, load: .mainThread, moveToTrash: false
+            )
+            mainLoadProof.append(sample.proof)
+            mainLoadClean.append(sample.cleanliness)
+            mainLoadDelay.append(sample.queueDelay)
+        }
+
+        var saturatedProof: [Double] = []
+        var saturatedClean: [Double] = []
+        var saturatedDelay: [Double] = []
+        for run in 0..<3 {
+            let sample = try await measureOneRemoval(
+                run: 100 + run, load: .globalQueue, moveToTrash: false
+            )
+            saturatedProof.append(sample.proof)
+            saturatedClean.append(sample.cleanliness)
+            saturatedDelay.append(sample.queueDelay)
+        }
+
+        var trashClean: [Double] = []
+        var trashDelay: [Double] = []
+        for run in 0..<5 {
+            let sample = try await measureOneRemoval(
+                run: 200 + run, load: .mainThread, moveToTrash: true
+            )
+            trashClean.append(sample.cleanliness)
+            trashDelay.append(sample.queueDelay)
+        }
+
+        func median(_ values: [Double]) -> Double {
+            values.sorted()[values.count / 2]
+        }
+        func show(_ label: String, _ values: [Double]) {
+            print(
+                "\(label) \(values.map { String(format: "%.3f", $0) })"
+                    + " median \(String(format: "%.3f", median(values)))"
+            )
+        }
+        show("MEASURED-PERMANENT-PROOF-WINDOW-MAIN-THREAD-LOAD-MS", mainLoadProof)
+        show("MEASURED-PERMANENT-MAIN-QUEUE-DELAY-MS", mainLoadDelay)
+        show("MEASURED-PERMANENT-PROOF-WINDOW-SATURATED-POOL-MS", saturatedProof)
+        show("MEASURED-PERMANENT-GLOBAL-QUEUE-DELAY-MS", saturatedDelay)
+        show("MEASURED-PERMANENT-CLEANLINESS-WINDOW-MAIN-THREAD-LOAD-MS", mainLoadClean)
+        show("MEASURED-PERMANENT-CLEANLINESS-WINDOW-SATURATED-POOL-MS", saturatedClean)
+        show("MEASURED-TRASH-CLEANLINESS-WINDOW-MAIN-THREAD-LOAD-MS", trashClean)
+        show("MEASURED-TRASH-MAIN-QUEUE-DELAY-MS", trashDelay)
+
+        XCTAssertGreaterThan(
+            median(mainLoadDelay), 40,
+            "the main thread was NOT loaded, so the main-thread rows measured "
+                + "nothing: \(mainLoadDelay)"
+        )
+        XCTAssertGreaterThan(
+            median(saturatedDelay), 40,
+            "the global pool was NOT saturated, so the saturation rows "
+                + "measured nothing: \(saturatedDelay)"
+        )
+        XCTAssertLessThan(
+            median(saturatedProof), 20,
+            "the last identity/lock/HEAD proof and the removal are separated "
+                + "by the global pool's depth — the proof is on the wrong "
+                + "side of the hop: \(saturatedProof), delays \(saturatedDelay)"
+        )
+        XCTAssertLessThan(
+            median(mainLoadProof), 20,
+            "proofs \(mainLoadProof), delays \(mainLoadDelay)"
+        )
     }
 
     /// Reports NO identity for any DESCRIPTOR — the "I opened the folder but
@@ -4754,6 +5149,43 @@ final class Timeline: @unchecked Sendable {
 }
 
 /// A trash seam that records instead of trashing.
+/// Measures how long a block enqueued on a queue waits before it STARTS —
+/// the queue's depth at that instant, and the witness that a load fixture
+/// actually loaded something (PR #460 codex r7, D1).
+final class QueueDelayWitness: @unchecked Sendable {
+    private let lock = NSLock()
+    private var waited: UInt64?
+
+    func arm(on queue: DispatchQueue) {
+        let enqueued = DispatchTime.now().uptimeNanoseconds
+        queue.async { [self] in
+            let started = DispatchTime.now().uptimeNanoseconds
+            lock.lock()
+            if waited == nil, started >= enqueued { waited = started - enqueued }
+            lock.unlock()
+        }
+    }
+
+    var milliseconds: Double? {
+        lock.lock(); defer { lock.unlock() }
+        guard let waited else { return nil }
+        return Double(waited) / 1_000_000
+    }
+
+    /// The witness is enqueued BEHIND the load, so it can still be waiting
+    /// when the measured removal has already finished. Bounded, and it
+    /// returns nil rather than hanging if the block never runs.
+    func settled(within seconds: Double = 5) -> Double? {
+        let deadline = DispatchTime.now().uptimeNanoseconds
+            + UInt64(seconds * 1_000_000_000)
+        while DispatchTime.now().uptimeNanoseconds < deadline {
+            if let value = milliseconds { return value }
+            usleep(2000)
+        }
+        return milliseconds
+    }
+}
+
 final class TrashRecorder: @unchecked Sendable {
     private let lock = NSLock()
     private var recorded: [URL] = []

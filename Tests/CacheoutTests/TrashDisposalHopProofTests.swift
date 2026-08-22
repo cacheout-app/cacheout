@@ -109,7 +109,7 @@ final class TrashDisposalHopProofTests: XCTestCase {
         )
         let parent = try admittedParent(of: target, provider: provider)
         let log = MoveLog()
-        let landings = self.landings!
+        let landings = try XCTUnwrap(self.landings)
         let fileManager = fm
 
         var thrown: Error?
@@ -165,7 +165,7 @@ final class TrashDisposalHopProofTests: XCTestCase {
         let identity = try XCTUnwrap(provider.identity(of: target))
         let parent = try admittedParent(of: target, provider: provider)
         let log = MoveLog()
-        let landings = self.landings!
+        let landings = try XCTUnwrap(self.landings)
         let fileManager = fm
 
         var thrown: Error?
@@ -217,7 +217,7 @@ final class TrashDisposalHopProofTests: XCTestCase {
         let identity = try XCTUnwrap(provider.identity(of: target))
         let parent = try admittedParent(of: target, provider: provider)
         let log = MoveLog()
-        let landings = self.landings!
+        let landings = try XCTUnwrap(self.landings)
         let fileManager = fm
 
         var thrown: Error?
@@ -259,7 +259,7 @@ final class TrashDisposalHopProofTests: XCTestCase {
         // `dispose` that refused everything. Each arm is driven once with a
         // mover that performs no swap, and must complete and land the object.
         let provider = FileSystemIdentityProvider()
-        let landings = self.landings!
+        let landings = try XCTUnwrap(self.landings)
         let fileManager = fm
         func move(_ url: URL, _ prove: () throws -> Void) throws -> URL? {
             try prove()

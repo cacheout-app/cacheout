@@ -144,8 +144,20 @@ below are both part of that coordination, and the latter BLOCKS this release.
   between the last check and the move. Both the checks and the move now happen
   on the far side of that hop, with nothing in between: **0.004 ms** under the
   identical load. This affects every Trash disposal in the app, not only
-  worktrees. Permanent delete was never affected — it re-proves the folder it
-  opens from a handle after its own hop.
+  worktrees.
+- **And permanent delete now does the same across its own hop.** Permanent
+  delete runs on a background queue, so it never waited on the main thread —
+  but it waits on that queue, and the check it re-ran on the far side proved
+  only which FOLDER it was deleting in, never which checkout stood there,
+  whether it had been locked, or whether its HEAD had moved. With the
+  background pool held busy, **242.7 ms** passed between the last of those
+  three checks and the delete; they now run on the far side of that hop too,
+  leaving **0.03 ms**. What still does not cross either hop is the
+  cleanliness check: it runs `git`, and starting a program there would be a
+  worse trade than the gap it closes. Under a busy queue that gap is
+  185.9 ms (Trash) and 241.2 ms (permanent), and work saved into the worktree
+  inside it is still destroyed with the tree — re-scan and the item is judged
+  afresh.
 - **`tool_unavailable` scan errors.** When a scanner cannot run an external
   tool it depends on — today `git` for `git_worktrees` — the scan publishes a
   `tool_unavailable` row in `scanner_errors` and withdraws every item that

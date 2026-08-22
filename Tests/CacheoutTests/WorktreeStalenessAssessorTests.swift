@@ -373,6 +373,40 @@ final class WorktreeStalenessAssessorTests: XCTestCase {
             "detached HEAD needs no special case — the COMMIT is what is judged"
         )
         XCTAssertEqual(try reason(assessment, .merged), "HEAD is ancestor of refs/heads/main")
+
+        // …AND ITS TAIL MUST NOT PROMISE A BRANCH REF (PR #460 codex r1).
+        // The field observation the branch sentence encodes was measured on
+        // BRANCH worktrees; a detached candidate has no branch ref, so
+        // removing it leaves whatever HEAD names reachable from nothing —
+        // the one shape where removal can orphan a commit was the one shape
+        // the confirmation sheet reassured the user about.
+        let head = try XCTUnwrap(record.headSHA)
+        XCTAssertFalse(
+            assessment.evidence.contains("branch ref survives removal"),
+            assessment.evidence
+        )
+        XCTAssertTrue(
+            assessment.evidence.hasSuffix(
+                "detached HEAD \(head.prefix(12)) — no branch ref will "
+                    + "survive removal"
+            ),
+            assessment.evidence
+        )
+    }
+
+    func testAnAttachedCandidateStillCarriesTheBranchRefSentence() async throws {
+        // The NEGATIVE CONTROL for the cell above: the field-verified
+        // sentence is retired for DETACHED worktrees only, not deleted.
+        let repository = try makeRepository(named: "repo")
+        try addWorktree(named: "wt", in: repository, arguments: ["-b", "feature"])
+
+        let assessment = try await assessLinked(of: repository)
+        XCTAssertTrue(assessment.isCandidate)
+        XCTAssertTrue(
+            assessment.evidence.hasSuffix("branch ref survives removal"),
+            assessment.evidence
+        )
+        XCTAssertFalse(assessment.evidence.contains("detached"), assessment.evidence)
     }
 
     func testDetachedHeadAtAnUnmergedCommitIsNotACandidate() async throws {

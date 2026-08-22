@@ -854,8 +854,9 @@ actor CacheCleaner {
     /// adapter would silently drop it. `assertionFailure` makes that a loud
     /// debug-build failure at the moment it becomes possible, instead of a
     /// quiet loss of the identity proof; release builds still fall through to
-    /// the performer's own re-checks (the clean re-check, the oracle
-    /// recompute, the D13 traversal guard).
+    /// the performer's own re-checks — its delete-time gate re-establishment
+    /// (R0/R1/R2), the G2 clean re-check before the filesystem fallback, the
+    /// oracle recompute in prune mode, and the D13 traversal guard.
     nonisolated private func preDeleteRefusal(
         for item: ReclaimableItem, authorization: String?
     ) -> PreDeleteSeamRefusal? {

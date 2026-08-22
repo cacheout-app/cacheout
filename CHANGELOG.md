@@ -39,10 +39,17 @@ below are both part of that coordination, and the latter BLOCKS this release.
   every scanner that actually walks those roots.
 - **Worktree removal runs through git, and says so.** Removal is
   `git worktree remove` — never `--force`, because git's own refusal of a
-  dirty tree is a check worth keeping. If git refuses, the tree is re-checked
-  for cleanliness and only then deleted directly, followed by a narrowly
-  gated `git worktree prune --expire=now` limited to that worktree's own
-  admin entry; the repository-level item prunes exactly the disclosed set.
+  dirty tree is a check worth keeping. Immediately before that removal — and
+  again before the direct-delete fallback — the gates the scan used are
+  re-established against the live repository: which repository the parent
+  path actually resolves to, and whether the worktree is still registered,
+  still linked, still unlocked and still merged. Anything that changed since
+  the scan refuses, names the action that clears it ("run
+  `git worktree unlock …`", "merge, rebase or push that commit"), and deletes
+  nothing. Only then is the tree re-checked for cleanliness and deleted
+  directly, followed by a narrowly gated `git worktree prune --expire=now`
+  limited to that worktree's own admin entry; the repository-level item
+  prunes exactly the disclosed set.
   **No branch is ever deleted and repository objects are never touched.**
   Because git unlinks rather than trashes, the confirmation sheet discloses
   per selected item that Move to Trash does not apply — stale removals and

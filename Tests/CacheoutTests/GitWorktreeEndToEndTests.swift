@@ -280,6 +280,105 @@ final class GitWorktreeEndToEndTests: XCTestCase {
         XCTAssertFalse(fm.fileExists(atPath: fixture.merged.path))
     }
 
+    /// THE C1 ACCEPTANCE (PR #460 codex r1), through the production
+    /// composition: a DETACHED worktree that was a candidate at scan time,
+    /// committed into before the user clicks clean.
+    ///
+    /// Every later gate the epic already had passes this shape — the tree is
+    /// still clean, the record is still registered and unlocked, the paths
+    /// are unmoved, and `git worktree remove` itself exits 0 SILENTLY. Only
+    /// re-establishing G3 refuses it, and the commit is on no branch, so
+    /// removal would leave it reachable from nothing at all.
+    @MainActor
+    func testACommitMadeBetweenScanAndCleanRefusesTheDetachedRemoval()
+        async throws
+    {
+        let repository = try makeRepository(at: dev.appendingPathComponent("repo"))
+        let worktree = dev.appendingPathComponent("detached")
+        let added = try GitFixture.git(
+            ["-C", repository.path, "worktree", "add", "--detach",
+             worktree.path, "HEAD"],
+            home: home
+        )
+        XCTAssertEqual(added.status, 0)
+        try Data(repeating: 0xAB, count: 8192)
+            .write(to: worktree.appendingPathComponent("payload.bin"))
+
+        let runner = hermeticRunner()
+        let viewModel = CacheoutViewModel(runtime: productionRuntime(runner: runner))
+        await viewModel.scan(
+            trigger: .userInitiated, scannerIDs: [GitWorktreeScanner.registeredID]
+        )
+        let stale = try item(
+            viewModel.items(forScanner: GitWorktreeScanner.registeredID),
+            mode: .removeStaleWorktree
+        )
+        // The scan really did offer it, and its evidence does NOT promise a
+        // surviving branch ref for this shape.
+        XCTAssertEqual(
+            try plan(of: stale).worktreePath.map { identityPath($0) },
+            identityPath(worktree)
+        )
+        XCTAssertFalse(stale.evidence.contains("branch ref survives removal"),
+                       stale.evidence)
+        XCTAssertTrue(stale.evidence.contains("no branch ref will survive removal"),
+                      stale.evidence)
+
+        // ---- THE WINDOW: the user goes back and commits ------------------
+        try "precious\n".write(
+            to: worktree.appendingPathComponent("precious.txt"),
+            atomically: true, encoding: .utf8
+        )
+        XCTAssertEqual(
+            try GitFixture.git(["-C", worktree.path, "add", "precious.txt"],
+                               home: home).status, 0
+        )
+        XCTAssertEqual(
+            try GitFixture.git(
+                ["-C", worktree.path, "-c", "user.name=t", "-c", "user.email=t@t",
+                 "commit", "-m", "precious"], home: home
+            ).status, 0
+        )
+        let precious = String(
+            decoding: try GitFixture.git(
+                ["-C", worktree.path, "rev-parse", "HEAD"], home: home
+            ).stdout, as: UTF8.self
+        ).trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // ---- CLEAN -------------------------------------------------------
+        viewModel.moveToTrash = false
+        viewModel.toggleSelection(for: stale.key)
+        await viewModel.clean()
+
+        // (a) the tree — and the commit in it — SURVIVES.
+        XCTAssertTrue(fm.fileExists(atPath: worktree.path))
+        XCTAssertTrue(fm.fileExists(
+            atPath: worktree.appendingPathComponent("precious.txt").path
+        ))
+        XCTAssertEqual(
+            String(
+                decoding: try GitFixture.git(
+                    ["-C", worktree.path, "rev-parse", "HEAD"], home: home
+                ).stdout, as: UTF8.self
+            ).trimmingCharacters(in: .whitespacesAndNewlines),
+            precious,
+            "the commit must still be reachable from the worktree's own HEAD"
+        )
+        // (b) git was never asked to remove anything.
+        XCTAssertNil(runner.argvs.first { $0.contains("remove") }, "\(runner.argvs)")
+        // (c) the run reported a REFUSAL, not a success with zero bytes.
+        let report = try XCTUnwrap(viewModel.lastReport)
+        XCTAssertTrue(report.entries.isEmpty, "nothing may be reported as freed")
+        XCTAssertEqual(report.errors.count, 1, "\(report.errorLines)")
+        let message = try XCTUnwrap(report.errors.first?.message)
+        XCTAssertTrue(message.contains("no longer an ancestor"), message)
+        XCTAssertTrue(message.contains("HEAD is DETACHED"), message)
+        XCTAssertTrue(message.contains("then re-scan"), message)
+        // (d) the worktree is still registered — nothing half-happened.
+        XCTAssertTrue(try worktreeListing(of: repository)
+            .contains(identityPath(worktree)))
+    }
+
     // ====================================================================
     // MARK: - R11: scan → select → clean → report
     // ====================================================================

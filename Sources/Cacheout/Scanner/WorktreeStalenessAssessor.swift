@@ -38,10 +38,17 @@
 ///   FAILED — including git's talkative exit 1 for an unreadable ref —
 ///   fails the gate closed rather than silently promoting a lower rung to
 ///   default branch. No network anywhere (the Boundaries forbid
-///   `fetch`/`remote prune`).
+///   `fetch`/`remote prune`). Exported standalone as
+///   `GitWorktreeMergedCheck` for the same reason G2 was: fn-5.4's
+///   delete-time re-establishment re-runs exactly this gate immediately
+///   before the removal, and a second spelling of the ladder or of the
+///   ancestry decision would let the scan and the deletion disagree about
+///   what "merged" means (PR #460 codex r1).
 /// - **G4 not locked** — porcelain `locked`. A locked worktree is NEVER a
 ///   candidate; this epic has no lock handling at all (`--force`, including
-///   the "twice for locked" trick, is a Boundaries violation).
+///   the "twice for locked" trick, is a Boundaries violation). fn-5.4
+///   re-reads the record and re-runs `evaluateNotLocked` on it immediately
+///   before the mutation, so a lock taken AFTER the scan refuses too.
 ///
 /// EVERY gate is evaluated even after an earlier one fails: the evidence
 /// format below requires all four clauses ALWAYS, and the per-worktree git
@@ -60,6 +67,12 @@
 ///     G1 linked (not main/bare); G2 clean; G3 HEAD is ancestor of
 ///     refs/heads/main; G4 not locked; last commit 2026-08-14; branch ref
 ///     survives removal
+///
+/// The last clause is CONDITIONAL on the porcelain record: a worktree on a
+/// branch gets `branch ref survives removal`, a DETACHED one gets
+/// `detached HEAD <oid> — no branch ref will survive removal`. Printing the
+/// branch sentence for a detached candidate was a false reassurance about
+/// precisely the shape whose removal can orphan a commit (PR #460 codex r1).
 ///
 /// and a multi-failure assessment names every failing gate in the ONE string:
 ///
@@ -275,6 +288,272 @@ enum GitWorktreeCleanCheck {
     }
 }
 
+// MARK: - G3, exported for fn-5.4
+
+/// The G3 merged verdict.
+///
+/// `notAncestor` is git's own ANSWER (`merge-base --is-ancestor` exit 1) and
+/// `unanswered` is everything else — a nonzero exit git could not decide on,
+/// a timeout, an absent git, or a D6 ladder that could not name a default
+/// branch. They are never conflated: only the first is a fact about the
+/// worktree, and the two are reported to the user differently.
+enum WorktreeMergedVerdict: Equatable, Sendable {
+    case merged(defaultRef: String)
+    case notAncestor(defaultRef: String)
+    case unanswered(reason: String)
+
+    /// The ONLY affirmative state. Every other case — including every
+    /// failure class — is not merged.
+    var isMerged: Bool {
+        if case .merged = self { return true }
+        return false
+    }
+}
+
+/// The G3 check as a standalone, reusable surface — the SAME move G2 made.
+///
+/// fn-5.4's delete path re-runs it immediately before `git worktree remove`
+/// (PR #460 codex r1 / C1), so it must be ONE implementation with one argv
+/// and one routing: a second spelling of the D6 ladder or of the ancestry
+/// decision would let the scan and the deletion disagree about what "merged"
+/// means, which is exactly what exporting G2 was created to prevent.
+///
+/// Every command here is READ-ONLY by D17 classification (`symbolic-ref`,
+/// `rev-parse`, `merge-base`), so the runner's read-only profile rides both
+/// call sites automatically.
+enum GitWorktreeMergedCheck {
+
+    // MARK: Pinned refs (D6 ladder)
+
+    /// Step (a): the remote's default branch pointer. Frequently UNSET on
+    /// fetched (non-cloned) repositories — the local fallback below is the
+    /// common path, not the exception.
+    static let originHeadRef = "refs/remotes/origin/HEAD"
+
+    /// The exit code BOTH ladder commands use for "this ref is not there"
+    /// (`symbolic-ref -q`: unset, deleted, or not symbolic;
+    /// `rev-parse --verify --quiet`: absent). Necessary but NOT sufficient
+    /// to continue the ladder — see `isRefMissing`.
+    static let refMissingExitCode: Int32 = 1
+
+    /// Step (b) and (c). A `develop`/`trunk` repository without
+    /// `origin/HEAD` resolves to nothing and is never a candidate — accepted
+    /// (repairing it would need `fetch`, which the no-network boundary
+    /// forbids).
+    static let localDefaultRefs = ["refs/heads/main", "refs/heads/master"]
+
+    /// Whether a nonzero ladder result really means "this ref is not there".
+    ///
+    /// Exit 1 alone is not enough. Git also answers 1 for a ref that EXISTS
+    /// and cannot be read — `warning: ignoring broken ref refs/heads/main`,
+    /// verified on git 2.50.1 against a corrupted loose ref — and that is a
+    /// completely different fact from "there is no such ref". Continuing on
+    /// it would let a repository whose `main` is unreadable be judged
+    /// against `master`, so a worktree unmerged into the real default branch
+    /// could pass G3.
+    ///
+    /// The discriminator is stderr: a genuine miss is SILENT (both commands
+    /// print nothing for an absent/unset ref — verified), while every
+    /// diagnostic answer says something. Erring on the strict side costs at
+    /// most a missed reclaim; erring the other way costs human work.
+    static func isRefMissing(exitCode: Int32, stderr: String) -> Bool {
+        exitCode == refMissingExitCode
+            && stderr.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    // MARK: Argv — ONE spelling, both call sites
+
+    static func originHeadArguments(parentRepoWorkingDir: URL) -> [String] {
+        ["-C", parentRepoWorkingDir.path, "symbolic-ref", "-q", originHeadRef]
+    }
+
+    static func verifyRefArguments(
+        parentRepoWorkingDir: URL, ref: String
+    ) -> [String] {
+        ["-C", parentRepoWorkingDir.path, "rev-parse", "--verify", "--quiet", ref]
+    }
+
+    /// Detached HEAD needs no special case: `HEAD` names the commit, and the
+    /// commit is exactly what is being judged.
+    static func ancestryArguments(
+        worktreeAt worktreePath: URL, defaultRef: String
+    ) -> [String] {
+        ["-C", worktreePath.path, "merge-base", "--is-ancestor", "HEAD", defaultRef]
+    }
+
+    // MARK: The D6 ladder
+
+    /// The D6 ladder's answer.
+    enum DefaultBranchResolution: Equatable, Sendable {
+        case resolved(ref: String)
+        case unresolved(reason: String)
+    }
+
+    /// The D6 ladder, run in the PARENT repository:
+    /// `refs/remotes/origin/HEAD` → `refs/heads/main` → `refs/heads/master`
+    /// → fail closed.
+    ///
+    /// EVERY failure class is enumerated, and exactly ONE of them continues
+    /// the ladder: a SILENT exit 1, which is each command's "this rung is
+    /// not there" answer. Everything else stops it.
+    ///
+    /// - `symbolic-ref -q <ref>` exits **1** SILENTLY when the ref is unset,
+    ///   deleted, or present-but-not-symbolic (the common shape on fetched,
+    ///   non-cloned repos) and **128** when git could not look at all — not
+    ///   a repository, or an unreadable ref file. Verified on git 2.50.1;
+    ///   the `-q` is what SPLITS those two, because without it the ordinary
+    ///   unset case also dies with 128 and becomes indistinguishable from a
+    ///   broken repository.
+    /// - `rev-parse --verify --quiet <ref>` exits **1** SILENTLY for an
+    ///   absent ref, **1 with a `warning: ignoring broken ref …`** for a ref
+    ///   that exists and cannot be read, and **128** for a fatal condition.
+    ///
+    /// Hence the miss test is `isRefMissing` — exit 1 AND a silent stderr —
+    /// not the exit code alone.
+    ///
+    /// Treating a FAILED rung as a missing one would be a real fail-open,
+    /// not a conservative refusal: a repository whose `refs/heads/main`
+    /// cannot be read but whose `refs/heads/master` still resolves would
+    /// silently be judged against `master`, and a worktree unmerged into the
+    /// actual default branch could pass G3. So a failed rung fails the gate
+    /// CLOSED with the rung and the failure NAMED. A TIMEOUT or a
+    /// gitUnavailable stops the ladder for the same reason plus one more:
+    /// firing two further subprocesses at a wedged or absent git would only
+    /// relabel a real failure as "default branch unresolvable".
+    static func resolveDefaultBranch(
+        parentRepoWorkingDir: URL,
+        using runner: any GitCommandRunning,
+        timeout: TimeInterval? = nil
+    ) async -> DefaultBranchResolution {
+        let symbolic = await invoke(
+            originHeadArguments(parentRepoWorkingDir: parentRepoWorkingDir),
+            using: runner, timeout: timeout
+        )
+        switch symbolic.outcome {
+        case .success(let stdout):
+            guard let ref = WorktreeStalenessAssessor.firstLine(of: stdout),
+                  ref.hasPrefix("refs/") else {
+                // A successful symbolic-ref whose output is not a ref is an
+                // anomaly, NOT the "unset" case — it must not fall through
+                // into the local ladder as if the pointer were merely absent.
+                return .unresolved(
+                    reason: "\(originHeadRef) resolved to an unreadable ref"
+                )
+            }
+            return .resolved(ref: ref)
+        case .failure(let exitCode, let stderr):
+            guard isRefMissing(exitCode: exitCode, stderr: stderr) else {
+                let summary = GitCommandFailureSummary.describe(
+                    exitCode: exitCode, stderr: stderr
+                )
+                return .unresolved(
+                    reason: "\(originHeadRef) lookup failed (\(summary))"
+                )
+            }
+            break // The ONLY continuing class: the ref is not there.
+        case .timeout:
+            return .unresolved(reason: "default branch lookup timed out")
+        case .gitUnavailable:
+            return .unresolved(reason: "git unavailable")
+        }
+
+        for ref in localDefaultRefs {
+            let verify = await invoke(
+                verifyRefArguments(
+                    parentRepoWorkingDir: parentRepoWorkingDir, ref: ref
+                ),
+                using: runner, timeout: timeout
+            )
+            switch verify.outcome {
+            case .success:
+                return .resolved(ref: ref)
+            case .failure(let exitCode, let stderr):
+                guard isRefMissing(exitCode: exitCode, stderr: stderr) else {
+                    // A FAILED rung is not a MISSING one: falling through to
+                    // the next ref would judge the worktree against a branch
+                    // that is not this repository's default.
+                    let summary = GitCommandFailureSummary.describe(
+                        exitCode: exitCode, stderr: stderr
+                    )
+                    return .unresolved(reason: "\(ref) lookup failed (\(summary))")
+                }
+                continue // The ref is absent — try the next rung.
+            case .timeout:
+                return .unresolved(reason: "default branch lookup timed out")
+            case .gitUnavailable:
+                return .unresolved(reason: "git unavailable")
+            }
+        }
+
+        return .unresolved(reason: "default branch unresolvable")
+    }
+
+    // MARK: The ancestry decision
+
+    /// TOTAL routing over the runner's four outcome classes. Exit 0 is the
+    /// ONLY pass; exit 1 is git's ANSWER "not an ancestor" and every other
+    /// exit — 128 for a bad or unresolvable ref above all — means git could
+    /// not answer. Conflating them would let an unanswered check masquerade
+    /// as a hedged negative, so they render differently. Both fail closed.
+    static func verdict(
+        for outcome: GitCommandOutcome, defaultRef: String
+    ) -> WorktreeMergedVerdict {
+        switch outcome {
+        case .success:
+            return .merged(defaultRef: defaultRef)
+        case .failure(let exitCode, let stderr):
+            if exitCode == 1 {
+                return .notAncestor(defaultRef: defaultRef)
+            }
+            return .unanswered(
+                reason: "ancestry check against \(defaultRef) failed "
+                    + "(\(GitCommandFailureSummary.describe(exitCode: exitCode, stderr: stderr)))"
+            )
+        case .timeout:
+            return .unanswered(
+                reason: "ancestry check against \(defaultRef) timed out"
+            )
+        case .gitUnavailable:
+            return .unanswered(reason: "git unavailable")
+        }
+    }
+
+    /// Resolve the default branch in the parent, then decide ancestry in the
+    /// worktree. A ladder that cannot name a default branch is `unanswered`
+    /// with the ladder's own reason and NO ancestry command runs.
+    static func run(
+        worktreeAt worktreePath: URL,
+        parentRepoWorkingDir: URL,
+        using runner: any GitCommandRunning,
+        timeout: TimeInterval? = nil
+    ) async -> WorktreeMergedVerdict {
+        let defaultRef: String
+        switch await resolveDefaultBranch(
+            parentRepoWorkingDir: parentRepoWorkingDir,
+            using: runner, timeout: timeout
+        ) {
+        case .resolved(let ref):
+            defaultRef = ref
+        case .unresolved(let reason):
+            return .unanswered(reason: reason)
+        }
+        let invocation = await invoke(
+            ancestryArguments(worktreeAt: worktreePath, defaultRef: defaultRef),
+            using: runner, timeout: timeout
+        )
+        return verdict(for: invocation.outcome, defaultRef: defaultRef)
+    }
+
+    private static func invoke(
+        _ arguments: [String],
+        using runner: any GitCommandRunning,
+        timeout: TimeInterval?
+    ) async -> GitCommandInvocation {
+        if let timeout { return await runner.run(arguments, timeout: timeout) }
+        return await runner.run(arguments)
+    }
+}
+
 // MARK: - Shared failure rendering
 
 /// One-line, bounded rendering of a git failure for evidence strings.
@@ -313,48 +592,27 @@ enum GitCommandFailureSummary {
 /// rendering configuration, so the scanner actor (fn-5.5) can hold one.
 struct WorktreeStalenessAssessor: Sendable {
 
-    // MARK: Pinned refs (D6 ladder)
-
-    /// Step (a): the remote's default branch pointer. Frequently UNSET on
-    /// fetched (non-cloned) repositories — the local fallback below is the
-    /// common path, not the exception.
-    static let originHeadRef = "refs/remotes/origin/HEAD"
-    /// The exit code BOTH ladder commands use for "this ref is not there"
-    /// (`symbolic-ref -q`: unset, deleted, or not symbolic;
-    /// `rev-parse --verify --quiet`: absent). Necessary but NOT sufficient
-    /// to continue the ladder — see `isRefMissing`.
-    static let refMissingExitCode: Int32 = 1
-
-    /// Whether a nonzero ladder result really means "this ref is not there".
-    ///
-    /// Exit 1 alone is not enough. Git also answers 1 for a ref that EXISTS
-    /// and cannot be read — `warning: ignoring broken ref refs/heads/main`,
-    /// verified on git 2.50.1 against a corrupted loose ref — and that is a
-    /// completely different fact from "there is no such ref". Continuing on
-    /// it would let a repository whose `main` is unreadable be judged
-    /// against `master`, so a worktree unmerged into the real default branch
-    /// could pass G3.
-    ///
-    /// The discriminator is stderr: a genuine miss is SILENT (both commands
-    /// print nothing for an absent/unset ref — verified), while every
-    /// diagnostic answer says something. Erring on the strict side costs at
-    /// most a missed reclaim; erring the other way costs human work.
-    static func isRefMissing(exitCode: Int32, stderr: String) -> Bool {
-        exitCode == refMissingExitCode
-            && stderr.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-    }
-    /// Step (b) and (c). A `develop`/`trunk` repository without
-    /// `origin/HEAD` resolves to nothing and is never a candidate — accepted
-    /// (repairing it would need `fetch`, which the no-network boundary
-    /// forbids).
-    static let localDefaultRefs = ["refs/heads/main", "refs/heads/master"]
-
     // MARK: Pinned evidence fragments
 
-    /// The field-verified statement the candidate tail always carries: 28/28
-    /// branch refs survived removal of 12 worktrees
-    /// (FIELD-EVIDENCE-2026-08-06.md scenario 2).
+    /// The field-verified statement the candidate tail carries for a worktree
+    /// checked out ON A BRANCH: 28/28 branch refs survived removal of 12
+    /// worktrees (FIELD-EVIDENCE-2026-08-06.md scenario 2 — every worktree in
+    /// that scenario was on a branch).
+    ///
+    /// IT IS NOT TRUE FOR A DETACHED HEAD, and this candidate tail used to
+    /// print it for every candidate unconditionally (PR #460 codex r1 / C1).
+    /// A detached worktree has no branch ref, so removing it leaves whatever
+    /// HEAD names reachable from nothing — the one shape where removal can
+    /// orphan a commit was the one shape the confirmation sheet reassured the
+    /// user about. `detachedHeadSentence` replaces it there.
     static let branchRefSentence = "branch ref survives removal"
+
+    /// The candidate tail for a DETACHED worktree. It states what is true:
+    /// there is no branch ref to survive.
+    static func detachedHeadSentence(_ headSHA: String?) -> String {
+        let oid = headSHA.map { String($0.prefix(12)) } ?? "unknown"
+        return "detached HEAD \(oid) — no branch ref will survive removal"
+    }
     /// The explicit marker that fills the date slot when the lookup failed —
     /// the slot is NEVER silently absent.
     static let lastCommitUnavailableMarker = "last commit unavailable"
@@ -423,7 +681,9 @@ struct WorktreeStalenessAssessor: Sendable {
                 gates: gates,
                 lastCommitDate: lastCommitDate,
                 evidence: Self.evidence(
-                    gates: gates, lastCommitDate: lastCommitDate, timeZone: timeZone
+                    gates: gates, lastCommitDate: lastCommitDate,
+                    detachedRecord: (entry.isDetached, entry.headSHA),
+                    timeZone: timeZone
                 )
             )
         )
@@ -471,153 +731,34 @@ struct WorktreeStalenessAssessor: Sendable {
 
     // MARK: G3 — merged (LOCAL ancestry, hedged)
 
-    /// The D6 ladder's answer.
-    private enum DefaultBranchResolution: Equatable {
-        case resolved(ref: String)
-        case unresolved(reason: String)
-    }
-
+    /// G3, through `GitWorktreeMergedCheck` — ONE implementation, two call
+    /// sites (here and fn-5.4's delete-time re-establishment). This function
+    /// owns only the EVIDENCE WORDING; the ladder, the argv and the routing
+    /// belong to the shared check.
     private func evaluateMerged(
         worktreeAt worktreePath: URL, parentRepoWorkingDir: URL
     ) async -> WorktreeGateOutcome {
-        let defaultRef: String
-        switch await resolveDefaultBranch(parentRepoWorkingDir: parentRepoWorkingDir) {
-        case .resolved(let ref):
-            defaultRef = ref
-        case .unresolved(let reason):
-            // The ladder failed: G3 fails CLOSED with the cause named, and no
-            // ancestry command runs against an unresolved ref.
-            return WorktreeGateOutcome(gate: .merged, passed: false, reason: reason)
-        }
-
-        // Detached HEAD needs no special case: `HEAD` names the commit, and
-        // the commit is exactly what is being judged.
-        let invocation = await run(
-            ["-C", worktreePath.path, "merge-base", "--is-ancestor", "HEAD", defaultRef]
-        )
-        switch invocation.outcome {
-        case .success:
+        switch await GitWorktreeMergedCheck.run(
+            worktreeAt: worktreePath,
+            parentRepoWorkingDir: parentRepoWorkingDir,
+            using: runner, timeout: timeout
+        ) {
+        case .merged(let defaultRef):
             return WorktreeGateOutcome(
                 gate: .merged, passed: true, reason: "HEAD is ancestor of \(defaultRef)"
             )
-        case .failure(let exitCode, let stderr):
-            // Exit 1 is git's ANSWER ("not an ancestor"); every other exit —
-            // 128 for a bad or unresolvable ref above all — means git could
-            // not answer. Conflating them would let an unanswered check
-            // masquerade as a hedged negative, so they render differently.
-            // Both fail closed.
-            if exitCode == 1 {
-                return WorktreeGateOutcome(
-                    gate: .merged, passed: false,
-                    reason: "HEAD not an ancestor of \(defaultRef) "
-                        + "(squash/rebase merges not detected)"
-                )
-            }
+        case .notAncestor(let defaultRef):
             return WorktreeGateOutcome(
                 gate: .merged, passed: false,
-                reason: "ancestry check against \(defaultRef) failed "
-                    + "(\(GitCommandFailureSummary.describe(exitCode: exitCode, stderr: stderr)))"
+                reason: "HEAD not an ancestor of \(defaultRef) "
+                    + "(squash/rebase merges not detected)"
             )
-        case .timeout:
-            return WorktreeGateOutcome(
-                gate: .merged, passed: false,
-                reason: "ancestry check against \(defaultRef) timed out"
-            )
-        case .gitUnavailable:
-            return WorktreeGateOutcome(gate: .merged, passed: false, reason: "git unavailable")
+        case .unanswered(let reason):
+            // Covers BOTH a ladder that could not name a default branch and
+            // an ancestry command git could not answer — each carries its
+            // own cause, and neither passes.
+            return WorktreeGateOutcome(gate: .merged, passed: false, reason: reason)
         }
-    }
-
-    /// The D6 ladder, run in the PARENT repository:
-    /// `refs/remotes/origin/HEAD` → `refs/heads/main` → `refs/heads/master`
-    /// → fail closed.
-    ///
-    /// EVERY failure class is enumerated, and exactly ONE of them continues
-    /// the ladder: a SILENT exit 1, which is each command's "this rung is
-    /// not there" answer. Everything else stops it.
-    ///
-    /// - `symbolic-ref -q <ref>` exits **1** SILENTLY when the ref is unset,
-    ///   deleted, or present-but-not-symbolic (the common shape on fetched,
-    ///   non-cloned repos) and **128** when git could not look at all — not
-    ///   a repository, or an unreadable ref file. Verified on git 2.50.1;
-    ///   the `-q` is what SPLITS those two, because without it the ordinary
-    ///   unset case also dies with 128 and becomes indistinguishable from a
-    ///   broken repository.
-    /// - `rev-parse --verify --quiet <ref>` exits **1** SILENTLY for an
-    ///   absent ref, **1 with a `warning: ignoring broken ref …`** for a ref
-    ///   that exists and cannot be read, and **128** for a fatal condition.
-    ///
-    /// Hence the miss test is `isRefMissing` — exit 1 AND a silent stderr —
-    /// not the exit code alone.
-    ///
-    /// Treating a FAILED rung as a missing one would be a real fail-open,
-    /// not a conservative refusal: a repository whose `refs/heads/main`
-    /// cannot be read but whose `refs/heads/master` still resolves would
-    /// silently be judged against `master`, and a worktree unmerged into the
-    /// actual default branch could pass G3. So a failed rung fails the gate
-    /// CLOSED with the rung and the failure NAMED. A TIMEOUT or a
-    /// gitUnavailable stops the ladder for the same reason plus one more:
-    /// firing two further subprocesses at a wedged or absent git would only
-    /// relabel a real failure as "default branch unresolvable".
-    private func resolveDefaultBranch(
-        parentRepoWorkingDir: URL
-    ) async -> DefaultBranchResolution {
-        let parent = parentRepoWorkingDir.path
-
-        let symbolic = await run(
-            ["-C", parent, "symbolic-ref", "-q", Self.originHeadRef]
-        )
-        switch symbolic.outcome {
-        case .success(let stdout):
-            guard let ref = Self.firstLine(of: stdout), ref.hasPrefix("refs/") else {
-                // A successful symbolic-ref whose output is not a ref is an
-                // anomaly, NOT the "unset" case — it must not fall through
-                // into the local ladder as if the pointer were merely absent.
-                return .unresolved(
-                    reason: "\(Self.originHeadRef) resolved to an unreadable ref"
-                )
-            }
-            return .resolved(ref: ref)
-        case .failure(let exitCode, let stderr):
-            guard Self.isRefMissing(exitCode: exitCode, stderr: stderr) else {
-                let summary = GitCommandFailureSummary.describe(
-                    exitCode: exitCode, stderr: stderr
-                )
-                return .unresolved(
-                    reason: "\(Self.originHeadRef) lookup failed (\(summary))"
-                )
-            }
-            break // The ONLY continuing class: the ref is not there.
-        case .timeout:
-            return .unresolved(reason: "default branch lookup timed out")
-        case .gitUnavailable:
-            return .unresolved(reason: "git unavailable")
-        }
-
-        for ref in Self.localDefaultRefs {
-            let verify = await run(["-C", parent, "rev-parse", "--verify", "--quiet", ref])
-            switch verify.outcome {
-            case .success:
-                return .resolved(ref: ref)
-            case .failure(let exitCode, let stderr):
-                guard Self.isRefMissing(exitCode: exitCode, stderr: stderr) else {
-                    // A FAILED rung is not a MISSING one: falling through to
-                    // the next ref would judge the worktree against a branch
-                    // that is not this repository's default.
-                    let summary = GitCommandFailureSummary.describe(
-                        exitCode: exitCode, stderr: stderr
-                    )
-                    return .unresolved(reason: "\(ref) lookup failed (\(summary))")
-                }
-                continue // The ref is absent — try the next rung.
-            case .timeout:
-                return .unresolved(reason: "default branch lookup timed out")
-            case .gitUnavailable:
-                return .unresolved(reason: "git unavailable")
-            }
-        }
-
-        return .unresolved(reason: "default branch unresolvable")
     }
 
     // MARK: G4 — not locked
@@ -658,13 +799,25 @@ struct WorktreeStalenessAssessor: Sendable {
     /// sentence) rides CANDIDATES only — it describes what happens when the
     /// worktree is removed, and non-candidates are never offered for removal
     /// (D15).
+    /// `detachedRecord` carries the porcelain record's `detached` attribute
+    /// and its HEAD: a detached candidate gets `detachedHeadSentence`, an
+    /// attached one gets `branchRefSentence`. Passing the record's own fields
+    /// rather than a Bool keeps the tail's claim sourced from the same
+    /// porcelain the gates were judged on.
     static func evidence(
-        gates: [WorktreeGateOutcome], lastCommitDate: Date?, timeZone: TimeZone
+        gates: [WorktreeGateOutcome],
+        lastCommitDate: Date?,
+        detachedRecord: (isDetached: Bool, headSHA: String?),
+        timeZone: TimeZone
     ) -> String {
         var clauses = gates.map(\.clause)
         if gates.allSatisfy(\.passed) {
             clauses.append(lastCommitPhrase(lastCommitDate, timeZone: timeZone))
-            clauses.append(branchRefSentence)
+            clauses.append(
+                detachedRecord.isDetached
+                    ? detachedHeadSentence(detachedRecord.headSHA)
+                    : branchRefSentence
+            )
         }
         return clauses.joined(separator: "; ")
     }

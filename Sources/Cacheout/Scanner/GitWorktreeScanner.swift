@@ -1366,8 +1366,12 @@ struct GitWorktreeScanner: @unchecked Sendable {
 /// `keptRoots`, declared spellings verbatim), and `scan(context:)`. No
 /// `preDeleteRevalidator` is declared: this scanner runs no scan-time content
 /// probe whose result a delete-time re-inspection could contradict — the
-/// composite performer's own re-checks (the clean re-check, the oracle
-/// recompute, the D13 traversal guard) are the delete-time gates for its items.
+/// composite performer's own re-checks are the delete-time gates for its
+/// items, and the performer is where they are enumerated:
+/// `reestablishStaleGates` (R0 repository identity, R1 the re-read porcelain
+/// record's G1/G4 plus the registration, R2 the shared G3 ancestry check),
+/// the G2 clean re-check before the filesystem fallback, the oracle recompute
+/// in prune mode, and the D13 traversal guard before every invocation.
 ///
 /// `participates(in:)` IS NOT OVERRIDDEN, and that is a decision rather than an
 /// omission (fn-6 reconciliation). fn-6 added the member so a scanner can

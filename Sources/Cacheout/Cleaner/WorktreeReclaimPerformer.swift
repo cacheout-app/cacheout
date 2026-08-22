@@ -5,8 +5,9 @@
 ///
 /// - **`removeStaleWorktree`** — `git -C <parent> worktree remove <path>`
 ///   first (never `--force`), with a guarded filesystem fallback + a GATED
-///   `worktree prune --expire=now` when git refuses with a nonzero exit and
-///   the tree re-checks CLEAN.
+///   `worktree prune --expire=now` when git refuses with a nonzero exit, the
+///   tree re-checks CLEAN, and the delete-time gate re-establishment below
+///   still passes.
 /// - **`pruneOrphanedAdmin`** — a repository-level
 ///   `git -C <parent> worktree prune --expire=now` over the PROVABLY-COMPLETE
 ///   admin-directory set the scan disclosed (D14).
@@ -34,11 +35,28 @@
 /// | invocation                       | guarded paths                          |
 /// |----------------------------------|----------------------------------------|
 /// | admission (both modes)           | parent (or-equal), admin container; stale mode adds the worktree |
+/// | R0 `rev-parse --git-common-dir`  | parent (`-C`)                          |
+/// | R1 registry re-read (`worktree list`) | parent (`-C`)                     |
+/// | R2 ladder (`symbolic-ref`, `rev-parse --verify`) | parent (`-C`)        |
+/// | R2 ancestry (`merge-base --is-ancestor`) | the worktree (`-C`)            |
 /// | `worktree remove`                | parent (`-C`), the worktree argument   |
-/// | `status` re-check                | the worktree (`-C`) AND the admin container — git follows `<wt>/.git` INTO the admin/common git dir, so a swap in EITHER between the remove failure and the re-check would redirect it (epic round 6) |
+/// | `status` re-check                | the worktree (`-C`) AND the admin container — git follows `<wt>/.git` INTO the admin/common git dir, so a swap in EITHER between the remove failure and the re-check would redirect it (epic round 6) — AND the parent, which the fallback's own R0/R1/R2 re-run traverses |
 /// | oracle recompute (`worktree list`) | parent (`-C`)                        |
 /// | `worktree prune`                 | parent (`-C`), admin container         |
 /// | each affected admin dir (prune mode) | the dir itself, strictly           |
+///
+/// ## THE DELETE-TIME GATE RE-ESTABLISHMENT (PR #460 codex r1)
+///
+/// The scan authorises a removal with four gates (`WorktreeStalenessAssessor`
+/// G1…G4). Until this round the delete path re-established exactly ONE of
+/// them (G2, and only inside the fallback), so a worktree that was locked,
+/// deregistered, or committed into between the scan and the click was
+/// destroyed anyway — with an empty error list. `reestablishStaleGates` now
+/// re-proves R0 (repository identity), R1 (G1 + G4 + the registration
+/// itself, from the re-read porcelain record) and R2 (G3, through the shared
+/// `GitWorktreeMergedCheck`) immediately before the mutation, at BOTH
+/// mutating sites: before `worktree remove`, and again inside the fallback
+/// before the filesystem delete.
 ///
 /// ## RUNNER-RESULT ROUTING IS TOTAL
 ///
@@ -60,7 +78,18 @@
 ///    `validate_no_submodules` refuses without `--force`, the re-check
 ///    passes, and the fallback delete is ACCEPTED (the targets are user-owned
 ///    dev roots and the parent's absorbed `modules/` object store is
-///    untouched; branch refs survive).
+///    untouched; refs of an attached branch survive).
+///
+/// THE ROUTING ENUMERATES ZERO OF THOSE CLASSES, and that is deliberate — a
+/// classification derived from git's message text is forbidden here. What
+/// SEPARATES the two intended classes from git's own SAFETY refusals is the
+/// re-established state, not the wording: a lock refusal leaves the porcelain
+/// record `locked`, an "is not a working tree" refusal leaves no record at
+/// all, and both are refused by R1. The ignored-tree and submodule refusals
+/// leave the record registered, linked and unlocked, so they proceed. Before
+/// PR #460 the fallback re-checked only cleanliness and therefore achieved
+/// `remove -f -f`'s effect on a locked worktree without the flag — measured,
+/// with `errors=[]`.
 ///
 /// ## ACCOUNTING (mirrors `removeGuardedItem`; D14's verified-removal for prune)
 ///
@@ -123,6 +152,21 @@ struct WorktreeReclaimPerformer {
         parentRepoWorkingDir: URL, worktreePath: URL
     ) -> [String] {
         ["-C", parentRepoWorkingDir.path, "worktree", "remove", worktreePath.path]
+    }
+
+    /// `git -C <parent> rev-parse --path-format=absolute --git-common-dir` —
+    /// the delete-time question "which repository is this `-C` target
+    /// actually about?".
+    ///
+    /// READ-ONLY by D17 classification (`rev-parse` is in
+    /// `GitSafetyProfile.readOnlyCommands`), so the read-only profile rides
+    /// it with no change. `--path-format=absolute` needs git ≥ 2.31 and this
+    /// epic's floor is 2.39.
+    static func commonGitDirArguments(parentRepoWorkingDir: URL) -> [String] {
+        [
+            "-C", parentRepoWorkingDir.path, "rev-parse",
+            "--path-format=absolute", "--git-common-dir",
+        ]
     }
 
     /// `git -C <parent> worktree prune --expire=now`.
@@ -293,6 +337,15 @@ struct WorktreeReclaimPerformer {
             return refusal(item, error, at: worktreePath)
         }
 
+        // (8) THE DELETE-TIME GATE RE-ESTABLISHMENT. Placed HERE, before the
+        // primary invocation, so it covers BOTH arms: the fallback is only
+        // reachable through the `worktree remove` below.
+        if case .refuse(let tag, let detail) = await reestablishStaleGates(
+            plan: plan, worktreePath: worktreePath
+        ) {
+            return failure(item, detail, tag: tag)
+        }
+
         let removal = await runner.run(
             Self.removeArguments(
                 parentRepoWorkingDir: plan.parentRepoWorkingDir,
@@ -363,13 +416,18 @@ struct WorktreeReclaimPerformer {
         // The guard re-runs over BOTH paths the re-check traverses (round 6):
         // `git -C <wt> status` follows `<wt>/.git` INTO the admin container,
         // so a leaf swapped to a symlink in EITHER between the remove failure
-        // and this call would redirect the check outside the container.
+        // and this call would redirect the check outside the container. The
+        // PARENT joins them (PR #460 codex r1) because the gate
+        // re-establishment below re-reads the repository and its registry
+        // with `-C <parent>`.
         do {
             try guardTraversal([
                 (label: "worktree", url: worktreePath,
                  containment: .strictDescendant),
                 (label: "admin container", url: plan.parentAdminContainer,
                  containment: .strictDescendant),
+                (label: "parent repository", url: plan.parentRepoWorkingDir,
+                 containment: .descendantOrEqual),
             ], inside: container)
         } catch {
             return refusal(item, error, at: worktreePath)
@@ -400,6 +458,28 @@ struct WorktreeReclaimPerformer {
                 + "prove it clean (\(reason)) — the tree was left untouched"
             logRefusal("worktree-recheck-failed", detail)
             return failure(item, detail, tag: nil)
+        }
+
+        // THE GATE RE-ESTABLISHMENT, AGAIN — and this is the placement that
+        // makes the fallback safe rather than merely earlier.
+        //
+        // `case .failure` upstream routes EVERY nonzero exit here, so the
+        // classes that arrive include git's own SAFETY refusals: a lock, a
+        // deregistered path. Re-running R0/R1/R2 immediately before the
+        // filesystem delete is what discriminates them from the two intended
+        // trigger classes — and it does it from the re-read porcelain RECORD,
+        // never from git's stderr. Running the same check only before
+        // `worktree remove` would leave the window between that check and
+        // this delete open, which is the window a lock acquired mid-operation
+        // lands in.
+        if case .refuse(let tag, let detail) = await reestablishStaleGates(
+            plan: plan, worktreePath: worktreePath
+        ) {
+            return failure(
+                item,
+                "\(detail) (git had refused with: \(gitRefusal))",
+                tag: tag
+            )
         }
 
         // Still clean → the guarded filesystem fallback, `removeGuardedItem`'s
@@ -531,6 +611,15 @@ struct WorktreeReclaimPerformer {
                 "the pre-prune traversal guard refused "
                     + "(\(error.localizedDescription))"
             )
+        }
+
+        // R0 again — the recompute above asked `-C <parent>` which entries
+        // are prunable, so the repository that answered must still be the one
+        // whose admin data this plan carries. A WARNING, not an error: the
+        // bytes are already freed and the deletion already succeeded (D11).
+        if case .refuse(_, let detail) =
+            await reestablishParentRepository(plan: plan) {
+            return warning(detail)
         }
 
         let prune = await runner.run(
@@ -679,6 +768,17 @@ struct WorktreeReclaimPerformer {
             return refusal(item, error, at: plan.parentAdminContainer)
         }
 
+        // (9b) R0 — the repository this item IS. A prune item's whole subject
+        // is one repository's registry, so a `-C` target that now resolves
+        // somewhere else means the recompute above answered about a
+        // repository nobody was shown. The path gates cannot see that: a
+        // planted `gitdir:` file redirects git while every leaf, canonical
+        // spelling, containment and device check still passes.
+        if case .refuse(let tag, let detail) =
+            await reestablishParentRepository(plan: plan) {
+            return failure(item, detail, tag: tag)
+        }
+
         let prune = await runner.run(
             Self.pruneArguments(parentRepoWorkingDir: plan.parentRepoWorkingDir),
             timeout: gitTimeout
@@ -724,6 +824,294 @@ struct WorktreeReclaimPerformer {
             entry: entry(for: item, accepted: accepted, disposal: .permanent),
             errors: []
         )
+    }
+
+    // MARK: - Delete-time gate re-establishment (PR #460 codex r1)
+
+    /// What one re-establishment answered. There is no "could not tell that
+    /// passes" arm anywhere below: every class that is not an affirmative
+    /// re-proof is a refusal with its cause NAMED.
+    enum GateReestablishment: Equatable {
+        case proceed
+        case refuse(tag: String, detail: String)
+    }
+
+    /// The re-read porcelain record, or the refusal that replaced it.
+    private enum WorktreeRecordReestablishment {
+        case record(GitWorktreeEntry)
+        case refuse(tag: String, detail: String)
+    }
+
+    /// THE WHOLE STALE-MODE RE-ESTABLISHMENT, in scan order.
+    ///
+    /// fn-6 established, for the FILESYSTEM path, that every gate is
+    /// re-established immediately before deletion from a HELD DESCRIPTOR and
+    /// that the object destroyed is proved to be the object inspected. A
+    /// `git` subprocess hands back no descriptor, so that shape cannot be
+    /// copied verbatim. The equivalent guarantee for this substrate is to ask
+    /// the SAME authority the scan asked, about the SAME repository, one
+    /// subprocess before the mutation:
+    ///
+    /// - **R0 (repository identity)** re-resolves which repository the `-C`
+    ///   target names and binds it to the git directory the plan carries —
+    ///   the substrate's answer to "prove it is the same object", because git
+    ///   resolves the repository from `<parent>/.git` and git is the only
+    ///   authority on that resolution.
+    /// - **R1 (G1 + G4 + registration)** re-reads the porcelain record and
+    ///   re-runs the assessor's OWN gate functions over it. G1 and G4 are not
+    ///   properties of file CONTENT — they are structured fields of the
+    ///   record — so re-reading the record IS re-establishing them.
+    /// - **R2 (G3)** re-runs the shared `GitWorktreeMergedCheck`.
+    ///
+    /// G2 is deliberately absent here and is NOT an omission: the primary arm
+    /// is `git worktree remove` WITHOUT `--force`, whose own dirty-refusal is
+    /// the gate (measured: exit 128 `contains modified or untracked files`),
+    /// and the fallback re-runs `GitWorktreeCleanCheck` itself before it
+    /// deletes anything. Every other scan-time gate is listed above.
+    ///
+    /// EVERY refusal below is CLEARABLE — none keys on a deterministic limit,
+    /// and each message names the action that clears it (this project has
+    /// shipped a fail-closed refusal on a fixed cap whose printed remedy was
+    /// "re-scan", which could never differ).
+    ///
+    /// The caller must already have run the D13 traversal guard over the
+    /// parent AND the worktree: R0/R1 traverse the parent (`-C`), R2
+    /// traverses both.
+    private func reestablishStaleGates(
+        plan: GitWorktreeReclaimPlan, worktreePath: URL
+    ) async -> GateReestablishment {
+        if case .refuse(let tag, let detail) =
+            await reestablishParentRepository(plan: plan) {
+            return .refuse(tag: tag, detail: detail)
+        }
+        let record: GitWorktreeEntry
+        switch await reestablishWorktreeRecord(
+            plan: plan, worktreePath: worktreePath
+        ) {
+        case .refuse(let tag, let detail):
+            return .refuse(tag: tag, detail: detail)
+        case .record(let entry):
+            record = entry
+        }
+        return await reestablishAncestry(
+            plan: plan, worktreePath: worktreePath, record: record
+        )
+    }
+
+    /// **R0** — the repository behind the `-C` target is still the one whose
+    /// admin data this plan carries.
+    ///
+    /// Every path gate in this file (`admitContainer`,
+    /// `validateRemovableItem`, `validateSubprocessTraversalDirectory`) is a
+    /// fact about a PATH: a real leaf, a canonical spelling, containment, a
+    /// device. A repository can be re-pointed while every one of those still
+    /// holds — planting a one-line `gitdir:` file at `<bare>/.git` redirects
+    /// `git -C <bare>` at another repository entirely without moving,
+    /// replacing or symlinking anything the guards look at (measured, git
+    /// 2.50.1). Re-running the scan's own `crossValidate` would NOT catch it
+    /// either: its bare branch compares inodes the added file does not
+    /// disturb. Only git can answer which repository it resolved.
+    private func reestablishParentRepository(
+        plan: GitWorktreeReclaimPlan
+    ) async -> GateReestablishment {
+        let carried = plan.parentAdminContainer.deletingLastPathComponent()
+        let resolved = await runner.run(
+            Self.commonGitDirArguments(
+                parentRepoWorkingDir: plan.parentRepoWorkingDir
+            ),
+            timeout: gitTimeout
+        )
+        let stdout: Data
+        switch resolved.outcome {
+        case .success(let data):
+            stdout = data
+        case .failure(let exitCode, let stderr):
+            return .refuse(
+                tag: "parent-repo-unresolvable",
+                detail: "refused: the parent repository "
+                    + "\(plan.parentRepoWorkingDir.path) could not be "
+                    + "re-resolved at clean time "
+                    + "(\(GitCommandFailureSummary.describe(exitCode: exitCode, stderr: stderr)))"
+                    + " — nothing was removed. Retry once git can read that "
+                    + "repository."
+            )
+        case .timeout:
+            return .refuse(
+                tag: "parent-repo-unresolvable",
+                detail: "refused: re-resolving the parent repository timed out "
+                    + "after \(Self.seconds(gitTimeout))s — nothing was "
+                    + "removed. Retry when the machine is less busy."
+            )
+        case .gitUnavailable:
+            return .refuse(
+                tag: "parent-repo-unresolvable",
+                detail: "refused: git became unavailable before the parent "
+                    + "repository could be re-resolved — nothing was removed. "
+                    + "Retry once git is installed and reachable."
+            )
+        }
+        guard let line = WorktreeStalenessAssessor.firstLine(of: stdout),
+              line.hasPrefix("/") else {
+            return .refuse(
+                tag: "parent-repo-unresolvable",
+                detail: "refused: git did not answer with an absolute git "
+                    + "directory for \(plan.parentRepoWorkingDir.path) — "
+                    + "nothing was removed. Re-scan to rebuild this item."
+            )
+        }
+        // Inode identity when both sides exist, so a different SPELLING of
+        // the same git directory passes and only a genuinely different
+        // object refuses.
+        guard provider.sameLocation(URL(fileURLWithPath: line), carried) else {
+            return .refuse(
+                tag: "parent-repo-rebound",
+                detail: "refused: the parent repository "
+                    + "\(plan.parentRepoWorkingDir.path) now resolves to git "
+                    + "directory \(line), not the admitted \(carried.path) — "
+                    + "the repository was redirected since the scan; nothing "
+                    + "was removed. Remove the redirect, then re-scan."
+            )
+        }
+        return .proceed
+    }
+
+    /// **R1** — G1 and G4, re-read from the live porcelain record, plus the
+    /// registration itself.
+    ///
+    /// THIS IS WHAT DISCRIMINATES THE FALLBACK'S TRIGGER CLASSES, and it does
+    /// so from a STRUCTURED signal: a re-read `worktree list --porcelain -z`
+    /// record, parsed by fn-5.1's parser, judged by fn-5.2's OWN gate
+    /// functions. NOTHING here reads git's stderr — classifying a refusal by
+    /// its message text is forbidden house doctrine, and it is also what a
+    /// locale or a git upgrade breaks first. The ignored-tree and populated-
+    /// submodule refusals leave the record REGISTERED, LINKED and UNLOCKED;
+    /// a lock refusal leaves it `locked`; an "is not a working tree" refusal
+    /// leaves no record at all.
+    private func reestablishWorktreeRecord(
+        plan: GitWorktreeReclaimPlan, worktreePath: URL
+    ) async -> WorktreeRecordReestablishment {
+        let listing = await runner.run(
+            GitWorktreeOracle.listArguments(
+                forRepositoryAt: plan.parentRepoWorkingDir
+            ),
+            timeout: gitTimeout
+        )
+        let stdout: Data
+        switch listing.outcome {
+        case .success(let data):
+            stdout = data
+        case .failure(let exitCode, let stderr):
+            return .refuse(
+                tag: "worktree-registry-unreadable",
+                detail: "refused: the worktree registry of "
+                    + "\(plan.parentRepoWorkingDir.path) could not be re-read "
+                    + "(\(GitCommandFailureSummary.describe(exitCode: exitCode, stderr: stderr)))"
+                    + " — nothing was removed. Retry once git can read that "
+                    + "repository."
+            )
+        case .timeout:
+            return .refuse(
+                tag: "worktree-registry-unreadable",
+                detail: "refused: re-reading the worktree registry timed out "
+                    + "after \(Self.seconds(gitTimeout))s — nothing was "
+                    + "removed. Retry when the machine is less busy."
+            )
+        case .gitUnavailable:
+            return .refuse(
+                tag: "worktree-registry-unreadable",
+                detail: "refused: git became unavailable before the worktree "
+                    + "registry could be re-read — nothing was removed. Retry "
+                    + "once git is installed and reachable."
+            )
+        }
+        guard let inventory = GitWorktreeInventory.parse(stdout) else {
+            return .refuse(
+                tag: "worktree-registry-unreadable",
+                detail: "refused: the worktree registry of "
+                    + "\(plan.parentRepoWorkingDir.path) could not be parsed "
+                    + "— nothing was removed. Re-scan to rebuild this item."
+            )
+        }
+        guard let record = inventory.entries.first(where: {
+            provider.sameLocation($0.path, worktreePath)
+        }) else {
+            return .refuse(
+                tag: "worktree-deregistered",
+                detail: "refused: \(worktreePath.path) is no longer a "
+                    + "registered worktree of "
+                    + "\(plan.parentRepoWorkingDir.path) — it was deregistered "
+                    + "since the scan, so whatever is at that path now is not "
+                    + "the object that was assessed; nothing was removed. "
+                    + "Re-scan to see what is actually there."
+            )
+        }
+        // G1, verbatim — the assessor's own function, never a second spelling.
+        let linked = WorktreeStalenessAssessor.evaluateNotMainOrBare(record)
+        guard linked.passed else {
+            return .refuse(
+                tag: "worktree-not-linked",
+                detail: "refused: \(worktreePath.path) is now the "
+                    + "repository's \(linked.reason) record — nothing was "
+                    + "removed. Re-scan to rebuild this item."
+            )
+        }
+        // G4, verbatim. A locked worktree is NEVER removed: git's own way to
+        // do it is `remove -f -f`, which this epic's Boundaries forbid, and a
+        // filesystem fallback that ignored the lock would achieve exactly
+        // that forbidden effect without the flag.
+        let notLocked = WorktreeStalenessAssessor.evaluateNotLocked(record)
+        guard notLocked.passed else {
+            return .refuse(
+                tag: "worktree-locked",
+                detail: "refused: this worktree was LOCKED after the scan "
+                    + "(\(notLocked.reason)) — nothing was removed. Run "
+                    + "`git worktree unlock \(worktreePath.path)` first, then "
+                    + "re-scan; a re-scan alone will keep refusing while the "
+                    + "lock is held."
+            )
+        }
+        return .record(record)
+    }
+
+    /// **R2** — G3, re-run through the SHARED `GitWorktreeMergedCheck`.
+    ///
+    /// The scan's ancestry answer is the whole authorization for destroying
+    /// this checkout, and it is the one gate a user can invalidate simply by
+    /// working: committing in the worktree after the scan leaves the tree
+    /// CLEAN, leaves the record REGISTERED and UNLOCKED, and leaves git's own
+    /// `worktree remove` perfectly willing (measured: exit 0, silent). On a
+    /// branch the commit survives on the ref; on a DETACHED HEAD it survives
+    /// only as a dangling object with no reflog left to name it.
+    private func reestablishAncestry(
+        plan: GitWorktreeReclaimPlan, worktreePath: URL, record: GitWorktreeEntry
+    ) async -> GateReestablishment {
+        switch await GitWorktreeMergedCheck.run(
+            worktreeAt: worktreePath,
+            parentRepoWorkingDir: plan.parentRepoWorkingDir,
+            using: runner, timeout: gitTimeout
+        ) {
+        case .merged:
+            return .proceed
+        case .notAncestor(let defaultRef):
+            var detail = "refused: this worktree's HEAD is no longer an "
+                + "ancestor of \(defaultRef) — work was committed after the "
+                + "scan (HEAD \(Self.shortOID(record.headSHA))); nothing was "
+                + "removed."
+            if record.isDetached {
+                detail += " HEAD is DETACHED, so removing this worktree would "
+                    + "leave that commit reachable from no ref at all."
+            }
+            detail += " Merge, rebase or push that commit — or move it onto a "
+                + "branch — then re-scan."
+            return .refuse(tag: "worktree-unmerged", detail: detail)
+        case .unanswered(let reason):
+            return .refuse(
+                tag: "worktree-ancestry-unanswered",
+                detail: "refused: the delete-time ancestry re-check could not "
+                    + "be answered (\(reason)) — nothing was removed. Retry "
+                    + "once git can answer, or repair the named ref."
+            )
+        }
     }
 
     // MARK: - Oracle recompute (shared by both modes)
@@ -913,5 +1301,13 @@ struct WorktreeReclaimPerformer {
 
     private static func seconds(_ interval: TimeInterval) -> String {
         String(Int(interval.rounded()))
+    }
+
+    /// The porcelain record's HEAD, abbreviated for a human-readable refusal.
+    /// `unknown` rather than an empty slot when git emitted no `HEAD` line —
+    /// the message must never read as if it named a commit it did not.
+    static func shortOID(_ sha: String?) -> String {
+        guard let sha, sha.count >= 8 else { return sha ?? "unknown" }
+        return String(sha.prefix(12))
     }
 }

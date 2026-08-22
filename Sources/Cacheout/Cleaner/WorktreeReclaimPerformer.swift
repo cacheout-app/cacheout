@@ -126,12 +126,28 @@
 /// ours is two steps: a failure between them leaves admin data behind, which
 /// is a WARNING on a successful row and an item the next scan offers.
 ///
-/// WHAT IS GAINED. The residual falls from 14.87 ms (growing with the tree)
-/// to 0.417 ms (constant), and everything in it is re-proved: which checkout
-/// this is, whether it is locked, whether HEAD moved. The mount-boundary
-/// refusal now covers the actual removal. And **Move to Trash now applies**:
-/// the GUI ships `moveToTrash = true` and the primary arm ignored it, so the
-/// app's most common worktree removal was unconditionally unrecoverable.
+/// WHAT IS GAINED. The residual falls from **14.87 ms** — SPAWN → first
+/// destruction on a 1-tracked-file checkout, and it GROWS with the tree
+/// (156.8 ms at 2001 files) — to **0.032 ms** in the permanent arm with the
+/// global pool saturated and **0.004 ms** in the Trash arm under 120 ms
+/// main-thread work items, and neither of those grows with the tree.
+/// Everything in that residual is re-proved: which checkout this is, whether
+/// it is locked, whether HEAD moved.
+///
+/// NOT 0.417 ms, which this paragraph published through r8 (PR #460 codex r9,
+/// D4). That is the `removefile` row of the table above, which this file's
+/// own caveat under it calls "a PROXY — a C harness calling `removefile`
+/// directly, which is not this code", and its endpoint is CALL → first
+/// destruction on an idle machine. Three intervals, three load conditions:
+/// the pair quoted here is the one the three propositions actually sit in,
+/// re-derived with its loads under `reproveFromTheFilesystem` below, and it
+/// covers those three propositions only — CLEANLINESS is disclosed as
+/// residual 1.
+///
+/// The mount-boundary refusal now covers the actual removal. And **Move to
+/// Trash now applies**: the GUI ships `moveToTrash = true` and the primary
+/// arm ignored it, so the app's most common worktree removal was
+/// unconditionally unrecoverable.
 ///
 /// WHAT DOES NOT CHANGE: every class where git REFUSED already ended in this
 /// same removal, so no outcome moves from "kept" to "deleted". The outcomes
@@ -424,9 +440,14 @@ struct WorktreeReclaimPerformer {
     //
     // The removal is now this process's own, under `DepthSafeRemoval` and a
     // descriptor-captured container binding, with the filesystem re-proof
-    // immediately before it — measured to the SAME endpoint at 0.417 ms
-    // median (range 0.361–0.639 ms, n=10, and that figure includes a `fork`
-    // the production path does not do). See `removeUnderLastInstantProof`.
+    // immediately before it. The row measured to the SAME endpoint — call →
+    // first destruction — is 0.417 ms median (range 0.361–0.639 ms, n=10),
+    // and it is the header table's `removefile` PROXY: a C harness, not this
+    // code, and it includes a `fork` the production path does not do (PR
+    // #460 codex r9, D4). THIS code's own last-proof → destruction interval
+    // is 0.032 ms with the global pool saturated (permanent) and 0.004 ms
+    // under 120 ms main-thread work items (Trash), which is the pair the
+    // header quotes. See `removeUnderLastInstantProof`.
     //
     // Nothing about `--force` survives either: git's `--force`-less dirty
     // refusal was a free TOCTOU gate, and what replaces it is

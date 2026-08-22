@@ -558,6 +558,105 @@ final class GitWorktreeEndToEndTests: XCTestCase {
     }
 
     // ====================================================================
+    // MARK: - R11: the GUI's DEFAULT disposal, through the production seam
+    // ====================================================================
+
+    /// **THE SHIPPED DEFAULT, WITH NOTHING INJECTED AT THE TRASH SEAM** (PR
+    /// #460 codex r10, D1/D2).
+    ///
+    /// `CacheoutViewModel.moveToTrash` DEFAULTS TO `true`
+    /// (`CacheoutViewModel.swift`), and until this cell existed
+    /// `grep -rn 'viewModel.moveToTrash = true' Tests/` returned NOTHING:
+    /// every clean cell in this file — the epic's closing acceptance — turned
+    /// the toggle OFF, and every Trash cell in the suite injected a
+    /// `trashHandler:` landing in a FIXTURE directory. The fixture's parent is
+    /// freely openable; the real `~/.Trash` IS NOT without Full Disk Access,
+    /// and that one property is exactly what the disposal's after-proof
+    /// depends on. So the GUI's default disposal had zero coverage, and the
+    /// D1 defect it hid — `entries=0`, 0 bytes, and an error stating that what
+    /// the Trash took "could not be put back — it is no longer at
+    /// `~/.Trash/<name>`" about a checkout sitting at that exact path — was
+    /// reproduced 3/3 through this composition before the fix.
+    ///
+    /// Nothing here is injected but the hermetic git runner: the runtime is
+    /// `SpaceScannerRuntime.production`, the cleaner is the one
+    /// `makeCleaner(snapshot:)` builds, and the mover is
+    /// `FileManager.trashItem` landing in the REAL `~/.Trash`. The cell
+    /// removes exactly the one item it put there — the landing name is
+    /// unique per run — and touches nothing else in the user's Trash.
+    @MainActor
+    func testTheTrashDefaultReportsTheCheckoutItReallyMovedToTheTrash()
+        async throws
+    {
+        let repository = try makeRepository(at: dev.appendingPathComponent("repo"))
+        // UNIQUE per run, so the landing name is DETERMINISTIC (`trashItem`
+        // only suffixes on collision) and the cleanup below can name it.
+        let leaf = "cacheout-e2e-\(UUID().uuidString.prefix(8))"
+        let worktree = try addWorktree(
+            of: repository, at: dev.appendingPathComponent(leaf), branch: "merged"
+        )
+        let landing = fm.homeDirectoryForCurrentUser
+            .appendingPathComponent(".Trash").appendingPathComponent(leaf)
+        XCTAssertFalse(fm.fileExists(atPath: landing.path),
+                       "the landing name must be free before the run")
+        // Registered BEFORE the clean: the fixture is removed from the Trash
+        // however this cell ends. Only this exact path — never the Trash.
+        addTeardownBlock { try? FileManager.default.removeItem(at: landing) }
+
+        let runner = hermeticRunner()
+        let viewModel = CacheoutViewModel(runtime: productionRuntime(runner: runner))
+        await viewModel.scan(
+            trigger: .userInitiated, scannerIDs: [GitWorktreeScanner.registeredID]
+        )
+        let stale = try item(
+            viewModel.items(forScanner: GitWorktreeScanner.registeredID),
+            mode: .removeStaleWorktree
+        )
+        XCTAssertEqual(stale.url?.path, identityPath(worktree))
+        let expectedExact = DirectorySizer()
+            .measure(at: worktree, mode: .deletionTarget).exactAllocatedBytes
+        XCTAssertGreaterThan(expectedExact, 0)
+
+        // ---- CLEAN, ON THE DEFAULT --------------------------------------
+        XCTAssertTrue(viewModel.moveToTrash,
+                      "the toggle's shipped default is what this cell drives")
+        // Assigned as well as asserted: the assertion pins the DEFAULT, and
+        // the assignment is what the rot gate below reads to know the default
+        // is still driven by something.
+        viewModel.moveToTrash = true
+        viewModel.toggleSelection(for: stale.key)
+        await viewModel.clean()
+
+        // ---- WHAT ACTUALLY HAPPENED ------------------------------------
+        XCTAssertFalse(fm.fileExists(atPath: worktree.path),
+                       "the checkout left its path")
+        XCTAssertTrue(
+            fm.fileExists(atPath: landing.path),
+            "…and it is in the Trash at \(landing.path), recoverable in one "
+                + "drag — which is what the report must not deny"
+        )
+        XCTAssertTrue(
+            fm.fileExists(atPath: landing.appendingPathComponent("payload.bin").path),
+            "the checkout's contents went with it"
+        )
+
+        // ---- AND WHAT THE USER IS TOLD ABOUT IT -------------------------
+        let report = try XCTUnwrap(viewModel.lastReport)
+        XCTAssertEqual(
+            report.errors.map(\.message), [],
+            "the move SUCCEEDED — the checkout is in the Trash — so any "
+                + "refusal here is a false one"
+        )
+        let entry = try XCTUnwrap(
+            report.entries.first { $0.key == stale.key },
+            "the disposal that happened must be reported: \(report.entries)"
+        )
+        XCTAssertEqual(entry.disposal, .trash, "D16: the entry follows the toggle")
+        XCTAssertEqual(entry.exactBytes, expectedExact,
+                       "the bytes the disposal actually reclaimed")
+    }
+
+    // ====================================================================
     // MARK: - R11: the CLI wire
     // ====================================================================
 
@@ -639,6 +738,81 @@ final class GitWorktreeEndToEndTests: XCTestCase {
     // ====================================================================
     // MARK: - R11: the grep gates
     // ====================================================================
+
+    /// **THE SUITE STILL DRIVES THE SHIPPED DEFAULT, AND STILL DRIVES IT
+    /// THROUGH THE PRODUCTION SEAM** (PR #460 codex r10, D2).
+    ///
+    /// This is the rot check for the gap that let D1 survive eight rounds,
+    /// and both halves of it are needed:
+    ///
+    /// 1. At r9 `grep -rn 'viewModel.moveToTrash = true' Tests/` returned
+    ///    NOTHING. Every clean cell in this file — the epic's closing
+    ///    acceptance, and the only place the real production composition is
+    ///    driven — set the toggle to `false`, so the disposal the GUI
+    ///    performs by default was never once executed end to end.
+    /// 2. Setting the toggle is not enough on its own. Every Trash cell in
+    ///    the suite injects a `trashHandler:` landing in a FIXTURE directory,
+    ///    whose parent is freely openable — and that ONE property is what
+    ///    D1's guard depended on and what the real `~/.Trash` does not have.
+    ///    So this file must contain no `trashHandler` at all: whatever it
+    ///    drives, it drives through `FileManager.trashItem`.
+    ///
+    /// The gate is deliberately about THIS FILE for (2) and about the whole
+    /// suite for (1): another target may legitimately inject a seam, but the
+    /// composition acceptance may not.
+    func testTheSuiteDrivesTheTrashDefaultThroughTheProductionSeam() throws {
+        let testsRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()   // CacheoutTests
+            .deletingLastPathComponent()   // Tests
+        var sources: [URL] = []
+        let walker = fm.enumerator(at: testsRoot, includingPropertiesForKeys: nil)
+        while let next = walker?.nextObject() as? URL {
+            if next.pathExtension == "swift" { sources.append(next) }
+        }
+        XCTAssertGreaterThan(sources.count, 40,
+                             "the gate must have read the suite, not an "
+                                 + "empty listing")
+
+        // SPLIT, so neither this line nor the failure message below is itself
+        // a match — a gate its own text satisfies is vacuous.
+        let assignment = "moveToTrash" + " = true"
+        var drivers: [String] = []
+        for source in sources {
+            let text = try String(contentsOf: source, encoding: .utf8)
+            for (offset, line) in text.split(
+                separator: "\n", omittingEmptySubsequences: false
+            ).enumerated() where line.contains(assignment)
+                && !line.trimmingCharacters(in: .whitespaces).hasPrefix("//")
+            {
+                drivers.append("\(source.lastPathComponent):\(offset + 1)")
+            }
+        }
+        XCTAssertFalse(
+            drivers.isEmpty,
+            "nothing in the suite assigns the Trash toggle its shipped value "
+                + "and cleans — the GUI's default disposal is uncovered "
+                + "again, which is exactly the state D1 shipped in"
+        )
+
+        // CODE lines only — this cell's own doc comment spells the needle,
+        // and a comment that explains the rule is not a violation of it. The
+        // needle is SPLIT so this line is not one either.
+        let needle = "trash" + "Handler"
+        let own = try String(contentsOf: URL(fileURLWithPath: #filePath),
+                             encoding: .utf8)
+        let injections = own.split(
+            separator: "\n", omittingEmptySubsequences: false
+        ).enumerated().filter { _, line in
+            line.contains(needle)
+                && !line.trimmingCharacters(in: .whitespaces).hasPrefix("//")
+        }.map { offset, _ in "\(offset + 1)" }
+        XCTAssertEqual(
+            injections, [],
+            "the composition acceptance must never inject the Trash seam: a "
+                + "fixture landing directory is freely openable and the real "
+                + "~/.Trash is not"
+        )
+    }
 
     /// The epic's Boundaries, read off the PRODUCTION SOURCE TREE rather than
     /// off whichever argv a fixture happened to execute.

@@ -898,7 +898,7 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         XCTAssertTrue(report.errors.isEmpty)
     }
 
-    func testAParentRebooundBetweenTheFallbackDeleteAndThePruneLeavesTheAdminEntry()
+    func testAParentReboundBetweenTheFallbackDeleteAndThePruneLeavesTheAdminEntry()
         async throws
     {
         // D3 (PR #460 codex r2): the R0 re-check inside

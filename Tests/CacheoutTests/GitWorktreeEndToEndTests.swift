@@ -479,7 +479,11 @@ final class GitWorktreeEndToEndTests: XCTestCase {
         // selection (F7): both modes, named separately.
         let disclosures = viewModel.gitWorktreeTrashDisclosures
         XCTAssertEqual(disclosures.count, 2, "\(disclosures)")
-        XCTAssertTrue(try XCTUnwrapElement(disclosures, 0).contains("unlinked permanently"))
+        XCTAssertTrue(
+            try XCTUnwrapElement(disclosures, 0)
+                .contains("removed permanently either way"),
+            "the stale wording names the half the toggle does NOT cover"
+        )
         XCTAssertTrue(try XCTUnwrapElement(disclosures, 1).contains("repository admin data permanently"))
 
         let expectedExact = DirectorySizer()

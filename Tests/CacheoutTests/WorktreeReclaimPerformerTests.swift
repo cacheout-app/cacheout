@@ -926,7 +926,7 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         }
     }
 
-    func testFallbackEntryIsTrashOnlyWhenTheTrashHandlerActuallySucceeded()
+    func testTheEntryIsTrashOnlyWhenTheTrashHandlerActuallySucceeded()
         async throws
     {
         // D16, both directions, plus the R11 rule that a trash FAILURE is an
@@ -936,11 +936,7 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         let plan = staleplan(
             worktree: worktree, membership: try membership(of: worktree, in: repository)
         )
-        let failing = InterceptingGitRunner(wrapping: realRunner()) { arguments, _ in
-            arguments.contains("remove")
-                ? .failure(exitCode: 128, stderr: "injected refusal")
-                : nil
-        }
+        let failing = InterceptingGitRunner(wrapping: realRunner())
 
         // (a) the trash handler FAILS: per-item error, tree untouched.
         let refused = await perform(
@@ -974,7 +970,7 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         ))
     }
 
-    func testTheFallbackRefusesATrashDisposalItCannotProveTookTheWorktree()
+    func testTheRemovalRefusesATrashDisposalItCannotProveTookTheWorktree()
         async throws
     {
         // fn-5 RECONCILIATION — the LAST unbound deletion path in the app.
@@ -1004,11 +1000,7 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         let plan = staleplan(
             worktree: worktree, membership: try membership(of: worktree, in: repository)
         )
-        let failing = InterceptingGitRunner(wrapping: realRunner()) { arguments, _ in
-            arguments.contains("remove")
-                ? .failure(exitCode: 128, stderr: "injected refusal")
-                : nil
-        }
+        let failing = InterceptingGitRunner(wrapping: realRunner())
 
         // A stranger's tree, and somewhere to park the real worktree — both
         // OUTSIDE the container, so nothing the guard admits changes shape.
@@ -1072,7 +1064,7 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         override func identity(ofDescriptor fd: Int32) -> Identity? { nil }
     }
 
-    func testTheFallbackRefusesWhenItCannotBindTheFolderItWouldDeleteIn()
+    func testTheRemovalRefusesWhenItCannotBindTheFolderItWouldDeleteIn()
         async throws
     {
         // fn-6 RECONCILIATION, and the cell that EVIDENCES the binding.
@@ -1097,11 +1089,7 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         )
         // git refuses `remove`, which is what routes this item to the
         // filesystem fallback in the first place.
-        let failing = InterceptingGitRunner(wrapping: realRunner()) { arguments, _ in
-            arguments.contains("remove")
-                ? .failure(exitCode: 128, stderr: "injected refusal")
-                : nil
-        }
+        let failing = InterceptingGitRunner(wrapping: realRunner())
 
         let outcome = await perform(
             item(plan), plan: plan,
@@ -1138,11 +1126,7 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         XCTAssertTrue(fm.fileExists(atPath: unrelatedAdmin.path))
 
         let plan = staleplan(worktree: worktree, membership: membership)
-        let runner = InterceptingGitRunner(wrapping: realRunner()) { arguments, _ in
-            arguments.contains("remove")
-                ? .failure(exitCode: 128, stderr: "injected refusal")
-                : nil
-        }
+        let runner = InterceptingGitRunner(wrapping: realRunner())
         let report = await makeCleaner(runner: runner)
             .clean(items: [item(plan)], moveToTrash: false)
 
@@ -1172,7 +1156,7 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         XCTAssertTrue(report.errors.isEmpty)
     }
 
-    func testAParentReboundBetweenTheFallbackDeleteAndThePruneLeavesTheAdminEntry()
+    func testAParentReboundBetweenTheDeleteAndThePruneLeavesTheAdminEntry()
         async throws
     {
         // D3 (PR #460 codex r2): the R0 re-check inside
@@ -1257,11 +1241,7 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         let plan = staleplan(
             worktree: worktree, membership: try membership(of: worktree, in: repository)
         )
-        let runner = InterceptingGitRunner(wrapping: realRunner()) { arguments, _ in
-            arguments.contains("remove")
-                ? .failure(exitCode: 128, stderr: "injected refusal")
-                : nil
-        }
+        let runner = InterceptingGitRunner(wrapping: realRunner())
         // The gated post-fallback cleanup is now a scoped REMOVAL, so its
         // failure class is a removal failure rather than a subprocess one —
         // and it must still be a WARNING, because the tree's bytes are
@@ -2742,7 +2722,7 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         }
     }
 
-    func testASamePathReAddInsideTheDisposalWindowIsRefusedInTheFallback()
+    func testASamePathReAddInsideTheDisposalWindowIsRefused()
         async throws
     {
         // D1, THE FALLBACK ARM. r3 made G2 the last GATE and argued that
@@ -2803,7 +2783,7 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         assertNoForbiddenArgv(runner)
     }
 
-    func testALockTakenInsideTheDisposalWindowStopsTheFallbackDelete()
+    func testALockTakenInsideTheDisposalWindowStopsTheRemoval()
         async throws
     {
         // D2, THE LOCK. G4 is re-established from the porcelain record, five
@@ -4111,11 +4091,7 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         let plan = staleplan(
             worktree: worktree, membership: try membership(of: worktree, in: repository)
         )
-        let runner = InterceptingGitRunner(wrapping: realRunner()) { arguments, _ in
-            arguments.contains("remove")
-                ? .failure(exitCode: 128, stderr: "injected refusal")
-                : nil
-        }
+        let runner = InterceptingGitRunner(wrapping: realRunner())
         _ = await perform(
             item(plan), plan: plan,
             with: makePerformer(runner: runner, gitTimeout: 42)

@@ -142,7 +142,7 @@
 ///
 /// The scan authorises a removal with four gates (`WorktreeStalenessAssessor`
 /// G1…G4). Until this round the delete path re-established exactly ONE of
-/// them (G2, and only inside the fallback), so a worktree that was locked,
+/// them (G2, and only on the fallback path), so a worktree that was locked,
 /// deregistered, or committed into between the scan and the click was
 /// destroyed anyway — with an empty error list. `reestablishStaleGates` now
 /// re-proves R0 (repository identity), R1 (G1 + G4 + the registration
@@ -283,7 +283,7 @@ struct WorktreeReclaimPerformer {
     /// plus the runner's termination protocol is the REAL bound.
     static let deleteTimeGitTimeout: TimeInterval = 300
 
-    /// The D11 warning tail every post-fallback prune OUTCOME that left admin
+    /// The D11 warning tail every post-removal prune OUTCOME that left admin
     /// data behind carries — the conservative skip (round 8) and every prune
     /// failure after a successful delete alike. EXCLUSIVE to stale mode:
     /// prune-only failures are ERRORS, never warnings.
@@ -363,11 +363,11 @@ struct WorktreeReclaimPerformer {
     let measure: (URL, DirectorySizer.Mode, Set<FileSystemIdentityProvider.Identity>) -> SizeReport
     /// Per-invocation git budget (see `deleteTimeGitTimeout`).
     let gitTimeout: TimeInterval
-    /// The run's REQUESTED disposal mode. Only the filesystem fallback honours
+    /// The run's REQUESTED disposal mode. Only the CHECKOUT removal honours
     /// it (D16).
     let moveToTrash: Bool
     /// The RAW mover, answering WHERE IT LANDED — `nil` when the disposal
-    /// would not say. It is never called directly: the fallback reaches it
+    /// would not say. It is never called directly: the removal reaches it
     /// only through `TrashDisposal.dispose(_:containedIn:provider:via:)`,
     /// which binds the leaf under the admitted container on both sides of it.
     ///
@@ -389,7 +389,7 @@ struct WorktreeReclaimPerformer {
     /// identity captured from a descriptor BEFORE the hop onto its background
     /// queue. Passing the binding rather than deriving it inside the seam is
     /// what lets the capture happen at the point the ordering requires (see
-    /// the fallback's use site), not wherever the closure happens to run.
+    /// the removal's use site), not wherever the closure happens to run.
     let removeTree: (URL, DepthSafeRemoval.AdmittedParent) async throws -> Void
     /// The GENERALIZED per-scanner pre-delete revalidator seam (D9), bound to
     /// THIS item's authorization entry by the cleaner. It can only REFUSE,
@@ -468,7 +468,7 @@ struct WorktreeReclaimPerformer {
         )
         // (4) Mount doctrine (`removeGuardedItem` parity): a boundary at the
         // target or nested anywhere beneath it refuses the deletion — the
-        // fallback would recurse straight through an inner mount.
+        // removal would recurse straight through an inner mount.
         if let boundary = report.mountBoundaries.first {
             let detail = "\(worktreePath.path): mount boundary at "
                 + "\(boundary.path) — refused, not deleted"
@@ -725,7 +725,7 @@ struct WorktreeReclaimPerformer {
 
         // The SAME pre-registered token — never measured or registered twice.
         let accepted = await registry.acceptSuccessful(token)
-        let warning = await gatedPostFallbackPrune(
+        let warning = await gatedPostRemovalPrune(
             plan: plan, container: container, adminEntry: adminEntry
         )
         logCleaned(accepted.exactBytes + accepted.estimatedUpToBytes)
@@ -741,7 +741,7 @@ struct WorktreeReclaimPerformer {
         )
     }
 
-    /// The GATED post-fallback prune (epic round 8 / D14). Returns the D11
+    /// The GATED post-removal prune (epic round 8 / D14). Returns the D11
     /// warning to attach to the SUCCESS entry, or nil when nothing was left
     /// behind.
     ///
@@ -754,7 +754,7 @@ struct WorktreeReclaimPerformer {
     /// EVERY failure class here is a WARNING, never an error: the bytes are
     /// already freed and the deletion already succeeded (D11) — and the next
     /// scan's repo-level prune tier is what reclaims the leftover metadata.
-    private func gatedPostFallbackPrune(
+    private func gatedPostRemovalPrune(
         plan: GitWorktreeReclaimPlan,
         container: AdmittedContainer,
         adminEntry: URL
@@ -1043,7 +1043,7 @@ struct WorktreeReclaimPerformer {
                 // an error and no entry, which under-reports what was freed
                 // rather than over-reporting it. (In practice the set is one
                 // directory — the field shape and the only shape the gated
-                // post-fallback prune can ever have.)
+                // post-removal prune can ever have.)
                 return (
                     CacheCleaner.refusalTag(error),
                     "refused: the orphaned admin directory \(directory.path) "
@@ -1170,11 +1170,15 @@ struct WorktreeReclaimPerformer {
     /// guard covers the mutation's paths — parent and worktree — and NOT the
     /// admin container, which `worktree list` enumerates.
     ///
-    /// G2 is deliberately absent here and is NOT an omission: the primary arm
-    /// is `git worktree remove` WITHOUT `--force`, whose own dirty-refusal is
-    /// the gate (measured: exit 128 `contains modified or untracked files`),
-    /// and the fallback re-runs `GitWorktreeCleanCheck` itself before it
-    /// deletes anything. Every other scan-time gate is listed above.
+    /// G2 is deliberately absent from THIS function and is NOT an omission:
+    /// it runs at the last possible instant instead (see below),
+    /// and `removeUnderLastInstantProof` runs `GitWorktreeCleanCheck` itself
+    /// as its last git call before it deletes anything. Every other scan-time
+    /// gate is listed above.
+    ///
+    /// The "`git worktree remove` WITHOUT `--force`" half of that sentence is
+    /// history as of r5/D1: no git removal runs, so the clean check IS the
+    /// gate rather than a second opinion beside git's.
     ///
     /// EVERY refusal below is CLEARABLE — none keys on a deterministic limit,
     /// and each message names the action that clears it (this project has
@@ -1189,7 +1193,7 @@ struct WorktreeReclaimPerformer {
     ) async -> StaleGateReestablishment {
         // R0 traverses the `-C` target ONLY, and the caller guarded exactly
         // that path immediately before entering here — the primary arm at
-        // step (7), the fallback at its own entry. NO extra guard is added:
+        // step (7). NO extra guard is added:
         // it would be an unevidenced re-run of a check microseconds old, and
         // an unevidenced guard is a defect this project has shipped before.
         if case .refuse(let tag, let detail) =
@@ -1521,7 +1525,7 @@ struct WorktreeReclaimPerformer {
     /// **R1** — G1 and G4, re-read from the live porcelain record, plus the
     /// registration itself.
     ///
-    /// THIS IS WHAT DISCRIMINATES THE FALLBACK'S TRIGGER CLASSES, and it does
+    /// THIS IS WHAT DISCRIMINATES THE CLASSES GIT WOULD HAVE REFUSED, and it does
     /// so from a STRUCTURED signal: a re-read `worktree list --porcelain -z`
     /// record, parsed by fn-5.1's parser, judged by fn-5.2's OWN gate
     /// functions. NOTHING here reads git's stderr — classifying a refusal by
@@ -1600,7 +1604,7 @@ struct WorktreeReclaimPerformer {
         }
         // G4, verbatim. A locked worktree is NEVER removed: git's own way to
         // do it is `remove -f -f`, which this epic's Boundaries forbid, and a
-        // filesystem fallback that ignored the lock would achieve exactly
+        // filesystem removal that ignored the lock would achieve exactly
         // that forbidden effect without the flag.
         let notLocked = WorktreeStalenessAssessor.evaluateNotLocked(record)
         guard notLocked.passed else {

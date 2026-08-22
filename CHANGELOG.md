@@ -49,8 +49,13 @@ below are both part of that coordination, and the latter BLOCKS this release.
   2.50.1: **14.9 ms** (median of ten) between launching git and the first
   file being gone, on a worktree holding a single tracked file, and the gap
   GROWS with the tree because git's status walk sits inside it. Cacheout
-  removes the checkout itself now, with the last check immediately in front
-  of it: **0.4 ms** to the same point, and it does not grow. Nothing became
+  removes the checkout itself now, with the identity, lock and HEAD re-proof
+  immediately in front of it — **0.03 ms** (permanent) and **0.004 ms**
+  (Trash) before the destruction, both with the queue that runs it held busy —
+  and it does not grow. The cleanliness answer is not in that re-proof and
+  cannot be — it runs `git` — and its own distance from the destruction is
+  given, with its load condition, in the "permanent delete now does the same
+  across its own hop" entry below. Nothing became
   removable that was not removable before — every case where git refused
   already ended in this same delete. What is new is the refusals that gap
   used to swallow.

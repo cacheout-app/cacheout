@@ -238,9 +238,20 @@ Enumerate-and-explain, the counterpart to the curated allowlist:
     `status --porcelain --ignored`, the ancestry ladder), and Cacheout removes
     the checkout itself under `DepthSafeRemoval` — or moves it to the Trash
     under `TrashDisposal`, which the git arm could never do — with the
-    filesystem re-proved at the last instant. MEASURED, last gate answered →
-    first destruction: 14.87 ms (1 file) / 156.8 ms (2001 files) for
-    `git worktree remove`, against 0.373 ms constant for the shipped removal.
+    filesystem re-proved at the last instant. MEASURED (git 2.50.1, macOS 15,
+    APFS), and each figure with its own endpoint and load condition — r5's
+    whole correction was that these differ: `git worktree remove` takes
+    14.87 ms (1 tracked file) / 156.8 ms (2001) between its SPAWN and its
+    first destruction, NOT between the last gate and it. The corresponding
+    interval for the shipped removal is the last identity/lock/HEAD proof →
+    the destruction, which since r6/r7 runs on the far side of each arm's
+    hop: 0.032 ms (permanent, global pool saturated) / 0.004 ms (Trash,
+    120 ms main-thread work items). The cleanliness answer cannot cross that
+    hop, and its own window under those same loads is 241.2 ms / 185.9 ms
+    (0.373 ms / 0.674 ms on an idle main thread) — that is the figure this
+    bullet used to print as "0.373 ms constant". The tables and their
+    caveats are in `WorktreeReclaimPerformer`'s header, including that its
+    0.417 ms `removefile` row is a PROXY harness rather than this code.
     The `Directory not empty` field class the bullet was written around is now
     REFUSED rather than routed: the last gate runs `status --porcelain
     --ignored`, so an ignored tree that appeared since the scan aborts the

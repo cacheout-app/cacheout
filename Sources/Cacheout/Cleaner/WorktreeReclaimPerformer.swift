@@ -243,10 +243,21 @@
 /// (R1b's own resolver), whether it is locked (`<admin>/locked`), and whether
 /// HEAD moved (`<admin>/HEAD`, when that file corroborates the porcelain
 /// record, or `<admin>/reftable/tables.list` when it cannot). It spawns
-/// nothing, so it opens no window of its own: MEASURED to the UNLINK through
-/// the production composition, the residual is 0.373 ms (median, n=10) in the
-/// permanent arm and 0.674 ms in the Trash arm, against the 14.87 ms
-/// `git worktree remove` left open. What genuinely needs a subprocess —
+/// nothing, and since r6/r7 it runs on the FAR side of each arm's hop, so the
+/// residual it leaves is the pair measured under each arm's OWN load above:
+/// **0.032 ms** in the permanent arm with the global pool saturated, and
+/// **0.004 ms** in the Trash arm under 120 ms main-thread work items.
+///
+/// NOT 0.373 ms / 0.674 ms, which this paragraph published through r7 (PR
+/// #460 codex r8, D6). Those are a different interval on a different load:
+/// the LAST GIT COMPLETION → UNLINK on an IDLE MAIN THREAD — i.e. the
+/// CLEANLINESS window, the one proposition that cannot cross the hop — and
+/// under the loads above that window is 241.156 ms and 185.864 ms. The
+/// 14.87 ms `git worktree remove` figure is a third endpoint again: SPAWN →
+/// first destruction. Three intervals, three load conditions; none of them
+/// substitutes for another.
+///
+/// What genuinely needs a subprocess —
 /// cleanliness, and
 /// ancestry when HEAD did not move but a branch tip did — is enumerated as a
 /// RESIDUAL rather than described as closed: see `reproveFromTheFilesystem`
@@ -1619,7 +1630,7 @@ struct WorktreeReclaimPerformer {
     //    `--ignored` DOES NOT NARROW THAT WINDOW, and r7 said it did (PR
     //    #460 codex r8, D4). The ignored comparison is `appeared =
     //    ignoredNow.subtracting(ignoredWitness)`
-    //    (`WorktreeReclaimPerformer.swift:786-798`), computed from the SAME
+    //    (`WorktreeReclaimPerformer.swift:797-809`), computed from the SAME
     //    `status --ignored` reading this proposition is about, and taken
     //    BEFORE `reproveFromTheFilesystem`,
     //    i.e. entirely on the NEAR side of both hops. Nothing re-reads the

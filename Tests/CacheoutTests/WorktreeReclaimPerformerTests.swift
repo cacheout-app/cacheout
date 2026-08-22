@@ -337,7 +337,10 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         measure: ((URL, DirectorySizer.Mode, Set<FileSystemIdentityProvider.Identity>) -> SizeReport)? = nil,
         moveToTrash: Bool = false,
         trash: TrashDisposal.Mover? = nil,
-        removeTree: ((URL, DepthSafeRemoval.AdmittedParent) async throws -> Void)? = nil,
+        removeTree: (
+            (URL, DepthSafeRemoval.AdmittedParent, () throws -> Void)
+                async throws -> Void
+        )? = nil,
         revalidate: ((ReclaimableItem) -> PreDeleteSeamRefusal?)? = nil,
         gitTimeout: TimeInterval = WorktreeReclaimPerformer.deleteTimeGitTimeout,
         provider overrideProvider: FileSystemIdentityProvider? = nil
@@ -374,7 +377,16 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
                 try fileManager.moveItem(at: url, to: landed)
                 return landed
             },
-            removeTree: removeTree ?? { url, _ in try fileManager.removeItem(at: url) },
+            // THE DEFAULT DOUBLE HONOURS THE PERMANENT SEAM'S CONTRACT TOO
+            // (PR #460 codex r7, D1), for the same reason the trash double
+            // does: the production seam runs `prove()` on the far side of its
+            // `DispatchQueue.global` hop, immediately before
+            // `DepthSafeRemoval.remove`, and a double that skipped it would
+            // destroy trees the real seam refuses to destroy.
+            removeTree: removeTree ?? { url, _, prove in
+                try prove()
+                try fileManager.removeItem(at: url)
+            },
             revalidate: revalidate ?? { _ in nil },
             logRefusal: { _, _ in },
             logCleaned: { _ in }
@@ -1561,7 +1573,8 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
             item(plan), plan: plan,
             with: makePerformer(
                 runner: runner,
-                removeTree: { url, _ in
+                removeTree: { url, _, prove in
+                    try prove()
                     if url.path.hasPrefix(adminContainerPath) {
                         throw CocoaError(.fileWriteNoPermission)
                     }
@@ -3845,7 +3858,9 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         let runner = InterceptingGitRunner(wrapping: realRunner())
         let outcome = await perform(
             item(plan, id: "prune"), plan: plan,
-            with: makePerformer(runner: runner, removeTree: { _, _ in })
+            with: makePerformer(runner: runner, removeTree: { _, _, prove in
+                try prove()
+            })
         )
 
         XCTAssertTrue(outcome.errors.isEmpty)
@@ -3885,7 +3900,7 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
                 with: makePerformer(
                     runner: runner,
                     removeTree: scripted == nil
-                        ? { _, _ in throw CocoaError(.fileWriteNoPermission) }
+                        ? { _, _, _ in throw CocoaError(.fileWriteNoPermission) }
                         : nil
                 )
             )
@@ -4278,7 +4293,8 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
             item(plan, id: "prune"), plan: plan,
             with: makePerformer(
                 runner: InterceptingGitRunner(wrapping: realRunner()),
-                removeTree: { url, _ in
+                removeTree: { url, _, prove in
+                    try prove()
                     removed.record(url)
                     if removed.urls.count == 1 {
                         try? fileManager.createDirectory(

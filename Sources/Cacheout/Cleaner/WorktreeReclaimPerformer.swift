@@ -433,9 +433,21 @@ struct WorktreeReclaimPerformer {
     /// last of them and the move was the MAIN THREAD'S QUEUE DEPTH rather than
     /// the 0.674 ms this file used to publish. MEASURED through the production
     /// composition under 120 ms main-thread work items, n=5: median
-    /// **175.736 ms** before, **0.004 ms** after. The permanent arm never had this shape — it
-    /// hops to a global concurrent queue, and `DepthSafeRemoval` re-proves the
-    /// container from a descriptor on the far side of that hop.
+    /// **175.736 ms** before, **0.004 ms** after.
+    ///
+    /// THE PERMANENT ARM HAS THE SAME SHAPE, AND IT IS THE SAME TYPE NOW
+    /// (PR #460 codex r7, D1). r6 asserted here that "the permanent arm never
+    /// had this shape — it hops to a global concurrent queue, and
+    /// `DepthSafeRemoval` re-proves the container from a descriptor on the far
+    /// side of that hop". The second clause is true and the first does not
+    /// follow from it: WHAT `DepthSafeRemoval` re-proves is the ADMITTED
+    /// PARENT and, when a leaf verdict exists, the leaf — never WHICH CHECKOUT
+    /// this is, whether it is LOCKED, or whether HEAD MOVED, none of which are
+    /// in that file's vocabulary. The permanent arm hops too, and until r7
+    /// every one of those three propositions was last proved on the near side
+    /// of that hop. `removeTree` therefore takes the same proof argument the
+    /// mover does, and the two arms now re-prove the identical set at the
+    /// identical distance from their own destruction.
     let trash: TrashDisposal.Mover
     /// The permanent-delete seam. It takes the container binding as a SECOND
     /// argument (fn-6 reconciliation) because the removal it fronts —
@@ -444,7 +456,18 @@ struct WorktreeReclaimPerformer {
     /// queue. Passing the binding rather than deriving it inside the seam is
     /// what lets the capture happen at the point the ordering requires (see
     /// the removal's use site), not wherever the closure happens to run.
-    let removeTree: (URL, DepthSafeRemoval.AdmittedParent) async throws -> Void
+    ///
+    /// AND A PROOF AS A THIRD (PR #460 codex r7, D1) — the same contract
+    /// `TrashDisposal.Mover` states: run it on the far side of whatever hop
+    /// you perform, immediately before the destruction, and destroy nothing if
+    /// it throws. The production seam hops to `DispatchQueue.global`; see
+    /// `testThePermanentProofAndTheRemovalAreNotSeparatedByTheHop` for what
+    /// that hop measures under main-thread load and under a saturated global
+    /// queue, and `testThePermanentArmRefusesAWorktreeSwappedInsideTheHop` for
+    /// the cell that goes red when the proof is deleted.
+    let removeTree: (
+        URL, DepthSafeRemoval.AdmittedParent, () throws -> Void
+    ) async throws -> Void
     /// The GENERALIZED per-scanner pre-delete revalidator seam (D9), bound to
     /// THIS item's authorization entry by the cleaner. It can only REFUSE,
     /// never widen admission.
@@ -794,7 +817,29 @@ struct WorktreeReclaimPerformer {
                     }
                 )
             } else {
-                try await removeTree(worktreePath, admittedParent)
+                // THE SAME RE-PROOF, ON THE FAR SIDE OF THIS ARM'S OWN HOP
+                // (PR #460 codex r7, D1). `removeItemConcurrently` hops to
+                // `DispatchQueue.global` and `DepthSafeRemoval` then re-proves
+                // the ADMITTED PARENT from a descriptor — which is the
+                // container, not the checkout. Which checkout this is, whether
+                // it is locked and whether HEAD moved are not propositions
+                // that file can express, so until r7 all three were last
+                // proved on the near side of the hop while the Trash arm's
+                // were proved on the far side. Same closure, same order, same
+                // refusal type as the mover's above: the two arms differ only
+                // in what performs the destruction.
+                try await removeTree(worktreePath, admittedParent) {
+                    if case .refuse(let tag, let detail) =
+                        reproveFromTheFilesystem(
+                            worktreePath: worktreePath,
+                            adminEntry: adminEntry,
+                            carriedIdentity: plan.worktreeAdminEntryIdentity,
+                            head: head
+                        )
+                    {
+                        throw LastInstantRefusal(tag: tag, detail: detail)
+                    }
+                }
             }
         } catch let refusal as LastInstantRefusal {
             // The re-proof that crosses the mover's hop reports through the
@@ -1127,7 +1172,22 @@ struct WorktreeReclaimPerformer {
                     directory: directory.deletingLastPathComponent(),
                     displayPath: directory.path, provider: provider
                 )
-                try await removeTree(directory, admittedParent)
+                // AND THE REVIVAL CHECK CROSSES THE HOP TOO (PR #460 codex r7,
+                // D1). The near-side call a few lines up is the cheap refusal;
+                // this one is the load-bearing one, because between them sits
+                // `removeItemConcurrently`'s hop onto `DispatchQueue.global`
+                // and a checkout repaired inside it is live state. It is the
+                // SAME function, so the two readings cannot disagree about
+                // what "revived" means.
+                try await removeTree(directory, admittedParent) {
+                    if let revived = revivedCheckoutRefusal(for: directory) {
+                        throw LastInstantRefusal(
+                            tag: "prune-checkout-revived", detail: revived
+                        )
+                    }
+                }
+            } catch let refusal as LastInstantRefusal {
+                return (refusal.tag, refusal.detail)
             } catch {
                 // A mid-loop failure leaves the directories already removed
                 // genuinely gone. Their bytes are NOT reported: this returns

@@ -1195,7 +1195,16 @@ actor CacheCleaner {
                 // folder these children were enumerated from being swapped.
                 try await Self.removeItemConcurrently(
                     at: child, expecting: nil, provider: provider,
-                    containedIn: admittedParent
+                    containedIn: admittedParent,
+                    // NOTHING FURTHER TO PROVE PAST THE HOP, STATED RATHER
+                    // THAN DEFAULTED (PR #460 codex r7, D1). Every
+                    // proposition this arm carries is the container binding,
+                    // and `DepthSafeRemoval` re-proves exactly that from a
+                    // descriptor on the far side. The worktree arm passes a
+                    // real closure because it carries three propositions —
+                    // which checkout, the lock, HEAD — that live outside that
+                    // file's vocabulary.
+                    provingImmediatelyBefore: {}
                 )
             }
         } catch {
@@ -1536,7 +1545,12 @@ actor CacheCleaner {
                 // anything.
                 try await Self.removeItemConcurrently(
                     at: target, expecting: probedObject, provider: provider,
-                    containedIn: admittedParent
+                    containedIn: admittedParent,
+                    // NOTHING FURTHER TO PROVE PAST THE HOP (PR #460 codex r7,
+                    // D1): this arm's two propositions are the container
+                    // binding and `probedObject`, and `DepthSafeRemoval`
+                    // re-proves BOTH from descriptors on the far side.
+                    provingImmediatelyBefore: {}
                 )
             }
         } catch {
@@ -1654,15 +1668,24 @@ actor CacheCleaner {
                     return try handler(url)
                 }
             },
-            removeTree: { url, admittedParent in
+            removeTree: { url, admittedParent, prove in
                 // `expecting: nil` is STATED, not defaulted (fn-6's item path
                 // states its own the same way): `git_worktrees` registers no
                 // `preDeleteRevalidator`, so this deletion has no leaf verdict
                 // to prove — the binding it does carry is the CONTAINER one
                 // the performer captured before its rechecks.
+                //
+                // AND THE PROOF CROSSES THE HOP (PR #460 codex r7, D1). This
+                // arm hops to `DispatchQueue.global`, and what
+                // `DepthSafeRemoval` re-proves past that hop is the ADMITTED
+                // PARENT — never which checkout stands at `url`, whether it is
+                // locked, or whether its HEAD moved. Those three are the
+                // performer's propositions and only the performer can state
+                // them, so they ride across in `prove`.
                 try await Self.removeItemConcurrently(
                     at: url, expecting: nil, provider: provider,
-                    containedIn: admittedParent
+                    containedIn: admittedParent,
+                    provingImmediatelyBefore: prove
                 )
             },
             revalidate: { [self] subject in
@@ -1798,22 +1821,39 @@ actor CacheCleaner {
     /// descriptor on THIS side, and it has no default here either — the hop
     /// is the whole reason the parameter exists, so a caller that reaches it
     /// without stating a binding must not compile.
+    ///
+    /// AND `provingImmediatelyBefore` IS WHERE A CALLER'S OWN PROPOSITIONS GO
+    /// (PR #460 codex r7, D1). Everything above is about what
+    /// `DepthSafeRemoval` itself re-proves past the hop — the container, and
+    /// the leaf when a verdict exists. A caller whose authorization rests on
+    /// anything ELSE (the worktree performer's: WHICH CHECKOUT this is,
+    /// whether it is LOCKED, whether HEAD MOVED) cannot express it in that
+    /// vocabulary, so before r7 its last proof of those sat on the NEAR side
+    /// of this hop while the Trash arm's had already been moved across. This
+    /// closure runs on the far side, immediately before the removal, and
+    /// nothing is destroyed if it throws. It has no default: a hop with a
+    /// silent no-op on the other side of it is the shape this parameter
+    /// exists to make visible.
     nonisolated private static func removeItemConcurrently(
         at url: URL,
         expecting inspected: UserDataProbeResult.InspectedRoot?,
         provider: FileSystemIdentityProvider,
-        containedIn admittedParent: DepthSafeRemoval.AdmittedParent
+        containedIn admittedParent: DepthSafeRemoval.AdmittedParent,
+        provingImmediatelyBefore prove: () throws -> Void
     ) async throws {
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            DispatchQueue.global(qos: .userInitiated).async {
-                do {
-                    try DepthSafeRemoval.remove(
-                        at: url, expecting: inspected, provider: provider,
-                        containedIn: admittedParent
-                    )
-                    continuation.resume()
-                } catch {
-                    continuation.resume(throwing: error)
+        try await withoutActuallyEscaping(prove) { prove in
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                DispatchQueue.global(qos: .userInitiated).async {
+                    do {
+                        try prove()
+                        try DepthSafeRemoval.remove(
+                            at: url, expecting: inspected, provider: provider,
+                            containedIn: admittedParent
+                        )
+                        continuation.resume()
+                    } catch {
+                        continuation.resume(throwing: error)
+                    }
                 }
             }
         }

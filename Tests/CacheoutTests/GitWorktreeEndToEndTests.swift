@@ -274,9 +274,13 @@ final class GitWorktreeEndToEndTests: XCTestCase {
         viewModel.toggleSelection(for: stale.key)
         await viewModel.clean()
 
+        // The clean's OWN delete-time gates rode the same instance. There is
+        // no mutating git argv to look for since r5 (D1), so the marker is
+        // `rev-parse --git-common-dir`: only the delete path runs it, never
+        // the scan.
         XCTAssertTrue(
-            runner.invocations.contains { $0.argv.contains("remove") },
-            "the clean's mutation rode the SAME instance: \(runner.argvs)"
+            runner.invocations.contains { $0.argv.contains("--git-common-dir") },
+            "the clean's gates rode the SAME instance: \(runner.argvs)"
         )
         XCTAssertFalse(fm.fileExists(atPath: fixture.merged.path))
     }

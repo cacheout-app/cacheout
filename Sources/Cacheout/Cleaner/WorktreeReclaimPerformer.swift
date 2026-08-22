@@ -3,14 +3,65 @@
 /// The execution behind the composite `ReclaimAction.gitWorktreeReclaim`, in
 /// two modes:
 ///
-/// - **`removeStaleWorktree`** — `git -C <parent> worktree remove <path>`
-///   first (never `--force`), with a guarded filesystem fallback + a GATED
-///   removal of that worktree's OWN admin entry when git refuses with a
-///   nonzero exit, the tree re-checks CLEAN, and the delete-time gate
-///   re-establishment below still passes.
+/// - **`removeStaleWorktree`** — the scan's four gates re-established, the
+///   clean re-check LAST, the filesystem re-proof after it, then THIS
+///   process removes the checkout under `DepthSafeRemoval` (or moves it to
+///   the Trash), then a GATED removal of that worktree's OWN admin entry.
+///   `git worktree remove` does not appear anywhere: see "WHO REMOVES THE
+///   TREE" below.
 /// - **`pruneOrphanedAdmin`** — a SCOPED removal of exactly the
 ///   PROVABLY-COMPLETE admin-directory set the scan disclosed (D14), never a
 ///   repository-wide `git worktree prune` (see `removeAdminDirectories`).
+///
+/// ## WHO REMOVES THE TREE (PR #460 codex r5, D1)
+///
+/// Through r4 the DEFAULT path was `git worktree remove`, and the header
+/// claimed a 0.16 ms window between the last gate and "the destructive
+/// call". The spawn is not the destructive act. git starts up, reads the
+/// registry, runs its own `status --porcelain` child over the whole tree,
+/// and only then unlinks — and it never re-reads admin-directory identity,
+/// HEAD, or ancestry.
+///
+/// MEASURED, uninstrumented (fork + exec, spinning on `lstat` of the
+/// worktree's only tracked file until ENOENT; git 2.50.1, macOS 15,
+/// APFS):
+///
+/// | arm | 1 tracked file | 2001 tracked files |
+/// |---|---|---|
+/// | `git worktree remove`, spawn → first destruction | median **14.87 ms**, 14.28–19.84, n=10 | median **156.8 ms**, 117.1–161.7, n=5 |
+/// | direct `removefile`, call → first destruction | median **0.417 ms**, 0.361–0.639, n=10 | median 62.5 ms, 39.5–65.9, n=5 |
+///
+/// The 2001-file column is the same *file*, not the same *position in the
+/// walk*, so its two numbers differ mostly by git's own pre-unlink work:
+/// ~94 ms of registry read plus a `status` walk that GROWS with the tree.
+/// The 1-file column is the honest handoff cost, and it is 35× ours.
+///
+/// **That window is IRREDUCIBLE while git performs the removal** — the
+/// unlink happens inside git's process, so no re-proof of ours can sit
+/// closer. The choice is therefore not "narrow it": it is disclose it, or
+/// change who removes the tree. This file changes who.
+///
+/// WHAT IS LOST. git's `--force`-less dirty refusal is a real gate, run
+/// inside git with no window at all. What replaces it is
+/// `GitWorktreeCleanCheck` — the SAME `status --porcelain` git runs
+/// internally — as the LAST git call, extended with `--ignored` (D2), so it
+/// refuses strictly MORE than git's own does. git's `validate_no_submodules`
+/// refusal is also lost; it was already lost, because that class routed to
+/// the fallback and was deleted there anyway (see the trigger classes
+/// below). And git's removal was ATOMIC with the registry cleanup, where
+/// ours is two steps: a failure between them leaves admin data behind, which
+/// is a WARNING on a successful row and an item the next scan offers.
+///
+/// WHAT IS GAINED. The residual falls from 14.87 ms (growing with the tree)
+/// to 0.417 ms (constant), and everything in it is re-proved: which checkout
+/// this is, whether it is locked, whether HEAD moved. The mount-boundary
+/// refusal now covers the actual removal. And **Move to Trash now applies**:
+/// the GUI ships `moveToTrash = true` and the primary arm ignored it, so the
+/// app's most common worktree removal was unconditionally unrecoverable.
+///
+/// WHAT DOES NOT CHANGE: every class where git REFUSED already ended in this
+/// same removal, so no outcome moves from "kept" to "deleted". The outcomes
+/// that move are refusals we can now make and git's success swallowed.
 ///
 /// It is a `struct` of injected seams rather than more `CacheCleaner` body so
 /// every gate below is reachable from a test without a real repository: the
@@ -36,10 +87,11 @@
 /// returns 9 on this file because THIS COMMENT contains the search string —
 /// the eighth instance of a claim this file could not reproduce):
 /// `grep -cE '^ +try guardTraversal\(' Sources/Cacheout/Cleaner/WorktreeReclaimPerformer.swift`
-/// returns 8 call sites (one of which is inside the shared `guardGroup`
-/// helper), against far more git invocations than that, and R0 and R2 are
-/// both invoked with no immediately-preceding guard, deliberately — see the
-/// table):
+/// returns **7** call sites at r5 (one of which is inside the shared
+/// `guardGroup` helper) — it was 8 through r4 and the fallback-entry guard
+/// went with the fallback (D1) — against far more git invocations than that,
+/// and R0 and R2 are both invoked with no immediately-preceding guard,
+/// deliberately — see the table):
 ///
 /// **Every path a git invocation traverses is covered by a
 /// `validateSubprocessTraversalDirectory` that ran after admission and
@@ -58,10 +110,9 @@
 /// | guard site                       | paths                  | the invocations it covers |
 /// |----------------------------------|------------------------|---------------------------|
 /// | admission (both modes)           | parent (or-equal), admin container; stale mode adds the worktree | everything, as the floor |
-/// | pre-`worktree remove` (stale)    | parent, worktree       | R0, R2's ladder + ancestry, and `worktree remove` itself |
-/// | inside R1 (PR #460 codex r2)     | parent, admin container | the `worktree list` re-read — it ENUMERATES `$GIT_COMMON_DIR/worktrees` to answer `prunable`, and the pre-remove guard covers only the parent and the worktree |
-/// | fallback entry                   | worktree, admin container, parent | the fallback's own R0/R1/R1b/R2 (R1b reads `<wt>/.git`, so the admin container is traversed there too) |
-/// | pre-`status` in the fallback (PR #460 codex r3, EVIDENCED r4) | worktree, admin container | the clean re-check, which is now the LAST gate and is therefore separated from the fallback-entry guard by five subprocesses — git follows `<wt>/.git` INTO the admin/common git dir, so a swap in EITHER would redirect it (epic round 6). r3 asserted this row without a cell that could tell the guard from its absence, which is the very thing this file's doctrine forbids; `testTheAdminContainerSwappedInsideTheGateWindowIsRefusedBeforeStatus` now stages a swap in exactly that window and goes RED when the guard is deleted |
+/// | pre-gates (stale, step 7)        | parent, worktree, admin container | R0, R1b's back-link read, and R2's ladder + ancestry (R1b reads `<wt>/.git`, so the admin container is traversed there too). r5 widened this row from "parent, worktree": it used to be the pre-`worktree remove` guard, and the fallback re-guarded the third path on entry |
+/// | inside R1 (PR #460 codex r2)     | parent, admin container | the `worktree list` re-read — it ENUMERATES `$GIT_COMMON_DIR/worktrees` to answer `prunable`, and the step-7 guard cannot bind what a later subprocess resolves |
+/// | pre-`status` (PR #460 codex r3, EVIDENCED r4) | worktree, admin container | the clean re-check, which is the LAST git call and is therefore separated from the step-7 guard by five subprocesses — git follows `<wt>/.git` INTO the admin/common git dir, so a swap in EITHER would redirect it (epic round 6). r3 asserted this row without a cell that could tell the guard from its absence, which is the very thing this file's doctrine forbids; `testTheAdminContainerSwappedInsideTheGateWindowIsRefusedBeforeStatus` stages a swap in exactly that window and goes RED when the guard is deleted |
 /// | inside the oracle recompute      | parent, admin container | the recompute's `worktree list` — same argv, same two paths |
 /// | pre-scoped-removal               | parent, admin container | the scoped admin removal and the R0 immediately before it |
 /// | each affected admin dir (prune mode) | the dir itself, strictly | that directory's own removal |
@@ -80,11 +131,13 @@
 /// re-proves R0 (repository identity), R1 (G1 + G4 + the registration
 /// itself, from the re-read porcelain record), R1b (WHICH worktree that
 /// record is about) and R2 (G3, through the shared `GitWorktreeMergedCheck`)
-/// immediately before the mutation, at BOTH mutating sites: before
-/// `worktree remove`, and again inside the fallback before the filesystem
-/// delete.
+/// immediately before the mutation. Through r4 it ran at BOTH mutating sites
+/// — before `worktree remove`, and again inside the fallback — because the
+/// two arms were reachable independently. There is ONE mutating site now
+/// (r5/D1), so it runs once, five subprocesses earlier than the removal
+/// rather than ten.
 ///
-/// ## GATE ORDER INSIDE THE FALLBACK (PR #460 codex r3)
+/// ## GATE ORDER (PR #460 codex r3)
 ///
 /// R0/R1/R1b/R2 run FIRST and G2 (the clean re-check) runs LAST, immediately
 /// before the disposal. The reverse order shipped in r1/r2 and was a live
@@ -110,73 +163,84 @@
 ///
 /// ## THE LAST-INSTANT RE-PROOF (PR #460 codex r4)
 ///
-/// Immediately before the destructive act in BOTH arms — before `worktree
-/// remove`, and after G2 in the fallback — every proposition whose AUTHORITY
+/// Immediately before the destructive act — after G2, and since r5 there is
+/// only ONE destructive act to be before — every proposition whose AUTHORITY
 /// IS THE FILESYSTEM is re-proved from the filesystem: which checkout this is
 /// (R1b's own resolver), whether it is locked (`<admin>/locked`), and whether
 /// HEAD moved (`<admin>/HEAD`, when that file corroborates the porcelain
-/// record). It spawns nothing, so it opens no window of its own — MEASURED
-/// end to end: last gate → destructive call, median 0.17 ms in the fallback
-/// arm and 0.16 ms in the primary arm, against the 77.9 ms and 56.9 ms r3
-/// left standing. What genuinely
-/// needs a subprocess — cleanliness, and ancestry when HEAD did not move but
-/// a branch tip did — is enumerated as a RESIDUAL rather than described as
-/// closed: see `reproveFromTheFilesystem` and the "What is left, measured"
-/// section.
+/// record, or `<admin>/reftable/tables.list` when it cannot). It spawns
+/// nothing, so it opens no window of its own: MEASURED to the UNLINK, the
+/// residual is 0.417 ms (median, n=10) against the 14.87 ms `git worktree
+/// remove` left open. What genuinely needs a subprocess — cleanliness, and
+/// ancestry when HEAD did not move but a branch tip did — is enumerated as a
+/// RESIDUAL rather than described as closed: see `reproveFromTheFilesystem`
+/// and the "What is left, measured" section.
 ///
 /// ## RUNNER-RESULT ROUTING IS TOTAL
 ///
 /// Every `GitCommandOutcome` is switched EXHAUSTIVELY at every call site —
 /// there is no "any failure" arm anywhere, because the four classes mean
-/// different things: exit 0 is the ONLY signal that admits pre-registered
-/// claims; a nonzero exit is git's considered refusal (and the ONLY fallback
-/// trigger); a TIMEOUT may have left a partially-removed tree and therefore
-/// never falls back and never accepts; `gitUnavailable` executed nothing at
-/// all.
+/// different things: exit 0 is the ONLY signal a gate's answer can be read
+/// from; a nonzero exit is git's considered refusal; a TIMEOUT means the
+/// question was never answered; `gitUnavailable` executed nothing at all.
+/// Since r5 no git invocation on this path MUTATES anything, so none of the
+/// four classes can leave partial state — every one of them is a refusal
+/// before the removal rather than a decision about a removal already begun.
 ///
-/// ## THE TWO NAMED FALLBACK TRIGGER CLASSES (D4)
+/// ## THE TWO CLASSES GIT WOULD HAVE REFUSED, AND STILL DOES NOT STOP (D4)
 ///
-/// Both are the NONZERO-EXIT class — never a failure-string match, never the
-/// timeout class:
+/// Through r4 these were the "fallback trigger classes": git refused with a
+/// nonzero exit and the guarded delete ran anyway. They are named here still,
+/// because the OUTCOME is unchanged and pretending otherwise would be the
+/// dishonesty this file is about:
 /// 1. an ignored-tree "Directory not empty" refusal (the field class:
-///    `status --porcelain` omits ignored files, so the re-check passes);
+///    `status --porcelain` omits ignored files, so the re-check passed).
+///    THIS ONE IS NOW ACTUALLY GATED — G2 runs with `--ignored` (D2), so an
+///    ignored file that is not a git-generated artefact REFUSES rather than
+///    routing to a delete;
 /// 2. a CLEAN worktree containing a POPULATED SUBMODULE — git's
 ///    `validate_no_submodules` refuses without `--force`, the re-check
-///    passes, and the fallback delete is ACCEPTED (the targets are user-owned
-///    dev roots and the parent's absorbed `modules/` object store is
-///    untouched; refs of an attached branch survive).
+///    passes, and the removal proceeds (the targets are user-owned dev roots
+///    and the parent's absorbed `modules/` object store is untouched; refs of
+///    an attached branch survive). Unchanged, and unchanged deliberately.
 ///
-/// THE ROUTING ENUMERATES ZERO OF THOSE CLASSES, and that is deliberate — a
-/// classification derived from git's message text is forbidden here. What
-/// SEPARATES the two intended classes from git's own SAFETY refusals is the
-/// re-established state, not the wording: a lock refusal leaves the porcelain
-/// record `locked`, an "is not a working tree" refusal leaves no record at
-/// all, and both are refused by R1. The ignored-tree and submodule refusals
-/// leave the record registered, linked and unlocked, so they proceed. Before
-/// PR #460 the fallback re-checked only cleanliness and therefore achieved
-/// `remove -f -f`'s effect on a locked worktree without the flag — measured,
-/// with `errors=[]`.
+/// What SEPARATED the two intended classes from git's own SAFETY refusals was
+/// never the wording — a classification derived from git's message text is
+/// forbidden here — but the re-established state, and that is still what
+/// decides: a lock leaves the porcelain record `locked` (and `<admin>/locked`
+/// on disk), a deregistered path leaves no record at all, and both are
+/// refused by R1 and by the last-instant re-proof. Before PR #460 the
+/// fallback re-checked only cleanliness and therefore achieved `remove -f -f`'s
+/// effect on a locked worktree without the flag — measured, with `errors=[]`.
 ///
 /// ## ACCOUNTING (mirrors `removeGuardedItem`; D14's verified-removal for prune)
 ///
 /// Claims are measured and REGISTERED before any git runs, and accepted ONLY
-/// after the removal actually succeeded — git exit 0, or the fallback delete.
-/// A failed or aborted removal accepts nothing; its registrations stay
-/// transferable by siblings. Prune mode goes further (D14 round 4): it
-/// measures the RECOMPUTED set at delete time, never the scan-time disclosed
-/// measures, and accepts only the dirs it can VERIFY disappeared — a
-/// disclosed entry that became locked or repaired since the scan is not in
-/// the final removal set at all, and reporting its bytes as freed would be a
-/// lie.
+/// after the removal actually succeeded. A failed or aborted removal accepts
+/// nothing; its registrations stay transferable by siblings. Prune mode goes
+/// further (D14 round 4): it measures the RECOMPUTED set at delete time,
+/// never the scan-time disclosed measures, and accepts only the dirs it can
+/// VERIFY disappeared — a disclosed entry that became locked or repaired
+/// since the scan is not in the final removal set at all, and reporting its
+/// bytes as freed would be a lie.
 ///
-/// ## DISPOSAL HONESTY (D16)
+/// ## DISPOSAL HONESTY (D16, corrected r5 / D7)
 ///
-/// The git-removal entry and every prune-only entry are `.permanent` ALWAYS,
-/// whatever the Move-to-Trash toggle says: git unlinks and prunes, it does not
-/// trash (the command-backed-category precedent, `ScanResult.swift`). ONLY the
-/// filesystem fallback honours the toggle, and its entry is `.trash` only when
-/// the trash handler ACTUALLY succeeded — a trash failure is an error and
-/// yields no entry at all, never a fall-through to a permanent delete.
+/// The stale-removal entry HONOURS the Move-to-Trash toggle, and its
+/// `.trash` disposal is reported only when the trash handler ACTUALLY
+/// succeeded — a trash failure is an error and yields no entry at all, never
+/// a fall-through to a permanent delete. That is new at r5: while
+/// `git worktree remove` was the primary arm the entry was `.permanent`
+/// ALWAYS, justified in this file by "git unlinks and prunes, it does not
+/// trash". `141e3a1` retired that sentence from the docs and left it here,
+/// where it was the stated reason for the disposal — the seventh instance of
+/// a retired proposition surviving at its DEFINITION site. No git prune runs
+/// any more and no git removal runs any more, so the sentence has no subject.
+///
+/// Every prune-only entry, and the admin-entry removal that follows a
+/// successful stale removal, remain `.permanent` unconditionally: those are
+/// repository metadata this process deletes directly, and a `worktrees/<id>`
+/// directory in the Trash is not something a user restores.
 
 import Foundation
 
@@ -209,17 +273,32 @@ struct WorktreeReclaimPerformer {
 
     // MARK: - Argv (registry code, built from PLAN FIELDS — never carried)
 
-    /// `git -C <parent> worktree remove <worktree>`.
-    ///
-    /// The `-C <parent>` form is REQUIRED, not stylistic: `worktree remove`
-    /// fails when the process CWD is inside the target, and pinning `-C` to
-    /// the parent keeps CWD out of the doomed tree. `--force` NEVER appears —
-    /// git's own dirty-refusal is a free TOCTOU gate this epic depends on.
-    static func removeArguments(
-        parentRepoWorkingDir: URL, worktreePath: URL
-    ) -> [String] {
-        ["-C", parentRepoWorkingDir.path, "worktree", "remove", worktreePath.path]
-    }
+    // THERE IS NO `removeArguments`, AND THAT IS THE POINT (PR #460 codex r5).
+    //
+    // `git -C <parent> worktree remove <worktree>` used to be the primary
+    // arm. It is gone, argv builder and all, because the ACT it performs is
+    // inside git's process and no gate of ours can sit next to it: git
+    // starts up, reads the registry, runs its own `status --porcelain` child
+    // over the whole tree, and only then unlinks — and it never re-reads
+    // admin-directory identity or HEAD. MEASURED (fork + exec, spinning on
+    // `lstat` of the worktree's only tracked file until ENOENT, git 2.50.1,
+    // macOS 15): spawn → first destruction median **14.87 ms**, range
+    // 14.28–19.84 ms, n=10. The same measurement over a 2001-file worktree
+    // reaches the same file at median 156.8 ms against 62.5 ms for a direct
+    // `removefile` — a ~94 ms git-side excess that is its own `status` walk
+    // and therefore GROWS with the tree.
+    //
+    // The removal is now this process's own, under `DepthSafeRemoval` and a
+    // descriptor-captured container binding, with the filesystem re-proof
+    // immediately before it — measured to the SAME endpoint at 0.417 ms
+    // median (range 0.361–0.639 ms, n=10, and that figure includes a `fork`
+    // the production path does not do). See `removeUnderLastInstantProof`.
+    //
+    // Nothing about `--force` survives either: git's `--force`-less dirty
+    // refusal was a free TOCTOU gate, and what replaces it is
+    // `GitWorktreeCleanCheck` — the SAME `status --porcelain` git runs
+    // internally — as the last git call, now with `--ignored` (D2), which
+    // git's own refusal does not have.
 
     /// `git -C <parent> rev-parse --path-format=absolute --git-common-dir` —
     /// the delete-time question "which repository is this `-C` target
@@ -393,106 +472,62 @@ struct WorktreeReclaimPerformer {
         // (6) REGISTER before git runs (R8 phase 1).
         let token = await registry.registerObservations(report.claims)
 
-        // (7) The guard re-runs immediately before the invocation, over the
-        // two paths `worktree remove` traverses.
+        // (7) The guard re-runs over the three paths the gates below and the
+        // removal itself traverse: the PARENT (the registry re-read runs
+        // `-C <parent>`), the WORKTREE (the ancestry rung and the clean
+        // re-check run `-C <wt>`) and the ADMIN CONTAINER (`<wt>/.git` points
+        // INTO it, so `git -C <wt> …` is redirected by a swap in either).
         do {
             try guardTraversal([
                 (label: "parent repository", url: plan.parentRepoWorkingDir,
                  containment: .descendantOrEqual),
                 (label: "worktree", url: worktreePath,
                  containment: .strictDescendant),
+                (label: "admin container", url: plan.parentAdminContainer,
+                 containment: .strictDescendant),
             ], inside: container)
         } catch {
             return refusal(item, error, at: worktreePath)
         }
 
-        // (8) THE DELETE-TIME GATE RE-ESTABLISHMENT. Placed HERE, before the
-        // primary invocation, so it covers BOTH arms: the fallback is only
-        // reachable through the `worktree remove` below. It runs its OWN D13
-        // guards, per invocation group (PR #460 codex r2) — the guard at (7)
-        // covers the mutation's two paths and does not cover the admin
-        // container `worktree list` enumerates.
+        // (8) THE DELETE-TIME GATE RE-ESTABLISHMENT — R0/R1/R1b/R2, and the
+        // HEAD witness R2's answer is conditioned on. It runs its OWN D13
+        // guards, per invocation group (PR #460 codex r2), because the guard
+        // at (7) is a PATH check and cannot bind what a subprocess spawned
+        // later resolves.
         let head: HeadWitness?
+        let ignoredWitness: Set<String>
         switch await reestablishStaleGates(
             plan: plan, worktreePath: worktreePath, adminEntry: adminEntry,
             container: container
         ) {
         case .refuse(let tag, let detail):
             return failure(item, detail, tag: tag)
-        case .proceed(let witness):
+        case .proceed(let witness, let ignored):
             head = witness
+            ignoredWitness = ignored
         }
 
-        // (9) THE LAST INSTANT. The gates above end three subprocesses before
-        // this line (MEASURED at r3: R1b-done → `worktree remove` spawned,
-        // median 56.9 ms), and everything the FILESYSTEM can answer is
-        // re-proved here for the price of a few `lstat`s — which checkout
-        // this is, whether it is locked, whether HEAD moved. See
-        // `reproveFromTheFilesystem` for what remains and why.
-        if case .refuse(let tag, let detail) = reproveFromTheFilesystem(
+        // (9) THE REMOVAL — G2 last, the filesystem re-proof after it, and the
+        // unlink immediately after that. See `removeUnderLastInstantProof`
+        // and the "WHO REMOVES THE TREE" section of the file header for why
+        // `git worktree remove` is no longer the thing that does it.
+        return await removeUnderLastInstantProof(
+            item: item, plan: plan, origin: origin, container: container,
             worktreePath: worktreePath, adminEntry: adminEntry,
-            carriedIdentity: plan.worktreeAdminEntryIdentity, head: head
-        ) {
-            return failure(item, detail, tag: tag)
-        }
-
-        let removal = await runner.run(
-            Self.removeArguments(
-                parentRepoWorkingDir: plan.parentRepoWorkingDir,
-                worktreePath: worktreePath
-            ),
-            timeout: gitTimeout
+            registry: registry, token: token, head: head,
+            ignoredWitness: ignoredWitness
         )
-
-        switch removal.outcome {
-        case .success:
-            // git removed the tree AND its own admin directory — no prune is
-            // needed or run. Exit 0 is the signal that admits the claims.
-            let accepted = await registry.acceptSuccessful(token)
-            logCleaned(accepted.exactBytes + accepted.estimatedUpToBytes)
-            return WorktreeReclaimOutcome(
-                entry: entry(
-                    for: item, accepted: accepted,
-                    // D16: git unlinks regardless of the Trash toggle.
-                    disposal: .permanent
-                ),
-                errors: []
-            )
-
-        case .timeout:
-            // NEVER the fallback: compounding a partially-removed tree with a
-            // filesystem delete is how a half-removed worktree becomes an
-            // unrecoverable one. Nothing is accepted.
-            let detail = "git worktree remove timed out after "
-                + "\(Self.seconds(gitTimeout))s; the tree may be partially "
-                + "removed — rescan required"
-            logRefusal("git-timeout", detail)
-            return failure(item, detail, tag: nil)
-
-        case .gitUnavailable:
-            let detail = "refused: git is unavailable at clean time — nothing "
-                + "was reclaimed"
-            logRefusal("git-unavailable", detail)
-            return failure(item, detail, tag: nil)
-
-        case .failure(let exitCode, let stderr):
-            // The ONE fallback trigger class (D4), reached by EXIT CODE — the
-            // message is display only and is never matched on.
-            return await fallbackAfterRefusal(
-                item: item, plan: plan, origin: origin, container: container,
-                worktreePath: worktreePath, adminEntry: adminEntry,
-                registry: registry, token: token,
-                gitRefusal: GitCommandFailureSummary.describe(
-                    exitCode: exitCode, stderr: stderr
-                )
-            )
-        }
     }
 
-    /// git refused with a nonzero exit: re-establish the scan's gates, then
-    /// re-check CLEAN as the LAST gate, then delete the tree ourselves under
-    /// the `removeGuardedItem` doctrine, then run the GATED prune.
-    private func fallbackAfterRefusal(
+    /// Re-check CLEAN as the LAST gate, re-prove from the filesystem at the
+    /// last instant, then remove the tree under the `removeGuardedItem`
+    /// doctrine, then run the GATED prune of its own admin entry.
+    ///
+    /// The caller has already run the (7) guard and (8) `reestablishStaleGates`
+    /// and hands the HEAD witness down; this function owns everything from G2
+    /// to the entry.
+    private func removeUnderLastInstantProof(
         item: ReclaimableItem,
         plan: GitWorktreeReclaimPlan,
         origin: URL,
@@ -501,61 +536,10 @@ struct WorktreeReclaimPerformer {
         adminEntry: URL,
         registry: InodeAccountingRegistry,
         token: RegisteredChild,
-        gitRefusal: String
+        head: HeadWitness?,
+        ignoredWitness: Set<String>
     ) async -> WorktreeReclaimOutcome {
-        // The guard covers the three paths this function's git invocations
-        // traverse. The PARENT (PR #460 codex r1) because the gate
-        // re-establishment below re-reads the repository and its registry
-        // with `-C <parent>`; the WORKTREE and the ADMIN CONTAINER (round 6)
-        // because R1b's back-link read and R2's ancestry run `-C <wt>`, and
-        // `<wt>/.git` points INTO the admin container, so a leaf swapped to a
-        // symlink in EITHER between the remove failure and this call would
-        // redirect them outside the container.
-        //
-        // The clean re-check no longer runs here — it is the LAST gate now
-        // (PR #460 codex r3) and carries its own guard, because the entry
-        // guard is separated from it by five subprocesses.
-        do {
-            try guardTraversal([
-                (label: "worktree", url: worktreePath,
-                 containment: .strictDescendant),
-                (label: "admin container", url: plan.parentAdminContainer,
-                 containment: .strictDescendant),
-                (label: "parent repository", url: plan.parentRepoWorkingDir,
-                 containment: .descendantOrEqual),
-            ], inside: container)
-        } catch {
-            return refusal(item, error, at: worktreePath)
-        }
-
-        // THE GATE RE-ESTABLISHMENT, AGAIN — and this is the placement that
-        // makes the fallback safe rather than merely earlier.
-        //
-        // `case .failure` upstream routes EVERY nonzero exit here, so the
-        // classes that arrive include git's own SAFETY refusals: a lock, a
-        // deregistered path. Re-running R0/R1/R2 immediately before the
-        // filesystem delete is what discriminates them from the two intended
-        // trigger classes — and it does it from the re-read porcelain RECORD,
-        // never from git's stderr. Running the same check only before
-        // `worktree remove` would leave the window between that check and
-        // this delete open, which is the window a lock acquired mid-operation
-        // lands in.
-        let head: HeadWitness?
-        switch await reestablishStaleGates(
-            plan: plan, worktreePath: worktreePath, adminEntry: adminEntry,
-            container: container
-        ) {
-        case .refuse(let tag, let detail):
-            return failure(
-                item,
-                "\(detail) (git had refused with: \(gitRefusal))",
-                tag: tag
-            )
-        case .proceed(let witness):
-            head = witness
-        }
-
-        // The guarded filesystem fallback, `removeGuardedItem`'s doctrine
+        // The guarded removal, `removeGuardedItem`'s doctrine
         // verbatim: TOCTOU re-admission immediately pre-delete, then the
         // trash toggle (a trash failure is an error, NEVER a fall-through to
         // a permanent delete).
@@ -570,12 +554,12 @@ struct WorktreeReclaimPerformer {
             // of it. It fails closed and costs nothing to do so: the removal
             // performs the identical open a moment later.
             //
-            // BOTH ARMS USE IT. It was captured for the permanent arm alone
-            // and the Trash arm — the GUI's default, `moveToTrash` is `true`
-            // out of the box — handed the mover a bare URL beside it, which
-            // made this the one deletion path in the app with no container
-            // binding (fn-5/fn-6 reconciliation). The ordering the capture
-            // already had is the ordering the Trash arm needs: the binding
+            // BOTH DISPOSALS USE IT. It was captured for the permanent one
+            // alone and the Trash one — the GUI's default, `moveToTrash` is
+            // `true` out of the box — handed the mover a bare URL beside it,
+            // which made this the one deletion path in the app with no
+            // container binding (fn-5/fn-6 reconciliation). The ordering the
+            // capture already had is the ordering Trash needs: the binding
             // covers the two rechecks below, not merely the seam call.
             let admittedParent = try DepthSafeRemoval.admittedParent(
                 directory: worktreePath.deletingLastPathComponent(),
@@ -584,15 +568,14 @@ struct WorktreeReclaimPerformer {
             let recheck = try pathGuard.admitContainer(origin, snapshot: snapshot)
             try pathGuard.validateRemovableItem(worktreePath, inside: recheck)
 
-            // G2 IS THE LAST GATE, and this ordering is the whole point
+            // G2 IS THE LAST GIT CALL, and this ordering is the whole point
             // (PR #460 codex r3).
             //
-            // Until this round the clean re-check ran at the TOP of this
-            // function and `reestablishStaleGates` ran after it, so between
-            // "this tree is clean" and "delete this tree" sat FIVE git
-            // subprocesses (`rev-parse --git-common-dir`, `worktree list`,
-            // `symbolic-ref`, `rev-parse --verify`, `merge-base`) plus the
-            // two rechecks above. MEASURED: a file written into the worktree
+            // Until r3 the clean re-check ran BEFORE `reestablishStaleGates`,
+            // so between "this tree is clean" and "delete this tree" sat FIVE
+            // git subprocesses (`rev-parse --git-common-dir`, `worktree list`,
+            // `symbolic-ref`, `rev-parse --verify`, `merge-base`) plus two
+            // path re-admissions. MEASURED: a file written into the worktree
             // in that window was destroyed and the performer returned a
             // SUCCESS entry with `errors == []` and no warning. The comment
             // above the gate re-establishment made exactly this argument for
@@ -600,11 +583,17 @@ struct WorktreeReclaimPerformer {
             // remove` would leave the window between that check and this
             // delete open" — and never applied it to G2.
             //
-            // G2 is now the last thing that runs before the disposal, so the
-            // surviving window is the disposal call itself, which no ordering
-            // can remove: `status` is a read, not a lock. What the ordering
-            // buys is that the window no longer CONTAINS five subprocess
-            // spawns and two path re-admissions.
+            // G2 is now the last SUBPROCESS before the disposal; only the
+            // filesystem re-proof below, which spawns nothing, sits between
+            // it and the unlink. `status` is a read, not a lock, so a write
+            // landing after it answers is not seen — that residual is stated
+            // in "What is left, measured", not described as closed.
+            //
+            // AND IT IS THE GATE THAT REPLACES GIT'S OWN (PR #460 codex r5).
+            // `git worktree remove` without `--force` refuses a dirty tree by
+            // running the same `status --porcelain` internally. Since the
+            // removal is no longer git's, this call is that refusal — and
+            // `--ignored` makes it see MORE than git's does (D2).
             //
             // The guard re-runs here for the same reason it runs at entry:
             // `git -C <wt> status` follows `<wt>/.git` INTO the admin
@@ -626,41 +615,46 @@ struct WorktreeReclaimPerformer {
             // so the abort wording can differ.
             //
             // THE REFUSAL THIS ORDERING INTRODUCES IS RETRYABLE. A tree that
-            // was clean when the fallback was entered and dirty by the time
-            // the gates finished now refuses instead of being deleted. That
-            // is a fact about a CONCURRENT WRITER, not a fixed property of
-            // the input: stop the writer (or commit/stash the work), re-scan,
-            // and the same item can succeed. It is the opposite of a
-            // deterministic bound, which no re-scan can ever clear.
-            switch await GitWorktreeCleanCheck.run(
+            // was clean at scan time and dirty by the time the gates finished
+            // refuses instead of being deleted. That is a fact about a
+            // CONCURRENT WRITER, not a fixed property of the input: stop the
+            // writer (or commit/stash the work), re-scan, and the same item
+            // can succeed. It is the opposite of a deterministic bound, which
+            // no re-scan can ever clear.
+            let reading = await GitWorktreeCleanCheck.read(
                 worktreeAt: worktreePath, using: runner, timeout: gitTimeout
-            ) {
-            case .clean:
-                break
-            case .dirty(let entryCount):
-                let detail = "aborted: git refused to remove this worktree "
-                    + "(\(gitRefusal)) and the delete-time re-check found it "
-                    + "DIRTY (\(entryCount) porcelain "
-                    + "\(entryCount == 1 ? "entry" : "entries")) — the tree "
-                    + "was left untouched"
-                logRefusal("worktree-dirty", detail)
-                return failure(item, detail, tag: nil)
-            case .failed(let reason):
-                let detail = "aborted: git refused to remove this worktree "
-                    + "(\(gitRefusal)) and the delete-time re-check could not "
-                    + "prove it clean (\(reason)) — the tree was left "
-                    + "untouched"
-                logRefusal("worktree-recheck-failed", detail)
+            )
+            guard let ignoredNow = reading.ignoredPaths else {
+                let detail = Self.uncleanDetail(reading.verdict)
+                logRefusal(Self.uncleanTag(reading.verdict), detail)
                 return failure(item, detail, tag: nil)
             }
 
-            // THE LAST INSTANT, and this is the line the whole round is
-            // about (PR #460 codex r4).
+            // D2, THE OTHER HALF OF THE LAST GATE. A path that appeared in
+            // the ignored set while the gates ran is work `--porcelain`
+            // cannot see and this removal would destroy without a word.
+            let appeared = ignoredNow.subtracting(ignoredWitness).sorted()
+            if let first = appeared.first {
+                let more = appeared.count > 1
+                    ? " and \(appeared.count - 1) more" : ""
+                let detail = "aborted: a file your `.gitignore` hides appeared "
+                    + "in this worktree while the delete-time checks were "
+                    + "running (\(first)\(more)) — `git status` reports "
+                    + "nothing about ignored paths, so removing the tree "
+                    + "would have destroyed it silently. The tree was left "
+                    + "untouched. Move that work out of the worktree, or "
+                    + "re-scan and remove again once you are done with it."
+                logRefusal("worktree-ignored-appeared", detail)
+                return failure(item, detail, tag: nil)
+            }
+
+            // THE LAST INSTANT (PR #460 codex r4), and since r5 it is the
+            // last thing that runs before the ONLY unlink there is.
             //
             // r3 made G2 the last GATE, which narrowed the window from five
             // subprocesses to one. It did not close it, and it moved the
             // propositions rather than closing any: R1b — WHICH checkout this
-            // is — now sat FIVE subprocesses before the delete. MEASURED at
+            // is — then sat FIVE subprocesses before the delete. MEASURED at
             // r3: with a `git worktree remove` + `git worktree add` at the
             // same path staged on the clean re-check, this arm destroyed a
             // brand-new checkout plus a `secret.env` hidden by a committed
@@ -680,11 +674,7 @@ struct WorktreeReclaimPerformer {
                 carriedIdentity: plan.worktreeAdminEntryIdentity, head: head
             ) {
                 logRefusal(tag, detail)
-                return failure(
-                    item,
-                    "\(detail) (git had refused with: \(gitRefusal))",
-                    tag: tag
-                )
+                return failure(item, detail, tag: tag)
             }
 
             if moveToTrash {
@@ -1126,7 +1116,9 @@ struct WorktreeReclaimPerformer {
     /// R2's answer at the last instant depends on HEAD not having moved
     /// since, and only the site that ran R2 can say what HEAD was then.
     private enum StaleGateReestablishment {
-        case proceed(head: HeadWitness?)
+        /// `ignored` is the D2 witness: the worktree's IGNORED path set as it
+        /// was when identity had just been proved and R2 had not yet run.
+        case proceed(head: HeadWitness?, ignored: Set<String>)
         case refuse(tag: String, detail: String)
     }
 
@@ -1225,6 +1217,7 @@ struct WorktreeReclaimPerformer {
         // no cell can distinguish is one this project has shipped before.
         let captured = captureHead(adminEntry: adminEntry, record: record)
 
+
         // A DETACHED head with no usable witness is refused rather than
         // proceeded with, and this is the one place availability is spent on
         // purpose: on a branch, a commit made inside the window survives on
@@ -1234,7 +1227,7 @@ struct WorktreeReclaimPerformer {
         // refusing for. The refusal CLEARS — attach the HEAD to a branch and
         // re-scan, and the same worktree is judged with a witness available.
         if record.isDetached, let cause = Self.witnessAbsence(
-            captured, headFile: adminEntry.appendingPathComponent(Self.headFileName)
+            captured, adminEntry: adminEntry
         ) {
             return .refuse(
                 tag: "worktree-head-unwitnessable",
@@ -1246,6 +1239,41 @@ struct WorktreeReclaimPerformer {
                     + "Nothing was removed. Put that work on a branch "
                     + "(`git -C \(worktreePath.path) switch -c <name>`), then "
                     + "re-scan."
+            )
+        }
+
+        // THE IGNORED WITNESS, TAKEN IN THE SAME PLACE AND FOR THE SAME
+        // REASON (PR #460 codex r5, D2).
+        //
+        // `status --porcelain` reports NOTHING about a path a committed
+        // `.gitignore` hides, so through r4 the last gate could not see one —
+        // MEASURED, `secret.env` written into the gate window was destroyed
+        // with the tree under `Entry(exactBytes: 49152, .permanent,
+        // warning: nil)` and `errors == []`, while the same fixture with a
+        // NON-ignored file refused. `docs/v1/CATEGORIES.md:519` said "work
+        // saved while the checks were running is caught rather than
+        // destroyed", which was false for exactly that file.
+        //
+        // WHY HERE AND NOT EARLIER. It is a reading OF A PATH, and this
+        // file's own doctrine is that a reading through a path means nothing
+        // until the path's identity is settled — the same argument
+        // `reproveFromTheFilesystem` makes for putting identity ahead of the
+        // lock and HEAD. R0, R1 and R1b have answered by this line; R2's
+        // three-subprocess ladder and the disposal-time re-admissions have
+        // not, and that is the window this witness spans (MEASURED at r4:
+        // R1b-done → destructive call, median 56.9 ms of the ~78 ms total).
+        //
+        // What is compared is the SET of ignored paths, never their contents:
+        // a path that APPEARED refuses, a path that was already there does
+        // not. That is the only rule compatible with the product — an ignored
+        // build tree is what this scanner exists to reclaim.
+        let witnessReading = await GitWorktreeCleanCheck.read(
+            worktreeAt: worktreePath, using: runner, timeout: gitTimeout
+        )
+        guard let ignoredWitness = witnessReading.ignoredPaths else {
+            return .refuse(
+                tag: Self.uncleanTag(witnessReading.verdict),
+                detail: Self.uncleanDetail(witnessReading.verdict)
             )
         }
 
@@ -1262,24 +1290,36 @@ struct WorktreeReclaimPerformer {
             // ATTACHED, and HEAD is not witnessable from the filesystem. The
             // ancestry residual for this item is then the whole R2→disposal
             // window; see "What is left, measured".
-            return .proceed(head: nil)
+            return .proceed(head: nil, ignored: ignoredWitness)
         }
-        return .proceed(head: witness)
+        return .proceed(head: witness, ignored: ignoredWitness)
     }
 
     /// Why a capture is not a witness, or nil when it IS one.
     private static func witnessAbsence(
-        _ capture: HeadWitnessCapture, headFile: URL
+        _ capture: HeadWitnessCapture, adminEntry: URL
     ) -> String? {
+        let headFile = adminEntry.appendingPathComponent(headFileName)
+        let stack = adminEntry.appendingPathComponent(reftableStackPath)
         switch capture {
         case .witness:
             return nil
         case .unreadable:
-            return "\(headFile.path) is not a readable regular file"
+            return "neither \(headFile.path) nor \(stack.path) is a readable "
+                + "regular file"
         case .uncorroborated(let live, let expected):
+            // NOT "this backend keeps no HEAD file" — CHANGELOG.md:80-81 and
+            // CATEGORIES.md:540-541 said that at r4 and it is false (D6):
+            // MEASURED on git 2.50.1, `git init --ref-format=reftable` +
+            // `git worktree add --detach` leaves `<admin>/HEAD` present as a
+            // regular file reading `ref: refs/heads/.invalid`, byte- and
+            // inode-identical across a detached commit, while porcelain
+            // reports a real SHA. The file is present and re-readable; what
+            // fails is CORROBORATION.
             return "\(headFile.path) reads '\(live)' while git reports HEAD "
-                + "as '\(expected)', so it is not tracking HEAD — the "
-                + "`reftable` ref backend keeps a constant stub there"
+                + "as '\(expected)', so that file is not tracking HEAD, and "
+                + "\(stack.path) — the per-worktree ref stack that would "
+                + "witness it instead — is not a readable regular file either"
         }
     }
 
@@ -1725,14 +1765,36 @@ struct WorktreeReclaimPerformer {
 
     // MARK: - The LAST-INSTANT re-proof (PR #460 codex r4)
 
-    /// `<admin>/HEAD` as R2 saw it: the bytes, and the inode they were read
-    /// through. The inode matters as much as the bytes — git REPLACES this
-    /// file rather than writing it in place, so the inode moves on every HEAD
-    /// write. MEASURED on git 2.50.1: a commit on a detached head took it
-    /// from 115935185 to 116190333, and a branch switch moved an attached
-    /// worktree's from 115935122 to 116190340. A file re-created with
-    /// identical bytes is still a different object, and this catches it.
+    /// The per-worktree HEAD file — or, for the `reftable` backend, the
+    /// per-worktree ref STACK — as R2 saw it: the bytes, and the inode they
+    /// were read through.
+    ///
+    /// The inode matters as much as the bytes: git REPLACES both files rather
+    /// than writing them in place, so the inode moves on every write.
+    /// MEASURED on git 2.50.1 — `<admin>/HEAD`: a commit on a detached head
+    /// took it from 115935185 to 116190333, and a branch switch moved an
+    /// attached worktree's from 115935122 to 116190340;
+    /// `<admin>/reftable/tables.list`: 117937252 → 117937281 → 117937297 →
+    /// 117937323 across an attached commit, a `switch --detach` and a
+    /// detached commit, and UNCHANGED across `status` and `worktree list`.
+    /// A file re-created with identical bytes is still a different object,
+    /// and this catches it.
     struct HeadWitness: Equatable {
+        /// WHICH file is the witness. Two backends, two files, and the
+        /// comparison at the last instant must re-read the SAME one — a
+        /// witness taken from the reftable stack and compared against `HEAD`
+        /// would compare two different objects and pass forever.
+        enum Substrate: String, Equatable {
+            /// `<admin>/HEAD` — the files ref backend.
+            case headFile = "HEAD"
+            /// `<admin>/reftable/tables.list` — the reftable ref backend's
+            /// PER-WORKTREE ref stack.
+            case reftableStack = "reftable/tables.list"
+
+            var relativePath: String { rawValue }
+        }
+
+        let substrate: Substrate
         let identity: FileSystemIdentityProvider.Identity
         let bytes: Data
     }
@@ -1744,14 +1806,17 @@ struct WorktreeReclaimPerformer {
         case witness(HeadWitness)
         /// `<admin>/HEAD` is not a readable regular file.
         case unreadable
-        /// It is readable and does NOT corroborate the porcelain record, so
-        /// it is not a witness to anything. The MEASURED instance is the
-        /// `reftable` ref backend: `<admin>/HEAD` is the constant stub
-        /// `ref: refs/heads/.invalid` and does not change when the worktree
-        /// commits (verified, git 2.50.1, `git init --ref-format=reftable`),
-        /// while porcelain reports a real moving SHA. Comparing that file
-        /// across the window would be a guard that can never fire — the
-        /// silently-inert shape D6 is about.
+        /// `<admin>/HEAD` is readable and does NOT corroborate the porcelain
+        /// record, AND the reftable stack that would witness it instead is
+        /// not readable either. Comparing an uncorroborated HEAD across the
+        /// window would be a guard that can never fire — the silently-inert
+        /// shape D6 is about.
+        ///
+        /// The `reftable` backend USED to land here (its `<admin>/HEAD` is the
+        /// constant stub `ref: refs/heads/.invalid`, verified git 2.50.1),
+        /// which is what made D3 possible; it now corroborates through
+        /// `reftableStackPath` instead, so this case is reachable only for a
+        /// HEAD file that is neither backend's.
         case uncorroborated(live: String, expected: String)
     }
 
@@ -1764,6 +1829,57 @@ struct WorktreeReclaimPerformer {
     /// commit on an ATTACHED branch does not (the bytes stay
     /// `ref: refs/heads/<branch>` while the branch tip moves).
     static let headFileName = "HEAD"
+
+    /// The reftable backend's PER-WORKTREE ref stack (PR #460 codex r5, D3).
+    ///
+    /// Through r4 a reftable worktree had no witness at all: `<admin>/HEAD`
+    /// is a constant stub there, so `captureHead` returned `.uncorroborated`,
+    /// an ATTACHED record fell through to `.proceed(head: nil)`, and
+    /// `reproveFromTheFilesystem` skipped the HEAD proposition entirely.
+    /// MEASURED on `git init --ref-format=reftable`: a `git switch --detach`
+    /// followed by a commit inside the window destroyed the worktree, left
+    /// the commit reachable from no ref, and returned
+    /// `Entry(exactBytes: 45056, .permanent, warning: nil)` with `errors == []`.
+    ///
+    /// `tables.list` is the substrate that closes it. MEASURED, git 2.50.1,
+    /// on a linked worktree of a `--ref-format=reftable` repository:
+    ///
+    /// | operation | `tables.list` inode | contents |
+    /// |---|---|---|
+    /// | baseline | 117937252 | `0x…0001-0x…0003-296e1169.ref` |
+    /// | `git status` | 117937252 | unchanged |
+    /// | `git worktree list` | 117937252 | unchanged |
+    /// | commit on the ATTACHED branch | 117937281 | `…0x…0004-0caa0886.ref` |
+    /// | `git switch --detach` | 117937297 | `…0x…0005-4f3d89fa.ref` |
+    /// | commit while DETACHED | 117937323 | `…0x…0006-b54c4d23.ref` |
+    ///
+    /// So it is stable under reads and moves on every ref write — including
+    /// the ATTACHED-branch commit, which the files backend's HEAD file does
+    /// NOT catch (residual 2 in "What is left, measured"). A reftable
+    /// worktree therefore gets a STRICTLY STRONGER guarantee here than a
+    /// files-backend one, and that asymmetry is real rather than cosmetic.
+    ///
+    /// The two backends are mutually exclusive on disk: a files-backend
+    /// linked worktree's admin directory holds `HEAD ORIG_HEAD commondir
+    /// gitdir index logs refs` and NO `reftable` directory (measured, same
+    /// run), so the presence of this file identifies the backend with no
+    /// configuration read.
+    static let reftableStackPath = "reftable/tables.list"
+
+    // THERE IS NO `reftablePlaceholderRef` GUARD, AND THE MEASUREMENT IS WHY
+    // (PR #460 codex r5). While building D3's fixtures this file briefly
+    // refused a record naming `refs/heads/.invalid`, on the theory that an
+    // unreadable per-worktree ref stack would make git report the stub as the
+    // branch and let the stub corroborate itself. MEASURED on git 2.50.1
+    // (stack replaced by a directory, `worktree add --detach`), the record is
+    // instead `HEAD 0000000000000000000000000000000000000000` with NO
+    // `branch` and NO `detached` attribute — so `branchRef` is nil, the
+    // capture is `.uncorroborated`, and the removal is refused by the gates
+    // that already exist (`status` reports the whole tree added against the
+    // null HEAD, and the ancestry ladder cannot answer). The guard could not
+    // be made to fire by any fixture, which is the definition of the
+    // unevidenced guard this project has shipped twice; it was deleted rather
+    // than asserted.
 
     /// git's OWN representation of a worktree lock: `git worktree lock`
     /// creates `<admin>/locked` (empty, or holding the `--reason` text) and
@@ -1801,7 +1917,7 @@ struct WorktreeReclaimPerformer {
     /// |---|---|---|
     /// | WHICH CHECKOUT this is (R1b) | `<wt>/.git` → admin dir → back-link → inode | YES — the same pure-filesystem resolver R1b runs, no git at all |
     /// | THE LOCK (G4) | `<admin>/locked` exists | YES — git's own on-disk representation |
-    /// | HEAD UNMOVED (R2's premise) | `<admin>/HEAD` bytes + inode | YES, when the file corroborates the record |
+    /// | HEAD UNMOVED (R2's premise) | `<admin>/HEAD` bytes + inode, or `<admin>/reftable/tables.list` when that file cannot corroborate (D3) | YES |
     ///
     /// and the second class is stated, not hidden, in `residualWindow` below.
     ///
@@ -1868,11 +1984,13 @@ struct WorktreeReclaimPerformer {
         // last-instant set at all, and `reestablishStaleGates` has already
         // refused the one case where that absence is unrecoverable.
         guard let head else { return .proceed }
-        guard let live = readHead(adminEntry: adminEntry) else {
+        guard let live = readWitness(
+            adminEntry: adminEntry, substrate: head.substrate
+        ) else {
             return .refuse(
                 tag: "worktree-head-unreadable",
-                detail: "refused: this worktree's HEAD "
-                    + "(\(adminEntry.appendingPathComponent(Self.headFileName).path)) "
+                detail: "refused: this worktree's HEAD witness "
+                    + "(\(adminEntry.appendingPathComponent(head.substrate.relativePath).path)) "
                     + "could not be re-read at the last instant, so the "
                     + "ancestry answer cannot be tied to a commit — nothing "
                     + "was removed. Re-scan to rebuild this item."
@@ -1895,13 +2013,17 @@ struct WorktreeReclaimPerformer {
     /// `nil` when it is not a regular file or cannot be read — a symlink at
     /// that name is never followed, so a link planted over HEAD reads as an
     /// absent witness rather than as whatever it points at.
-    private func readHead(adminEntry: URL) -> HeadWitness? {
-        let head = adminEntry.appendingPathComponent(Self.headFileName)
-        guard provider.probeKind(of: head) == .kind(.regularFile),
-              let identity = provider.identity(of: head),
-              let bytes = try? Data(contentsOf: head)
+    private func readWitness(
+        adminEntry: URL, substrate: HeadWitness.Substrate
+    ) -> HeadWitness? {
+        let file = adminEntry.appendingPathComponent(substrate.relativePath)
+        guard provider.probeKind(of: file) == .kind(.regularFile),
+              let identity = provider.identity(of: file),
+              let bytes = try? Data(contentsOf: file)
         else { return nil }
-        return HeadWitness(identity: identity, bytes: bytes)
+        return HeadWitness(
+            substrate: substrate, identity: identity, bytes: bytes
+        )
     }
 
     /// The HEAD witness, CORROBORATED against the porcelain record git just
@@ -1918,20 +2040,39 @@ struct WorktreeReclaimPerformer {
     private func captureHead(
         adminEntry: URL, record: GitWorktreeEntry
     ) -> HeadWitnessCapture {
-        guard let witness = readHead(adminEntry: adminEntry) else {
-            return .unreadable
-        }
-        let live = String(decoding: witness.bytes, as: UTF8.self)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let expected = record.isDetached
-            ? record.headSHA
-            : record.branchRef.map { "ref: \($0)" }
-        guard let expected, !expected.isEmpty,
-              live.caseInsensitiveCompare(expected) == .orderedSame
-        else {
+        // (1) THE FILES BACKEND. `<admin>/HEAD` is a witness only when it
+        // CORROBORATES the record git just gave us.
+        if let witness = readWitness(adminEntry: adminEntry, substrate: .headFile) {
+            let live = String(decoding: witness.bytes, as: UTF8.self)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let expected = record.isDetached
+                ? record.headSHA
+                : record.branchRef.map { "ref: \($0)" }
+            if let expected, !expected.isEmpty,
+               live.caseInsensitiveCompare(expected) == .orderedSame {
+                return .witness(witness)
+            }
+            // (2) THE REFTABLE BACKEND (D3). HEAD is readable and does not
+            // corroborate — the measured shape is the `ref: refs/heads/.invalid`
+            // stub. The PER-WORKTREE REF STACK is the substrate that does move,
+            // and it needs no corroboration against the record because it is
+            // not a copy of HEAD: it is the log of every ref write this
+            // worktree has made, and a witness that MOVES on every write is the
+            // opposite of the inert-file shape corroboration exists to reject.
+            if let stack = readWitness(
+                adminEntry: adminEntry, substrate: .reftableStack
+            ) {
+                return .witness(stack)
+            }
             return .uncorroborated(live: live, expected: expected ?? "nothing")
         }
-        return .witness(witness)
+        // (3) HEAD is not a readable regular file. The stack may still be.
+        if let stack = readWitness(
+            adminEntry: adminEntry, substrate: .reftableStack
+        ) {
+            return .witness(stack)
+        }
+        return .unreadable
     }
 
     /// **R2** — G3, re-run through the SHARED `GitWorktreeMergedCheck`.
@@ -2140,6 +2281,37 @@ struct WorktreeReclaimPerformer {
         return WorktreeReclaimOutcome(entry: nil, errors: [
             CacheCleaner.itemError(item, message),
         ])
+    }
+
+    /// The refusal TAG for a clean reading that did not answer "clean".
+    /// `.clean` never reaches here — a clean reading always carries its
+    /// ignored set — so the arm is total over what a caller can hold.
+    private static func uncleanTag(_ verdict: WorktreeCleanVerdict) -> String {
+        if case .dirty = verdict { return "worktree-dirty" }
+        return "worktree-recheck-failed"
+    }
+
+    /// The user-facing sentence for the same, with the action that clears it.
+    /// RETRY: both classes clear — a dirty tree clears when the work is
+    /// committed, stashed or discarded; an unanswered check clears when git
+    /// can answer. Neither keys on a deterministic limit.
+    private static func uncleanDetail(_ verdict: WorktreeCleanVerdict) -> String {
+        switch verdict {
+        case .dirty(let entryCount):
+            return "aborted: the delete-time re-check found this worktree "
+                + "DIRTY (\(entryCount) porcelain "
+                + "\(entryCount == 1 ? "entry" : "entries")) — the tree was "
+                + "left untouched. Commit, stash or discard that work, then "
+                + "re-scan."
+        case .failed(let reason):
+            return "aborted: the delete-time re-check could not prove this "
+                + "worktree clean (\(reason)) — the tree was left untouched. "
+                + "Retry once git can answer."
+        case .clean:
+            return "aborted: the delete-time re-check reported CLEAN without "
+                + "an ignored-path reading, which cannot happen — the tree "
+                + "was left untouched. Re-scan to rebuild this item."
+        }
     }
 
     private func warning(_ cause: String) -> String {

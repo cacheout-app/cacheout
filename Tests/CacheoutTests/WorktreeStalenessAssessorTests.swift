@@ -1073,7 +1073,41 @@ final class WorktreeStalenessAssessorTests: XCTestCase {
         XCTAssertEqual(
             GitWorktreeCleanCheck.arguments(forWorktreeAt: worktree),
             ["-C", "/repos/wt", "status", "--porcelain",
-             "--ignore-submodules=none", "--untracked-files=normal"]
+             "--ignore-submodules=none", "--untracked-files=normal",
+             "--ignored=traditional"]
+        )
+    }
+
+    /// `--ignored=traditional` MUST NOT change what counts as dirty (PR #460
+    /// codex r5, D2): an ignored build tree is what this scanner exists to
+    /// reclaim, so a `!! ` line is reported through `ignoredPaths` and is
+    /// invisible to the verdict, while every other byte still counts.
+    func testIgnoredLinesAreReportedButNeverCountAsDirt() {
+        let onlyIgnored = Data("!! .build/\n!! secret.env\n".utf8)
+        XCTAssertEqual(GitWorktreeCleanCheck.verdict(for: .success(stdout: onlyIgnored)),
+                       .clean)
+        XCTAssertEqual(
+            GitWorktreeCleanCheck.ignoredPaths(in: onlyIgnored),
+            [".build/", "secret.env"]
+        )
+
+        let mixed = Data("?? untracked.txt\n!! .build/\n".utf8)
+        XCTAssertEqual(GitWorktreeCleanCheck.verdict(for: .success(stdout: mixed)),
+                       .dirty(entryCount: 1),
+                       "the ignored line is not counted as an entry")
+
+        // An UNRECOGNISED line has no `!! ` prefix and is therefore dirt —
+        // the fail-closed direction the byte-level rule used to give for free.
+        let unknown = Data("something git has never printed\n".utf8)
+        XCTAssertEqual(GitWorktreeCleanCheck.verdict(for: .success(stdout: unknown)),
+                       .dirty(entryCount: 1))
+
+        // A reading only carries its ignored set when it is CLEAN: there is
+        // nothing to compare across a window that already refuses.
+        XCTAssertNil(
+            GitWorktreeCleanCheck.Reading(
+                verdict: .dirty(entryCount: 1), ignoredPaths: nil
+            ).ignoredPaths
         )
     }
 

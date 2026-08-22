@@ -16,17 +16,30 @@
 /// - **G1 not-main/not-bare** — porcelain POSITION (`isMain`) and the `bare`
 ///   attribute. No git call.
 /// - **G2 clean** — `git -C <wt> status --porcelain --ignore-submodules=none
-///   --untracked-files=normal` with EMPTY stdout. Neither flag is
-///   decoration: a repository can CONFIGURE its way to a false "clean", and
-///   this gate authorises a deletion. `--ignore-submodules=none` is what
-///   git's own `check_clean_worktree` (builtin/worktree.c) passes and
-///   overrides `submodule.<name>.ignore` / `diff.ignoreSubmodules`;
+///   --untracked-files=normal --ignored=traditional` reporting NO line that
+///   is not an ignored (`!! `) one. No flag is decoration: a repository can
+///   CONFIGURE its way to a false "clean", and this gate authorises a
+///   deletion. `--ignore-submodules=none` is what git's own
+///   `check_clean_worktree` (builtin/worktree.c) passes and overrides
+///   `submodule.<name>.ignore` / `diff.ignoreSubmodules`;
 ///   `--untracked-files=normal` overrides `status.showUntrackedFiles=no`.
 ///   Both holes are verified on git 2.50.1 and both are proven by fixtures
-///   that assert the bare-default command reports the tree CLEAN. Exported
-///   standalone as `GitWorktreeCleanCheck` because fn-5.4's revalidator
-///   re-runs exactly this check immediately before the filesystem fallback;
-///   one implementation, two call sites.
+///   that assert the bare-default command reports the tree CLEAN.
+///   `--ignored=traditional` (PR #460 codex r5, D2) does NOT change what
+///   counts as dirty — an ignored build tree is what this scanner exists to
+///   reclaim — it makes the ignored SET readable so the delete path can
+///   compare it across the gate window. Exported standalone as
+///   `GitWorktreeCleanCheck` because fn-5.4 re-runs exactly this check as its
+///   last gate; one implementation, two call sites.
+///
+///   WHAT G2 DOES NOT DECIDE, STATED HERE BECAUSE IT IS A DESIGN BOUNDARY
+///   AND NOT AN OVERSIGHT: an ignored file is not evidence against
+///   staleness. Refusing a worktree because it holds `node_modules/` or
+///   `.build/` would refuse every worktree this scanner is for. So the scan
+///   judges staleness on TRACKED and UNTRACKED state only, and what protects
+///   ignored work is the delete-time comparison — new ignored paths in the
+///   gate window refuse — plus the documented fact that ignored content IS
+///   destroyed with the tree.
 /// - **G3 merged** — LOCAL ancestry only. The default branch is resolved in
 ///   the PARENT repo (`refs/remotes/origin/HEAD` → `refs/heads/main` →
 ///   `refs/heads/master` → fail closed, D6) and then
@@ -224,9 +237,27 @@ enum GitWorktreeCleanCheck {
     /// multi-GB untracked build trees, where the extra walk could exhaust
     /// the scan budget and fail the gate closed on a perfectly ordinary
     /// tree.
+    /// - `--ignored=traditional` (PR #460 codex r5, D2) makes the ignored
+    ///   paths VISIBLE. It does not make them dirty — the verdict below still
+    ///   ignores them — but a worktree's ignored set is the one part of its
+    ///   contents `--porcelain` reports NOTHING about, and the delete path
+    ///   compares that set across the gate window so a file saved while the
+    ///   checks run is caught rather than destroyed. `traditional` rather
+    ///   than `matching` because, with `--untracked-files=normal`, it
+    ///   collapses an ignored DIRECTORY to one line instead of recursing into
+    ///   it: on this scanner's actual subject matter — worktrees holding
+    ///   multi-GB `node_modules` / `.build` trees — `matching` would walk
+    ///   every ignored file and could exhaust the scan budget. The cost of
+    ///   that choice is stated where it bites: a file created INSIDE an
+    ///   already-ignored directory is inside a collapsed line and is not
+    ///   detected.
     static let statusArguments = [
-        "status", "--porcelain", "--ignore-submodules=none", "--untracked-files=normal"
+        "status", "--porcelain", "--ignore-submodules=none",
+        "--untracked-files=normal", "--ignored=traditional",
     ]
+
+    /// The `!! ` prefix porcelain v1 puts on an ignored path.
+    static let ignoredPrefix = "!! "
 
     /// Full argv for one worktree. `-C <path>` rather than a CWD change: the
     /// runner never changes directory, and the shared PATH/`env` shape stays
@@ -241,9 +272,20 @@ enum GitWorktreeCleanCheck {
     static func verdict(for outcome: GitCommandOutcome) -> WorktreeCleanVerdict {
         switch outcome {
         case .success(let stdout):
-            // Byte-level: ANY output at all means the tree is not clean.
-            // Nothing here trims, tolerates, or interprets the bytes first.
-            guard stdout.isEmpty else { return .dirty(entryCount: entryCount(in: stdout)) }
+            // ANY line that is not an IGNORED line means the tree is not
+            // clean. Through r4 the rule was "any output at all", which was
+            // right while the argv could not produce a line that is not a
+            // status entry; `--ignored=traditional` can, and those lines are
+            // gated separately (`ignoredPaths` + the delete path's witness
+            // comparison) rather than conflated with dirtiness — an ignored
+            // build tree is this scanner's SUBJECT, not a reason to refuse.
+            // Every other byte is still dirt: an unrecognised line has no
+            // `!! ` prefix and therefore counts.
+            let entries = statusLines(in: stdout)
+                .filter { !$0.hasPrefix(ignoredPrefix) }
+            guard entries.isEmpty else {
+                return .dirty(entryCount: max(1, entries.count))
+            }
             return .clean
         case .failure(let exitCode, let stderr):
             return .failed(
@@ -282,9 +324,60 @@ enum GitWorktreeCleanCheck {
     /// body from reporting "0 entries" for output that already proved the
     /// tree dirty.
     static func entryCount(in stdout: Data) -> Int {
-        let text = String(decoding: stdout, as: UTF8.self)
-        let lines = text.split(separator: "\n", omittingEmptySubsequences: true)
-        return max(1, lines.count)
+        max(1, statusLines(in: stdout).count)
+    }
+
+    /// The porcelain body as non-empty lines. Porcelain v1 C-QUOTES a path
+    /// containing a newline, so splitting on `\n` never splits one path into
+    /// two — the same guarantee `-z` buys the registry parser, for free here
+    /// because this output is not `-z`.
+    static func statusLines(in stdout: Data) -> [Substring] {
+        String(decoding: stdout, as: UTF8.self)
+            .split(separator: "\n", omittingEmptySubsequences: true)
+            .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+    }
+
+    /// The IGNORED paths this reading reports, as a SET — the D2 witness.
+    ///
+    /// EMPTY IS NOT "no answer": a reading that did not succeed never reaches
+    /// here, because `read` returns the paths only alongside a `.clean`
+    /// verdict and the caller refuses on every other verdict.
+    static func ignoredPaths(in stdout: Data) -> Set<String> {
+        Set(
+            statusLines(in: stdout)
+                .filter { $0.hasPrefix(ignoredPrefix) }
+                .map { String($0.dropFirst(ignoredPrefix.count)) }
+        )
+    }
+
+    /// One reading: the clean verdict AND the ignored set that came with it.
+    ///
+    /// ONE invocation answers both, which is the point — a second `status`
+    /// for the ignored half would answer about a different instant.
+    struct Reading: Equatable, Sendable {
+        let verdict: WorktreeCleanVerdict
+        /// Non-nil ONLY for `.clean`; there is no ignored set to compare when
+        /// the tree is already refused.
+        let ignoredPaths: Set<String>?
+    }
+
+    /// Run the check and keep both halves of the answer.
+    static func read(
+        worktreeAt worktreePath: URL,
+        using runner: any GitCommandRunning,
+        timeout: TimeInterval? = nil
+    ) async -> Reading {
+        let arguments = arguments(forWorktreeAt: worktreePath)
+        let invocation: GitCommandInvocation
+        if let timeout {
+            invocation = await runner.run(arguments, timeout: timeout)
+        } else {
+            invocation = await runner.run(arguments)
+        }
+        let verdict = verdict(for: invocation.outcome)
+        guard verdict == .clean, case .success(let stdout) = invocation.outcome
+        else { return Reading(verdict: verdict, ignoredPaths: nil) }
+        return Reading(verdict: verdict, ignoredPaths: ignoredPaths(in: stdout))
     }
 }
 

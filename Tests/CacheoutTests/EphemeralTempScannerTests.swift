@@ -2968,11 +2968,11 @@ final class EphemeralTempScannerTests: XCTestCase {
         // the defect and must not regress.
         XCTAssertTrue(
             try XCTUnwrapElement(outcome.errors, 0).detail.contains("(regular file)"),
-            "detail names the real kind: \(outcome.errors[0].detail)"
+            "detail names the real kind: \(outcome.errors.map(\.detail))"
         )
         XCTAssertTrue(
             try XCTUnwrapElement(outcome.errors, 1).detail.contains("(special file)"),
-            "detail names the real kind: \(outcome.errors[1].detail)"
+            "detail names the real kind: \(outcome.errors.map(\.detail))"
         )
     }
 
@@ -3014,7 +3014,7 @@ final class EphemeralTempScannerTests: XCTestCase {
         // The clause that fired stays in the tooltip, where it always was.
         XCTAssertTrue(
             try XCTUnwrapElement(outcome.errors, 0).detail.contains("home directory"),
-            "detail names the clause: \(outcome.errors[0].detail)"
+            "detail names the clause: \(outcome.errors.map(\.detail))"
         )
     }
 

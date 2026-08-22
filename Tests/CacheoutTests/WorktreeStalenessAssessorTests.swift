@@ -644,7 +644,7 @@ final class WorktreeStalenessAssessorTests: XCTestCase {
             "-q is what makes an unset origin/HEAD exit 1 instead of a fatal 128"
         )
         guard case .failure(let exitCode, _) = try XCTUnwrapElement(ladder, 0).outcome else {
-            return XCTFail("expected the origin/HEAD probe to fail, got \(ladder[0].outcome)")
+            return XCTFail("expected the origin/HEAD probe to fail, got \(ladder.map(\.outcome))")
         }
         XCTAssertEqual(
             exitCode, 1,

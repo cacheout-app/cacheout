@@ -2356,8 +2356,16 @@ struct WorktreeReclaimPerformer {
         // .reftableStack) { return .witness(stack) }` on this line, in the
         // round whose own doctrine deleted a guard twenty lines above for
         // being unevidenced. It was unevidenced too: MUTATION M7 replaced this
-        // whole block with `return .unreadable` and the FULL suite stayed at
-        // 1466 executed / 2 skipped / 0 failures.
+        // whole block with `return .unreadable` and the FULL suite stayed
+        // GREEN — `swift test`, run AT COMMIT 06c1ad5, reported 1466
+        // executed / 2 skipped / 0 failures.
+        //
+        // THE COMMAND AND THE COMMIT ARE BOTH STATED BECAUSE THE TOTAL MOVES
+        // (PR #460 codex r7, D5). 1466 is 06c1ad5's total, not this branch's:
+        // 0284fd1 took it to 1467, 193b043 to 1470, bcfcb7e to 1471, and r7's
+        // own cells take it further again. The half that survives every
+        // commit — and the half a mutation actually establishes — is the ZERO
+        // FAILURES.
         //
         // MEASURED, git 2.50.1, on a `--ref-format=reftable` linked worktree
         // (`git init --ref-format=reftable`, seed commit, `worktree add -b

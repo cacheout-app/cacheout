@@ -591,8 +591,10 @@ final class GitWorktreeReclaimActionTests: XCTestCase {
             "a stale plan whose worktree path is not the admitted target",
             reason: "is not the admitted requestedTargetURL"
         )
-        // Round 8: the admin ENTRY is what the post-fallback prune gate
+        // Round 8: the admin ENTRY is what the GATED POST-REMOVAL prune gate
         // compares against, so it must live inside the carried container.
+        // ("post-fallback" until PR #460 codex r7, D6: there is no fallback
+        // arm — the removal is the only arm, and the prune follows it.)
         try await assertRefusedAtBothSites(
             item(plan(.removeStaleWorktree,
                       worktreeAdminEntry: container.appendingPathComponent("wt"))),

@@ -72,8 +72,12 @@ import XCTest
 /// A THIRD MUTATION, from the same round, is recorded here because its
 /// subject no longer exists: M7 replaced `captureHead`'s THIRD arm — the
 /// reftable-stack read after "HEAD is not a readable regular file" — with
-/// `return .unreadable`, and the FULL suite stayed at 1466 executed / 2
-/// skipped / 0 failures. That arm was deleted at r6 rather than evidenced; see
+/// `return .unreadable`, and the FULL suite stayed GREEN: `swift test`, run AT
+/// COMMIT 06c1ad5, reported 1466 executed / 2 skipped / 0 failures. The TOTAL
+/// belongs to that commit and not to this branch (PR #460 codex r7, D5) —
+/// 0284fd1 → 1467, 193b043 → 1470, bcfcb7e → 1471, and r7 adds more; what a
+/// mutation establishes is the zero failures. That arm was deleted at r6
+/// rather than evidenced; see
 /// `testAReftableWorktreeWhoseHeadFileIsGoneIsRefusedByTheGatesThatRemain` and
 /// the measurement in `captureHead` itself.
 ///
@@ -1406,9 +1410,10 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
     /// M1's cell — the far-side `reproveFromTheFilesystem` inside the mover
     /// closure — AND M6's, the `catch let refusal as LastInstantRefusal` arm.
     ///
-    /// r6 added both and evidenced neither: PR #460 codex r7, D3 measured that
+    /// r6 added both and evidenced neither: the r7 review measured that
     /// deleting the far-side re-proof (keeping `proveTheLeaf()`) and deleting
-    /// the typed catch arm each left the FULL suite at 1471/2/0, exit 0.
+    /// the typed catch arm each left `swift test` AT COMMIT 26c880b at
+    /// 1471 executed / 2 skipped / 0 failures, exit 0.
     ///
     /// THE ATTACK IS A LOCK, NOT A RE-ADD, AND THAT IS THE WHOLE POINT.
     /// `git worktree lock` writes `<admin>/locked` and touches neither the
@@ -1956,8 +1961,13 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         // caller captured from a descriptor first, so the removal path
         // captures one before its TOCTOU rechecks. Handing `.unbound` instead still
         // compiles and still deletes — measured: replacing the capture with
-        // `.unbound` left the whole suite green at 1418/2/0 — so without this
-        // cell the binding is a parameter nobody checks.
+        // `.unbound` left the whole suite GREEN, zero failures, under
+        // `swift test`. The executed total recorded beside that figure (1418)
+        // was taken at an earlier commit on this branch that the note did not
+        // name, and it does not reproduce at HEAD (PR #460 codex r7, D5), so
+        // it is not restated here as though it did; the fact the mutation
+        // established is the zero failures. So without this cell the binding
+        // is a parameter nobody checks.
         //
         // The capture is the removal path's FIRST descriptor-identity call
         // (the gates before it are path-based), so a provider that can prove no
@@ -3995,8 +4005,10 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
     ///
     /// r5 shipped a reftable-stack fallback after "(3) HEAD is not a readable
     /// regular file", and MUTATION M7 — replacing that block with
-    /// `return .unreadable` — left the full suite at 1466 / 2 skipped / 0
-    /// failures. It could not be otherwise: MEASURED on git 2.50.1, making a
+    /// `return .unreadable` — left the full suite GREEN: `swift test`, run AT
+    /// COMMIT 06c1ad5, reported 1466 executed / 2 skipped / 0 failures (the
+    /// total is that commit's; HEAD's is higher — see the class header, D5).
+    /// It could not be otherwise: MEASURED on git 2.50.1, making a
     /// reftable worktree's `<admin>/HEAD` unreadable (symlink, or removed)
     /// leaves `git -C <parent> worktree list` reporting BOTH records at exit 0
     /// while `git -C <worktree> …` returns exit 128, "fatal: not a git

@@ -2,8 +2,6 @@
 # Measure the window between handing a worktree to a remover and the first
 # file inside it being gone (PR #460 codex r5, D1).
 #
-#   cc -O2 -o scripts/measure/worktree-removal-window \
-#          scripts/measure/worktree-removal-window.c
 #   scripts/measure/worktree-removal-window.sh git 0    10
 #   scripts/measure/worktree-removal-window.sh fs  0    10
 #   scripts/measure/worktree-removal-window.sh git 2000 5
@@ -23,7 +21,43 @@
 set -e
 MODE=$1; N=$2; ITERS=$3
 BASE=${TMPDIR:-/tmp}/cacheout-removal-window
-WIN=${WIN:-$(dirname "$0")/worktree-removal-window}
+HERE=$(dirname "$0")
+WIN=${WIN:-$HERE/worktree-removal-window}
+
+# BUILD IT, OR SAY WHY NOT (PR #460 codex r7, D7). Through r6 this script
+# printed a `cc -O2 …` recipe in a comment and then ran $WIN regardless: on a
+# machine with no `cc` on PATH — the Xcode-only macOS default, where the
+# compiler is `xcrun clang` — the recipe failed, the binary was never built,
+# and the script died with a bare "no such file or directory" that named
+# neither cause. A checked-in harness whose own instructions do not run is not
+# a reproducible measurement.
+if [ ! -x "$WIN" ] || [ "$HERE/worktree-removal-window.c" -nt "$WIN" ]; then
+  # An ARRAY, because the working spelling on a stock macOS is TWO words
+  # (`xcrun clang`) and this script's shell is zsh, which does not word-split
+  # an unquoted scalar. `$CC="xcrun clang"` split as one word is exactly how
+  # the first attempt at this fix failed.
+  local -a COMPILER
+  if [ -n "${CC:-}" ]; then
+    COMPILER=( ${=CC} )
+  elif command -v cc >/dev/null 2>&1; then
+    COMPILER=( cc )
+  elif command -v xcrun >/dev/null 2>&1 && xcrun -f clang >/dev/null 2>&1; then
+    COMPILER=( xcrun clang )
+  else
+    echo "worktree-removal-window: no C compiler found. Install the Xcode" >&2
+    echo "command line tools (xcode-select --install), or set CC=<compiler>." >&2
+    exit 127
+  fi
+  echo "worktree-removal-window: building with ${COMPILER[*]}" >&2
+  "${COMPILER[@]}" -O2 -o "$WIN" "$HERE/worktree-removal-window.c" || {
+    echo "worktree-removal-window: build FAILED with ${COMPILER[*]}" >&2
+    exit 1
+  }
+fi
+if [ ! -x "$WIN" ]; then
+  echo "worktree-removal-window: $WIN is missing or not executable" >&2
+  exit 1
+fi
 for i in $(seq 1 $ITERS); do
   rm -rf "$BASE"
   mkdir -p "$BASE/parent"

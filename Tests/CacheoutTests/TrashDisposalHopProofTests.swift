@@ -4,12 +4,17 @@ import XCTest
 /// # The proofs `TrashDisposal` runs on the FAR SIDE of the mover's hop
 ///
 /// r6 added three of them — one per `dispose` arm — and shipped all three
-/// UNEVIDENCED. PR #460 codex r7, D3 measured it: deleting each in turn (M2,
-/// the no-leaf-verdict overload; M3, the `.nonDirectoryLeaf` arm; M4, the
-/// `proveStanding` arm) left the FULL suite at 1471 executed / 2 skipped /
-/// 0 failures, exit 0. A guard no cell can kill is a guard nobody is holding
-/// to its contract, and this branch's own doctrine is that such a guard is
-/// deleted or evidenced. These three cells evidence them.
+/// UNEVIDENCED. The r7 review measured it: deleting each in turn (M2, the
+/// no-leaf-verdict overload; M3, the `.nonDirectoryLeaf` arm; M4, the
+/// `proveStanding` arm) left `swift test` AT COMMIT 26c880b at 1471 executed /
+/// 2 skipped / 0 failures, exit 0. A guard no cell can kill is a guard nobody
+/// is holding to its contract, and this branch's own doctrine is that such a
+/// guard is deleted or evidenced. These three cells evidence them.
+///
+/// RE-RUN AGAINST THESE CELLS, each mutation reddens exactly its own — the
+/// command is `swift test --filter TrashDisposalHopProofTests`, and M2 fails
+/// only `testTheNoVerdictArm…`, M3 only `testTheFileVerdictArm…`, M4 only
+/// `testTheDirectoryVerdictArm…`.
 ///
 /// ## The shape, and why it is the honest one
 ///

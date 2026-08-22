@@ -263,7 +263,12 @@ struct CleanupReport {
         let disposal: Disposal
         /// ADDITIVE (fn-5.4, D11) — a NON-FATAL condition attached to an entry
         /// that DID succeed. Today's only producer is the stale-worktree
-        /// post-fallback prune: the tree is gone and its bytes are genuinely
+        /// GATED POST-REMOVAL prune (`WorktreeReclaimPerformer.gatedPostRemovalPrune`;
+        /// this said "post-fallback prune" until PR #460 codex r7, D6 — there
+        /// is no fallback arm on that path and has not been since r5, and the
+        /// prune runs after THE removal, gated on the recomputed prunable set
+        /// being exactly the deleted worktree's own admin entry): the tree is
+        /// gone and its bytes are genuinely
         /// freed, but the repository's orphaned admin data was left behind
         /// (the prune was conservatively skipped, or it failed after the
         /// deletion had already succeeded).

@@ -22,11 +22,12 @@
 /// and only then unlinks — and it never re-reads admin-directory identity,
 /// HEAD, or ancestry.
 ///
-/// MEASURED THIS ROUND, uninstrumented — a C harness that forks and execs
-/// the remover while the parent spins on `lstat` of the worktree's only
-/// tracked file until ENOENT (git 2.50.1, macOS 15, APFS). The r5 review
-/// reported 19.9 ms and 159.5 ms for the git row on the same shapes; these
-/// are this round's own runs of the same experiment:
+/// MEASURED THIS ROUND, uninstrumented, with the harness checked in at
+/// `scripts/measure/worktree-removal-window.{c,sh}` — it forks and execs the
+/// remover while the parent spins on `lstat` of the worktree's only tracked
+/// file until ENOENT (git 2.50.1, macOS 15, APFS). The r5 review reported
+/// 19.9 ms and 159.5 ms for the git row on the same shapes; these are this
+/// round's own runs of the same experiment:
 ///
 /// | arm | 1 tracked file | 2001 tracked files |
 /// |---|---|---|
@@ -1890,8 +1891,10 @@ struct WorktreeReclaimPerformer {
     ///
     /// `tables.list` is the substrate that closes it. MEASURED THIS ROUND,
     /// git 2.50.1, on a linked worktree of a `--ref-format=reftable`
-    /// repository (`scratchpad/reftable2.sh`, one run, figures pasted from
-    /// its output):
+    /// repository — `git init --ref-format=reftable`, seed commit,
+    /// `worktree add -b feature`, then each operation in the order shown,
+    /// `stat`-ing the file after each (one run, figures pasted from its
+    /// output):
     ///
     /// | operation | `tables.list` inode | contents |
     /// |---|---|---|

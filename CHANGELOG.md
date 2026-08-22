@@ -48,7 +48,12 @@ below are both part of that coordination, and the latter BLOCKS this release.
   `git worktree unlock …`", "merge, rebase or push that commit"), and deletes
   nothing. Only then is the tree re-checked for cleanliness and deleted
   directly, followed by a narrowly gated removal of that worktree's own admin
-  entry. The repository-level item removes exactly the admin directories it
+  entry. The re-establishment also proves WHICH worktree it is about: the
+  checkout at the assessed path must still back-link to the same admin
+  directory the scan resolved, so a worktree you retired and replaced at that
+  path — by `git worktree move` or a fresh `add` under another name — is
+  refused instead of removed. The repository-level item removes exactly the
+  admin directories it
   disclosed, one at a time — no repository-wide `git worktree prune` runs,
   because git recomputes that command's set for itself after every check has
   already answered, and a second checkout of the same repository that

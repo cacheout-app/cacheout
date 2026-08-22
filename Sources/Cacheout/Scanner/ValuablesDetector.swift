@@ -136,7 +136,7 @@
 /// this machine, `st_dev` is identical for literally every path INCLUDING
 /// `/` and `/System/Volumes/Data`, so the device comparison is blind to
 /// exactly the APFS firmlink split it was partly meant to catch. The two
-/// path-based signals the sizer (`DirectorySizer.swift:202,287`) and the
+/// path-based signals the sizer (`DirectorySizer.swift:261-272,354-359`) and the
 /// project walker already use are retained beside it — they are the seam
 /// hermetic tests inject through, and they can only ever push the answer
 /// toward refusal. There is still exactly ONE notion of "mount boundary" in
@@ -500,7 +500,7 @@ struct ValuablesDisclosure: Equatable, Sendable {
     /// `ValuableIdentity` integer verbatim (decimal; `device`/`inode`
     /// unsigned). The leading pair is the canonical ItemKey serialization,
     /// matching the frozen `stableID` preimage convention
-    /// (`ReclaimableItem.stableID`, `SpaceScanner.swift:784`): item ids are
+    /// (`ReclaimableItem.stableID`, `SpaceScanner.swift:796`): item ids are
     /// scanner-scoped, so only the
     /// FULL ItemKey makes a token item-bound — a token applied to another
     /// item, even the same item id under a different scanner id, can never
@@ -935,7 +935,7 @@ enum ValuablesDetector {
         descriptorWindow: Int? = nil
     ) -> ValuablesDisclosure {
         // MOUNT BOUNDARY AT THE ROOT. The sizer applies these signals to its
-        // OWN root (`DirectorySizer.swift:202`) and declines to enumerate; the
+        // OWN root (`DirectorySizer.swift:261-272`) and declines to enumerate; the
         // probe must decline identically, or the delete-time face — which has
         // no size report to consult — would read a whole mounted volume.
         // Nothing beneath is opened: not one entry of a foreign filesystem is

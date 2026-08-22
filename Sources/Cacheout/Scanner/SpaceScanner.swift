@@ -1572,7 +1572,7 @@ struct SpaceScannerRuntime {
     ///   parameter and its pass-through as if they were callers, and omitted
     ///   the GUI entirely). First: `devRoots` is passed NON-NIL by both
     ///   shipped surfaces — the GUI unconditionally
-    ///   (`CacheoutViewModel.swift:489`, a non-optional `DevRootsResolution`)
+    ///   (`CacheoutViewModel.swift:541`, a non-optional `DevRootsResolution`)
     ///   and the CLI whenever `--dev-root` is given
     ///   (`CLIHandler.swift:206` and `:220`, through the forwarder whose own
     ///   parameter is declared at `:427` and passed through at `:433`) —
@@ -1587,7 +1587,7 @@ struct SpaceScannerRuntime {
     ///
     ///   It exists because of D4 (PR #459 codex r10): the `nil` arm is the
     ///   one BOTH shipped compositions take — neither
-    ///   `CacheoutViewModel.production` (`CacheoutViewModel.swift:483-499`)
+    ///   `CacheoutViewModel.production` (`CacheoutViewModel.swift:533-552`)
     ///   nor `CLIHandler.CLIRuntimeDependencies.production`
     ///   (`CLIHandler.swift:426-438`) passes `ephemeralTempRoots:` — and its
     ///   `issues` half was UNEVIDENCED: replacing this site with a version

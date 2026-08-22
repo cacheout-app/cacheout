@@ -1,0 +1,328 @@
+import XCTest
+
+/// # Anchors rot silently, and this branch shipped that three times
+///
+/// A comment that cites `Some.swift` at lines 1452-1456 is a claim about a
+/// LINE NUMBER, and a line number is invalidated by any edit ABOVE it in the
+/// cited file — an edit that touches neither the comment nor anything it
+/// is about. Nothing then reads wrong: the anchor still names a real file
+/// and a real line, and the reader lands on plausible neighbouring text.
+///
+/// MEASURED on this branch (PR #460 codex r8, D2). `2d2ad5e` ("repoint 17
+/// anchors") set 16 anchors against `SpaceScanner.swift` as it stood there;
+/// `26c880b` then added a net +12 lines above them and nothing re-verified.
+/// By `git show <commit>:Sources/Cacheout/Scanner/SpaceScanner.swift`:
+/// `static func stableID` 784 → 796, `static func production(` 1589 → 1601,
+/// `private static func suppressingAliasShadows` 1447 → 1459. One of them,
+/// the one at 1462-1465, had drifted onto DIFFERENT prose that still reads
+/// like a citation — the failure mode this file exists to make impossible.
+///
+/// Auditing the rest at r8 found the same rot in anchors this PR never
+/// touched. In `DirectorySizer`, lines 202 and 205 were cited by 5 sites
+/// between them and are BLANK LINES. In `CacheoutViewModel`, the range
+/// 483-499 was cited as `CacheoutViewModel.production`, which sits at 533,
+/// and line 489 was cited as a non-optional `DevRootsResolution` and is the
+/// doc line `///   source.`. In `ProjectTreeWalker`, line 376 is a bare `}`;
+/// in `PathGuard`, line 357 is a bare `)`. And one anchor named
+/// `NodeModulesScanner`, a file that no longer exists — its predicate now
+/// lives in `BuildArtifactsScanner.publishedLogicalBytes`. All are repointed
+/// in the same commit as this file.
+///
+/// ## The check
+///
+/// Every `<Name>.swift` followed by `:N` or `:N-M`, written inside a comment
+/// anywhere under `Sources/` or `Tests/`, must:
+///
+/// 1. name a file that exists, exactly once, under `Sources/` or `Tests/`;
+/// 2. cite a line range that file actually has;
+/// 3. appear in `anchorExpectations` — DEFAULT-DENY, so a new anchor is a
+///    build-out-of-the-box failure until its author states what it points at;
+/// 4. and the pinned excerpt must appear somewhere inside the cited range.
+///
+/// The excerpt is the point. Pinning only "the file has that many lines"
+/// would have passed every one of the shifted anchors above.
+///
+/// ## What this does NOT cover, stated rather than implied
+///
+/// - **Only comments.** The scanner requires a `//` earlier on the line, so
+///   an anchor inside a string literal is invisible. None exists.
+/// - **The excerpt, not the MEANING.** It proves the cited range still holds
+///   the text r8 verified it held; it cannot prove that text is what the
+///   citing sentence claims. That judgement was made once, by hand, at r8 —
+///   and pinning it is what makes a future drift a failing cell instead of a
+///   reader's wrong turn.
+/// - **A moved anchor is a FAILING cell, not an auto-fix.** Repointing means
+///   re-reading the citing sentence, which is the work the three shipped
+///   shifts skipped.
+/// - **Anchors in Markdown are not read** — `SCANNERS-ROADMAP.md` and
+///   `CHANGELOG.md` cite by SYMBOL, not by line.
+final class SourceAnchorIntegrityTests: XCTestCase {
+
+    /// `File.swift:N` or `File.swift:N-M`.
+    static let anchorPattern =
+        #"([A-Za-z][A-Za-z0-9_]*\.swift):(\d+)(?:\s*-\s*(\d+))?"#
+
+    /// Every anchor in the tree, with a fragment of the text it cites.
+    /// Sorted; one entry per DISTINCT anchor however many places cite it.
+    static let anchorExpectations: [(anchor: String, excerpt: String)] = [
+        ("BuildArtifactsScanner.swift:1405-1406",
+         "deletable && report.logicalBytes > report.measur"),
+        ("BuildArtifactsScanner.swift:378-382",
+         "this walk's per-root classified issues. Candidat"),
+        ("CLIHandler.swift:206",
+         "orphanedCachesThresholds: sweepThresholds, devRo"),
+        ("CLIHandler.swift:2123",
+         "One invocation, one session (R9): the cleaner ho"),
+        ("CLIHandler.swift:426-438",
+         "orphanedCachesThresholds: OrphanedCacheClassifie"),
+        ("CacheoutApp.swift:58",
+         "@StateObject private var viewModel = CacheoutVie"),
+        ("CacheoutViewModel.swift:1465-1466",
+         "never report (the runtime invokes only the named"),
+        ("CacheoutViewModel.swift:264",
+         "@MainActor"),
+        ("CacheoutViewModel.swift:533-552",
+         "static func production("),
+        ("CacheoutViewModel.swift:541",
+         ".production(home: home, provider: provider, devR"),
+        ("CacheoutViewModel.swift:588-592",
+         "private func isBlockedFromDestructivePaths(_ sca"),
+        ("ContentView.swift:203-208",
+         "ForEach(viewModel.perItemSections) { section in"),
+        ("DepthSafeRemoval.swift:641-878",
+         "private static func removeTree("),
+        ("DevRootsStore.swift:28-38",
+         "walker's `originRoot` carry these verbatim; vali"),
+        ("DevRootsStore.swift:320-324",
+         "isDirectory: provider.probeKind(of: declared) =="),
+        ("DevRootsStore.swift:322",
+         "key: provider.canonicalize(declared).path,"),
+        ("DevRootsStore.swift:326-332",
+         "of it — and an ACTIVELY HARMFUL one: `PathGuard."),
+        ("DevRootsStore.swift:333-335",
+         "let coveredByRealDirectory = Set("),
+        ("DevRootsStore.swift:349-355",
+         "issues.append(ScanIssue("),
+        ("DirectorySizer.swift:261-272",
+         "provider.isMountPoint(resolved)"),
+        ("DirectorySizer.swift:354-359",
+         "provider.isMountPoint(itemURL)"),
+        ("DirectorySizer.swift:483",
+         "case .some(Int(EPERM)):"),
+        ("DirectorySizer.swift:50-52",
+         "- `.scanRoot`: the root is fully resolved via th"),
+        ("EphemeralTempScanner.swift:1579-1583",
+         "Never followed; neither carries content of its o"),
+        ("EphemeralTempScanner.swift:771-777",
+         "kind: kind == .symlink ? .symlinkRoot : .nonDire"),
+        ("EphemeralTempScannerTests.swift:2971",
+         "XCTAssertTrue("),
+        ("FileSystemIdentityProvider.swift:143",
+         "guard !blocksOverflow, allocated >= 0 else { ret"),
+        ("FileSystemIdentityProvider.swift:292-296",
+         "case S_IFREG: return .kind(.regularFile)"),
+        ("MemlimitWorkaround.swift:187",
+         "return (false, \"memorystatus_control_hwm_failed:"),
+        ("OrphanedCachesScanner.swift:1387-1691",
+         "static func boundedUserDataShapeWalk("),
+        ("OrphanedCachesScanner.swift:193",
+         "#458 review r9). It is the single IRREDUCIBLE cl"),
+        ("OrphanedCachesScanner.swift:230-233",
+         "tree is still unmeasurable and still lands at re"),
+        ("OrphanedCachesScanner.swift:2397-2403",
+         "A failed read mid-directory: the rest is unprove"),
+        ("PathGuard.swift:165-176",
+         "refuses non-directory containers, so a link iden"),
+        ("PathGuard.swift:350-361",
+         "throw PathGuardError.outsideCategoryPolicy(path:"),
+        ("PathGuard.swift:370",
+         "`~/Documents` can be a container while `admitDel"),
+        ("PathGuard.swift:400-403",
+         "(2) No-follow reality gate on BOTH spellings: th"),
+        ("PathGuard.swift:45",
+         "compared as `pathComponents` arrays (never `hasP"),
+        ("PathGuard.swift:462-469",
+         "The filesystem root `/` is exempt from both: it"),
+        ("ProjectTreeWalker.swift:529-532",
+         "|| provider.isMountPoint(provider.canonicalize(c"),
+        ("SpaceScanner.swift:1413-1424",
+         "no-follow reality gate to THAT spelling and refu"),
+        ("SpaceScanner.swift:143",
+         "`[\"git\", \"-C\", <parentRepoWorkingDir>, \"worktree"),
+        ("SpaceScanner.swift:1453-1458",
+         "Nothing is silently lost: a dropped root is unus"),
+        ("SpaceScanner.swift:1459-1461",
+         "private static func suppressingAliasShadows("),
+        ("SpaceScanner.swift:1459-1499",
+         "private static func suppressingAliasShadows("),
+        ("SpaceScanner.swift:1464-1468",
+         "let probed = roots.map { root in"),
+        ("SpaceScanner.swift:1474-1477",
+         "Two real-directory spellings of one location are"),
+        ("SpaceScanner.swift:1601",
+         "static func production("),
+        ("SpaceScanner.swift:40-51",
+         "(Documents, Desktop, …) are enumerated ONLY for"),
+        ("SpaceScanner.swift:796",
+         "static func stableID(scannerID: String, canonica"),
+        ("SysctlJournal.swift:192",
+         "state.entries.append(entry)"),
+        ("ValuablesDetector.swift:1752",
+         "errno = 0"),
+]
+
+    // MARK: - The walk
+
+    /// The repository root: this file is `Tests/CacheoutTests/<name>.swift`.
+    private var repositoryRoot: URL {
+        URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()   // Tests/CacheoutTests
+            .deletingLastPathComponent()   // Tests
+            .deletingLastPathComponent()   // <repo>
+    }
+
+    /// Every `.swift` file under `Sources/` and `Tests/`, in a stable order.
+    private func swiftSources() throws -> [URL] {
+        var files: [URL] = []
+        for directory in ["Sources", "Tests"] {
+            let root = repositoryRoot.appendingPathComponent(directory)
+            let walker = try XCTUnwrap(
+                FileManager.default.enumerator(
+                    at: root, includingPropertiesForKeys: nil
+                ),
+                "\(directory)/ could not be enumerated at \(root.path)"
+            )
+            for case let url as URL in walker where url.pathExtension == "swift" {
+                files.append(url)
+            }
+        }
+        return files.sorted { $0.path < $1.path }
+    }
+
+    /// `anchor -> [citing site]`, read from comment text only.
+    private func anchorSites() throws -> [String: [String]] {
+        guard let regex = try? NSRegularExpression(
+            pattern: Self.anchorPattern
+        ) else { return [:] }
+        var sites: [String: [String]] = [:]
+        for file in try swiftSources() {
+            let source = try String(contentsOf: file, encoding: .utf8)
+            for (number, line) in source.split(
+                separator: "\n", omittingEmptySubsequences: false
+            ).enumerated() {
+                guard let comment = line.range(of: "//") else { continue }
+                let text = String(line[comment.lowerBound...])
+                let full = NSRange(text.startIndex..., in: text)
+                for match in regex.matches(in: text, range: full) {
+                    guard let range = Range(match.range, in: text) else {
+                        continue
+                    }
+                    sites[String(text[range]), default: []].append(
+                        "\(file.lastPathComponent):\(number + 1)"
+                    )
+                }
+            }
+        }
+        return sites
+    }
+
+    func testEverySourceAnchorStillPointsAtWhatItCites() throws {
+        let sources = try swiftSources()
+        var byName: [String: [URL]] = [:]
+        for file in sources {
+            byName[file.lastPathComponent, default: []].append(file)
+        }
+        let expectations = Dictionary(
+            uniqueKeysWithValues: Self.anchorExpectations.map {
+                ($0.anchor, $0.excerpt)
+            }
+        )
+        let sites = try anchorSites()
+        var offenders: [String] = []
+
+        for anchor in sites.keys.sorted() {
+            let where_ = sites[anchor]?.sorted().joined(separator: ", ") ?? ""
+            // No subscripts anywhere below: `StrandFenceTests` reads this
+            // file too, and it reported this very block at r8 before the
+            // rewrite.
+            let parts = anchor.split(separator: ":").map(String.init)
+            guard parts.count == 2, let name = parts.first,
+                  let citedLines = parts.last
+            else {
+                offenders.append("\(anchor) (\(where_)): unparsable")
+                continue
+            }
+            let numbers = citedLines.split(separator: "-").compactMap {
+                Int($0.trimmingCharacters(in: .whitespaces))
+            }
+            guard let low = numbers.first, let high = numbers.last else {
+                offenders.append("\(anchor) (\(where_)): unparsable")
+                continue
+            }
+            guard let targets = byName[name], targets.count == 1,
+                  let target = targets.first
+            else {
+                offenders.append(
+                    "\(anchor) (\(where_)): names \(byName[name]?.count ?? 0) "
+                        + "files under Sources/ and Tests/"
+                )
+                continue
+            }
+            let lines = try String(contentsOf: target, encoding: .utf8)
+                .split(separator: "\n", omittingEmptySubsequences: false)
+            guard low >= 1, high >= low, high <= lines.count else {
+                offenders.append(
+                    "\(anchor) (\(where_)): the file has \(lines.count) lines"
+                )
+                continue
+            }
+            guard let excerpt = expectations[anchor] else {
+                offenders.append(
+                    "\(anchor) (\(where_)): no entry in anchorExpectations — "
+                        + "state what this anchor points at"
+                )
+                continue
+            }
+            let cited = lines[(low - 1)..<high].joined(separator: "\n")
+            if !cited.contains(excerpt) {
+                offenders.append(
+                    "\(anchor) (\(where_)): the cited range no longer contains "
+                        + "\(excerpt.debugDescription) — it now reads "
+                        + "\(cited.prefix(160).debugDescription)"
+                )
+            }
+        }
+
+        XCTAssertGreaterThan(
+            sources.count, 80,
+            "the check must actually have read the tree, not an empty listing"
+        )
+        XCTAssertGreaterThan(
+            sites.count, 40,
+            "the check must actually have found anchors, not zero of them"
+        )
+        XCTAssertEqual(
+            offenders, [],
+            "an anchor whose cited line no longer holds what the comment says "
+                + "sends every future reader to the wrong place, and nothing "
+                + "else in the build looks at it. Re-read the citing sentence, "
+                + "repoint the anchor, and update anchorExpectations."
+        )
+    }
+
+    /// The table's own rot check: an entry for an anchor nobody cites any more
+    /// is a pin on text no comment depends on, and it hides the fact that the
+    /// citation was deleted.
+    func testTheAnchorTableCarriesNoEntryNobodyCites() throws {
+        let cited = Set(try anchorSites().keys)
+        let listed = Self.anchorExpectations.map(\.anchor)
+        XCTAssertEqual(
+            listed.count, Set(listed).count,
+            "anchorExpectations has a duplicate anchor"
+        )
+        XCTAssertEqual(
+            listed.filter { !cited.contains($0) }, [],
+            "anchorExpectations lists anchors no comment cites any more"
+        )
+    }
+}

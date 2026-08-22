@@ -510,8 +510,9 @@ final class StrandFenceTests: XCTestCase {
     /// `.indices`, an integer range, `stride` — the subscript is an INTEGER
     /// subscript, so the receiver is a collection indexed by `Int` and the
     /// read traps exactly like `xs[0]`. MEASURED at r8: the live site was
-    /// `WorktreeStalenessAssessorTests.swift:974-975`,
-    /// `clauses[index].hasPrefix(…)` with `clauses` composed by
+    /// `clauses[index].hasPrefix(…)` in `WorktreeStalenessAssessorTests`
+    /// (lines 974-975 as they stood at `f6a048f`, the commit before the fix),
+    /// with `clauses` composed by
     /// `WorktreeStalenessAssessor.evidence` — the exact shape
     /// `TestElementAccess.swift` calls out, sitting one line under its
     /// `XCTAssertEqual(clauses.count, 4, …)`.

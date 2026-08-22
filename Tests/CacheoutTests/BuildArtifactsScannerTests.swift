@@ -1004,7 +1004,7 @@ final class BuildArtifactsScannerTests: XCTestCase {
     }
 
     func testLogicalBytesPredicateMatchesTheAsBuiltBoundaryCells() {
-        // The as-built predicate VERBATIM (NodeModulesScanner.swift:618-619)
+        // The as-built predicate VERBATIM (BuildArtifactsScanner.swift:1405-1406)
         // — boundary cells on BOTH sides, which no filesystem fixture can
         // place precisely.
         var equal = SizeReport()
@@ -3770,7 +3770,7 @@ final class BuildArtifactsScannerTests: XCTestCase {
         async throws
     {
         // The ROOT cell. The sizer declines to enumerate its own root when
-        // that root is a mount (`DirectorySizer.swift:202`); the probe must
+        // that root is a mount (`DirectorySizer.swift:261-272`); the probe must
         // decline identically, or it reads a whole foreign volume that the
         // caller has already denied.
         let artifact = try makeProject(

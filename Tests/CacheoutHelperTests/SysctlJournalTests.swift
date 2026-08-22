@@ -35,10 +35,12 @@ final class SysctlJournalTests: XCTestCase {
     private var journalPath: String!
     private var provider: MockSysctlProvider!
 
-    override func setUp() {
-        super.setUp()
+    override func setUpWithError() throws {
+        try super.setUpWithError()
         tmpDir = NSTemporaryDirectory() + "SysctlJournalTests-\(UUID().uuidString)"
-        try! FileManager.default.createDirectory(atPath: tmpDir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(
+            atPath: tmpDir, withIntermediateDirectories: true
+        )
         journalPath = tmpDir + "/journal.plist"
         provider = MockSysctlProvider()
     }
@@ -52,31 +54,55 @@ final class SysctlJournalTests: XCTestCase {
         SysctlJournal(path: journalPath, provider: provider)
     }
 
+    /// The journal as production last wrote it.
+    ///
+    /// `throws` RATHER THAN `try!` (PR #460 codex r6, D4): what this decodes
+    /// is a file PRODUCTION wrote, so a regression in the writer is exactly
+    /// what makes it fail — and a `try!` here turns that regression into a
+    /// `SIGILL` that takes every cell after this class in the run order with
+    /// it. This class sorts immediately before `WorktreeReclaimPerformerTests`
+    /// and `WorktreeStalenessAssessorTests` in the single process
+    /// `swift test` builds.
+    private func decodedJournal() throws -> JournalState {
+        let data = try Data(contentsOf: URL(fileURLWithPath: journalPath))
+        return try PropertyListDecoder().decode(JournalState.self, from: data)
+    }
+
+    /// The journal file's POSIX permission bits.
+    private func journalPermissions() throws -> Int {
+        let attrs = try FileManager.default
+            .attributesOfItem(atPath: journalPath)
+        return try XCTUnwrap(
+            attrs[.posixPermissions] as? Int,
+            "the journal file reported no POSIX permissions: \(attrs)"
+        )
+    }
+
     /// Helper: write a journal state with a stale heartbeat (>30s old) to simulate crash.
-    private func writeStaleJournal(entries: [JournalEntry]) {
+    private func writeStaleJournal(entries: [JournalEntry]) throws {
         let state = JournalState(
             entries: entries,
             shutdownClean: false,
             lastHeartbeat: ProcessInfo.processInfo.systemUptime - 60 // 60s ago — stale
         )
-        let data = try! PropertyListEncoder().encode(state)
-        try! data.write(to: URL(fileURLWithPath: journalPath))
+        let data = try PropertyListEncoder().encode(state)
+        try data.write(to: URL(fileURLWithPath: journalPath))
     }
 
     /// Helper: write a journal state with a fresh heartbeat (shutdownClean=false but recent).
-    private func writeFreshDirtyJournal(entries: [JournalEntry]) {
+    private func writeFreshDirtyJournal(entries: [JournalEntry]) throws {
         let state = JournalState(
             entries: entries,
             shutdownClean: false,
             lastHeartbeat: ProcessInfo.processInfo.systemUptime // just now
         )
-        let data = try! PropertyListEncoder().encode(state)
-        try! data.write(to: URL(fileURLWithPath: journalPath))
+        let data = try PropertyListEncoder().encode(state)
+        try data.write(to: URL(fileURLWithPath: journalPath))
     }
 
     // MARK: - Record Tests
 
-    func testRecordJournalsCurrentValue() {
+    func testRecordJournalsCurrentValue() throws {
         provider.values["kern.maxfiles"] = 12288
         let journal = makeJournal()
         journal.startup()
@@ -85,17 +111,16 @@ final class SysctlJournalTests: XCTestCase {
         XCTAssertNotNil(token)
 
         // Verify journal file exists and has correct permissions.
-        let attrs = try! FileManager.default.attributesOfItem(atPath: journalPath)
-        let perms = attrs[.posixPermissions] as! Int
+        let perms = try journalPermissions()
         XCTAssertEqual(perms, 0o600, "Journal file should have 0600 permissions")
 
         // Verify plist content.
-        let data = try! Data(contentsOf: URL(fileURLWithPath: journalPath))
-        let state = try! PropertyListDecoder().decode(JournalState.self, from: data)
+        let state = try decodedJournal()
         XCTAssertEqual(state.entries.count, 1)
-        XCTAssertEqual(state.entries[0].name, "kern.maxfiles")
-        XCTAssertEqual(state.entries[0].originalValue, 12288)
-        XCTAssertFalse(state.entries[0].rolledBack)
+        let recorded = try XCTUnwrap(state.entries.first)
+        XCTAssertEqual(recorded.name, "kern.maxfiles")
+        XCTAssertEqual(recorded.originalValue, 12288)
+        XCTAssertFalse(recorded.rolledBack)
 
         journal.markCleanShutdown()
     }
@@ -154,7 +179,7 @@ final class SysctlJournalTests: XCTestCase {
         journal.markCleanShutdown()
     }
 
-    func testRollbackDuplicateSysctlRestoresFirstOriginalValue() {
+    func testRollbackDuplicateSysctlRestoresFirstOriginalValue() throws {
         // Record kern.maxfiles twice with different "original" values.
         // The first record captures the true original (12288).
         // The second record captures an intermediate value (20000).
@@ -182,14 +207,14 @@ final class SysctlJournalTests: XCTestCase {
         // Should only have written once (the first entry), not twice.
         let maxfilesWrites = provider.writes.filter { $0.name == "kern.maxfiles" }
         XCTAssertEqual(maxfilesWrites.count, 1)
-        XCTAssertEqual(maxfilesWrites[0].value, 12288)
+        XCTAssertEqual(try XCTUnwrap(maxfilesWrites.first).value, 12288)
 
         journal.markCleanShutdown()
     }
 
     // MARK: - Crash Recovery Tests
 
-    func testCrashRecoveryRollsBackOnStaleHeartbeat() {
+    func testCrashRecoveryRollsBackOnStaleHeartbeat() throws {
         provider.values["kern.maxfiles"] = 12288
 
         // Write a journal with stale heartbeat (>30s old) and shutdownClean=false.
@@ -198,7 +223,7 @@ final class SysctlJournalTests: XCTestCase {
             name: "kern.maxfiles", originalValue: 12288,
             rolledBack: false, timestamp: Date()
         )
-        writeStaleJournal(entries: [entry])
+        try writeStaleJournal(entries: [entry])
 
         // Change the value externally (simulates what the helper set before crash).
         provider.values["kern.maxfiles"] = 99999
@@ -215,7 +240,7 @@ final class SysctlJournalTests: XCTestCase {
         journal.markCleanShutdown()
     }
 
-    func testUncleanShutdownRollsBackRegardlessOfHeartbeat() {
+    func testUncleanShutdownRollsBackRegardlessOfHeartbeat() throws {
         provider.values["kern.maxfiles"] = 12288
 
         // Write a journal with fresh heartbeat but shutdownClean=false.
@@ -226,7 +251,7 @@ final class SysctlJournalTests: XCTestCase {
             name: "kern.maxfiles", originalValue: 12288,
             rolledBack: false, timestamp: Date()
         )
-        writeFreshDirtyJournal(entries: [entry])
+        try writeFreshDirtyJournal(entries: [entry])
 
         provider.values["kern.maxfiles"] = 99999
 
@@ -266,17 +291,16 @@ final class SysctlJournalTests: XCTestCase {
 
     // MARK: - Corruption Tests
 
-    func testCorruptJournalIsReCreated() {
+    func testCorruptJournalIsReCreated() throws {
         // Write garbage to the journal file.
-        try! "not a valid plist".data(using: .utf8)!.write(to: URL(fileURLWithPath: journalPath))
+        try "not a valid plist".data(using: .utf8)!.write(to: URL(fileURLWithPath: journalPath))
 
         let journal = makeJournal()
         // Should not crash — corrupt journal is logged and re-created.
         journal.startup()
 
         // Verify journal is now valid.
-        let data = try! Data(contentsOf: URL(fileURLWithPath: journalPath))
-        let state = try! PropertyListDecoder().decode(JournalState.self, from: data)
+        let state = try decodedJournal()
         XCTAssertEqual(state.entries.count, 0)
 
         journal.markCleanShutdown()
@@ -284,12 +308,11 @@ final class SysctlJournalTests: XCTestCase {
 
     // MARK: - Atomic Persistence Tests
 
-    func testJournalFilePermissions() {
+    func testJournalFilePermissions() throws {
         let journal = makeJournal()
         journal.startup()
 
-        let attrs = try! FileManager.default.attributesOfItem(atPath: journalPath)
-        let perms = attrs[.posixPermissions] as! Int
+        let perms = try journalPermissions()
         XCTAssertEqual(perms, 0o600)
 
         journal.markCleanShutdown()
@@ -297,24 +320,22 @@ final class SysctlJournalTests: XCTestCase {
 
     // MARK: - Shutdown Marker Tests
 
-    func testStartupClearsShutdownMarker() {
+    func testStartupClearsShutdownMarker() throws {
         let journal = makeJournal()
         journal.startup()
 
-        let data = try! Data(contentsOf: URL(fileURLWithPath: journalPath))
-        let state = try! PropertyListDecoder().decode(JournalState.self, from: data)
+        let state = try decodedJournal()
         XCTAssertFalse(state.shutdownClean, "Startup should clear shutdownClean marker")
 
         journal.markCleanShutdown()
     }
 
-    func testCleanShutdownSetsMarker() {
+    func testCleanShutdownSetsMarker() throws {
         let journal = makeJournal()
         journal.startup()
         journal.markCleanShutdown()
 
-        let data = try! Data(contentsOf: URL(fileURLWithPath: journalPath))
-        let state = try! PropertyListDecoder().decode(JournalState.self, from: data)
+        let state = try decodedJournal()
         XCTAssertTrue(state.shutdownClean)
     }
 }

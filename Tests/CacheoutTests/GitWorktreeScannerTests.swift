@@ -1000,10 +1000,12 @@ final class GitWorktreeScannerTests: XCTestCase {
         // skips locked admin directories" — is retired: the repository-wide
         // prune no longer runs at all, so nothing downstream would skip
         // anything; PR #460 codex r3 / D4.)
+        let firstOrphan = try XCTUnwrapElement(orphans, 0)
+        let secondOrphan = try XCTUnwrapElement(orphans, 1)
         let doctored = Self.porcelain([
             ["worktree \(repository.resolvingSymlinksInPath().path)", "HEAD \(String(repeating: "0", count: 40))", "branch refs/heads/main"],
-            ["worktree \(orphans[0].resolvingSymlinksInPath().path)", "HEAD \(String(repeating: "0", count: 40))", "detached", "prunable gitdir file points to non-existent location"],
-            ["worktree \(orphans[1].resolvingSymlinksInPath().path)", "HEAD \(String(repeating: "0", count: 40))", "detached", "locked in use elsewhere", "prunable gitdir file points to non-existent location"],
+            ["worktree \(firstOrphan.resolvingSymlinksInPath().path)", "HEAD \(String(repeating: "0", count: 40))", "detached", "prunable gitdir file points to non-existent location"],
+            ["worktree \(secondOrphan.resolvingSymlinksInPath().path)", "HEAD \(String(repeating: "0", count: 40))", "detached", "locked in use elsewhere", "prunable gitdir file points to non-existent location"],
         ])
 
         let runner = DoctoringGitRunner(wrapping: makeRunner(), listing: doctored)

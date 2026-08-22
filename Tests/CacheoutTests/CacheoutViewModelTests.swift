@@ -101,7 +101,7 @@ final class CacheoutViewModelTests: XCTestCase {
     /// records every resolution it was handed. No production scanner could
     /// ever answer those ids, so "the rebuild silently swapped the injected
     /// composition for production defaults" is a single assertion away.
-    private func makeReconstruction()
+    private func makeReconstruction() throws
         -> (CacheoutViewModel.RuntimeReconstruction, ResolutionLog)
     {
         let base = self.base!
@@ -122,6 +122,19 @@ final class CacheoutViewModelTests: XCTestCase {
             }
         )
         let log = ResolutionLog()
+        // THE FALLBACK EXISTS SO THE FACTORY BELOW CANNOT TRAP (PR #460 codex
+        // r6, D4). The factory is NON-throwing, so the composition inside it
+        // used to be a `try!` — and what decides that throw is PRODUCTION's
+        // registration validation, so a regression there turned this cell into
+        // a `SIGILL` that took every later class in the run with it (this class
+        // sorts near the front). Built HERE instead, in a throwing test
+        // context, where the same failure is one red cell; the factory falls
+        // back to it and the assertions about scanner ids then fail loudly
+        // rather than the process dying.
+        let fallback = try SpaceScannerRuntime(
+            scanners: [], categories: [], home: home,
+            provider: FileSystemIdentityProvider()
+        )
         let seam = CacheoutViewModel.RuntimeReconstruction(
             devRootsStore: makeDevRootsStore(),
             home: home
@@ -136,14 +149,16 @@ final class CacheoutViewModelTests: XCTestCase {
                 trustedContainerRoots: [base.appendingPathComponent(scannerID)],
                 provide: { outcome }
             )
-            // try!: a fixture composition with one valid slug and no
-            // categories cannot fail registration validation.
-            return try! SpaceScannerRuntime(
+            // A fixture composition with one valid slug and no categories
+            // cannot fail registration validation — but "cannot" is what a
+            // `try!` here would be asserting about PRODUCTION code, so the
+            // failure lands on `fallback` instead of on the run.
+            return (try? SpaceScannerRuntime(
                 scanners: [scanner],
                 categories: [],
                 home: home,
                 provider: FileSystemIdentityProvider()
-            )
+            )) ?? fallback
         }
         return (seam, log)
     }
@@ -1643,7 +1658,7 @@ final class CacheoutViewModelTests: XCTestCase {
         let runtime = try makeRuntime([
             fixtureScanner("old_alpha") { outcome },
         ])
-        let (seam, log) = makeReconstruction()
+        let (seam, log) = try makeReconstruction()
         let viewModel = CacheoutViewModel(
             runtime: runtime, reconstruction: seam
         )
@@ -1692,7 +1707,7 @@ final class CacheoutViewModelTests: XCTestCase {
         let runtime = try makeRuntime(
             [fixtureScanner("old_alpha") { outcome }], provider: spy
         )
-        let (seam, log) = makeReconstruction()
+        let (seam, log) = try makeReconstruction()
         let viewModel = CacheoutViewModel(
             runtime: runtime, reconstruction: seam
         )
@@ -1771,7 +1786,7 @@ final class CacheoutViewModelTests: XCTestCase {
                 return outcome
             },
         ])
-        let (seam, log) = makeReconstruction()
+        let (seam, log) = try makeReconstruction()
         let viewModel = CacheoutViewModel(
             runtime: runtime, reconstruction: seam
         )
@@ -1828,7 +1843,7 @@ final class CacheoutViewModelTests: XCTestCase {
         let runtime = try makeRuntime([
             DirectoryFixtureScanner(id: "fixture_items", container: container),
         ])
-        let (seam, log) = makeReconstruction()
+        let (seam, log) = try makeReconstruction()
         let viewModel = CacheoutViewModel(
             runtime: runtime, reconstruction: seam
         )
@@ -1883,7 +1898,7 @@ final class CacheoutViewModelTests: XCTestCase {
         let runtime = try makeRuntime([
             fixtureScanner("old_alpha") { outcome },
         ])
-        let (seam, _) = makeReconstruction()
+        let (seam, _) = try makeReconstruction()
         let viewModel = CacheoutViewModel(
             runtime: runtime, reconstruction: seam
         )
@@ -1924,7 +1939,7 @@ final class CacheoutViewModelTests: XCTestCase {
                 return outcome
             },
         ])
-        let (seam, log) = makeReconstruction()
+        let (seam, log) = try makeReconstruction()
         let viewModel = CacheoutViewModel(
             runtime: runtime, reconstruction: seam
         )
@@ -2114,9 +2129,14 @@ private actor OutcomeSequence {
     }
 
     func next() -> ScanOutcome {
-        // FIXTURE-CONTROLLED, so not an `XCTUnwrapElement` site: `outcomes` is
-        // the literal list this test handed the box, `init` precondition-
-        // checks it non-empty, and no production code can shorten it.
-        outcomes.count > 1 ? outcomes.removeFirst() : outcomes[0]
+        // FIXTURE-CONTROLLED — `outcomes` is the literal list this test
+        // handed the box and no production code can shorten it — but the
+        // subscript is gone anyway (PR #460 codex r6, D4): the statement-
+        // position fence forbids the SHAPE, because "provably non-empty" is
+        // exactly what every stranding subscript in this suite's history also
+        // claimed. The `??` arm is unreachable; it is not a guard.
+        outcomes.count > 1
+            ? outcomes.removeFirst()
+            : (outcomes.first ?? ScanOutcome(items: [], errors: []))
     }
 }

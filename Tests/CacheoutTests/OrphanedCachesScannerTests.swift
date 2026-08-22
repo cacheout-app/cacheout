@@ -6539,9 +6539,13 @@ private actor OutcomeSequenceBox {
     init(_ outcomes: [ScanOutcome]) { self.outcomes = outcomes }
     func next() -> ScanOutcome {
         // FIXTURE-CONTROLLED (see the note on the twin in
-        // CacheoutViewModelTests): the literal list is the test's own.
+        // CacheoutViewModelTests): the literal list is the test's own. The
+        // subscript is gone anyway — the statement-position fence forbids the
+        // shape (PR #460 codex r6, D4); the `??` arm is unreachable.
         precondition(!outcomes.isEmpty)
-        return outcomes.count > 1 ? outcomes.removeFirst() : outcomes[0]
+        return outcomes.count > 1
+            ? outcomes.removeFirst()
+            : (outcomes.first ?? ScanOutcome(items: [], errors: []))
     }
 }
 

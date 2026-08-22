@@ -27,8 +27,13 @@ final class SuiteIntegritySocketTests: XCTestCase {
             socketpair(AF_UNIX, SOCK_STREAM, 0, &pair), 0,
             "socketpair(2) failed: errno \(errno)"
         )
-        let fd = pair[0]
-        defer { close(pair[0]); close(pair[1]) }
+        // `pair` is a two-element literal `socketpair(2)` fills in, so a
+        // subscript here could not trap — but the statement-position fence
+        // forbids the shape rather than each site's reasoning about itself
+        // (PR #460 codex r6, D4).
+        let fd = try XCTUnwrap(pair.first)
+        let descriptors = pair
+        defer { descriptors.forEach { close($0) } }
 
         XCTAssertTrue(
             TestSocketClient.disarmSIGPIPE(on: fd),

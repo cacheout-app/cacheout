@@ -96,7 +96,7 @@ final class MemlimitWorkaroundTests: XCTestCase {
 
     // MARK: - HWM path (no bug)
 
-    func testHWMPathUsedWhenNoBug() {
+    func testHWMPathUsedWhenNoBug() throws {
         let mock = MockMemorystatusProvider()
         let workaround = MemlimitWorkaround(provider: mock, detector: ForcedBugDetector(bugPresent: false))
 
@@ -104,7 +104,7 @@ final class MemlimitWorkaroundTests: XCTestCase {
         XCTAssertTrue(success)
         XCTAssertEqual(mock.calls.count, 1)
 
-        let call = mock.calls[0]
+        let call = try XCTUnwrap(mock.calls.first)
         // MEMORYSTATUS_CMD_SET_JETSAM_HIGH_WATER_MARK = 5
         XCTAssertEqual(call.command, 5)
         XCTAssertEqual(call.pid, 42)
@@ -127,7 +127,7 @@ final class MemlimitWorkaroundTests: XCTestCase {
 
     // MARK: - Properties path (128GB bug workaround)
 
-    func testPropertiesPathUsedWhenBugDetected() {
+    func testPropertiesPathUsedWhenBugDetected() throws {
         let mock = MockMemorystatusProvider()
         let workaround = MemlimitWorkaround(provider: mock, detector: ForcedBugDetector(bugPresent: true))
 
@@ -135,7 +135,7 @@ final class MemlimitWorkaroundTests: XCTestCase {
         XCTAssertTrue(success)
         XCTAssertEqual(mock.calls.count, 1)
 
-        let call = mock.calls[0]
+        let call = try XCTUnwrap(mock.calls.first)
         // MEMORYSTATUS_CMD_SET_PRIORITY_PROPERTIES = 2
         XCTAssertEqual(call.command, 2, "Should use SET_PRIORITY_PROPERTIES command")
         XCTAssertEqual(call.pid, 99)
@@ -216,14 +216,15 @@ final class MemlimitWorkaroundTests: XCTestCase {
 
     // MARK: - Path routing with forced detector
 
-    func testForcedBugDetectorDrivesBothPaths() {
+    func testForcedBugDetectorDrivesBothPaths() throws {
         let mock = MockMemorystatusProvider()
 
         // Force no bug → HWM path
         let noBug = MemlimitWorkaround(provider: mock, detector: ForcedBugDetector(bugPresent: false))
         _ = noBug.setJetsamLimit(pid: 1, limitMB: 100)
         XCTAssertEqual(mock.calls.count, 1)
-        XCTAssertEqual(mock.calls[0].command, 5, "No-bug path should use HWM command")
+        XCTAssertEqual(try XCTUnwrap(mock.calls.first).command, 5,
+                       "No-bug path should use HWM command")
 
         mock.calls.removeAll()
 
@@ -231,7 +232,8 @@ final class MemlimitWorkaroundTests: XCTestCase {
         let hasBug = MemlimitWorkaround(provider: mock, detector: ForcedBugDetector(bugPresent: true))
         _ = hasBug.setJetsamLimit(pid: 1, limitMB: 100)
         XCTAssertEqual(mock.calls.count, 1)
-        XCTAssertEqual(mock.calls[0].command, 2, "Bug path should use SET_PRIORITY_PROPERTIES command")
+        XCTAssertEqual(try XCTUnwrap(mock.calls.first).command, 2,
+                       "Bug path should use SET_PRIORITY_PROPERTIES command")
     }
 
     // MARK: - Struct layout

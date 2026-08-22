@@ -95,6 +95,9 @@ final class GitWorktreeReclaimActionTests: XCTestCase {
             mode: mode,
             worktreePath: worktreePath ?? (stale ? worktree : nil),
             worktreeAdminEntry: worktreeAdminEntry ?? (stale ? adminEntry : nil),
+            // Shape/validation cells only — none reaches the delete path,
+            // where a nil identity is itself a refusal (r4/D6).
+            worktreeAdminEntryIdentity: nil,
             parentRepoWorkingDir: parentRepoWorkingDir ?? repoDir,
             parentAdminContainer: parentAdminContainer ?? adminContainer,
             disclosedAdminDirectories: disclosedAdminDirectories
@@ -395,6 +398,7 @@ final class GitWorktreeReclaimActionTests: XCTestCase {
         // the modes; the memberwise init stays reachable so the TESTS can.
         let stale = GitWorktreeReclaimPlan.removeStaleWorktree(
             worktreePath: worktree, worktreeAdminEntry: adminEntry,
+            worktreeAdminEntryIdentity: nil,
             parentRepoWorkingDir: repoDir, adminContainer: adminContainer
         )
         XCTAssertTrue(stale.disclosedAdminDirectories.isEmpty)
@@ -468,6 +472,7 @@ final class GitWorktreeReclaimActionTests: XCTestCase {
             worktreePath: worktree,
             worktreeAdminEntry: atRoot.parentAdminContainer
                 .appendingPathComponent("wt"),
+            worktreeAdminEntryIdentity: nil,
             parentRepoWorkingDir: container,
             parentAdminContainer: atRoot.parentAdminContainer,
             disclosedAdminDirectories: []

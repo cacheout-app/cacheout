@@ -504,6 +504,9 @@ final class CleanSheetPresentationTests: XCTestCase {
             return .gitWorktreeReclaim(.removeStaleWorktree(
                 worktreePath: base.appendingPathComponent("wt"),
                 worktreeAdminEntry: admin.appendingPathComponent("wt"),
+                // Presentation-only fixture: nothing here reaches the
+                // delete path, where a nil identity is refused (r4/D6).
+                worktreeAdminEntryIdentity: nil,
                 parentRepoWorkingDir: parent,
                 adminContainer: admin
             ))

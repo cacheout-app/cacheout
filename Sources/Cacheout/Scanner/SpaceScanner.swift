@@ -206,12 +206,21 @@ struct GitWorktreeReclaimPlan: Equatable, Sendable {
     /// directory itself alone; `git worktree repair` likewise. Only `remove`
     /// destroys it — which is exactly the event that must refuse.
     ///
-    /// NIL means the plan was not built by a scan that could stat that
-    /// directory. `GitWorktreeScanner` always can: it has already resolved
-    /// the directory THROUGH the worktree's own back-link by the time it
-    /// builds the plan. Hand-built plans (tests, and only tests) may leave it
-    /// nil, and then the identity gate is inert and R1b falls back to its
-    /// path-level proof — which is the pre-r3 behaviour, not a new hole.
+    /// NIL IS REFUSED AT DELETE TIME (PR #460 codex r4, D6). r3 said "the
+    /// plan was not built by a scan that could stat that directory.
+    /// `GitWorktreeScanner` always can", and that universal was unevidenced
+    /// and false: the capture is a bare `provider.identity(of:)` with no
+    /// `guard let`, and `lstat` CAN fail — EPERM under a protected root, or
+    /// the directory vanishing in the resolve→plan-build window. In that
+    /// state the whole gate silently did nothing. Now the scanner emits NO
+    /// item when it cannot stat the directory (it records a visible issue
+    /// instead), R1b REFUSES a plan that carries no identity, and the
+    /// initializers below no longer default the field — so a future
+    /// construction path that forgets it fails to compile rather than
+    /// shipping a disabled guard.
+    ///
+    /// It stays Optional in the TYPE because prune-mode plans are not about
+    /// one worktree and carry nil by construction.
     let worktreeAdminEntryIdentity: FileSystemIdentityProvider.Identity?
 
     /// BOTH MODES: git's `-C` target — the porcelain FIRST record's path
@@ -236,17 +245,16 @@ struct GitWorktreeReclaimPlan: Equatable, Sendable {
     /// disclosure (D14).
     let disclosedAdminDirectories: [URL]
 
-    /// Spelled out rather than synthesized ONLY so
-    /// `worktreeAdminEntryIdentity` can default to nil: the memberwise
-    /// initializer omits `let` properties that carry a default value, and
-    /// every existing construction site (including the tests the factories
-    /// deliberately leave the memberwise init reachable for) predates that
-    /// field.
+    /// Spelled out rather than synthesized so every field is NAMED at every
+    /// construction site. `worktreeAdminEntryIdentity` deliberately carries
+    /// NO default (PR #460 codex r4, D6): a default let the field be omitted
+    /// silently, and omitting it disabled the only gate that can tell a
+    /// re-created checkout from the assessed one.
     init(
         mode: Mode,
         worktreePath: URL?,
         worktreeAdminEntry: URL?,
-        worktreeAdminEntryIdentity: FileSystemIdentityProvider.Identity? = nil,
+        worktreeAdminEntryIdentity: FileSystemIdentityProvider.Identity?,
         parentRepoWorkingDir: URL,
         parentAdminContainer: URL,
         disclosedAdminDirectories: [URL]
@@ -265,7 +273,7 @@ struct GitWorktreeReclaimPlan: Equatable, Sendable {
     static func removeStaleWorktree(
         worktreePath: URL,
         worktreeAdminEntry: URL,
-        worktreeAdminEntryIdentity: FileSystemIdentityProvider.Identity? = nil,
+        worktreeAdminEntryIdentity: FileSystemIdentityProvider.Identity?,
         parentRepoWorkingDir: URL,
         adminContainer: URL
     ) -> GitWorktreeReclaimPlan {
@@ -291,6 +299,8 @@ struct GitWorktreeReclaimPlan: Equatable, Sendable {
             mode: .pruneOrphanedAdmin,
             worktreePath: nil,
             worktreeAdminEntry: nil,
+            // No worktree, so no worktree identity — stated, not defaulted.
+            worktreeAdminEntryIdentity: nil,
             parentRepoWorkingDir: parentRepoWorkingDir,
             parentAdminContainer: adminContainer,
             disclosedAdminDirectories: disclosedAdminDirectories

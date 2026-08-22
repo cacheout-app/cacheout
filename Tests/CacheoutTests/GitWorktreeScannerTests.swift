@@ -682,10 +682,15 @@ final class GitWorktreeScannerTests: XCTestCase {
     /// admin directory's scan-time inode, and it is the inode of the entry
     /// the plan names.
     ///
-    /// This is what makes the nil arm of `worktreeAdminEntryIdentity`
-    /// unreachable in production. Without it the delete-time gate would be
-    /// silently inert for real users while every hand-built test plan kept
-    /// passing — the exact shape of an unevidenced guard.
+    /// "Unreachable in production" is what this cell used to claim, and that
+    /// claim was UNEVIDENCED and false (PR #460 codex r4, D6): the capture
+    /// was a bare `provider.identity(of:)`, and an `lstat` failure — EPERM
+    /// under a protected root, or the directory vanishing in the
+    /// resolve→plan-build window — yielded nil and disarmed the gate
+    /// silently. The nil arm is now unreachable BY CONSTRUCTION instead: the
+    /// scanner refuses to emit an item it cannot stat the admin directory of
+    /// (see `testAnUnstattableAdminEntryIsRefusedRatherThanOfferedUnbound`),
+    /// the field carries no default, and R1b refuses a plan without it.
     func testEveryStalePlanCarriesTheAdminEntrysScanTimeIdentity() async throws {
         let repository = try makeRepositoryIgnoringPayloads(
             at: dev.appendingPathComponent("repo")
@@ -717,6 +722,58 @@ final class GitWorktreeScannerTests: XCTestCase {
         }
         XCTAssertEqual(checked, 2, "both stale candidates were inspected")
         try assertNonMalformed(outcome, from: scanner)
+    }
+
+    func testAnUnstattableAdminEntryIsRefusedRatherThanOfferedUnbound()
+        async throws
+    {
+        // D6 (PR #460 codex r4). The scan-time capture used to be a bare
+        // `provider.identity(of: adminEntry)` with no `guard let`, so an
+        // `lstat` failure — EPERM under a protected root, or the directory
+        // vanishing between the resolve and the plan build — produced a plan
+        // whose delete-time identity gate was silently INERT. Two universals
+        // asserted that could not happen and neither was evidenced.
+        //
+        // The double here is LESS capable than production, never more: it
+        // reports exactly one path as unidentifiable and delegates everything
+        // else, which is what an `lstat` denial on that one directory looks
+        // like.
+        //
+        // MUTATION: restore the bare capture (drop the `guard let` in
+        // `emitStaleCandidate`) and this cell goes RED — an item is offered
+        // carrying no identity at all.
+        let repository = try makeRepositoryIgnoringPayloads(
+            at: dev.appendingPathComponent("repo")
+        )
+        let worktree = try addWorktree(
+            of: repository, at: dev.appendingPathComponent("wt-a"), branch: "a"
+        )
+        let adminEntry = try XCTUnwrap(
+            GitWorktreeGitdirResolver().adminDirectory(forWorktreeAt: worktree),
+            "the fixture must have a resolvable admin directory"
+        )
+
+        let outcome = await makeScanner(
+            provider: BlindToOnePathProvider(blinded: adminEntry)
+        ).scan(context: ScanContext(trigger: .userInitiated))
+
+        XCTAssertTrue(
+            outcome.items.allSatisfy { item in
+                if case .gitWorktreeReclaim(let plan) = item.action {
+                    return plan.mode != .removeStaleWorktree
+                }
+                return true
+            },
+            "a stale item was offered for a checkout whose admin directory "
+                + "could not be identified: \(outcome.items.map(\.displayName))"
+        )
+        let issue = try XCTUnwrap(
+            outcome.errors.first { $0.detail.contains("could not be identified") },
+            "the refusal must be visible, not silent: \(outcome.errors)"
+        )
+        XCTAssertEqual(issue.kind, .unreadable)
+        XCTAssertTrue(issue.detail.contains("no item is offered"), issue.detail)
+        XCTAssertTrue(fm.fileExists(atPath: worktree.path))
     }
 
     // MARK: - R6: the orphaned-admin tier
@@ -1761,5 +1818,27 @@ final class GitWorktreeScannerTests: XCTestCase {
             return Data()
         }
         return stdout
+    }
+}
+
+/// A provider that reports ONE path as unidentifiable and delegates
+/// everything else — the shape of an `lstat` denial on a single directory
+/// (D6). Strictly LESS capable than production: it never answers a question
+/// the real provider would refuse.
+private final class BlindToOnePathProvider: FileSystemIdentityProvider {
+
+    private let blinded: String
+
+    init(blinded: URL) {
+        self.blinded = "/" + blinded.deletingLastPathComponent().lastPathComponent
+            + "/" + blinded.lastPathComponent
+        super.init()
+    }
+
+    override func identity(of url: URL) -> Identity? {
+        // SUFFIX, not exact spelling: the scanner asks about the admin entry
+        // through `resolveTargetKeepingLeaf`, and a double that missed the
+        // question by a `/private` prefix would silently prove nothing.
+        url.path.hasSuffix(blinded) ? nil : super.identity(of: url)
     }
 }

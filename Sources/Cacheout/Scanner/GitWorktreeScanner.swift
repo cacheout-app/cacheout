@@ -796,8 +796,33 @@ struct GitWorktreeScanner: @unchecked Sendable {
             return
         }
 
+        // THE IDENTITY THE DELETE-TIME GATE IS ARMED WITH (PR #460 codex r4,
+        // D6). r3 captured this inode inside `staleItem` with no `guard let`,
+        // so an `lstat` failure yielded nil and silently DISABLED R1b's
+        // same-path-re-add check — while two universals elsewhere asserted
+        // that could not happen. `lstat` can fail: EPERM under a protected
+        // root, or the directory vanishing between the resolve above and the
+        // plan build. NO ITEM IS OFFERED in that state, and the issue says
+        // why. It CLEARS: the next scan re-stats.
+        guard let adminEntryIdentity = provider.identity(of: strict[2]) else {
+            issues.append(ScanIssue(
+                url: record.path, kind: .unreadable,
+                detail: "worktree '\(record.path.path)' has an admin directory "
+                    + "at '\(strict[2].path)' that could not be identified "
+                    + "(lstat failed), so the delete-time gate that tells a "
+                    + "re-created checkout from this one could not be armed — "
+                    + "no item is offered"
+            ))
+            log.entries.append(GitWorktreeAssessmentLog.Entry(
+                worktreePath: record.path, isCandidate: true,
+                emittedItem: false, evidence: assessment.evidence
+            ))
+            return
+        }
+
         let emission = staleItem(
             worktreePath: strict[0], adminContainer: strict[1], adminEntry: strict[2],
+            adminEntryIdentity: adminEntryIdentity,
             parentRepoWorkingDir: parent, declaredRoot: root.declaredRoot,
             assessment: assessment
         )
@@ -819,6 +844,7 @@ struct GitWorktreeScanner: @unchecked Sendable {
         worktreePath: URL,
         adminContainer: URL,
         adminEntry: URL,
+        adminEntryIdentity: FileSystemIdentityProvider.Identity,
         parentRepoWorkingDir: URL,
         declaredRoot: URL,
         assessment: WorktreeAssessment
@@ -879,10 +905,12 @@ struct GitWorktreeScanner: @unchecked Sendable {
                     // just its spelling. `remove` + `add` at the same path
                     // gives the new checkout the SAME admin directory NAME
                     // back, so a carried path alone cannot tell the two
-                    // checkouts apart at delete time. Captured here because
-                    // this is the last point that provably still sees the
-                    // checkout the assessment was about.
-                    worktreeAdminEntryIdentity: provider.identity(of: adminEntry),
+                    // checkouts apart at delete time.
+                    //
+                    // NON-OPTIONAL, and proved by the caller (r4/D6): taken
+                    // as a bare `provider.identity(of:)` here, an `lstat`
+                    // failure produced a nil that silently disarmed the gate.
+                    worktreeAdminEntryIdentity: adminEntryIdentity,
                     parentRepoWorkingDir: parentRepoWorkingDir,
                     adminContainer: adminContainer
                 )
@@ -1393,8 +1421,14 @@ struct GitWorktreeScanner: @unchecked Sendable {
 /// items, and the performer is where they are enumerated:
 /// `reestablishStaleGates` (R0 repository identity, R1 the re-read porcelain
 /// record's G1/G4 plus the registration, R2 the shared G3 ancestry check),
-/// the G2 clean re-check before the filesystem fallback, the oracle recompute
-/// in prune mode, and the D13 traversal guard before every invocation.
+/// the G2 clean re-check before the filesystem fallback, the LAST-INSTANT
+/// filesystem re-proof immediately before each destructive act (which
+/// checkout, the lock file, the HEAD file — PR #460 codex r4), the oracle
+/// recompute in prune mode, and the D13 traversal guard, which covers every
+/// path a git invocation traverses with a check that ran after admission and
+/// before that invocation — NOT one guard per invocation, a universal retired
+/// as false in the performer and at `PathGuard` in r2/r3 and here in r4
+/// (`WorktreeReclaimPerformer`'s guard-site table is the authority).
 ///
 /// `participates(in:)` IS NOT OVERRIDDEN, and that is a decision rather than an
 /// omission (fn-6 reconciliation). fn-6 added the member so a scanner can

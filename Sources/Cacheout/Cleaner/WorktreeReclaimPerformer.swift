@@ -31,10 +31,15 @@
 ///
 /// WHAT IS ACTUALLY GUARANTEED (rewritten, PR #460 codex r2 — the previous
 /// wording, "re-runs IMMEDIATELY before EVERY git invocation", was FALSE, and
-/// it is still false at r3. MEASURED: `grep -c 'try guardTraversal('` on this
-/// file returns 8 (one of which is inside the shared `guardGroup` helper),
-/// against far more git invocations than that, and R0 and R2 are both invoked
-/// with no immediately-preceding guard, deliberately — see the table):
+/// it is still false at r3. MEASURED (PR #460 codex r4 corrects the evidence
+/// sentence, not the count: r3 cited `grep -c 'try guardTraversal('`, which
+/// returns 9 on this file because THIS COMMENT contains the search string —
+/// the eighth instance of a claim this file could not reproduce):
+/// `grep -cE '^ +try guardTraversal\(' Sources/Cacheout/Cleaner/WorktreeReclaimPerformer.swift`
+/// returns 8 call sites (one of which is inside the shared `guardGroup`
+/// helper), against far more git invocations than that, and R0 and R2 are
+/// both invoked with no immediately-preceding guard, deliberately — see the
+/// table):
 ///
 /// **Every path a git invocation traverses is covered by a
 /// `validateSubprocessTraversalDirectory` that ran after admission and
@@ -91,8 +96,33 @@
 /// The order is safe both ways round for R0/R1/R2 — they read the PARENT's
 /// porcelain record, which the worktree's own contents cannot change — so
 /// putting the contents check last costs nothing and closes the window that
-/// mattered. What remains is the disposal call itself; `status` is a read,
-/// not a lock, so no ordering can close that.
+/// mattered.
+///
+/// THAT ENUMERATION WAS INCOMPLETE AND ITS CONCLUSION WAS FALSE (PR #460
+/// codex r4). R1b is not in the list, and R1b is precisely the gate that does
+/// NOT read the parent's record: it reads `<worktree>/.git` and inodes the
+/// admin directory it points at — a fact the worktree's own contents CAN
+/// change. Under r3's order R1b sat FIVE subprocesses before the delete, and
+/// MEASURED, a `git worktree remove` + `git worktree add` at the SAME PATH
+/// staged on the clean re-check destroyed the brand-new checkout with
+/// `errors == []`. The sentence "what remains is the disposal call itself"
+/// became true only with the section below.
+///
+/// ## THE LAST-INSTANT RE-PROOF (PR #460 codex r4)
+///
+/// Immediately before the destructive act in BOTH arms — before `worktree
+/// remove`, and after G2 in the fallback — every proposition whose AUTHORITY
+/// IS THE FILESYSTEM is re-proved from the filesystem: which checkout this is
+/// (R1b's own resolver), whether it is locked (`<admin>/locked`), and whether
+/// HEAD moved (`<admin>/HEAD`, when that file corroborates the porcelain
+/// record). It spawns nothing, so it opens no window of its own — MEASURED
+/// end to end: last gate → destructive call, median 0.17 ms in the fallback
+/// arm and 0.16 ms in the primary arm, against the 77.9 ms and 56.9 ms r3
+/// left standing. What genuinely
+/// needs a subprocess — cleanliness, and ancestry when HEAD did not move but
+/// a branch tip did — is enumerated as a RESIDUAL rather than described as
+/// closed: see `reproveFromTheFilesystem` and the "What is left, measured"
+/// section.
 ///
 /// ## RUNNER-RESULT ROUTING IS TOTAL
 ///
@@ -382,9 +412,26 @@ struct WorktreeReclaimPerformer {
         // guards, per invocation group (PR #460 codex r2) — the guard at (7)
         // covers the mutation's two paths and does not cover the admin
         // container `worktree list` enumerates.
-        if case .refuse(let tag, let detail) = await reestablishStaleGates(
+        let head: HeadWitness?
+        switch await reestablishStaleGates(
             plan: plan, worktreePath: worktreePath, adminEntry: adminEntry,
             container: container
+        ) {
+        case .refuse(let tag, let detail):
+            return failure(item, detail, tag: tag)
+        case .proceed(let witness):
+            head = witness
+        }
+
+        // (9) THE LAST INSTANT. The gates above end three subprocesses before
+        // this line (MEASURED at r3: R1b-done → `worktree remove` spawned,
+        // median 56.9 ms), and everything the FILESYSTEM can answer is
+        // re-proved here for the price of a few `lstat`s — which checkout
+        // this is, whether it is locked, whether HEAD moved. See
+        // `reproveFromTheFilesystem` for what remains and why.
+        if case .refuse(let tag, let detail) = reproveFromTheFilesystem(
+            worktreePath: worktreePath, adminEntry: adminEntry,
+            carriedIdentity: plan.worktreeAdminEntryIdentity, head: head
         ) {
             return failure(item, detail, tag: tag)
         }
@@ -493,15 +540,19 @@ struct WorktreeReclaimPerformer {
         // `worktree remove` would leave the window between that check and
         // this delete open, which is the window a lock acquired mid-operation
         // lands in.
-        if case .refuse(let tag, let detail) = await reestablishStaleGates(
+        let head: HeadWitness?
+        switch await reestablishStaleGates(
             plan: plan, worktreePath: worktreePath, adminEntry: adminEntry,
             container: container
         ) {
+        case .refuse(let tag, let detail):
             return failure(
                 item,
                 "\(detail) (git had refused with: \(gitRefusal))",
                 tag: tag
             )
+        case .proceed(let witness):
+            head = witness
         }
 
         // The guarded filesystem fallback, `removeGuardedItem`'s doctrine
@@ -601,6 +652,39 @@ struct WorktreeReclaimPerformer {
                     + "untouched"
                 logRefusal("worktree-recheck-failed", detail)
                 return failure(item, detail, tag: nil)
+            }
+
+            // THE LAST INSTANT, and this is the line the whole round is
+            // about (PR #460 codex r4).
+            //
+            // r3 made G2 the last GATE, which narrowed the window from five
+            // subprocesses to one. It did not close it, and it moved the
+            // propositions rather than closing any: R1b — WHICH checkout this
+            // is — now sat FIVE subprocesses before the delete. MEASURED at
+            // r3: with a `git worktree remove` + `git worktree add` at the
+            // same path staged on the clean re-check, this arm destroyed a
+            // brand-new checkout plus a `secret.env` hidden by a committed
+            // `.gitignore`, returned `Entry(exactBytes: 49152, .permanent,
+            // warning: nil)` and `errors == []`, and the gated prune then
+            // deregistered the new checkout as well.
+            //
+            // The file header's claim that "the order is safe both ways round
+            // for R0/R1/R2 — they read the PARENT's porcelain record, which
+            // the worktree's own contents cannot change" left R1b out of its
+            // enumeration, and R1b is the one gate that reads
+            // `<worktree>/.git` — a fact the worktree's own contents CAN
+            // change. Its conclusion, "what remains is the disposal call
+            // itself", was measured false; it is true only from HERE.
+            if case .refuse(let tag, let detail) = reproveFromTheFilesystem(
+                worktreePath: worktreePath, adminEntry: adminEntry,
+                carriedIdentity: plan.worktreeAdminEntryIdentity, head: head
+            ) {
+                logRefusal(tag, detail)
+                return failure(
+                    item,
+                    "\(detail) (git had refused with: \(gitRefusal))",
+                    tag: tag
+                )
             }
 
             if moveToTrash {
@@ -1037,6 +1121,15 @@ struct WorktreeReclaimPerformer {
         case refuse(tag: String, detail: String)
     }
 
+    /// What the whole stale-mode re-establishment answered. It carries the
+    /// HEAD WITNESS forward rather than just `proceed`, because the value of
+    /// R2's answer at the last instant depends on HEAD not having moved
+    /// since, and only the site that ran R2 can say what HEAD was then.
+    private enum StaleGateReestablishment {
+        case proceed(head: HeadWitness?)
+        case refuse(tag: String, detail: String)
+    }
+
     /// THE WHOLE STALE-MODE RE-ESTABLISHMENT, in scan order.
     ///
     /// fn-6 established, for the FILESYSTEM path, that every gate is
@@ -1082,7 +1175,7 @@ struct WorktreeReclaimPerformer {
         worktreePath: URL,
         adminEntry: URL,
         container: AdmittedContainer
-    ) async -> GateReestablishment {
+    ) async -> StaleGateReestablishment {
         // R0 traverses the `-C` target ONLY, and the caller guarded exactly
         // that path immediately before entering here — the primary arm at
         // step (7), the fallback at its own entry. NO extra guard is added:
@@ -1115,13 +1208,126 @@ struct WorktreeReclaimPerformer {
             record = entry
         }
 
+        // THE HEAD WITNESS, TAKEN BEFORE R2 (PR #460 codex r4).
+        //
+        // R2 costs three subprocesses and cannot be repeated at the last
+        // instant. What CAN be repeated for two `lstat`s and a read is the
+        // question its answer depends on: is the same commit still checked
+        // out? The witness is taken BEFORE the ladder runs, so the comparison
+        // at the last instant spans the WHOLE R2→disposal window rather than
+        // starting after it.
+        //
+        // There is deliberately NO second read after the ladder. One was
+        // written and then removed as an unevidenced guard: MEASURED, with
+        // the post-read disabled and a commit staged on the ancestry check,
+        // the removal was still refused — by this same witness at the last
+        // instant — and the only thing that changed was the wording. A guard
+        // no cell can distinguish is one this project has shipped before.
+        let captured = captureHead(adminEntry: adminEntry, record: record)
+
+        // A DETACHED head with no usable witness is refused rather than
+        // proceeded with, and this is the one place availability is spent on
+        // purpose: on a branch, a commit made inside the window survives on
+        // the branch ref, which no removal here touches; detached, it is
+        // reachable from nothing once the admin directory's reflog goes with
+        // the worktree. That loss is unrecoverable, so it is the one worth
+        // refusing for. The refusal CLEARS — attach the HEAD to a branch and
+        // re-scan, and the same worktree is judged with a witness available.
+        if record.isDetached, let cause = Self.witnessAbsence(
+            captured, headFile: adminEntry.appendingPathComponent(Self.headFileName)
+        ) {
+            return .refuse(
+                tag: "worktree-head-unwitnessable",
+                detail: "refused: this worktree is on a DETACHED HEAD and its "
+                    + "HEAD cannot be re-read from the filesystem (\(cause)), "
+                    + "so a commit made while the delete-time checks run "
+                    + "could not be detected — and a commit removed with a "
+                    + "detached worktree is reachable from no ref at all. "
+                    + "Nothing was removed. Put that work on a branch "
+                    + "(`git -C \(worktreePath.path) switch -c <name>`), then "
+                    + "re-scan."
+            )
+        }
+
         // R2's ladder runs `-C <parent>` and its ancestry runs
         // `-C <worktree>` — the two paths the caller guarded on entry, and
         // no others. Same reasoning as R0: no extra guard.
-        return await reestablishAncestry(
+        if case .refuse(let tag, let detail) = await reestablishAncestry(
             plan: plan, worktreePath: worktreePath, record: record
-        )
+        ) {
+            return .refuse(tag: tag, detail: detail)
+        }
+
+        guard case .witness(let witness) = captured else {
+            // ATTACHED, and HEAD is not witnessable from the filesystem. The
+            // ancestry residual for this item is then the whole R2→disposal
+            // window; see "What is left, measured".
+            return .proceed(head: nil)
+        }
+        return .proceed(head: witness)
     }
+
+    /// Why a capture is not a witness, or nil when it IS one.
+    private static func witnessAbsence(
+        _ capture: HeadWitnessCapture, headFile: URL
+    ) -> String? {
+        switch capture {
+        case .witness:
+            return nil
+        case .unreadable:
+            return "\(headFile.path) is not a readable regular file"
+        case .uncorroborated(let live, let expected):
+            return "\(headFile.path) reads '\(live)' while git reports HEAD "
+                + "as '\(expected)', so it is not tracking HEAD — the "
+                + "`reftable` ref backend keeps a constant stub there"
+        }
+    }
+
+    // MARK: - What is left, measured
+
+    // WHAT IS LEFT, MEASURED — the honest half of the last-instant re-proof
+    // (PR #460 codex r4).
+    //
+    // `reproveFromTheFilesystem` closes every proposition the filesystem can
+    // answer. These are the ones it cannot, stated rather than described as
+    // closed:
+    //
+    // 1. **CLEANLINESS (G2).** `git status --porcelain` is the only faithful
+    //    answer — the index, `.gitignore` rules, submodules and skip-worktree
+    //    entries are not readable from metadata — so it stays a subprocess
+    //    and stays the LAST git call. What remains between the last gate and
+    //    the destructive call is now the re-proof itself, which spawns
+    //    nothing. MEASURED end to end, instrumented, on the two success
+    //    cells: FALLBACK (clean re-check answered → disposal call) median
+    //    0.173 ms, range 0.160–0.227 ms, n=5; PRIMARY (gates answered →
+    //    `worktree remove` spawn) median 0.163 ms, range 0.136–0.239 ms,
+    //    n=10. r3's equivalents were 77.9 ms and 56.9 ms, the latter
+    //    containing three subprocess spawns.
+    //
+    //    In the PRIMARY arm cleanliness is not this process's check at all:
+    //    `git worktree remove` runs WITHOUT `--force` and refuses a dirty
+    //    tree itself, inside the mutation, where no window exists.
+    // 2. **ANCESTRY WHEN HEAD DID NOT MOVE BUT ITS TARGET DID.** For an
+    //    ATTACHED worktree the HEAD file names a branch and does not change
+    //    when that branch commits, so a commit made inside the window is not
+    //    detected. It is also not LOST: the commit and the branch ref both
+    //    live in the common git directory, which no arm of this performer
+    //    touches — `git worktree remove` deletes no branch and the fallback
+    //    deletes only the checkout. The DETACHED case, where the same commit
+    //    would be unrecoverable, is fully covered above and refused when it
+    //    cannot be. The default ref moving (`git update-ref refs/heads/main
+    //    <older>`) sits in the same class and the same reasoning.
+    // 3. **THE DISPOSAL CALL ITSELF.** Once `trashItem`/`removeTree` is
+    //    entered, nothing this process can read changes what it does. That
+    //    window is not removable by any ordering.
+    //
+    // The user-facing form of this is in `docs/v1/CATEGORIES.md` and the
+    // CHANGELOG: *"The final re-check before the delete reads the
+    // filesystem, not git: which checkout it is, whether it is locked, and
+    // whether its HEAD moved. Cleanliness is git's answer and is the last
+    // git call — work saved in the millisecond after it is not seen. On a
+    // branch, work committed after the checks still survives on the branch;
+    // a detached worktree whose HEAD cannot be re-read is refused instead."*
 
     /// The D13 guard as a `GateReestablishment`, so a refused traversal reads
     /// like every other delete-time refusal instead of throwing through the
@@ -1377,6 +1583,14 @@ struct WorktreeReclaimPerformer {
     /// only ADD a refusal, whereas here an unreadable back-link means the
     /// authorisation cannot be tied to an object at all.
     ///
+    /// That sentence was FALSE FOR ONE ARM until PR #460 codex r4 (D6).
+    /// `sameLocation` is inode identity only when BOTH sides can be stat'd;
+    /// when either cannot it falls back to comparing canonical path
+    /// COMPONENTS, so an admin directory that had become unreadable was
+    /// answered by a spelling. The live identity is now taken FIRST and its
+    /// absence is a refusal, and a plan with no carried identity is a refusal
+    /// too — there is no arm left that a spelling alone can satisfy.
+    ///
     /// RETRY: yes, and it can differ. Every class refused here is a change a
     /// re-scan re-evaluates from scratch — the checkout now at that path
     /// becomes its own candidate, or fails the four gates on its own merits,
@@ -1400,20 +1614,34 @@ struct WorktreeReclaimPerformer {
     /// one: `git worktree move` rewrites its `gitdir` file, `git worktree
     /// repair` rewrites its pointers, and neither replaces the directory.
     ///
-    /// WHERE THIS GATE IS REACHABLE FROM (PR #460 codex r3, D7): the GUI.
-    /// `Cacheout --cli clean` re-scans in-process before executing, so a
-    /// checkout moved onto the assessed path between scan and clean is
-    /// answered by the re-scan with exit 1 / `INVALID_ARGUMENTS` ("Unknown
-    /// item id … rescan and retry") and never reaches here. The window R1b
-    /// closes is the one the GUI holds open: a scan session kept alive across
-    /// a user's click.
+    /// WHERE THIS GATE IS REACHABLE FROM — CORRECTED (PR #460 codex r4, D4).
+    /// r3 claimed here, in the CHANGELOG, in `docs/v1/CATEGORIES.md` and in
+    /// 26e8bdf's own commit message that `Cacheout --cli clean` is protected
+    /// by its in-process re-scan because a replacement is answered with
+    /// "Unknown item id … rescan and retry". THAT IS FALSE, and a run cell
+    /// falsifies it: item ids are `SHA256(scannerID + NUL + canonicalPath)`
+    /// (`ReclaimableItem.stableID`), so a replacement checkout AT THE SAME
+    /// PATH gets the SAME id; and candidacy is `gates.allSatisfy(\.passed)`
+    /// with NO age term (`WorktreeStalenessAssessor`), so a brand-new
+    /// `git worktree add` on a merged branch is a candidate the instant it
+    /// exists. The CLI's re-scan re-JUDGES what is at the path; it does not
+    /// DETECT that the object was substituted.
+    ///
+    /// What each surface actually gets: the CLI re-scans, so the plan it
+    /// executes carries the REPLACEMENT's own admin inode and the removal is
+    /// the one a fresh scan authorises — this gate cannot fire there, and the
+    /// protection is that a fresh scan judged the replacement (`.review`
+    /// risk, never auto-selected, never automatic-clean eligible), not that
+    /// the id failed to resolve. The GUI holds a scan session alive across a
+    /// user's click, and THAT window — the one where the plan predates the
+    /// substitution — is the one this gate closes.
     ///
     /// - Parameter carriedIdentity: the scan-time inode identity of
-    ///   `adminEntry`, or nil for a plan built without one. Every plan
-    ///   `GitWorktreeScanner` emits carries it (the scanner has already
-    ///   resolved that directory through the worktree's back-link);
-    ///   hand-built test plans may not, and there the gate is inert and only
-    ///   the path proof below runs — the pre-r3 behaviour, not a new hole.
+    ///   `adminEntry`. Optional in the TYPE only, because a plan can be
+    ///   hand-built without it; nil is REFUSED here rather than skipped
+    ///   (r4/D6). `GitWorktreeScanner` no longer emits an item at all when it
+    ///   cannot stat that directory, so a nil arriving here means a plan that
+    ///   was not built by a scan.
     private func reestablishWorktreeIdentity(
         worktreePath: URL, adminEntry: URL,
         carriedIdentity: FileSystemIdentityProvider.Identity?
@@ -1430,6 +1658,23 @@ struct WorktreeReclaimPerformer {
                     + "see what is actually there."
             )
         }
+        // THE LIVE IDENTITY IS TAKEN FIRST AND IS MANDATORY (PR #460 codex
+        // r4, D6). `sameLocation` compares INODES only when both sides can be
+        // stat'd and otherwise falls back to comparing canonical path
+        // COMPONENTS (`FileSystemIdentityProvider.sameLocation`) — so making
+        // it the first question would have let an unreadable admin directory
+        // be answered by a spelling, which is the ambiguity this gate claims
+        // not to have.
+        guard let liveIdentity = provider.identity(of: live) else {
+            return .refuse(
+                tag: "worktree-identity-unreadable",
+                detail: "refused: the admin directory \(live.path) could not "
+                    + "be identified at clean time — the checkout the scan "
+                    + "assessed is not provably the one at "
+                    + "\(worktreePath.path) now; nothing was removed. "
+                    + "Re-scan to see what is actually there."
+            )
+        }
         guard provider.sameLocation(live, adminEntry) else {
             return .refuse(
                 tag: "worktree-identity-rebound",
@@ -1443,32 +1688,243 @@ struct WorktreeReclaimPerformer {
         }
         // THE SAME-PATH RE-ADD. Everything above compares SPELLINGS that
         // survive a remove/add cycle intact; only the inode does not.
-        if let carriedIdentity {
-            guard let liveIdentity = provider.identity(of: live) else {
-                return .refuse(
-                    tag: "worktree-identity-unreadable",
-                    detail: "refused: the admin directory \(live.path) could "
-                        + "not be identified at clean time — the checkout the "
-                        + "scan assessed is not provably the one at "
-                        + "\(worktreePath.path) now; nothing was removed. "
-                        + "Re-scan to see what is actually there."
-                )
-            }
-            guard liveIdentity == carriedIdentity else {
-                return .refuse(
-                    tag: "worktree-identity-recreated",
-                    detail: "refused: \(worktreePath.path) is a DIFFERENT "
-                        + "checkout from the one that was assessed — its admin "
-                        + "directory \(live.path) has the same name but was "
-                        + "re-created since the scan, which is what a "
-                        + "`git worktree remove` followed by a fresh "
-                        + "`git worktree add` at that path does. Nothing was "
-                        + "removed. Re-scan; the checkout there now is judged "
-                        + "on its own merits."
-                )
-            }
+        //
+        // A MISSING CARRIED IDENTITY IS A REFUSAL, NOT AN INERT GATE (PR #460
+        // codex r4, D6). It used to skip the comparison silently, so any plan
+        // built without the field — a future construction path that forgot
+        // it, or a scan whose `lstat` failed — disabled the only check that
+        // can tell a re-created checkout from the assessed one, with no
+        // compiler complaint and no runtime signal. The production
+        // initializer no longer defaults the field, and this gate no longer
+        // proceeds without it.
+        guard let carriedIdentity else {
+            return .refuse(
+                tag: "worktree-identity-unbound",
+                detail: "refused: this item carries no scan-time identity for "
+                    + "the admin directory of \(worktreePath.path), so a "
+                    + "checkout re-created at that path since the scan could "
+                    + "not be told from the assessed one — nothing was "
+                    + "removed. Re-scan to rebuild this item."
+            )
+        }
+        guard liveIdentity == carriedIdentity else {
+            return .refuse(
+                tag: "worktree-identity-recreated",
+                detail: "refused: \(worktreePath.path) is a DIFFERENT "
+                    + "checkout from the one that was assessed — its admin "
+                    + "directory \(live.path) has the same name but was "
+                    + "re-created since the scan, which is what a "
+                    + "`git worktree remove` followed by a fresh "
+                    + "`git worktree add` at that path does. Nothing was "
+                    + "removed. Re-scan; the checkout there now is judged "
+                    + "on its own merits."
+            )
         }
         return .proceed
+    }
+
+    // MARK: - The LAST-INSTANT re-proof (PR #460 codex r4)
+
+    /// `<admin>/HEAD` as R2 saw it: the bytes, and the inode they were read
+    /// through. The inode matters as much as the bytes — git updates HEAD by
+    /// writing `HEAD.lock` and renaming it over, so ANY HEAD write replaces
+    /// the file (MEASURED, git 2.50.1), and a re-created file with identical
+    /// bytes is still a different object.
+    struct HeadWitness: Equatable {
+        let identity: FileSystemIdentityProvider.Identity
+        let bytes: Data
+    }
+
+    /// A HEAD witness, or the NAMED reason there is none. Never collapsed to
+    /// a bare nil: which proposition sits outside the last-instant set is the
+    /// thing this round has to be able to state, and a nil cannot state it.
+    enum HeadWitnessCapture: Equatable {
+        case witness(HeadWitness)
+        /// `<admin>/HEAD` is not a readable regular file.
+        case unreadable
+        /// It is readable and does NOT corroborate the porcelain record, so
+        /// it is not a witness to anything. The MEASURED instance is the
+        /// `reftable` ref backend: `<admin>/HEAD` is the constant stub
+        /// `ref: refs/heads/.invalid` and does not change when the worktree
+        /// commits (verified, git 2.50.1, `git init --ref-format=reftable`),
+        /// while porcelain reports a real moving SHA. Comparing that file
+        /// across the window would be a guard that can never fire — the
+        /// silently-inert shape D6 is about.
+        case uncorroborated(live: String, expected: String)
+    }
+
+    /// Per-worktree HEAD, inside the admin directory. A LINKED worktree's
+    /// HEAD is per-worktree by git's own layout (`git worktree` docs; the
+    /// admin directory holds `HEAD`, `index`, `ORIG_HEAD`, `logs/`,
+    /// `refs/bisect`), so this is the file that moves when the checkout
+    /// commits — verified on git 2.50.1: a commit on a DETACHED head
+    /// rewrites it, a commit on an ATTACHED branch does not.
+    static let headFileName = "HEAD"
+
+    /// git's OWN representation of a worktree lock: `git worktree lock`
+    /// creates `<admin>/locked` (empty, or holding the `--reason` text) and
+    /// `git worktree unlock` removes it — verified on git 2.50.1 both ways.
+    /// Its PRESENCE is the lock; the reason is display data.
+    static let lockFileName = "locked"
+
+    /// THE LAST-INSTANT RE-PROOF — every gate whose ORACLE IS THE FILESYSTEM
+    /// ITSELF, re-proved immediately before the destructive act in BOTH arms.
+    ///
+    /// ## THE GENERAL SHAPE, AND WHY IT IS NOT "MOVE ONE CALL DOWN"
+    ///
+    /// `reestablishStaleGates` asks GIT. Every question it asks costs a
+    /// subprocess, and the answer is stale the moment the pipe closes — so
+    /// the re-establishment cannot be pushed arbitrarily close to the
+    /// mutation: something always sits between the last answer and the act.
+    /// MEASURED at r3's ordering, 5 samples, uninstrumented: fallback last
+    /// gate → destructive call, median 77.9 ms; all identity gates done →
+    /// destructive call, median 58.0 ms; primary R1b-done → `worktree remove`
+    /// spawned, median 56.9 ms, containing THREE further subprocess spawns.
+    /// Those windows swallowed a whole `git worktree remove` + `git worktree
+    /// add` at the same path, a `git worktree lock`, and a commit on a
+    /// detached HEAD — each measured destroying real data with `errors == []`.
+    ///
+    /// The division that closes them is not "run the gates later". It is:
+    /// **a proposition whose authority is the filesystem can be re-proved at
+    /// the last instant for the price of a few `lstat`s; a proposition whose
+    /// authority is git cannot be re-proved without opening a new window.**
+    /// This function is the whole first class:
+    ///
+    /// | proposition | substrate | re-proved here |
+    /// |---|---|---|
+    /// | WHICH CHECKOUT this is (R1b) | `<wt>/.git` → admin dir → back-link → inode | YES — the same pure-filesystem resolver R1b runs, no git at all |
+    /// | THE LOCK (G4) | `<admin>/locked` exists | YES — git's own on-disk representation |
+    /// | HEAD UNMOVED (R2's premise) | `<admin>/HEAD` bytes + inode | YES, when the file corroborates the record |
+    ///
+    /// and the second class is stated, not hidden, in `residualWindow` below.
+    ///
+    /// ORDER: identity first. The lock file and the HEAD file are read
+    /// THROUGH the admin directory, so "which admin directory" must be
+    /// settled before either answer means anything.
+    ///
+    /// NO D13 GUARD RUNS HERE, and that is not an omission. This function
+    /// spawns nothing: there is no subprocess to hand a path to, which is the
+    /// only thing `validateSubprocessTraversalDirectory` exists to protect.
+    /// It is itself a fail-closed path proof — `<wt>/.git` must be a regular
+    /// FILE (never followed), the admin directory must be a real directory
+    /// whose `gitdir` points BACK at that file, and its inode must equal the
+    /// scan's. A `<wt>` swapped for a symlink to another checkout fails that
+    /// chain rather than passing an unresolved-spelling containment check.
+    ///
+    /// RETRY: every refusal below clears. A replacement checkout, a lock, a
+    /// moved HEAD are all states a re-scan re-evaluates from scratch — none
+    /// is a deterministic limit whose printed remedy could never differ.
+    private func reproveFromTheFilesystem(
+        worktreePath: URL,
+        adminEntry: URL,
+        carriedIdentity: FileSystemIdentityProvider.Identity?,
+        head: HeadWitness?
+    ) -> GateReestablishment {
+        // (1) WHICH CHECKOUT. Same function R1b runs — one implementation, so
+        // the last instant and the gate can never disagree about identity.
+        if case .refuse(let tag, let detail) = reestablishWorktreeIdentity(
+            worktreePath: worktreePath, adminEntry: adminEntry,
+            carriedIdentity: carriedIdentity
+        ) {
+            return .refuse(tag: tag, detail: detail)
+        }
+
+        // (2) THE LOCK. G4 re-read from git's own file rather than from the
+        // porcelain record, because the record costs a subprocess and this
+        // costs one `lstat`. ANY object at that name is a lock — git tests
+        // for existence, not for kind.
+        let lockFile = adminEntry.appendingPathComponent(Self.lockFileName)
+        switch provider.probeKind(of: lockFile) {
+        case .absent:
+            break
+        case .kind:
+            return .refuse(
+                tag: "worktree-locked",
+                detail: "refused: this worktree was LOCKED while the "
+                    + "delete-time checks were running (\(lockFile.path) "
+                    + "exists) — nothing was removed. Run `git worktree "
+                    + "unlock \(worktreePath.path)` first, then re-scan; a "
+                    + "re-scan alone will keep refusing while the lock is "
+                    + "held."
+            )
+        case .failed(let code):
+            return .refuse(
+                tag: "worktree-lock-unreadable",
+                detail: "refused: whether this worktree is locked could not "
+                    + "be determined at the last instant (\(lockFile.path): "
+                    + "errno \(code)) — nothing was removed. Re-scan once "
+                    + "that directory is readable."
+            )
+        }
+
+        // (3) HEAD UNMOVED. Absent witness ⇒ this proposition is not in the
+        // last-instant set at all, and `reestablishStaleGates` has already
+        // refused the one case where that absence is unrecoverable.
+        guard let head else { return .proceed }
+        guard let live = readHead(adminEntry: adminEntry) else {
+            return .refuse(
+                tag: "worktree-head-unreadable",
+                detail: "refused: this worktree's HEAD "
+                    + "(\(adminEntry.appendingPathComponent(Self.headFileName).path)) "
+                    + "could not be re-read at the last instant, so the "
+                    + "ancestry answer cannot be tied to a commit — nothing "
+                    + "was removed. Re-scan to rebuild this item."
+            )
+        }
+        guard live == head else {
+            return .refuse(
+                tag: "worktree-head-moved",
+                detail: "refused: this worktree's HEAD MOVED while the "
+                    + "delete-time checks were running, so the ancestry "
+                    + "answer is no longer about the commit that is checked "
+                    + "out — nothing was removed. Re-scan; the checkout is "
+                    + "judged on its new HEAD."
+            )
+        }
+        return .proceed
+    }
+
+    /// `<admin>/HEAD`, no-follow: the inode it IS and the bytes it holds.
+    /// `nil` when it is not a regular file or cannot be read — a symlink at
+    /// that name is never followed, so a link planted over HEAD reads as an
+    /// absent witness rather than as whatever it points at.
+    private func readHead(adminEntry: URL) -> HeadWitness? {
+        let head = adminEntry.appendingPathComponent(Self.headFileName)
+        guard provider.probeKind(of: head) == .kind(.regularFile),
+              let identity = provider.identity(of: head),
+              let bytes = try? Data(contentsOf: head)
+        else { return nil }
+        return HeadWitness(identity: identity, bytes: bytes)
+    }
+
+    /// The HEAD witness, CORROBORATED against the porcelain record git just
+    /// gave us.
+    ///
+    /// The corroboration is what stops this from being an inert guard. A file
+    /// that never changes compares equal across every window and would
+    /// silently prove nothing; requiring it to AGREE with what git reports
+    /// HEAD to be — the SHA for a detached record, `ref: <branch>` for an
+    /// attached one — admits only a file that is actually tracking HEAD.
+    /// MEASURED: the files backend corroborates in both shapes, and the
+    /// `reftable` backend's `ref: refs/heads/.invalid` stub corroborates in
+    /// neither.
+    private func captureHead(
+        adminEntry: URL, record: GitWorktreeEntry
+    ) -> HeadWitnessCapture {
+        guard let witness = readHead(adminEntry: adminEntry) else {
+            return .unreadable
+        }
+        let live = String(decoding: witness.bytes, as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let expected = record.isDetached
+            ? record.headSHA
+            : record.branchRef.map { "ref: \($0)" }
+        guard let expected, !expected.isEmpty,
+              live.caseInsensitiveCompare(expected) == .orderedSame
+        else {
+            return .uncorroborated(live: live, expected: expected ?? "nothing")
+        }
+        return .witness(witness)
     }
 
     /// **R2** — G3, re-run through the SHARED `GitWorktreeMergedCheck`.

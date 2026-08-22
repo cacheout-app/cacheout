@@ -536,6 +536,7 @@ final class DocumentedContractTests: XCTestCase {
             ReclaimAction.gitWorktreeReclaim(.removeStaleWorktree(
                 worktreePath: URL(fileURLWithPath: "/dev/wt"),
                 worktreeAdminEntry: URL(fileURLWithPath: "/dev/repo/admin/wt"),
+                worktreeAdminEntryIdentity: nil,
                 parentRepoWorkingDir: URL(fileURLWithPath: "/dev/repo"),
                 adminContainer: URL(fileURLWithPath: "/dev/repo/admin")
             )).wireString,

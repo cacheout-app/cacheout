@@ -100,6 +100,16 @@ subsystem (`Intervention/`, `Memory/`, `Helper/`, `CacheoutHelper*`,
 | D7 | Two divergent `directorySize` implementations (regular-file filter vs none) | see above |
 | D8 | APFS clones/hardlinks counted at full size per link → cross-category double count (pnpm store ↔ project node_modules); headline total overstates | `CacheoutViewModel.swift:117-119` |
 
+> **Reading the "Where" column.** Those line numbers are `d747412`'s, per the
+> header rule — `git show d747412:<path>` reads them, HEAD does not.
+> `NodeModulesScanner.swift` (rows D3 and D6) has since been RETIRED along
+> with the `node_modules` scanner slug (see CHANGELOG.md, `[Unreleased]`,
+> PRE-RELEASE RENAME); per-project `node_modules` is now scanned by
+> `BuildArtifactsScanner`. `SourceAnchorIntegrityTests` enforces both halves
+> of this paragraph: a Markdown file that cites a Swift line must declare the
+> commit it was verified at, and every file it cites must exist or be
+> accounted for.
+
 Size math is otherwise **correct**: `totalFileAllocatedSize` (on-disk blocks)
 is the right key. Field evidence: a Rust target dir was 57.1G logical but 31G
 allocated (sparse incremental files). Any new scanner must use allocated size;

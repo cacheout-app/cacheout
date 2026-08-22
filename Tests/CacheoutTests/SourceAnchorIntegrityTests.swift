@@ -54,8 +54,26 @@ import XCTest
 /// - **A moved anchor is a FAILING cell, not an auto-fix.** Repointing means
 ///   re-reading the citing sentence, which is the work the three shipped
 ///   shifts skipped.
-/// - **Anchors in Markdown are not read** — `SCANNERS-ROADMAP.md` and
-///   `CHANGELOG.md` cite by SYMBOL, not by line.
+/// - **Markdown line-anchors are not checked AGAINST HEAD, and the reason is
+///   not that there are none** (PR #460 codex r9, D3). r8 wrote that
+///   `SCANNERS-ROADMAP.md` and `CHANGELOG.md` "cite by SYMBOL, not by line";
+///   `CHANGELOG.md` does, `SCANNERS-ROADMAP.md` does not — six rows of its
+///   D1-D8 defect table cite lines, which
+///   `grep -rnE '([A-Za-z][A-Za-z0-9_]*\.swift):([0-9]+)' --include='*.md' .`
+///   prints. Checking them against HEAD would be a CATEGORY ERROR: that
+///   document is a dated snapshot, "Anchored to v2.1.9, commit `d747412`",
+///   and it says so in its own third line — its line numbers are `d747412`'s
+///   and are MEANT to be read with `git show d747412:<path>`. One of them
+///   names `NodeModulesScanner.swift`, which existed at `d747412`
+///   (`git ls-tree -r --name-only d747412 | grep -i nodemodules` prints it)
+///   and does not exist now.
+///
+///   So the rule Markdown gets is the one that fits it, and it is CHECKED
+///   rather than described: `testMarkdownLineAnchorsAreDatedAndTheirFilesAccountedFor`
+///   requires every `.md` that cites a Swift LINE to declare the commit those
+///   lines were verified at in its opening lines, and requires every
+///   `.swift` file it cites by line either to exist today or to be listed in
+///   `retiredMarkdownAnchorTargets` with where it went.
 final class SourceAnchorIntegrityTests: XCTestCase {
 
     /// `File.swift:N` or `File.swift:N-M`.
@@ -325,6 +343,123 @@ final class SourceAnchorIntegrityTests: XCTestCase {
         XCTAssertEqual(
             listed.filter { !cited.contains($0) }, [],
             "anchorExpectations lists anchors no comment cites any more"
+        )
+    }
+
+    // MARK: - Markdown line-anchors (PR #460 codex r9, D3)
+
+    /// `.swift` files cited BY LINE from Markdown that no longer exist in the
+    /// tree. A Markdown line-anchor is read against the commit its document
+    /// declares, not against HEAD, so a retired file is not by itself a
+    /// defect — an UNACCOUNTED one is, because the reader has no way to tell
+    /// "deleted, and here is where it went" from "this citation rotted".
+    static let retiredMarkdownAnchorTargets: [(file: String, whereItWent: String)] = [
+        ("NodeModulesScanner.swift",
+         "retired before this branch, together with the `node_modules` "
+             + "scanner slug (CHANGELOG.md, [Unreleased], PRE-RELEASE "
+             + "RENAME); per-project node_modules is now scanned by "
+             + "`BuildArtifactsScanner`. SCANNERS-ROADMAP.md rows D3 and D6 "
+             + "cite it at `d747412`, where it existed: "
+             + "`git show d747412:Sources/Cacheout/Scanner/NodeModulesScanner.swift`"),
+    ]
+
+    /// Every Markdown file in the repository, excluding build products.
+    private func markdownDocuments() throws -> [URL] {
+        var files: [URL] = []
+        let walker = try XCTUnwrap(
+            FileManager.default.enumerator(
+                at: repositoryRoot, includingPropertiesForKeys: nil
+            ),
+            "the repository root could not be enumerated"
+        )
+        for case let url as URL in walker {
+            let name = url.lastPathComponent
+            if name == ".build" || name == ".git" {
+                walker.skipDescendants()
+                continue
+            }
+            if url.pathExtension == "md" { files.append(url) }
+        }
+        return files.sorted { $0.path < $1.path }
+    }
+
+    func testMarkdownLineAnchorsAreDatedAndTheirFilesAccountedFor() throws {
+        guard let anchors = try? NSRegularExpression(
+            pattern: Self.anchorPattern
+        ) else { return XCTFail("the anchor pattern does not compile") }
+        // A DOCUMENT-LEVEL declaration, so it has to sit in the opening
+        // lines: `CHANGELOG.md` mentions a commit hundreds of lines down in
+        // the body, and that is a sentence about one entry, not a statement
+        // about how to read the whole file.
+        let pin = #"commit `[0-9a-f]{7,40}`"#
+        let retired = Set(Self.retiredMarkdownAnchorTargets.map(\.file))
+        let live = Set(try swiftSources().map(\.lastPathComponent))
+
+        var scanned = 0
+        var citing = 0
+        var offenders: [String] = []
+        for document in try markdownDocuments() {
+            scanned += 1
+            let text = try String(contentsOf: document, encoding: .utf8)
+            let lines = text.split(
+                separator: "\n", omittingEmptySubsequences: false
+            )
+            var cited: Set<String> = []
+            let full = NSRange(text.startIndex..., in: text)
+            for match in anchors.matches(in: text, range: full) {
+                guard match.numberOfRanges > 1,
+                      let range = Range(match.range(at: 1), in: text)
+                else { continue }
+                cited.insert(String(text[range]))
+            }
+            guard !cited.isEmpty else { continue }
+            citing += 1
+            let opening = lines.prefix(10).joined(separator: "\n")
+            if opening.range(of: pin, options: .regularExpression) == nil {
+                offenders.append(
+                    "\(document.lastPathComponent): cites "
+                        + "\(cited.sorted().joined(separator: ", ")) by LINE "
+                        + "but its opening lines declare no commit those "
+                        + "lines were verified at"
+                )
+            }
+            for name in cited.sorted()
+            where !live.contains(name) && !retired.contains(name) {
+                offenders.append(
+                    "\(document.lastPathComponent): cites \(name) by LINE and "
+                        + "no such file exists under Sources/ or Tests/ — say "
+                        + "where it went in retiredMarkdownAnchorTargets"
+                )
+            }
+        }
+
+        XCTAssertGreaterThan(
+            scanned, 3,
+            "the check must actually have read the repository's Markdown"
+        )
+        XCTAssertGreaterThan(
+            citing, 0,
+            "the check must actually have found a Markdown line-anchor — if "
+                + "the last one is genuinely gone, delete this cell rather "
+                + "than leave it passing vacuously"
+        )
+        XCTAssertEqual(
+            offenders, [],
+            "a Markdown line-anchor is read against the commit its document "
+                + "declares. Undeclared, a reader checks it against HEAD and "
+                + "lands on unrelated text; unaccounted, a deleted file reads "
+                + "as a rotted citation."
+        )
+    }
+
+    /// `retiredMarkdownAnchorTargets`' own rot check: a name that exists
+    /// again would silently exempt a live file.
+    func testTheRetiredMarkdownAnchorListIsExactlyWhatItClaims() throws {
+        let live = Set(try swiftSources().map(\.lastPathComponent))
+        XCTAssertEqual(
+            Self.retiredMarkdownAnchorTargets.map(\.file).filter(live.contains),
+            [],
+            "a retired anchor target that exists again must leave the list"
         )
     }
 

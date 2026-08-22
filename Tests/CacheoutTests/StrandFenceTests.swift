@@ -59,8 +59,10 @@ import XCTest
 /// `Sources/CacheoutHelperLib/MemlimitWorkaround.swift:187` return a nil detail
 /// turned `XCTAssertTrue(error!.contains("hwm_failed"))` into
 /// `Fatal error: Unexpectedly found nil`, **signal 5, the total line never
-/// printed, 493 of 1471 cells never ran**, and this PR's own
-/// `WorktreeReclaimPerformerTests` appeared in the log zero times.
+/// printed, 493 of the 1471 cells AT COMMIT 26c880b never ran**, and this
+/// PR's own `WorktreeReclaimPerformerTests` appeared in the log zero times.
+/// (The suite is 1480 at r7; the figure belongs to the commit it was taken
+/// at — see `WorktreeReclaimPerformerTests`' class header, D5.)
 ///
 /// So r7 converted that population — 14 sites in `CategoryScannerTests`,
 /// `CompressorTrackerTests`, `PredictiveEngineTests`,

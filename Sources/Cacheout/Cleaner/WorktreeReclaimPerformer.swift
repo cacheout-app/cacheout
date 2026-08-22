@@ -1614,9 +1614,24 @@ struct WorktreeReclaimPerformer {
     //    WHAT THAT COSTS, PLAINLY: work saved into the worktree after
     //    `status` answered and before the disposal ran is destroyed with the
     //    tree, and under a loaded queue that interval is hundreds of
-    //    milliseconds rather than a fraction of one. `--ignored` narrows the
-    //    class (an ignored path that APPEARS in the window refuses) but does
-    //    not close it; a re-scan clears it, because it is a fact about a
+    //    milliseconds rather than a fraction of one.
+    //
+    //    `--ignored` DOES NOT NARROW THAT WINDOW, and r7 said it did (PR
+    //    #460 codex r8, D4). The ignored comparison is `appeared =
+    //    ignoredNow.subtracting(ignoredWitness)`
+    //    (`WorktreeReclaimPerformer.swift:786-798`), computed from the SAME
+    //    `status --ignored` reading this proposition is about, and taken
+    //    BEFORE `reproveFromTheFilesystem`,
+    //    i.e. entirely on the NEAR side of both hops. Nothing re-reads the
+    //    ignored set after it, and nothing can: the far side of the Trash
+    //    arm's hop is the MAIN ACTOR, which is the same reason this
+    //    proposition cannot cross the hop at all. What `--ignored` narrows
+    //    is the window BEFORE that reading — the interval the gates
+    //    themselves take, where `--porcelain` alone is blind and this
+    //    comparison refuses. The post-reading window is the same width for
+    //    an ignored file as for a tracked one.
+    //
+    //    A re-scan clears the residual, because it is a fact about a
     //    concurrent writer and not a deterministic bound.
     //
     //    MEASURED TO THE UNLINK, INSTRUMENTED, ON AN IDLE MAIN THREAD,

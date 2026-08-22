@@ -842,11 +842,18 @@ struct WorktreeReclaimPerformer {
                 }
             }
         } catch let refusal as LastInstantRefusal {
-            // The re-proof that crosses the mover's hop reports through the
+            // The re-proof that crosses either arm's hop reports through the
             // SAME tag and the SAME detail as the one on this side of it — a
             // user must not be able to tell which of the two fired, because
             // the fact they state is identical.
-            logRefusal(refusal.tag, refusal.detail)
+            //
+            // ONE LOG LINE, NOT TWO (PR #460 codex r7, D3). r6 shipped an
+            // explicit `logRefusal(refusal.tag, refusal.detail)` here AND
+            // `failure(…, tag:)` below, which logs whenever a tag is present:
+            // every refusal raised inside a seam was written to
+            // `~/.cacheout` twice. Nothing asserted on the log, so nothing
+            // caught it — the same gap that left this catch arm itself
+            // unevidenced. `failure` is the one place that logs.
             return failure(item, refusal.detail, tag: refusal.tag)
         } catch {
             if error is PathGuardError {

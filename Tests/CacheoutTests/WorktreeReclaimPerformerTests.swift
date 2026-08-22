@@ -327,6 +327,21 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         ContainerSnapshot.capture(roots: [container], provider: provider)
     }
 
+    /// Every `logRefusal(tag:detail:)` the performer made, in order.
+    final class RefusalLog {
+        private let lock = NSLock()
+        private var entries: [(tag: String, detail: String)] = []
+        func record(_ tag: String, _ detail: String) {
+            lock.lock(); entries.append((tag, detail)); lock.unlock()
+        }
+        var tags: [String] {
+            lock.lock(); defer { lock.unlock() }; return entries.map(\.tag)
+        }
+        var details: [String] {
+            lock.lock(); defer { lock.unlock() }; return entries.map(\.detail)
+        }
+    }
+
     private func realRunner() -> GitCommandRunner {
         GitCommandRunner(environment: GitFixture.environment(home: home))
     }
@@ -343,7 +358,15 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         )? = nil,
         revalidate: ((ReclaimableItem) -> PreDeleteSeamRefusal?)? = nil,
         gitTimeout: TimeInterval = WorktreeReclaimPerformer.deleteTimeGitTimeout,
-        provider overrideProvider: FileSystemIdentityProvider? = nil
+        provider overrideProvider: FileSystemIdentityProvider? = nil,
+        // THE REFUSAL LOG, INJECTABLE (PR #460 codex r7, D3/M6). The tag is
+        // the ONLY thing that distinguishes a refusal raised inside a seam
+        // and rethrown through `catch let refusal as LastInstantRefusal` from
+        // the same refusal collapsing into the generic `catch`: both produce
+        // the identical per-item message, because `LastInstantRefusal`'s
+        // `errorDescription` IS the detail. Without a cell that reads the
+        // log, that catch arm cannot be killed by any mutation.
+        refusals: RefusalLog? = nil
     ) -> WorktreeReclaimPerformer {
         let provider = overrideProvider ?? self.provider
         let sizer = DirectorySizer(provider: provider)
@@ -388,7 +411,7 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
                 try fileManager.removeItem(at: url)
             },
             revalidate: revalidate ?? { _ in nil },
-            logRefusal: { _, _ in },
+            logRefusal: { tag, detail in refusals?.record(tag, detail) },
             logCleaned: { _ in }
         )
     }
@@ -1375,6 +1398,152 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
                 + "queue depth — the proof is on the wrong side of the hop: "
                 + "windows \(windows), hops \(hops)"
         )
+    }
+
+
+    // MARK: - The proofs on the FAR SIDE of each arm's own hop (r6 D1, r7 D1/D3)
+
+    /// M1's cell — the far-side `reproveFromTheFilesystem` inside the mover
+    /// closure — AND M6's, the `catch let refusal as LastInstantRefusal` arm.
+    ///
+    /// r6 added both and evidenced neither: PR #460 codex r7, D3 measured that
+    /// deleting the far-side re-proof (keeping `proveTheLeaf()`) and deleting
+    /// the typed catch arm each left the FULL suite at 1471/2/0, exit 0.
+    ///
+    /// THE ATTACK IS A LOCK, NOT A RE-ADD, AND THAT IS THE WHOLE POINT.
+    /// `git worktree lock` writes `<admin>/locked` and touches neither the
+    /// checkout's inode nor its contents, so `TrashDisposal`'s own leaf
+    /// binding — the other proof inside that closure — still passes. The ONLY
+    /// thing that can refuse this is the re-proof, which is what makes the
+    /// cell specific to it. (A same-path re-add would be caught by either.)
+    ///
+    /// AND THE TAG IS ASSERTED, WHICH IS M6. `LastInstantRefusal`'s
+    /// `errorDescription` is the detail, so with the typed catch arm deleted
+    /// the per-item MESSAGE is byte-identical — the refusal simply stops being
+    /// logged and becomes untagged, which is the shape four rounds of this
+    /// branch have been removing. Only the log can tell the two apart.
+    func testTheTrashArmRefusesACheckoutLockedInsideTheMoversHop()
+        async throws
+    {
+        let repository = try makeRepository(named: "repo")
+        let worktree = try addWorktree(
+            named: "wt", branch: "feature", in: repository
+        )
+        let plan = staleplan(
+            worktree: worktree,
+            membership: try membership(of: worktree, in: repository)
+        )
+        let home = self.home!
+        let trashRoot = trashDirectory!
+        let fileManager = fm
+        let staged = InvocationCounter()
+        let moved = TrashRecorder()
+        let refusals = RefusalLog()
+
+        let outcome = await perform(
+            item(plan), plan: plan,
+            with: makePerformer(
+                runner: InterceptingGitRunner(wrapping: realRunner()),
+                moveToTrash: true,
+                trash: { url, prove in
+                    // THE HOP: production reaches this closure inside
+                    // `MainActor.run`, having waited out the main queue. The
+                    // wait is replaced by the event it admits.
+                    if Self.lockWorktree(
+                        worktree, repository: repository, home: home
+                    ) { staged.bump() }
+                    try prove()
+                    moved.record(url)
+                    let landed = trashRoot.appendingPathComponent(
+                        url.lastPathComponent
+                    )
+                    try fileManager.moveItem(at: url, to: landed)
+                    return landed
+                },
+                refusals: refusals
+            )
+        )
+
+        XCTAssertEqual(staged.count, 1, "the fixture never staged the lock")
+        XCTAssertNil(outcome.entry, "nothing may be reported as freed")
+        XCTAssertEqual(
+            moved.urls, [],
+            "the refusal is BEFORE the move: the Trash must be untouched"
+        )
+        let message = try XCTUnwrapElement(outcome.errors, 0).message
+        XCTAssertTrue(
+            message.contains("LOCKED while the delete-time checks"), message
+        )
+        XCTAssertTrue(
+            fm.fileExists(atPath: worktree.path),
+            "a worktree locked inside the hop was destroyed"
+        )
+        // M6: the refusal reached the log WITH its tag, indistinguishable
+        // from the same refusal raised on the near side.
+        XCTAssertEqual(refusals.tags, ["worktree-locked"])
+        XCTAssertEqual(refusals.details, [message])
+    }
+
+    /// The permanent arm's own far-side re-proof (PR #460 codex r7, D1) — the
+    /// guard this round ADDED, with the cell that kills it.
+    ///
+    /// r6 asserted that this arm "never had this shape", because it hops to a
+    /// global concurrent queue where `DepthSafeRemoval` re-proves the
+    /// container from a descriptor. It does — the CONTAINER. Which checkout
+    /// stands at the path, whether it is locked and whether HEAD moved are
+    /// not propositions `DepthSafeRemoval` can express, and until r7 all three
+    /// were last proved on the NEAR side of this hop. Same attack as the
+    /// Trash cell above, same refusal, same tag.
+    func testThePermanentArmRefusesACheckoutLockedInsideItsOwnHop()
+        async throws
+    {
+        let repository = try makeRepository(named: "repo")
+        let worktree = try addWorktree(
+            named: "wt", branch: "feature", in: repository
+        )
+        let plan = staleplan(
+            worktree: worktree,
+            membership: try membership(of: worktree, in: repository)
+        )
+        let home = self.home!
+        let fileManager = fm
+        let staged = InvocationCounter()
+        let removed = TrashRecorder()
+        let refusals = RefusalLog()
+
+        let outcome = await perform(
+            item(plan), plan: plan,
+            with: makePerformer(
+                runner: InterceptingGitRunner(wrapping: realRunner()),
+                moveToTrash: false,
+                removeTree: { url, _, prove in
+                    if Self.lockWorktree(
+                        worktree, repository: repository, home: home
+                    ) { staged.bump() }
+                    try prove()
+                    removed.record(url)
+                    try fileManager.removeItem(at: url)
+                },
+                refusals: refusals
+            )
+        )
+
+        XCTAssertEqual(staged.count, 1, "the fixture never staged the lock")
+        XCTAssertNil(outcome.entry)
+        XCTAssertEqual(
+            removed.urls, [],
+            "the refusal is BEFORE the removal: nothing may be unlinked"
+        )
+        let message = try XCTUnwrapElement(outcome.errors, 0).message
+        XCTAssertTrue(
+            message.contains("LOCKED while the delete-time checks"), message
+        )
+        XCTAssertTrue(
+            fm.fileExists(atPath: worktree.path),
+            "a worktree locked inside the hop was destroyed"
+        )
+        XCTAssertEqual(refusals.tags, ["worktree-locked"])
+        XCTAssertEqual(refusals.details, [message])
     }
 
     /// Reports NO identity for any DESCRIPTOR — the "I opened the folder but

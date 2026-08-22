@@ -525,10 +525,12 @@ struct WorktreeReclaimPerformer {
     /// `TrashDisposal.Mover` states: run it on the far side of whatever hop
     /// you perform, immediately before the destruction, and destroy nothing if
     /// it throws. The production seam hops to `DispatchQueue.global`; see
-    /// `testThePermanentProofAndTheRemovalAreNotSeparatedByTheHop` for what
-    /// that hop measures under main-thread load and under a saturated global
-    /// queue, and `testThePermanentArmRefusesAWorktreeSwappedInsideTheHop` for
-    /// the cell that goes red when the proof is deleted.
+    /// `testTheWindowsThatRemainAreMeasuredUnderLoadInBothArms` for what that
+    /// hop measures under main-thread load and under a saturated global queue,
+    /// and `testThePermanentArmRefusesACheckoutLockedInsideItsOwnHop` for the
+    /// cell that goes red when the proof is deleted. (Both names were wrong
+    /// when r7 wrote them — `grep -rn "func <name>" Tests` returned 0 for the
+    /// two it printed; PR #460 codex r8, D3.)
     let removeTree: (
         URL, DepthSafeRemoval.AdmittedParent, LastInstantProof
     ) async throws -> Void

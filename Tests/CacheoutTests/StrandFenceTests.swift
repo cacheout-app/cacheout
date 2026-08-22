@@ -26,7 +26,7 @@ import XCTest
 ///    converts the very failure `XCTUnwrapElement` exists to make survivable
 ///    back into a `SIGILL`. MEASURED on this branch: dropping the issue
 ///    emission in `EphemeralTempScanner.swift:771-777` killed the runner at
-///    `EphemeralTempScannerTests.swift:2971` with `Index out of range` and
+///    `EphemeralTempScannerTests.swift:2975-2977` with `Index out of range` and
 ///    signal 5; the cells after it never ran and the total line never printed.
 /// 3. **STATEMENT** (PR #460 codex r6, D4) — a trap needs no assertion around
 ///    it at all. `let call = mock.calls[0]` and `let state = try!

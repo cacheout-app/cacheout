@@ -577,9 +577,13 @@ final class EphemeralTempScannerTests: XCTestCase {
     /// was already visible; this closes the asymmetry.
     ///
     /// Driven through the `readChildNames` seam because a real mid-`readdir`
-    /// failure cannot be staged deterministically. That production actually
-    /// produces `.readFailed` is pinned separately and without any seam by
-    /// `testProductionBoundedReadCarriesTheReaddirErrno`.
+    /// failure cannot be staged deterministically. There is NO seamless cell
+    /// behind that: this comment used to name one
+    /// (`testProductionBoundedReadCarriesTheReaddirErrno`), which has never
+    /// existed, and `testACleanReadIsNeverMisreadAsAFailedOne`'s own HONEST
+    /// SCOPE paragraph says the opposite in as many words — "`.readFailed`
+    /// itself has no cell", with the measurement behind that claim
+    /// (PR #460 codex r8, D3).
     func testWalkDisclosesAReadFailureAndStaysSilentOnAVanishedBranch() async throws {
         try makeStaleCandidate("old-scratch", under: sharedRootURL)
         // The walk composes children under the root's DECLARED (canonical)

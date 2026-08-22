@@ -115,8 +115,8 @@ final class SourceAnchorIntegrityTests: XCTestCase {
          "Never followed; neither carries content of its o"),
         ("EphemeralTempScanner.swift:771-777",
          "kind: kind == .symlink ? .symlinkRoot : .nonDire"),
-        ("EphemeralTempScannerTests.swift:2971",
-         "XCTAssertTrue("),
+        ("EphemeralTempScannerTests.swift:2975-2977",
+         "detail.contains("),
         ("FileSystemIdentityProvider.swift:143",
          "guard !blocksOverflow, allocated >= 0 else { ret"),
         ("FileSystemIdentityProvider.swift:292-296",
@@ -167,8 +167,8 @@ final class SourceAnchorIntegrityTests: XCTestCase {
          "static func stableID(scannerID: String, canonica"),
         ("SysctlJournal.swift:192",
          "state.entries.append(entry)"),
-        ("ValuablesDetector.swift:1752",
-         "errno = 0"),
+        ("ValuablesDetector.swift:1754-1756",
+         "is the only discriminator, so it is cleared before ea"),
 ]
 
     // MARK: - The walk
@@ -323,6 +323,127 @@ final class SourceAnchorIntegrityTests: XCTestCase {
         XCTAssertEqual(
             listed.filter { !cited.contains($0) }, [],
             "anchorExpectations lists anchors no comment cites any more"
+        )
+    }
+
+    // MARK: - Cited cell names (PR #460 codex r8, D3)
+
+    /// Cell names cited in a comment that no `func` declares — because the
+    /// cell was renamed, because it was deleted, or because it NEVER EXISTED
+    /// and the citation is this branch's record of that defect. Each carries
+    /// the reason the citation is still honest; anything NOT listed here must
+    /// be a real `func`.
+    ///
+    /// The defect this closes: r7's own headline guard
+    /// (`WorktreeReclaimPerformer.swift`, the `removeTree` seam) named
+    /// `testThePermanentProofAndTheRemovalAreNotSeparatedByTheHop` and
+    /// `testThePermanentArmRefusesAWorktreeSwappedInsideTheHop`. Neither has
+    /// ever existed — `grep -rn 'func <name>' Tests` returned 0 for both —
+    /// and a reader checking the guard's evidence finds nothing, which reads
+    /// as evidence that was deleted. Two more of the same shape predate this
+    /// PR and are corrected in the same commit: a cell claiming to pin
+    /// `.readFailed` "without any seam" in `EphemeralTempScannerTests`, and a
+    /// scan-time-token round trip in `ValuablesDetector`.
+    static let absentCellNames: [(name: String, reason: String)] = [
+        ("testNonZeroExitIsTheOnlyClassThatReachesTheReCheck",
+         "renamed at r5 when the second `worktree remove` arm was deleted; "
+             + "cited by its successor's doc as history, in the past tense"),
+        ("testTheForceUnwrapPopulationDoesNotGrow",
+         "deleted at r7 and replaced by "
+             + "`testNoForceUnwrapCanBeDecidedByProductionCode`; "
+             + "`StrandFenceTests` records what stood there and why it went"),
+        ("testThePermanentProofAndTheRemovalAreNotSeparatedByTheHop",
+         "never existed; named by r7's `removeTree` guard and cited only in "
+             + "this file's record of that defect"),
+        ("testThePermanentArmRefusesAWorktreeSwappedInsideTheHop",
+         "never existed; named by r7's `removeTree` guard and cited only in "
+             + "this file's record of that defect"),
+        ("testProductionBoundedReadCarriesTheReaddirErrno",
+         "never existed; cited by `EphemeralTempScannerTests` only in the "
+             + "correction that retired the false coverage claim naming it"),
+    ]
+
+    func testEveryCitedTestCellNameExists() throws {
+        var declared: Set<String> = []
+        guard let declaration = try? NSRegularExpression(
+            pattern: #"func\s+(test[A-Za-z0-9_]+)"#
+        ), let citation = try? NSRegularExpression(
+            pattern: #"`(test[A-Za-z0-9_]+)`"#
+        ) else { return XCTFail("the cell-name patterns do not compile") }
+
+        let sources = try swiftSources()
+        for file in sources where file.path.contains("/Tests/") {
+            let source = try String(contentsOf: file, encoding: .utf8)
+            let full = NSRange(source.startIndex..., in: source)
+            for match in declaration.matches(in: source, range: full) {
+                guard let range = Range(match.range(at: 1), in: source)
+                else { continue }
+                declared.insert(String(source[range]))
+            }
+        }
+        let retired = Set(Self.absentCellNames.map(\.name))
+
+        var offenders: [String] = []
+        var citations = 0
+        for file in sources {
+            let source = try String(contentsOf: file, encoding: .utf8)
+            for (number, line) in source.split(
+                separator: "\n", omittingEmptySubsequences: false
+            ).enumerated() {
+                guard let comment = line.range(of: "//") else { continue }
+                let text = String(line[comment.lowerBound...])
+                let full = NSRange(text.startIndex..., in: text)
+                for match in citation.matches(in: text, range: full) {
+                    guard let range = Range(match.range(at: 1), in: text)
+                    else { continue }
+                    let name = String(text[range])
+                    citations += 1
+                    guard !declared.contains(name), !retired.contains(name)
+                    else { continue }
+                    offenders.append(
+                        "\(file.lastPathComponent):\(number + 1): \(name)"
+                    )
+                }
+            }
+        }
+
+        XCTAssertGreaterThan(
+            citations, 40,
+            "the check must actually have found citations, not zero of them"
+        )
+        XCTAssertGreaterThan(
+            declared.count, 1_000,
+            "the check must actually have read the cells: \(declared.count)"
+        )
+        XCTAssertEqual(
+            offenders, [],
+            "a guard that cites a cell by name is claiming that cell is its "
+                + "evidence. When the name is wrong the reader finds nothing "
+                + "and reads it as evidence that was deleted. Name the real "
+                + "cell, or list it in `absentCellNames` with the reason the "
+                + "citation is still honest."
+        )
+    }
+
+    /// `absentCellNames`' own rot check: an entry for a name that EXISTS
+    /// again would silently exempt a live cell from the check.
+    func testTheAbsentCellListIsExactlyWhatItClaims() throws {
+        var declared: Set<String> = []
+        guard let declaration = try? NSRegularExpression(
+            pattern: #"func\s+(test[A-Za-z0-9_]+)"#
+        ) else { return XCTFail("the declaration pattern does not compile") }
+        for file in try swiftSources() where file.path.contains("/Tests/") {
+            let source = try String(contentsOf: file, encoding: .utf8)
+            let full = NSRange(source.startIndex..., in: source)
+            for match in declaration.matches(in: source, range: full) {
+                guard let range = Range(match.range(at: 1), in: source)
+                else { continue }
+                declared.insert(String(source[range]))
+            }
+        }
+        XCTAssertEqual(
+            Self.absentCellNames.map(\.name).filter(declared.contains), [],
+            "an absent name that exists again must leave the list"
         )
     }
 }

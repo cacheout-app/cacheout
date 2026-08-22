@@ -108,8 +108,12 @@
 /// the surviving one is measured byte-identical in exposure to the derivation
 /// it replaced — strictly fewer, never more. It is fail-closed downstream: the
 /// rotated token does not match at delete time, so the clean is REFUSED rather
-/// than performed against the wrong tree (`testAdvScanTimeTokenAuthorizesThe`
-/// `ProductionRevalidator` pins the honest round trip; a rotated token refuses).
+/// than performed against the wrong tree — the honest round trip is pinned by
+/// `testUnacknowledgedConfirmRefusesWithTokenThenTheTokenDeletes` and the
+/// rotated-token refusal by
+/// `testInPlaceReplacementRotatesTheTokenAndRefusesTheStaleOne`, both in
+/// `CLIGateTests`. (This sentence used to name a cell that has never existed;
+/// PR #460 codex r8, D3.)
 /// Closing it entirely needs `F_GETPATH` on the held anchor, which would change
 /// the identity doctrine for every scanner — deliberately out of scope here.
 ///

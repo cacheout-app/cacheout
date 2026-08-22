@@ -17,12 +17,19 @@ import XCTest
 ///
 /// MEASURED before the fix (PR #460 codex r4): 2 of 9 full `swift test` runs
 /// died at `StatusSocketIntegrationTests.testConcurrentClients` with
-/// **signal 13**. In one of them only 1319 of 1448 cells had run — 127 never
-/// ran at all, including every cell in `WorktreeReclaimPerformerTests` and
+/// **signal 13**. In one of them only 1319 of 1448 cells had run, including
+/// every cell in `WorktreeReclaimPerformerTests` and
 /// `WorktreeStalenessAssessorTests`, i.e. the whole delete-time-gate
 /// evidence base of this PR. NO cell fails in that state and the
 /// "Executed N tests" line never prints, so a truncated run is easy to
 /// mistake for a green one.
+///
+/// ARITHMETIC CORRECTION (PR #460 codex r5, D8). This comment and `60a1696`
+/// both said "127 never ran". 1448 − 1319 = **129**. The two figures the
+/// measurement actually produced are kept and the derived one is dropped
+/// rather than re-derived, because nothing in that run recorded which of the
+/// two endpoints was the approximate one — and a subtraction is not evidence
+/// for either.
 ///
 /// With `SO_NOSIGPIPE` set at creation, the same broken pipe returns
 /// `-1`/`EPIPE` from `write(2)` and fails ONE cell.

@@ -1222,13 +1222,13 @@ actor CacheCleaner {
                     label: label, tag: "container-drift",
                     detail: "\(child.path): \(error.localizedDescription)"
                 )
-            } else if error is TrashDisposal.Failure {
+            } else if let failure = error as? TrashDisposal.Failure {
                 // The swap landed inside `trashItem`'s own resolution, so it
                 // was caught AFTER the move and undone. Same event as the one
                 // above, one disposal over — and the same tag item mode uses
-                // for it.
+                // for it, INCLUDING the container case (r13).
                 logRefusal(
-                    label: label, tag: "content-drift",
+                    label: label, tag: Self.trashRefusalTag(failure),
                     detail: "\(child.path): \(error.localizedDescription)"
                 )
             }
@@ -1579,12 +1579,22 @@ actor CacheCleaner {
                     label: item.displayName, tag: "container-drift",
                     detail: "\(target.path): \(error.localizedDescription)"
                 )
-            } else if error is TrashDisposal.Failure {
+            } else if let failure = error as? TrashDisposal.Failure {
                 // Same event again, one disposal over: a swap the Trash arm
                 // caught (before its move, or after it and undone) is the same
                 // thing happening to the user as one the permanent arm caught.
+                //
+                // AND THE CONTAINER CASE KEEPS THE CONTAINER'S TAG (PR #460
+                // codex r13, A2's class). One of these causes is not about
+                // the item at all: `.destinationNotTheAdmittedContainer` says
+                // the FOLDER THAT HOLDS IT was replaced — the same fact
+                // `DepthSafeRemoval.Failure.notTheAdmittedContainer` carries
+                // two branches up — and tagging it `content-drift` sent the
+                // user to look at the wrong thing on the one arm where a
+                // container swap is now reachable end to end.
                 logRefusal(
-                    label: item.displayName, tag: "content-drift",
+                    label: item.displayName,
+                    tag: Self.trashRefusalTag(failure),
                     detail: "\(target.path): \(error.localizedDescription)"
                 )
             }
@@ -1708,6 +1718,22 @@ actor CacheCleaner {
     /// `PathGuardError` cases, never derived from message strings. Internal
     /// (fn-5.4) so the composite performer classifies its own PathGuard
     /// refusals through the same switch.
+    /// The cleanup-log tag for a Trash disposal refusal.
+    ///
+    /// ONE of `TrashDisposal.Failure`'s six causes is about the FOLDER rather
+    /// than the item, and it is the one a container swap reaches: the
+    /// rollback refused to restore into a directory it could not prove. The
+    /// permanent arm has said `container-drift` for that event since PR #458;
+    /// this is the Trash arm saying it too (PR #460 codex r13).
+    static func trashRefusalTag(_ failure: TrashDisposal.Failure) -> String {
+        switch failure.cause {
+        case .destinationNotTheAdmittedContainer: return "container-drift"
+        case .putBack, .strandedInTrash, .lastSeenInTrash,
+             .putBackTookAnotherObject, .destinationUnknown:
+            return "content-drift"
+        }
+    }
+
     static func refusalTag(_ error: Error) -> String {
         guard let guardError = error as? PathGuardError else { return "error" }
         switch guardError {

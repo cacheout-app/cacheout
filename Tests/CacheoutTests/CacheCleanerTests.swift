@@ -2197,6 +2197,15 @@ final class CacheCleanerTests: XCTestCase {
             ),
             "our own file never left the folder it was inspected in"
         )
+        // AND THE LOG SAYS WHICH THING CHANGED (A2's class, one disposal
+        // over). `content-drift` says the item changed; this is the FOLDER,
+        // and the permanent arm has tagged it `container-drift` since PR
+        // #458. MUTATION: make `CacheCleaner.trashRefusalTag` return
+        // `content-drift` unconditionally and this assertion fails.
+        XCTAssertTrue(
+            logContents(home: home).contains("REFUSED [container-drift]"),
+            logContents(home: home)
+        )
     }
 
     /// The same verdict and the same composition, with only the LEAF swapped

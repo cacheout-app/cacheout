@@ -115,8 +115,8 @@ import XCTest
 /// `Fatal error: Unexpectedly found nil`, **signal 5, the total line never
 /// printed, 493 of the 1471 cells AT COMMIT 26c880b never ran**, and this
 /// PR's own `WorktreeReclaimPerformerTests` appeared in the log zero times.
-/// (The suite WAS 1486 at r8's head 7e9b2c5, 1496 at 101753b, and IS 1500 at
-/// a917447; a total
+/// (The suite WAS 1486 at r8's head 7e9b2c5, 1496 at 101753b, 1500 at
+/// a917447, and IS 1511 at 592eb0a; a total
 /// is only ever a fact about the commit it was taken at — see
 /// `WorktreeReclaimPerformerTests`' class header, D5, and r10's D4.)
 ///

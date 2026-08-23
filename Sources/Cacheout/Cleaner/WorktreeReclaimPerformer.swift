@@ -2458,7 +2458,12 @@ struct WorktreeReclaimPerformer {
         // 2 skipped / 0 failures, exit 0 — and r11's four cells (two on the
         // Trash fallback's errno gate, two on the unbounded-park fence) took
         // it to 1500: `swift test` AT COMMIT a917447 reported 1500 executed /
-        // 2 skipped / 0 failures, exit 0. Every figure here now names the
+        // 2 skipped / 0 failures, exit 0. r12's eleven cells — five on the
+        // directory-verdict arm's landing, one on an absent container, three
+        // on the scan session's wall-clock bound, one on its visible row and
+        // one on the errno-carrying open — took it to 1511: `swift test` AT
+        // COMMIT 592eb0a reported 1511 executed / 2 skipped / 0 failures,
+        // exit 0. Every figure here now names the
         // commit it was taken at, which is the only spelling that cannot rot.
         // The half that survives every commit — and the half a mutation
         // actually establishes — is the ZERO FAILURES.

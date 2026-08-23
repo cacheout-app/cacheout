@@ -79,7 +79,8 @@ import XCTest
 /// measurement 7e9b2c5 records), r9 and r10 → 1496 (`swift test` AT COMMIT
 /// 101753b: 1496 executed / 2 skipped / 0 failures, exit 0), r11 → 1500
 /// (`swift test` AT COMMIT a917447: 1500 executed / 2 skipped / 0 failures,
-/// exit 0). The previous
+/// exit 0), r12 → 1511 (`swift test` AT COMMIT 592eb0a: 1511 executed /
+/// 2 skipped / 0 failures, exit 0). The previous
 /// spelling was "r8 → 1486 (`swift test`, this commit)" — true at 7e9b2c5,
 /// which wrote it, and stale at the very next commit, because "this commit"
 /// is not an endpoint. r9's cells moved the total and this line did not

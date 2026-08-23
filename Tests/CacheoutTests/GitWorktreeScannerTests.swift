@@ -1432,6 +1432,79 @@ final class GitWorktreeScannerTests: XCTestCase {
 
 
 
+    /// B-P4 (PR #460 codex r16). (e2) leaves a record unwitnessed when
+    /// `adminDirectory` or `identity` returns nil — EPERM, a momentary vanish
+    /// — and if both succeed again by the time `handle` runs, the record
+    /// reached the re-proof with `assessmentWitness == nil`. The user was
+    /// then told the worktree "was replaced while this scan was running …
+    /// the evidence belongs to a checkout that is gone", for what was a
+    /// transient stat failure: a different cause with a different remedy
+    /// (nothing was replaced, and nothing about the checkout needs
+    /// re-judging).
+    ///
+    /// The pre-existing `adminEntryIdentity` guard already had the honest
+    /// wording — "lstat failed … the delete-time gate … could not be armed" —
+    /// and this arm now carries it too. BOTH arms suppress the item, so this
+    /// is message correctness, not a safety hole, and the cell asserts the
+    /// suppression as well so a future edit cannot buy the wording by
+    /// offering the item.
+    ///
+    /// The double fails the SECOND `identity` call for the admin entry: the
+    /// first is the discovery capture, the second is (e2)'s, the third is the
+    /// live one in `handle`. Its call counter is asserted so a re-ordering of
+    /// those captures cannot leave this cell exercising a different arm.
+    ///
+    /// MUTATION: collapse this arm back into the re-proof's `guard let
+    /// assessmentWitness, assessmentWitness == adminEntryIdentity` — RED
+    /// here, GREEN everywhere else.
+    func testATransientLstatFailureAtTheWitnessLoopIsNotReportedAsAReplacement()
+        async throws
+    {
+        let repository = try makeRepositoryIgnoringPayloads(
+            at: dev.appendingPathComponent("repo")
+        )
+        let worktree = try addWorktree(
+            of: repository, at: dev.appendingPathComponent("wt-a"), branch: "a"
+        )
+        let adminEntry = try XCTUnwrap(
+            GitWorktreeGitdirResolver().adminDirectory(forWorktreeAt: worktree),
+            "the fixture must have a resolvable admin directory"
+        )
+
+        let provider = BlindOnNthIdentityCallProvider(blinded: adminEntry, onCall: 2)
+        let outcome = await makeScanner(provider: provider)
+            .scan(context: ScanContext(trigger: .userInitiated))
+
+        XCTAssertEqual(
+            provider.calls, 4,
+            "the admin entry is identified four times — discovery, the "
+                + "witness loop, the live read in `handle`, and the prune "
+                + "tier's admin-container mapping; this cell names the "
+                + "SECOND and cannot be read if that ordering changes"
+        )
+        // Suppression is unchanged: an unwitnessed record is never armed.
+        XCTAssertTrue(
+            try outcome.items.allSatisfy { try plan(of: $0).mode != .removeStaleWorktree },
+            "a stale item was offered for an unwitnessed checkout: "
+                + "\(outcome.items.map(\.displayName))"
+        )
+        let issue = try XCTUnwrap(
+            outcome.errors.first { $0.url?.lastPathComponent == "wt-a" },
+            "the refusal must be visible, not silent: \(outcome.errors)"
+        )
+        XCTAssertFalse(
+            issue.detail.contains("replaced"),
+            "a transient lstat failure is reported as a REPLACEMENT — a "
+                + "different cause with a different remedy: \(issue.detail)"
+        )
+        XCTAssertTrue(issue.detail.contains("lstat failed"), issue.detail)
+        XCTAssertTrue(issue.detail.contains("could not be armed"), issue.detail)
+        XCTAssertTrue(issue.detail.contains("no item is offered"), issue.detail)
+        XCTAssertEqual(issue.kind, .unreadable)
+        XCTAssertTrue(fm.fileExists(atPath: worktree.path))
+    }
+
+
     // MARK: - R6: the orphaned-admin tier
 
     func testTwoOrphanedCheckoutsYieldOneMeasuredPruneItemDisclosingBoth()
@@ -2476,6 +2549,49 @@ final class GitWorktreeScannerTests: XCTestCase {
             return Data()
         }
         return stdout
+    }
+}
+
+/// A provider that reports one path as unidentifiable on the Nth `identity`
+/// call for it ONLY, and answers truthfully on every other — the shape of a
+/// TRANSIENT `lstat` failure (EPERM under a momentary sandbox change, an
+/// entry that vanishes and comes back).
+///
+/// Strictly LESS capable than production on that one call and identical to it
+/// everywhere else, so it can never answer a question the real provider would
+/// refuse. The counter is per-path and matched on the admin-entry SUFFIX, for
+/// the same reason `BlindToOnePathProvider` is: the scanner asks about the
+/// entry under several legal spellings.
+private final class BlindOnNthIdentityCallProvider: FileSystemIdentityProvider,
+    @unchecked Sendable
+{
+    private let suffix: String
+    private let blindCall: Int
+    private let lock = NSLock()
+    private var seen = 0
+
+    init(blinded: URL, onCall blindCall: Int) {
+        self.suffix = "/" + blinded.deletingLastPathComponent().lastPathComponent
+            + "/" + blinded.lastPathComponent
+        self.blindCall = blindCall
+        super.init()
+    }
+
+    /// How many times the blinded path was asked about — read back so a cell
+    /// cannot silently stop exercising the call it names.
+    var calls: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return seen
+    }
+
+    override func identity(of url: URL) -> Identity? {
+        guard url.path.hasSuffix(suffix) else { return super.identity(of: url) }
+        lock.lock()
+        seen += 1
+        let index = seen
+        lock.unlock()
+        return index == blindCall ? nil : super.identity(of: url)
     }
 }
 

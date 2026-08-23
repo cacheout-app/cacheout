@@ -728,6 +728,9 @@ struct GitWorktreeScanner: @unchecked Sendable {
             else { continue }
             let entry = provider.resolveTargetKeepingLeaf(admin)
             discoveryWitnesses[record.path.path] = group.discoveryWitnesses[entry.path]
+            // nil = an lstat that failed HERE (EPERM, a momentary vanish).
+            // That is a different fact from a replacement and `handle` says
+            // so in different words (PR #460 codex r16, B-P4).
             assessmentWitnesses[record.path.path] = provider.identity(of: entry)
         }
 
@@ -785,7 +788,8 @@ struct GitWorktreeScanner: @unchecked Sendable {
         /// listing (see (e2)). It is what witnesses the listing command
         /// itself: a replacement while git was reading these admin entries
         /// shows up as a discovery/assessment DISAGREEMENT and nowhere else.
-        /// `nil` is itself a refusal.
+        /// `nil` here means an lstat that FAILED at (e2), which is a
+        /// different fact from a replacement.
         assessmentWitness: FileSystemIdentityProvider.Identity?,
         context: ScanContext,
         bindings: [RootBinding],
@@ -986,6 +990,31 @@ struct GitWorktreeScanner: @unchecked Sendable {
             return
         }
 
+        // A TRANSIENT LSTAT FAILURE AT (e2) IS NOT A REPLACEMENT (PR #460
+        // codex r16, B-P4). (e2) leaves no witness when `adminDirectory` or
+        // `identity` returns nil — EPERM, a momentary vanish — and until r16
+        // such a record fell through the re-proof below and was reported to
+        // the user as "replaced while this scan was running … the evidence
+        // belongs to a checkout that is gone". Different cause, different
+        // remedy. This arm carries the same honest wording the
+        // `adminEntryIdentity` guard above already had. Both arms suppress
+        // the item, so this is message correctness, not a safety hole.
+        guard let assessmentWitness else {
+            issues.append(ScanIssue(
+                url: record.path, kind: .unreadable,
+                detail: "worktree '\(record.path.path)' has an admin directory "
+                    + "at '\(strict[2].path)' that could not be identified "
+                    + "when this scan listed its repository (lstat failed), so "
+                    + "the delete-time gate that tells a re-created checkout "
+                    + "from this one could not be armed — no item is offered"
+            ))
+            log.entries.append(GitWorktreeAssessmentLog.Entry(
+                worktreePath: record.path, isCandidate: true,
+                emittedItem: false, evidence: assessment.evidence
+            ))
+            return
+        }
+
         // THE RE-PROOF (PR #460 codex r14 N1; r15's S-P1 capture; anchored on
         // the DISCOVERY capture by r16's B-P1/B-P2). The `adminEntryIdentity`
         // guard above was written against `lstat` FAILING — its own comment
@@ -1008,7 +1037,7 @@ struct GitWorktreeScanner: @unchecked Sendable {
         //
         // A mismatch is not an error state: the next scan simply assesses
         // whatever is there now and offers it on its own evidence.
-        guard let assessmentWitness, discoveryWitness == assessmentWitness,
+        guard discoveryWitness == assessmentWitness,
               assessmentWitness == adminEntryIdentity
         else {
             issues.append(ScanIssue(

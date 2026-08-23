@@ -1982,6 +1982,137 @@ final class GitWorktreeScannerTests: XCTestCase {
         )
     }
 
+    /// A worktree added with `--detach` and committed into, then deleted:
+    /// its admin directory's `HEAD` is the ONLY name its commit has.
+    /// Returns the orphaned checkout path and the commit OID.
+    private func addDetachedOrphan(
+        of repository: URL, at path: URL
+    ) throws -> (checkout: URL, commit: String) {
+        try fm.createDirectory(
+            at: path.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        XCTAssertEqual(
+            try GitFixture.git(
+                ["-C", repository.path, "worktree", "add", "--detach", path.path],
+                home: home
+            ).status, 0, "git worktree add --detach failed at \(path.path)"
+        )
+        try "unique work".write(
+            to: path.appendingPathComponent("work.txt"), atomically: true, encoding: .utf8
+        )
+        XCTAssertEqual(
+            try GitFixture.git(["-C", path.path, "add", "work.txt"], home: home).status, 0
+        )
+        XCTAssertEqual(
+            try GitFixture.git(
+                ["-C", path.path, "-c", "user.name=t", "-c", "user.email=t@t",
+                 "commit", "-m", "detached work"],
+                home: home
+            ).status, 0
+        )
+        let head = try GitFixture.git(["-C", path.path, "rev-parse", "HEAD"], home: home)
+        XCTAssertEqual(head.status, 0)
+        let commit = String(decoding: head.stdout, as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        try fm.removeItem(at: path)
+        return (path, commit)
+    }
+
+    /// THE COMMIT NO REF REACHES IS NOT PRUNED, AND SAYING SO IS THE WHOLE
+    /// POINT (PR #460 codex r18, C4).
+    ///
+    /// Before this arm the tier mapped every unlocked prunable record and
+    /// offered a `.safe` item whose evidence says repository objects are
+    /// untouched. MEASURED on git 2.50.1 outside the suite: after the admin
+    /// directory of a detached orphan is removed, `git fsck --unreachable
+    /// --no-reflogs` — silent a moment earlier — reports the commit, its tree
+    /// and its blob, and `git gc --prune=now` then deletes the object.
+    ///
+    /// The cell asserts BOTH halves, because a refusal that never lifts is
+    /// its own defect: the whole repository is suppressed while the commit is
+    /// nameless, and the same scanner offers the item once the user names it.
+    ///
+    /// MUTATIONS, each RED here:
+    /// - delete the `case .refuse` arm (or the whole `prove` call) — the item
+    ///   ships and the fsck assertion fails on the pruned fixture;
+    /// - drop `--single-worktree` from the reachability argv — `--all` then
+    ///   counts the DOOMED record's own HEAD as a ref, the query answers `0`,
+    ///   and the item ships;
+    /// - refuse every detached record without querying reachability — the
+    ///   second half fails, because naming the commit would never clear it.
+    func testADetachedOrphanNoRefReachesSuppressesThePruneUntilItIsNamed()
+        async throws
+    {
+        let repository = try makeRepositoryIgnoringPayloads(
+            at: dev.appendingPathComponent("repo")
+        )
+        // A second, ORDINARY orphan: the suppression is repository-wide, and
+        // this one proves the refusal is not limited to the detached record.
+        let attached = try addWorktree(
+            of: repository, at: dev.appendingPathComponent("gone"), branch: "gone"
+        )
+        try fm.removeItem(at: attached)
+        let detached = try addDetachedOrphan(
+            of: repository, at: dev.appendingPathComponent("detached-gone")
+        )
+
+        let scanner = makeScanner()
+        let outcome = await scanner.scan(context: ScanContext(trigger: .userInitiated))
+
+        XCTAssertTrue(
+            outcome.items.isEmpty,
+            "no prune item may be offered while a commit hangs off an admin "
+                + "directory: \(outcome.items.map(\.displayName))"
+        )
+        let issue = try XCTUnwrap(
+            outcome.errors.first { $0.kind == .unreadable },
+            "the suppression must be VISIBLE: \(outcome.errors)"
+        )
+        XCTAssertTrue(
+            issue.detail.contains(String(detached.commit.prefix(12))),
+            "the issue must name the commit at risk: \(issue.detail)"
+        )
+        XCTAssertTrue(
+            issue.detail.contains("no branch, tag or other ref reaches that commit"),
+            issue.detail
+        )
+        XCTAssertTrue(
+            issue.detail.contains("git branch"),
+            "the remedy must be named: \(issue.detail)"
+        )
+        // Nothing was touched, and git agrees the commit is still named.
+        let fsck = try GitFixture.git(
+            ["-C", repository.path, "fsck", "--unreachable", "--no-reflogs"],
+            home: home
+        )
+        XCTAssertFalse(
+            String(decoding: fsck.stdout, as: UTF8.self).contains(detached.commit),
+            "the commit must still be reachable after the scan"
+        )
+        try assertNonMalformed(outcome, from: scanner)
+
+        // THE REFUSAL CLEARS. Naming the commit is a fact about the
+        // repository, not a bound of this process, so the very next scan
+        // offers both admin directories.
+        XCTAssertEqual(
+            try GitFixture.git(
+                ["-C", repository.path, "branch", "rescued", detached.commit],
+                home: home
+            ).status, 0, "the fixture must be able to name the commit"
+        )
+        let second = await makeScanner()
+            .scan(context: ScanContext(trigger: .userInitiated))
+        let item = try XCTUnwrap(
+            second.items.first,
+            "once the commit is named the item must be offered: \(second.errors)"
+        )
+        XCTAssertEqual(try plan(of: item).mode, .pruneOrphanedAdmin)
+        XCTAssertEqual(
+            try plan(of: item).disclosedAdminDirectories.count, 2,
+            "both orphans ride the cleared item"
+        )
+    }
+
     func testUnmappablePrunableRecordSuppressesThePruneItemEntirely() async throws {
         let repository = try makeRepositoryIgnoringPayloads(
             at: dev.appendingPathComponent("repo")

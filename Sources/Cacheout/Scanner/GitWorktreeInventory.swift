@@ -543,10 +543,19 @@ struct GitWorktreeAdminMapper {
     /// records synthetically. Keep the clause: it costs nothing and it holds
     /// if a future git ever does mark such a record. Do not read it as the
     /// last guard on a live path.
+    /// THE ONE SPELLING of "the records whose admin directories a prune would
+    /// remove" (PR #460 codex r18, C4). Three call sites read it — this
+    /// mapper, the scanner's disclosure, and the delete-time preservation
+    /// proof — and a second spelling would let one of them reason about a set
+    /// the removal does not have.
+    static func removalTargets(in entries: [GitWorktreeEntry]) -> [GitWorktreeEntry] {
+        entries.filter { $0.isPrunable && !$0.isLocked }
+    }
+
     func map(
         prunableRecordsIn entries: [GitWorktreeEntry], adminContainer: URL
     ) -> GitAdminMappingVerdict {
-        let targets = entries.filter { $0.isPrunable && !$0.isLocked }
+        let targets = Self.removalTargets(in: entries)
 
         // ABSENCE is the ONLY benign container failure, and only when
         // nothing is prunable — a repository that never had a linked
@@ -678,5 +687,235 @@ struct GitWorktreeAdminMapper {
         let ancestorComponents = ancestor.pathComponents
         guard candidateComponents.count > ancestorComponents.count else { return false }
         return Array(candidateComponents.prefix(ancestorComponents.count)) == ancestorComponents
+    }
+}
+
+// MARK: - Detached-HEAD preservation (PR #460 codex r18, C4)
+
+/// What the preservation proof answered about a repository's prune set.
+enum GitOrphanedHeadVerdict: Equatable, Sendable {
+    /// Every record in the set survives its own removal: it is attached to a
+    /// ref, its HEAD is reachable from one, or the commit is not in the
+    /// object database at all.
+    case nothingOrphaned
+    /// The prune would leave a commit named by nothing. The reason NAMES the
+    /// checkout and the commit, and carries the remedy.
+    case refuse(reason: String)
+}
+
+/// THE PROOF THAT PRUNING AN ADMIN DIRECTORY DESTROYS NO COMMIT
+/// (PR #460 codex r18, C4).
+///
+/// ## What the hazard is, MEASURED on git 2.50.1 (Apple Git-155) today
+///
+/// A registered worktree that was `--detach`ed and then committed to has its
+/// tip named by exactly one thing: the `HEAD` file inside its admin
+/// directory. Delete the checkout and git calls the record `prunable`; delete
+/// the ADMIN DIRECTORY — which is what this product's prune item does — and
+/// the commit is named by nothing at all. Reproduced end to end: a detached
+/// worktree with one commit, its checkout removed, `git fsck --unreachable
+/// --no-reflogs` SILENT before the admin directory was removed and reporting
+/// `unreachable commit <oid>` (plus its tree and blob) immediately after, and
+/// a subsequent `git gc --prune=now` deleting the object outright
+/// (`git cat-file -t <oid>` → `could not get object info`). That is the
+/// user's own work, and the item that removes it is labelled `.safe`.
+///
+/// ## Why this REFUSES rather than preserving the commit itself
+///
+/// The obvious alternative — write `refs/…` or a tag at the commit before
+/// pruning — would make this product WRITE INTO THE USER'S REPOSITORY. Every
+/// git command this app has ever issued is read-only (`GitSafetyProfile`
+/// classifies them, and the last two mutating argvs were retired in
+/// PR #460 codex r5/r6); a scanner that silently creates refs is a different
+/// product with a different consent model, and a ref it created would then
+/// outlive the reclaim as litter nobody asked for. So the conservative arm is
+/// taken: prove the commit survives, or offer nothing.
+///
+/// ## Why the refusal is not a permanent strand
+///
+/// The condition is USER-CLEARABLE and a retry genuinely differs: naming the
+/// commit (`git branch`, `git tag`, a merge, a push) makes the very next scan
+/// read `0` from the reachability query and offer the item. That is the
+/// distinction the "deterministic bound dressed as a re-scan promise" doctrine
+/// turns on — this is a fact about the repository, not a fixed limit of this
+/// process.
+///
+/// ## What it does NOT cover, stated rather than implied
+///
+/// The admin directory also holds a per-worktree REFLOG, and entries in it
+/// can name commits that no ref reaches (work that was `reset --hard` away,
+/// for instance). Those are not checked: they are already invisible to
+/// `git fsck --no-reflogs`, git's own `worktree prune` discards them exactly
+/// as this removal does, and `gc.reflogExpireUnreachable` (30 days by
+/// default) expires them anyway. The claim made here is precisely the one
+/// that is proved — the record's HEAD commit — and nothing wider.
+enum GitOrphanedHeadPreservation {
+
+    /// `rev-parse --verify --quiet` answers 1 for "no such object". The
+    /// discriminator against a real failure is the same one the D6 ladder
+    /// uses: a genuine miss is SILENT (verified on git 2.50.1 — exit 1, no
+    /// stdout, no stderr), while every diagnostic answer says something.
+    static let missingObjectExitCode: Int32 = 1
+
+    /// `git -C <repo> rev-parse --verify --quiet <oid>^{commit}` — does the
+    /// object database still hold this commit? A commit that is ALREADY gone
+    /// cannot be destroyed by removing a directory, and refusing on it would
+    /// be a refusal no user action could ever clear.
+    static func commitExistenceArguments(
+        repositoryAt repository: URL, commit: String
+    ) -> [String] {
+        ["-C", repository.path, "rev-parse", "--verify", "--quiet", "\(commit)^{commit}"]
+    }
+
+    /// `git -C <repo> rev-list --single-worktree --max-count=1 --count <oid>
+    /// --not --all` — prints `0` when the commit is reachable from some ref,
+    /// `1` when it is reachable from none.
+    ///
+    /// `--single-worktree` IS THE WHOLE CORRECTNESS OF THIS QUERY, and its
+    /// absence would make the check answer "safe" every single time. By
+    /// default `--all` pretends every WORKING TREE's `HEAD` is listed too —
+    /// including the doomed record's own, since a prunable worktree is still
+    /// registered until it is pruned. MEASURED on the reproduction above:
+    /// without the flag the query printed `0` (reachable) for the very commit
+    /// `git fsck` reported unreachable one command later; with it, `1`.
+    ///
+    /// The cost of the flag is a conservative reading in one shape: a commit
+    /// reachable ONLY from ANOTHER live worktree's detached HEAD reads as
+    /// unreachable and is refused. That errs toward keeping the user's data,
+    /// and it clears the same way every other reading here does.
+    static func unreachableCountArguments(
+        repositoryAt repository: URL, commit: String
+    ) -> [String] {
+        [
+            "-C", repository.path, "rev-list", "--single-worktree",
+            "--max-count=1", "--count", commit, "--not", "--all",
+        ]
+    }
+
+    /// A syntactically usable object name: hex, and one of git's two hash
+    /// lengths (SHA-1 / SHA-256). Anything else is not handed to git as a
+    /// revision.
+    static func isObjectName(_ text: String) -> Bool {
+        (text.count == 40 || text.count == 64)
+            && text.allSatisfy(\.isHexDigit)
+    }
+
+    /// The count `--count` printed, or nil when the output is not one.
+    static func count(in stdout: Data) -> Int? {
+        let text = String(decoding: stdout, as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return nil }
+        return Int(text)
+    }
+
+    /// Run the proof over the records a prune would remove the admin
+    /// directories of.
+    ///
+    /// ONE implementation, both call sites — the scanner's disclosure and the
+    /// performer's delete-time recompute — for the reason the mapper is
+    /// shared: a detection that proves this and an execution that does not
+    /// would destroy the commit anyway, and an execution stricter than
+    /// detection would strand every offered item.
+    ///
+    /// ATTACHED RECORDS ARE NOT QUERIED, and that is not an omission: git
+    /// REFUSES to delete a branch a registered worktree holds, prunable or
+    /// not (`error: cannot delete branch 'x' used by worktree at …`, measured
+    /// on 2.50.1), so the branch ref that names the tip is still there and
+    /// still names it after the admin directory is gone.
+    static func prove(
+        prunableRecords: [GitWorktreeEntry],
+        repositoryAt repository: URL,
+        run: (_ arguments: [String]) async -> GitCommandOutcome
+    ) async -> GitOrphanedHeadVerdict {
+        for record in prunableRecords where record.isDetached {
+            let checkout = record.path.path
+            guard let commit = record.headSHA, isObjectName(commit) else {
+                return .refuse(
+                    reason: "the registered checkout '\(checkout)' is detached "
+                        + "but this repository's listing named no usable commit "
+                        + "for its HEAD, so it cannot be shown that pruning its "
+                        + "admin directory destroys no work"
+                )
+            }
+            let short = String(commit.prefix(12))
+
+            switch await run(
+                commitExistenceArguments(repositoryAt: repository, commit: commit)
+            ) {
+            case .success:
+                break
+            case .failure(let exitCode, let stderr)
+                where exitCode == missingObjectExitCode
+                && stderr.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty:
+                // The commit is not in the object database — there is nothing
+                // left for this removal to orphan.
+                continue
+            case .failure(let exitCode, let stderr):
+                return .refuse(
+                    reason: "whether the detached commit \(short) of the "
+                        + "registered checkout '\(checkout)' still exists could "
+                        + "not be answered "
+                        + "(\(GitCommandFailureSummary.describe(exitCode: exitCode, stderr: stderr)))"
+                )
+            case .timeout:
+                return .refuse(
+                    reason: "the existence check for the detached commit "
+                        + "\(short) of the registered checkout '\(checkout)' "
+                        + "timed out"
+                )
+            case .gitUnavailable:
+                return .refuse(
+                    reason: "git became unavailable while checking the detached "
+                        + "commit \(short) of the registered checkout "
+                        + "'\(checkout)'"
+                )
+            }
+
+            switch await run(
+                unreachableCountArguments(repositoryAt: repository, commit: commit)
+            ) {
+            case .success(let stdout):
+                guard let unreachable = count(in: stdout) else {
+                    return .refuse(
+                        reason: "the reachability query for the detached commit "
+                            + "\(short) of the registered checkout '\(checkout)' "
+                            + "produced no count"
+                    )
+                }
+                guard unreachable == 0 else {
+                    return .refuse(
+                        reason: "the registered checkout '\(checkout)' was "
+                            + "detached at commit \(short), and no branch, tag "
+                            + "or other ref reaches that commit — its admin "
+                            + "directory's HEAD is the only name it has, so "
+                            + "pruning would leave the commit unreachable and a "
+                            + "later `git gc` may delete it. Name the commit "
+                            + "(`git branch <name> \(short)` or `git tag`), or "
+                            + "prune this repository with git yourself, and the "
+                            + "next scan offers it"
+                    )
+                }
+            case .failure(let exitCode, let stderr):
+                return .refuse(
+                    reason: "whether the detached commit \(short) of the "
+                        + "registered checkout '\(checkout)' is reachable from "
+                        + "any ref could not be answered "
+                        + "(\(GitCommandFailureSummary.describe(exitCode: exitCode, stderr: stderr)))"
+                )
+            case .timeout:
+                return .refuse(
+                    reason: "the reachability query for the detached commit "
+                        + "\(short) of the registered checkout '\(checkout)' "
+                        + "timed out"
+                )
+            case .gitUnavailable:
+                return .refuse(
+                    reason: "git became unavailable while checking whether the "
+                        + "detached commit \(short) of the registered checkout "
+                        + "'\(checkout)' is reachable"
+                )
+            }
+        }
+        return .nothingOrphaned
     }
 }

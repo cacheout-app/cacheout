@@ -4560,6 +4560,107 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         return (repository, membership, admin)
     }
 
+    /// A DETACHED orphan whose commit no ref reaches — the shape the scanner
+    /// refuses to publish (PR #460 codex r18, C4). Returns its admin
+    /// directory and the commit OID.
+    private func makeDetachedOrphan(
+        named name: String, in repository: URL, membership: WorktreeMembership
+    ) throws -> (admin: URL, commit: String) {
+        let worktree = container.appendingPathComponent(name)
+        XCTAssertEqual(
+            try GitFixture.git(
+                ["-C", repository.path, "worktree", "add", "--detach", worktree.path],
+                home: home
+            ).status, 0, "git worktree add --detach failed for \(worktree.path)"
+        )
+        try "unique work".write(
+            to: worktree.appendingPathComponent("work.txt"),
+            atomically: true, encoding: .utf8
+        )
+        XCTAssertEqual(
+            try GitFixture.git(["-C", worktree.path, "add", "work.txt"], home: home).status, 0
+        )
+        XCTAssertEqual(
+            try GitFixture.git(
+                ["-C", worktree.path, "-c", "user.name=t", "-c", "user.email=t@t",
+                 "commit", "-m", "detached work"],
+                home: home
+            ).status, 0
+        )
+        let head = try GitFixture.git(
+            ["-C", worktree.path, "rev-parse", "HEAD"], home: home
+        )
+        XCTAssertEqual(head.status, 0)
+        try fm.removeItem(at: worktree)
+        let adminDirectory = membership.parentAdminContainer
+            .appendingPathComponent(name)
+        XCTAssertTrue(fm.fileExists(atPath: adminDirectory.path))
+        return (
+            adminDirectory,
+            String(decoding: head.stdout, as: UTF8.self)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        )
+    }
+
+    /// THE PROOF IS RE-ESTABLISHED AT DELETE TIME, not just at scan time
+    /// (PR #460 codex r18, C4).
+    ///
+    /// The scan-time tier refuses to publish a prune item that would leave a
+    /// commit named by nothing. A user who deletes the naming branch AFTER
+    /// that scan holds an item whose disclosure has quietly become false, and
+    /// the removal is what destroys the commit — so the recompute that
+    /// decides the delete-time set carries the same proof. Both halves are
+    /// asserted here: the refusal while the commit is nameless, and the
+    /// removal once it is named.
+    ///
+    /// MUTATION: delete the `prove` call from `recomputePrunableSet` — the
+    /// first half goes RED (the directory is removed and the commit orphaned).
+    func testAPruneWhoseCommitNoRefReachesIsRefusedAtDeleteTimeToo() async throws {
+        let repository = try makeRepository(named: "repo")
+        let anchor = try addWorktree(named: "anchor", branch: "anchor", in: repository)
+        let membership = try membership(of: anchor, in: repository)
+        let orphan = try makeDetachedOrphan(
+            named: "detached-gone", in: repository, membership: membership
+        )
+        let plan = prunePlan(membership: membership, disclosed: [orphan.admin])
+        let runner = InterceptingGitRunner(wrapping: realRunner())
+
+        let refused = await perform(
+            item(plan, id: "prune"), plan: plan,
+            with: makePerformer(runner: runner)
+        )
+
+        XCTAssertNil(refused.entry, "a refused prune reports no row")
+        let message = try XCTUnwrap(refused.errors.first?.message)
+        XCTAssertTrue(message.contains("pruning would destroy work"), message)
+        XCTAssertTrue(
+            message.contains(String(orphan.commit.prefix(12))),
+            "the commit at risk must be named: \(message)"
+        )
+        XCTAssertTrue(
+            fm.fileExists(atPath: orphan.admin.path),
+            "the admin directory — the commit's only name — must survive"
+        )
+
+        // AND IT CLEARS. Naming the commit is a fact about the repository.
+        XCTAssertEqual(
+            try GitFixture.git(
+                ["-C", repository.path, "branch", "rescued", orphan.commit],
+                home: home
+            ).status, 0
+        )
+        let accepted = await perform(
+            item(plan, id: "prune"), plan: plan,
+            with: makePerformer(runner: InterceptingGitRunner(wrapping: realRunner()))
+        )
+        XCTAssertTrue(accepted.errors.isEmpty, "\(accepted.errors.map(\.message))")
+        XCTAssertFalse(
+            fm.fileExists(atPath: orphan.admin.path),
+            "once the commit is named the prune runs"
+        )
+        assertNoForbiddenArgv(runner)
+    }
+
     func testTheOracleRecomputeRefusesWhenTheAdminContainerIsSwappedMidFlight()
         async throws
     {

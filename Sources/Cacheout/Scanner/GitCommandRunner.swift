@@ -98,8 +98,16 @@ enum GitSafetyProfile: String, Equatable, Sendable {
     case mutation
 
     /// Bare git commands D17 classifies READ-ONLY.
+    ///
+    /// `rev-list` joined them in PR #460 codex r18 (C4) for the detached-HEAD
+    /// preservation query. It is a pure traversal of the object graph — it
+    /// writes no ref, no index and no object — so the read-only relaxations
+    /// are the correct pair for it, and leaving it off would have handed the
+    /// FALLBACK `.mutation` profile to a command that cannot mutate while the
+    /// file's own note says no command the app issues classifies that way.
     static let readOnlyCommands: Set<String> = [
-        "status", "rev-parse", "symbolic-ref", "merge-base", "show", "version"
+        "status", "rev-parse", "symbolic-ref", "merge-base", "show", "version",
+        "rev-list",
     ]
 
     /// `git worktree <sub>` subcommands D17 classifies READ-ONLY.

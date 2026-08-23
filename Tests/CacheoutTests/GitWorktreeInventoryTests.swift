@@ -907,6 +907,215 @@ final class GitWorktreeInventoryTests: XCTestCase {
         XCTAssertTrue(reason.contains("device"), reason)
     }
 
+    // MARK: - Detached-HEAD preservation (PR #460 codex r18, C4)
+
+    /// One prunable record, shaped by the caller.
+    private func prunableRecord(
+        named name: String, detached: Bool, headSHA: String?, locked: Bool = false
+    ) -> GitWorktreeEntry {
+        GitWorktreeEntry(
+            path: base.appendingPathComponent(name), headSHA: headSHA,
+            branchRef: detached ? nil : "refs/heads/\(name)",
+            isDetached: detached, isBare: false, isLocked: locked, lockReason: nil,
+            isPrunable: true, prunableReason: "gitdir file points to non-existent location",
+            isMain: false
+        )
+    }
+
+    /// Records every argv the proof fires and answers each with a script.
+    private func proofRecorder(
+        _ answer: @escaping @Sendable ([String]) -> GitCommandOutcome
+    ) -> (run: @Sendable ([String]) async -> GitCommandOutcome, argvs: () -> [[String]]) {
+        let box = ArgvBox()
+        return (
+            run: { arguments in
+                box.record(arguments)
+                return answer(arguments)
+            },
+            argvs: { box.recorded }
+        )
+    }
+
+    /// AN ATTACHED PRUNABLE RECORD IS NEVER QUERIED, and that is the cheap
+    /// half of the guarantee: git refuses to delete a branch a registered
+    /// worktree holds, so the ref that names the tip outlives the prune.
+    ///
+    /// MUTATION: drop the `where record.isDetached` clause on the proof's
+    /// loop — RED here, because the attached record then fires two queries.
+    func testAnAttachedPrunableRecordFiresNoReachabilityQueryAtAll() async throws {
+        let recorder = proofRecorder { _ in .success(stdout: Data()) }
+        let verdict = await GitOrphanedHeadPreservation.prove(
+            prunableRecords: [
+                prunableRecord(named: "attached", detached: false, headSHA: String(repeating: "a", count: 40)),
+            ],
+            repositoryAt: base, run: recorder.run
+        )
+        XCTAssertEqual(verdict, .nothingOrphaned)
+        XCTAssertEqual(recorder.argvs(), [], "an attached record needs no proof")
+    }
+
+    /// A COMMIT THAT IS ALREADY GONE CANNOT BE ORPHANED, and refusing on it
+    /// would be a refusal no user action could ever clear. `rev-parse
+    /// --verify --quiet` answers a SILENT exit 1 for it (measured, git
+    /// 2.50.1).
+    ///
+    /// MUTATION: treat the silent exit 1 as a refusal — RED here.
+    func testAMissingCommitObjectIsNotSomethingAPruneCanDestroy() async throws {
+        let recorder = proofRecorder { arguments in
+            arguments.contains("rev-parse")
+                ? .failure(exitCode: 1, stderr: "")
+                : .success(stdout: Data("1\n".utf8))
+        }
+        let verdict = await GitOrphanedHeadPreservation.prove(
+            prunableRecords: [
+                prunableRecord(named: "vanished", detached: true, headSHA: String(repeating: "b", count: 40)),
+            ],
+            repositoryAt: base, run: recorder.run
+        )
+        XCTAssertEqual(
+            verdict, .nothingOrphaned,
+            "a commit the object database no longer holds is not at risk"
+        )
+        XCTAssertEqual(
+            recorder.argvs().count, 1,
+            "and the reachability query is never reached: \(recorder.argvs())"
+        )
+    }
+
+    /// EVERY OTHER READING OF EITHER QUERY REFUSES. A nonzero exit that SAYS
+    /// something is not "the object is absent" — the same discriminator the
+    /// D6 ladder uses — and a timeout, an unavailable git or an
+    /// unparseable count are all readings that failed to prove the commit
+    /// survives.
+    func testEveryUnprovableReadingOfEitherQueryRefusesTheWholePrune() async throws {
+        let oid = String(repeating: "c", count: 40)
+        let cases: [(name: String, answer: @Sendable ([String]) -> GitCommandOutcome, fragment: String)] = [
+            ("noisy-exit-1", { arguments in
+                arguments.contains("rev-parse")
+                    ? .failure(exitCode: 1, stderr: "warning: ignoring broken ref")
+                    : .success(stdout: Data("0\n".utf8))
+            }, "still exists could not be answered"),
+            ("existence-timeout", { arguments in
+                arguments.contains("rev-parse") ? .timeout : .success(stdout: Data("0\n".utf8))
+            }, "existence check for the detached commit"),
+            ("existence-unavailable", { arguments in
+                arguments.contains("rev-parse")
+                    ? .gitUnavailable : .success(stdout: Data("0\n".utf8))
+            }, "git became unavailable while checking the detached commit"),
+            ("reachability-failure", { arguments in
+                arguments.contains("rev-list")
+                    ? .failure(exitCode: 128, stderr: "fatal: bad object")
+                    : .success(stdout: Data(oid.utf8))
+            }, "reachable from any ref could not be answered"),
+            ("reachability-timeout", { arguments in
+                arguments.contains("rev-list") ? .timeout : .success(stdout: Data(oid.utf8))
+            }, "reachability query for the detached commit"),
+            ("reachability-unavailable", { arguments in
+                arguments.contains("rev-list")
+                    ? .gitUnavailable : .success(stdout: Data(oid.utf8))
+            }, "git became unavailable while checking whether"),
+            ("unparseable-count", { arguments in
+                arguments.contains("rev-list")
+                    ? .success(stdout: Data("no idea\n".utf8))
+                    : .success(stdout: Data(oid.utf8))
+            }, "produced no count"),
+            ("unreachable", { arguments in
+                arguments.contains("rev-list")
+                    ? .success(stdout: Data("1\n".utf8))
+                    : .success(stdout: Data(oid.utf8))
+            }, "no branch, tag or other ref reaches that commit"),
+        ]
+        for (name, answer, fragment) in cases {
+            let recorder = proofRecorder(answer)
+            let verdict = await GitOrphanedHeadPreservation.prove(
+                prunableRecords: [
+                    prunableRecord(named: "detached", detached: true, headSHA: oid),
+                ],
+                repositoryAt: base, run: recorder.run
+            )
+            guard case .refuse(let reason) = verdict else {
+                XCTFail("\(name): expected a refusal, got \(verdict)")
+                continue
+            }
+            XCTAssertTrue(reason.contains(fragment), "\(name): \(reason)")
+        }
+    }
+
+    /// A DETACHED RECORD WITH NO USABLE OBJECT NAME is refused before git is
+    /// asked anything: a revision this process cannot even spell is one it
+    /// cannot prove safe.
+    func testADetachedRecordWithNoUsableCommitNameRefusesBeforeAnyQuery() async throws {
+        for headSHA in [nil, "", "not-a-sha", String(repeating: "z", count: 40)] {
+            let recorder = proofRecorder { _ in .success(stdout: Data("0".utf8)) }
+            let verdict = await GitOrphanedHeadPreservation.prove(
+                prunableRecords: [
+                    prunableRecord(named: "nameless", detached: true, headSHA: headSHA),
+                ],
+                repositoryAt: base, run: recorder.run
+            )
+            guard case .refuse(let reason) = verdict else {
+                XCTFail("expected a refusal for HEAD \(headSHA ?? "nil"), got \(verdict)")
+                continue
+            }
+            XCTAssertTrue(reason.contains("named no usable commit"), reason)
+            XCTAssertEqual(recorder.argvs(), [], "git must not be asked")
+        }
+    }
+
+    /// THE ARGVS ARE THE MEASURED ONES. `--single-worktree` is the whole
+    /// correctness of the reachability query: without it `--all` pretends the
+    /// DOOMED record's own HEAD is a ref, and the query answers "reachable"
+    /// for the very commit `git fsck` calls unreachable one command later.
+    func testTheProofFiresTheTwoMeasuredReadOnlyArgvs() async throws {
+        let oid = String(repeating: "d", count: 40)
+        let recorder = proofRecorder { arguments in
+            arguments.contains("rev-list")
+                ? .success(stdout: Data("0\n".utf8))
+                : .success(stdout: Data(oid.utf8))
+        }
+        let verdict = await GitOrphanedHeadPreservation.prove(
+            prunableRecords: [
+                prunableRecord(named: "reachable", detached: true, headSHA: oid),
+            ],
+            repositoryAt: base, run: recorder.run
+        )
+        XCTAssertEqual(verdict, .nothingOrphaned)
+        XCTAssertEqual(recorder.argvs(), [
+            GitOrphanedHeadPreservation.commitExistenceArguments(
+                repositoryAt: base, commit: oid
+            ),
+            GitOrphanedHeadPreservation.unreachableCountArguments(
+                repositoryAt: base, commit: oid
+            ),
+        ])
+        let reachability = GitOrphanedHeadPreservation.unreachableCountArguments(
+            repositoryAt: base, commit: oid
+        )
+        XCTAssertTrue(reachability.contains("--single-worktree"), "\(reachability)")
+        // D17: both are pure reads of the object graph.
+        XCTAssertEqual(
+            GitSafetyProfile.classify(
+                GitOrphanedHeadPreservation.commitExistenceArguments(
+                    repositoryAt: base, commit: oid
+                )
+            ), .readOnly
+        )
+        XCTAssertEqual(GitSafetyProfile.classify(reachability), .readOnly)
+    }
+
+    /// THE FILTER IS ONE SPELLING. A locked prunable record is not in the
+    /// removal set, so it is not in the set the proof speaks for either.
+    func testTheRemovalTargetFilterIsSharedAndExcludesLockedRecords() {
+        let entries = [
+            prunableRecord(named: "unlocked", detached: true, headSHA: nil),
+            prunableRecord(named: "locked", detached: true, headSHA: nil, locked: true),
+        ]
+        XCTAssertEqual(
+            GitWorktreeAdminMapper.removalTargets(in: entries).map(\.path.lastPathComponent),
+            ["unlocked"]
+        )
+    }
+
     // MARK: - Listing helper
 
     private func listing(
@@ -927,4 +1136,24 @@ final class GitWorktreeInventoryTests: XCTestCase {
     }
 
     private enum FixtureFailure: Error { case listingFailed }
+}
+
+/// Thread-safe argv recorder for the preservation proof's injected runner
+/// (PR #460 codex r18, C4). A plain array would be mutated from inside a
+/// `@Sendable` closure.
+final class ArgvBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: [[String]] = []
+
+    func record(_ arguments: [String]) {
+        lock.lock()
+        stored.append(arguments)
+        lock.unlock()
+    }
+
+    var recorded: [[String]] {
+        lock.lock()
+        defer { lock.unlock() }
+        return stored
+    }
 }

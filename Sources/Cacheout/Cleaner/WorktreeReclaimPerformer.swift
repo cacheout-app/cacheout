@@ -3094,14 +3094,47 @@ struct WorktreeReclaimPerformer {
         guard let inventory = GitWorktreeInventory.parse(stdout) else {
             return .failed("the porcelain -z listing could not be parsed")
         }
+        let directories: [URL]
         switch mapper.map(
             prunableRecordsIn: inventory.entries,
             adminContainer: plan.parentAdminContainer
         ) {
-        case .complete(let directories):
-            return .set(directories)
+        case .complete(let mapped):
+            directories = mapped
         case .incomplete(let reason):
             return .failed("the prunable set is not provably complete: \(reason)")
+        }
+
+        // THE DETACHED-HEAD PROOF, AT DELETE TIME TOO (PR #460 codex r18,
+        // C4). The scanner refuses to publish a prune item whose removal
+        // would leave a commit named by nothing; asking it only there would
+        // make the guarantee a scan-time reading that any later `git branch
+        // -d` invalidates, and this recompute is the delete-time authority on
+        // WHICH directories are removed. Placing it here rather than in
+        // `pruneOrphanedAdmin` puts it on the SAME re-listing all three
+        // callers already pay for — the two prune-mode recomputes and the
+        // stale mode's gated post-removal prune — so no path can miss it.
+        //
+        // It traverses nothing new: the queries are `git -C
+        // <parentRepoWorkingDir>`, the target the guard above already covers
+        // for the listing.
+        //
+        // The stale mode's own gates make this a no-op there in the ordinary
+        // case: G3 proved the worktree's HEAD is an ancestor of the default
+        // ref, which is exactly reachability from a ref.
+        switch await GitOrphanedHeadPreservation.prove(
+            prunableRecords: GitWorktreeAdminMapper.removalTargets(in: inventory.entries),
+            repositoryAt: plan.parentRepoWorkingDir,
+            run: { [runner, gitTimeout] arguments in
+                await runner.run(arguments, timeout: gitTimeout).outcome
+            }
+        ) {
+        case .nothingOrphaned:
+            return .set(directories)
+        case .refuse(let reason):
+            return .failed(
+                "pruning would destroy work: \(reason)"
+            )
         }
     }
 

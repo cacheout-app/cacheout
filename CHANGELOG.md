@@ -33,7 +33,13 @@ below are both part of that coordination, and the latter BLOCKS this release.
   armed without that, so the scan reports the problem instead of offering the
   row. Separately, each repository whose registered checkouts no longer exist
   on disk gets ONE item for its orphaned worktree registry, disclosing exactly
-  the set it will remove. `--cli scan` reports both as `scanner_items` rows
+  the set it will remove — unless one of those registrations was DETACHED at a
+  commit no branch, tag or other ref reaches. That registration's admin data
+  is the only name the commit has, so removing it would leave your work
+  unreachable and a later `git gc` could delete it; Cacheout then offers
+  nothing for that repository and tells you which commit to name. Naming it
+  (`git branch`, `git tag`, a merge or a push) clears the refusal on the next
+  scan, and the check runs again at clean time. `--cli scan` reports both as `scanner_items` rows
   and `--cli clean` accepts `git_worktrees` or `git_worktrees:<item-id>` —
   destructive runs still require `--confirm`. Nothing here is ever
   auto-selected, Quick-Cleaned, or reached by `smart-clean`. The macOS

@@ -938,7 +938,7 @@ struct GitWorktreeScanner: @unchecked Sendable {
         }
 
         // (g) ORPHANED-ADMIN TIER.
-        pruneTier(
+        await pruneTier(
             inventory: inventory,
             parentRepoWorkingDir: parentRepoWorkingDir,
             adminContainer: adminContainer,
@@ -1384,8 +1384,8 @@ struct GitWorktreeScanner: @unchecked Sendable {
         bindings: [RootBinding],
         issues: inout [ScanIssue],
         emissions: inout [(item: ReclaimableItem, identityPath: String)]
-    ) {
-        let disclosedRecords = inventory.entries.filter { $0.isPrunable && !$0.isLocked }
+    ) async {
+        let disclosedRecords = GitWorktreeAdminMapper.removalTargets(in: inventory.entries)
         let directories: [URL]
         switch mapper.map(
             prunableRecordsIn: inventory.entries, adminContainer: adminContainer
@@ -1465,6 +1465,47 @@ struct GitWorktreeScanner: @unchecked Sendable {
         }
         let respelledContainer = strict[0]
         let respelledDirectories = Array(strict.dropFirst())
+
+        // PRESERVE A DETACHED HEAD BEFORE PRUNING THE DIRECTORY THAT NAMES IT
+        // (PR #460 codex r18, C4). Until now this tier mapped every unlocked
+        // prunable record and offered the removal of its admin directory
+        // without ever asking what that directory's `HEAD` still holds. For a
+        // record git listed as `detached`, that HEAD is the ONLY name the
+        // commit has — measured today on git 2.50.1: `git fsck --unreachable
+        // --no-reflogs` silent before the removal, `unreachable commit <oid>`
+        // after it, and `git gc --prune=now` then deleting the object. The
+        // item is labelled `.safe` and its evidence says "repository objects
+        // are untouched", so the claim was user-facing as well as wrong.
+        //
+        // POSITION: after the D13 scope binding, so the `-C` target is the
+        // BOUND parent this item would act on and no repository whose scope
+        // is unbound pays for a subprocess. The TCC gates are already
+        // honoured — stage (c) deferred the repository entirely if this
+        // parent is protected — and the listing at (b) already ran `git -C`
+        // against this same repository.
+        //
+        // KIND: `.unreadable`, matching the three sibling refusals of this
+        // tier (incomplete mapping, mount boundary, sizing denial). The GUI
+        // derives its row label from the kind alone and "unreadable" is a
+        // thin word for a policy verdict; the truth and the remedy ride
+        // `detail`, exactly as they do for those three. Splitting a kind for
+        // this arm alone would leave the siblings misdescribed and is a
+        // taxonomy change, not a data-loss fix.
+        switch await GitOrphanedHeadPreservation.prove(
+            prunableRecords: disclosedRecords, repositoryAt: parent,
+            run: { [self] arguments in await run(arguments).outcome }
+        ) {
+        case .nothingOrphaned:
+            break
+        case .refuse(let reason):
+            issues.append(ScanIssue(
+                url: parentRepoWorkingDir, kind: .unreadable,
+                detail: "orphaned worktree admin data in this repository "
+                    + "cannot be offered for pruning: \(reason) — no prune "
+                    + "item is published for this repository"
+            ))
+            return
+        }
 
         let identity = provider.resolveTargetKeepingLeaf(respelledContainer)
         let record = RootScanRecord(

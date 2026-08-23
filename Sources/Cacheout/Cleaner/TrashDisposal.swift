@@ -386,6 +386,17 @@ enum TrashDisposal {
             /// the one-syscall window the Trash directory descriptor cannot
             /// close. The payload is the Trash name it came from. Nothing
             /// further is attempted: a second unproven move is not a fix.
+            ///
+            /// AND WHERE THE INSPECTED OBJECT WENT IS NOT ESTABLISHED HERE,
+            /// WHICH THE MESSAGE USED TO DENY (PR #460 codex r16, A-P1). The
+            /// message ended "…and the item the Trash took is still in the
+            /// Trash". Nothing on this path shows that: the re-bind proved
+            /// the object stood at the landing NAME, and the rename then
+            /// moved something ELSE out of that name — a fact about the NAME.
+            /// MEASURED with the swap in the real window between the two, the
+            /// taken object is moved OUT of the landing's own container
+            /// entirely and its inode is present nowhere under it. The
+            /// message now says the whereabouts were not established.
             case putBackTookAnotherObject(String)
             /// NOT PROVED, so NOTHING WAS MOVED: the directory the put-back
             /// would restore INTO is not the container the caller admitted.
@@ -434,6 +445,41 @@ enum TrashDisposal {
             //
             // `.destinationUnknown` never carried the clause and must not gain
             // one: it is raised before anything about a landing is known.
+            //
+            // AND THE OPENING WAS ONLY THE OPENING (PR #460 codex r16,
+            // A-P1/A-P2). r15's two guards —
+            // `…NoFailureMessageAssertsTheTargetWasReplacedWithoutReadingIt`
+            // and `…EveryTrashFailureMessageOpensWithWhatWasActuallyProved` —
+            // inspected the FIRST CLAUSE and nothing else, so two false TAILS
+            // walked straight through them:
+            //
+            // * `.lastSeenInTrash` ended "Look in the Trash for it". MEASURED
+            //   on the `moverMovedNothing` fixture at 3110d1e, all four Trash
+            //   arms: this cause, ZERO moves, the item STILL AT THE TARGET at
+            //   the SAME INODE, and nothing in the Trash at all — the same
+            //   event whose OPENING clause D-P3 had just retired for saying
+            //   the folder had been replaced. Commit 1849f86's own body named
+            //   the Trash half of it ("…AND TOLD THEM TO GO AND LOOK IN THE
+            //   TRASH, for an item that never left") and then changed only
+            //   the opening.
+            // * `.putBackTookAnotherObject` ended "…and the item the Trash
+            //   took is still in the Trash". `rollBack` establishes nothing of
+            //   the sort. The re-bind proved the object was at the landing
+            //   NAME; the `renameatx_np` then moved a DIFFERENT object out of
+            //   that name, which says the NAME was re-pointed and NOTHING
+            //   about where the original went. MEASURED at 3110d1e with the
+            //   swap placed in the real one-syscall window between the two:
+            //   the object the Trash took is moved OUT of the landing's own
+            //   container, a stranger takes its Trash name, the undo moves the
+            //   stranger to the target — and the message sent the user to look
+            //   in the Trash for an object whose inode the cell proves is not
+            //   present under the landing's container at all.
+            //
+            // BOTH now say what was actually established and say plainly that
+            // the item's whereabouts were NOT. The guards are widened to the
+            // WHOLE message (`TrashDisposalHopProofTests`'
+            // `…NoTrashFailureMessageAssertsAnythingItsOwnProofDidNotEstablish`),
+            // because a fence on the opening clause is a fence on one clause.
             let unproved = "\(path): the disposal could not be proved to have "
                 + "moved the item that was inspected"
             switch cause {
@@ -450,16 +496,19 @@ enum TrashDisposal {
                 return "\(unproved), and nothing could be put back — what it "
                     + "reported putting at \(landed) cannot be found there "
                     + "now, so nothing was moved rather than moving whatever "
-                    + "took its place. Look in the Trash for it; nothing was "
+                    + "took its place. Where the item is now was NOT "
+                    + "established: it may never have left \(path), and it "
+                    + "may be somewhere this could not read. Nothing was "
                     + "reported freed; refused, re-scan required"
             case .putBackTookAnotherObject(let landed):
                 return "\(unproved), and putting back what it did take moved "
                     + "a DIFFERENT object — the Trash name it came from "
                     + "(\(landed)) was re-used while the undo was running. "
                     + "Whatever now stands at \(path) came out of the Trash "
-                    + "and was NOT put there by you, and the item the Trash "
-                    + "took is still in the Trash; nothing was reported "
-                    + "freed; refused, re-scan required"
+                    + "and was NOT put there by you. Where the item the Trash "
+                    + "took is now was NOT established — all that was proved "
+                    + "is that its Trash name was re-pointed; nothing was "
+                    + "reported freed; refused, re-scan required"
             case .destinationNotTheAdmittedContainer(let landed):
                 return "\(unproved), and the folder that HOLDS this path is "
                     + "no longer the one the safety check admitted — so what "

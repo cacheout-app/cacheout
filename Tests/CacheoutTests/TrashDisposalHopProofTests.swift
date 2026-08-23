@@ -2450,6 +2450,391 @@ final class TrashDisposalHopProofTests: XCTestCase {
     }
 
     // ================================================================
+    // MARK: - The WHOLE message, not its opening (r16, A-P1/A-P2)
+    // ================================================================
+
+    /// Every cause, spelled once so a new one cannot be added without being
+    /// fenced: this `switch` has no `default:`, so the compiler is the rot
+    /// gate.
+    private func label(for cause: TrashDisposal.Failure.Cause) -> String {
+        switch cause {
+        case .putBack: return "putBack"
+        case .strandedInTrash: return "strandedInTrash"
+        case .lastSeenInTrash: return "lastSeenInTrash"
+        case .putBackTookAnotherObject: return "putBackTookAnotherObject"
+        case .destinationNotTheAdmittedContainer:
+            return "destinationNotTheAdmittedContainer"
+        case .destinationUnknown: return "destinationUnknown"
+        }
+    }
+
+    /// One cause, and the propositions its OWN after-proof does not
+    /// establish — checked against the WHOLE message.
+    private struct WholeMessageFence {
+        let cause: TrashDisposal.Failure.Cause
+        /// Must not appear ANYWHERE in the message.
+        let forbidden: [String]
+        /// Must appear — the honest replacement, so a silent deletion of the
+        /// disclosure fails too.
+        let required: [String]
+        /// What the code actually establishes on this path.
+        let because: String
+    }
+
+    /// **A-P1/A-P2 — TWO FALSE TAILS WALKED THROUGH r15'S OWN GUARD** (PR
+    /// #460 codex r16).
+    ///
+    /// `…NoFailureMessageAssertsTheTargetWasReplacedWithoutReadingIt` and
+    /// `…EveryTrashFailureMessageOpensWithWhatWasActuallyProved` inspect the
+    /// OPENING clause only. So D-P3 retired one false proposition from the
+    /// front of five messages and left two more sitting in the tails of two
+    /// of them — one of which commit `1849f86`'s own body had NAMED
+    /// ("…AND TOLD THEM TO GO AND LOOK IN THE TRASH, for an item that never
+    /// left") before changing only the opening.
+    ///
+    /// This is the same shape as the opening fence, applied to the whole
+    /// string, with the cause list spelled through `label(for:)` so a seventh
+    /// cause cannot be added without a compile error here.
+    ///
+    /// MUTATION: restore either tail — "Look in the Trash for it" on
+    /// `.lastSeenInTrash`, or "the item the Trash took is still in the Trash"
+    /// on `.putBackTookAnotherObject` — and this cell fails on that row. The
+    /// two fixture cells below prove the propositions are FALSE on the events
+    /// the causes are named for; this one keeps them out of every message.
+    func testNoTrashFailureMessageAssertsAnythingItsOwnProofDidNotEstablish()
+        throws
+    {
+        let landed = "/tmp/landed"
+        let fences: [WholeMessageFence] = [
+            WholeMessageFence(
+                cause: .putBack,
+                forbidden: [],
+                required: ["PUT BACK"],
+                because: "the arrival WAS identified under the held "
+                    + "destination descriptor"
+            ),
+            WholeMessageFence(
+                cause: .strandedInTrash(landed),
+                forbidden: [],
+                required: [landed],
+                because: "an object WAS identified at the landing and the "
+                    + "move could not be performed, so the path is a fact"
+            ),
+            WholeMessageFence(
+                cause: .lastSeenInTrash(landed),
+                forbidden: [
+                    "Look in the Trash for it",
+                    "it is in the Trash",
+                    "is still in the Trash",
+                ],
+                required: ["was NOT established"],
+                because: "this cause IS the failure to establish where the "
+                    + "object is; the fixture below reaches it with the item "
+                    + "still at the target and nothing in the Trash at all"
+            ),
+            WholeMessageFence(
+                cause: .putBackTookAnotherObject(landed),
+                forbidden: [
+                    "is still in the Trash",
+                    "still in the Trash",
+                    "Look in the Trash",
+                ],
+                required: ["was NOT established"],
+                because: "the rename proved the NAME was re-pointed, which "
+                    + "says nothing about where the taken object went"
+            ),
+            WholeMessageFence(
+                cause: .destinationNotTheAdmittedContainer(landed),
+                forbidden: [],
+                required: [landed],
+                because: "nothing was moved, so the item IS where the "
+                    + "disposal put it and the path is a fact"
+            ),
+            WholeMessageFence(
+                cause: .destinationUnknown,
+                forbidden: ["was inspected", "Trash at"],
+                required: [],
+                because: "raised before anything about a landing is known"
+            ),
+        ]
+
+        // THE ROT GATE: every case of the enum is fenced, and `label(for:)`
+        // is a `default`-less switch, so a seventh cause breaks the build.
+        XCTAssertEqual(
+            Set(fences.map { label(for: $0.cause) }).count, 6,
+            "every cause must be fenced exactly once"
+        )
+
+        for fence in fences {
+            let name = label(for: fence.cause)
+            let failure = TrashDisposal.Failure(
+                path: "/tmp/x", cause: fence.cause
+            )
+            let described = try XCTUnwrap(failure.errorDescription)
+            for phrase in fence.forbidden {
+                XCTAssertFalse(
+                    described.contains(phrase),
+                    "\(name) may not assert \"\(phrase)\" ANYWHERE in its "
+                        + "message — \(fence.because): \(described)"
+                )
+            }
+            for phrase in fence.required {
+                XCTAssertTrue(
+                    described.contains(phrase),
+                    "\(name) must still say \"\(phrase)\": \(described)"
+                )
+            }
+            // AND THE OPENING FENCE STILL APPLIES TO ALL SIX, so this cell
+            // cannot be satisfied by moving a false clause from the tail to
+            // the front.
+            XCTAssertFalse(
+                described.contains("no longer the one that was inspected"),
+                "\(name): \(described)"
+            )
+        }
+    }
+
+    /// **A-P2 — `.lastSeenInTrash` SENT THE USER TO THE TRASH FOR AN ITEM
+    /// THAT NEVER LEFT** (PR #460 codex r16).
+    ///
+    /// The identical fixture D-P3 used — the mover proves, moves NOTHING and
+    /// reports a landing where nothing stands. MEASURED at 3110d1e on all
+    /// four Trash arms: `.lastSeenInTrash`, zero moves, the item STILL AT THE
+    /// TARGET at the SAME INODE, and NOTHING in the landings directory at
+    /// all. D-P3 retired the opening clause of that message and left its tail
+    /// telling the user to go and look in the Trash.
+    ///
+    /// MUTATION: restore "Look in the Trash for it" and this cell fails on
+    /// all four arms.
+    func testTheLastSeenMessageDoesNotSendTheUserToTheTrashForAnItemStillOnDisk()
+        async throws
+    {
+        let landings = try XCTUnwrap(self.landings)
+        let provider = FileSystemIdentityProvider()
+        let container = try makeCacheContainer()
+
+        for arm in TrashArm.allCases {
+            let name = "never-left-\(arm.rawValue)"
+            let target = container.appendingPathComponent(name)
+            if arm.targetIsADirectory {
+                try fm.createDirectory(
+                    at: target, withIntermediateDirectories: true
+                )
+                try Data("ours".utf8).write(
+                    to: target.appendingPathComponent("ours.txt")
+                )
+            } else {
+                try Data("ours".utf8).write(to: target)
+            }
+            let before = try XCTUnwrap(provider.identity(of: target))
+            let landed = landings.appendingPathComponent("nowhere-\(name)")
+
+            let thrown = try await outcomeOfAMoverThatMovesNothing(
+                arm, of: target, reporting: landed, provider: provider
+            )
+            let failure = try XCTUnwrap(
+                thrown as? TrashDisposal.Failure,
+                "\(name): \(String(describing: thrown))"
+            )
+            XCTAssertEqual(failure.cause, .lastSeenInTrash(landed.path),
+                           "\(name)")
+            // THE PREMISE, ASSERTED ON BOTH SIDES: the item never left, and
+            // the Trash is EMPTY of it.
+            XCTAssertEqual(
+                provider.identity(of: target), before,
+                "\(name): the item must still be at the target, same inode"
+            )
+            XCTAssertEqual(
+                try fm.contentsOfDirectory(atPath: landings.path)
+                    .filter { $0.contains(name) },
+                [],
+                "\(name): nothing of this item may be in the landing "
+                    + "directory — that is what makes the tail false"
+            )
+
+            let described = try XCTUnwrap(failure.errorDescription)
+            XCTAssertFalse(
+                described.contains("Look in the Trash for it"),
+                "\(name): the item is at \(target.path) at the same inode "
+                    + "and nothing of it is in the Trash: \(described)"
+            )
+            XCTAssertTrue(
+                described.contains("Where the item is now was NOT "
+                                   + "established"),
+                "\(name): \(described)"
+            )
+        }
+    }
+
+    /// Re-points the landing INSIDE `rollBack`'s own re-bind — after the
+    /// `fstatat` has answered and before `renameatx_np` uses the name.
+    ///
+    /// Unlike `OrphanedCachesScannerTests`' twin, the object the Trash took
+    /// is moved OUT of the landing's own container, which is the event
+    /// `.putBackTookAnotherObject`'s old tail denied.
+    ///
+    /// Only the `.directory` verdict arm may use this: `identified` takes a
+    /// `.directory` sighting's identity off the descriptor `look` already
+    /// holds and does NOT call `facts`, so the FIRST `probeChild` naming the
+    /// landing is the re-bind. On the `facts`-reading arms it would fire one
+    /// call too early.
+    private final class RepointTheLandingInsideTheReBind:
+        FileSystemIdentityProvider {
+        var landed: URL!
+        /// Where the taken object goes — OUTSIDE the landing's container.
+        var outOfTheTrash: URL!
+        /// The object that takes the landing's name, built outside it.
+        var strangerSource: URL!
+        private(set) var swapped = false
+
+        override func probeChild(
+            inDirectory descriptor: Int32, named name: String,
+            logical: @autoclosure () -> URL
+        ) -> ChildProbe {
+            let url = logical()
+            let answer = super.probeChild(
+                inDirectory: descriptor, named: name, logical: url
+            )
+            guard !swapped,
+                  url.standardizedFileURL.path
+                      == landed.standardizedFileURL.path
+            else { return answer }
+            swapped = true
+            try? FileManager.default.moveItem(at: landed, to: outOfTheTrash)
+            try? FileManager.default.moveItem(at: strangerSource, to: landed)
+            // The STALE answer — exactly what losing this race yields.
+            return answer
+        }
+    }
+
+    /// **A-P1 — THE MESSAGE ASSERTED A FACT NO PROOF ESTABLISHES, AND IT IS
+    /// FALSE ON THE VERY EVENT THE CAUSE IS NAMED FOR** (PR #460 codex r16).
+    ///
+    /// `.putBackTookAnotherObject` ended "…and the item the Trash took is
+    /// still in the Trash". `rollBack` proved the object stood at the landing
+    /// NAME; the `renameatx_np` then moved a DIFFERENT object out of that
+    /// name. That is a fact about the NAME.
+    ///
+    /// MEASURED here, with the swap in the real one-syscall window between
+    /// the two: the object the Trash took is moved OUT of the landing's own
+    /// container, a stranger takes its Trash name, the undo moves the
+    /// stranger to the target — and the cell proves the taken object's INODE
+    /// is present nowhere under the landing's container. The old tail sent
+    /// the user to look there for it while a stranger's tree stood at their
+    /// cache path.
+    ///
+    /// MUTATION: restore the old tail and this cell fails.
+    func testAPutBackThatTookAnotherObjectDoesNotClaimWhereTheTakenOneIs()
+        async throws
+    {
+        let provider = RepointTheLandingInsideTheReBind()
+        let container = try makeCacheContainer()
+        let target = container.appendingPathComponent("victim")
+        try fm.createDirectory(at: target, withIntermediateDirectories: true)
+        try Data("ours".utf8).write(
+            to: target.appendingPathComponent("ours.txt")
+        )
+        let identity = try XCTUnwrap(provider.identity(of: target))
+        let parent = try admittedParent(of: target, provider: provider)
+
+        // THE LANDING'S OWN CONTAINER — a fixture Trash, so the cell can
+        // enumerate it and prove an absence.
+        let trashDir = base.appendingPathComponent("ap1-trash")
+        try fm.createDirectory(at: trashDir, withIntermediateDirectories: true)
+        let landed = trashDir.appendingPathComponent("victim")
+        provider.landed = landed
+        // OUTSIDE the container, which is the whole point.
+        provider.outOfTheTrash = base.appendingPathComponent("ap1-taken-away")
+        let strangerSource = base.appendingPathComponent("ap1-stranger")
+        try fm.createDirectory(
+            at: strangerSource, withIntermediateDirectories: true
+        )
+        try Data("intruder".utf8).write(
+            to: strangerSource.appendingPathComponent("their-work.txt")
+        )
+        provider.strangerSource = strangerSource
+
+        // WHAT THE TRASH ACTUALLY TOOK, recorded at the instant it took it.
+        let taken = IdentityBox()
+        let fileManager = fm
+        var thrown: Error?
+        do {
+            try await TrashDisposal.dispose(
+                target, expecting: .directory(identity), provider: provider,
+                containedIn: parent,
+                via: { url, prove in
+                    try prove()
+                    // The swap inside the mover, so the after-proof refuses
+                    // and the rollback runs at all.
+                    try fileManager.removeItem(at: url)
+                    try fileManager.createDirectory(
+                        at: url, withIntermediateDirectories: true
+                    )
+                    try Data("stranger".utf8).write(
+                        to: url.appendingPathComponent("their-work.txt")
+                    )
+                    try fileManager.moveItem(at: url, to: landed)
+                    taken.identity = FileSystemIdentityProvider()
+                        .identity(of: landed)
+                    return landed
+                }
+            )
+        } catch {
+            thrown = error
+        }
+
+        XCTAssertTrue(provider.swapped,
+                      "the fixture never re-pointed the landing")
+        let failure = try XCTUnwrap(
+            thrown as? TrashDisposal.Failure, String(describing: thrown)
+        )
+        XCTAssertEqual(failure.cause, .putBackTookAnotherObject(landed.path))
+
+        // THE PROPOSITION THE OLD TAIL ASSERTED, MEASURED FALSE: the taken
+        // object's inode is present NOWHERE under the landing's container.
+        let takenIdentity = try XCTUnwrap(taken.identity)
+        let survivors = try fm.contentsOfDirectory(atPath: trashDir.path)
+            .filter {
+                FileSystemIdentityProvider().identity(
+                    of: trashDir.appendingPathComponent($0)
+                ) == takenIdentity
+            }
+        XCTAssertEqual(
+            survivors, [],
+            "the item the Trash took is not under \(trashDir.path) at all — "
+                + "which is what the message used to tell the user"
+        )
+        XCTAssertEqual(
+            FileSystemIdentityProvider()
+                .identity(of: provider.outOfTheTrash), takenIdentity,
+            "the fixture must really have moved it out of the container"
+        )
+
+        let described = try XCTUnwrap(failure.errorDescription)
+        XCTAssertFalse(
+            described.contains("still in the Trash"),
+            "nothing here establishes where the taken object is: \(described)"
+        )
+        XCTAssertTrue(
+            described.contains(
+                "Where the item the Trash took is now was NOT established"
+            ),
+            described
+        )
+    }
+
+    /// A box so the mover can hand back what it saw without capturing the
+    /// test case.
+    private final class IdentityBox {
+        private let lock = NSLock()
+        private var value: FileSystemIdentityProvider.Identity?
+        var identity: FileSystemIdentityProvider.Identity? {
+            get { lock.lock(); defer { lock.unlock() }; return value }
+            set { lock.lock(); value = newValue; lock.unlock() }
+        }
+    }
+
+    // ================================================================
     // MARK: - WHICH OF THESE CAUSES A REAL USER CAN REACH (r16, A-P3)
     // ================================================================
 

@@ -801,6 +801,23 @@ below are both part of that coordination, and the latter BLOCKS this release.
   one's remaining clauses are unchanged except where they were also stronger
   than the evidence: the message no longer says the item "is no longer at" the
   Trash path it names, only that it cannot be found there now.
+- **And two refusals no longer tell you where an item is when nothing
+  established it.** The entry above fixed the OPENING of five messages and
+  left the ends of two of them saying things no check on those paths
+  performs. The first is the same event the entry above describes — the
+  disposal moved nothing and your folder never left — and after being told
+  correctly that the move could not be proved, you were still told to "look
+  in the Trash for it", for an item sitting untouched exactly where it
+  started. The second happens when the undo puts something back and the
+  object it moved turns out not to be the one the Trash took: you were told
+  "the item the Trash took is still in the Trash". Nothing shows that. All
+  that was established is that the NAME in the Trash was re-used by something
+  else while the undo was running; the item itself may have been moved
+  anywhere, and was measured being moved out of the Trash entirely. Both
+  messages now say plainly that where the item is was not established, and
+  both still name every path they do know. The check that keeps false claims
+  out of these messages used to read only their first sentence; it now reads
+  the whole message.
 - **A background refresh no longer reads the folders it has already decided
   to skip.** The ephemeral-temp scanner runs only when you ask for a scan, but
   before each scan Cacheout records the identity of every folder it might

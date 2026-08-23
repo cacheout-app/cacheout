@@ -1033,11 +1033,22 @@ struct ScanOutcome: Sendable {
 /// UNBOUND DELETION. The cleaner additionally binds the folder that HOLDS the
 /// target (`DepthSafeRemoval.admittedParent`) and proves it on BOTH disposal
 /// arms — the permanent one at its parent open, the Trash one through
-/// `TrashDisposal.dispose(_:containedIn:…)`, which also binds the leaf under
-/// that proved container. That pair is what covers the `.unestablished`
-/// population the third case below describes, and it is worth naming here
-/// because "no verdict" was read as "nothing to bind" at two Trash call sites
-/// for three review rounds.
+/// `TrashDisposal`. That pair is what covers the `.unestablished` population
+/// the third case below describes, and it is worth naming here because "no
+/// verdict" was read as "nothing to bind" at two Trash call sites for three
+/// review rounds.
+///
+/// "BOTH DISPOSAL ARMS" WAS TRUE OF THE PERMANENT ONE AND OF ONE OF THE
+/// TRASH ENTRY POINTS (corrected, PR #460 codex r13). This sentence named
+/// `TrashDisposal.dispose(_:containedIn:…)` and stopped there, which is the
+/// arm for items with NO verdict; the arm for items WITH one
+/// (`dispose(_:expecting:…)`) consulted `admittedParent` only inside its
+/// `.nonDirectoryLeaf` branch and inside its rollback. On a
+/// `.noDirectoryTree` verdict it opened no container at all, and since that
+/// verdict carries no identity either, the disposal bound NOTHING — measured
+/// through the shipped `FileManager.trashItem` into the real `~/.Trash`, a
+/// stranger's file was trashed and its bytes reported freed. Every arm of
+/// both entry points proves the container now.
 enum PreDeleteInspectedObject: Equatable, Sendable {
     /// A real directory was opened and walked; this is the `fstat` identity
     /// of the descriptor the whole walk was anchored to.

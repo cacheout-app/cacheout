@@ -3944,7 +3944,16 @@ final class OrphanedCachesScannerTests: XCTestCase {
         )
         XCTAssertTrue(fm.fileExists(atPath: stash.path),
                       "the inspected tree is untouched")
-        try assertCleanupLogContains(tag: "content-drift")
+        // `container-drift` SINCE PR #460 codex r13, AND THE OLD TAG WAS THE
+        // DEFECT THIS CELL'S OWN MESSAGE ASSERTION NAMES. Two assertions up,
+        // this cell requires the sentence "the folder that HOLDS it is no
+        // longer the one the safety check admitted" — a fact about the
+        // FOLDER — and then pinned the log to `content-drift`, the tag for
+        // "the item changed". The permanent arm has answered `container-drift`
+        // for the identical event since PR #458; the Trash arm now does too
+        // (`CacheCleaner.trashRefusalTag`), so the cleanup log has ONE word
+        // for it whichever disposal the user chose.
+        try assertCleanupLogContains(tag: "container-drift")
     }
 
     /// Swaps the TRASH DIRECTORY ITSELF — not the entry in it — inside the

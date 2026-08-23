@@ -597,6 +597,42 @@ below are both part of that coordination, and the latter BLOCKS this release.
 
 ### Fixed
 
+- **"Move to Trash" could take a file that was never yours, and report your
+  folder's bytes as freed.** Before deleting anything Cacheout re-inspects the
+  item, and for one kind of answer — "there is no folder of ours at this name
+  any more", which is what it records when the thing at the path turns out to
+  be a plain file — the Trash disposal checked only that SOMETHING that is not
+  a folder answered to that name. It never checked WHICH FOLDER it was looking
+  in. So if the cache folder itself was replaced between the safety check and
+  the disposal — by a program, an installer, or a synced folder arriving — the
+  file that landed at the same name inside a stranger's folder was moved to
+  your Trash, and the report said the item had been cleaned and counted its
+  bytes as freed. Permanent delete refused the identical event, and said so.
+  The Trash disposal now holds the folder it was given, proves it is the same
+  folder the safety check admitted, and reads the item INSIDE it — before the
+  move and again at the last instant before it — so a swapped folder is
+  refused with nothing moved, and a swap that lands inside the Trash system's
+  own resolution is caught afterwards and reported honestly: the item is
+  refused, nothing is counted as freed, and the message names where the
+  wrongly-taken file is so you can put it back in one drag. A folder that
+  appeared at that name since the check is refused too, which is what the
+  answer meant in the first place.
+- **A refusal about your FOLDER no longer reads as a refusal about your item.**
+  When Cacheout stops because the folder holding an item was replaced, the
+  cleanup log says `container-drift`; when it stops because the item itself
+  changed, it says `content-drift`. Two Trash-side refusals about the folder
+  were being written down as the item having changed, which sends you to look
+  at the wrong thing. They now say what they mean.
+- **Cleaning up abandoned git-worktree records no longer counts space
+  something else freed.** When Cacheout removes the leftover bookkeeping
+  folders of git worktrees you have deleted, it re-checks the list immediately
+  before acting, and that list is allowed to SHRINK — an entry that was
+  locked, repaired or removed by something else in the meantime is dropped.
+  The freed-space total was then computed over the ORIGINAL list, counting any
+  entry that was simply no longer there. So a folder another program removed
+  while Cacheout was working was billed to Cacheout: measured on a test
+  fixture, 450,560 bytes reported where 24,576 were actually this operation's.
+  The total now follows the entries Cacheout itself removed.
 - **A scan can no longer hang the app forever.** The window showed each
   scanner's progress and stopped when they all reported — and if one of them
   never reported, nothing ever ended it: the spinner ran until the app was

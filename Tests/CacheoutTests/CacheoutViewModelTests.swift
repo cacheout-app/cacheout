@@ -1726,20 +1726,44 @@ final class CacheoutViewModelTests: XCTestCase {
     /// than blocking anything, and repeats: each trial has every scanner
     /// return at about the deadline, and the invariant is checked over the
     /// raw event stream, which is where "both" and "neither" are both
-    /// visible. `.trials` is what makes it a gate rather than a coin flip;
-    /// r12's own measurement put the per-run failure rate at 7 scanners in 12.
+    /// visible.
+    ///
+    /// ## THE FIXTURE THIS SHIPPED WITH WAS A COIN FLIP, AND SAID IT WAS NOT
+    /// ## (PR #460 codex r14, V2-2)
+    ///
+    /// Through r13 it ran 12 trials x 6 scanners at a 40 ms deadline, and its
+    /// own doc asserted that "`.trials` is what makes it a gate rather than a
+    /// coin flip". MEASURED against a faithful reconstruction of the r12 race
+    /// (`ledger.record` + a bare `continuation.yield` in the producer, an
+    /// unsynchronized `ledger.missing(from:)` in the watchdog): EIGHT
+    /// consecutive runs of the old fixture gave exit 0,0,1,0,0,0,0,0 — **red 1
+    /// of 8** here, and 0,0,1,0,1,0,0,0 — 2 of 8 — for the round-13 verifier
+    /// who found it. Either way an edit reintroducing the race landed GREEN
+    /// most of the time. r13's commit message also claimed it was "red on
+    /// trial 0 ('racer_3 x2')"; at the shipped trial count that is not what it
+    /// does. Both claims are retired here: a repeat count is evidence only
+    /// when the RED RATE is measured, and this one's was not.
+    ///
+    /// The replacement is 40 trials x 8 scanners at a 30 ms deadline with the
+    /// per-scanner return jittered across the window, which is enough of the
+    /// race to be a gate. MEASURED, same mutant, eight consecutive runs:
+    /// **red 8 of 8**, 6 to 30 of the 320 scanner-trials doubly reported per
+    /// run, both harmful orders (`OT` and `TO`) seen in every run. Unmutated,
+    /// eight consecutive runs: **green 8 of 8**, 1.28-1.30 s each — so the
+    /// gate costs about 1.3 s and does not flake.
     ///
     /// MUTATION: replace the `ledger.publish(event, to: continuation)` call
     /// with `ledger.record(event.scannerID); continuation.yield(event)` and
-    /// the watchdog's `conclude` with an unsynchronized `missing(from:)`
-    /// read — duplicates appear and this cell is red.
-    @MainActor
+    /// the watchdog's `conclude` with an unsynchronized `missing(from:)` read
+    /// — duplicates appear and this cell is red.
     func testEveryScannerGetsExactlyOneEventEvenAtTheDeadline() async throws {
-        let trials = 12
-        let scannerCount = 6
-        let deadlineMilliseconds = 40
+        let trials = 40
+        let scannerCount = 8
+        let deadlineMilliseconds = 30
         var sawBoth: [String] = []
         var sawNeither: [String] = []
+        var doublyReported = 0
+        var kindsSeen: Set<String> = []
 
         for trial in 0..<trials {
             let scanners: [any SpaceScanner] = (0..<scannerCount).map { index in
@@ -1748,18 +1772,20 @@ final class CacheoutViewModelTests: XCTestCase {
                                     id: "i\(index)", bytes: 100)],
                     errors: []
                 )
+                // JITTERED PER SCANNER PER TRIAL, not laid out in a fixed
+                // fan: the window this races is scheduling, and a fixed
+                // offset table samples one point of it 40 times over.
+                let jitter = Int.random(in: -6...10)
                 return FixtureScanner(
                     id: "racer_\(index)",
                     trustedContainerRoots: [
                         base.appendingPathComponent("racer_\(index)"),
                     ]
                 ) {
-                    // Aimed AT the deadline, spread either side of it so a
-                    // trial covers both orders of the race.
-                    let jitter = Double(index) - Double(scannerCount) / 2
-                    let target = Double(deadlineMilliseconds) + jitter * 4
                     try? await Task.sleep(
-                        for: .milliseconds(max(1, Int(target)))
+                        for: .milliseconds(
+                            max(0, deadlineMilliseconds + jitter)
+                        )
                     )
                     return outcome
                 }
@@ -1774,19 +1800,34 @@ final class CacheoutViewModelTests: XCTestCase {
             let session = runtime.scanValidatedSession(
                 context: ScanContext(trigger: .automatic)
             )
-            var counts: [String: Int] = [:]
+            // THE RAW STREAM, not the view model's reduction of it: this is
+            // the only place where "reported twice" and "reported never" are
+            // both still visible.
+            var seen: [String: [String]] = [:]
             for await event in session.events {
-                counts[event.scannerID, default: 0] += 1
+                switch event {
+                case .outcome(let id, _):
+                    seen[id, default: []].append("O")
+                case .malformed(let id, let issue):
+                    seen[id, default: []].append(
+                        issue.kind == .scanDidNotFinish ? "T" : "M"
+                    )
+                }
             }
             await session.untilProducerFinishes()
 
             for index in 0..<scannerCount {
                 let id = "racer_\(index)"
-                let seen = counts[id] ?? 0
-                switch seen {
+                let events = seen[id] ?? []
+                switch events.count {
                 case 1: continue
                 case 0: sawNeither.append("trial \(trial): \(id)")
-                default: sawBoth.append("trial \(trial): \(id) x\(seen)")
+                default:
+                    doublyReported += 1
+                    kindsSeen.insert(events.joined())
+                    sawBoth.append(
+                        "trial \(trial): \(id) \(events.joined(separator: ","))"
+                    )
                 }
             }
         }
@@ -1795,7 +1836,9 @@ final class CacheoutViewModelTests: XCTestCase {
             sawBoth, [],
             "a scanner reported as timed out must not ALSO publish an "
                 + "outcome — `reconcile` would clear the timeout row and "
-                + "republish it as healthy"
+                + "republish it as healthy. \(doublyReported) of "
+                + "\(trials * scannerCount) doubly reported, orders "
+                + "\(kindsSeen.sorted())"
         )
         XCTAssertEqual(
             sawNeither, [],

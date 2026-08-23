@@ -1418,6 +1418,300 @@ final class CacheoutViewModelTests: XCTestCase {
         XCTAssertEqual(issue.kind, .scanDidNotFinish)
     }
 
+    /// THE BOUND MUST FIRE WHEN THE COOPERATIVE POOL IS STARVED — i.e. in
+    /// exactly the wedge class it exists for (PR #460 codex r13, B).
+    ///
+    /// The cell above wedges ONE scanner. One blocked thread out of
+    /// `activeProcessorCount` leaves eleven workers free on this machine, so
+    /// an r12 watchdog built on `Task.sleep` still had somewhere to resume
+    /// and the cell passed — while the mechanism it was written to prove was
+    /// broken. THE THRESHOLD IS THE POOL WIDTH. Measured on a 12-core
+    /// machine at a 200 ms bound: 11 blocking scanners -> `scan` returned in
+    /// 0.335 s (the bound); 12 -> 25.03 s (the walk); 36 -> 75.04 s.
+    ///
+    /// So this cell blocks MORE THREADS THAN THE POOL HAS and asserts the
+    /// scan still returns on the bound. `Thread.sleep`, not `Task.sleep`:
+    /// the point is to occupy the worker, not to yield it. The blockers do
+    /// NOT observe cancellation, which is the honest simulation of a walk
+    /// inside a syscall AND what keeps the mutation below honest — a
+    /// cancellable blocker would let the mutated build off by exiting the
+    /// moment the watchdog cancelled the producer.
+    ///
+    /// MUTATION: restore `let task = Task {` (from `Task.detached(priority:
+    /// .utility)`) in `scanValidatedSession` and the producer is back in the
+    /// consumer's own band; measured 2.82 s against this 0.9 s assertion.
+    @MainActor
+    func testTheBoundFiresWithEveryCooperativeWorkerBlocked() async throws {
+        // MORE than the pool is wide: the pool is `activeProcessorCount`
+        // threads per band, and the bound must not need one of them.
+        let blockerCount = ProcessInfo.processInfo.activeProcessorCount + 2
+        let blockers = LeakFreeBlockers(count: blockerCount)
+        defer { blockers.join() }
+        let scanners: [any SpaceScanner] = (0..<blockerCount).map { index in
+            FixtureScanner(
+                id: "blocked_\(index)",
+                trustedContainerRoots: [
+                    base.appendingPathComponent("blocked_\(index)"),
+                ]
+            ) {
+                blockers.hold()
+                return ScanOutcome(items: [], errors: [])
+            }
+        }
+        let runtime = try makeRuntime(
+            scanners,
+            sessionBounds: ScanSessionBounds(
+                eventDeadline: .milliseconds(200),
+                producerWindDownGrace: .milliseconds(100)
+            )
+        )
+        let viewModel = CacheoutViewModel(runtime: runtime)
+
+        let started = Date()
+        await viewModel.scan(trigger: .automatic)
+        let elapsed = Date().timeIntervalSince(started)
+
+        XCTAssertLessThan(
+            elapsed, 0.9,
+            "with all \(blockerCount) workers blocked the session must still "
+                + "end on its 200 ms bound, not on the walk: \(elapsed) s"
+        )
+        XCTAssertFalse(viewModel.isAnyScanInProgress)
+        // EVERY starved scanner is reported, not silently dropped.
+        for index in 0..<blockerCount {
+            let issue = try XCTUnwrap(
+                viewModel.malformedIssuesByScannerID["blocked_\(index)"],
+                "blocked_\(index) was cut off and must say so"
+            )
+            XCTAssertEqual(issue.kind, .scanDidNotFinish)
+        }
+    }
+
+    /// AND PRODUCTION NEEDS NO TWELVE SCANNERS TO GET THERE — ONE IS ENOUGH.
+    ///
+    /// `CategoryScanner` runs `CacheScanner.scanAll`, which adds one child
+    /// task per category — 23 in `CacheCategory.allCategories` — each running
+    /// the SYNCHRONOUS `sizer.measure(…)`. A single internally parallel
+    /// scanner therefore fills every cooperative worker in its band on every
+    /// scan, so the starvation above is not an exotic composition: it is the
+    /// shipped one the moment those measurements block (a hung mount, an
+    /// unresponsive FUSE volume). This cell is that shape — ONE registered
+    /// scanner, 23 thread-blocking children. Measured at 20.13 s under a
+    /// 200 ms bound with the r12 producer.
+    ///
+    /// MUTATION: the same restoration as the cell above.
+    @MainActor
+    func testOneInternallyParallelScannerAloneCanStarveThePool() async throws {
+        let childCount = 23  // CacheCategory.allCategories.count
+        let blockers = LeakFreeBlockers(count: childCount)
+        defer { blockers.join() }
+        let runtime = try makeRuntime(
+            [
+                FixtureScanner(
+                    id: "categories_like",
+                    trustedContainerRoots: [
+                        base.appendingPathComponent("categories_like"),
+                    ]
+                ) {
+                    await withTaskGroup(of: Void.self) { group in
+                        for _ in 0..<childCount {
+                            group.addTask { blockers.hold() }
+                        }
+                        await group.waitForAll()
+                    }
+                    return ScanOutcome(items: [], errors: [])
+                },
+            ],
+            sessionBounds: ScanSessionBounds(
+                eventDeadline: .milliseconds(200),
+                producerWindDownGrace: .milliseconds(100)
+            )
+        )
+        let viewModel = CacheoutViewModel(runtime: runtime)
+
+        let started = Date()
+        await viewModel.scan(trigger: .automatic)
+        let elapsed = Date().timeIntervalSince(started)
+
+        XCTAssertLessThan(
+            elapsed, 0.9,
+            "one scanner with \(childCount) blocking children starves the "
+                + "pool exactly as \(childCount) scanners would; the bound "
+                + "must still fire: \(elapsed) s"
+        )
+        let issue = try XCTUnwrap(
+            viewModel.malformedIssuesByScannerID["categories_like"]
+        )
+        XCTAssertEqual(issue.kind, .scanDidNotFinish)
+    }
+
+    /// THE DEADLINE MUST NOT DEPEND ON THE CALLER'S OWN PRIORITY BAND —
+    /// the half of B that the band separation does NOT cover.
+    ///
+    /// The two cells above are satisfied by the producer moving to
+    /// `.utility`: the consumer keeps a clear band, so a `Task.sleep`
+    /// watchdog would find a worker there too and they would pass with the
+    /// deadline still on the pool. This cell takes that worker away. The
+    /// watchdog is created inside `scanValidatedSession`, which is called
+    /// synchronously from the caller — so an r12 `Task { try await
+    /// Task.sleep(…) }` watchdog inherits THE CALLER'S priority. Here the
+    /// caller IS `.utility`, the same band its own blocking scanners
+    /// saturate, so there is no free worker anywhere for a pool-borne
+    /// deadline to run on. Real shape: the headless/CLI consumer, which is
+    /// not on the MainActor and carries no priority guarantee.
+    ///
+    /// The assertion is NOT on when the scan returns — that consumer is
+    /// starved by construction and cannot be prompt. It is on when the
+    /// DEADLINE ITSELF ran, observed the one way a starved pool permits:
+    /// the blocking scanners poll `Task.isCancelled` on the threads they
+    /// already hold, needing no worker of their own, and record when the
+    /// watchdog's `task.cancel()` reached them.
+    ///
+    /// MUTATION: restore the watchdog to `Task { try await Task.sleep(for:
+    /// bounds.eventDeadline) }` and nothing cancels them; they run out their
+    /// \(pollCapSeconds) s cap instead — red on the assertion rather than a
+    /// hang, which is why the cap is there.
+    @MainActor
+    func testTheDeadlineDoesNotDependOnTheCallersOwnPriorityBand()
+        async throws
+    {
+        let blockerCount = ProcessInfo.processInfo.activeProcessorCount + 2
+        let observedCancellation = TimestampBox()
+        let started = Date()
+        let scanners: [any SpaceScanner] = (0..<blockerCount).map { index in
+            FixtureScanner(
+                id: "polling_\(index)",
+                trustedContainerRoots: [
+                    base.appendingPathComponent("polling_\(index)"),
+                ]
+            ) {
+                // Holds its thread like a walk in a syscall, but wakes often
+                // enough to notice cancellation WITHOUT needing a worker.
+                let deadline = Date().addingTimeInterval(Self.pollCapSeconds)
+                while !Task.isCancelled, Date() < deadline {
+                    Thread.sleep(forTimeInterval: 0.02)
+                }
+                if Task.isCancelled {
+                    observedCancellation.record(
+                        Date().timeIntervalSince(started)
+                    )
+                }
+                return ScanOutcome(items: [], errors: [])
+            }
+        }
+        let runtime = try makeRuntime(
+            scanners,
+            sessionBounds: ScanSessionBounds(
+                eventDeadline: .milliseconds(200),
+                producerWindDownGrace: .milliseconds(100)
+            )
+        )
+
+        // THE CALLER IS IN THE SCANNERS' OWN BAND. Detached so the band is
+        // `.utility` rather than this cell's, and so the starvation below
+        // cannot reach the MainActor the test itself runs on.
+        let consumer = Task.detached(priority: .utility) {
+            let session = runtime.scanValidatedSession(
+                context: ScanContext(trigger: .automatic)
+            )
+            for await _ in session.events {}
+            await session.untilProducerFinishes()
+        }
+        // Polled from the MainActor's own (clear) band, so this wait costs
+        // the starved band nothing.
+        let waitUntil = Date().addingTimeInterval(Self.pollCapSeconds + 2)
+        while observedCancellation.value == nil, Date() < waitUntil {
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+        let elapsed = try XCTUnwrap(
+            observedCancellation.value,
+            "the watchdog must have cancelled the producer at all"
+        )
+        XCTAssertLessThan(
+            elapsed, 0.9,
+            "the 200 ms deadline must fire off the cooperative pool, not in "
+                + "the caller's own saturated .utility band: \(elapsed) s"
+        )
+        _ = await consumer.value
+    }
+
+    /// AND THE WIND-DOWN GRACE IS THE SECOND TIMER, WITH THE SAME EXPOSURE.
+    ///
+    /// `untilProducerFinishes()` arms its own timer, and through r12 that was
+    /// a `Task.detached` running `Task.sleep`. Detachment fixed the OTHER
+    /// pool hazard — a plain `Task` inside an already-cancelled caller starts
+    /// cancelled and the grace collapses to zero — but a detached sleep still
+    /// resumes only on a cooperative worker, in the band an unspecified
+    /// priority lands in. This cell saturates THAT band while the producer is
+    /// wedged, so the gate can only be opened by a timer that needs no worker
+    /// at all.
+    ///
+    /// The consumer stays on the MainActor's own clear band, so the ONLY
+    /// starved participant is the grace timer itself.
+    ///
+    /// MUTATION: restore `let timer = Task.detached { try? await
+    /// Task.sleep(for: windDownGrace); gate.open() }` and the scan returns
+    /// when the saturated band frees instead of on the 100 ms grace.
+    @MainActor
+    func testTheWindDownGraceDoesNotDependOnTheCooperativePoolEither()
+        async throws
+    {
+        // The band an unspecified-priority detached task lands in.
+        let bandCount = ProcessInfo.processInfo.activeProcessorCount + 2
+        let bandBlockers = LeakFreeBlockers(count: bandCount)
+        defer { bandBlockers.join() }
+
+        // A producer that CANNOT wind down inside the grace, so the gate is
+        // opened by the timer rather than by the producer.
+        let wedge = LeakFreeBlockers(count: 1)
+        defer { wedge.join() }
+        let runtime = try makeRuntime(
+            [
+                FixtureScanner(
+                    id: "unwinding",
+                    trustedContainerRoots: [
+                        base.appendingPathComponent("unwinding"),
+                    ]
+                ) {
+                    // SATURATION STARTS HERE, not before the scan: `scan`'s
+                    // own preamble does `await Task.detached { DiskInfo
+                    // .current() }.value`, which lands in this very band —
+                    // saturating it up front would time that fetch instead of
+                    // the grace, and did (1.83 s, all of it before the stream
+                    // was even created).
+                    for _ in 0..<bandCount {
+                        Task.detached(priority: .medium) {
+                            bandBlockers.hold()
+                        }
+                    }
+                    wedge.hold()
+                    return ScanOutcome(items: [], errors: [])
+                },
+            ],
+            sessionBounds: ScanSessionBounds(
+                eventDeadline: .milliseconds(200),
+                producerWindDownGrace: .milliseconds(100)
+            )
+        )
+        let viewModel = CacheoutViewModel(runtime: runtime)
+
+        let started = Date()
+        await viewModel.scan(trigger: .automatic)
+        let elapsed = Date().timeIntervalSince(started)
+
+        XCTAssertLessThan(
+            elapsed, 0.9,
+            "the 100 ms wind-down grace must not wait for a cooperative "
+                + "worker in a saturated band: \(elapsed) s"
+        )
+        XCTAssertFalse(viewModel.isAnyScanInProgress)
+    }
+
+    /// How long this file's polling blockers hold a thread when nothing ever
+    /// cancels them — the cap that turns a regression into a RED cell
+    /// instead of a hung run.
+    private static let pollCapSeconds: TimeInterval = 2.0
+
     /// THE HEALTHY PATH PAYS NOTHING, asserted rather than assumed: a
     /// session whose scanners all report ends on the producer's own
     /// terminator, immediately, and NO `scan_did_not_finish` row appears —
@@ -2394,5 +2688,59 @@ private actor OutcomeSequence {
         outcomes.count > 1
             ? outcomes.removeFirst()
             : (outcomes.first ?? ScanOutcome(items: [], errors: []))
+    }
+}
+
+/// N COOPERATIVE WORKERS HELD, AND THEN JOINED (PR #460 codex r13, B).
+///
+/// The starvation cells need threads blocked the way a walk inside a syscall
+/// blocks one: `Thread.sleep`, ignoring cancellation. A bare sleep does that
+/// but LEAKS — the blocked threads outlive the cell that made them and starve
+/// the NEXT one, which is not hypothetical: a four-cell run of these very
+/// cells failed a mutation check for that reason and passed when run alone.
+///
+/// So each blocker signals on its way out and the cell JOINS all of them
+/// before returning. The hold is uncancellable on purpose — a blocker that
+/// exited on cancellation would let a regressed build pass, because the
+/// watchdog cancels the producer whether or not the consumer can see it.
+private final class LeakFreeBlockers: @unchecked Sendable {
+    private let exited = DispatchSemaphore(value: 0)
+    private let count: Int
+    private let seconds: TimeInterval
+
+    init(count: Int, seconds: TimeInterval = 1.5) {
+        self.count = count
+        self.seconds = seconds
+    }
+
+    /// One blocker's body: holds its thread, cancellation or not.
+    func hold() {
+        Thread.sleep(forTimeInterval: seconds)
+        exited.signal()
+    }
+
+    /// Does not return until all `count` blockers have left `hold()`. Safe on
+    /// the MainActor: the blockers run in the session producer's `.utility`
+    /// band and never need the main thread to finish.
+    func join() {
+        for _ in 0..<count { exited.wait() }
+    }
+}
+
+/// A single elapsed-time reading, written from a blocked scanner thread and
+/// read from the test — lock-guarded because those are different threads and
+/// the writer must not suspend (PR #460 codex r13, B).
+private final class TimestampBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: TimeInterval?
+
+    var value: TimeInterval? {
+        lock.lock(); defer { lock.unlock() }
+        return stored
+    }
+
+    func record(_ seconds: TimeInterval) {
+        lock.lock(); defer { lock.unlock() }
+        if stored == nil { stored = seconds }
     }
 }

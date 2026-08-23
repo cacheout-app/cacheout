@@ -1299,6 +1299,63 @@ enum ValidatedScannerEvent: Sendable {
 /// and CLI, without any of them knowing: the alternative is one deadline per
 /// `for await`, fourteen of them today, that nothing can hold in step.
 ///
+/// ## Why the timers are not `Task.sleep` (PR #460 codex r13, B)
+///
+/// Through r12 both timers were `Task.sleep` — the deadline inside an
+/// unstructured `Task`, the wind-down grace inside a `Task.detached`. A sleep
+/// can only resume on a Swift cooperative worker, and the wedge class this
+/// bound exists for is precisely the one that OCCUPIES those workers: a
+/// scanner parked in a blocking syscall holds its thread, and the pool is
+/// `activeProcessorCount` threads wide. At that many blocked walks there is
+/// no worker left to resume the deadline and IT NEVER RUNS — measured on a
+/// 12-core machine with a 200 ms bound: 12 blocking scanners returned in
+/// 25.03 s on the walk rather than the bound, 36 in 75.04 s, while a CONTROL
+/// at 11 (one worker free) returned in 0.335 s. The threshold was exactly
+/// the pool width, and production needs no twelve scanners to cross it:
+/// `CategoryScanner` → `CacheScanner.scanAll` adds one child task per
+/// category — 23 of them — each running the SYNCHRONOUS `sizer.measure`, so
+/// ONE scanner fills every worker on every scan. Modelled that way the
+/// 200 ms bound took 20.13 s; with the children blocked 900 s (a hung mount)
+/// the run reproduced the pre-bound signature verbatim: the cell started,
+/// nothing followed, KILLED, exit -9, zero `Executed` lines.
+///
+/// So both timers run on `ScanSessionClock` — a Dispatch queue, off the
+/// cooperative pool entirely, the same move `GitCommandRunner.run` and
+/// `StatusSocket` already make for the same reason.
+///
+/// THAT IS ONLY HALF OF IT, AND THE HALF THAT WAS EASY TO MISTAKE. Firing the
+/// deadline is not the same as the consumer SEEING it fire, and the first
+/// draft of this comment claimed a MainActor consumer could not be delayed
+/// because it resumes on the main thread. Measurement says otherwise: with
+/// the deadline moved off the pool and nothing else changed, the watchdog ran
+/// at 206 ms and `CacheoutViewModel.scan` still did not return until 1.51 s,
+/// the moment the walks released. The main thread was never blocked — a
+/// 50 ms heartbeat on it ran unbroken through the whole gap. `for await`
+/// resumes `AsyncStream.Iterator.next()` on the GENERIC executor before
+/// hopping back to the actor, so the consumer's wake needs a cooperative
+/// worker of its own, in its own priority band — and the producer's blocking
+/// scanners were in that band, because an unstructured `Task {}` inherits the
+/// creating task's priority.
+///
+/// So the bound needs BOTH moves, and they close different halves:
+///   - `ScanSessionClock` (here) makes the deadline FIRE at all, whatever the
+///     pool is doing, including when the caller's own band is saturated.
+///   - the producer's `.utility` band (`scanValidatedSession`) keeps the scan's
+///     blocking work OUT of the band its consumer wakes in.
+/// Each is evidenced by a cell the other does not cover; see the mutation
+/// notes on `testTheDeadlineDoesNotDependOnTheCallersOwnPriorityBand` and
+/// `testTheBoundFiresWithEveryCooperativeWorkerBlocked`.
+///
+/// WHAT IS STILL NOT CLOSED, stated rather than glossed: a consumer that
+/// itself runs at `.utility` or below shares the band with the scanners and
+/// can still wake late. Both consumers in this repo sit above it
+/// (`CacheoutViewModel.scan` on the MainActor, `CLIHandler
+/// .collectValidatedScan` at the default `.medium`), and the DEADLINE fires
+/// regardless — but "the session ended" reaching such a consumer is bounded
+/// by a free worker in its band, not by wall-clock. That residual belongs to
+/// a scanner that blocks its thread, which is the thing this bound reports
+/// rather than the thing it can cure.
+///
 /// ## What happens when one fires
 ///
 /// NOT a silent truncation — that is its own defect. The watchdog first
@@ -1354,11 +1411,51 @@ struct ScanSessionBounds: Sendable {
     )
 }
 
+/// WHERE A SCAN SESSION'S BOUNDS ARE TIMED — off the Swift cooperative pool,
+/// on purpose (PR #460 codex r13, B). See `ScanSessionBounds` for the
+/// measurement that forced it: a `Task.sleep` deadline cannot resume while
+/// the pool's every worker is held by a scanner blocked in a syscall, which
+/// is the exact wedge the bound exists to convert into a report.
+///
+/// The queue is DEDICATED and SERIAL, and nothing blocking may ever be
+/// scheduled on it. Every body it runs is non-suspending and microseconds
+/// long — yield into an unbounded `AsyncStream`, `finish()`, `Task.cancel()`,
+/// `OneShotGate.open()` (which resumes continuations by ENQUEUEING them, it
+/// does not run them inline). That is what makes one serial queue safe for
+/// every concurrent session on the machine; put a blocking call in one of
+/// these bodies and you would stall every other session's deadline behind it.
+enum ScanSessionClock {
+    static let queue = DispatchQueue(
+        label: "app.cacheout.scan-session-bounds"
+    )
+
+    /// Runs `body` once, `delay` from now, unless the returned handle is
+    /// cancelled first. `DispatchWorkItem.cancel()` before execution
+    /// guarantees the body never runs; a handle cancelled after the body has
+    /// STARTED does not stop it, which is why the bodies themselves latch
+    /// (see `ScanSessionLedger`) rather than trusting the cancel to win.
+    static func schedule(
+        after delay: Duration, _ body: @escaping @Sendable () -> Void
+    ) -> DispatchWorkItem {
+        let item = DispatchWorkItem(block: body)
+        queue.asyncAfter(deadline: .now() + seconds(delay), execute: item)
+        return item
+    }
+
+    /// `Duration` in seconds, for Dispatch's `TimeInterval` deadlines.
+    /// `components` is (whole seconds, attoseconds).
+    static func seconds(_ duration: Duration) -> TimeInterval {
+        let parts = duration.components
+        return TimeInterval(parts.seconds)
+            + TimeInterval(parts.attoseconds) / 1e18
+    }
+}
+
 /// A one-shot gate: opened at most once, by whichever party gets there
 /// first, and waited on WITHOUT observing cancellation.
 ///
 /// Lock-guarded rather than an actor because `open()` is called from
-/// `Task.detached` closures and must not suspend, and because the wait must
+/// `ScanSessionClock` timer bodies and must not suspend, and because the wait must
 /// be a plain `withCheckedContinuation` — the ONE spelling that ignores the
 /// caller's cancellation, which is the property `untilProducerFinishes()`
 /// documents and depends on.
@@ -1463,17 +1560,24 @@ struct ValidatedScanSession {
     /// cannot finish.
     func untilProducerFinishes() async {
         // THE GRACE TIMER IS ARMED ONLY WHEN SOMEBODY IS ACTUALLY WAITING,
-        // and it is DETACHED. Both matter. Armed here, a healthy session —
-        // where the producer opened the gate before `events` even ended —
-        // pays for no sleeping task at all: `wait()` returns on the spot and
-        // the timer is cancelled before it runs. Detached, because a `Task`
-        // created inside a CANCELLED caller starts cancelled, `Task.sleep`
-        // throws immediately, and the grace would collapse to zero in
-        // exactly the case this method exists for — the consumer that has
-        // just been cancelled.
+        // and it runs OFF THE COOPERATIVE POOL. Both matter. Armed here, a
+        // healthy session — where the producer opened the gate before
+        // `events` even ended — pays for no timer at all: `wait()` returns on
+        // the spot and the item is cancelled before it runs.
+        //
+        // Off the pool (PR #460 codex r13, B) because this timer had BOTH
+        // pool-borne failures at once. Through r12 it was a `Task.detached`
+        // running `Task.sleep`: detached to dodge the first one (a plain
+        // `Task` created inside a CANCELLED caller starts cancelled, so
+        // `Task.sleep` throws immediately and the grace collapses to zero in
+        // exactly the case this method exists for), but detachment does
+        // nothing about the second — a sleep still resumes only on a
+        // cooperative worker, and the wedged scanner this grace is waiting
+        // out is the very thing holding those workers. `ScanSessionClock`'s
+        // Dispatch timer has neither problem: it does not inherit
+        // cancellation and it does not need the pool.
         let gate = woundDown
-        let timer = Task.detached { [windDownGrace] in
-            try? await Task.sleep(for: windDownGrace)
+        let timer = ScanSessionClock.schedule(after: windDownGrace) {
             gate.open()
         }
         await gate.wait()
@@ -2857,7 +2961,43 @@ struct SpaceScannerRuntime {
         let selectedIDs = selected.map(\.id)
         let reported = ReportedScanners()
         let woundDown = OneShotGate()
-        let task = Task {
+        // THE PRODUCER RUNS IN A LOWER PRIORITY BAND THAN ITS CONSUMER, and
+        // that is the OTHER half of making the bound observable (PR #460
+        // codex r13, B). Through r12 this was a plain `Task {}`, which
+        // inherits the creating task's priority — so a scan started from the
+        // MainActor put every scanner, and every child task a scanner spawns,
+        // in the SAME cooperative-pool band as the consumer that has to
+        // observe the session ending. `for await event in session.events`
+        // resumes `AsyncStream.Iterator.next()` on the GENERIC executor, not
+        // on the consumer's actor, so that wake needs a worker in that band —
+        // and a thread-blocking scanner has taken them all.
+        //
+        // MEASURED, one scanner with 23 blocking children at a 200 ms bound.
+        // Watchdog fires on time in every arm (it is off the pool entirely);
+        // what changes is when the MainActor consumer SEES it:
+        //   `Task {}`                              → 1.51 s / 3.02 s (the walk)
+        //   `Task.detached(priority: .utility)`    → 0.204 s (the bound)
+        //   `Task.detached(priority: .background)` → 0.210 s (the bound)
+        // Cooperative-pool width is per-band, so scan work at `.utility`
+        // cannot occupy the workers a `.userInitiated` or `.medium` consumer
+        // needs to wake.
+        //
+        // SAY WHAT THIS DOES NOT GUARANTEE. It is a band separation, not a
+        // reservation: a consumer that itself runs at `.utility` or below
+        // shares the band and can still queue behind a blocking scanner. The
+        // two consumers in this repo are above it — `CacheoutViewModel.scan`
+        // on the MainActor and `CLIHandler.collectValidatedScan` at the
+        // default `.medium`. The DEADLINE's own firing does not rest on this
+        // at all (see `ScanSessionClock`); only the consumer's promptness in
+        // observing it does.
+        //
+        // `.utility` and not lower: `.background` is I/O-throttled by the
+        // kernel, which would slow every real scan to buy nothing the band
+        // separation has not already bought. Detaching is otherwise a no-op
+        // here — this method is nonisolated, so `Task {}` inherited no actor
+        // isolation, an unstructured task inherits no cancellation either
+        // way, and the repo defines no task-local values.
+        let task = Task.detached(priority: .utility) {
             // Parallelism must not regress: scanners run concurrently
             // across the group (and internally parallel as today);
             // events yield in COMPLETION order — that is the
@@ -2895,12 +3035,14 @@ struct SpaceScannerRuntime {
         // `onTermination` the instant the stream ends and never runs a line
         // of its body; `continuation.finish()` is idempotent, so the two can
         // race without either being wrong.
-        let watchdog = Task {
-            do {
-                try await Task.sleep(for: bounds.eventDeadline)
-            } catch {
-                return  // cancelled: the session finished on its own.
-            }
+        //
+        // IT IS A DISPATCH TIMER, NOT A `Task` (PR #460 codex r13, B). An
+        // unstructured `Task`'s `Task.sleep` can only resume on a cooperative
+        // worker, and at `activeProcessorCount` thread-blocking scanners
+        // there is none — the deadline never ran in precisely the wedge class
+        // it exists for. `ScanSessionClock` is off that pool; see
+        // `ScanSessionBounds` for the measurement and the residual.
+        let watchdog = ScanSessionClock.schedule(after: bounds.eventDeadline) {
             // REPORTED, NOT SWALLOWED. Every scanner still outstanding gets
             // the event that says so, BEFORE the stream ends, so the
             // consumer's fail-closed path runs for it exactly as it would

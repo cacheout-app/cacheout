@@ -690,6 +690,22 @@ below are both part of that coordination, and the latter BLOCKS this release.
   so. When the put-back genuinely cannot be performed — the Trash or the
   destination folder cannot be opened — the message gives you the path in the
   Trash to drag it back from, rather than claiming it is not there.
+- **One disposal path refused to work under a symlinked folder while the
+  other four worked.** Cacheout deliberately follows symlinks when it opens
+  the folder that HOLDS the item it is about to remove — a cache root reached
+  through a link is a real folder, and refusing it would refuse every deletion
+  under it. Permanent delete does that, and so do three of the four Move to
+  Trash paths. The fourth — the one used when the item's own folder was
+  checked before the move — re-opened that holding folder a second time, by
+  path, refusing to follow: on a fixture where the item's immediate folder is
+  a symbolic link, the other four removed or trashed the item and this one
+  refused with "Not a directory" about a directory that plainly is one. It now
+  reads the item under the same followed, identity-checked folder the other
+  paths use, so all five agree. No scanner Cacheout ships could reach the
+  refusal (the items with this kind of check are always direct children of a
+  root that is itself checked), so nothing you could clean was affected. The
+  Trash side of the same check still refuses to follow a link, because the
+  folder the Trash reports is not one anybody proved.
 - **A background refresh no longer reads the folders it has already decided
   to skip.** The ephemeral-temp scanner runs only when you ask for a scan, but
   before each scan Cacheout records the identity of every folder it might

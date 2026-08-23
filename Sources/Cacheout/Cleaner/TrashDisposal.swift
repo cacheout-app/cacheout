@@ -614,21 +614,29 @@ enum TrashDisposal {
         // `.unestablished` reaches here too and every arm below refuses it
         // (`disagreement`'s `guard case`s each name a different case), which
         // is the fail-closed default rather than a fourth shape.
-        try proveAdmittedContainer(
-            of: target, containedIn: admittedParent, provider: provider
+        //
+        // (1) …AND THE LEAF IS READ UNDER THAT SAME DESCRIPTOR — the cheap
+        // refusal, and the one that keeps the Trash untouched. The two used
+        // to be separate acts, and the second one re-opened the container by
+        // PATH with `O_NOFOLLOW` (see `proveStandingUnderAdmittedContainer`
+        // for what that cost).
+        try proveStandingUnderAdmittedContainer(
+            inspected, at: target, containedIn: admittedParent,
+            provider: provider
         )
 
-        // (1) The cheap refusal, and the one that keeps the Trash untouched.
-        try proveStanding(inspected, at: target, provider: provider)
-
-        // (1b) THE SAME PROOFS, ON THE FAR SIDE OF THE SEAM'S HOP (D1). (0)
+        // (1b) THE SAME PROOF, ON THE FAR SIDE OF THE SEAM'S HOP (D1). (0)
         // and (1) are taken here; the move happens after a main-actor hop
-        // whose length is the main thread's queue depth, not a syscall.
+        // whose length is the main thread's queue depth, not a syscall. The
+        // container is opened and proved AGAIN here rather than carried
+        // across the hop on a descriptor: a descriptor held across it would
+        // still be the pre-hop container, and what this has to catch is a
+        // container swapped INSIDE it.
         let landed = try await disposal(target) {
-            try proveAdmittedContainer(
-                of: target, containedIn: admittedParent, provider: provider
+            try proveStandingUnderAdmittedContainer(
+                inspected, at: target, containedIn: admittedParent,
+                provider: provider
             )
-            try proveStanding(inspected, at: target, provider: provider)
         }
 
         // (2) The disposal happened. From here on the question is not "may we
@@ -686,21 +694,52 @@ enum TrashDisposal {
         }
     }
 
-    /// PROVE THE CONTAINER AND DROP IT — the container half of the binding,
-    /// for the one arm that reads its leaf by path afterwards.
+    /// THE CONTAINER IS PROVED AND THEN THE LEAF IS READ UNDER IT — the
+    /// `.directory` verdict's whole pre-move proof, as ONE act.
     ///
-    /// `dispose(_:expecting:…)`'s `.directory` path proves the leaf with
-    /// `look`, which resolves the name inside its own container; this asks
-    /// the separate question `look` cannot ask, which is WHICH container that
-    /// is. It is the identical `openAdmittedContainer` the permanent arm and
-    /// `boundLeaf` use, so the three cannot answer differently.
+    /// It is `boundLeaf`'s shape with one difference, and the difference is
+    /// forced: this verdict's rollback depends on `look`'s `.unidentifiable`
+    /// arm, which only an OPENED inode can produce, so the leaf is opened
+    /// (`openat`, `O_NOFOLLOW`) rather than `fstatat`ed. The CONTAINER half is
+    /// identical — `DepthSafeRemoval.openAdmittedContainer`, the same call the
+    /// permanent arm and `boundLeaf` make, so the three cannot answer
+    /// differently about whose folder this is.
     ///
-    /// The descriptor is closed immediately and ON PURPOSE: holding it would
-    /// suggest the leaf read that follows goes through it, and it does not —
-    /// that stronger shape is `boundLeaf`, and every arm that can use it now
-    /// does.
-    private static func proveAdmittedContainer(
-        of target: URL,
+    /// ## AND THAT IS THE FIX (PR #460 codex r14, V1-D2)
+    ///
+    /// r13 proved the container, CLOSED the descriptor, and then read the leaf
+    /// with `look(at:)`, which re-opened the container BY PATH with
+    /// `O_NOFOLLOW`. `DepthSafeRemoval.openContainer` deliberately FOLLOWS,
+    /// and its header states the reason verbatim: "a no-follow open would
+    /// refuse it while `remove`'s open succeeded — a binding that refuses
+    /// every deletion under a symlinked cache root". So the two opens
+    /// disagreed by construction, and this one arm refused what the other four
+    /// destructive paths perform.
+    ///
+    /// MEASURED at 6866012 on `base/link -> base/real`, target
+    /// `base/link/victim`, production provider, one `AdmittedParent`:
+    /// permanent DELETED, `dispose(_:containedIn:)` TRASHED, the
+    /// `.noDirectoryTree` arm TRASHED, the `.nonDirectoryLeaf` arm TRASHED,
+    /// and this arm REFUSED `.posix(20)` — surfaced to the user as
+    /// "…/victim: Not a directory" about a directory that plainly is one. No
+    /// shipped scanner reached it (both `.directory` producers emit only
+    /// direct children of their admitted roots), so it was latent rather than
+    /// shipping. Evidenced by
+    /// `TrashDisposalHopProofTests.testEveryDestructivePathAgreesUnderASymlinkedContainer`.
+    ///
+    /// The re-open also went away with it: the container was being resolved
+    /// twice per proof, and the second resolution was the unbound one.
+    ///
+    /// THE LANDING'S CONTAINER OPEN IS UNCHANGED AND MUST STAY SO. `look(at:)`
+    /// still opens ITS container `O_NOFOLLOW`, because the Trash's container
+    /// is proved against nothing — see `look`'s header and
+    /// `…RefusesASymlinkedLandingContainer`. Following there identified the
+    /// object on the other side of a link and reported a move that never
+    /// happened; following HERE is the only way to agree with the open that
+    /// the deletion itself uses.
+    private static func proveStandingUnderAdmittedContainer(
+        _ inspected: UserDataProbeResult.InspectedRoot,
+        at target: URL,
         containedIn admittedParent: DepthSafeRemoval.AdmittedParent,
         provider: FileSystemIdentityProvider
     ) throws {
@@ -709,7 +748,21 @@ enum TrashDisposal {
             provenAgainst: admittedParent, displayPath: target.path,
             provider: provider
         )
-        close(fd)
+        defer { close(fd) }
+        // `absenceProves: true` — the frozen ghost-target behaviour, and the
+        // same value `proveStanding` passes. See `proveStanding`.
+        if let cause = disagreement(
+            inspected,
+            with: look(
+                named: target.lastPathComponent, inDirectory: fd,
+                logical: target, provider: provider
+            ),
+            absenceProves: true
+        ) {
+            throw DepthSafeRemoval.Failure(
+                path: target.path, cause: cause, depth: 0
+            )
+        }
     }
 
     /// THE ONE DISPOSAL SHAPE THAT BINDS AN OBJECT — used by every arm that
@@ -1252,6 +1305,17 @@ enum TrashDisposal {
     /// refused, and its identity is only ever compared for EQUALITY against
     /// one bound before the move. Every other failure refuses.
     ///
+    /// ## AND THIS ENTRY POINT IS THE LANDING'S, NOT THE TARGET'S (r14, V1-D2)
+    ///
+    /// Everything above is about a container NOBODY PROVED — `~/.Trash`, whose
+    /// spelling comes from the mover. The TARGET's container is proved, so its
+    /// leaf is read through `proveStandingUnderAdmittedContainer` instead,
+    /// under the descriptor `DepthSafeRemoval.openAdmittedContainer` returns —
+    /// an open that deliberately FOLLOWS, because every other destructive path
+    /// follows and a no-follow open here refused what all four of them
+    /// performed. The two containers get two different opens because they are
+    /// two different questions; the leaf is `O_NOFOLLOW` in both.
+    ///
     /// Both directions are evidenced, and each by its own cell:
     /// `…IdentifiesAnUnopenableLanding` (`EPERM` must SUCCEED),
     /// `…IdentifiesAModeDeniedLanding` (`EACCES` must SUCCEED),
@@ -1309,10 +1373,35 @@ enum TrashDisposal {
     }
 
     /// The single component `name`, opened under the HELD container.
+    ///
+    /// THE PRECONDITION IS CHECKED HERE, NOT ONLY AT THE PATH-SPELLED CALLER
+    /// (PR #460 codex r14, V1-D2). `look(at:)` guards before it reaches this,
+    /// because ITS fallback is a path open with no name check beneath it; this
+    /// function has a second caller now —
+    /// `proveStandingUnderAdmittedContainer`, which resolves the target's own
+    /// last component under the PROVED container — and `openat` would happily
+    /// walk a `..` out of the descriptor it was handed. Guarding the shared
+    /// spelling rather than each call site is what stops the next caller from
+    /// having to remember.
+    ///
+    /// WHAT IT BUYS IS THE CAUSE, MEASURED rather than assumed: with it
+    /// deleted the disposal is still REFUSED, because
+    /// `URL.deletingLastPathComponent()` does not cancel a `..` (it answers
+    /// `<child>/../`), so the container open and the `openat` under it land
+    /// one level apart and the identity comparison disagrees. The refusal that
+    /// comes back is then `.notTheInspectedObject` — the user is told the ITEM
+    /// changed about a target whose NAME was never valid, which is exactly the
+    /// wrong-fact-to-the-user class r13's A2 was about. Evidenced by
+    /// `TrashDisposalHopProofTests.testTheDirectoryVerdictArmRefusesATargetSpelledOutOfItsOwnContainer`
+    /// (full suite under the mutation: 1532 executed / 1 failure, that cell
+    /// alone).
     private static func look(
         named name: String, inDirectory container: Int32,
         logical url: URL, provider: FileSystemIdentityProvider
     ) -> Sighting {
+        guard FileSystemIdentityProvider.isSafeComponent(name) else {
+            return .unreadable(errno: EINVAL)
+        }
         switch provider.openChildDirectoryCarryingErrno(
             inDirectory: container, named: name, logical: url
         ) {

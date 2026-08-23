@@ -52,7 +52,7 @@ import XCTest
 /// | mutation | red |
 /// |---|---|
 /// | `.noDirectoryTree` back on `proveStanding`, container proof KEPT | **2** — `…RefusesALeafSwappedInsideTheMoversHop`, `…RefusesAContainerSwappedInsideTheMover` |
-/// | …and step (0)'s `proveAdmittedContainer` deleted as well (the r12 state) | **4** — the two above, `…RefusesAStrangerInAnotherContainer`, `…NamesContainerDriftAsContainerDrift` |
+/// | …and the container proof dropped as well (the r12 state) | **4** — the two above, `…RefusesAStrangerInAnotherContainer`, `…NamesContainerDriftAsContainerDrift` |
 /// | `.anythingButADirectory` admits everything | **1** — `…RefusesADirectoryThatAppearedAtTheName` |
 ///
 /// The first row is the whole of A1: adding the container binding alone fixes
@@ -1597,9 +1597,13 @@ final class TrashDisposalHopProofTests: XCTestCase {
     /// item changed", for an event in which the item did not change and its
     /// FOLDER did.
     ///
-    /// MUTATION: delete step (0)'s `proveAdmittedContainer` and this cell
-    /// fails on the cause (the disposal is still refused — that is the
-    /// point: it is a taxonomy defect, not a destruction one).
+    /// MUTATION: in `proveStandingUnderAdmittedContainer`, replace the
+    /// `openAdmittedContainer` call with an unproved
+    /// `provider.openDirectoryNoFollow` of the same directory — the r12 shape
+    /// — and this cell fails on the cause (the disposal is still refused —
+    /// that is the point: it is a taxonomy defect, not a destruction one).
+    /// Named against the r14 spelling: the container proof and the leaf read
+    /// are one act now, so there is no separate step (0) to delete.
     func testTheDirectoryVerdictArmNamesContainerDriftAsContainerDrift()
         async throws
     {
@@ -1644,5 +1648,213 @@ final class TrashDisposalHopProofTests: XCTestCase {
                 + "— `content-drift` sends the user to look at the wrong thing"
         )
         XCTAssertTrue(log.urls.isEmpty)
+    }
+
+    // ================================================================
+    // MARK: - The symlinked CONTAINER below the admitted root (r14, V1-D2)
+    // ================================================================
+
+    /// FIVE DESTRUCTIVE PATHS, ONE FIXTURE, ONE ANSWER — and until r14 the
+    /// `.directory` verdict's arm was the one that said no (PR #460 codex
+    /// r14, V1-D2).
+    ///
+    /// `DepthSafeRemoval.openContainer` deliberately FOLLOWS symlinks, and
+    /// its header says why in as many words: "a no-follow open would refuse it
+    /// while `remove`'s open succeeded — a binding that refuses every deletion
+    /// under a symlinked cache root". Every destructive path binds its
+    /// container through it — except `dispose(_:expecting:…)`'s `.directory`
+    /// arm, which proved the container that way and then read the LEAF with
+    /// `look`, whose own container open carries `O_NOFOLLOW`. On this fixture
+    /// that open answers `ENOTDIR`, and the user is told
+    /// "…/victim: Not a directory" about a directory that plainly is one.
+    ///
+    /// MEASURED on this fixture at 6866012, production provider, same
+    /// `AdmittedParent`: permanent DELETES, `dispose(_:containedIn:)`
+    /// TRASHES, the `.noDirectoryTree` arm TRASHES, the `.nonDirectoryLeaf`
+    /// arm TRASHES, and the `.directory` arm REFUSED `.posix(20)`. Driven end
+    /// to end through the production composition, the same divergence read
+    /// DEEP-PERM `errors=[] entries=1 gone=true` against DEEP-TRASH
+    /// `errors=["…/Library/Caches/link/…: Not a directory"] entries=0
+    /// gone=false`.
+    ///
+    /// Introduced by r12's descriptor-relative rewrite of `look` (on
+    /// `origin/main` it was a path-spelled open of the TARGET, which resolves
+    /// a symlinked container fine — syscall probe, Darwin 25.5:
+    /// `open(link, O_DIRECTORY|O_NOFOLLOW)` = -1 errno 20,
+    /// `open(link/victim, O_DIRECTORY|O_NOFOLLOW)` = fd, `open(link,
+    /// O_DIRECTORY)` = fd). No shipped scanner reaches it today — both
+    /// `.directory` producers emit only DIRECT children of their admitted
+    /// roots, and when the symlink IS the admitted root `ContainerSnapshot`
+    /// refuses both arms upstream — so it was latent, not shipping. It is
+    /// still one-refuses/four-succeed with a message naming the wrong fact.
+    ///
+    /// THE LANDING KEEPS ITS `O_NOFOLLOW` CONTAINER OPEN. The two opens are
+    /// not the same question: the target's container is PROVED against the
+    /// caller's `AdmittedParent`, and the Trash's is not proved against
+    /// anything, which is why
+    /// `…RefusesASymlinkedLandingContainer` must stay green through this.
+    ///
+    /// MUTATION: give the verdict arm back its path-spelled leaf read
+    /// (`try proveStanding(inspected, at: target, provider: provider)` beside
+    /// the container proof) and this cell alone fails with `.posix(20)`.
+    func testEveryDestructivePathAgreesUnderASymlinkedContainer()
+        async throws
+    {
+        let landings = try XCTUnwrap(self.landings)
+        let provider = FileSystemIdentityProvider()
+        let real = base.appendingPathComponent("real")
+        try fm.createDirectory(at: real, withIntermediateDirectories: true)
+        let link = base.appendingPathComponent("link")
+        try fm.createSymbolicLink(at: link, withDestinationURL: real)
+
+        /// One victim directory under the SYMLINKED spelling of its
+        /// container, with the container bound exactly as production binds
+        /// it.
+        func victim(
+            _ name: String
+        ) throws -> (URL, DepthSafeRemoval.AdmittedParent,
+                     FileSystemIdentityProvider.Identity) {
+            let url = link.appendingPathComponent(name)
+            try fm.createDirectory(at: url, withIntermediateDirectories: true)
+            try Data("ours".utf8).write(
+                to: url.appendingPathComponent("ours.txt")
+            )
+            let identity = try XCTUnwrap(provider.identity(of: url))
+            return (url, try admittedParent(of: url, provider: provider),
+                    identity)
+        }
+
+        // 1. PERMANENT — the path the header quotes.
+        let (permanent, permanentParent, permanentIdentity) =
+            try victim("victim-permanent")
+        try DepthSafeRemoval.remove(
+            at: permanent, expecting: .directory(permanentIdentity),
+            provider: provider, containedIn: permanentParent
+        )
+        XCTAssertFalse(fm.fileExists(atPath: permanent.path),
+                       "the permanent arm refused a symlinked container")
+
+        // 2. THE CONTAINER-BOUND OVERLOAD — the GUI's contents-mode and
+        //    worktree disposal.
+        let (bound, boundParent, _) = try victim("victim-bound")
+        let boundLanding = landings.appendingPathComponent("victim-bound")
+        try await TrashDisposal.dispose(
+            bound, containedIn: boundParent, provider: provider,
+            via: { url, prove in
+                try prove()
+                try fm.moveItem(at: url, to: boundLanding)
+                return boundLanding
+            }
+        )
+        XCTAssertTrue(fm.fileExists(atPath: boundLanding.path))
+
+        // 3. THE `.directory` VERDICT ARM — the one that refused.
+        let (verdict, verdictParent, verdictIdentity) =
+            try victim("victim-verdict")
+        let verdictLanding = landings.appendingPathComponent("victim-verdict")
+        let log = MoveLog()
+        try await TrashDisposal.dispose(
+            verdict, expecting: .directory(verdictIdentity),
+            provider: provider, containedIn: verdictParent,
+            via: { url, prove in
+                try prove()
+                log.record(url)
+                try fm.moveItem(at: url, to: verdictLanding)
+                return verdictLanding
+            }
+        )
+        XCTAssertEqual(log.urls.count, 1,
+                       "the verdict arm refused before the move")
+        XCTAssertFalse(fm.fileExists(atPath: verdict.path))
+        XCTAssertTrue(
+            fm.fileExists(
+                atPath: verdictLanding.appendingPathComponent("ours.txt").path
+            ),
+            "the item the verdict arm disposed of is not at the landing"
+        )
+    }
+
+    /// AND THE SAME GUARD ON THE DESCRIPTOR-RELATIVE ARM, WHICH r14 GAVE A
+    /// SECOND CALLER (PR #460 codex r14, V1-D2).
+    ///
+    /// `look(named:inDirectory:…)` used to be reachable only from `look(at:)`,
+    /// which refuses the unsafe component before it ever calls — so the
+    /// spelling underneath carried no guard of its own and nothing noticed.
+    /// `proveStandingUnderAdmittedContainer` now resolves the TARGET's own
+    /// last component under the proved container descriptor, and `openat`
+    /// walks `..` out of a descriptor without complaint.
+    ///
+    /// WHAT IT COSTS IS THE CAUSE, NOT THE OUTCOME — MEASURED, and the
+    /// opposite of what this comment first claimed. With the guard deleted the
+    /// disposal is STILL refused, as `.notTheInspectedObject`. The arithmetic:
+    /// `URL.deletingLastPathComponent()` does not cancel a `..` (it returns
+    /// `<child>/../`, measured), so the container open resolves to `<child>/..`
+    /// = the CONTAINER, and the `openat` of `..` under it then lands one level
+    /// ABOVE the container — while the verdict names what the target's own
+    /// spelling resolves to, which is the container itself. The two can never
+    /// coincide, so the identity comparison catches it.
+    ///
+    /// It is therefore the A2 shape one layer down, and it is kept for the A2
+    /// reason: the user is told THE ITEM CHANGED (`content-drift`) about a
+    /// target whose NAME was never valid, and goes and looks at the wrong
+    /// thing. `boundLeaf`'s copy of this guard is disclosed the same way, in
+    /// `…ResolvedAlongThePath` above.
+    ///
+    /// MUTATION: delete the `isSafeComponent` guard at the top of
+    /// `look(named:inDirectory:…)` and this cell alone fails, on the cause —
+    /// measured over the full suite: 1532 executed / 2 skipped / 1 failure,
+    /// exit 1.
+    func testTheDirectoryVerdictArmRefusesATargetSpelledOutOfItsOwnContainer()
+        async throws
+    {
+        let provider = FileSystemIdentityProvider()
+        let container = try makeCacheContainer()
+        let child = container.appendingPathComponent("child")
+        try fm.createDirectory(at: child, withIntermediateDirectories: true)
+
+        // `deletingLastPathComponent()` does not cancel a `..`, so this
+        // target's container is `child` and what the name RESOLVES to is
+        // `container`.
+        let unsafe = child.appendingPathComponent("..")
+        XCTAssertEqual(unsafe.lastPathComponent, "..",
+                       "the fixture must actually carry an unsafe component")
+        // The verdict names what the `..` resolves to, which is what makes
+        // the identity comparison agree with the guard removed.
+        let identity = try XCTUnwrap(provider.identity(of: container))
+        let parent = try admittedParent(of: unsafe, provider: provider)
+        let log = MoveLog()
+
+        var thrown: Error?
+        do {
+            try await TrashDisposal.dispose(
+                unsafe, expecting: .directory(identity), provider: provider,
+                containedIn: parent,
+                via: { url, prove in
+                    try prove()
+                    log.record(url)
+                    return nil
+                }
+            )
+        } catch {
+            thrown = error
+        }
+
+        XCTAssertEqual(
+            unsafe.deletingLastPathComponent().lastPathComponent, "..",
+            "the fixture's premise: `deletingLastPathComponent()` does not "
+                + "cancel a `..`, which is what keeps the resolutions one "
+                + "level apart"
+        )
+        XCTAssertEqual(
+            log.urls, [],
+            "a target spelled out of its own container reached the mover"
+        )
+        XCTAssertEqual(
+            (thrown as? DepthSafeRemoval.Failure)?.cause, .posix(EINVAL),
+            "the refusal must name the malformed name rather than resolving "
+                + "it: \(String(describing: thrown))"
+        )
+        XCTAssertTrue(fm.fileExists(atPath: child.path),
+                      "nothing may be disturbed")
     }
 }

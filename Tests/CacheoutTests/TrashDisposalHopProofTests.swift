@@ -1552,7 +1552,10 @@ final class TrashDisposalHopProofTests: XCTestCase {
         )
         let described = try XCTUnwrap(failure.errorDescription)
         XCTAssertTrue(
-            described.contains("It is in the Trash at \(landed.path)"),
+            // ONE WORDING PER PROPOSITION (r18, E): `.theItemIsAtTheLanding`
+            // is now spelled the same here as in the `.strandedInTrash`
+            // cell above, which is the point — the two causes cannot drift.
+            described.contains("it is in the Trash at \(landed.path)"),
             described
         )
         XCTAssertEqual(
@@ -2705,238 +2708,146 @@ final class TrashDisposalHopProofTests: XCTestCase {
         }
     }
 
-    /// WHAT ONE PROPOSITION'S TEXT MUST — AND MUST NOT — LOOK LIKE.
-    ///
-    /// `all`/`any` are ANTI-DELETION: they keep a disclosure from being
-    /// quietly dropped. The other four are the ANTI-ADDITION half, and they
-    /// are the reason this is not another phrase list: they are stated over
-    /// CATEGORIES of word (does this clause name a place at all? does it
-    /// claim a net effect at all?) rather than over sentences anybody had to
-    /// think of first.
-    private struct FactContract {
-        /// Every one of these must appear in a clause tagged with the fact.
-        var all: [String] = []
-        /// At least one of these must, when the list is non-empty.
-        var any: [String] = []
-        /// The fact is ABOUT where something is, so a clause carrying it may
-        /// name places. A clause tagged with any other fact may not.
-        var isWhereabouts = false
-        /// …and it places something POSITIVELY. An unhedged clause that
-        /// names a place must carry a fact of this kind.
-        var isPositivePlacement = false
-        /// The fact is about the REPORT or the REMEDY: it may name no place.
-        var forbidsPlaces = false
-        /// …and may make no claim about bytes.
-        var forbidsNetEffect = false
-    }
-
-    /// The contract for each proposition, spelled through a `default`-less
-    /// `switch` so a new one cannot enter the vocabulary unexamined.
-    private func contract(
-        for fact: TrashDisposal.Failure.Established
-    ) -> FactContract {
-        switch fact {
-        case .theDisposalWasNotProvedToHaveMovedTheItem:
-            return FactContract(
-                all: ["could not be proved to have moved the item"],
-                isWhereabouts: true
-            )
-        case .theItemIsBackAtTheTarget:
-            return FactContract(
-                all: ["identified at this path"], any: ["PUT BACK"],
-                isWhereabouts: true, isPositivePlacement: true
-            )
-        case .theItemIsAtTheLanding:
-            return FactContract(
-                any: [Self.landingToken, "from there"],
-                isWhereabouts: true, isPositivePlacement: true
-            )
-        case .theLandingDidNotYieldTheItem:
-            return FactContract(
-                all: [Self.landingToken, "cannot be found"],
-                isWhereabouts: true
-            )
-        case .theLandingNameWasRepointed:
-            return FactContract(
-                all: [Self.landingToken], any: ["re-used", "re-pointed"],
-                isWhereabouts: true, isPositivePlacement: true
-            )
-        case .aStrangerStandsAtTheTarget:
-            return FactContract(
-                all: [Self.targetToken, "stands at"],
-                isWhereabouts: true, isPositivePlacement: true
-            )
-        case .theHoldingFolderIsNotTheAdmittedOne:
-            return FactContract(
-                all: ["folder"], isWhereabouts: true,
-                isPositivePlacement: true
-            )
-        case .theLandingWasNotReported:
-            return FactContract(
-                all: ["did not report where"], isWhereabouts: true
-            )
-        case .theItemsWhereaboutsAreNotEstablished:
-            return FactContract(
-                all: ["was NOT established"], isWhereabouts: true
-            )
-        case .nothingWasReportedFreed:
-            return FactContract(all: ["reported freed"], forbidsPlaces: true)
-        case .theRemedyForThisRefusal:
-            return FactContract(forbidsPlaces: true, forbidsNetEffect: true)
-        case .nothingWasFreedOnDisk, .theTargetWasReplaced,
-             .theTrashHoldsWhatItTook:
-            // Unsatisfiable ON PURPOSE. No arm establishes these, the fence
-            // below asserts that no cause claims them, and the contract is
-            // written so that a claim tagged with one fails even if the
-            // `established` table is edited to admit it.
-            //
-            // `.theTrashHoldsWhatItTook` joined them at r18 (E2): it was the
-            // one entry in the derivation table inferred from an INJECTABLE
-            // SEAM's contract rather than from something the code read, and
-            // it was false on the very event its cause is raised for.
-            return FactContract(all: ["\u{0}NO ARM ESTABLISHES THIS\u{0}"])
-        }
-    }
-
-    private static let targetToken = "«target»"
-    private static let landingToken = "«landing»"
     private static let targetPath = "/fixture/TARGET-PATH"
     private static let landingPath = "/fixture/LANDING-PATH"
 
-    /// A clause with its two payload paths replaced by tokens.
-    ///
-    /// THE ONE NORMALISATION THAT IS A JUDGEMENT, DISCLOSED AS ONE: the
-    /// string "Move to Trash" is the NAME OF THE APP'S CHECKBOX, not a
-    /// location, and it is removed before the place scan so that the remedy
-    /// clause naming that control is not read as placing the item in the
-    /// Trash. A false sentence that hid behind those four words would evade
-    /// the place rule; see the residual list on the fence itself.
-    private func normalised(_ text: String) -> String {
-        var out = text.replacingOccurrences(
-            of: "Move to Trash", with: "«control»"
-        )
-        out = out.replacingOccurrences(
-            of: Self.landingPath, with: Self.landingToken
-        )
-        return out.replacingOccurrences(
-            of: Self.targetPath, with: Self.targetToken
-        )
-    }
+    /// Every cause, built against the SAME two payload paths so that two
+    /// causes sharing a proposition can be compared word for word.
+    private static let everyCause: [TrashDisposal.Failure.Cause] = [
+        .putBack, .strandedInTrash(landingPath), .lastSeenInTrash(landingPath),
+        .putBackTookAnotherObject(landingPath),
+        .destinationNotTheAdmittedContainer(landingPath), .destinationUnknown,
+    ]
 
-    /// Does this clause name a place? A CATEGORY, not a phrase: the two
-    /// payload paths, the Trash, and the locative pronouns.
-    private func namesAPlace(_ normalisedText: String) -> Bool {
-        if normalisedText.contains(Self.targetToken)
-            || normalisedText.contains(Self.landingToken)
-            || normalisedText.contains("Trash")
-            || normalisedText.contains("this path") { return true }
-        return normalisedText.range(
-            of: "\\b(there|here|somewhere|elsewhere)\\b",
-            options: [.regularExpression, .caseInsensitive]
-        ) != nil
-    }
-
-    /// Does it claim, or deny, a net effect on the disk?
-    private func namesANetEffect(_ normalisedText: String) -> Bool {
-        normalisedText.range(
-            of: "\\b(free|freed|frees|reclaimed|deleted|removed)\\b",
-            options: [.regularExpression, .caseInsensitive]
-        ) != nil
-    }
-
-    /// Is the clause HEDGED — does it say, in its own words, that the thing
-    /// it mentions was not established?
-    private func isHedged(_ normalisedText: String) -> Bool {
-        for marker in [
-            "could not", "cannot", "was NOT", "were NOT", "not established",
-            "did not", "no longer", "may ", "might ",
-        ] where normalisedText.contains(marker) { return true }
-        return false
-    }
-
-    /// **M1 — THE FENCE AGAINST PHRASING-FIXES WAS ITSELF A PHRASING-FIX**
-    /// (PR #460 codex r17).
+    /// **E — THE MESSAGE FENCE WAS STILL A BLOCKLIST, AND IS NOT ONE ANY
+    /// MORE BECAUSE THERE IS NO LONGER ANY FREE TEXT TO FENCE** (PR #460
+    /// codex r18).
     ///
-    /// r16 widened r15's opening-clause guard to the whole message by adding
-    /// a list of FORBIDDEN PHRASES. MEASURED at e6afc9f, `swift test --filter
-    /// TrashDisposalHopProofTests` (36 cells), each mutation rebuilt:
+    /// ## What this replaces, and why widening it a tenth time was not on
     ///
-    /// | mutation | result |
-    /// |---|---|
-    /// | restore "Look in the Trash for it" on `.lastSeenInTrash` | RED |
-    /// | restore "…the item the Trash took is still in the Trash" | RED |
-    /// | **"Check your Trash for the item."** on `.lastSeenInTrash` | **GREEN 36/36** |
-    /// | **"The object the Trash took remains where the Trash put it."** | **GREEN** |
+    /// r17 replaced a list of banned phrases with a `Claim` carrying a tag
+    /// and its own FREE TEXT, plus a fence in this file that inspected that
+    /// text: `namesAPlace`, `namesANetEffect`, `isHedged`, and per-proposition
+    /// `all`/`any` marker strings. Its doc asserted "a NEW false sentence
+    /// fails without anyone having predicted its wording". MEASURED at
+    /// 9ca1129: **8 of 8 new false wordings PASSED**, five of them saying the
+    /// same false thing r16 spent a round retiring, one of them passing the
+    /// FULL suite — while the control (r17's own recorded RED row) still
+    /// reddened, so the harness was sound and the fence was not. Six distinct
+    /// mechanisms, each a CATEGORY rather than a gap in a word list:
     ///
-    /// A blocklist catches the sentences somebody already wrote down and
-    /// nothing else. This cell asserts a PROPERTY instead, over the type:
+    /// (a) `isHedged` was a WHOLE-CLAUSE boolean — one hedge word anywhere
+    ///     licensed an UNHEDGED positive placement anywhere else in the same
+    ///     clause;
+    /// (b) a proposition marked whereabouts+positive licensed ARBITRARY extra
+    ///     whereabouts claims, about any object and any place;
+    /// (c) the `all`/`any` markers were a phrase list INVERTED — a brand-new
+    ///     clause tagged with an already-used proposition passed iff it
+    ///     contained that proposition's markers, so the marker was a
+    ///     PASSWORD, not a property;
+    /// (d) `contract(for: .theRemedyForThisRefusal)` had no `all` and no
+    ///     `any` — free text bounded by two word lists;
+    /// (e) rule (5) tested `". "` only, so `"! "` and `"? "` let a NEW
+    ///     SENTENCE into an existing clause untagged;
+    /// (f) the net-effect lexicon was six words.
     ///
-    /// 1. every clause of every message is TAGGED with the one proposition
-    ///    it asserts, and `errorDescription` is the join of those clauses and
-    ///    nothing else — so there is no untagged text to hide in;
-    /// 2. no clause may carry a proposition its own cause's code path did not
-    ///    establish (`TrashDisposal.Failure.established(for:)`, derived at the
-    ///    raise sites);
-    /// 3. a clause that NAMES A PLACE AT ALL — either payload path, the
-    ///    Trash, or a locative pronoun — must carry a whereabouts
-    ///    proposition, and if it does so without hedging, a POSITIVE one;
-    /// 4. a clause that makes a NET-EFFECT claim at all must be the one about
-    ///    the report, and must say "reported freed";
-    /// 5. a clause may contain no sentence break, so a new sentence is
-    ///    necessarily a new clause and necessarily tagged;
-    /// 6. the THREE propositions this file has shipped and retired — "the
-    ///    target was replaced", "nothing was freed on disk" and (r18, E2)
-    ///    "the Trash holds what it took" — are established by NO cause, and
-    ///    their contract is unsatisfiable.
+    /// And the fence's own disclosed residual was WRONG: it said a false
+    /// graft passes only if it "adds no place and no net-effect word", yet
+    /// five of the eight passing mutations DID add a place.
     ///
-    /// None of (2)–(6) mentions a sentence, so a NEW false sentence fails
-    /// without anyone having predicted its wording. MEASURED at 36cf469,
-    /// eight mutations of `TrashDisposal.Failure.claims(path:cause:)`, each
-    /// rebuilt and run as `swift test --filter TrashDisposalHopProofTests`
-    /// (37 cells). NONE of these wordings appears anywhere in this repository
-    /// before this round:
+    /// ## The shape that closes it
+    ///
+    /// A fence that inspects FREE TEXT will always be a blocklist, because
+    /// "is this clause entailed by what the proof established?" is a SEMANTIC
+    /// judgement and every approximation of it in strings is a password. So
+    /// the free text is gone: `TrashDisposal.Failure.claims(path:cause:)`
+    /// chooses no words at all. It walks `messageOrder`, keeps the facts
+    /// `established(for:)` says the cause proved, and renders each through
+    /// `sentence(for:path:landed:remedy:)` — ONE wording per proposition,
+    /// shared by every cause. The remedy comes from the closed `Remedy` enum.
+    ///
+    /// A clause asserting a proposition its cause did not establish is
+    /// therefore UNREPRESENTABLE, not merely detected: there is no call site
+    /// at which one could be written. (b) and (c) die with the per-cause
+    /// wording; (a), (d), (e) and (f) die with the text inspection they
+    /// belonged to.
+    ///
+    /// ## What this cell asserts — all STRUCTURE, no prose inspection
+    ///
+    /// 1. `messageOrder` is a permutation of the whole vocabulary, so a new
+    ///    proposition cannot enter unplaced;
+    /// 2. every cause's claim list is EXACTLY the established facts, in
+    ///    `messageOrder`, each once — nothing extra, and nothing silently
+    ///    dropped by a `nil` rendering;
+    /// 3. exactly one OPENING fact, first, and never anywhere else;
+    /// 4. the report clause and the remedy close every message, in that
+    ///    order;
+    /// 5. `errorDescription` is the path, then the join, and nothing else;
+    /// 6. the same proposition renders IDENTICALLY under every cause that
+    ///    establishes it (the property that made (b) and (c) possible);
+    /// 7. the remedy is one of the closed set;
+    /// 8. the three propositions no arm establishes are established by no
+    ///    cause and render to `nil` under every remedy;
+    /// 9. the joined grammar holds: openings lower case, every other sentence
+    ///    upper case, every sentence terminated — a structural check on the
+    ///    join, not a filter on meaning.
+    ///
+    /// ## THE RESIDUAL, STATED PLAINLY BECAUSE AN ACCURATE DISCLOSURE BEATS
+    /// ## A TENTH FALSE ONE
+    ///
+    /// Nothing here reads the sentences. Someone can still write a wording in
+    /// `sentence(for:…)` that asserts MORE than the proposition it is filed
+    /// under, and no test in this repository can catch that — it is the same
+    /// semantic judgement, and it has simply been moved. What changed is its
+    /// size and shape: fourteen wordings in one `default`-less `switch`,
+    /// reviewed once and shared by every cause, instead of one wording per
+    /// (cause × clause) written afresh at six call sites — which is where all
+    /// nine of this branch's false sentences were written. That is a smaller
+    /// surface, not a proof.
+    ///
+    /// Equally: an author can edit `established(for:)` to admit a proposition
+    /// the code path does not prove. That table IS the derivation, nothing
+    /// here can check it against the code, and r18's E3 found it already
+    /// wrong about its own code in the commit that introduced it. What DOES
+    /// narrow it is `Failure.placesTheItem(_:)` — a property of the closed
+    /// vocabulary, not of any sentence — asserted by the two fixture cells
+    /// that have MEASURED the item still at the target at the same inode
+    /// (`…TheLastSeenMessageDoesNotSendTheUserToTheTrashForAnItemStillOnDisk`
+    /// and
+    /// `…TheUnknownDestinationMessageDoesNotSendTheUserToTheTrashForAnItemStillOnDisk`).
+    /// A measured event can now fence the derivation for its own cause.
+    ///
+    /// ## MEASURED
+    ///
+    /// The eight wordings that passed r17's fence CANNOT BE EXPRESSED against
+    /// this shape: every one of them was an extra sentence written into a
+    /// per-cause clause, and there are no per-cause clauses. What can be
+    /// expressed are edits to the three tables. Each mutated alone, target
+    /// rebuilt, `swift test --filter TrashDisposalHopProofTests` (39 cells).
+    /// These are type-level checks with no timing in them, so one run each:
     ///
     /// | mutation | fence |
     /// |---|---|
-    /// | `" Check your Trash for the item."` added to `.lastSeenInTrash`, tagged `.theItemsWhereaboutsAreNotEstablished` | **RED** (2 failures) |
-    /// | the same sentence tagged `.theTrashHoldsWhatItTook` | **RED** (1) |
-    /// | the same sentence GRAFTED onto the end of the whereabouts clause | **RED** (1) |
-    /// | `" The object the Trash took remains where the Trash put it."` added to `.putBackTookAnotherObject` | **RED** (2) |
-    /// | `"; nothing was reported freed"` reworded to `"; the bytes it took were reclaimed"` | **RED** (8) |
-    /// | `" Empty your Trash when you are done"` added to `.strandedInTrash` as a REMEDY | **RED** (3) |
-    /// | `"; your disk now has that space back"` added to `.putBack` as a REMEDY | GREEN |
-    /// | `"at this path"` → `"at this path within the last second"` | GREEN |
+    /// | `claims` appends a free-text clause (`"Check your Trash for the item."`) — the r17-era operation | **RED** (30) |
+    /// | `messageOrder` drops `.theItemsWhereaboutsAreNotEstablished` | **RED** (12) |
+    /// | `messageOrder` puts the remedy before the report | **RED** (12) |
+    /// | `sentence(for:)` returns `nil` for an ESTABLISHED fact (a silent drop) | **RED** (13) |
+    /// | an opening rendered upper case (the join's grammar) | **RED** (14) |
+    /// | `established(for: .lastSeenInTrash)` gains `.theItemIsAtTheLanding` — the exact false thing r16 retired, arrived through the derivation | **RED** (4) |
+    /// | `established(for: .destinationUnknown)` gains `.theItemIsBackAtTheTarget` | **RED** (4) |
+    /// | `established(for: .destinationUnknown)` gains back `.theTrashHoldsWhatItTook` and its clause (r18 E2's mutation) | **RED** 8/8 (9) |
+    /// | **a false clause GRAFTED INTO an existing wording** (`"…was NOT established, though it was there a second ago."`) | **GREEN** |
     ///
-    /// Every RED row is this cell. The two GREEN rows are the residual, and
-    /// they are what it CANNOT catch, stated rather than left to be
-    /// discovered:
-    ///
-    /// * A NET-EFFECT claim made without any word in the net-effect lexicon
-    ///   ("your disk now has that space back"). The lexicon is a category,
-    ///   but it is a category of WORDS.
-    /// * A false clause GRAFTED INTO an existing clause, when the result
-    ///   still satisfies that fact's `all`/`any` markers and adds no place
-    ///   and no net-effect word — a claim about TIME, or about who did it.
-    ///   Rule (5) forces a new SENTENCE to be a new clause; it cannot force
-    ///   a new CLAUSE to be one.
-    /// * A sentence hidden behind the literal string "Move to Trash", which
-    ///   `normalised(_:)` removes as the app's control name.
-    /// * An author who edits `established(for:)` itself to admit a
-    ///   proposition the code path does not prove. That table is the
-    ///   derivation, and nothing here can check a derivation against the
-    ///   code — but it is one visible, reviewable edit rather than a
-    ///   sentence buried in a string literal, which is the whole of what
-    ///   this change buys.
+    /// The last row is the residual, measured rather than asserted away: it
+    /// is the semantic judgement this shape moves and does not remove. The
+    /// two `established(for:)` rows are RED only because of
+    /// `placesTheItem(_:)`; without it the fence sees nothing wrong with
+    /// them, because by construction the message IS the established set.
     func testNoTrashFailureMessageAssertsAnythingItsOwnProofDidNotEstablish()
         throws
     {
-        let causes: [TrashDisposal.Failure.Cause] = [
-            .putBack, .strandedInTrash(Self.landingPath),
-            .lastSeenInTrash(Self.landingPath),
-            .putBackTookAnotherObject(Self.landingPath),
-            .destinationNotTheAdmittedContainer(Self.landingPath),
-            .destinationUnknown,
-        ]
+        typealias Failure = TrashDisposal.Failure
+        let causes = Self.everyCause
         // THE ROT GATE: `label(for:)` is a `default`-less switch, so a
         // seventh cause breaks the build, and this count catches one that was
         // added to the enum but not to the list above.
@@ -2945,120 +2856,163 @@ final class TrashDisposalHopProofTests: XCTestCase {
             "every cause must be audited exactly once"
         )
 
-        var used: Set<TrashDisposal.Failure.Established> = []
+        // (1) The order is a permutation of the vocabulary.
+        XCTAssertEqual(
+            Failure.messageOrder.count,
+            Failure.Established.allCases.count,
+            "messageOrder must place every proposition exactly once"
+        )
+        XCTAssertEqual(
+            Set(Failure.messageOrder), Set(Failure.Established.allCases),
+            "messageOrder and the vocabulary must be the same set"
+        )
+
+        // (8a) The three no arm establishes.
+        let neverEstablished: Set<Failure.Established> = [
+            .nothingWasFreedOnDisk, .theTargetWasReplaced,
+            .theTrashHoldsWhatItTook,
+        ]
+        for fact in neverEstablished {
+            for remedy in Failure.Remedy.allCases {
+                XCTAssertNil(
+                    Failure.sentence(
+                        for: fact, path: Self.targetPath,
+                        landed: Self.landingPath, remedy: remedy
+                    ),
+                    "\(fact.rawValue) is spoken by nobody"
+                )
+            }
+        }
+
+        var used: Set<Failure.Established> = []
+        // fact -> the one rendering it has, for (6).
+        var wording: [Failure.Established: String] = [:]
+
         for cause in causes {
             let name = label(for: cause)
-            let established = TrashDisposal.Failure.established(for: cause)
-            let claims = TrashDisposal.Failure.claims(
-                path: Self.targetPath, cause: cause
-            )
+            let established = Failure.established(for: cause)
+            let claims = Failure.claims(path: Self.targetPath, cause: cause)
+            let facts = claims.map(\.establishes)
+            used.formUnion(facts)
 
-            // (6) The two retired propositions are established by nobody.
-            XCTAssertFalse(
-                established.contains(.theTargetWasReplaced),
-                "\(name): no arm re-reads the target after the move"
-            )
-            XCTAssertFalse(
-                established.contains(.nothingWasFreedOnDisk),
-                "\(name): no arm counts bytes after the move"
-            )
-            XCTAssertFalse(
-                established.contains(.theTrashHoldsWhatItTook),
-                "\(name): a Trash mover returning without throwing does not "
-                    + "establish that anything went to the Trash — it may "
-                    + "have taken nothing (r18, E2)"
-            )
+            // (8b) No cause claims a retired proposition.
+            for fact in neverEstablished {
+                XCTAssertFalse(
+                    established.contains(fact),
+                    "\(name): \(fact.rawValue) is established by no arm"
+                )
+            }
 
-            // (1) The message is the join and nothing else.
-            let failure = TrashDisposal.Failure(
-                path: Self.targetPath, cause: cause
+            // (2) EXACTLY the established facts, in messageOrder, each once.
+            XCTAssertEqual(
+                facts, Failure.messageOrder.filter { established.contains($0) },
+                "\(name): the message is the established set in order — no "
+                    + "clause may be added, and none may be dropped by a nil "
+                    + "rendering"
             )
             XCTAssertEqual(
-                failure.errorDescription, claims.map(\.text).joined(),
+                Set(facts).count, facts.count,
+                "\(name): a proposition may be spoken once"
+            )
+
+            // (3) One opening, first, and nowhere else.
+            let opening = try XCTUnwrap(facts.first, "\(name): empty message")
+            XCTAssertTrue(
+                Failure.openingFacts.contains(opening),
+                "\(name): a message opens with a proposition written to "
+                    + "follow the path prefix, not with a mid-message one"
+            )
+            for fact in facts.dropFirst() {
+                XCTAssertFalse(
+                    Failure.openingFacts.contains(fact),
+                    "\(name): \(fact.rawValue) is an opening and is not first"
+                )
+            }
+
+            // (4) The report and the remedy close it, in that order.
+            XCTAssertEqual(
+                Array(facts.suffix(2)),
+                [.nothingWasReportedFreed, .theRemedyForThisRefusal],
+                "\(name): every refusal ends by saying nothing was reported "
+                    + "freed and what to do next"
+            )
+
+            // (5) The description is the path, the join, and nothing else.
+            let failure = Failure(path: Self.targetPath, cause: cause)
+            XCTAssertEqual(
+                failure.errorDescription,
+                "\(Self.targetPath): "
+                    + claims.map(\.text).joined(separator: " "),
                 "\(name): errorDescription must carry no free text"
             )
 
-            for claim in claims {
-                used.insert(claim.establishes)
-                let fact = claim.establishes
-                let text = normalised(claim.text)
-                let rule = contract(for: fact)
-                let where_ = "\(name)/\(fact.rawValue): \(text)"
+            // (7) The remedy is one of the closed set.
+            let remedyText = try XCTUnwrap(claims.last).text
+            XCTAssertTrue(
+                Failure.Remedy.allCases.map(\.text).contains(remedyText),
+                "\(name): the remedy is chosen from a closed set, not written"
+            )
 
-                // (2) The proposition must be one this cause proved.
+            for claim in claims {
+                let fact = claim.establishes
+                let where_ = "\(name)/\(fact.rawValue): \(claim.text)"
+                // The membership assertion (2) already covers this; it is
+                // repeated per claim so a failure names the clause.
                 XCTAssertTrue(
                     established.contains(fact),
                     "\(where_) — this cause's code path does not establish it"
                 )
-                // (5) One clause, no sentence break.
-                XCTAssertFalse(
-                    text.contains(". "),
-                    "\(where_) — a new sentence must be a new, tagged clause"
+                XCTAssertFalse(claim.text.isEmpty, where_)
+
+                // (9) The grammar of the join.
+                XCTAssertTrue(
+                    claim.text.hasSuffix("."),
+                    "\(where_) — every sentence is terminated, or the join "
+                        + "runs two of them together"
                 )
-                // Anti-deletion: the disclosure cannot be silently dropped.
-                for marker in rule.all {
-                    XCTAssertTrue(text.contains(marker), "\(where_) — «\(marker)»")
-                }
-                if !rule.any.isEmpty {
+                let first = try XCTUnwrap(claim.text.first)
+                if Failure.openingFacts.contains(fact) {
                     XCTAssertTrue(
-                        rule.any.contains(where: { text.contains($0) }),
-                        "\(where_) — one of \(rule.any)"
+                        first.isLowercase,
+                        "\(where_) — an opening follows «path: »"
+                    )
+                } else {
+                    XCTAssertTrue(
+                        first.isUppercase,
+                        "\(where_) — a mid-message sentence starts one"
                     )
                 }
-                // (3) Naming a place commits the clause to a whereabouts
-                // proposition, and doing so unhedged to a positive one.
-                let place = namesAPlace(text)
-                if place {
-                    XCTAssertTrue(
-                        rule.isWhereabouts,
-                        "\(where_) — names a place under a proposition that "
-                            + "is not about where anything is"
-                    )
-                    if !isHedged(text) {
-                        XCTAssertTrue(
-                            rule.isPositivePlacement,
-                            "\(where_) — places something without hedging, "
-                                + "so the proposition must be one that was "
-                                + "positively established"
+
+                // (6) ONE wording per proposition, shared by every cause.
+                // The remedy is exempt: it varies BY DESIGN, over a closed
+                // set, which (7) pins.
+                if fact != .theRemedyForThisRefusal {
+                    if let seen = wording[fact] {
+                        XCTAssertEqual(
+                            claim.text, seen,
+                            "\(where_) — a proposition has ONE wording; a "
+                                + "second is where a per-cause claim would "
+                                + "come back"
                         )
+                    } else {
+                        wording[fact] = claim.text
                     }
                 }
-                if rule.forbidsPlaces {
-                    XCTAssertFalse(
-                        place, "\(where_) — this proposition names no place"
-                    )
-                }
-                // (4) Any net-effect word belongs to the report clause.
-                if namesANetEffect(text) {
-                    XCTAssertEqual(
-                        fact, .nothingWasReportedFreed,
-                        "\(where_) — a claim about what happened on disk"
-                    )
-                    XCTAssertTrue(
-                        text.contains("reported freed"),
-                        "\(where_) — the report is what was established, not "
-                            + "the disk"
-                    )
-                }
-                if rule.forbidsNetEffect {
-                    XCTAssertFalse(namesANetEffect(text), where_)
-                }
+
                 // r15's retired opening, still fenced everywhere.
                 XCTAssertFalse(
-                    text.contains("no longer the one that was inspected"),
+                    claim.text.contains("no longer the one that was inspected"),
                     where_
                 )
             }
         }
 
         // ROT: every proposition in the vocabulary is either used by some
-        // cause or is one of the two no arm establishes.
+        // cause or is one of the three no arm establishes.
         for fact in TrashDisposal.Failure.Established.allCases
         where !used.contains(fact) {
             XCTAssertTrue(
-                fact == .nothingWasFreedOnDisk
-                    || fact == .theTargetWasReplaced
-                    || fact == .theTrashHoldsWhatItTook,
+                neverEstablished.contains(fact),
                 "\(fact.rawValue) is dead vocabulary — remove it or use it"
             )
         }
@@ -3132,6 +3086,20 @@ final class TrashDisposalHopProofTests: XCTestCase {
                                    + "established"),
                 "\(name): \(described)"
             )
+            // AND THE DERIVATION, FENCED BY THIS MEASUREMENT (r18, E). The
+            // item is at the target at the same inode and nothing of it is in
+            // the Trash — so no arm of this cause may establish a proposition
+            // that PLACES it. This is an assertion about the closed
+            // vocabulary, so it survives any rewording, and it is the one
+            // thing a measured event can say about `established(for:)`, the
+            // table nothing else can check.
+            for fact in TrashDisposal.Failure.established(for: failure.cause) {
+                XCTAssertFalse(
+                    TrashDisposal.Failure.placesTheItem(fact),
+                    "\(name): the item never left \(target.path) — "
+                        + "\(fact.rawValue) places it somewhere"
+                )
+            }
         }
     }
 
@@ -3217,6 +3185,15 @@ final class TrashDisposalHopProofTests: XCTestCase {
                 described.contains("Where the item is now was NOT established"),
                 "\(name): \(described)"
             )
+            // THE SAME DERIVATION FENCE (r18, E): measured same inode, so no
+            // proposition this cause establishes may place the item.
+            for fact in TrashDisposal.Failure.established(for: failure.cause) {
+                XCTAssertFalse(
+                    TrashDisposal.Failure.placesTheItem(fact),
+                    "\(name): the item never left \(target.path) — "
+                        + "\(fact.rawValue) places it somewhere"
+                )
+            }
         }
 
         // AND THE DERIVATION, OFF THE TYPE: the endorsement is gone too, not
@@ -3378,9 +3355,10 @@ final class TrashDisposalHopProofTests: XCTestCase {
             "nothing here establishes where the taken object is: \(described)"
         )
         XCTAssertTrue(
-            described.contains(
-                "Where the item the Trash took is now was NOT established"
-            ),
+            // r18's E folded this cause's bespoke phrasing into the ONE
+            // wording `.theItemsWhereaboutsAreNotEstablished` has. Same
+            // proposition, same disclosure, no per-cause sentence to drift.
+            described.contains("Where the item is now was NOT established"),
             described
         )
     }

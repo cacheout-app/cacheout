@@ -874,8 +874,43 @@ below are both part of that coordination, and the latter BLOCKS this release.
   to be a list of sentences that had been caught being wrong, so a NEW way of
   saying the same wrong thing passed it. Each message is now assembled from
   clauses that each name the one thing they claim, and every clause is
-  checked against what that refusal's own code path proved — so a false
-  sentence nobody has thought of yet fails as well.
+  checked against what that refusal's own code path proved.
+- **THE ENTRY ABOVE ENDED WITH A CLAIM THAT WAS MEASURED FALSE, and the
+  sixth refusal was still sending you to the Trash for an item that never
+  left.** That entry used to end "so a false sentence nobody has thought of
+  yet fails as well". It does not: eight new false wordings were written
+  against that check and all eight passed it, five of them saying the very
+  thing the two entries above had just been spent retiring. The check read
+  each clause's WORDS — does this name a place, does it claim bytes, is it
+  hedged — and every such test is a password rather than a property. The
+  messages are no longer WRITTEN at all: each refusal now states exactly the
+  set of things its own code path established, one fixed sentence per thing,
+  chosen from a closed list, with the next step chosen from a closed list of
+  two. A sentence asserting something the check did not establish has nowhere
+  to be written, rather than being caught after the fact. What that still
+  cannot catch is stated in the code and is worth saying here: someone can
+  word one of those fixed sentences to say more than the thing it stands
+  for.
+- **And the sixth refusal — "the Trash did not report where it put the item"
+  — no longer tells you to check your Trash.** It ended "Check the Trash, and
+  use permanent delete…", and the check positively endorsed that, on the
+  reasoning that a Trash disposal which returns without an error must have
+  put the item in the Trash. Measured on all four disposal paths: a disposal
+  that moves NOTHING and reports no location produces exactly this refusal,
+  and the item is still where it started, same folder, same inode. That was
+  the only thing any of these messages claimed on the strength of what a
+  component is supposed to do rather than something Cacheout read, and it is
+  the same mistake an earlier entry above fixed for a different refusal. The
+  message now says what this path does know: no location was reported,
+  nothing was reported freed, where the item is now was NOT established, and
+  permanent delete is the disposal that does not depend on the Trash naming
+  anything.
+- **A refusal that leaves your item in the Trash now warns you the put-back
+  can collide.** "Move it back from there" is what Cacheout says when it
+  could not restore the item itself. One of the three ways that refusal
+  arises is the restore failing because something ALREADY occupies the item's
+  old name — so the manual move you were told to make walks into the same
+  obstacle. The message now says to move whatever is there aside first.
 - **A background refresh no longer reads the folders it has already decided
   to skip.** The ephemeral-temp scanner runs only when you ask for a scan, but
   before each scan Cacheout records the identity of every folder it might

@@ -2919,9 +2919,15 @@ private final class LeakFreeBlockers: @unchecked Sendable {
         exited.signal()
     }
 
-    /// Does not return until all `count` blockers have left `hold()`. Safe on
-    /// the MainActor: the blockers run in the session producer's `.utility`
-    /// band and never need the main thread to finish.
+    /// Does not return until all `count` blockers have left `hold()`. Safe to
+    /// call from the MainActor because every caller puts its blockers BELOW
+    /// the MainActor's own band — `.utility` when they are session scanners,
+    /// `.medium` when they are detached — so none of them can be scheduled
+    /// onto the main thread and wait on the very actor that is joining them.
+    /// That is not hypothetical: an earlier draft used
+    /// `Task.detached(priority: .high)` and a blocker landed on the main
+    /// thread, deadlocking the cell (`sample` showed the main thread inside
+    /// `hold()`).
     func join() {
         for _ in 0..<count { exited.wait() }
     }

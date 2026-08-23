@@ -2508,7 +2508,13 @@ struct WorktreeReclaimPerformer {
         // the `isSafeComponent` guards r12's M5 could not kill and one on the
         // prune credit — took it to 1522: `swift test` AT COMMIT 350fa31
         // reported 1522 executed / 2 skipped / 0 failures, exit 0, 135 s.
-        // Every figure here names the
+        // r13's SECOND fixer added six more — three evidencing that the
+        // session bound fires with the cooperative pool starved (B), one
+        // that the watchdog's report is exclusive of the real outcome (C),
+        // one that a bounded session adopts nothing (D), and one that the
+        // wind-down grace is off the pool too — taking it to 1528: `swift
+        // test` AT COMMIT e29ffb4 reported 1528 executed / 2 skipped /
+        // 0 failures, exit 0, 149 s. Every figure here names the
         // commit it was taken at, which is the only spelling that cannot rot.
         // The half that survives every commit — and the half a mutation
         // actually establishes — is the ZERO FAILURES.

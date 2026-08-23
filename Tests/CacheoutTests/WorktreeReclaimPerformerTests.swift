@@ -80,8 +80,10 @@ import XCTest
 /// 101753b: 1496 executed / 2 skipped / 0 failures, exit 0), r11 → 1500
 /// (`swift test` AT COMMIT a917447: 1500 executed / 2 skipped / 0 failures,
 /// exit 0), r12 → 1511 (`swift test` AT COMMIT 592eb0a: 1511 executed /
-/// 2 skipped / 0 failures, exit 0), r13 → 1522 (`swift test` AT COMMIT
-/// 350fa31: 1522 executed / 2 skipped / 0 failures, exit 0, 135 s). The previous
+/// 2 skipped / 0 failures, exit 0), r13 → 1522 at its first fixer's head
+/// (`swift test` AT COMMIT 350fa31: 1522 executed / 2 skipped / 0 failures,
+/// exit 0, 135 s) and → 1528 at its second's (`swift test` AT COMMIT
+/// e29ffb4: 1528 executed / 2 skipped / 0 failures, exit 0, 149 s). The previous
 /// spelling was "r8 → 1486 (`swift test`, this commit)" — true at 7e9b2c5,
 /// which wrote it, and stale at the very next commit, because "this commit"
 /// is not an endpoint. r9's cells moved the total and this line did not

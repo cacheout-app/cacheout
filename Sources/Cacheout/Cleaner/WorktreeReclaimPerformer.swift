@@ -327,6 +327,20 @@
 /// since the scan is not in the final removal set at all, and reporting its
 /// bytes as freed would be a lie.
 ///
+/// THAT SENTENCE DESCRIBED THE INTENT AND THE CODE DID NOT EXPRESS IT (PR
+/// #460 codex r13, F). Step (10) iterated the ORIGINALLY MEASURED set and
+/// accepted anything that had since become `.absent`, which is not the same
+/// question: a disclosed entry ANOTHER PROCESS removed is absent, was never
+/// in the removal set, and was billed to Cacheout as bytes it freed
+/// (measured on the cell's fixture, printed as `MEASURED-PRUNE-CREDIT-BYTES`:
+/// 450,560 reported before, 24,576 after — the whole of a 400 KB stranger,
+/// billed to an operation that did not touch it). The
+/// acceptance now filters on REMOVAL-SET MEMBERSHIP, and the `.absent` probe
+/// is a re-assertion of something the control flow already guarantees —
+/// `removeAdminDirectories` returns on the first refusal — kept because it
+/// can only ever subtract. Pinned by
+/// `testADisclosedEntryANOTHERProcessRemovedIsNeverBilledAsFreed`.
+///
 /// ## DISPOSAL HONESTY (D16, corrected r5 / D7)
 ///
 /// The stale-removal entry HONOURS the Move-to-Trash toggle, and its
@@ -1212,11 +1226,35 @@ struct WorktreeReclaimPerformer {
             return failure(item, refusal.detail, tag: nil)
         }
 
-        // (10) VERIFIED-REMOVAL acceptance: only directories that actually
-        // disappeared contribute bytes.
+        // (10) VERIFIED-REMOVAL acceptance: only the directories THIS
+        // OPERATION REMOVED contribute bytes.
+        //
+        // IT ITERATED `registered` AND ACCEPTED ANY WHOSE PATH NOW PROBED
+        // `.absent` (PR #460 codex r13, F). `registered` is the ORIGINALLY
+        // MEASURED set, and the final oracle recompute above may legally
+        // SHRINK it — growth is refused at `prune-set-grew`, shrinkage is
+        // not, because a survivor is exactly what verified-removal
+        // accounting exists to handle. So a directory that ANOTHER PROCESS
+        // removed while this item was running is absent, was never in
+        // `removalSet`, and was billed to Cacheout as bytes it freed. The
+        // existing survivor cell
+        // (`testASurvivingDisclosedEntryNeverReportsItsBytesAsFreed`) cannot
+        // see it, because its survivor SURVIVES; the defect needs one that
+        // vanishes.
+        //
+        // AND THE `.absent` PROBE IS NOW A RE-ASSERTION RATHER THAN THE
+        // BINDING — SAID, RATHER THAN RELIED ON. `removeAdminDirectories`
+        // returns on the FIRST refusal, and this line is past its `nil`, so
+        // reaching here already means every member of `removalSet` was
+        // removed successfully. The membership test is what decides the
+        // credit; the probe can now only ever SUBTRACT (a directory
+        // re-created at the same path between the removal and this loop),
+        // which is the fail-closed direction and costs one `fstatat`.
+        let removedByThisOperation = Set(removalSet.map(Self.standardPath))
         var accepted = AcceptedByteComponents()
         for claim in registered
-        where provider.probeKind(of: claim.directory) == .absent {
+        where removedByThisOperation.contains(Self.standardPath(claim.directory))
+            && provider.probeKind(of: claim.directory) == .absent {
             let components = await registry.acceptSuccessful(claim.token)
             accepted.exactBytes += components.exactBytes
             accepted.estimatedUpToBytes += components.estimatedUpToBytes

@@ -4608,6 +4608,69 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
                      "the refusal precedes the prune")
     }
 
+
+    func testADisclosedEntryANOTHERProcessRemovedIsNeverBilledAsFreed()
+        async throws
+    {
+        // **PR #460 codex r13, F.** Step (10) iterated `registered` — the
+        // ORIGINALLY MEASURED set — and credited any directory whose path now
+        // probed `.absent`. The final oracle recompute may legally SHRINK the
+        // set (growth is refused at `prune-set-grew`; shrinkage is what
+        // verified-removal accounting exists to handle), so a directory that
+        // ANOTHER PROCESS removed inside that window is absent, was never in
+        // `removalSet`, and was billed to Cacheout as bytes it freed.
+        //
+        // `testASurvivingDisclosedEntryNeverReportsItsBytesAsFreed` cannot
+        // see this: its survivor SURVIVES, so the `.absent` probe subtracts
+        // it. The defect needs a survivor that VANISHES, which is what this
+        // fixture stages — and it stages it with a real `removeItem` from
+        // outside the performer, at the last runner call before the removal,
+        // so nothing about the item's own execution removed it.
+        let fixture = try makePruneFixture(orphans: ["gone", "stranger"])
+        let swept = try XCTUnwrapElement(fixture.admin, 0)
+        let takenByAnother = try XCTUnwrapElement(fixture.admin, 1)
+        // Big enough that a leak into the row is unmissable.
+        try Data(repeating: 7, count: 400_000)
+            .write(to: takenByAnother.appendingPathComponent("filler.bin"))
+
+        let plan = prunePlan(
+            membership: fixture.membership,
+            disclosed: [swept, takenByAnother]
+        )
+        let fileManager = fm
+        let runner = InterceptingGitRunner(wrapping: realRunner()) { arguments, index in
+            // Call 1 is the first recompute (measurement and claims are
+            // registered off it); call 2 is the FINAL pre-removal check. The
+            // outside removal lands between them, so the final set SHRINKS to
+            // `gone` alone and `stranger` is absent by the time step (10)
+            // looks.
+            if arguments.contains("list"), index == 2 {
+                try? fileManager.removeItem(at: takenByAnother)
+            }
+            return nil
+        }
+        let outcome = await perform(
+            item(plan, id: "prune"), plan: plan,
+            with: makePerformer(runner: runner)
+        )
+
+        XCTAssertTrue(outcome.errors.isEmpty, "\(outcome.errors.map(\.message))")
+        XCTAssertFalse(fm.fileExists(atPath: swept.path),
+                       "the one directory this operation removed is gone")
+        XCTAssertFalse(
+            fm.fileExists(atPath: takenByAnother.path),
+            "the fixture must actually have staged the outside removal, or "
+                + "this cell proves nothing"
+        )
+        let entry = try XCTUnwrap(outcome.entry)
+        print("MEASURED-PRUNE-CREDIT-BYTES \(entry.bytesFreed)")
+        XCTAssertLessThan(
+            entry.bytesFreed, 400_000,
+            "bytes another process freed are not this app's to report — the "
+                + "credit follows the REMOVAL SET, not the measured set"
+        )
+    }
+
     func testASurvivingDisclosedEntryNeverReportsItsBytesAsFreed() async throws {
         // The disclosed-set-SHRINKS fixture: one disclosed entry became
         // LOCKED since the scan, so the delete-time recompute drops it from

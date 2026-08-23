@@ -1462,6 +1462,86 @@ final class GitWorktreeScannerTests: XCTestCase {
 
 
 
+    /// F (PR #460 codex r18) — THE ARM THAT HAD NO CELL.
+    ///
+    /// `guard let discoveryWitness` is the only thing between a checkout with
+    /// NO pre-listing identity and the three-way re-proof re-anchoring on the
+    /// POST-listing capture — the exact state r16 was written to end, where
+    /// every read describes a replacement and they all agree. r17 re-scoped
+    /// the arm (adding (a2)'s container pass as a second source), and r17's
+    /// own verifier then MEASURED that nothing asserts it: the mutation
+    /// `let discoveryWitness = discoveryWitness ?? assessmentWitness` plus
+    /// `if false` on the refusal body left the FULL suite GREEN at 1564
+    /// executed / 2 skipped / 0 failures, and `identified before this scan`,
+    /// `identity older than` and `pre-listing read` returned ZERO hits over
+    /// `Tests/`.
+    ///
+    /// THE STATE THE ARM IS FOR: neither pre-listing capture could identify
+    /// the admin entry, while both post-listing reads can. The double blinds
+    /// calls 1 and 2 — the walk's discovery capture and (a2)'s pre-listing
+    /// admin-container pass — and answers truthfully for (e2)'s and the live
+    /// one, which is a denial that spans the two reads before the listing and
+    /// lifts after it (a sandbox change, a container briefly unreadable).
+    ///
+    /// MUTATION: `discoveryWitness ?? assessmentWitness` with the refusal body
+    /// disabled — RED here, because the re-proof then compares the
+    /// post-listing capture with itself, agrees, and OFFERS the row.
+    func testACheckoutWithNoPreListingIdentityIsRefusedNotReAnchored()
+        async throws
+    {
+        let repository = try makeRepositoryIgnoringPayloads(
+            at: dev.appendingPathComponent("repo")
+        )
+        let worktree = try addWorktree(
+            of: repository, at: dev.appendingPathComponent("wt-a"), branch: "a"
+        )
+        let adminEntry = try XCTUnwrap(
+            GitWorktreeGitdirResolver().adminDirectory(forWorktreeAt: worktree),
+            "the fixture must have a resolvable admin directory"
+        )
+
+        let provider = BlindOnNthIdentityCallProvider(
+            blinded: adminEntry, onCalls: [1, 2]
+        )
+        let outcome = await makeScanner(provider: provider)
+            .scan(context: ScanContext(trigger: .userInitiated))
+
+        XCTAssertEqual(
+            provider.calls, 5,
+            "the admin entry is identified five times — discovery, (a2)'s "
+                + "pre-listing pass, (e2), the live read in `handle`, and the "
+                + "prune tier's mapping; this cell blinds the FIRST TWO and "
+                + "cannot be read if that ordering changes"
+        )
+        XCTAssertTrue(
+            try outcome.items.allSatisfy { try plan(of: $0).mode != .removeStaleWorktree },
+            "a row was offered for a checkout with no identity from before the "
+                + "listing: \(outcome.items.map(\.displayName))"
+        )
+        let issue = try XCTUnwrap(
+            outcome.errors.first { $0.url?.lastPathComponent == "wt-a" },
+            "the refusal must be visible, not silent: \(outcome.errors)"
+        )
+        XCTAssertEqual(issue.kind, .unreadable)
+        XCTAssertTrue(
+            issue.detail.contains("could not be identified before this scan "
+                                  + "listed its repository"), issue.detail
+        )
+        XCTAssertTrue(
+            issue.detail.contains("neither the tree walk nor the pre-listing "
+                                  + "read"), issue.detail
+        )
+        XCTAssertTrue(
+            issue.detail.contains("no identity older than the evidence"),
+            issue.detail
+        )
+        XCTAssertTrue(issue.detail.contains("no item is offered"), issue.detail)
+        // NOT the replacement wording: nothing was replaced, and the remedy
+        // differs (r16's B-P4 is the sibling cell for that distinction).
+        XCTAssertFalse(issue.detail.contains("was replaced while"), issue.detail)
+        XCTAssertTrue(fm.fileExists(atPath: worktree.path))
+    }
+
     /// B-P4 (PR #460 codex r16). (e2) leaves a record unwitnessed when
     /// `adminDirectory` or `identity` returns nil — EPERM, a momentary vanish
     /// — and if both succeed again by the time `handle` runs, the record
@@ -3150,14 +3230,21 @@ private final class BlindOnNthIdentityCallProvider: FileSystemIdentityProvider,
     @unchecked Sendable
 {
     private let suffix: String
-    private let blindCall: Int
+    private let blindCalls: Set<Int>
     private let lock = NSLock()
     private var seen = 0
 
-    init(blinded: URL, onCall blindCall: Int) {
+    convenience init(blinded: URL, onCall blindCall: Int) {
+        self.init(blinded: blinded, onCalls: [blindCall])
+    }
+
+    /// SEVERAL calls blinded at once — the shape of a denial that spans more
+    /// than one capture, which is what leaves a record with no PRE-LISTING
+    /// identity at all (PR #460 codex r18, F).
+    init(blinded: URL, onCalls: Set<Int>) {
         self.suffix = "/" + blinded.deletingLastPathComponent().lastPathComponent
             + "/" + blinded.lastPathComponent
-        self.blindCall = blindCall
+        self.blindCalls = onCalls
         super.init()
     }
 
@@ -3175,7 +3262,7 @@ private final class BlindOnNthIdentityCallProvider: FileSystemIdentityProvider,
         seen += 1
         let index = seen
         lock.unlock()
-        return index == blindCall ? nil : super.identity(of: url)
+        return blindCalls.contains(index) ? nil : super.identity(of: url)
     }
 }
 

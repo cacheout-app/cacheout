@@ -2455,6 +2455,9 @@ struct WorktreeReclaimPerformer {
         // IT WENT STALE AT THE VERY NEXT COMMIT (PR #460 codex r10, D4): r9's
         // cells moved the total and this line did not follow. r9 and r10 took
         // it to 1496 — `swift test` AT COMMIT 101753b reported 1496 executed /
+        // 2 skipped / 0 failures, exit 0 — and r11's four cells (two on the
+        // Trash fallback's errno gate, two on the unbounded-park fence) took
+        // it to 1500: `swift test` AT COMMIT a917447 reported 1500 executed /
         // 2 skipped / 0 failures, exit 0. Every figure here now names the
         // commit it was taken at, which is the only spelling that cannot rot.
         // The half that survives every commit — and the half a mutation

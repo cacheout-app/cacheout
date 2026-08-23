@@ -2284,4 +2284,171 @@ final class TrashDisposalHopProofTests: XCTestCase {
             "nothing was replaced — the name is empty: \(described)"
         )
     }
+
+    // ================================================================
+    // MARK: - What the failure MESSAGES may assert (r15, D-P3)
+    // ================================================================
+
+    /// **D-P3 — FIVE OF THE SIX MESSAGES OPENED BY ASSERTING A PROPOSITION NO
+    /// ARM'S AFTER-PROOF TESTS** (PR #460 codex r15).
+    ///
+    /// `.putBack`, `.strandedInTrash`, `.lastSeenInTrash`,
+    /// `.putBackTookAnotherObject` and `.destinationNotTheAdmittedContainer`
+    /// all began "the folder at this path is no longer the one that was
+    /// inspected". The after-proof establishes only that the LANDING does not
+    /// hold what was bound; IT NEVER RE-READS THE TARGET.
+    ///
+    /// MEASURED at df551b1 with this fixture — the mover proves, moves
+    /// NOTHING, and reports a landing where nothing stands — on all four
+    /// Trash paths: `.lastSeenInTrash`, and the target still on disk,
+    /// untouched, SAME INODE. The message told the user their folder had been
+    /// replaced, and told them to look in the Trash, for an item that never
+    /// left.
+    ///
+    /// (`.destinationUnknown`, the sixth, never carried the clause.)
+    ///
+    /// MUTATION: put the old opening clause back on any of the five and this
+    /// cell fails on that row.
+    func testNoFailureMessageAssertsTheTargetWasReplacedWithoutReadingIt()
+        async throws
+    {
+        let landings = try XCTUnwrap(self.landings)
+        let provider = FileSystemIdentityProvider()
+        let container = try makeCacheContainer()
+
+        for arm in TrashArm.allCases {
+            let name = "untouched-\(arm.rawValue)"
+            let target = container.appendingPathComponent(name)
+            if arm.targetIsADirectory {
+                try fm.createDirectory(
+                    at: target, withIntermediateDirectories: true
+                )
+                try Data("ours".utf8).write(
+                    to: target.appendingPathComponent("ours.txt")
+                )
+            } else {
+                try Data("ours".utf8).write(to: target)
+            }
+            let before = try XCTUnwrap(provider.identity(of: target))
+            // A NAME NOTHING OCCUPIES: the disposal reports a landing it never
+            // put anything at — `moverMovedNothing`.
+            let landed = landings.appendingPathComponent("nowhere-\(name)")
+
+            let thrown = try await outcomeOfAMoverThatMovesNothing(
+                arm, of: target, reporting: landed, provider: provider
+            )
+            let failure = try XCTUnwrap(
+                thrown as? TrashDisposal.Failure,
+                "\(name): \(String(describing: thrown))"
+            )
+            XCTAssertEqual(failure.cause, .lastSeenInTrash(landed.path),
+                           "\(name)")
+
+            // THE FIXTURE'S OWN PREMISE, ASSERTED: the item never left.
+            XCTAssertEqual(
+                provider.identity(of: target), before,
+                "\(name): the fixture must leave the target untouched — that "
+                    + "is the whole of what makes the old clause false"
+            )
+
+            let described = try XCTUnwrap(failure.errorDescription)
+            XCTAssertFalse(
+                described.contains(
+                    "the folder at this path is no longer the one that was "
+                        + "inspected"
+                ),
+                "\(name): the after-proof never re-read the target, so no "
+                    + "message may assert that it changed: \(described)"
+            )
+            XCTAssertTrue(
+                described.contains(
+                    "the disposal could not be proved to have moved the item "
+                        + "that was inspected"
+                ),
+                "\(name): \(described)"
+            )
+        }
+    }
+
+    /// The other four causes' openings, taken off the type rather than off a
+    /// fixture — three of them need a race the suite drives elsewhere, and
+    /// what is asserted here is only the CLAUSE, which is a property of the
+    /// message and not of the event.
+    func testEveryTrashFailureMessageOpensWithWhatWasActuallyProved() throws {
+        let landed = "/tmp/landed"
+        let causes: [TrashDisposal.Failure.Cause] = [
+            .putBack,
+            .strandedInTrash(landed),
+            .lastSeenInTrash(landed),
+            .putBackTookAnotherObject(landed),
+            .destinationNotTheAdmittedContainer(landed),
+        ]
+        for cause in causes {
+            let failure = TrashDisposal.Failure(path: "/tmp/x", cause: cause)
+            let described = try XCTUnwrap(failure.errorDescription)
+            XCTAssertTrue(
+                described.contains(
+                    "the disposal could not be proved to have moved the item "
+                        + "that was inspected"
+                ),
+                "\(cause): \(described)"
+            )
+            XCTAssertFalse(
+                described.contains("no longer the one that was inspected"),
+                "\(cause): \(described)"
+            )
+        }
+        // AND THE SIXTH, WHICH NEVER CARRIED THE CLAUSE AND MUST NOT GAIN ONE:
+        // it is the one cause raised before anything about the landing is
+        // known at all.
+        let unknown = TrashDisposal.Failure(
+            path: "/tmp/x", cause: .destinationUnknown
+        )
+        let unknownDescribed = try XCTUnwrap(unknown.errorDescription)
+        XCTAssertFalse(
+            unknownDescribed.contains("was inspected"), unknownDescribed
+        )
+    }
+
+    /// Drive one of the four Trash arms with a mover that PROVES, moves
+    /// nothing, and reports `landed` anyway.
+    private func outcomeOfAMoverThatMovesNothing(
+        _ arm: TrashArm, of target: URL, reporting landed: URL,
+        provider: FileSystemIdentityProvider
+    ) async throws -> Error? {
+        let parent = try admittedParent(of: target, provider: provider)
+        let mover: TrashDisposal.Mover = { _, prove in
+            try prove()
+            return landed
+        }
+        do {
+            switch arm {
+            case .noVerdict:
+                try await TrashDisposal.dispose(
+                    target, containedIn: parent, provider: provider,
+                    via: mover
+                )
+            case .noDirectoryTree:
+                try await TrashDisposal.dispose(
+                    target, expecting: .noDirectoryTree, provider: provider,
+                    containedIn: parent, via: mover
+                )
+            case .nonDirectoryLeaf:
+                let identity = try XCTUnwrap(provider.identity(of: target))
+                try await TrashDisposal.dispose(
+                    target, expecting: .nonDirectoryLeaf(identity),
+                    provider: provider, containedIn: parent, via: mover
+                )
+            case .directory:
+                let identity = try XCTUnwrap(provider.identity(of: target))
+                try await TrashDisposal.dispose(
+                    target, expecting: .directory(identity),
+                    provider: provider, containedIn: parent, via: mover
+                )
+            }
+        } catch {
+            return error
+        }
+        return nil
+    }
 }

@@ -3937,8 +3937,8 @@ final class OrphanedCachesScannerTests: XCTestCase {
         )
         XCTAssertTrue(
             message.contains(
-                "the folder that HOLDS it is no longer the one the safety "
-                    + "check admitted"
+                "the folder that HOLDS this path is no longer the one the "
+                    + "safety check admitted"
             ),
             message
         )
@@ -4134,7 +4134,14 @@ final class OrphanedCachesScannerTests: XCTestCase {
             "sent the user to a path nothing occupies: \(message)"
         )
         XCTAssertTrue(
-            message.contains("no longer at \(landed.path)"),
+            // r15 (D-P3) weakened this clause from "it is no longer at …" to
+            // "cannot be found there now" — the proposition the cell is about
+            // is unchanged, and the new wording is the one the r14 doc says
+            // is actually established (an unreadable landing may still hold
+            // the object).
+            message.contains(
+                "putting at \(landed.path) cannot be found there now"
+            ),
             "the refusal must say the item is not where the Trash put it: "
                 + message
         )

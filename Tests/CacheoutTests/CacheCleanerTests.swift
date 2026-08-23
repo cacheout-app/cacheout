@@ -2180,8 +2180,8 @@ final class CacheCleanerTests: XCTestCase {
         XCTAssertEqual(report.errors.count, 1)
         let message = try XCTUnwrap(report.errors.first?.message)
         XCTAssertTrue(
-            message.contains("the folder that HOLDS it is no longer the one "
-                                 + "the safety check admitted"),
+            message.contains("the folder that HOLDS this path is no longer "
+                                 + "the one the safety check admitted"),
             message
         )
         XCTAssertTrue(message.contains(landed.path),

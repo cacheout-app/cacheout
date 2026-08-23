@@ -369,6 +369,17 @@ enum TrashDisposal {
             /// arms all pass through it. `.strandedInTrash` is what the two
             /// cases that DO establish the object's presence report instead —
             /// the Trash open and the destination open, both below.
+            ///
+            /// AND THE CLAUSE THAT WAS NOT DISCLOSED, NOW RETIRED RATHER THAN
+            /// DISCLOSED (PR #460 codex r15, D-P3). The paragraph above
+            /// discloses that "it is no longer at …" is stronger than what was
+            /// established. The message ALSO opened by asserting that the
+            /// folder at the target's path had been replaced — and the
+            /// after-proof never re-reads the target at all. MEASURED, event
+            /// `moverMovedNothing`, all four Trash paths: this cause, zero
+            /// moves, and the target untouched at the same inode. The opening
+            /// is now the one proposition every row does establish; see
+            /// `errorDescription`.
             case lastSeenInTrash(String)
             /// The rollback moved an object out of the Trash and the arrival
             /// is NOT the one it looked at — the name was re-pointed inside
@@ -393,46 +404,68 @@ enum TrashDisposal {
         let cause: Cause
 
         var errorDescription: String? {
+            // THE SHARED OPENING, AND WHY IT IS THIS ONE (PR #460 codex r15,
+            // D-P3).
+            //
+            // Five of these six messages used to open "the folder at this
+            // path is no longer the one that was inspected — it was replaced
+            // between the safety check and the disposal". NO ARM'S AFTER-PROOF
+            // TESTS THAT. Everything this file establishes after the mover
+            // returns is about the LANDING: `facts(at: landed)` / `look(at:
+            // landed)` compared with what was bound. THE TARGET IS NEVER
+            // RE-READ.
+            //
+            // MEASURED at df551b1, event `moverMovedNothing` (the mover
+            // proves, moves nothing, and reports a landing where nothing
+            // stands), all four Trash paths: `.lastSeenInTrash`, zero moves,
+            // and the target still on disk, untouched, SAME INODE. The message
+            // told the user their folder had been replaced — and told them to
+            // go and look in the Trash — for an item that never left.
+            //
+            // WHAT IS TRUE IN EVERY ROW is exactly one proposition: the
+            // disposal could not be PROVED to have moved the inspected item.
+            // That is the opening the five now share, and it is the strongest
+            // one the after-proof licenses. Pinned by
+            // `TrashDisposalHopProofTests`'
+            // `…NoFailureMessageAssertsTheTargetWasReplacedWithoutReadingIt`
+            // (the fixture) and
+            // `…EveryTrashFailureMessageOpensWithWhatWasActuallyProved` (every
+            // cause, off the type).
+            //
+            // `.destinationUnknown` never carried the clause and must not gain
+            // one: it is raised before anything about a landing is known.
+            let unproved = "\(path): the disposal could not be proved to have "
+                + "moved the item that was inspected"
             switch cause {
             case .putBack:
-                // Deliberately opens with the SAME clause the pre-delete
-                // checks produce: to the user this is one event, and the only
-                // new information is that it was undone.
-                return "\(path): the folder at this path is no longer the one "
-                    + "that was inspected — it was replaced between the safety "
-                    + "check and the disposal, so the item the Trash took has "
-                    + "been PUT BACK. Nothing was moved to the Trash and "
-                    + "nothing was freed; refused, re-scan required"
+                return "\(unproved), so what it did take has been PUT BACK at "
+                    + "this path. Nothing was moved to the Trash and nothing "
+                    + "was freed; refused, re-scan required"
             case .strandedInTrash(let landed):
-                return "\(path): the folder at this path is no longer the one "
-                    + "that was inspected, and what the Trash took could not "
-                    + "be put back automatically — it is in the Trash at "
-                    + "\(landed). Move it back from there; nothing was "
-                    + "reported freed; refused, re-scan required"
+                return "\(unproved), and what it did take could not be put "
+                    + "back automatically — it is in the Trash at \(landed). "
+                    + "Move it back from there; nothing was reported freed; "
+                    + "refused, re-scan required"
             case .lastSeenInTrash(let landed):
-                return "\(path): the folder at this path is no longer the one "
-                    + "that was inspected, and what the Trash took could not "
-                    + "be put back — it is no longer at \(landed), where the "
-                    + "Trash reported putting it, so nothing was moved rather "
-                    + "than moving whatever took its place. Look in the Trash "
-                    + "for it; nothing was reported freed; refused, re-scan "
-                    + "required"
-            case .putBackTookAnotherObject(let landed):
-                return "\(path): the folder at this path is no longer the one "
-                    + "that was inspected, and putting back what the Trash "
-                    + "took moved a DIFFERENT object — the Trash name it came "
-                    + "from (\(landed)) was re-used while the undo was "
-                    + "running. Whatever now stands at \(path) came out of "
-                    + "the Trash and was NOT put there by you, and the item "
-                    + "the Trash took is still in the Trash; nothing was "
+                return "\(unproved), and nothing could be put back — what it "
+                    + "reported putting at \(landed) cannot be found there "
+                    + "now, so nothing was moved rather than moving whatever "
+                    + "took its place. Look in the Trash for it; nothing was "
                     + "reported freed; refused, re-scan required"
+            case .putBackTookAnotherObject(let landed):
+                return "\(unproved), and putting back what it did take moved "
+                    + "a DIFFERENT object — the Trash name it came from "
+                    + "(\(landed)) was re-used while the undo was running. "
+                    + "Whatever now stands at \(path) came out of the Trash "
+                    + "and was NOT put there by you, and the item the Trash "
+                    + "took is still in the Trash; nothing was reported "
+                    + "freed; refused, re-scan required"
             case .destinationNotTheAdmittedContainer(let landed):
-                return "\(path): the folder at this path is no longer the one "
-                    + "that was inspected, and the folder that HOLDS it is no "
-                    + "longer the one the safety check admitted either — so "
-                    + "what the Trash took was NOT put back into it. It is in "
-                    + "the Trash at \(landed). Move it back once the folder "
-                    + "at \(path) is the one you expect; nothing was reported "
+                return "\(unproved), and the folder that HOLDS this path is "
+                    + "no longer the one the safety check admitted — so what "
+                    + "the Trash took was NOT put back into it. It is in the "
+                    + "Trash at \(landed). Move it back once the folder at "
+                    + "\(path) is the one you expect; nothing was reported "
                     + "freed; refused, re-scan required"
             case .destinationUnknown:
                 return "\(path): the Trash did not report where it put the "

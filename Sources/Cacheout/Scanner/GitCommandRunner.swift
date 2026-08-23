@@ -191,7 +191,14 @@ enum GitCommandOutcome: Equatable, Sendable {
     /// Non-zero exit, with git's own stderr (lossily decoded — stderr is a
     /// human message, never a path used as a deletion target).
     case failure(exitCode: Int32, stderr: String)
-    /// The per-invocation budget expired; the full termination protocol ran.
+    /// The invocation could not be COMPLETED within its bounds, and the full
+    /// termination protocol ran. Two ways in, and they are one answer on
+    /// purpose (PR #460 codex r18, C7): the per-invocation budget expired
+    /// before git exited, OR git exited but its output could not be read to
+    /// completion within the drain budget — which means something git spawned
+    /// still holds the inherited pipe, so the captured bytes may be short.
+    /// Both are retryable and neither may be reported as a `.success` whose
+    /// `stdout` a porcelain parser will count.
     case timeout
     /// `env` could not find git (exit 127), the launch itself failed, or the
     /// instance's cached availability probe already said no.
@@ -467,8 +474,57 @@ final class GitCommandRunner: GitCommandRunning, @unchecked Sendable {
         // the buffer — the same lock, no announcement, and the call that used
         // to run FIRST — unbounded. `closeAndCapture()` is the only spelling
         // of this pair that is bounded; see its doc for the measurement.
-        stdoutDrain.join(within: drainJoinBudget)
-        stderrDrain.join(within: drainJoinBudget)
+        //
+        // AND THE JOIN CAN FAIL ON THIS PATH TOO, WHICH NOBODY ASKED (PR #460
+        // codex r18, C7). `join(within:)` is `@discardableResult` and both
+        // results were dropped. THE WHOLE PATH, ENUMERATED ONCE rather than
+        // bounding a fourth call — r14 bounded `close()`, r15 bounded the
+        // capture, and this, the third finding on the same four statements,
+        // is not a boundedness bug at all:
+        //
+        // * A drain reaches EOF only when EVERY write end is closed. git has
+        //   exited, so a join that times out means something git SPAWNED
+        //   still holds the inherited write end — the runner's founding
+        //   scenario, one path over.
+        // * `closeAndCapture()` is bounded either way (`close()` announces
+        //   itself through `stateLock`), so the runner does not hang. What it
+        //   does instead is worse: it closes the descriptor, which by
+        //   `closeAndCapture()`'s own disclosure DROPS whatever was still
+        //   unread, and hands the truncated bytes back as `.success`.
+        // * `.success(stdout:)` is a promise of COMPLETE output — the
+        //   porcelain parsers downstream count entries. A silently short
+        //   `worktree list` is a smaller worktree set, i.e. a wrong answer
+        //   that looks like a right one. This file's own header says nothing
+        //   collapses a failure into an empty success; a truncation is the
+        //   same class.
+        //
+        // So an unfinished drain is answered as `.timeout`: the invocation
+        // could not be completed within its bounds, which is what that case
+        // means to every caller (they all re-scan or refuse). The tree that
+        // is feeding the pipe is terminated first, by the same group protocol
+        // the expiry arm uses — otherwise the orphan goes on running exactly
+        // as C8 describes.
+        //
+        // WHAT THIS COSTS, STATED: a git command that really did exit 0 with
+        // complete output, whose descendant merely outlives it holding the
+        // pipe, is refused rather than believed. That is deliberate — the
+        // runner cannot tell that case from a truncated one — and it is
+        // retryable, so no caller strands on it.
+        let stdoutJoined = stdoutDrain.join(within: drainJoinBudget)
+        let stderrJoined = stderrDrain.join(within: drainJoinBudget)
+        guard stdoutJoined, stderrJoined else {
+            terminate(process, group: group)
+            // The same pinned order as the expiry arm: close FIRST (an open
+            // FD is what wedges a reader), then join.
+            stdoutDrain.close()
+            stderrDrain.close()
+            stdoutDrain.join(within: drainJoinBudget)
+            stderrDrain.join(within: drainJoinBudget)
+            return GitCommandInvocation(
+                profile: profile, argv: argv, environment: environment,
+                outcome: .timeout
+            )
+        }
         let capturedStdout = stdoutDrain.closeAndCapture()
         let capturedStderr = stderrDrain.closeAndCapture()
 

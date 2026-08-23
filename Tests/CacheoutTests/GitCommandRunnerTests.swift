@@ -471,6 +471,86 @@ final class GitCommandRunnerTests: XCTestCase {
         )
     }
 
+    /// **C7 — A NORMAL EXIT WHOSE DRAIN NEVER FINISHED WAS REPORTED AS A
+    /// COMPLETE SUCCESS** (PR #460 codex r18).
+    ///
+    /// Third finding on the same four statements: r14 bounded `close()`, r15
+    /// bounded the capture, and the JOIN's own RESULT was dropped by both.
+    /// It is not a boundedness bug — `closeAndCapture()` is bounded either
+    /// way — it is a TRUNCATION bug. A drain reaches EOF only when every
+    /// write end is closed, so a join that times out after git has exited
+    /// means something git SPAWNED still holds the inherited write end; the
+    /// close that follows drops whatever is still unread (its own disclosed
+    /// cost), and the short bytes went back as `.success(stdout:)`, which the
+    /// porcelain parsers downstream COUNT.
+    ///
+    /// The fixture is exactly that shape: the stub starts a grandchild that
+    /// holds the inherited stdout and never closes it, and then EXITS 0
+    /// itself. So the runner takes the normal-exit path — `waitForExit`
+    /// succeeds — and the drain can never see EOF.
+    ///
+    /// THE HOLDER IS SILENT ON PURPOSE, AND THAT IS A MEASUREMENT, NOT A
+    /// PREFERENCE. A holder that WRITES dies of SIGPIPE the instant the drain
+    /// closes the read end, which hides the second half of the fix: with a
+    /// `( while :; do echo drip; sleep 0.02; done ) &` holder, deleting
+    /// `terminate(process, group:)` from this path is GREEN 8/8 — the writer
+    /// dies of the close either way. `( exec sleep 300 )` never writes, so
+    /// only the signal can end it.
+    ///
+    /// MUTATIONS, target rebuilt, `swift test --filter
+    /// …testAnUnfinishedDrainOnANormalExitIsNotReportedAsSuccess`, one per
+    /// ARM:
+    ///
+    /// | mutation | result |
+    /// |---|---|
+    /// | drop `guard stdoutJoined, stderrJoined` (r15's two bare joins) | RED 8/8 (2 failures) |
+    /// | drop `terminate(process, group:)` from the join-failure arm | RED 8/8 (1 failure) |
+    ///
+    /// Unmutated GREEN 8/8, no stray process left in any state.
+    func testAnUnfinishedDrainOnANormalExitIsNotReportedAsSuccess()
+        async throws
+    {
+        let stubs = base.appendingPathComponent("stubs-outliving-holder")
+        let holderPidFile = base.appendingPathComponent("holder.pid")
+        _ = try GitFixture.makeStubGit(in: stubs, body: """
+        export PATH=/bin:/usr/bin
+        # A GRANDCHILD holding the inherited stdout and never closing it …
+        ( exec sleep 300 ) &
+        echo $! > "\(holderPidFile.path)"
+        # … and the stub itself exits 0, so the runner takes the NORMAL path.
+        echo done
+        exit 0
+        """)
+        defer {
+            if let pid = recordedPid(at: holderPidFile), pid > 0 {
+                kill(pid, SIGKILL)
+            }
+        }
+        let runner = GitCommandRunner(
+            environment: stubEnvironment(pathDirectories: [stubs]),
+            defaultTimeout: 30,
+            terminationGrace: 0.5,
+            drainJoinBudget: 0.5
+        )
+        // The per-invocation budget is generous: nothing here TIMES OUT in
+        // the expiry sense, and a `.timeout` proves the join arm answered.
+        let invocation = await runner.run(["status", "--porcelain"], timeout: 20)
+        XCTAssertEqual(
+            invocation.outcome, .timeout,
+            "output that could not be read to completion must not be handed "
+                + "back as a complete `.success`"
+        )
+
+        // AND THE ORPHAN IS REAPED (C8's protocol, on C7's path): the thing
+        // holding the pipe is what stopped the drain, so leaving it running
+        // would leak a holder per invocation.
+        let holder = try XCTUnwrap(recordedPid(at: holderPidFile))
+        XCTAssertTrue(
+            waitUntil(5) { kill(holder, 0) != 0 },
+            "the descendant that outlived git must not be left running"
+        )
+    }
+
     // MARK: - The drain's lock: bounded turns, and a closer nobody barges past
 
     /// A shell that starts `count` writers on the pipe's write end and then

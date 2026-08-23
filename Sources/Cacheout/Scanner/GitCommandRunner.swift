@@ -444,12 +444,16 @@ final class GitCommandRunner: GitCommandRunning, @unchecked Sendable {
 
         // Normal exit: the drains reach EOF on their own, so join first and
         // close after — closing early could truncate buffered output.
+        //
+        // PINNED ORDER, second half (PR #460 codex r15, S-P2): the capture
+        // rides INSIDE the close. r14 bounded `close()` and left the read of
+        // the buffer — the same lock, no announcement, and the call that used
+        // to run FIRST — unbounded. `closeAndCapture()` is the only spelling
+        // of this pair that is bounded; see its doc for the measurement.
         stdoutDrain.join(within: drainJoinBudget)
         stderrDrain.join(within: drainJoinBudget)
-        let capturedStdout = stdoutDrain.captured
-        let capturedStderr = stderrDrain.captured
-        stdoutDrain.close()
-        stderrDrain.close()
+        let capturedStdout = stdoutDrain.closeAndCapture()
+        let capturedStderr = stderrDrain.closeAndCapture()
 
         let status = process.terminationStatus
         if status == 0 {
@@ -500,11 +504,19 @@ final class GitCommandRunner: GitCommandRunning, @unchecked Sendable {
 /// deliberately unused — its EOF notification is known to be missed
 /// (SR-12080), which would hang the join.
 ///
-/// ## What bounds `close()` (PR #460 codex r14, N2)
+/// ## What bounds ending a drain (PR #460 codex r14 N2, r15 S-P2)
 ///
-/// The worker holds `lock` across its whole turn, so `close()` — which needs
-/// the same lock — waits for it. TWO mechanisms used to be able to make that
-/// wait long, and the poll interval bounded NEITHER of them:
+/// The worker holds `lock` across its whole turn — the 20 ms `poll` included
+/// — so anything that needs the same lock waits for it. Only ONE call
+/// announces itself and is therefore bounded: `close()`. Reading the buffer
+/// does not, which is why production ends a drain through
+/// `closeAndCapture()` and never through `captured` alone (S-P2: r14 bounded
+/// `close()` and left the capture — the same lock, no announcement, and the
+/// call that ran FIRST — unbounded, measured at an 83.8 ms median against an
+/// advertised 20 ms).
+///
+/// TWO mechanisms used to be able to make `close()`'s own wait long, and the
+/// poll interval bounded NEITHER of them:
 ///
 /// 1. The read loop `continue`d on every `count > 0` WITHOUT releasing the
 ///    lock. A descriptor whose write end is held open and written to
@@ -534,8 +546,10 @@ final class GitCommandRunner: GitCommandRunning, @unchecked Sendable {
 ///
 /// INTERNAL rather than file-private so `GitCommandRunnerTests` can time
 /// `close()` against a live flood
-/// (`testCloseIsNotStarvedByAContinuouslyWrittenWriteEnd`) and against a
-/// descriptor that never runs dry
+/// (`testCloseIsNotStarvedByAContinuouslyWrittenWriteEnd`), the whole
+/// end-a-drain pair against the same flood
+/// (`testCapturingOutputIsNotStarvedByAContinuouslyWrittenWriteEnd`), and
+/// `close()` against a descriptor that never runs dry
 /// (`testAReadTurnThatNeverRunsDryStillEndsOnItsOwnBound`). Nothing outside
 /// this file constructs one.
 final class PipeDrain: @unchecked Sendable {
@@ -579,10 +593,59 @@ final class PipeDrain: @unchecked Sendable {
 
     /// Everything read so far, snapshotted under the lock — safe to call
     /// even if a join timed out and the worker is still running.
+    ///
+    /// NOT BOUNDED against a live worker, and not fixable in place: this
+    /// takes `lock` WITHOUT announcing itself, so it parks behind a worker
+    /// that unlocks and immediately re-locks, and `NSLock` hands the lock
+    /// back to the barger. It is the same starvation `close()` was cured of
+    /// at r14, on the same lock — the ONLY difference is the announcement.
+    ///
+    /// PRODUCTION NEVER CALLS THIS DIRECTLY; `closeAndCapture()` does, in the
+    /// bounded order. It stays internal because a test may legitimately
+    /// observe a drain that is deliberately still running.
     var captured: Data {
         lock.lock()
         defer { lock.unlock() }
         return buffer
+    }
+
+    /// END the drain and take everything it read — the one bounded spelling
+    /// of that pair, and what production uses.
+    ///
+    /// `close()` FIRST, because it is the only call that announces itself
+    /// through `stateLock`: the worker sees `closeRequested` between turns
+    /// and RETURNS instead of re-acquiring, so this wait is one turn (the
+    /// 20 ms poll at worst) rather than an unbounded queue of them. The
+    /// snapshot then runs against a worker that is provably not going to
+    /// contend for the lock again.
+    ///
+    /// MEASURED on this branch at r15, 8 cold trios of EACH order against the
+    /// same fixture (a `Pipe` fed by eight `dd bs=64` grandchild writers —
+    /// the inherited-write-end case this runner exists to survive):
+    ///
+    ///   bare `captured` (r14's order)    4.8-342.4 ms, median 83.8
+    ///   `closeAndCapture()` (this one)   0.13-0.96 ms, median 0.67
+    ///
+    /// Same lock, same load, same fixture — the announcement is the only
+    /// difference. The figures move run to run (a second sweep gave
+    /// 1.8-577.6 ms, median 166.8, against 0.06-0.77 ms, median 0.15) but the
+    /// two régimes have never overlapped.
+    /// `testCapturingOutputIsNotStarvedByAContinuouslyWrittenWriteEnd` re-prints
+    /// both on every run and asserts the bounded half only — the starved half
+    /// is recorded rather than asserted, because a cell that demands a wait BE
+    /// long is a cell that goes red on a quiet machine.
+    ///
+    /// WHAT THIS GIVES UP, stated rather than implied: after a join that
+    /// timed out, closing before reading drops whatever is still sitting in
+    /// the pipe unread. By construction those bytes are not the child's —
+    /// the child has exited, so a join can only time out while some OTHER
+    /// holder of the write end keeps it open, and the child's own bytes were
+    /// drained inside the join budget (2 s against a 20 ms poll). The order
+    /// this replaces did not reliably collect them either: it merely waited,
+    /// unboundedly, for the lock while they arrived.
+    func closeAndCapture() -> Data {
+        close()
+        return captured
     }
 
     func start() {

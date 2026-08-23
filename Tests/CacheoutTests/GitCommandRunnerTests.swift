@@ -455,6 +455,111 @@ final class GitCommandRunnerTests: XCTestCase {
         return waited
     }
 
+    /// One (pipe, writers, drain) trio timing ONE cold call against a flood
+    /// at steady state. `ending == true` times `closeAndCapture()` — what
+    /// production calls; `false` times the bare `captured` — r14's order,
+    /// measured and printed but never asserted.
+    ///
+    /// COLD both ways: a thread that has just released `NSLock` wins the next
+    /// race trivially, so the probe must not have touched the lock before.
+    private func measureDrainEndWaitMilliseconds(
+        ending: Bool, writers: Int, settle: TimeInterval
+    ) throws -> (waited: Double, bytes: Int) {
+        let pidFile = base.appendingPathComponent("writers-\(UUID().uuidString).pid")
+        let pipe = Pipe()
+        let shell = try startWriters(on: pipe, count: writers, pidFile: pidFile)
+        defer {
+            shell.terminate()
+            killRecordedWriters(pidFile)
+        }
+        let drain = PipeDrain(pipe: pipe)
+        drain.start()
+        Thread.sleep(forTimeInterval: settle)
+        Thread.sleep(forTimeInterval: 0.05)
+
+        let started = DispatchTime.now().uptimeNanoseconds
+        let bytes = ending ? drain.closeAndCapture().count : drain.captured.count
+        let waited = Double(DispatchTime.now().uptimeNanoseconds - started) / 1e6
+
+        if !ending { drain.close() }
+        XCTAssertTrue(
+            drain.join(within: 5), "the worker must return once the close lands"
+        )
+        return (waited, bytes)
+    }
+
+    /// S-P2 (PR #460 codex r15). r14's N2 bounded `close()` and left
+    /// `captured` — THE SAME LOCK, NO ANNOUNCEMENT, and the call `run()` made
+    /// FIRST — unbounded. `run()`'s normal-exit path read both buffers and
+    /// only THEN closed, so the read that mattered was the starvable one.
+    ///
+    /// Reachable in production precisely in the case this runner exists to
+    /// survive: the child exits 0 while a grandchild holds the inherited
+    /// write end, so the drain never sees EOF, `join` spends its whole budget
+    /// and the buffer is then read against a LIVE worker — one that unlocks
+    /// and immediately re-locks thousands of times a second, which `NSLock`
+    /// lets it win.
+    ///
+    /// MEASURED at r15, 8 cold trios of each order on the same fixture shape:
+    ///
+    ///   bare `captured` (r14's order)    4.8-342.4 ms, median 83.8
+    ///   `closeAndCapture()` (this one)   0.13-0.96 ms, median 0.67
+    ///
+    /// The advertised bound is one poll interval, 20 ms — what the sibling
+    /// `testCloseIsNotStarvedByAContinuouslyWrittenWriteEnd` asserts for
+    /// `close()`. The bare capture exceeded it in 6 of those 8 trios, by
+    /// 1.8x-13.7x; an earlier sweep of the same cell gave 7 of 8 by 4x-23x
+    /// (1.8-577.6 ms, median 166.8) against 0.06-0.77 ms, median 0.15.
+    ///
+    /// Only the bounded half is ASSERTED: two of the eight starved trios came
+    /// back under 10 ms, so a cell demanding that the unbounded order BE slow
+    /// would be a cell that goes red on a quiet machine. The starved figure
+    /// is printed instead, so it stays re-derivable on every run.
+    ///
+    /// MUTATION: swap the two lines inside `closeAndCapture()` (capture, then
+    /// close) — r14's exact order. Red rate over 8 runs is in the commit
+    /// message.
+    func testCapturingOutputIsNotStarvedByAContinuouslyWrittenWriteEnd() throws {
+        var starved: [Double] = []
+        for _ in 0..<8 {
+            let trio = try measureDrainEndWaitMilliseconds(
+                ending: false, writers: 8, settle: 0.3
+            )
+            XCTAssertGreaterThan(trio.bytes, 0, "the fixture never fed the drain")
+            starved.append(trio.waited)
+        }
+        print(
+            "MEASURED-DRAIN-BARE-CAPTURE-MS",
+            starved.sorted().map { String(format: "%.4f", $0) }
+        )
+
+        var waits: [Double] = []
+        for _ in 0..<8 {
+            let trio = try measureDrainEndWaitMilliseconds(
+                ending: true, writers: 8, settle: 0.3
+            )
+            XCTAssertGreaterThan(
+                trio.bytes, 0,
+                "the capture must carry the flood's bytes — a close that "
+                    + "emptied the buffer would satisfy a timing bound by "
+                    + "losing the output"
+            )
+            waits.append(trio.waited)
+        }
+        let sorted = waits.sorted()
+        let median = sorted[sorted.count / 2]
+        print(
+            "MEASURED-DRAIN-CLOSE-AND-CAPTURE-MS",
+            sorted.map { String(format: "%.4f", $0) }
+        )
+        XCTAssertLessThan(
+            median, 25,
+            "median cold `closeAndCapture()` wait \(median) ms against a live "
+                + "stream; the advertised bound is one poll interval, 20 ms "
+                + "(samples: \(sorted))"
+        )
+    }
+
     /// N2 (PR #460 codex r14). `drain()` took `lock`, entered
     /// `readAvailable: while true` and `continue`d on every `count > 0`
     /// WITHOUT releasing it — so a descriptor being written continuously kept

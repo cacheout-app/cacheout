@@ -7,7 +7,56 @@ import XCTest
 /// so every cell that sorts after the trap never runs and the total line never
 /// prints. This suite has been stranded that way twice, measured both times.
 ///
-/// ## The four positions, and the order they were closed in
+/// ## TWO SCALES WITH ONE WORD, AND THE CANONICAL LIST (PR #460 codex r16, G1)
+///
+/// This file numbers FENCE POSITIONS — places in a source file where a trap
+/// can sit. The branch's commit messages number STRAND MECHANISMS — distinct
+/// ways this suite has been measured to stop early. They are DIFFERENT
+/// SCALES: fence position 5 (keyed-dictionary construction) is the EIGHTH
+/// strand mechanism. Numbering both "1…N" and calling both "the strand
+/// numbering" is how a draft PR body came to RECONSTRUCT four mechanism
+/// ordinals out of commit subjects.
+///
+/// Only 3, 4, 7, 8, 9, 10, 11 and 12 were ever STATED anywhere on the branch
+/// (every commit body in `f88ef10..HEAD` and every source, test and CHANGELOG
+/// file grepped, r16). 1, 2, 5 and 6 are established here by CHRONOLOGY
+/// rather than reconstructed: the stated ordinals bracket them and the commit
+/// timestamps are strictly ordered, so nothing else can occupy those slots.
+/// This table is the canonical list — cite it, do not rebuild it.
+///
+/// | # | mechanism | closed by | the measured strand |
+/// |---|---|---|---|
+/// | 1 | trapping integer subscript reached after a count assertion | r3 `8fa8ad3` | 985 of 1446 cells never ran; the footer still printed "✔ Test run … passed" |
+/// | 2 | `SIGPIPE` on a bare client socket with no `SO_NOSIGPIPE` | r4 `60a1696` | 2 of 9 full runs died with signal 13; in one, 127 cells never ran |
+/// | 3 | an assertion MESSAGE evaluated when its condition THROWS | r5 `9d63e0a` | signal 5 at `EphemeralTempScannerTests:2973`; no total line |
+/// | 4 | a trapping construct in ordinary STATEMENT position | r6 `193b043` | the `SysctlJournal` mutation stranded the run from an UNFENCED target |
+/// | 5 | force-unwrap of a PRODUCTION-DECIDED optional | r7 `88c9a1c` | signal 5; 493 of the 1471 cells at 26c880b never ran |
+/// | 6 | `withoutActuallyEscaping` over a genuinely escaping closure | r7 `619aac4` | trapped under the FULL suite only — every filtered run of the same cells passed |
+/// | 7 | a `Range` built from two INDEPENDENT searches | r9 `e0f27ef` | fatal error, no `Executed N tests` line, from a `PROTOCOL.md` edit touching no test |
+/// | 8 | `Dictionary(uniqueKeysWithValues:)` on a duplicate key | r10 `101753b` | 24 of 95 `CacheCleanerTests` cells had started; no total line |
+/// | 9 | an unbounded PARK on a hand-built gate | r11 `065b173` | the run simply stopped for 120 s: no failure, no total, no signal |
+/// | 10 | an unbounded SCAN SESSION, reached through production | r12 `72dd0e9` | the production bound itself |
+/// | 11 | the session bound not firing when the POOL is starved | r13 `7afd585` | the wedge class the bound exists for |
+/// | 12 | the header refresh parking IN FRONT of the bound | r14 `828d8c3` | a third site r13 left out |
+///
+/// THE MAPPING between the two scales, which is the thing that was actually
+/// confusing:
+///
+/// | fence position (below) | 1 | 2 | 3 | 4 | 5 | 6 |
+/// |---|---|---|---|---|---|---|
+/// | strand mechanism (above) | 1 | 3 | 4 | 7 | 8 | 9 |
+///
+/// Mechanism 2 is fenced by `TestSocketClient` and `SuiteIntegritySocketTests`
+/// rather than by a source-shape scan; 5 and 6 by the force-unwrap rule below
+/// and by a type change (`LastInstantProof`); 10-12 are PRODUCTION bounds with
+/// no source shape to scan at all. That asymmetry is why the two scales exist,
+/// and it is why neither may be renumbered onto the other.
+///
+/// ## The six FENCE POSITIONS, and the order they were closed in
+///
+/// These are POSITIONS, not the mechanism ordinals above; the mapping is in
+/// the table. The heading said "four" for four rounds after the fifth and
+/// sixth were added (PR #460 codex r16, G1).
 ///
 /// 1. **CONDITION** — `TestElementAccess.swift` retired the trapping subscript
 ///    from the condition position and PR #460 codex r3 converted the sites.

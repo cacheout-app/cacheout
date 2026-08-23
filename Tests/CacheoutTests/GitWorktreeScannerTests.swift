@@ -261,6 +261,29 @@ private final class FailingProbeProvider: FileSystemIdentityProvider {
     }
 }
 
+/// A one-shot latch for an interception closure that must fire EXACTLY once —
+/// the scan issues several commands per record, and a fixture that mutated the
+/// tree on each of them would be testing a different story every time.
+private final class OneShotLatch: @unchecked Sendable {
+    private let lock = NSLock()
+    private var fired = false
+
+    /// `true` for the FIRST caller only.
+    func claim() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if fired { return false }
+        fired = true
+        return true
+    }
+
+    var didFire: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return fired
+    }
+}
+
 // MARK: - Tests
 
 final class GitWorktreeScannerTests: XCTestCase {
@@ -842,6 +865,109 @@ final class GitWorktreeScannerTests: XCTestCase {
             "…while it is provably a different checkout: the re-scan JUDGED "
                 + "the replacement, it did not DETECT the substitution"
         )
+    }
+
+    /// N1 (PR #460 codex r14). The identity the delete-time gate is armed
+    /// with used to be captured AFTER `assessor.assess` returned. Its guard
+    /// was written against `lstat` FAILING — "the directory vanishing between
+    /// the resolve above and the plan build" — and never considered the case
+    /// where `lstat` SUCCEEDS and answers about a DIFFERENT object.
+    ///
+    /// So a worktree removed and re-added at the SAME path inside the
+    /// assessment window produced an item whose `record` and
+    /// `assessment.evidence` describe the ORIGINAL checkout while its armed
+    /// identity is the REPLACEMENT's. R1b then compares the live admin inode
+    /// against that identity, both are the replacement, they MATCH, and the
+    /// gate passes — the GUI deletes a brand-new checkout, ignored content
+    /// and all, on the strength of a row the user read about the old one.
+    ///
+    /// The window is entered through the assessor's LAST command for a
+    /// candidate (`show -s --format=%ct HEAD`, display-only): every gate has
+    /// already answered about the original when the replacement lands.
+    ///
+    /// MUTATION A (the re-verify): delete the `guard let assessmentWitness,
+    /// assessmentWitness == adminEntryIdentity` block in `handle` — RED here.
+    /// MUTATION B (the capture): move the `assessmentWitness` capture below
+    /// `await assessor.assess(...)` so it witnesses the post-assessment world
+    /// — the comparison becomes a tautology and this cell goes RED too.
+    func testAWorktreeReplacedInsideItsAssessmentWindowIsRefusedRatherThanOffered()
+        async throws
+    {
+        let repository = try makeRepositoryIgnoringPayloads(
+            at: dev.appendingPathComponent("repo")
+        )
+        let path = dev.appendingPathComponent("wt-a")
+        try addWorktree(of: repository, at: path, branch: "a")
+
+        let identityProvider = FileSystemIdentityProvider()
+        let originalAdmin = try XCTUnwrap(
+            GitWorktreeGitdirResolver().adminDirectory(forWorktreeAt: path),
+            "the fixture must have a resolvable admin directory"
+        )
+        let originalIdentity = try XCTUnwrap(identityProvider.identity(of: originalAdmin))
+
+        let latch = OneShotLatch()
+        let fixtureHome = try XCTUnwrap(home)
+        let runner = InterceptingGitRunner(wrapping: makeRunner()) { arguments, _ in
+            guard arguments.contains("show"),
+                  arguments.contains(where: { $0.hasSuffix("/wt-a") }),
+                  latch.claim()
+            else { return nil }
+            // The developer retires the worktree and creates a fresh one at
+            // the same path while the scan is still running. REAL git, real
+            // removal, real re-add — the admin entry is destroyed and
+            // recreated, so its inode genuinely changes.
+            _ = try? GitFixture.git(
+                ["-C", repository.path, "worktree", "remove", path.path],
+                home: fixtureHome
+            )
+            _ = try? GitFixture.git(
+                ["-C", repository.path, "worktree", "add", path.path, "-b", "brand-new"],
+                home: fixtureHome
+            )
+            // nil = delegate: the real `show` now runs against the replacement,
+            // exactly as it would in the field.
+            return nil
+        }
+
+        let scanner = makeScanner(runner: runner)
+        let outcome = await scanner.scan(context: ScanContext(trigger: .userInitiated))
+
+        XCTAssertTrue(
+            latch.didFire, "the fixture never entered the assessment window"
+        )
+        let replacementAdmin = try XCTUnwrap(
+            GitWorktreeGitdirResolver().adminDirectory(forWorktreeAt: path),
+            "the replacement must itself be a well-formed linked worktree"
+        )
+        XCTAssertNotEqual(
+            identityProvider.identity(of: replacementAdmin), originalIdentity,
+            "the fixture must have replaced the OBJECT, not merely the path"
+        )
+
+        let offered = try outcome.items.filter { item in
+            guard case .gitWorktreeReclaim = item.action else { return false }
+            let reclaim = try plan(of: item)
+            return reclaim.mode == .removeStaleWorktree
+                && reclaim.worktreePath?.path.hasSuffix("/wt-a") == true
+        }
+        let armed = try offered.first.map { try plan(of: $0).worktreeAdminEntryIdentity }
+        XCTAssertTrue(
+            offered.isEmpty,
+            "an item was offered for a checkout that was replaced mid-assessment; "
+                + "its armed identity is \(String(describing: armed)) while the "
+                + "assessed checkout's was \(originalIdentity)"
+        )
+        let issue = try XCTUnwrap(
+            outcome.errors.first { $0.detail.contains("replaced") },
+            "the refusal must be visible, not silent: \(outcome.errors)"
+        )
+        XCTAssertEqual(issue.kind, .unreadable)
+        XCTAssertTrue(issue.detail.contains("no item is offered"), issue.detail)
+        // The replacement is left entirely alone — the scan refuses it, it
+        // does not touch it.
+        XCTAssertTrue(fm.fileExists(atPath: path.path))
+        try assertNonMalformed(outcome, from: scanner)
     }
 
     // MARK: - R6: the orphaned-admin tier

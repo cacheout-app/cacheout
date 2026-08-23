@@ -77,7 +77,11 @@ below are both part of that coordination, and the latter BLOCKS this release.
   the admin directory the scan resolved AND that directory must be the same
   object the scan saw. So a checkout you moved onto that path, and equally
   one you removed and re-created there, is refused rather than removed — the
-  replacement is judged on its own merits by the next scan. (This window is
+  replacement is judged on its own merits by the next scan. That identity is
+  taken BEFORE the worktree is examined and proved again after, so the same
+  binding covers the scan's own window: a checkout replaced while it is being
+  assessed is never offered at all, because the row's evidence would describe
+  a checkout that is already gone. (This window is
   the desktop app's, where one scan's results stay on screen across your
   click. An earlier draft of this entry said `--cli clean` was protected
   because its re-scan answers a replacement with "unknown item id — rescan

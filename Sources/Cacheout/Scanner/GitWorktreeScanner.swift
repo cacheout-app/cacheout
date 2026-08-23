@@ -728,6 +728,25 @@ struct GitWorktreeScanner: @unchecked Sendable {
             return
         }
 
+        // THE WITNESS THE ASSESSMENT IS ABOUT (PR #460 codex r14, N1).
+        //
+        // Captured BEFORE the assessment because `lstat` SUCCEEDING is not the
+        // same fact as `lstat` answering about the object that was assessed. A
+        // worktree removed and re-added at the SAME path during the assessment
+        // window leaves a well-formed directory at every path this function
+        // reads — the resolve below succeeds, the back-link validates, the
+        // containment holds — so nothing downstream can tell the replacement
+        // from the checkout `record` and `assessment.evidence` describe. Only
+        // an identity taken before the window and re-proved after it can.
+        //
+        // Same shape as r4's HEAD witness: taken before the check, re-proved
+        // immediately before the guarantee is handed on, so it spans the whole
+        // window rather than ending when the check returns. `nil` here is
+        // itself a refusal (see the re-proof below) — an unwitnessed
+        // assessment cannot arm the delete-time gate.
+        let assessmentWitness = resolver.adminDirectory(forWorktreeAt: record.path)
+            .flatMap { provider.identity(of: provider.resolveTargetKeepingLeaf($0)) }
+
         // ASSESSMENT — runs even when containment will refuse the item (D13):
         // read-only git against a parent outside the roots is not gated by
         // `admitSearchRoot`, and the evidence is what makes the refusal
@@ -817,6 +836,36 @@ struct GitWorktreeScanner: @unchecked Sendable {
                     + "(lstat failed), so the delete-time gate that tells a "
                     + "re-created checkout from this one could not be armed — "
                     + "no item is offered"
+            ))
+            log.entries.append(GitWorktreeAssessmentLog.Entry(
+                worktreePath: record.path, isCandidate: true,
+                emittedItem: false, evidence: assessment.evidence
+            ))
+            return
+        }
+
+        // THE RE-PROOF (PR #460 codex r14, N1). The guard above was written
+        // against `lstat` FAILING — its own comment anticipates "the directory
+        // vanishing between the resolve above and the plan build" — and a
+        // vanished directory is the benign half of that window. The dangerous
+        // half is REPLACEMENT: `lstat` succeeds and reports the NEW checkout's
+        // inode, which would then be bound as the identity R1b re-checks.
+        // Live inode and carried identity would both be the replacement, they
+        // would match, the gate would pass, and the GUI would delete a
+        // newly-created checkout — pre-existing ignored content and all — on
+        // the strength of a row the user read about the old one.
+        //
+        // A mismatch is not an error state: the next scan simply assesses
+        // whatever is there now and offers it on its own evidence.
+        guard let assessmentWitness, assessmentWitness == adminEntryIdentity else {
+            issues.append(ScanIssue(
+                url: record.path, kind: .unreadable,
+                detail: "worktree '\(record.path.path)' was replaced while it "
+                    + "was being assessed: the admin directory at "
+                    + "'\(strict[2].path)' is no longer the object the "
+                    + "assessment describes, so the evidence belongs to a "
+                    + "checkout that is gone — no item is offered (the next "
+                    + "scan assesses the checkout that is there now)"
             ))
             log.entries.append(GitWorktreeAssessmentLog.Entry(
                 worktreePath: record.path, isCandidate: true,

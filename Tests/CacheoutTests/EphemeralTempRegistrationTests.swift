@@ -262,7 +262,7 @@ final class EphemeralTempRegistrationTests: XCTestCase {
     /// The cell above hands `production` a pre-built resolution through the
     /// `ephemeralTempRoots:` seam, which BYPASSES the `??` arm entirely.
     /// Neither shipped surface uses that seam: `CacheoutViewModel.production`
-    /// (`CacheoutViewModel.swift:533-552`) and
+    /// (`CacheoutViewModel.swift:555-574`) and
     /// `CLIHandler.CLIRuntimeDependencies.production`
     /// (`CLIHandler.swift:426-438`) both leave it `nil`, so both go through
     /// `EphemeralTempRoots.resolve(provider:confstrPath:)` inside the

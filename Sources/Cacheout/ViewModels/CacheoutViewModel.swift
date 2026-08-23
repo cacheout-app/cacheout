@@ -299,6 +299,26 @@ class CacheoutViewModel: ObservableObject {
 
     @Published var isCleaning = false
     @Published var diskInfo: DiskInfo?
+
+    /// HOW LONG THE HEADER'S VOLUME FIGURES MAY HOLD A CALLER (PR #460 codex
+    /// r14, V2-1). Two seconds, and the figure is not load-bearing: a healthy
+    /// `DiskInfo.current()` is one `statfs`-class call and returns in
+    /// microseconds, so anything at this scale means a starved cooperative
+    /// band or an unresponsive volume, neither of which gets better by
+    /// waiting. Deliberately far BELOW `ScanSessionBounds.production`'s ten
+    /// minutes: this fetch buys a display refresh, not a scan, and it is
+    /// spent before the session's own bound is even armed. On expiry the
+    /// figures are left as they were and the caller carries on — see
+    /// `BoundedDiskInfo` for what that costs and why a retry can differ.
+    static let diskInfoRefreshBudget: Duration = .seconds(2)
+
+    /// THIS view model's budget — the production default unless a caller
+    /// names one. Injectable for the same reason `ScanSessionBounds` is: the
+    /// starvation cells must saturate the band for a WALL-CLOCK interval, and
+    /// a two-second one costs the suite two seconds per cell to prove a
+    /// property that does not depend on the figure. Nothing in the app passes
+    /// it; `CacheoutApp` and every non-test construction take the default.
+    private let diskInfoBudget: Duration
     @Published var showCleanConfirmation = false
     @Published var showCleanupReport = false
     @Published var lastReport: CleanupReport?
@@ -489,10 +509,12 @@ class CacheoutViewModel: ObservableObject {
     ///   source.
     init(
         runtime: SpaceScannerRuntime = .production(),
-        reconstruction: RuntimeReconstruction? = nil
+        reconstruction: RuntimeReconstruction? = nil,
+        diskInfoBudget: Duration = CacheoutViewModel.diskInfoRefreshBudget
     ) {
         self.runtime = runtime
         self.reconstruction = reconstruction
+        self.diskInfoBudget = diskInfoBudget
 
         let storedInterval = UserDefaults.standard.double(forKey: "cacheout.scanIntervalMinutes")
         self.scanIntervalMinutes = storedInterval > 0 ? storedInterval : 30
@@ -1483,7 +1505,27 @@ class CacheoutViewModel: ObservableObject {
         sessionGeneration += 1
         let generation = sessionGeneration
         activeScanGeneration = generation
-        diskInfo = await Task.detached { DiskInfo.current() }.value
+        // THE HEADER REFRESH IS BOUNDED, AND IT HAD TO BE (PR #460 codex
+        // r14, V2-1). This await sits AFTER the in-progress guard above and
+        // BEFORE `scanValidatedSession` below creates the stream, the
+        // producer, the watchdog and the grace timer — so the session bound
+        // does not reach it and no `.scanDidNotFinish` is possible here. As a
+        // bare `await Task.detached { DiskInfo.current() }.value` it needed a
+        // free worker in the unspecified cooperative band just to START:
+        // measured with that band saturated, `scan()` returned at 2.619 s
+        // with the guard still raised at 1.2 s and no issue recorded, while
+        // a COMPLETE bounded session took 0.0065 s in the same cell.
+        //
+        // On `.timedOut` `diskInfo` KEEPS ITS PREVIOUS VALUE (nil before the
+        // first successful fetch — a state every renderer already handles)
+        // and the scan proceeds into the session, where the bound applies. A
+        // retry can differ: both causes are transient, so the next scan
+        // fetches again with nothing latched. See `BoundedDiskInfo`.
+        if case .fetched(let fetched) = await BoundedDiskInfo.current(
+            within: diskInfoBudget
+        ) {
+            diskInfo = fetched
+        }
 
         let session = sessionRuntime.scanValidatedSession(
             scannerIDs: participating,
@@ -1837,8 +1879,20 @@ class CacheoutViewModel: ObservableObject {
             lastDockerPruneResult = "Docker not found"
         }
 
-        // Refresh disk info after prune
-        diskInfo = await Task.detached { DiskInfo.current() }.value
+        // Refresh disk info after prune — THE TWIN OF `scan`'s fetch, and
+        // bounded for the same reason (PR #460 codex r14, V2-1). Nothing
+        // bounds this one either: `isDockerPruning` is released by the
+        // `defer` at the top of this method, which does not run until this
+        // await returns, so an unstarted detached fetch latched the button
+        // disabled exactly the way the prune's own unbounded
+        // `waitUntilExit()` does. On `.timedOut` the header keeps the
+        // figures it had, `lastDockerPruneResult` (already set above) still
+        // reaches the user, and the next scan refreshes.
+        if case .fetched(let fetched) = await BoundedDiskInfo.current(
+            within: diskInfoBudget
+        ) {
+            diskInfo = fetched
+        }
     }
 
     // MARK: - Cleaning

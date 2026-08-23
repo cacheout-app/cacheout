@@ -597,6 +597,25 @@ below are both part of that coordination, and the latter BLOCKS this release.
 
 ### Fixed
 
+- **A scan could hang before it started, with the spinner up and no way to
+  stop it.** The first thing a scan does after marking itself in progress is
+  refresh the free-space figures in the header. That refresh was unbounded:
+  it ran on a background worker, and if no worker was free — or the boot
+  volume was slow to answer — the scan sat there. Every protection Cacheout
+  has for a scan that will not finish is armed by the NEXT step, so none of
+  them applied: no timeout fired, no "scan did not finish" row appeared, the
+  spinner stayed up, a second scan was refused as already running, and the
+  app looked healthy while nothing was happening. Reproduced with the
+  background workers held busy: the scan returned after 2.6 s with no problem
+  reported, while a complete scan under its own timeout took 0.007 s in the
+  same run. The refresh now gives up after two seconds and the scan carries
+  on immediately, keeping whatever free-space figures it already had (before
+  the first successful reading, the usage bar simply stays hidden, exactly as
+  it does when the volume cannot be read at all). Nothing is remembered about
+  the failure — the next scan reads the figures again from scratch, and a
+  busy moment or a briefly unresponsive volume clears itself. The identical
+  refresh after "Prune Docker" is bounded the same way, so a slow volume can
+  no longer leave that button disabled.
 - **"Move to Trash" could take a file that was never yours, and report your
   folder's bytes as freed.** Before deleting anything Cacheout re-inspects the
   item, and for one kind of answer — "there is no folder of ours at this name

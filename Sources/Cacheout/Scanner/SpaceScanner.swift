@@ -2029,7 +2029,7 @@ struct SpaceScannerRuntime {
     ///   parameter and its pass-through as if they were callers, and omitted
     ///   the GUI entirely). First: `devRoots` is passed NON-NIL by both
     ///   shipped surfaces — the GUI unconditionally
-    ///   (`CacheoutViewModel.swift:541`, a non-optional `DevRootsResolution`)
+    ///   (`CacheoutViewModel.swift:563`, a non-optional `DevRootsResolution`)
     ///   and the CLI whenever `--dev-root` is given
     ///   (`CLIHandler.swift:206` and `:220`, through the forwarder whose own
     ///   parameter is declared at `:427` and passed through at `:433`) —
@@ -2044,7 +2044,7 @@ struct SpaceScannerRuntime {
     ///
     ///   It exists because of D4 (PR #459 codex r10): the `nil` arm is the
     ///   one BOTH shipped compositions take — neither
-    ///   `CacheoutViewModel.production` (`CacheoutViewModel.swift:533-552`)
+    ///   `CacheoutViewModel.production` (`CacheoutViewModel.swift:555-574`)
     ///   nor `CLIHandler.CLIRuntimeDependencies.production`
     ///   (`CLIHandler.swift:426-438`) passes `ephemeralTempRoots:` — and its
     ///   `issues` half was UNEVIDENCED: replacing this site with a version
@@ -2952,10 +2952,10 @@ struct SpaceScannerRuntime {
     ///
     /// - the ViewModel gates every destructive path on the scanner's
     ///   outcome generation equalling the ADOPTED one
-    ///   (`isBlockedFromDestructivePaths`, CacheoutViewModel.swift:588-592).
+    ///   (`isBlockedFromDestructivePaths`, CacheoutViewModel.swift:610-614).
     ///   A non-participating scanner delivers no event, so its retained rows
     ///   keep the older generation while adoption moves on
-    ///   (CacheoutViewModel.swift:1465-1466) — they are already
+    ///   (CacheoutViewModel.swift:1487-1488) — they are already
     ///   visible-but-non-cleanable before this filter sees them;
     /// - the CLI resolves the items it cleans FROM the same collected
     ///   session (CLIHandler.swift:2123 and :2442 pass that session's
@@ -3077,6 +3077,20 @@ struct SpaceScannerRuntime {
         // `mountPointPaths()` preflight does NOT close it: it skips roots
         // that ARE mount points, and a root INSIDE a hung mount is still
         // lstat'ed. Pre-existing on origin/main; its own task.
+        //
+        // IT IS NOT THE ONLY PRE-SESSION WAIT, and reading it as "the one
+        // place the bound cannot reach" is what let a second one sit
+        // undisclosed for two rounds (PR #460 codex r14, V2-1).
+        // `CacheoutViewModel.scan`'s header refresh also runs after the
+        // in-progress guard and before this method is called; it is now
+        // bounded on its own clock (`BoundedDiskInfo`), which is the shape a
+        // fix for THIS site would take too — a wall-clock budget of its own,
+        // since the session's cannot be armed yet. What stops that here and
+        // not there is the disposition: an abandoned header fetch costs a
+        // stale figure, while an abandoned container snapshot would leave the
+        // session with no identity baseline to admit deletes against, so
+        // giving up on it needs a product decision about what the scan then
+        // reports.
         let snapshot = ContainerSnapshot.capture(
             roots: sessionContainerRoots(for: selected), provider: provider
         )

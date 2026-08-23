@@ -1674,11 +1674,18 @@ final class CacheoutViewModelTests: XCTestCase {
                     ]
                 ) {
                     // SATURATION STARTS HERE, not before the scan: `scan`'s
-                    // own preamble does `await Task.detached { DiskInfo
-                    // .current() }.value`, which lands in this very band —
-                    // saturating it up front would time that fetch instead of
-                    // the grace, and did (1.83 s, all of it before the stream
-                    // was even created).
+                    // own preamble fetches the header's volume figures on a
+                    // detached task that lands in this very band, so
+                    // saturating it up front times THAT instead of the grace,
+                    // and did (1.83 s, all of it before the stream was even
+                    // created). That preamble is now bounded on its own clock
+                    // (`BoundedDiskInfo`, PR #460 codex r14, V2-1) — this
+                    // cell still starts the saturation from inside the
+                    // scanner because the two budgets would otherwise both be
+                    // in flight and the elapsed time would stop distinguishing
+                    // them. `testScanIsNotParkedByItsOwnDiskInfoPreamble
+                    // WhenTheBandIsSaturated` is the cell that times the
+                    // preamble on purpose.
                     for _ in 0..<bandCount {
                         Task.detached(priority: .medium) {
                             bandBlockers.hold()
@@ -1705,6 +1712,194 @@ final class CacheoutViewModelTests: XCTestCase {
                 + "worker in a saturated band: \(elapsed) s"
         )
         XCTAssertFalse(viewModel.isAnyScanInProgress)
+    }
+
+    // MARK: - The header refresh in FRONT of the bound (PR #460 codex r14, V2-1)
+
+    /// THE BOUND ITSELF, ON A FETCH THAT NEVER RETURNS.
+    ///
+    /// Deterministic — the fetch is a `Thread.sleep`, so the arithmetic does
+    /// not depend on how the pool happens to be scheduled. What it pins is
+    /// that `BoundedDiskInfo.current` returns AT the budget rather than at
+    /// the fetch, and that it says `.timedOut` rather than reporting a
+    /// completed read of nothing (a `.fetched(nil)` here would be a lie the
+    /// header would then render as a real "0 bytes free").
+    ///
+    /// MUTATION: delete the `ScanSessionClock.schedule` timer (leave the
+    /// detached settle) and this cell fails on the elapsed assertion — it
+    /// returns at the fetch's 3 s, not the 200 ms budget.
+    func testTheHeaderFetchReturnsOnItsBudgetNotOnAStuckVolume() async throws {
+        let released = DispatchSemaphore(value: 0)
+        let started = Date()
+        let outcome = await BoundedDiskInfo.current(
+            within: .milliseconds(200),
+            fetch: {
+                // Holds its thread the way `URL.resourceValues` on a hung
+                // mount does — uncancellable, because the real one is.
+                Thread.sleep(forTimeInterval: 3.0)
+                released.signal()
+                return DiskInfo(totalSpace: 1, freeSpace: 1, usedSpace: 0)
+            }
+        )
+        let elapsed = Date().timeIntervalSince(started)
+
+        XCTAssertTrue(
+            outcome.didTimeOut,
+            "a fetch still parked at the budget must be reported as timed "
+                + "out, never as a completed read"
+        )
+        XCTAssertLessThan(
+            elapsed, 1.5,
+            "the 200 ms budget must end the wait, not the 3 s fetch: "
+                + "\(elapsed) s"
+        )
+        // JOINED rather than leaked: a thread still sleeping when the next
+        // cell saturates the band is exactly what made r13's M-B3 look green.
+        released.wait()
+    }
+
+    /// AND A FETCH THAT DOES RETURN IS NOT REPORTED AS TIMED OUT — the other
+    /// direction, without which "always `.timedOut`" would pass the cell
+    /// above and silently freeze the header forever.
+    ///
+    /// It also pins that `DiskInfo.current()`'s OWN nil (an unreadable
+    /// volume) stays `.fetched(nil)`: that is a completed read, and the call
+    /// sites must be free to store it.
+    ///
+    /// MUTATION: settle the rendezvous with `.timedOut` from the detached
+    /// task and both assertions here go red.
+    func testACompletedFetchIsNeverReportedAsTimedOut() async throws {
+        let value = await BoundedDiskInfo.current(
+            within: .seconds(30),
+            fetch: { DiskInfo(totalSpace: 100, freeSpace: 40, usedSpace: 60) }
+        )
+        guard case .fetched(let disk) = value else {
+            return XCTFail("a prompt fetch must report .fetched, got \(value)")
+        }
+        XCTAssertEqual(disk?.freeSpace, 40)
+
+        let unreadable = await BoundedDiskInfo.current(
+            within: .seconds(30), fetch: { nil }
+        )
+        guard case .fetched(let none) = unreadable else {
+            return XCTFail(
+                "an unreadable volume is a COMPLETED read, not a timeout, "
+                    + "got \(unreadable)"
+            )
+        }
+        XCTAssertNil(none)
+    }
+
+    /// THE SITE, END TO END: `scan()` MUST NOT PARK IN ITS OWN PREAMBLE.
+    ///
+    /// This is the defect's measured shape. The fetch at the top of `scan`
+    /// runs AFTER the in-progress guard is raised and BEFORE
+    /// `scanValidatedSession` exists, so nothing bounds it and no
+    /// `.scanDidNotFinish` can be produced — and as a bare `Task.detached` it
+    /// needs a free worker in the unspecified cooperative band merely to
+    /// START. So the band is saturated BEFORE the scan (the opposite of
+    /// `testTheWindDownGraceDoesNotDependOnTheCooperativePoolEither`, which
+    /// saturates from inside the scanner precisely to avoid timing this
+    /// fetch — its comment records having measured 1.83 s here).
+    ///
+    /// The assertion is on `scan()`'s wall time against an injected 200 ms
+    /// budget, with the holders outliving it: with the bound, `scan` gives up
+    /// on the header and returns; without it, `scan` returns only when the
+    /// band frees.
+    ///
+    /// MUTATION: restore `diskInfo = await Task.detached { DiskInfo.current()
+    /// }.value` at `CacheoutViewModel.swift`'s scan preamble and this cell
+    /// goes red on the elapsed assertion.
+    @MainActor
+    func testScanIsNotParkedByItsOwnDiskInfoPreambleWhenTheBandIsSaturated()
+        async throws
+    {
+        // The band an unspecified-priority `Task.detached` lands in — the
+        // band the production fetch uses.
+        let bandCount = ProcessInfo.processInfo.activeProcessorCount + 2
+        let holders = LeakFreeBlockers(count: bandCount)
+        defer { holders.join() }
+        for _ in 0..<bandCount {
+            Task.detached(priority: .medium) { holders.hold() }
+        }
+        // Let them actually take the workers before the scan starts.
+        try await Task.sleep(for: .milliseconds(150))
+
+        let runtime = try makeRuntime(
+            [
+                FixtureScanner(
+                    id: "prompt",
+                    trustedContainerRoots: [
+                        base.appendingPathComponent("prompt"),
+                    ]
+                ) { ScanOutcome(items: [], errors: []) },
+            ],
+            sessionBounds: ScanSessionBounds(
+                eventDeadline: .milliseconds(200),
+                producerWindDownGrace: .milliseconds(100)
+            )
+        )
+        // The budget is INJECTED at 200 ms for the same reason the session
+        // bounds above are: the property under test is that the wait ENDS on
+        // a clock rather than on a worker, not what the production figure is.
+        let viewModel = CacheoutViewModel(
+            runtime: runtime, diskInfoBudget: .milliseconds(200)
+        )
+
+        let started = Date()
+        await viewModel.scan(trigger: .automatic)
+        let elapsed = Date().timeIntervalSince(started)
+
+        XCTAssertLessThan(
+            elapsed, 0.9,
+            "scan must not wait past its header budget for a cooperative "
+                + "worker in a saturated band — the guard is already raised "
+                + "and no bound covers this await: \(elapsed) s"
+        )
+        // The guard is RELEASED on the way out, which is the half of the
+        // signature the user sees as a spinner that never stops.
+        XCTAssertFalse(viewModel.isAnyScanInProgress)
+    }
+
+    /// AND THE HEADER IS STILL FILLED IN ON A HEALTHY SCAN — the direction
+    /// the two cells above cannot see.
+    ///
+    /// Bounding a fetch is only half a change: a budget of zero, a bound that
+    /// always wins, or an assignment dropped while rewriting the call site
+    /// would all satisfy "scan returns promptly" and leave the usage bar
+    /// permanently blank. Nothing in the suite asserted this before the
+    /// bound existed, so the regression would have been silent.
+    ///
+    /// Reads the REAL boot volume through the production default budget,
+    /// which is what the shipped call site does; `DiskInfo.current()` is
+    /// read-only.
+    ///
+    /// MUTATION: drop the `diskInfo = fetched` assignment in `scan`'s
+    /// preamble (or match `.timedOut` instead of `.fetched`) and this cell
+    /// goes red; the two starvation cells stay green.
+    @MainActor
+    func testAHealthyScanStillPublishesTheHeadersVolumeFigures() async throws {
+        let runtime = try makeRuntime(
+            [
+                FixtureScanner(
+                    id: "prompt",
+                    trustedContainerRoots: [
+                        base.appendingPathComponent("prompt"),
+                    ]
+                ) { ScanOutcome(items: [], errors: []) },
+            ]
+        )
+        let viewModel = CacheoutViewModel(runtime: runtime)
+        XCTAssertNil(viewModel.diskInfo, "nothing is fetched at construction")
+
+        await viewModel.scan(trigger: .automatic)
+
+        let disk = try XCTUnwrap(
+            viewModel.diskInfo,
+            "an unstarved scan must publish the volume figures — a bound that "
+                + "always fires would leave the header blank forever"
+        )
+        XCTAssertGreaterThan(disk.totalSpace, 0)
     }
 
     /// EXACTLY ONE EVENT PER SCANNER, EVER — the watchdog's report and the

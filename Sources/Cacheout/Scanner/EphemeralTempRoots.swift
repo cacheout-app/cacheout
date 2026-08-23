@@ -109,7 +109,7 @@
 /// which is ordinary app construction: the GUI evaluates it on the main
 /// thread while building its `@StateObject`
 /// (`CacheoutApp.swift:58` → `CacheoutViewModel.production()` →
-/// `CacheoutViewModel.swift:541` → `SpaceScannerRuntime.production`,
+/// `CacheoutViewModel.swift:563` → `SpaceScannerRuntime.production`,
 /// `SpaceScanner.swift:2058`), long
 /// before any trigger or `participates(in:)` gate exists to consult. The main
 /// thread is not an inference: `CacheoutViewModel` is `@MainActor`
@@ -574,7 +574,7 @@ enum EphemeralTempRoots {
         // `SpaceScannerRuntime.production`
         // (`SpaceScannerRuntime.production` (`SpaceScanner.swift:2058`)), which
         // the GUI calls from `CacheoutViewModel.production`
-        // (`CacheoutViewModel.swift:533-552`) at the `@MainActor` view
+        // (`CacheoutViewModel.swift:555-574`) at the `@MainActor` view
         // model's construction (`CacheoutApp.swift:58`), so the block lands
         // on the main thread before any window, trigger gate or scan exists.
         // Measured through the shipped `??` arm with a table-injected

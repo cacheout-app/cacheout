@@ -824,10 +824,23 @@ enum TrashDisposal {
         // multi-component one THROUGH the held directory, which is exactly the
         // no-follow guarantee this call exists to keep. No production URL
         // reaching here can violate it (`target` is an admitted item or an
-        // enumerated child), so deleting it — measured, both this and the copy
-        // in `facts` at once — leaves the FULL suite GREEN. It stays because
-        // the precondition is the primitive's, not this call's, and a future
-        // caller is what it is for.
+        // enumerated child), so no DISPOSAL fixture can kill it: measured at
+        // r13, deleting it alone leaves 361 tests across the six destructive
+        // suites GREEN, because `probeChild` carries the identical
+        // precondition and answers `EINVAL` itself.
+        //
+        // WHAT ITS REMOVAL DOES CHANGE IS THE CAUSE, AND THAT IS EVIDENCED
+        // RATHER THAN CONCEDED (PR #460 codex r13, E). This guard answers
+        // BEFORE anything is resolved; without it the malformed name is
+        // resolved first and the refusal reports whatever that resolution
+        // says — measured on the cell's fixture, `.notTheAdmittedContainer`,
+        // which tells the user the FOLDER changed about a target whose name
+        // was never valid. Pinned by
+        // `TrashDisposalHopProofTests.testALookAtAnUnsafeNameIsRefusedRatherThanResolvedAlongThePath`.
+        // The claim that stood here — that deleting this AND the copy in
+        // `facts` together leaves the full suite green — was true when it was
+        // written and is false now: `facts`' copy is load-bearing over its
+        // `probeLeaf` fallback, and both have cells.
         guard FileSystemIdentityProvider.isSafeComponent(leaf) else {
             throw DepthSafeRemoval.Failure(
                 path: target.path, cause: .invalidTarget, depth: 0
@@ -997,6 +1010,13 @@ enum TrashDisposal {
         at url: URL, provider: FileSystemIdentityProvider
     ) -> FileSystemIdentityProvider.ChildFacts? {
         let name = url.lastPathComponent
+        // THE SAME GUARD OVER THE SAME HOLE AS `look`'s, and load-bearing for
+        // the same reason (PR #460 codex r13, E): this function's
+        // permission-class fallback is `probeLeaf`, an `lstat` of the PATH
+        // with no name check beneath it. Measured with the guard deleted:
+        // `facts` at a name of `..` under a permission-denied container
+        // returns `ChildFacts(kind: .directory, identity: <the container>)`
+        // where the guard returns `nil`. Same cell as `look`'s.
         guard FileSystemIdentityProvider.isSafeComponent(name) else {
             return nil
         }
@@ -1166,15 +1186,25 @@ enum TrashDisposal {
         at url: URL, provider: FileSystemIdentityProvider
     ) -> Sighting {
         let name = url.lastPathComponent
-        // A PRECONDITION, DISCLOSED AS ONE RATHER THAN DRESSED AS A GUARD —
-        // the same disclosure `rollBack` makes about the same primitive. A
-        // MULTI-COMPONENT name would defeat the whole no-follow guarantee
-        // (`O_NOFOLLOW` guards only the last component of whatever `openat`
-        // is handed, measured in `probeChild`'s header). No URL that reaches
-        // `look` can violate it — `target` comes from an admitted item and
-        // `landed` from the mover — so NO CELL FAILS when this is deleted
-        // (mutation-tested against the 389-test trash scope: 0 red). It is
-        // the family's documented contract, restated where it is called.
+        // LOAD-BEARING ON THE FALLBACK, AND THE COMMENT THAT STOOD HERE SAID
+        // THE OPPOSITE (PR #460 codex r13, E). It called this a precondition
+        // "restated where it is called" and recorded that NO CELL FAILS when
+        // it is deleted — which r12's mutation M5 confirmed, red_count 0.
+        // Both readings were about the DESCRIPTOR-RELATIVE arm, where
+        // `openChildDirectory` carries the identical precondition and answers
+        // `EINVAL` itself, so nothing can tell the two apart.
+        //
+        // `lookAlongThePath` is the arm this holds. It is a path-spelled
+        // `open(url.path, …)` with NO name check anywhere beneath it, and
+        // `O_NOFOLLOW` does not object to `..` — measured, with the guard
+        // deleted: `look` at a name of `..` under a permission-denied
+        // container returns `.directory(<the container's identity>)`, an
+        // identity for a directory two levels above the name the caller
+        // asked about, where the guard returns `.unreadable(errno: EINVAL)`.
+        // The denial that routes it there is the ORDINARY production one:
+        // `~/.Trash` answers `EPERM` to every process without Full Disk
+        // Access. Evidenced by
+        // `TrashDisposalHopProofTests.testALookAtAnUnsafeNameIsRefusedRatherThanResolvedAlongThePath`.
         guard FileSystemIdentityProvider.isSafeComponent(name) else {
             return .unreadable(errno: EINVAL)
         }
@@ -1380,11 +1410,20 @@ enum TrashDisposal {
         // A PRECONDITION, DISCLOSED AS ONE RATHER THAN DRESSED AS A GUARD.
         // `probeChild`/`renameatx_np` take a SINGLE component and resolve a
         // multi-component one through the held directory, which would let a
-        // symlinked middle component out of it. No production URL reaching
-        // here can violate that (`landed` comes from `trashItem`, `target`
-        // from an admitted item), so no test FAILS when this is deleted —
-        // it is the same precondition `FileSystemIdentityProvider` documents
-        // on both primitives, restated where they are called.
+        // symlinked middle component out of it.
+        //
+        // THIS IS THE ONE COPY THAT STAYS DISCLOSED RATHER THAN EVIDENCED,
+        // AND THE REASON IS STATED (PR #460 codex r13, E). Its SOURCE half is
+        // subsumed — `probeChild` answers `EINVAL`, the comparison below
+        // fails, and `.lastSeenInTrash` comes back either way, so there is
+        // no observable difference to assert. Its DESTINATION half is NOT
+        // subsumed: `renameatx_np` is a raw syscall and would resolve a
+        // multi-component `to` through `containerFD`. But that half is
+        // UNREACHABLE from either entry point, because `boundLeaf` refuses
+        // the same target with `.invalidTarget` before any disposal runs, so
+        // no cell can drive it. Unevidenceable is not the same as unexamined:
+        // `look`'s and `facts`' copies WERE reachable, and both now have
+        // cells (r13, E).
         guard FileSystemIdentityProvider.isSafeComponent(source),
               FileSystemIdentityProvider.isSafeComponent(destination)
         else { return .lastSeenInTrash(landed.path) }

@@ -973,6 +973,134 @@ final class TrashDisposalHopProofTests: XCTestCase {
         )
     }
 
+
+    // MARK: - E (PR #460 codex r13): the precondition r12's M5 could not kill
+
+    /// **`look`'s `isSafeComponent` GUARD, EVIDENCED** — r12's mutation M5
+    /// deleted it and NOTHING went red, and this branch's doctrine gives a
+    /// guard in that state two options, not three.
+    ///
+    /// WHY M5 FOUND NOTHING, AND WHERE THE GUARD IS ACTUALLY LOAD-BEARING.
+    /// `look`'s descriptor-relative arm hands the name to
+    /// `FileSystemIdentityProvider.openChildDirectory`, which carries the
+    /// IDENTICAL precondition and answers `EINVAL` on its own — so on that
+    /// arm the guard is genuinely subsumed and no fixture can tell the two
+    /// apart. The PERMISSION-CLASS FALLBACK is different: `lookAlongThePath`
+    /// is a path-spelled `open(url.path, …)` with NO name check anywhere
+    /// beneath it, and `O_NOFOLLOW` does not object to `..`. Reached with an
+    /// unsafe last component it RESOLVES it and hands back a real directory
+    /// identity — for a directory two levels up from the one the caller
+    /// asked about.
+    ///
+    /// MEASURED with the guard deleted: `.directory(<identity of the
+    /// container>)` where the guard produces `.unreadable(errno: EINVAL)`.
+    /// The denial here is the ORDINARY production one — `~/.Trash` answers
+    /// `EPERM` to every process without Full Disk Access — so this is the
+    /// arm the guard has to hold, not an exotic one.
+    ///
+    /// No production URL can reach `look` with such a name (`target` is an
+    /// admitted item, `landed` comes from `trashItem`), which is why the
+    /// disposal cells cannot kill it; that makes this a cell about the
+    /// FUNCTION's contract, and the contract is what a future caller will
+    /// rely on.
+    func testALookAtAnUnsafeNameIsRefusedRatherThanResolvedAlongThePath()
+        throws
+    {
+        let container = try makeCacheContainer()
+        let child = container.appendingPathComponent("child")
+        try fm.createDirectory(at: child, withIntermediateDirectories: true)
+
+        // `URL.deletingLastPathComponent()` does not cancel a `..`, so the
+        // container this resolves to IS `container` — which is what the
+        // fallback would hand back if the guard were not there.
+        let unsafe = child.appendingPathComponent("..")
+        XCTAssertEqual(unsafe.lastPathComponent, "..",
+                       "the fixture must actually carry an unsafe component")
+        let provider = TrashDeniedProvider(
+            denying: unsafe.deletingLastPathComponent(), with: EPERM
+        )
+
+        // THE FIXTURE IS THE PERMISSION CLASS, ASSERTED RATHER THAN ASSUMED:
+        // without this the cell could pass against a container open that
+        // simply succeeded, and the fallback — the only arm the guard is
+        // load-bearing on — would never be the one answering.
+        XCTAssertEqual(
+            provider.openDirectoryNoFollowCarryingErrno(
+                at: unsafe.deletingLastPathComponent()
+            ),
+            .failed(errno: EPERM),
+            "the container open must land in the permission class, which is "
+                + "what routes `look` onto its path-spelled fallback"
+        )
+        let denialsBefore = provider.refusals
+
+        XCTAssertEqual(
+            TrashDisposal.look(at: unsafe, provider: provider),
+            .unreadable(errno: EINVAL),
+            "an unsafe component is refused; with the guard deleted this "
+                + "answers `.directory(...)` for the container two levels up "
+                + "— a resolution through `..` taken by the path-spelled open"
+        )
+        XCTAssertEqual(
+            provider.refusals, denialsBefore,
+            "the guard answers BEFORE the container is even opened — which "
+                + "is exactly why no disposal fixture can kill it, and why "
+                + "this cell asks the function directly"
+        )
+        // AND THE MEASUREMENT THE GUARD PREVENTS, taken here so the failure
+        // message above is not the only record of it: the path-spelled open
+        // the fallback performs resolves `..` and lands on the container.
+        let resolved = open(
+            unsafe.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+        )
+        XCTAssertGreaterThanOrEqual(
+            resolved, 0,
+            "`O_NOFOLLOW` does not object to `..` — that is the whole point"
+        )
+        defer { if resolved >= 0 { close(resolved) } }
+        XCTAssertEqual(
+            provider.identity(ofDescriptor: resolved),
+            provider.identity(of: container),
+            "…and what it lands on is the CONTAINER, two levels above the "
+                + "name the caller asked about"
+        )
+
+        // AND `facts` CARRIES THE SAME GUARD OVER THE SAME HOLE. Its
+        // permission-class fallback is `probeLeaf`, an `lstat` of the PATH
+        // with no name check beneath it, so an unsafe component resolves
+        // there exactly as it does above. Deleting `facts`' guard makes this
+        // answer `ChildFacts(kind: .directory, identity: <the container>)`
+        // where the guard answers `nil` — and `nil` is the value the caller
+        // treats as "nothing identified", which is never a match.
+        XCTAssertNil(
+            TrashDisposal.facts(at: unsafe, provider: provider),
+            "an unsafe component identifies NOTHING, on this arm too"
+        )
+
+        // AND `boundLeaf`'s COPY, whose removal changes the CAUSE rather than
+        // the outcome. It answers BEFORE anything is resolved; without it the
+        // malformed name is resolved first, and what comes back is whatever
+        // the resolution happens to say — MEASURED on this fixture:
+        // `.notTheAdmittedContainer`, i.e. the user is told the FOLDER THAT
+        // HOLDS THE ITEM changed, about a target whose name was never valid.
+        // That is the same wrong-fact-to-the-user class as A2, one layer
+        // down. Deleting this guard alone leaves 361 tests across the six
+        // destructive suites GREEN, which is why it needs its own assertion
+        // rather than a disposal fixture.
+        let parent = try admittedParent(of: child, provider: provider)
+        XCTAssertThrowsError(
+            try TrashDisposal.boundLeaf(
+                of: unsafe, containedIn: parent, provider: provider
+            )
+        ) { error in
+            XCTAssertEqual(
+                (error as? DepthSafeRemoval.Failure)?.cause, .invalidTarget,
+                "the refusal names the malformed target, not an errno: "
+                    + "\(error)"
+            )
+        }
+    }
+
     // MARK: - The control: an UNDISTURBED hop still disposes
 
     func testAnUndisturbedHopStillDisposesOnEveryArm() async throws {

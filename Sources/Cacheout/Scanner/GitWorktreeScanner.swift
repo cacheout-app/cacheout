@@ -853,7 +853,11 @@ struct GitWorktreeScanner: @unchecked Sendable {
         //      record, taken immediately AFTER the listing at (b).
         //
         //      IT IS NOT THE ONE THE RE-PROOF IS ANCHORED ON — that is
-        //      `group.discoveryWitnesses`, captured before the listing ran.
+        //      `group.discoveryWitnesses` where the walk supplied one and
+        //      (a2)'s `containerWitnesses` otherwise, both captured before
+        //      the listing ran. The walk's is the earlier of the two and is
+        //      preferred for that reason; (a2)'s exists because the walk's
+        //      reach is bounded and git's is not (r17, W1).
         //      r14 captured the witness inside `handle` (after every earlier
         //      record's whole assessment); r15 moved it here (after the
         //      listing). Both were still on the SAME side of the listing as
@@ -881,8 +885,9 @@ struct GitWorktreeScanner: @unchecked Sendable {
         //      discovery capture and this one. One capture compared with
         //      itself could never see it.
         //
-        //      Keyed by the CANONICAL admin-entry path so both maps share one
-        //      key (see `RepositoryGroup.discoveryWitnesses`). The TCC gate is
+        //      Keyed by the CANONICAL admin-entry path so all three maps
+        //      share one key (see `RepositoryGroup.discoveryWitnesses` and
+        //      `adminContainerWitnesses`). The TCC gate is
         //      honoured here exactly as `handle` honours it: `adminDirectory`
         //      reads `<worktree>/.git`, so a deferred worktree is never
         //      touched to witness it.
@@ -951,9 +956,12 @@ struct GitWorktreeScanner: @unchecked Sendable {
         parentRepoWorkingDir: URL,
         adminContainer: URL,
         groupGitDirectory: URL,
-        /// The admin entry's identity as it stood at DISCOVERY — before this
-        /// repository's porcelain listing ran (see
-        /// `RepositoryGroup.discoveryWitnesses`). This is the anchor of the
+        /// The admin entry's identity as it stood BEFORE this repository's
+        /// porcelain listing ran: the walk's own capture where the walk
+        /// reached this checkout (`RepositoryGroup.discoveryWitnesses`, taken
+        /// at the instant its `.git` entry was observed), otherwise (a2)'s
+        /// admin-container capture (`adminContainerWitnesses`, taken
+        /// immediately before the listing). This is the anchor of the
         /// re-proof: it is the only capture the listing, the parse, the
         /// cross-validation, the dedupe and (e2)'s whole loop all come after.
         /// `nil` is itself a refusal, and it is NOT the same refusal as a

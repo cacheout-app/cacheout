@@ -472,11 +472,32 @@ enum TrashDisposal {
             /// The mover returned no landing URL at all, so which object it
             /// took cannot be established.
             case theLandingWasNotReported
-            /// The mover is a TRASH disposal and it returned without
-            /// throwing, so whatever it took went to the Trash — only the
-            /// name it went to is unknown. Established on
-            /// `.destinationUnknown` and on nothing else: every other cause
-            /// has read the landing the mover DID report.
+            /// NEVER ESTABLISHED BY ANY ARM, AND RETIRED IN THE ROUND AFTER
+            /// THE ONE THAT BLESSED IT (PR #460 codex r18, E2).
+            ///
+            /// It shipped on `.destinationUnknown`, justified like this: "the
+            /// mover is a TRASH disposal and it returned without throwing, so
+            /// whatever it took went to the Trash". That was the ONLY entry in
+            /// `established(for:)` derived from an assumption about an
+            /// INJECTABLE SEAM's contract rather than from something this code
+            /// READ — the identical inference an earlier round falsified for
+            /// `.lastSeenInTrash` — and "whatever it took" begs the question
+            /// when it took NOTHING.
+            ///
+            /// MEASURED at 9ca1129, all four Trash arms, 8/8 runs: a Mover
+            /// that proves and moves nothing and returns a nil landing raises
+            /// `.destinationUnknown`, and `lstat` before and after gives the
+            /// SAME `st_ino`. The message said "Check the Trash," for an item
+            /// that never left, and the fence positively ENDORSED it.
+            ///
+            /// REACHABILITY, STATED HONESTLY, because it is the reason this is
+            /// a retirement and not a bug report: the counterexample uses an
+            /// injected Mover. In the shipped composition `.destinationUnknown`
+            /// needs `FileManager.trashItem` to SUCCEED with a nil
+            /// `resultingItemURL`, and NOTHING IN THIS TREE MEASURES WHETHER
+            /// THAT HAPPENS. So the choice was between measuring Foundation's
+            /// behaviour and dropping the claim; the claim is dropped, which
+            /// is the answer that is right under both outcomes.
             case theTrashHoldsWhatItTook
             /// The disclosure, not a claim: where the item is now was NOT
             /// established on this path.
@@ -597,14 +618,24 @@ enum TrashDisposal {
                 ])
             case .destinationUnknown:
                 // Raised before anything about a landing is known — the
-                // mover returned `nil`. It did NOT throw, and the seam's
-                // contract is a move to the Trash, so what it took is in the
-                // Trash under a name this code was never told.
+                // mover returned `nil`. This arm READS NOTHING, so the only
+                // positive fact is that no landing was reported, and the only
+                // other true thing to say is that the item's whereabouts were
+                // not established.
+                //
+                // IT USED TO CLAIM `.theTrashHoldsWhatItTook` AS WELL, AND
+                // THAT WAS THE ONE ROW DERIVED FROM A SEAM'S CONTRACT RATHER
+                // THAN FROM A READ (PR #460 codex r18, E2). See that case's
+                // own doc for the measurement that falsified it — same inode,
+                // all four arms — and for why it is retired rather than
+                // re-derived.
+                //
                 // `.theDisposalWasNotProvedToHaveMovedTheItem` is NOT here:
                 // this message never carried the shared opening, and must not
                 // gain one (r15, D-P3).
                 return always.union([
-                    .theLandingWasNotReported, .theTrashHoldsWhatItTook,
+                    .theLandingWasNotReported,
+                    .theItemsWhereaboutsAreNotEstablished,
                 ])
             }
         }
@@ -799,13 +830,19 @@ enum TrashDisposal {
                         establishes: .nothingWasReportedFreed,
                         text: " — nothing was reported freed."
                     ),
+                    // WAS " Check the Trash," (retired r18, E2). This arm
+                    // reads nothing, and the mover that raises it may have
+                    // moved nothing: measured on all four arms, the item is
+                    // still at the target at the SAME INODE. Sending the user
+                    // to the Trash for it was the same error r16 spent a
+                    // round retiring on `.lastSeenInTrash`, one cause over.
                     Claim(
-                        establishes: .theTrashHoldsWhatItTook,
-                        text: " Check the Trash,"
+                        establishes: .theItemsWhereaboutsAreNotEstablished,
+                        text: " Where the item is now was NOT established"
                     ),
                     Claim(
                         establishes: .theRemedyForThisRefusal,
-                        text: " and use permanent delete (turn off Move to "
+                        text: "; use permanent delete (turn off Move to "
                             + "Trash) for a disposal that proves the folder "
                             + "it acts on"
                     ),

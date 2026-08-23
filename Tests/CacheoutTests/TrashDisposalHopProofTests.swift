@@ -2775,11 +2775,6 @@ final class TrashDisposalHopProofTests: XCTestCase {
             return FactContract(
                 all: ["did not report where"], isWhereabouts: true
             )
-        case .theTrashHoldsWhatItTook:
-            return FactContract(
-                all: ["Trash"], isWhereabouts: true,
-                isPositivePlacement: true
-            )
         case .theItemsWhereaboutsAreNotEstablished:
             return FactContract(
                 all: ["was NOT established"], isWhereabouts: true
@@ -2788,11 +2783,17 @@ final class TrashDisposalHopProofTests: XCTestCase {
             return FactContract(all: ["reported freed"], forbidsPlaces: true)
         case .theRemedyForThisRefusal:
             return FactContract(forbidsPlaces: true, forbidsNetEffect: true)
-        case .nothingWasFreedOnDisk, .theTargetWasReplaced:
+        case .nothingWasFreedOnDisk, .theTargetWasReplaced,
+             .theTrashHoldsWhatItTook:
             // Unsatisfiable ON PURPOSE. No arm establishes these, the fence
             // below asserts that no cause claims them, and the contract is
             // written so that a claim tagged with one fails even if the
             // `established` table is edited to admit it.
+            //
+            // `.theTrashHoldsWhatItTook` joined them at r18 (E2): it was the
+            // one entry in the derivation table inferred from an INJECTABLE
+            // SEAM's contract rather than from something the code read, and
+            // it was false on the very event its cause is raised for.
             return FactContract(all: ["\u{0}NO ARM ESTABLISHES THIS\u{0}"])
         }
     }
@@ -2883,9 +2884,10 @@ final class TrashDisposalHopProofTests: XCTestCase {
     ///    the report, and must say "reported freed";
     /// 5. a clause may contain no sentence break, so a new sentence is
     ///    necessarily a new clause and necessarily tagged;
-    /// 6. the two propositions this file has shipped and retired — "the
-    ///    target was replaced" and "nothing was freed on disk" — are
-    ///    established by NO cause, and their contract is unsatisfiable.
+    /// 6. the THREE propositions this file has shipped and retired — "the
+    ///    target was replaced", "nothing was freed on disk" and (r18, E2)
+    ///    "the Trash holds what it took" — are established by NO cause, and
+    ///    their contract is unsatisfiable.
     ///
     /// None of (2)–(6) mentions a sentence, so a NEW false sentence fails
     /// without anyone having predicted its wording. MEASURED at 36cf469,
@@ -2959,6 +2961,12 @@ final class TrashDisposalHopProofTests: XCTestCase {
             XCTAssertFalse(
                 established.contains(.nothingWasFreedOnDisk),
                 "\(name): no arm counts bytes after the move"
+            )
+            XCTAssertFalse(
+                established.contains(.theTrashHoldsWhatItTook),
+                "\(name): a Trash mover returning without throwing does not "
+                    + "establish that anything went to the Trash — it may "
+                    + "have taken nothing (r18, E2)"
             )
 
             // (1) The message is the join and nothing else.
@@ -3049,7 +3057,8 @@ final class TrashDisposalHopProofTests: XCTestCase {
         where !used.contains(fact) {
             XCTAssertTrue(
                 fact == .nothingWasFreedOnDisk
-                    || fact == .theTargetWasReplaced,
+                    || fact == .theTargetWasReplaced
+                    || fact == .theTrashHoldsWhatItTook,
                 "\(fact.rawValue) is dead vocabulary — remove it or use it"
             )
         }
@@ -3124,6 +3133,99 @@ final class TrashDisposalHopProofTests: XCTestCase {
                 "\(name): \(described)"
             )
         }
+    }
+
+    /// **E2 — `.destinationUnknown` SENT THE USER TO THE TRASH FOR AN ITEM
+    /// STILL AT THE TARGET, SAME INODE** (PR #460 codex r18).
+    ///
+    /// The message ended "Check the Trash, and use permanent delete …", and
+    /// `established(for: .destinationUnknown)` POSITIVELY ENDORSED it through
+    /// `.theTrashHoldsWhatItTook` — the one row of the derivation table
+    /// inferred from an INJECTABLE SEAM's contract ("the mover is a Trash
+    /// disposal and it returned without throwing, so whatever it took went to
+    /// the Trash") rather than from anything this code READ. It begs the
+    /// question when the mover took nothing, and it is the identical
+    /// inference an earlier round falsified for `.lastSeenInTrash`.
+    ///
+    /// This cell is the falsification, on the event the cause is raised for:
+    /// a mover that PROVES, moves NOTHING, and reports NO landing. All four
+    /// Trash arms; the target's `st_ino` is captured before and asserted
+    /// after; the landing directory is asserted EMPTY of the item.
+    ///
+    /// REACHABILITY, ASSERTED HONESTLY IN THE CELL'S OWN NAME AND NOWHERE
+    /// DENIED: this uses an injected Mover. Through the shipped composition
+    /// `.destinationUnknown` needs `FileManager.trashItem` to SUCCEED with a
+    /// nil `resultingItemURL`, and nothing in this tree measures whether that
+    /// happens. That is the argument for DROPPING the claim rather than
+    /// re-deriving it: the drop is right under both outcomes.
+    ///
+    /// MUTATION: put `.theTrashHoldsWhatItTook` back in
+    /// `established(for: .destinationUnknown)` and restore the
+    /// `" Check the Trash,"` clause — this cell fails on every arm, and so
+    /// does the property fence's `theTrashHoldsWhatItTook` row.
+    func testTheUnknownDestinationMessageDoesNotSendTheUserToTheTrashForAnItemStillOnDisk()
+        async throws
+    {
+        let landings = try XCTUnwrap(self.landings)
+        let provider = FileSystemIdentityProvider()
+        let container = try makeCacheContainer()
+
+        for arm in TrashArm.allCases {
+            let name = "silent-landing-\(arm.rawValue)"
+            let target = container.appendingPathComponent(name)
+            if arm.targetIsADirectory {
+                try fm.createDirectory(
+                    at: target, withIntermediateDirectories: true
+                )
+                try Data("ours".utf8).write(
+                    to: target.appendingPathComponent("ours.txt")
+                )
+            } else {
+                try Data("ours".utf8).write(to: target)
+            }
+            let before = try XCTUnwrap(provider.identity(of: target))
+
+            let thrown = try await outcomeOfAMoverThatMovesNothing(
+                arm, of: target, reporting: nil, provider: provider
+            )
+            let failure = try XCTUnwrap(
+                thrown as? TrashDisposal.Failure,
+                "\(name): \(String(describing: thrown))"
+            )
+            XCTAssertEqual(failure.cause, .destinationUnknown, "\(name)")
+
+            // THE PREMISE, ASSERTED ON BOTH SIDES.
+            XCTAssertEqual(
+                provider.identity(of: target), before,
+                "\(name): the item must still be at the target, SAME INODE — "
+                    + "that is the whole of what makes the old clause false"
+            )
+            XCTAssertEqual(
+                try fm.contentsOfDirectory(atPath: landings.path)
+                    .filter { $0.contains(name) },
+                [],
+                "\(name): nothing of this item may be in the landing directory"
+            )
+
+            let described = try XCTUnwrap(failure.errorDescription)
+            XCTAssertFalse(
+                described.contains("Check the Trash"),
+                "\(name): the item is at \(target.path) at the same inode: "
+                    + "\(described)"
+            )
+            XCTAssertTrue(
+                described.contains("Where the item is now was NOT established"),
+                "\(name): \(described)"
+            )
+        }
+
+        // AND THE DERIVATION, OFF THE TYPE: the endorsement is gone too, not
+        // just the sentence it licensed.
+        XCTAssertFalse(
+            TrashDisposal.Failure.established(for: .destinationUnknown)
+                .contains(.theTrashHoldsWhatItTook),
+            "the fence must not endorse a placement this arm never read"
+        )
     }
 
     /// Re-points the landing INSIDE `rollBack`'s own re-bind — after the
@@ -3816,9 +3918,10 @@ final class TrashDisposalHopProofTests: XCTestCase {
     }
 
     /// Drive one of the four Trash arms with a mover that PROVES, moves
-    /// nothing, and reports `landed` anyway.
+    /// nothing, and reports `landed` anyway — or reports NOTHING, when
+    /// `landed` is `nil`, which is the `.destinationUnknown` shape (r18, E2).
     private func outcomeOfAMoverThatMovesNothing(
-        _ arm: TrashArm, of target: URL, reporting landed: URL,
+        _ arm: TrashArm, of target: URL, reporting landed: URL?,
         provider: FileSystemIdentityProvider
     ) async throws -> Error? {
         let parent = try admittedParent(of: target, provider: provider)

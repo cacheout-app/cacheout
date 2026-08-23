@@ -752,13 +752,27 @@ enum TrashDisposal {
     /// that open succeeds the descriptor-relative answer, including its
     /// `.absent`, is the only one used.
     ///
-    /// THE ARM THIS RESTORES PARITY WITH: `dispose(_:expecting:…)`'s
-    /// directory path has always identified the landing with `look`, which is
-    /// a DIRECT `open` of `url` and therefore never needed the Trash
-    /// directory. Only the arms that read the landing descriptor-relative —
-    /// the container-bound overload (the GUI's default worktree and
-    /// contents-mode disposal) and the `.nonDirectoryLeaf` arm — were
-    /// unusable without Full Disk Access.
+    /// THE SIBLING ARM, AND THE PARITY THIS HEADER CLAIMED IT ALREADY HAD
+    /// (corrected, PR #460 codex r12, D1). r11 wrote here that
+    /// `dispose(_:expecting:…)`'s directory path "has always identified the
+    /// landing with `look`, which is a DIRECT `open` of `url` and therefore
+    /// never needed the Trash directory", and offered that as the reason it
+    /// needed no gate. **Never needing the permission is not the same fact as
+    /// being sound**: a direct open of the whole path was the SAME
+    /// resolution-through-a-symlinked-container this gate exists to refuse,
+    /// because `O_NOFOLLOW` guards only the FINAL component. The false
+    /// success was reproduced on that arm at 93d6198
+    /// (`testTheDirectoryVerdictArmRefusesASymlinkedLandingContainer`), and
+    /// `look` now resolves the name inside its container with the same
+    /// permission-class fallback this function carries. The two arms are at
+    /// parity because both were fixed, not because one never had the defect.
+    ///
+    /// What r10's D1 broke remains as stated: only the arms that read the
+    /// landing descriptor-relative — the container-bound overload (the GUI's
+    /// default worktree and contents-mode disposal) and the
+    /// `.nonDirectoryLeaf` arm — were unusable without Full Disk Access. The
+    /// directory arm reached the landing by path, which TCC permits, so its
+    /// fallback is what keeps it working rather than what restored it.
     static func facts(
         at url: URL, provider: FileSystemIdentityProvider
     ) -> FileSystemIdentityProvider.ChildFacts? {
@@ -876,8 +890,120 @@ enum TrashDisposal {
     /// INODE — the same shape `DepthSafeRemoval.remove` uses, for the same
     /// reason: a gate beside an open is a swap window by construction, and an
     /// `lstat` of a path is a second resolution of a name anyone can re-point.
+    ///
+    /// ## THE OPEN IS DESCRIPTOR-RELATIVE (PR #460 codex r12, D1)
+    ///
+    /// Through r11 this was ONE path-spelled
+    /// `open(url.path, O_RDONLY|O_DIRECTORY|O_NOFOLLOW)`, and r11's own
+    /// header called that the safe end of the trade it made in `facts`,
+    /// "a DIRECT `open` of `url` [which] therefore never needed the Trash
+    /// directory". **It is the same unsoundness one call away.**
+    /// `O_NOFOLLOW` guards only the FINAL component, so that open FOLLOWS a
+    /// symlinked landing CONTAINER exactly as `probeLeaf`'s `lstat` did — and
+    /// `dispose(_:expecting:…)`'s directory arm identified the landing with
+    /// it.
+    ///
+    /// MEASURED at 93d6198, production provider, real symlink, in
+    /// `TrashDisposalHopProofTests.testTheDirectoryVerdictArmRefusesASymlinkedLandingContainer`:
+    /// a mover that moves NOTHING and reports a landing whose parent is a
+    /// symlink aimed back at the item's own container made this open resolve
+    /// through the link onto the ORIGINAL object, hand back the identity the
+    /// verdict names, and `dispose` RETURNED NORMALLY with `victim` still on
+    /// disk — a disposal that reported success having moved nothing.
+    ///
+    /// So the name is now resolved INSIDE its container: one
+    /// `openDirectoryNoFollowCarryingErrno` of the container, one
+    /// `openChildDirectoryCarryingErrno` of the single component under the
+    /// held descriptor. Both carry `O_NOFOLLOW`, so a symlink at EITHER level
+    /// is a refusal rather than a resolution, and the identity still comes
+    /// off the opened inode — which is what the rollback's
+    /// `identity(ofDescriptor:)` seam and its `.unidentifiable` arm depend
+    /// on, and why this is not `facts`' `probeChild`.
+    ///
+    /// ## AND THE PERMISSION CLASS IS STILL ANSWERED
+    ///
+    /// `~/.Trash` is TCC-denied to every process without Full Disk Access
+    /// (measured in `facts`: `EPERM` on the directory, traversal THROUGH it
+    /// permitted). The path-spelled open never needed that permission, so
+    /// this arm was never broken the way r10's D1 broke the others — and a
+    /// descriptor-relative rewrite without a fallback would have broken it
+    /// for the first time. `EPERM`/`EACCES` on the CONTAINER open therefore
+    /// fall back to the path-spelled open, under the identical bound `facts`
+    /// carries: reaching either code means the container's last component IS
+    /// a real directory that `O_NOFOLLOW` accepted (a symlink there answers
+    /// `ENOTDIR`/`ELOOP` first, measured), so the fallback resolves no link
+    /// this open refused, and its identity is only ever compared for EQUALITY
+    /// against one bound before the move. Every other failure refuses.
+    ///
+    /// Both directions are evidenced, and each by its own cell:
+    /// `…IdentifiesAnUnopenableLanding` (`EPERM` must SUCCEED),
+    /// `…IdentifiesAModeDeniedLanding` (`EACCES` must SUCCEED),
+    /// `…RefusesASymlinkedLandingContainer` and
+    /// `…RefusesALandingThatIsNotADirectory` (must REFUSE).
     static func look(
         at url: URL, provider: FileSystemIdentityProvider
+    ) -> Sighting {
+        let name = url.lastPathComponent
+        // A PRECONDITION, DISCLOSED AS ONE RATHER THAN DRESSED AS A GUARD —
+        // the same disclosure `rollBack` makes about the same primitive. A
+        // MULTI-COMPONENT name would defeat the whole no-follow guarantee
+        // (`O_NOFOLLOW` guards only the last component of whatever `openat`
+        // is handed, measured in `probeChild`'s header). No URL that reaches
+        // `look` can violate it — `target` comes from an admitted item and
+        // `landed` from the mover — so NO CELL FAILS when this is deleted
+        // (mutation-tested against the 389-test trash scope: 0 red). It is
+        // the family's documented contract, restated where it is called.
+        guard FileSystemIdentityProvider.isSafeComponent(name) else {
+            return .unreadable(errno: EINVAL)
+        }
+        switch provider.openDirectoryNoFollowCarryingErrno(
+            at: url.deletingLastPathComponent()
+        ) {
+        case .opened(let container):
+            defer { close(container) }
+            return look(named: name, inDirectory: container,
+                        logical: url, provider: provider)
+        case .failed(let code):
+            // THE CONTAINER IS GONE. Nothing can stand inside a directory
+            // that is not there, and no name was resolved to establish it —
+            // so this is the same `.absent` the path-spelled open produced,
+            // and it is unspoofable for the same reason (an `ENOENT` cannot
+            // come from following anything).
+            if code == ENOENT { return .absent }
+            // THE PERMISSION CLASS ONLY — see the header. Every other cause,
+            // `ENOTDIR`/`ELOOP` on a symlinked container above all, is this
+            // open refusing to resolve something, and a path-spelled open
+            // must not be used to answer around it.
+            guard code == EPERM || code == EACCES else {
+                return .unreadable(errno: code)
+            }
+            return lookAlongThePath(url, provider: provider)
+        }
+    }
+
+    /// The single component `name`, opened under the HELD container.
+    private static func look(
+        named name: String, inDirectory container: Int32,
+        logical url: URL, provider: FileSystemIdentityProvider
+    ) -> Sighting {
+        switch provider.openChildDirectoryCarryingErrno(
+            inDirectory: container, named: name, logical: url
+        ) {
+        case .opened(let fd):
+            defer { close(fd) }
+            guard let identity = provider.identity(ofDescriptor: fd) else {
+                return .unidentifiable
+            }
+            return .directory(identity)
+        case .failed(let code):
+            return sighting(forOpenFailure: code)
+        }
+    }
+
+    /// The path-spelled open — the WHOLE of `look` through r11, kept as the
+    /// permission-class fallback and reachable from nowhere else.
+    private static func lookAlongThePath(
+        _ url: URL, provider: FileSystemIdentityProvider
     ) -> Sighting {
         // The errno is READ INSIDE the closure, next to the call that set it
         // — the same discipline as
@@ -893,20 +1019,27 @@ enum TrashDisposal {
             if descriptor < 0 { code = errno }
             return descriptor
         }
-        guard fd >= 0 else {
-            switch code {
-            case ENOENT: return .absent
-            // ENOTDIR/ELOOP: something that is NOT a directory tree stands
-            // here. That is exactly what `.noDirectoryTree` is about.
-            case ENOTDIR, ELOOP: return .noDirectoryTree
-            default: return .unreadable(errno: code)
-            }
-        }
+        guard fd >= 0 else { return sighting(forOpenFailure: code) }
         defer { close(fd) }
         guard let identity = provider.identity(ofDescriptor: fd) else {
             return .unidentifiable
         }
         return .directory(identity)
+    }
+
+    /// The ONE errno taxonomy both opens above are read through, so the
+    /// descriptor-relative arm and its fallback can never classify the same
+    /// failure differently.
+    private static func sighting(forOpenFailure code: Int32) -> Sighting {
+        switch code {
+        case ENOENT: return .absent
+        // ENOTDIR/ELOOP: something that is NOT a directory tree stands here.
+        // That is exactly what `.noDirectoryTree` is about. (`O_DIRECTORY`
+        // makes a symlink answer ENOTDIR before O_NOFOLLOW's ELOOP on this
+        // OS — measured, and both are named so neither OS is a surprise.)
+        case ENOTDIR, ELOOP: return .noDirectoryTree
+        default: return .unreadable(errno: code)
+        }
     }
 
     /// Why `sighting` does NOT satisfy `inspected` — `nil` when it does.

@@ -553,6 +553,327 @@ final class TrashDisposalHopProofTests: XCTestCase {
         )
     }
 
+    // ================================================================
+    // MARK: - THE SAME QUESTION, ON THE SIBLING ARM (PR #460 codex r12, D1)
+    // ================================================================
+
+    /// **THE BLOCKER r11 CLOSED IN ONE ARM AND LEFT OPEN IN ITS SIBLING.**
+    ///
+    /// r11 bounded `TrashDisposal.facts`'s `probeLeaf` fallback to the
+    /// permission class, and its own header then asserted that the
+    /// verdict-bound arm was already safe because `look` "is a DIRECT `open`
+    /// of `url` and therefore never needed the Trash directory". A direct
+    /// open of the whole path is not the safe end of that trade — it is the
+    /// SAME unsoundness one call away. **`O_NOFOLLOW` guards only the FINAL
+    /// component**, so `open(landed.path, O_RDONLY|O_DIRECTORY|O_NOFOLLOW)`
+    /// FOLLOWS a symlinked landing CONTAINER exactly as `probeLeaf`'s `lstat`
+    /// did.
+    ///
+    /// The fixture is r11's, aimed at the other entry point: the mover moves
+    /// NOTHING and reports a landing whose parent is a symlink pointing back
+    /// at the item's own container, so the resolution finds the ORIGINAL
+    /// object still standing at its original path and hands back the very
+    /// identity the verdict names.
+    ///
+    /// MEASURED at 93d6198, with the pre-r12 `look` (one path-spelled
+    /// `open`): `dispose` RETURNS NORMALLY, `victim` is still on disk with
+    /// its contents, and the caller reports the item freed — a disposal that
+    /// reports success having moved nothing. Nothing is mocked: the provider
+    /// is the production one, the link is a real symlink, the errno is the
+    /// kernel's.
+    func testTheDirectoryVerdictArmRefusesASymlinkedLandingContainer()
+        async throws
+    {
+        let provider = FileSystemIdentityProvider()
+        let container = base.appendingPathComponent("verdict-container")
+        try fm.createDirectory(at: container, withIntermediateDirectories: true)
+        let target = container.appendingPathComponent("victim")
+        try fm.createDirectory(at: target, withIntermediateDirectories: true)
+        try Data("ours".utf8).write(
+            to: target.appendingPathComponent("ours.txt")
+        )
+        let identity = try XCTUnwrap(provider.identity(of: target))
+        let parent = try admittedParent(of: target, provider: provider)
+
+        let link = base.appendingPathComponent("verdict-link")
+        try fm.createSymbolicLink(at: link, withDestinationURL: container)
+        let landed = link.appendingPathComponent(target.lastPathComponent)
+
+        // THE PREMISE, ASSERTED RATHER THAN ASSUMED. The container open
+        // refuses the link (ENOTDIR — `O_DIRECTORY` answers before
+        // `O_NOFOLLOW`'s ELOOP, measured in the sibling cell above), and the
+        // whole-path open the old `look` performed walks straight through it
+        // and identifies the ORIGINAL object.
+        XCTAssertEqual(
+            provider.openDirectoryNoFollowCarryingErrno(at: link),
+            .failed(errno: ENOTDIR),
+            "the container open must refuse the link"
+        )
+        let throughTheLink = open(
+            landed.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+        )
+        XCTAssertGreaterThanOrEqual(
+            throughTheLink, 0,
+            "the path-spelled open must SUCCEED through the link — that is "
+                + "what makes the old `look` unsound"
+        )
+        if throughTheLink >= 0 {
+            XCTAssertEqual(
+                provider.identity(ofDescriptor: throughTheLink), identity,
+                "…and it must land on the ORIGINAL object, whose identity is "
+                    + "exactly the one the verdict names"
+            )
+            close(throughTheLink)
+        }
+
+        let log = MoveLog()
+        var thrown: Error?
+        do {
+            try await TrashDisposal.dispose(
+                target, expecting: .directory(identity), provider: provider,
+                containedIn: parent,
+                via: { url, prove in
+                    try prove()
+                    // MOVES NOTHING and reports a landing anyway.
+                    log.record(url)
+                    return landed
+                }
+            )
+        } catch {
+            thrown = error
+        }
+
+        let failure = try XCTUnwrap(
+            thrown as? TrashDisposal.Failure,
+            "a landing whose container cannot be opened NO-FOLLOW must be "
+                + "refused on THIS arm too, not resolved through the link: "
+                + "\(String(describing: thrown))"
+        )
+        XCTAssertEqual(failure.cause, .lastSeenInTrash(landed.path))
+        XCTAssertEqual(log.urls.map(\.path), [target.path],
+                       "the mover was driven exactly once")
+        XCTAssertTrue(
+            fm.fileExists(atPath: target.appendingPathComponent("ours.txt").path),
+            "nothing was moved — which is precisely why reporting success "
+                + "would have been a lie"
+        )
+    }
+
+    /// THE OTHER DIRECTION, AND THE REASON THE FIX IS NOT SIMPLY "REFUSE
+    /// WHAT CANNOT BE OPENED": `EPERM` is what TCC answers for `~/.Trash` on
+    /// every machine without Full Disk Access, and this arm must still
+    /// identify the item it really moved.
+    ///
+    /// Before r12 this arm reached the landing with one path open, which TCC
+    /// permits, so it was never broken the way r10's D1 broke the others —
+    /// and a descriptor-relative rewrite WITHOUT the permission-class
+    /// fallback would have broken it for the first time. That is what this
+    /// cell holds.
+    ///
+    /// MUTATION: delete the permission-class fallback in `look` and this cell
+    /// fails with `.strandedInTrash`.
+    func testTheDirectoryVerdictArmIdentifiesAnUnopenableLanding()
+        async throws
+    {
+        try await assertTheDirectoryVerdictArmDisposesUnder(errno: EPERM,
+                                                            named: "victim-dv-eperm")
+    }
+
+    /// The mode-bit spelling of the same fact about the same open — the
+    /// second member of the permitted class, evidenced rather than assumed
+    /// (the sibling arm's `testAModeDeniedLandingIsIdentifiedRatherThanRefused`).
+    ///
+    /// MUTATION: narrow `look`'s fallback guard to `code == EPERM` and this
+    /// cell alone fails, with `.strandedInTrash`.
+    func testTheDirectoryVerdictArmIdentifiesAModeDeniedLanding()
+        async throws
+    {
+        try await assertTheDirectoryVerdictArmDisposesUnder(errno: EACCES,
+                                                            named: "victim-dv-eacces")
+    }
+
+    private func assertTheDirectoryVerdictArmDisposesUnder(
+        errno failing: Int32, named name: String
+    ) async throws {
+        let landings = try XCTUnwrap(self.landings)
+        let provider = TrashDeniedProvider(denying: landings, with: failing)
+        let target = base.appendingPathComponent(name)
+        try fm.createDirectory(at: target, withIntermediateDirectories: true)
+        try Data("ours".utf8).write(
+            to: target.appendingPathComponent("ours.txt")
+        )
+        let identity = try XCTUnwrap(provider.identity(of: target))
+        let parent = try admittedParent(of: target, provider: provider)
+        let fileManager = fm
+        let landed = landings.appendingPathComponent(target.lastPathComponent)
+
+        try await TrashDisposal.dispose(
+            target, expecting: .directory(identity), provider: provider,
+            containedIn: parent,
+            via: { url, prove in
+                try prove()
+                try fileManager.moveItem(at: url, to: landed)
+                return landed
+            }
+        )
+
+        XCTAssertGreaterThan(
+            provider.refusals, 0,
+            "the cell must actually have exercised the denied open"
+        )
+        XCTAssertFalse(fm.fileExists(atPath: target.path),
+                       "the disposal really moved it")
+        XCTAssertTrue(
+            fm.fileExists(
+                atPath: landed.appendingPathComponent("ours.txt").path
+            ),
+            "…and it is in the landing, intact"
+        )
+    }
+
+    /// AND THE PERMITTED CLASS IS NOT A SKIPPED PROOF ON THIS ARM EITHER: the
+    /// same unopenable landing, with a stranger swapped in after the far-side
+    /// proof, is still caught. `.strandedInTrash` because the rollback cannot
+    /// open the Trash to move it back — but it IS there, and the cause names
+    /// the path.
+    func testTheDirectoryVerdictArmStillCatchesAStrangerUnderADeniedLanding()
+        async throws
+    {
+        let landings = try XCTUnwrap(self.landings)
+        let provider = TrashDeniedProvider(denying: landings)
+        let target = base.appendingPathComponent("victim-dv-stranger")
+        try fm.createDirectory(at: target, withIntermediateDirectories: true)
+        try Data("ours".utf8).write(
+            to: target.appendingPathComponent("ours.txt")
+        )
+        let identity = try XCTUnwrap(provider.identity(of: target))
+        let parent = try admittedParent(of: target, provider: provider)
+        let fileManager = fm
+        let landed = landings.appendingPathComponent(target.lastPathComponent)
+
+        var thrown: Error?
+        do {
+            try await TrashDisposal.dispose(
+                target, expecting: .directory(identity), provider: provider,
+                containedIn: parent,
+                via: { url, prove in
+                    try prove()
+                    try self.swapInAStranger(at: url, directory: true)
+                    try fileManager.moveItem(at: url, to: landed)
+                    return landed
+                }
+            )
+        } catch {
+            thrown = error
+        }
+
+        let failure = try XCTUnwrap(
+            thrown as? TrashDisposal.Failure,
+            "an object that is not ours must be refused even when the "
+                + "landing cannot be opened: \(String(describing: thrown))"
+        )
+        XCTAssertEqual(failure.cause, .strandedInTrash(landed.path))
+        XCTAssertTrue(
+            fm.fileExists(
+                atPath: landed.appendingPathComponent("their-work.txt").path
+            ),
+            "the stranger is where the refusal says it is"
+        )
+    }
+
+    /// THE KIND GATE SURVIVES THE REWRITE. `look`'s gate WAS the
+    /// `O_DIRECTORY` open of the path; it is now the `O_DIRECTORY` `openat`
+    /// of the NAME under the held container, and a landing that is a regular
+    /// file must still be `.noDirectoryTree` rather than an identified
+    /// object.
+    ///
+    /// Green before r12 as well as after — it is the control that stops the
+    /// descriptor-relative rewrite from reading the identity of a
+    /// non-directory and calling it a match.
+    func testTheDirectoryVerdictArmRefusesALandingThatIsNotADirectory()
+        async throws
+    {
+        let landings = try XCTUnwrap(self.landings)
+        let provider = FileSystemIdentityProvider()
+        let target = base.appendingPathComponent("victim-dv-file")
+        try fm.createDirectory(at: target, withIntermediateDirectories: true)
+        try Data("ours".utf8).write(
+            to: target.appendingPathComponent("ours.txt")
+        )
+        let identity = try XCTUnwrap(provider.identity(of: target))
+        let parent = try admittedParent(of: target, provider: provider)
+        let landed = landings.appendingPathComponent("a-plain-file")
+        try Data("not a tree".utf8).write(to: landed)
+
+        var thrown: Error?
+        do {
+            try await TrashDisposal.dispose(
+                target, expecting: .directory(identity), provider: provider,
+                containedIn: parent,
+                via: { _, prove in
+                    try prove()
+                    return landed
+                }
+            )
+        } catch {
+            thrown = error
+        }
+
+        let failure = try XCTUnwrap(
+            thrown as? TrashDisposal.Failure,
+            "a landing that is not a directory tree cannot satisfy a "
+                + "`.directory` verdict: \(String(describing: thrown))"
+        )
+        XCTAssertEqual(failure.cause, .lastSeenInTrash(landed.path))
+        XCTAssertTrue(
+            fm.fileExists(atPath: target.appendingPathComponent("ours.txt").path),
+            "nothing was moved"
+        )
+    }
+
+    /// AN ABSENT CONTAINER IS STILL AN ABSENCE, NOT AN UNREADABLE LOOK — the
+    /// arm the descriptor-relative rewrite had to ADD, because one
+    /// path-spelled open answered `ENOENT` for a missing name and a missing
+    /// container alike and a two-step open does not.
+    ///
+    /// The contract is `proveStanding`'s frozen ghost-target behaviour: an
+    /// absence SATISFIES a `.noDirectoryTree` verdict on the way in and
+    /// proves nothing on the way out.
+    /// `OrphanedCachesScannerTests.testAnAbsenceProvesTheVerdictBeforeTheDisposalOnly`
+    /// pins that for a ghost inside an EXISTING container; nothing pinned it
+    /// when the CONTAINER is the thing that is gone, which is the only case
+    /// the rewrite could have changed.
+    ///
+    /// MUTATION: delete the `code == ENOENT` arm in `look` and this cell
+    /// alone fails — `.unreadable(2)` instead of `.absent`, and the standing
+    /// proof throws `.posix(2)` about a target whose absence is exactly what
+    /// the verdict says.
+    func testALookInsideAContainerThatIsGoneIsStillAnAbsence() throws {
+        let provider = FileSystemIdentityProvider()
+        let ghost = base
+            .appendingPathComponent("a-container-that-never-existed")
+            .appendingPathComponent("ghost")
+
+        XCTAssertEqual(
+            TrashDisposal.look(at: ghost, provider: provider), .absent,
+            "a name inside a container that is not there is ABSENT, and no "
+                + "resolution happened to establish it"
+        )
+        XCTAssertNoThrow(
+            try TrashDisposal.proveStanding(
+                .noDirectoryTree, at: ghost, provider: provider
+            ),
+            "an absent target still satisfies a verdict about an ABSENCE, "
+                + "whether the NAME or its whole CONTAINER is what is gone"
+        )
+        XCTAssertThrowsError(
+            try TrashDisposal.proveTaken(
+                .noDirectoryTree, at: ghost, provider: provider
+            ),
+            "…and still proves nothing on the way out"
+        )
+    }
+
     // MARK: - The control: an UNDISTURBED hop still disposes
 
     func testAnUndisturbedHopStillDisposesOnEveryArm() async throws {

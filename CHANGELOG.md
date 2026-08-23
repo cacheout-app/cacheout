@@ -616,7 +616,15 @@ below are both part of that coordination, and the latter BLOCKS this release.
   object on the other side of the link and report a move that never
   happened. When such a refusal happens without Full Disk Access the item
   cannot be moved back automatically, and the message now says where it is
-  instead of denying it is there.
+  instead of denying it is there. **The same symbolic-link rule now covers
+  every kind of item.** Folders whose contents were checked before the move
+  were re-identified by their full path instead, which followed a symbolic
+  link standing in for the Trash folder just the same — and because such a
+  link can be aimed back at the item's own folder, the check could find the
+  original item exactly where it started, agree that it was the right one,
+  and report the folder as freed when nothing had moved at all. That path is
+  now read the same way as the others, so the link is refused rather than
+  followed and no disposal can report a move that did not happen.
 - **A background refresh no longer reads the folders it has already decided
   to skip.** The ephemeral-temp scanner runs only when you ask for a scan, but
   before each scan Cacheout records the identity of every folder it might

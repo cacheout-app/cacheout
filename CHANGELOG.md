@@ -799,15 +799,25 @@ below are both part of that coordination, and the latter BLOCKS this release.
   reported. **Both of those need Full Disk Access, and neither sentence
   above said so.** Putting an item back means opening the Trash folder, and macOS
   refuses that to any app without Full Disk Access — which Cacheout does not
-  ask for and does not have by default. So on an ordinary Mac the undo stops
-  one step earlier than either sentence above describes, under EITHER
-  spelling: nothing is put back, the item stays in the Trash, and the message
-  is the one that gives you its path so you can drag it back in one move.
-  Measured through the shipped Trash seam into the real Trash, on all four
-  Move to Trash paths, eight runs out of eight. What is fixed for everyone is
-  that the move itself still succeeds and the message names where the item
-  is; what is fixed only once you grant Full Disk Access is the automatic
-  put-back and the "folder that holds this item" refusal.
+  ask for and does not have by default. So for an item on your STARTUP VOLUME
+  the undo stops one step earlier than either sentence above describes, under
+  EITHER spelling: nothing is put back, the item stays in the Trash, and the
+  message is the one that gives you its path so you can drag it back in one
+  move. Measured through the shipped Trash seam into the real Trash, on all
+  four Move to Trash paths, eight runs out of eight. What is fixed for
+  everyone is that the move itself still succeeds and the message names where
+  the item is; what is fixed only once you grant Full Disk Access is the
+  automatic put-back and the "folder that holds this item" refusal.
+  **And that is a fact about the STARTUP VOLUME, not about Cacheout: the
+  paragraph above once said it of every item, and for items on any other
+  disk it is false.** macOS gives each mounted volume its own Trash, and only
+  the one in your home folder is protected. An item cleaned from an external
+  drive, a disk image or any other mounted volume goes to that volume's own
+  Trash, which any app may open — so on those volumes the automatic put-back
+  and the "folder that holds this item" refusal both work with no Full Disk
+  Access at all. Measured on a temporary disk image, all four Move to Trash
+  paths, eight runs out of eight, with the home Trash still refused in the
+  same process.
 - **A folder that is simply GONE is no longer reported as one somebody
   replaced.** If an item vanishes between the safety check and the deletion —
   an ordinary race with an installer, an uninstaller or a synced folder —

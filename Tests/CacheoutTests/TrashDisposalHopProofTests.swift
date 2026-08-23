@@ -3018,12 +3018,26 @@ final class TrashDisposalHopProofTests: XCTestCase {
     /// PARENT is freely openable and `~/.Trash` is not.
     ///
     /// `rollBack` returns at its FIRST guard —
-    /// `provider.openDirectoryNoFollow(~/.Trash)`, three statements BEFORE the
-    /// destination open D-P1 moved — and that open is EPERM on every machine
-    /// without Full Disk Access (measured; see `facts` and the r10 D1 note).
-    /// So `.putBack`, `.putBackTookAnotherObject` and
-    /// `.destinationNotTheAdmittedContainer` are ALL UNREACHABLE for the
-    /// default user, under either container spelling.
+    /// `provider.openDirectoryNoFollow(landed.deletingLastPathComponent())`,
+    /// three statements BEFORE the destination open D-P1 moved — and for an
+    /// item on the HOME VOLUME that directory is `~/.Trash`, which is EPERM
+    /// on every machine without Full Disk Access (measured; see `facts` and
+    /// the r10 D1 note). So for home-volume items `.putBack`,
+    /// `.putBackTookAnotherObject` and `.destinationNotTheAdmittedContainer`
+    /// are unreachable for the default user, under either container spelling.
+    ///
+    /// **AND ONLY FOR HOME-VOLUME ITEMS — THE SENTENCE ABOVE USED TO OMIT
+    /// THAT AND WAS THEREFORE FALSE FOR EVERY OTHER VOLUME** (PR #460 codex
+    /// r17, M2). The open is of the LANDING's container, and the Trash
+    /// `FileManager.trashItem` picks is per volume: an item on any other
+    /// mounted volume lands in `<volume>/.Trashes/<uid>`, which TCC does not
+    /// gate at all, so the undo runs to completion with no Full Disk Access
+    /// anywhere. This cell cannot see that, because it uses no volume fixture
+    /// — every landing it makes is in the home Trash by construction. Its
+    /// counterpart `…ANonHomeVolumeUndoPutsTheItemBackWithoutFullDiskAccess`
+    /// measures the other half on a temporary APFS disk image, and reaches
+    /// `.putBack` and `.destinationNotTheAdmittedContainer` on all four arms
+    /// with `~/.Trash` still denied.
     ///
     /// THIS CELL IS THE ONE THAT CANNOT BE FOOLED BY A FIXTURE: no
     /// `trashHandler` is injected, the mover is the shipped
@@ -3211,6 +3225,301 @@ final class TrashDisposalHopProofTests: XCTestCase {
             XCTAssertNotEqual(
                 lstat(landing.path, &probe), 0,
                 "\(name): this cell's own leaving must be gone from the Trash"
+            )
+        }
+    }
+
+    // ================================================================
+    // MARK: - AND THE SAME QUESTION ON A VOLUME THAT IS NOT HOME (r17, M2)
+    // ================================================================
+
+    /// Run `tool` to completion and answer its exit status.
+    ///
+    /// `waitForExit(within:)` rather than `waitUntilExit()`: this suite
+    /// spawns and reaps processes concurrently, and `waitUntilExit` can miss
+    /// its termination wakeup under exactly that load (see the extension's
+    /// own note in `CacheCategory.swift`).
+    private static func run(_ tool: String, _ arguments: [String]) -> Int32 {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: tool)
+        process.arguments = arguments
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        do { try process.run() } catch { return -1 }
+        guard process.waitForExit(within: 120) else {
+            process.terminate()
+            return -1
+        }
+        return process.terminationStatus
+    }
+
+    /// Drive ONE of the four Trash arms at `target`, and answer what it threw.
+    private func disposeThroughTheArm(
+        _ arm: TrashArm, of target: URL,
+        containedIn parent: DepthSafeRemoval.AdmittedParent,
+        provider: FileSystemIdentityProvider,
+        via mover: @escaping TrashDisposal.Mover
+    ) async throws -> Error? {
+        do {
+            switch arm {
+            case .noVerdict:
+                try await TrashDisposal.dispose(
+                    target, containedIn: parent, provider: provider, via: mover
+                )
+            case .noDirectoryTree:
+                try await TrashDisposal.dispose(
+                    target, expecting: .noDirectoryTree, provider: provider,
+                    containedIn: parent, via: mover
+                )
+            case .nonDirectoryLeaf:
+                let identity = try XCTUnwrap(provider.identity(of: target))
+                try await TrashDisposal.dispose(
+                    target, expecting: .nonDirectoryLeaf(identity),
+                    provider: provider, containedIn: parent, via: mover
+                )
+            case .directory:
+                let identity = try XCTUnwrap(provider.identity(of: target))
+                try await TrashDisposal.dispose(
+                    target, expecting: .directory(identity),
+                    provider: provider, containedIn: parent, via: mover
+                )
+            }
+        } catch {
+            return error
+        }
+        return nil
+    }
+
+    /// **M2 — A-P3's REACHABILITY CLAIM IS FALSE FOR EVERY ITEM THAT IS NOT
+    /// ON THE HOME VOLUME** (PR #460 codex r17).
+    ///
+    /// A-P3 measured `~/.Trash`, found it EPERM without Full Disk Access, and
+    /// published the finding as "`.putBack`, `.putBackTookAnotherObject` and
+    /// `.destinationNotTheAdmittedContainer` are ALL UNREACHABLE for the
+    /// default user". THE PERMISSION IS NOT THE POPULATION. `rollBack` opens
+    /// `landed.deletingLastPathComponent()`, and that directory is `~/.Trash`
+    /// only for items that live on the HOME volume. For an item on any other
+    /// mounted volume `FileManager.trashItem` lands it in
+    /// `<volume>/.Trashes/<uid>` — a directory TCC does not gate at all — so
+    /// the undo runs to completion with no Full Disk Access anywhere in
+    /// sight. A-P3's own cell could not see this because it uses no volume
+    /// fixture: every landing it produces is in the home Trash by
+    /// construction.
+    ///
+    /// THIS CELL IS THE OTHER HALF OF THAT MEASUREMENT, taken in the SAME
+    /// process and the same run as A-P3's: no `trashHandler` is injected, the
+    /// mover is the shipped `FileManager.trashItem` inside the production
+    /// main-actor hop, and the landing is whatever the real Trash mechanism
+    /// picks for a temporary APFS disk image attached under this test's own
+    /// directory. It first asserts that `~/.Trash` really is closed to this
+    /// process (skipping if the machine HAS Full Disk Access, because then
+    /// both rows coincide and there is no split to show), then measures both
+    /// rows the corrected claim names:
+    ///
+    /// * `.putBack` — the ordinary swap, all four arms;
+    /// * `.destinationNotTheAdmittedContainer` — the container replaced after
+    ///   the move, all four arms.
+    ///
+    /// Two of the three causes A-P3 called unreachable, reached, with the
+    /// permission A-P3 measured still denied.
+    ///
+    /// TRASH HYGIENE: nothing here goes near the user's Trash. Every landing
+    /// is inside the disk image, which is detached and deleted in teardown.
+    func testANonHomeVolumeUndoPutsTheItemBackWithoutFullDiskAccess()
+        async throws
+    {
+        let provider = FileSystemIdentityProvider()
+
+        // (0) THE PERMISSION A-P3 MEASURED, READ THROUGH THE SAME CALL
+        // `rollBack` MAKES. If it is OPEN this machine has Full Disk Access
+        // and the two rows coincide, so there is nothing to separate.
+        let homeTrash = fm.homeDirectoryForCurrentUser
+            .appendingPathComponent(".Trash")
+        let homeFD = provider.openDirectoryNoFollow(at: homeTrash)
+        if homeFD >= 0 { close(homeFD) }
+        try XCTSkipIf(
+            homeFD >= 0,
+            "Full Disk Access is granted here: A-P3's row and this one "
+                + "coincide, so the split by volume cannot be measured"
+        )
+
+        // (1) A REAL SECOND VOLUME, mounted inside this test's own directory.
+        let image = base.appendingPathComponent("r17-m2.dmg")
+        let mount = base.appendingPathComponent("r17-m2-volume")
+        try fm.createDirectory(at: mount, withIntermediateDirectories: true)
+        guard Self.run("/usr/bin/hdiutil", [
+            "create", "-size", "16m", "-fs", "APFS", "-volname",
+            "CacheoutR17M2", "-type", "UDIF", "-quiet", image.path,
+        ]) == 0 else { throw XCTSkip("hdiutil create unavailable") }
+        guard Self.run("/usr/bin/hdiutil", [
+            "attach", image.path, "-mountpoint", mount.path,
+            "-nobrowse", "-noverify", "-quiet",
+        ]) == 0 else { throw XCTSkip("hdiutil attach unavailable") }
+        addTeardownBlock {
+            _ = Self.run("/usr/bin/hdiutil", ["detach", mount.path, "-force"])
+        }
+        let volumeTrash = mount.appendingPathComponent(".Trashes")
+            .appendingPathComponent("\(getuid())")
+
+        // ---- ROW ONE: the ordinary swap. A-P3 says `.strandedInTrash`;
+        // off the home volume it is `.putBack`, on every arm.
+        for arm in TrashArm.allCases {
+            let container = mount
+                .appendingPathComponent("box-putback-\(arm.rawValue)")
+            try fm.createDirectory(
+                at: container, withIntermediateDirectories: true
+            )
+            let name = "putback-\(arm.rawValue)"
+            let target = container.appendingPathComponent(name)
+            let directory = arm.targetIsADirectory
+            if directory {
+                try fm.createDirectory(
+                    at: target, withIntermediateDirectories: true
+                )
+                try Data("ours".utf8).write(
+                    to: target.appendingPathComponent("ours.txt")
+                )
+            } else {
+                try Data("ours".utf8).write(to: target)
+            }
+            let parent = try admittedParent(of: target, provider: provider)
+
+            let mover: TrashDisposal.Mover = { url, prove in
+                try await MainActor.run {
+                    try prove()
+                    let manager = FileManager.default
+                    try manager.removeItem(at: url)
+                    if directory {
+                        try manager.createDirectory(
+                            at: url, withIntermediateDirectories: true
+                        )
+                        try Data("stranger".utf8).write(
+                            to: url.appendingPathComponent("their-work.txt")
+                        )
+                    } else {
+                        try Data("stranger".utf8).write(to: url)
+                    }
+                    var landed: NSURL?
+                    try manager.trashItem(at: url, resultingItemURL: &landed)
+                    return landed as URL?
+                }
+            }
+
+            let thrown = try await disposeThroughTheArm(
+                arm, of: target, containedIn: parent, provider: provider,
+                via: mover
+            )
+            let failure = try XCTUnwrap(
+                thrown as? TrashDisposal.Failure,
+                "\(name): \(String(describing: thrown))"
+            )
+            XCTAssertEqual(
+                failure.cause, .putBack,
+                "\(name): the volume's own .Trashes IS openable, so "
+                    + "`rollBack` runs past the guard that ends A-P3's row"
+            )
+            XCTAssertTrue(
+                fm.fileExists(atPath: target.path),
+                "\(name): the object the Trash took is back at the target"
+            )
+            XCTAssertFalse(
+                fm.fileExists(
+                    atPath: volumeTrash.appendingPathComponent(name).path
+                ),
+                "\(name): and it is no longer in the volume's Trash"
+            )
+        }
+
+        // (2) THE FACT THAT MAKES THE SPLIT, read side by side: the home
+        // Trash is closed to this process (asserted at (0)) and the volume's
+        // is not. `.Trashes/<uid>` exists now — row one created it.
+        let volumeFD = provider.openDirectoryNoFollow(at: volumeTrash)
+        XCTAssertGreaterThanOrEqual(
+            volumeFD, 0,
+            "the whole split: \(volumeTrash.path) must be openable by a "
+                + "process that may not open \(homeTrash.path)"
+        )
+        if volumeFD >= 0 { close(volumeFD) }
+
+        // ---- ROW TWO: the container replaced AFTER the move, which A-P3
+        // also called unreachable for the default user.
+        for arm in TrashArm.allCases {
+            let container = mount
+                .appendingPathComponent("box-drift-\(arm.rawValue)")
+            try fm.createDirectory(
+                at: container, withIntermediateDirectories: true
+            )
+            let name = "drift-\(arm.rawValue)"
+            let target = container.appendingPathComponent(name)
+            let directory = arm.targetIsADirectory
+            if directory {
+                try fm.createDirectory(
+                    at: target, withIntermediateDirectories: true
+                )
+                try Data("ours".utf8).write(
+                    to: target.appendingPathComponent("ours.txt")
+                )
+            } else {
+                try Data("ours".utf8).write(to: target)
+            }
+            let parent = try admittedParent(of: target, provider: provider)
+            let displaced = mount
+                .appendingPathComponent("gone-\(arm.rawValue)")
+
+            let mover: TrashDisposal.Mover = { url, prove in
+                try await MainActor.run {
+                    try prove()
+                    let manager = FileManager.default
+                    try manager.removeItem(at: url)
+                    if directory {
+                        try manager.createDirectory(
+                            at: url, withIntermediateDirectories: true
+                        )
+                        try Data("stranger".utf8).write(
+                            to: url.appendingPathComponent("their-work.txt")
+                        )
+                    } else {
+                        try Data("stranger".utf8).write(to: url)
+                    }
+                    var landed: NSURL?
+                    try manager.trashItem(at: url, resultingItemURL: &landed)
+                    // …and NOW the folder that holds the target is a
+                    // different inode answering to the same name.
+                    try manager.moveItem(at: container, to: displaced)
+                    try manager.createDirectory(
+                        at: container, withIntermediateDirectories: true
+                    )
+                    return landed as URL?
+                }
+            }
+
+            let thrown = try await disposeThroughTheArm(
+                arm, of: target, containedIn: parent, provider: provider,
+                via: mover
+            )
+            let failure = try XCTUnwrap(
+                thrown as? TrashDisposal.Failure,
+                "\(name): \(String(describing: thrown))"
+            )
+            guard case .destinationNotTheAdmittedContainer(let landedPath)
+                = failure.cause
+            else {
+                XCTFail("\(name): \(failure.cause)")
+                continue
+            }
+            XCTAssertEqual(
+                URL(fileURLWithPath: landedPath)
+                    .resolvingSymlinksInPath().path,
+                volumeTrash.appendingPathComponent(name)
+                    .resolvingSymlinksInPath().path,
+                "\(name): the refusal names the volume's own Trash"
+            )
+            XCTAssertTrue(
+                fm.fileExists(
+                    atPath: volumeTrash.appendingPathComponent(name).path
+                ),
+                "\(name): the disclosed residual — nothing was put back, so "
+                    + "the object stays where the refusal says it is"
             )
         }
     }

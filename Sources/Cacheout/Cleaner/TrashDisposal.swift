@@ -1782,18 +1782,49 @@ enum TrashDisposal {
         // `.strandedInTrash` every time, leaving the object in the user's real
         // Trash and the target's name EMPTY.
         //
-        // SO THE CAUSES SPLIT BY POPULATION, and this is the list:
+        // SO THE CAUSES SPLIT — BY VOLUME FIRST, AND ONLY THEN BY
+        // PERMISSION (PR #460 codex r17, M2). r16 wrote this list with the
+        // VOLUME axis missing and published "the default user never gets a
+        // put-back" off it. That is over-broad, and the axis it left out is
+        // the one that decides which directory this open is even about: the
+        // argument is `landed.deletingLastPathComponent()`, and the Trash
+        // `FileManager.trashItem` picks is PER VOLUME.
         //
-        // * WITHOUT Full Disk Access (the shipped GUI's default) the only
-        //   causes reachable are `.strandedInTrash` — from HERE, whatever the
-        //   container spelling — plus `.lastSeenInTrash` and
-        //   `.destinationUnknown`, both of which are decided before this line.
-        // * WITH it, the other three become reachable: `.putBack`,
-        //   `.putBackTookAnotherObject` and
-        //   `.destinationNotTheAdmittedContainer`. Every cell that evidences
-        //   those three injects a landing in a fixture directory whose parent
-        //   IS openable, which is exactly the property this file's r11 D4 note
-        //   records as having hidden a defect for eight rounds.
+        // * A HOME-VOLUME item lands in `~/.Trash`, which TCC gates. Without
+        //   Full Disk Access this open is EPERM, so the only causes reachable
+        //   are `.strandedInTrash` — from HERE, whatever the container
+        //   spelling — plus `.lastSeenInTrash` and `.destinationUnknown`,
+        //   both of which are decided before this line. WITH the permission
+        //   the other three become reachable.
+        // * AN ITEM ON ANY OTHER MOUNTED VOLUME lands in
+        //   `<volume>/.Trashes/<uid>`, which TCC does not gate AT ALL. This
+        //   open SUCCEEDS for a process with no Full Disk Access, so the undo
+        //   runs to completion and the last three causes are reachable for
+        //   the DEFAULT user.
+        //
+        // MEASURED at be445a0 with `~/.Trash` answering -1/EPERM throughout,
+        // no `trashHandler` injected — the shipped `FileManager.trashItem`
+        // inside the production main-actor hop — on a temporary APFS disk
+        // image attached under the test's own directory and detached in
+        // teardown (`TrashDisposalHopProofTests`'
+        // `…ANonHomeVolumeUndoPutsTheItemBackWithoutFullDiskAccess`, all four
+        // verdict arms, 8/8 runs):
+        //
+        //     other volume, ordinary swap       .putBack
+        //     other volume, container swapped   .destinationNotTheAdmittedContainer
+        //
+        // and the home-volume row it is the counterpart of —
+        // `…WithoutFullDiskAccessEveryUndoStrandsTheItemInTheRealTrash`, all
+        // four arms `.strandedInTrash` — is green in the same tree. Both
+        // cells assert AGAINST the permission they read, so each is a fact
+        // about the machine either way.
+        //
+        // What stays true from r16 is the FIXTURE warning: every cell that
+        // evidences the last three causes with an INJECTED landing proves
+        // only what a fixture directory proves, which is exactly the property
+        // this file's r11 D4 note records as having hidden a defect for eight
+        // rounds. The two cells above are the ones that use no fixture
+        // landing at all.
         //
         // D-P1's fix is not undone by that and is not being questioned: it is
         // what makes the second row true, and it removed a real regression for

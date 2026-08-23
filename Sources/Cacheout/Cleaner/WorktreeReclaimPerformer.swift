@@ -3077,7 +3077,16 @@ struct WorktreeReclaimPerformer {
         // r17's SECOND fixer added ONE — the non-home-volume undo, on a
         // temporary APFS disk image (M2) — taking it to 1563: `swift test`
         // AT COMMIT b73b639 reported 1563 executed / 2 skipped / 0 failures,
-        // exit 0, 178 s.
+        // exit 0, 178 s. r18's SECOND fixer added ELEVEN — six routing the
+        // detached-HEAD preservation proof (C4), two more running it end to
+        // end through the scanner and the performer, two on the partial-prune
+        // disclosure and its pre-removal pass (C5), one on the unmeasurable
+        // recomputed admin directory (C6) and one on the pre-listing-identity
+        // refusal that had none (F) — taking it to 1578: `swift test` AT
+        // COMMIT 2f4c2fe reported 1578 executed / 2 skipped / 0 failures,
+        // exit 0, 180 s. (Its FIRST fixer's own notes above record 1567 for
+        // the mutation runs at 8734c5e; that figure is theirs, not a full
+        // suite this fixer ran.)
         // Every figure here names the
         // commit it was taken at, which is the only spelling that cannot rot.
         // The half that survives every commit — and the half a mutation

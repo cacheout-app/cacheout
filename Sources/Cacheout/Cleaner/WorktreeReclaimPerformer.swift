@@ -3086,7 +3086,13 @@ struct WorktreeReclaimPerformer {
         // COMMIT 2f4c2fe reported 1578 executed / 2 skipped / 0 failures,
         // exit 0, 180 s. (Its FIRST fixer's own notes above record 1567 for
         // the mutation runs at 8734c5e; that figure is theirs, not a full
-        // suite this fixer ran.)
+        // suite this fixer ran.) r18's THIRD fixer added FOUR — the
+        // descendant a timed-out git used to orphan (C8), the normal exit
+        // whose drain never finished (C7), the rot gate on the stranding
+        // derivation's raise sites (E3) and the unknown-destination message
+        // that sent the user to the Trash (E2) — taking it to 1582:
+        // `swift test` AT COMMIT c5888a8 reported 1582 executed / 2 skipped /
+        // 0 failures, exit 0, 176 s.
         // Every figure here names the
         // commit it was taken at, which is the only spelling that cannot rot.
         // The half that survives every commit — and the half a mutation

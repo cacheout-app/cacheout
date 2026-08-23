@@ -137,6 +137,18 @@
 //  so the worktree cell would have caught it for all three arms; nothing
 //  measured says the other two reach `~/.Trash` correctly.
 //
+//  ONE OF THOSE TWO IS NOW MEASURED, AND THE SIZE OF WHAT IS LEFT IS STATED
+//  (PR #460 codex r13, A4).
+//  `CacheCleanerTests.testTrashDefaultReallyTrashesANoTreeSweepItemIntoTheRealTrash`
+//  builds a real `CacheCleaner` with NO `trashHandler:` — the constructor's
+//  default is `FileManager.trashItem` — and drives ITEM MODE on a
+//  `.noDirectoryTree` sweep item into the real `~/.Trash`, asserting the
+//  landing, the entry and the bytes. That closes the arm and the verdict this
+//  round's P1 lived on; the paragraph above must not now be read as closing
+//  the rest. STILL UNCOVERED through the real seam: item mode on the
+//  `.directory` and `.nonDirectoryLeaf` verdicts, and ALL of contents mode.
+//  The gap that hid A was this one, and it is the one that was closed.
+//
 //  THE RESIDUAL, WITH ITS ENDPOINTS AND ITS SIZE MEASURED — not "a syscall
 //  wide", which is what an unmeasured version of this note would have claimed
 //  and which is false.

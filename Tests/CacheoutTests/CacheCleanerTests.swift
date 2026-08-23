@@ -2078,6 +2078,280 @@ final class CacheCleanerTests: XCTestCase {
         return (home, caches, entry, sessionSnapshot(of: [caches]))
     }
 
+    // MARK: - A4 (PR #460 codex r13): the `.noDirectoryTree` verdict, at the
+    // CLEANER, on the TRASH arm — the combination with zero cells before r13
+    //
+    // `grep -c noDirectoryTree Tests/CacheoutTests/CacheCleanerTests.swift`
+    // returned 0 at 0139713, and the only cleaner-level `.noDirectoryTree`
+    // cell anywhere in the suite drives `moveToTrash: false` — the PERMANENT
+    // arm. That gap is what hid A: `dispose(_:expecting:…)`'s
+    // `.noDirectoryTree` path never opened `admittedParent`, and the verdict
+    // carries no identity, so both of its proofs reduced to "some
+    // non-directory answers to this name".
+
+    /// A sweep fixture whose ENTRY IS A REGULAR FILE — the shape that makes
+    /// `OrphanedCachesScanner`'s revalidator answer `.noDirectoryTree`: its
+    /// root open is `O_DIRECTORY`, a file answers `ENOTDIR`, and the probe
+    /// reports "no directory tree of ours is here" with no identity to carry.
+    ///
+    /// The leaf name is UNIQUE per run so the real-Trash cell below can name
+    /// its own landing and remove exactly that.
+    private func makeNoTreeSweepFixture(
+        _ label: String = #function, bytes: Int = 4096
+    ) throws -> (home: URL, caches: URL, entry: URL, snapshot: ContainerSnapshot) {
+        let home = try makeTempDir(label)
+        let caches = home.appendingPathComponent("Library/Caches")
+        try FileManager.default.createDirectory(
+            at: caches, withIntermediateDirectories: true
+        )
+        let entry = caches.appendingPathComponent(
+            "cacheout-notree-\(UUID().uuidString.prefix(8))"
+        )
+        try writeFile(entry, bytes: bytes)
+        return (home, caches, entry, sessionSnapshot(of: [caches]))
+    }
+
+    /// The item the cells below clean, spelled once.
+    private func noTreeSweepItem(caches: URL, entry: URL) -> ReclaimableItem {
+        makeRemoveItem(
+            scannerID: OrphanedCachesScanner.registeredID,
+            displayName: entry.lastPathComponent,
+            origin: caches, target: entry,
+            requiresRevalidation: true
+        )
+    }
+
+    /// **THE P1, THROUGH THE PRODUCTION COMPOSITION** (PR #460 codex r13, A).
+    ///
+    /// Real `CacheCleaner`, real `OrphanedCachesScanner.preDeleteRevalidator`,
+    /// real PathGuard admission, real `ContainerSnapshot`, `moveToTrash:
+    /// true` — the GUI's shipped default. The seam performs the swap
+    /// `trashItem`'s own URL resolution makes possible: the CONTAINER is
+    /// replaced with a stranger's directory carrying a file of the same name,
+    /// and the mover then moves whatever answers to the target's name.
+    ///
+    /// MEASURED AT 0139713 on this exact fixture: the stranger's file was
+    /// trashed and the report read
+    /// `entries=[… exactBytes: 4096, disposal: .trash], errors=[]`.
+    ///
+    /// The outcome now is the disclosed, honest one: the item is REFUSED —
+    /// no entry, no bytes — and the stranger's file stays in the landing,
+    /// because the rollback will not restore into a container it cannot
+    /// prove. The error names the path it is at.
+    func testTrashModeNoTreeVerdictRefusesAContainerSwappedInsideTheSeam()
+        async throws
+    {
+        let (home, caches, entry, snapshot) = try makeNoTreeSweepFixture()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let trashDir = home.appendingPathComponent("fixture-trash")
+        try FileManager.default.createDirectory(
+            at: trashDir, withIntermediateDirectories: true
+        )
+        let stash = home.appendingPathComponent("stash")
+        let landed = trashDir.appendingPathComponent(entry.lastPathComponent)
+
+        let cleaner = CacheCleaner(
+            home: home, containerRoots: [caches], containerSnapshot: snapshot,
+            preDeleteRevalidators: sweepRevalidators,
+            trashHandler: { url in
+                // TWO REAL `rename(2)`s, on the far side of every proof this
+                // process can take before handing the URL over.
+                try FileManager.default.moveItem(at: caches, to: stash)
+                try FileManager.default.createDirectory(
+                    at: caches, withIntermediateDirectories: true
+                )
+                try Data("stranger".utf8).write(
+                    to: caches.appendingPathComponent(url.lastPathComponent)
+                )
+                try FileManager.default.moveItem(at: url, to: landed)
+                return landed
+            }
+        )
+        let report = await cleaner.clean(
+            items: [noTreeSweepItem(caches: caches, entry: entry)],
+            moveToTrash: true
+        )
+
+        XCTAssertTrue(
+            report.entries.isEmpty,
+            "a disposal that took a stranger's file must report NOTHING "
+                + "freed: \(report.entries)"
+        )
+        XCTAssertEqual(report.errors.count, 1)
+        let message = try XCTUnwrap(report.errors.first?.message)
+        XCTAssertTrue(
+            message.contains("the folder that HOLDS it is no longer the one "
+                                 + "the safety check admitted"),
+            message
+        )
+        XCTAssertTrue(message.contains(landed.path),
+                      "the refusal names where the item actually is: \(message)")
+        XCTAssertEqual(
+            try String(contentsOf: landed, encoding: .utf8), "stranger",
+            "the disclosed residual: the wrongly-taken object stays in the "
+                + "landing rather than being restored into a stranger's folder"
+        )
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: stash.appendingPathComponent(entry.lastPathComponent).path
+            ),
+            "our own file never left the folder it was inspected in"
+        )
+    }
+
+    /// The same verdict and the same composition, with only the LEAF swapped
+    /// inside the seam — the window the after-proof exists to catch, and the
+    /// one it CAN catch once the disposal binds an object.
+    ///
+    /// The rollback can prove its destination here (the container never
+    /// moved), so the wrongly-taken file is PUT BACK and the item refused.
+    func testTrashModeNoTreeVerdictPutsBackALeafSwappedInsideTheSeam()
+        async throws
+    {
+        let (home, caches, entry, snapshot) = try makeNoTreeSweepFixture()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let trashDir = home.appendingPathComponent("fixture-trash")
+        try FileManager.default.createDirectory(
+            at: trashDir, withIntermediateDirectories: true
+        )
+        let landed = trashDir.appendingPathComponent(entry.lastPathComponent)
+
+        let cleaner = CacheCleaner(
+            home: home, containerRoots: [caches], containerSnapshot: snapshot,
+            preDeleteRevalidators: sweepRevalidators,
+            trashHandler: { url in
+                try FileManager.default.removeItem(at: url)
+                try Data("stranger".utf8).write(to: url)
+                try FileManager.default.moveItem(at: url, to: landed)
+                return landed
+            }
+        )
+        let report = await cleaner.clean(
+            items: [noTreeSweepItem(caches: caches, entry: entry)],
+            moveToTrash: true
+        )
+
+        XCTAssertTrue(report.entries.isEmpty, "\(report.entries)")
+        let message = try XCTUnwrap(report.errors.first?.message)
+        XCTAssertTrue(message.contains("has been PUT BACK"), message)
+        XCTAssertEqual(
+            try String(contentsOf: entry, encoding: .utf8), "stranger",
+            "the object the Trash wrongly took is back at the original name"
+        )
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: landed.path),
+            "nothing is left in the Trash after a proved put-back"
+        )
+    }
+
+    /// The GHOST TARGET, and the choice this round made about it.
+    ///
+    /// Through r12 an absent target satisfied `proveStanding`
+    /// (`absenceProves: true` — a `.noDirectoryTree` verdict is a statement
+    /// that no tree of ours was there, which an absence also satisfies) and
+    /// the disposal produced its own `ENOENT`. `boundLeaf` throws
+    /// `.posix(ENOENT)` one call earlier instead. Both are item-keyed POSIX
+    /// errors and neither is a silent skip; this one additionally leaves the
+    /// user's Trash UNTOUCHED, which the other cannot promise because it
+    /// hands the NAME to `trashItem` and whatever answers to it a moment
+    /// later is what gets taken.
+    func testTrashModeRefusesANoTreeItemThatVanishedBeforeItCouldBeBound()
+        async throws
+    {
+        let (home, caches, entry, snapshot) = try makeNoTreeSweepFixture()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let recorder = TrashRecorder()
+        let trashDir = home.appendingPathComponent("fixture-trash")
+        try FileManager.default.createDirectory(
+            at: trashDir, withIntermediateDirectories: true
+        )
+        let item = noTreeSweepItem(caches: caches, entry: entry)
+        // Gone before the clean — the probe's ENOENT root open produces the
+        // same `.noDirectoryTree` verdict a non-directory does.
+        try FileManager.default.removeItem(at: entry)
+
+        let cleaner = CacheCleaner(
+            home: home, containerRoots: [caches], containerSnapshot: snapshot,
+            preDeleteRevalidators: sweepRevalidators,
+            trashHandler: makeTrashSeam(into: trashDir, recorder: recorder)
+        )
+        let report = await cleaner.clean(items: [item], moveToTrash: true)
+
+        XCTAssertTrue(report.entries.isEmpty, "\(report.entries)")
+        XCTAssertEqual(report.errors.count, 1, "an item-keyed error, never a "
+                           + "silent skip")
+        XCTAssertTrue(recorder.urls.isEmpty,
+                      "the user's Trash is not disturbed for an item that "
+                          + "was never there")
+    }
+
+    /// **THE SHIPPED SEAM, WITH NOTHING INJECTED** (PR #460 codex r13, A4).
+    ///
+    /// The r11-D4 note in `TrashDisposal.swift` recorded that `CacheCleaner`'s
+    /// item-mode Trash disposal had ZERO coverage through the real
+    /// `FileManager.trashItem` — every cell injected a landing in a fixture
+    /// directory whose parent is freely openable, which is exactly the
+    /// property that hid `~/.Trash`'s TCC denial for eight rounds, and the
+    /// property that let A's `.noDirectoryTree` arm ship unbound. This cell
+    /// closes it for the item arm on the identity-free verdict: the cleaner
+    /// is built with NO `trashHandler`, so the mover is
+    /// `FileManager.trashItem` landing in the user's REAL `~/.Trash`.
+    ///
+    /// It removes exactly the one item it put there — the entry name is
+    /// unique per run, and `trashItem` only suffixes on collision, so the
+    /// landing name is deterministic — and touches nothing else.
+    func testTrashDefaultReallyTrashesANoTreeSweepItemIntoTheRealTrash()
+        async throws
+    {
+        let (home, caches, entry, snapshot) = try makeNoTreeSweepFixture()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let expected = measured(entry).exactAllocatedBytes
+        XCTAssertGreaterThan(expected, 0)
+
+        let landing = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".Trash")
+            .appendingPathComponent(entry.lastPathComponent)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: landing.path),
+                       "the landing name must be free before the run")
+        // Registered BEFORE the clean: this exact path is removed however the
+        // cell ends. Only this path — never the Trash itself.
+        addTeardownBlock {
+            try? FileManager.default.removeItem(at: landing)
+        }
+
+        // NO `trashHandler`: the constructor's default is
+        // `FileManager.trashItem`, which is what the GUI runs.
+        let cleaner = CacheCleaner(
+            home: home, containerRoots: [caches], containerSnapshot: snapshot,
+            preDeleteRevalidators: sweepRevalidators
+        )
+        let report = await cleaner.clean(
+            items: [noTreeSweepItem(caches: caches, entry: entry)],
+            moveToTrash: true
+        )
+
+        XCTAssertEqual(
+            report.errors.map(\.message), [],
+            "the move SUCCEEDED — the file is in the Trash — so any refusal "
+                + "here is a false one, which is the shape of the r10 D1 "
+                + "defect this seam is the only place to catch"
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: entry.path),
+                       "the entry left the cache folder")
+        var isDirectory: ObjCBool = false
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: landing.path, isDirectory: &isDirectory
+            ),
+            "…and it is in the REAL Trash at \(landing.path), recoverable in "
+                + "one drag — which is what the report must not deny"
+        )
+        XCTAssertFalse(isDirectory.boolValue)
+        let entryRow = try XCTUnwrap(report.entries.first)
+        XCTAssertEqual(entryRow.disposal, .trash)
+        XCTAssertEqual(entryRow.exactBytes, expected)
+    }
+
     func testAutoEligibleSweepItemRecreatedWithUserDataIsRefusedUntouched() async throws {
         let (home, caches, entry, snapshot) = try makeSweepFixture()
         defer { try? FileManager.default.removeItem(at: home) }

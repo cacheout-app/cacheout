@@ -3059,6 +3059,24 @@ struct SpaceScannerRuntime {
         // the kernel table names as a mount point is skipped WITHOUT the
         // lstat (PR #459 review r6 codex C2 — that lstat is first contact
         // with the mounted filesystem).
+        //
+        // RECORDED, NOT FIXED, AND NOT COVERED BY THE BOUND BELOW (PR #460
+        // codex r13). This capture is SYNCHRONOUS — `ContainerSnapshot
+        // .capture` reads the mount table and then runs `provider
+        // .identity(of:)`, an `lstat`, for every remaining session container
+        // root — and `CacheoutViewModel.scan` calls this method without an
+        // `await`, on the MainActor. So it runs ON THE MAIN THREAD, and it
+        // runs BEFORE the stream, the producer, the watchdog and the grace
+        // timer exist: a hung network mount or unresponsive FUSE volume
+        // freezes the app here, unbounded and unreported, with no
+        // `.scanDidNotFinish` possible because nothing is armed yet. r12's
+        // verifier measured a 6.03 s `scan` with `isMainThread == true` from
+        // a 6 s blocking `identity(of:)`; verified here as a code path
+        // rather than re-measured — the loop is straight-line synchronous
+        // and this call site has no suspension point before it. The
+        // `mountPointPaths()` preflight does NOT close it: it skips roots
+        // that ARE mount points, and a root INSIDE a hung mount is still
+        // lstat'ed. Pre-existing on origin/main; its own task.
         let snapshot = ContainerSnapshot.capture(
             roots: sessionContainerRoots(for: selected), provider: provider
         )

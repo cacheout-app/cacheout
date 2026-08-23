@@ -1792,6 +1792,20 @@ class CacheoutViewModel: ObservableObject {
         ]
 
         do {
+            // RECORDED, NOT FIXED (PR #460 codex r13). This wait is
+            // UNBOUNDED, and it is the one primitive this repo replaced
+            // everywhere else: `Process.waitUntilExit()` can miss its
+            // termination wakeup under concurrent reaping (see
+            // `Process.waitForExit(within:)` in CacheCategory.swift, which
+            // exists for that and is used by CacheCleaner and the category
+            // subprocesses). Here it sits behind a `readToEnd()` on a
+            // cooperative worker, so a docker CLI that never exits holds the
+            // worker AND latches `isDockerPruning` true for the life of the
+            // app — the button never re-enables. Pre-existing on
+            // origin/main, unrelated to this PR's scanners, and left to its
+            // own change: the fix is `waitForExit(within:)` plus a
+            // termination policy, which is a product decision about how long
+            // a prune may take.
             let result = try await Task.detached { () -> (Int32, String) in
                 try process.run()
                 let data = try pipe.fileHandleForReading.readToEnd() ?? Data()

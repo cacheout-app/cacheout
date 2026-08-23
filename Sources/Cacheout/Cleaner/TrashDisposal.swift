@@ -113,6 +113,19 @@
 //  skip the verification either — see `facts` for why the weaker binding can
 //  never admit what the stronger one would refuse.
 //
+//  AND THE COVERAGE THAT CLOSED IS ONE ARM OF THREE — RECORDED HERE BECAUSE
+//  THE PARAGRAPH ABOVE READS AS IF IT WERE ALL OF THEM (PR #460 codex r11,
+//  D4). `GitWorktreeEndToEndTests.testTheTrashDefaultReportsTheCheckoutItReallyMovedToTheTrash`
+//  drives the WORKTREE arm through the real `FileManager.trashItem` into the
+//  real `~/.Trash`. `CacheCleaner`'s item-mode and contents-mode Trash
+//  disposal — the app's primary feature, and the population the
+//  container-bound overload was written for — still has ZERO coverage through
+//  that seam: every one of those cells injects a `trashHandler:` landing in a
+//  fixture directory whose parent is freely openable, which is the exact
+//  property that hid this defect for eight rounds. D1 lived in shared code,
+//  so the worktree cell would have caught it for all three arms; nothing
+//  measured says the other two reach `~/.Trash` correctly.
+//
 //  THE RESIDUAL, WITH ITS ENDPOINTS AND ITS SIZE MEASURED — not "a syscall
 //  wide", which is what an unmeasured version of this note would have claimed
 //  and which is false.

@@ -740,7 +740,8 @@ final class GitWorktreeEndToEndTests: XCTestCase {
     // ====================================================================
 
     /// **THE SUITE STILL DRIVES THE SHIPPED DEFAULT, AND STILL DRIVES IT
-    /// THROUGH THE PRODUCTION SEAM** (PR #460 codex r10, D2).
+    /// THROUGH THE PRODUCTION SEAM** (PR #460 codex r10, D2; strengthened
+    /// r11, D4).
     ///
     /// This is the rot check for the gap that let D1 survive eight rounds,
     /// and both halves of it are needed:
@@ -757,9 +758,35 @@ final class GitWorktreeEndToEndTests: XCTestCase {
     ///    So this file must contain no `trashHandler` at all: whatever it
     ///    drives, it drives through `FileManager.trashItem`.
     ///
-    /// The gate is deliberately about THIS FILE for (2) and about the whole
-    /// suite for (1): another target may legitimately inject a seam, but the
-    /// composition acceptance may not.
+    /// WHAT (1) LOOKED FOR UNTIL r11, AND WHY THAT WAS NOT ENOUGH (D4). It
+    /// passed if ANY non-comment line anywhere under `Tests/` contained the
+    /// assignment. It did not check that the line was in a cell driving the
+    /// production composition, or that a clean followed it — so an edit that
+    /// set the toggle in an unrelated cell, or that deleted the `clean()`
+    /// below it, kept this gate GREEN with the coverage gone. That is the
+    /// same class of defect the gate exists to catch, one level up.
+    ///
+    /// It now requires at least one `func test…` IN THIS FILE that does all
+    /// three: assigns the toggle its shipped value, composes
+    /// `productionRuntime(` (the real `SpaceScannerRuntime.production`, with
+    /// nothing injected but the hermetic git runner), and calls `clean()` on
+    /// a LATER line than the assignment. The suite-wide inventory is kept,
+    /// but only as failure-message context: a driver in another target proves
+    /// nothing about the composition acceptance.
+    ///
+    /// ## THE RESIDUAL, RECORDED RATHER THAN IMPLIED (r11, D4)
+    ///
+    /// What this gate holds is the WORKTREE arm. `CacheCleaner`'s item-mode
+    /// and contents-mode Trash disposal — the app's primary feature, and the
+    /// population `TrashDisposal.dispose(_:containedIn:provider:via:)` was
+    /// written for — still has ZERO coverage through the real
+    /// `FileManager.trashItem`: every one of those cells injects a
+    /// `trashHandler:` landing in a fixture directory whose parent is freely
+    /// openable, which is exactly the property that hid D1 for eight rounds.
+    /// The bug D1 fixed was in shared code, so the worktree cell would have
+    /// caught it for both — but nothing here says the item and contents arms
+    /// reach `~/.Trash` correctly, and this gate must not be read as saying
+    /// so.
     func testTheSuiteDrivesTheTrashDefaultThroughTheProductionSeam() throws {
         let testsRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()   // CacheoutTests
@@ -776,22 +803,65 @@ final class GitWorktreeEndToEndTests: XCTestCase {
         // SPLIT, so neither this line nor the failure message below is itself
         // a match — a gate its own text satisfies is vacuous.
         let assignment = "moveToTrash" + " = true"
+        func isCode(_ line: Substring) -> Bool {
+            !line.trimmingCharacters(in: .whitespaces).hasPrefix("//")
+        }
         var drivers: [String] = []
         for source in sources {
             let text = try String(contentsOf: source, encoding: .utf8)
             for (offset, line) in text.split(
                 separator: "\n", omittingEmptySubsequences: false
-            ).enumerated() where line.contains(assignment)
-                && !line.trimmingCharacters(in: .whitespaces).hasPrefix("//")
-            {
+            ).enumerated() where line.contains(assignment) && isCode(line) {
                 drivers.append("\(source.lastPathComponent):\(offset + 1)")
             }
         }
+
+        // THE LOAD-BEARING HALF: a cell IN THIS FILE that assigns the toggle,
+        // composes the production runtime, and cleans AFTER assigning.
+        let ownLines = try String(
+            contentsOf: URL(fileURLWithPath: #filePath), encoding: .utf8
+        ).split(separator: "\n", omittingEmptySubsequences: false)
+            .map(String.init)
+        var blocks: [(name: String, first: Int, last: Int)] = []
+        var open: (name: String, first: Int)?
+        for (offset, line) in ownLines.enumerated() {
+            if line.hasPrefix("    func test") {
+                open = (String(line.dropFirst(9)), offset)
+            } else if line == "    }", let started = open {
+                blocks.append((started.name, started.first, offset))
+                open = nil
+            }
+        }
+        XCTAssertGreaterThan(
+            blocks.count, 5,
+            "the block reader found \(blocks.count) cells in this file — it "
+                + "has stopped parsing, so every check below is vacuous"
+        )
+
+        // A composition seam is what `productionRuntime(` builds; the clean
+        // must come AFTER the assignment, not merely appear in the same cell.
+        var qualifying: [String] = []
+        for block in blocks {
+            let body = ownLines[block.first...block.last]
+            var assignedAt: Int?
+            var cleanedAt: Int?
+            var composes = false
+            for (index, line) in body.enumerated() where isCode(line[...]) {
+                if line.contains(assignment), assignedAt == nil { assignedAt = index }
+                if line.contains("productionRuntime(") { composes = true }
+                if line.contains(".clean()") { cleanedAt = index }
+            }
+            if let assignedAt, let cleanedAt, composes, cleanedAt > assignedAt {
+                qualifying.append(block.name)
+            }
+        }
         XCTAssertFalse(
-            drivers.isEmpty,
-            "nothing in the suite assigns the Trash toggle its shipped value "
-                + "and cleans — the GUI's default disposal is uncovered "
-                + "again, which is exactly the state D1 shipped in"
+            qualifying.isEmpty,
+            "no cell in the composition acceptance assigns the Trash toggle "
+                + "its shipped value, builds the production runtime AND "
+                + "cleans after it — the GUI's default disposal is uncovered "
+                + "again, which is exactly the state D1 shipped in. Lines in "
+                + "the suite that merely assign it: \(drivers)"
         )
 
         // CODE lines only — this cell's own doc comment spells the needle,

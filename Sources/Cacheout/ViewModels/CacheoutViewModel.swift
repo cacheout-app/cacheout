@@ -1987,7 +1987,10 @@ class CacheoutViewModel: ObservableObject {
         // NEGATIVE RESULT, recorded so the next round does not re-derive it:
         // the `defer` ITSELF is not evidenceable here. Replacing it with the
         // plain assignment at the same site left the WHOLE suite green
-        // (1549 executed / 2 skipped / 0 failures, exit 0, 165 s). There is
+        // (1549 executed / 2 skipped / 0 failures, exit 0, 165 s — measured
+        // at r15's second fixer's head, d3d62b4, where the suite WAS 1549;
+        // a total is only ever a fact about the commit it was taken at).
+        // There is
         // no reachable early exit from this block today — the awaited call
         // does not throw, and cancelling the surrounding task does not unwind
         // a non-throwing await — so it is scope hygiene against a future

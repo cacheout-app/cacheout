@@ -2550,7 +2550,14 @@ struct WorktreeReclaimPerformer {
         // against a live stream (S-P2) and one pinning the scope of the clean
         // flag's release (S-P4) — taking it to 1549: `swift test` AT COMMIT
         // d3d62b4 reported 1549 executed / 2 skipped / 0 failures, exit 0,
-        // 174 s.
+        // 174 s. r16's FIRST fixer added five — three on the checkout
+        // replaced after the listing returned and inside the witness loop
+        // (B-P1/B-P2, one of them end-to-end through the production
+        // composition), one on a transient lstat failure not being reported
+        // as a replacement (B-P4) and one source fence pinning the drain's
+        // bounded end-a-drain spelling (B-P3) — taking it to 1554: `swift
+        // test` AT COMMIT afaea66 reported 1554 executed / 2 skipped /
+        // 0 failures, exit 0, 174 s.
         // Every figure here names the
         // commit it was taken at, which is the only spelling that cannot rot.
         // The half that survives every commit — and the half a mutation

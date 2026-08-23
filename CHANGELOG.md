@@ -98,7 +98,12 @@ below are both part of that coordination, and the latter BLOCKS this release.
   sides of it were the replacement and it agreed with itself. The window was
   also larger than the second draft said — it grew with the number of
   worktrees in the repository. All of this was measured, and is now
-  refused.) (This window is
+  refused. A related message correction rides with it: a checkout whose admin
+  directory could not be stat'd for a moment — a permission blip, an entry
+  that vanished and came back — used to be reported as one that "was replaced
+  while this scan was running". It now says the identity could not be read
+  and the gate could not be armed, which is what actually happened; either
+  way the row is not offered.) (This window is
   the desktop app's, where one scan's results stay on screen across your
   click. An earlier draft of this entry said `--cli clean` was protected
   because its re-scan answers a replacement with "unknown item id — rescan

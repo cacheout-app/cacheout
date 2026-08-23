@@ -272,12 +272,20 @@ final class TrashDisposalHopProofTests: XCTestCase {
     /// ordinary CLI process: `open("/Users/<u>/.Trash",
     /// O_RDONLY|O_DIRECTORY|O_NOFOLLOW)` → -1, errno 1 (EPERM), while `lstat`
     /// and `open` of `~/.Trash/<name>` both succeed.
+    ///
+    /// `failing` is the errno it refuses with, because the fallback is now
+    /// gated on the errno CLASS (PR #460 codex r11, D1) and the class has two
+    /// members: `EPERM` is what TCC answers with, `EACCES` the ordinary
+    /// mode-bit spelling of the same fact about the same open. Both must
+    /// reach the fallback; nothing else may.
     private final class TrashDeniedProvider: FileSystemIdentityProvider {
         let denied: String
+        let failing: Int32
         private(set) var refusals = 0
 
-        init(denying directory: URL) {
+        init(denying directory: URL, with failing: Int32 = EPERM) {
             denied = directory.standardizedFileURL.path
+            self.failing = failing
             super.init()
         }
 
@@ -286,7 +294,7 @@ final class TrashDisposalHopProofTests: XCTestCase {
                 return super.openDirectoryNoFollow(at: url)
             }
             refusals += 1
-            errno = EPERM
+            errno = failing
             return -1
         }
     }
@@ -399,6 +407,149 @@ final class TrashDisposalHopProofTests: XCTestCase {
                 atPath: landed.appendingPathComponent("their-work.txt").path
             ),
             "the stranger is where the refusal says it is"
+        )
+    }
+
+    /// **THE SOUNDNESS BOUND ON THE FALLBACK** (PR #460 codex r11, D1): the
+    /// failure `O_NOFOLLOW` exists to produce must NOT be answered with a
+    /// path `lstat`.
+    ///
+    /// r10 fired the `probeLeaf` fallback on EVERY failure of the container
+    /// open, arguing that it "cannot ADMIT anything the descriptor-relative
+    /// read would refuse". It can, and this is the case: `probeChild` reads a
+    /// name inside a HELD DESCRIPTOR, `probeLeaf` `lstat`s a PATH, and
+    /// `lstat`'s no-follow covers the FINAL component only. So a landing
+    /// whose CONTAINER is a symlink fails the open — and the fallback then
+    /// walks through that very link.
+    ///
+    /// WHICH ERRNO, MEASURED RATHER THAN ASSUMED (Darwin 25.5, this machine).
+    /// The r11 review called this the `ELOOP` case, and `ELOOP` is what
+    /// `open(link, O_RDONLY|O_NOFOLLOW)` returns — 62, for a symlink to a
+    /// directory AND for a self-referential one. But this codebase's open
+    /// carries `O_DIRECTORY` as well, and `open(link,
+    /// O_RDONLY|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW)` returns **ENOTDIR (20)**
+    /// for both: the directory check answers first. The name of the errno
+    /// changes nothing about the defect — neither code is in the permitted
+    /// class — and the cell asserts the one the kernel actually produces
+    /// rather than the one the taxonomy predicted.
+    ///
+    /// NOTHING IS MOCKED HERE. The provider is the production one; the link
+    /// is a real symlink and the errno is the kernel's. The mover moves
+    /// NOTHING and reports a landing whose parent link is aimed back at the
+    /// item's own container, so the `lstat` finds the ORIGINAL object, still
+    /// standing at its original path, and hands back the identity that was
+    /// bound before the move.
+    ///
+    /// MEASURED, with r10's unrestricted fallback restored (delete the
+    /// `code == EPERM || code == EACCES` guard in `TrashDisposal.facts`):
+    /// `dispose` RETURNS NORMALLY and `victim` is still on disk — a disposal
+    /// that reports success having moved nothing, which is strictly worse
+    /// than the false refusal r10 removed. This cell is the only one that
+    /// reddens.
+    func testASymlinkedLandingContainerIsRefusedRatherThanResolvedThroughIt()
+        async throws
+    {
+        let provider = FileSystemIdentityProvider()
+        let container = base.appendingPathComponent("container")
+        try fm.createDirectory(at: container, withIntermediateDirectories: true)
+        let target = container.appendingPathComponent("victim")
+        try fm.createDirectory(at: target, withIntermediateDirectories: true)
+        try Data("ours".utf8).write(
+            to: target.appendingPathComponent("ours.txt")
+        )
+        let parent = try admittedParent(of: target, provider: provider)
+
+        // The landing the mover will name: its PARENT is a symlink pointing
+        // back at the item's own container, so `lstat` of the whole path
+        // resolves to the item itself while the container open cannot.
+        let link = base.appendingPathComponent("link")
+        try fm.createSymbolicLink(at: link, withDestinationURL: container)
+        let landed = link.appendingPathComponent(target.lastPathComponent)
+
+        // The premise, asserted rather than assumed: the open really does
+        // fail ELOOP and the path lstat really does resolve through the link.
+        let opened = provider.openDirectoryNoFollowCarryingErrno(at: link)
+        XCTAssertEqual(
+            opened, .failed(errno: ENOTDIR),
+            "the container open must fail — ENOTDIR, because O_DIRECTORY "
+                + "answers before O_NOFOLLOW's ELOOP: \(opened)"
+        )
+        XCTAssertEqual(
+            provider.probeLeaf(at: landed),
+            provider.probeLeaf(at: target),
+            "…and the path lstat must resolve through the link to the "
+                + "ORIGINAL object, which is what makes this unsound"
+        )
+
+        let log = MoveLog()
+        var thrown: Error?
+        do {
+            try await TrashDisposal.dispose(
+                target, containedIn: parent, provider: provider,
+                via: { url, prove in
+                    try prove()
+                    // MOVES NOTHING and reports a landing anyway.
+                    log.record(url)
+                    return landed
+                }
+            )
+        } catch {
+            thrown = error
+        }
+
+        let failure = try XCTUnwrap(
+            thrown as? TrashDisposal.Failure,
+            "a landing whose container cannot be opened NO-FOLLOW must be "
+                + "refused, not resolved through the link: "
+                + "\(String(describing: thrown))"
+        )
+        XCTAssertEqual(failure.cause, .lastSeenInTrash(landed.path))
+        XCTAssertEqual(log.urls.map(\.path), [target.path],
+                       "the mover was driven exactly once")
+        XCTAssertTrue(
+            fm.fileExists(atPath: target.appendingPathComponent("ours.txt").path),
+            "nothing was moved — which is precisely why reporting success "
+                + "would have been a lie"
+        )
+    }
+
+    /// THE OTHER MEMBER OF THE PERMITTED CLASS: `EACCES` is the same fact
+    /// about the same open, spelled by the mode bits rather than by TCC, and
+    /// it must reach the fallback too.
+    ///
+    /// MUTATION: narrow the guard in `TrashDisposal.facts` to `code == EPERM`
+    /// and this cell alone fails, with `.lastSeenInTrash`.
+    func testAModeDeniedLandingIsIdentifiedRatherThanRefused() async throws {
+        let landings = try XCTUnwrap(self.landings)
+        let provider = TrashDeniedProvider(denying: landings, with: EACCES)
+        let target = base.appendingPathComponent("victim-eacces")
+        try fm.createDirectory(at: target, withIntermediateDirectories: true)
+        try Data("ours".utf8).write(
+            to: target.appendingPathComponent("ours.txt")
+        )
+        let parent = try admittedParent(of: target, provider: provider)
+        let fileManager = fm
+        let landed = landings.appendingPathComponent(target.lastPathComponent)
+
+        try await TrashDisposal.dispose(
+            target, containedIn: parent, provider: provider,
+            via: { url, prove in
+                try prove()
+                try fileManager.moveItem(at: url, to: landed)
+                return landed
+            }
+        )
+
+        XCTAssertGreaterThan(provider.refusals, 0,
+                             "the cell must actually have exercised the "
+                                + "denied open")
+        XCTAssertFalse(fm.fileExists(atPath: target.path),
+                       "the disposal really moved it")
+        XCTAssertTrue(
+            fm.fileExists(
+                atPath: landed.appendingPathComponent("ours.txt").path
+            ),
+            "…and it is in the landing, intact"
         )
     }
 

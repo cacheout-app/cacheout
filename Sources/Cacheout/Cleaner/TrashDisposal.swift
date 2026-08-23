@@ -693,14 +693,51 @@ enum TrashDisposal {
     /// object still mismatches and is still refused
     /// (`testAnUnopenableLandingStillCatchesAnObjectThatIsNotOurs`).
     ///
-    /// IT IS NOT RESTRICTED TO THE PERMISSION ERRNOS, deliberately. The
-    /// fallback cannot ADMIT anything the descriptor-relative read would
-    /// refuse — its result is only ever compared for equality against an
-    /// identity bound before the move — so a per-errno gate would add an
-    /// untestable branch and buy nothing. It is reached only when the
-    /// container open has ALREADY failed; while that open succeeds the
-    /// descriptor-relative answer, including its `.absent`, is the only one
-    /// used.
+    /// IT IS RESTRICTED TO THE PERMISSION ERRNOS, AND r10 SHIPPED IT
+    /// UNRESTRICTED (PR #460 codex r11, D1). r10's header argued that a
+    /// per-errno gate "would add an untestable branch and buy nothing"
+    /// because the fallback "cannot ADMIT anything the descriptor-relative
+    /// read would refuse". **That reasoning is wrong, and the counterexample
+    /// is the failure `O_NOFOLLOW` exists to produce.** The two reads do not
+    /// resolve the same path: `probeChild` reads a name inside a descriptor,
+    /// while `probeLeaf` `lstat`s a PATH, and `lstat`'s no-follow applies to
+    /// the FINAL component only. So when the CONTAINER is a symlink the
+    /// container open FAILS — and the fallback then resolves that link and
+    /// identifies whatever lies on the other side of it.
+    ///
+    /// MEASURED, in
+    /// `TrashDisposalHopProofTests.testASymlinkedLandingContainerIsRefusedRatherThanResolvedThroughIt`:
+    /// a mover that returns a landing whose parent is a symlink aimed back at
+    /// the item's OWN container makes `lstat` walk through the link, find the
+    /// ORIGINAL object still standing at its original path, and return the
+    /// identity bound before the move. `observed == bound` then holds and the
+    /// disposal reports SUCCESS HAVING MOVED NOTHING — a false success, which
+    /// is strictly worse than the false refusal r10 removed. With the gate
+    /// that errno is not in the permitted class, `facts` returns `nil`, and
+    /// the caller refuses exactly as it did before r10.
+    ///
+    /// (WHICH errno, measured on Darwin 25.5 rather than assumed: the r11
+    /// review named this the `ELOOP` case, and `ELOOP` (62) is indeed what
+    /// `open(link, O_RDONLY|O_NOFOLLOW)` returns. This open also carries
+    /// `O_DIRECTORY`, and with it the same call returns **`ENOTDIR` (20)** —
+    /// the directory check answers first, for a symlink to a directory and
+    /// for a self-referential one alike. Neither code is permitted, so the
+    /// gate is the same either way.)
+    ///
+    /// `EPERM`/`EACCES` are the whole permitted class because they are the
+    /// whole measured cause: TCC answers this open with `EPERM` (above), and
+    /// `EACCES` is the ordinary mode-bit spelling of the same fact about the
+    /// same open. Neither can be produced by a symlink, a missing directory
+    /// or a non-directory, so neither can license a resolution the
+    /// descriptor-relative read would have refused. All three directions are
+    /// evidenced: `testAnUnopenableLandingIsIdentifiedRatherThanRefused`
+    /// (`EPERM` must SUCCEED),
+    /// `testAModeDeniedLandingIsIdentifiedRatherThanRefused` (`EACCES` must
+    /// SUCCEED) and the symlinked-container cell above (must REFUSE).
+    ///
+    /// It is reached only when the container open has ALREADY failed; while
+    /// that open succeeds the descriptor-relative answer, including its
+    /// `.absent`, is the only one used.
     ///
     /// THE ARM THIS RESTORES PARITY WITH: `dispose(_:expecting:…)`'s
     /// directory path has always identified the landing with `look`, which is
@@ -716,10 +753,18 @@ enum TrashDisposal {
         guard FileSystemIdentityProvider.isSafeComponent(name) else {
             return nil
         }
-        let fd = provider.openDirectoryNoFollow(
+        let fd: Int32
+        switch provider.openDirectoryNoFollowCarryingErrno(
             at: url.deletingLastPathComponent()
-        )
-        guard fd >= 0 else {
+        ) {
+        case .opened(let descriptor):
+            fd = descriptor
+        case .failed(let code):
+            // THE PERMISSION CLASS ONLY. Every other cause — ENOTDIR on a
+            // symlinked container above all — is this open refusing to
+            // resolve something, and a path `lstat` must not be used to
+            // answer around it.
+            guard code == EPERM || code == EACCES else { return nil }
             guard case .facts(let facts) = provider.probeLeaf(at: url) else {
                 return nil
             }

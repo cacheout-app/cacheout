@@ -606,13 +606,17 @@ below are both part of that coordination, and the latter BLOCKS this release.
   taken: every trashed item was reported as a refusal with nothing freed, and
   the message said what the Trash took "could not be put back — it is no
   longer at `~/.Trash/<name>`, where the Trash reported putting it" — about a
-  folder that was at exactly that path, intact, one drag from recovery. The
-  check now identifies the item the way the permission actually allows when
-  the Trash directory cannot be opened, so a real disposal is reported as one
-  and a swapped folder is still caught and refused. When such a refusal
-  happens without Full Disk Access the item cannot be moved back
-  automatically, and the message now says where it is instead of denying it
-  is there.
+  folder that was at exactly that path, intact, one drag from recovery. When
+  — and ONLY when — macOS answers that open with a permission denial, the
+  check now identifies the item the way the permission actually allows, so a
+  real disposal is reported as one and a swapped folder is still caught and
+  refused. Any OTHER reason the folder cannot be opened is still a refusal:
+  in particular a landing folder that turns out to be a symbolic link is
+  refused rather than followed, because following it would identify the
+  object on the other side of the link and report a move that never
+  happened. When such a refusal happens without Full Disk Access the item
+  cannot be moved back automatically, and the message now says where it is
+  instead of denying it is there.
 - **A background refresh no longer reads the folders it has already decided
   to skip.** The ephemeral-temp scanner runs only when you ask for a scan, but
   before each scan Cacheout records the identity of every folder it might

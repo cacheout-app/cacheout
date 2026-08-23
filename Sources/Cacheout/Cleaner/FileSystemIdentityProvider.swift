@@ -415,6 +415,29 @@ class FileSystemIdentityProvider {
         open(url.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
     }
 
+    /// `openDirectoryNoFollow(at:)` with its `errno` CAPTURED AT THE CALL.
+    ///
+    /// WHY IT EXISTS (PR #460 codex r11, D1). One caller —
+    /// `TrashDisposal.facts` — must distinguish WHY the open failed, because
+    /// its `probeLeaf` fallback is sound for exactly one class of failure
+    /// (the TCC denial of `~/.Trash`, measured `EPERM`) and UNSOUND for the
+    /// class `O_NOFOLLOW` exists to produce: `ELOOP` says the last component
+    /// IS a symlink, and `probeLeaf`'s path `lstat` would then resolve the
+    /// very link the descriptor-relative read refused. "Failed" is not one
+    /// fact, so it is not returned as one.
+    ///
+    /// DELEGATES to `openDirectoryNoFollow(at:)` rather than re-spelling the
+    /// `open` on purpose: every existing subclass override of that method —
+    /// the suite's TCC doubles among them — still governs this call, so the
+    /// two can never disagree about which directories are refusable. The
+    /// global `errno` is read on the statement immediately after, with no
+    /// intervening call, which is the read this shape exists to make
+    /// unclobberable at the CALLER (see `openChildDirectoryCarryingErrno`).
+    func openDirectoryNoFollowCarryingErrno(at url: URL) -> DescriptorOpen {
+        let fd = openDirectoryNoFollow(at: url)
+        return fd >= 0 ? .opened(fd) : .failed(errno: errno)
+    }
+
     /// `fstatat(parent, name, AT_SYMLINK_NOFOLLOW)` — kind + metadata, one
     /// atomic call, no path resolution. `logical` is carried for tests only.
     func probeKind(

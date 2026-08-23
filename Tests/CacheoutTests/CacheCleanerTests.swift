@@ -4820,7 +4820,7 @@ final class CacheCleanerTests: XCTestCase {
         XCTAssertEqual(report.errors.count, 1)
         let message = try XCTUnwrap(report.errors.first?.message)
         XCTAssertTrue(message.contains("PUT BACK"), message)
-        XCTAssertTrue(message.contains("nothing was freed"), message)
+        XCTAssertTrue(message.contains("nothing was reported freed"), message)
     }
 
     /// Removes the child inside the ONE window between the container proof

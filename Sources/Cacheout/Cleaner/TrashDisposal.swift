@@ -491,10 +491,29 @@ enum TrashDisposal {
                 // now what it says — the object was moved back out under the
                 // held Trash descriptor and IDENTIFIED at this path under the
                 // held, admitted destination descriptor.
+                //
+                // AND ITS SIBLING NET-EFFECT CLAIM SURVIVED THAT FIX BY ONE
+                // CLAUSE (PR #460 codex r17, M4). r16 retired "Nothing was
+                // moved to the Trash" from this very message and left
+                // "nothing was freed" standing beside it — the only one of
+                // the six that made the claim BARE. The other five say
+                // "nothing was REPORTED freed", which is a fact about the
+                // report this code writes; "nothing was freed" is a fact
+                // about the DISK, and this arm establishes no such thing. On
+                // the fixture that produces the cause the inspected object is
+                // gone from where it stood: the mover really did remove it
+                // and really did trash a replacement, and what came back is
+                // the replacement. Whether anything was freed is not
+                // something the after-proof looked at. It now says what it
+                // can: nothing was reported freed. r16's whole-message guard
+                // did not catch it, because that guard is a list of phrases
+                // somebody had already thought of and this phrase was not on
+                // it; keeping the class out needs a structural fence, not a
+                // longer list.
                 return "\(unproved), so what it did take has been PUT BACK: "
                     + "it was moved back out of the Trash and identified at "
-                    + "this path; nothing was freed; refused, re-scan "
-                    + "required"
+                    + "this path; nothing was reported freed; refused, "
+                    + "re-scan required"
             case .strandedInTrash(let landed):
                 return "\(unproved), and what it did take could not be put "
                     + "back automatically — it is in the Trash at \(landed). "

@@ -3549,7 +3549,7 @@ final class OrphanedCachesScannerTests: XCTestCase {
         XCTAssertEqual(report.errors.count, 1)
         let message = try XCTUnwrap(report.errors.first?.message)
         XCTAssertTrue(message.contains("PUT BACK"), message)
-        XCTAssertTrue(message.contains("nothing was freed"), message)
+        XCTAssertTrue(message.contains("nothing was reported freed"), message)
         XCTAssertTrue(
             fm.fileExists(atPath: library.path),
             "the wrongly-taken tree was left in the Trash — a disposal that "

@@ -4955,6 +4955,75 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
     }
 
 
+    /// A DELETE-TIME MEASUREMENT THAT COULD NOT READ THROUGH THE DIRECTORY
+    /// REFUSES THE WHOLE PRUNE (PR #460 codex r18, C6).
+    ///
+    /// The SCAN-TIME tier already suppresses the entire item for this exact
+    /// condition — "the disclosure would be unverifiable". Delete time took
+    /// the same report and looked only at mount boundaries, so the FRESHER
+    /// reading was the WEAKER one: a denial that developed after the scan
+    /// left the measurement short, the claims registered from it short, and
+    /// the recursive removal running anyway.
+    ///
+    /// A REAL denial, not a seam: `chmod 000` on a subdirectory of the admin
+    /// directory is what the production sizer reports as one.
+    ///
+    /// MUTATION: delete the `report.denials.first` arm — RED here, because
+    /// the directory is then removed and a row is emitted.
+    func testAnUnmeasurableRecomputedAdminDirRefusesBeforeClaimsOrPrune()
+        async throws
+    {
+        let fixture = try makePruneFixture(orphans: ["gone"])
+        let orphan = try XCTUnwrapElement(fixture.admin, 0)
+        let plan = prunePlan(membership: fixture.membership, disclosed: [orphan])
+        let unreadable = orphan.appendingPathComponent("unreadable-subtree")
+        try fm.createDirectory(at: unreadable, withIntermediateDirectories: true)
+        try Data(repeating: 3, count: 2048)
+            .write(to: unreadable.appendingPathComponent("payload.bin"))
+        let fileManager = fm
+        addTeardownBlock {
+            try? fileManager.setAttributes(
+                [.posixPermissions: 0o755], ofItemAtPath: unreadable.path
+            )
+        }
+        try fm.setAttributes([.posixPermissions: 0o000], ofItemAtPath: unreadable.path)
+
+        let runner = InterceptingGitRunner(wrapping: realRunner())
+        let outcome = await perform(
+            item(plan, id: "prune"), plan: plan,
+            with: makePerformer(runner: runner)
+        )
+
+        XCTAssertNil(outcome.entry, "an unaccountable directory credits nothing")
+        let message = try XCTUnwrap(outcome.errors.first?.message)
+        XCTAssertTrue(
+            message.contains("could not be measured completely"), message
+        )
+        XCTAssertTrue(message.contains(unreadable.path), message)
+        XCTAssertTrue(
+            message.contains("nothing was pruned"),
+            "the refusal precedes every removal: \(message)"
+        )
+        XCTAssertTrue(
+            fm.fileExists(atPath: orphan.path),
+            "the directory nobody could account for must survive"
+        )
+        // AND NOTHING INSIDE IT WAS TOUCHED. Without the refusal the removal
+        // is ATTEMPTED and `removefile` destroys what it can reach before
+        // failing on the part it cannot — so the entry's own live state is
+        // what the arm is really protecting.
+        try fm.setAttributes(
+            [.posixPermissions: 0o755], ofItemAtPath: unreadable.path
+        )
+        XCTAssertTrue(
+            fm.fileExists(atPath: unreadable.appendingPathComponent("payload.bin").path)
+        )
+        XCTAssertTrue(
+            fm.fileExists(atPath: orphan.appendingPathComponent("gitdir").path),
+            "the back-link the next scan reads must still be there"
+        )
+    }
+
     func testADisclosedEntryANOTHERProcessRemovedIsNeverBilledAsFreed()
         async throws
     {

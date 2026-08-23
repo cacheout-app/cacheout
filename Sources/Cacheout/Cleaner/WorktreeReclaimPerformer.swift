@@ -1201,6 +1201,31 @@ struct WorktreeReclaimPerformer {
                 logRefusal("mount_boundary", detail)
                 return failure(item, detail, tag: nil)
             }
+            // (5b) AND A DIRECTORY THAT COULD NOT BE READ THROUGH IS NOT ONE
+            // THIS ITEM CAN ACCOUNT FOR (PR #460 codex r18, C6). The
+            // scan-time prune tier SUPPRESSES the whole item for exactly this
+            // condition — "the disclosure would be unverifiable" — and this
+            // reading is the more current one, taken over the RECOMPUTED set
+            // moments before the removal. Ignoring it here made the fresher
+            // reading the weaker one: an enumeration, permission or I/O
+            // denial that developed after the scan (a chmod, a failing disk,
+            // an unreadable subtree) left the delete-time measurement silently
+            // short, the claims registered from it silently short, and the
+            // recursive removal running anyway over a directory nobody could
+            // account for.
+            //
+            // BEFORE ANY REGISTRATION, like the mount gate beside it: this
+            // loop only measures, and the claims are registered in (7) once
+            // every directory has passed both gates.
+            if let denial = report.denials.first {
+                let detail = "refused: affected admin directory "
+                    + "\(directory.path) could not be measured completely "
+                    + "(\(denial.url.path): \(denial.detail)) — what it holds "
+                    + "cannot be accounted for, so nothing was pruned. "
+                    + "Re-scan once it is readable."
+                logRefusal("prune-measurement-denied", detail)
+                return failure(item, detail, tag: nil)
+            }
             measured.append((directory, report))
         }
 

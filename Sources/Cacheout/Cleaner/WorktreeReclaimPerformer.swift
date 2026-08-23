@@ -2501,7 +2501,14 @@ struct WorktreeReclaimPerformer {
         // on the scan session's wall-clock bound, one on its visible row and
         // one on the errno-carrying open — took it to 1511: `swift test` AT
         // COMMIT 592eb0a reported 1511 executed / 2 skipped / 0 failures,
-        // exit 0. Every figure here now names the
+        // exit 0. r13's eleven cells — five on the `.noDirectoryTree` arm
+        // that bound neither its container nor its leaf, four driving that
+        // verdict through the CLEANER (one of them through the shipped
+        // `FileManager.trashItem` into the real `~/.Trash`), one evidencing
+        // the `isSafeComponent` guards r12's M5 could not kill and one on the
+        // prune credit — took it to 1522: `swift test` AT COMMIT 350fa31
+        // reported 1522 executed / 2 skipped / 0 failures, exit 0, 135 s.
+        // Every figure here names the
         // commit it was taken at, which is the only spelling that cannot rot.
         // The half that survives every commit — and the half a mutation
         // actually establishes — is the ZERO FAILURES.

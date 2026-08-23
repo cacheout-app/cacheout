@@ -20,12 +20,15 @@
 ///   than `readabilityHandler` EOF, whose EOF notification is known to be
 ///   missed (SR-12080).
 /// - **A FULL termination protocol on timeout expiry.** `terminate()` alone
-///   is insufficient twice over: a child that ignores SIGTERM survives it,
-///   and open pipe FDs wedge the reader joins. The pinned sequence is
-///   `terminate()` → bounded grace wait → `SIGKILL` if still running →
-///   close the pipe file handles → boundedly join BOTH drain workers. Every
-///   step is bounded, so the runner returns `.timeout` even against a
-///   SIGTERM-ignoring child, with no wedged reader and no surviving child.
+///   is insufficient THREE times over: a child that ignores SIGTERM survives
+///   it, open pipe FDs wedge the reader joins, and a signal aimed at the
+///   child's pid leaves everything the child SPAWNED running (PR #460 codex
+///   r18, C8). The pinned sequence is `SIGTERM the child's process GROUP` →
+///   bounded grace wait → `SIGKILL` the group if anything in it is still
+///   there → close the pipe file handles → boundedly join BOTH drain
+///   workers. Every step is bounded, so the runner returns `.timeout` even
+///   against a SIGTERM-ignoring child, with no wedged reader, no surviving
+///   child and no orphaned descendant.
 ///   "Every step" INCLUDES the close, which is the step that used to be the
 ///   exception: it takes the drain's lock, and until PR #460 codex r14 the
 ///   drain could hold that lock indefinitely against a live stream. What
@@ -427,6 +430,12 @@ final class GitCommandRunner: GitCommandRunning, @unchecked Sendable {
             )
         }
 
+        // THE CHILD'S PROCESS GROUP, READ WHILE THE CHILD IS PROVABLY ALIVE
+        // (PR #460 codex r18, C8). Everything the runner may later have to
+        // signal is decided here, once, before any wait — see
+        // `ownProcessGroup(of:)`.
+        let group = Self.ownProcessGroup(of: process)
+
         // Both drains start BEFORE the wait: either stream filling the
         // 64 KiB pipe buffer would otherwise block the child forever while
         // the parent waits for an exit that can never come.
@@ -436,7 +445,7 @@ final class GitCommandRunner: GitCommandRunning, @unchecked Sendable {
         stderrDrain.start()
 
         guard process.waitForExit(within: timeout) else {
-            terminate(process)
+            terminate(process, group: group)
             // PINNED ORDER: close the pipe handles FIRST, then join. An open
             // FD is exactly what wedges a reader when the child (or a
             // grandchild that inherited the write end) is still holding it.
@@ -486,16 +495,73 @@ final class GitCommandRunner: GitCommandRunning, @unchecked Sendable {
         )
     }
 
-    /// terminate → bounded grace → SIGKILL if still running → bounded reap
-    /// wait. Every step bounded; a SIGTERM-ignoring child cannot survive it.
-    private func terminate(_ process: Process) {
-        process.terminate()
-        guard !process.waitForExit(within: terminationGrace) else { return }
+    /// The child's process group ID — but ONLY when the child is that
+    /// group's own LEADER, and read ONCE, immediately after `run()`, while
+    /// the pid is provably still allocated to this child.
+    ///
+    /// MEASURED on this machine (Darwin 25.5, 2026-08-23) with a 15-line
+    /// Foundation program: `Process` places every child in a NEW process
+    /// group whose id IS the child's pid — parent `pid 47862 pgrp 47770`,
+    /// child `pid 47866 pgid 47866`. So `kill(-pid, …)` reaches the child
+    /// AND every descendant that has not deliberately left the group, which
+    /// is the whole of what a git command spawns (helpers, submodule
+    /// recursions, the odd `sh`).
+    ///
+    /// THE `group == pid` TEST IS THE SAFETY, NOT DECORATION. If a future
+    /// Foundation left the child in the CALLER's group, `-group` would
+    /// signal this whole process — the app, or the test bundle. `nil` then
+    /// means "signal the pid alone", which is exactly what the runner did
+    /// before r18 and is never worse than it.
+    private static func ownProcessGroup(of process: Process) -> pid_t? {
         let pid = process.processIdentifier
-        if pid > 0 {
-            kill(pid, SIGKILL)
-        }
+        guard pid > 0 else { return nil }
+        let group = getpgid(pid)
+        guard group == pid else { return nil }
+        return group
+    }
+
+    /// SIGTERM the TREE → bounded grace → SIGKILL the TREE if anything in it
+    /// is still there → bounded reap wait. Every step bounded; a
+    /// SIGTERM-ignoring child cannot survive it, and neither can a
+    /// descendant that outlives it.
+    ///
+    /// **THE TREE, NOT THE PID** (PR #460 codex r18, C8). Both steps used to
+    /// target `process.processIdentifier` alone. Killing the parent of a
+    /// timed-out `git` leaves whatever it spawned — a helper invoked while
+    /// inspecting a submodule, say — orphaned and running, still holding the
+    /// inherited pipe write end and still traversing repositories after the
+    /// runner has returned `.timeout`. The old timeout cell could not see it:
+    /// its fixture launches `sleep`, and it checked only the shell's pid.
+    ///
+    /// AND THE ESCALATION IS DECIDED ON THE GROUP, NOT ON THE PARENT. A
+    /// parent that exits inside the grace window says nothing about a
+    /// descendant that ignored the same SIGTERM, so after the grace the
+    /// group is probed (`kill(-group, 0)`) and SIGKILLed if anything answers.
+    ///
+    /// DISCLOSED RESIDUAL — a pid-recycle window. `group` equals the child's
+    /// pid, and once the kernel reaps that child the pid may be reissued; a
+    /// process that then became a group leader with the same id would receive
+    /// the SIGKILL below. macOS pids are issued sequentially and wrap near
+    /// 99999, so hitting it needs ~100k spawns inside one `terminationGrace`.
+    /// The pre-r18 code had the same class of window on its bare
+    /// `kill(pid, SIGKILL)`; what is new is that the post-exit probe can fire
+    /// after the parent has already been reaped.
+    private func terminate(_ process: Process, group: pid_t?) {
+        signal(SIGTERM, to: process, group: group)
+        let parentExited = process.waitForExit(within: terminationGrace)
+        let treeStillThere = group.map { kill(-$0, 0) == 0 } ?? false
+        guard !parentExited || treeStillThere else { return }
+        signal(SIGKILL, to: process, group: group)
         _ = process.waitForExit(within: terminationGrace)
+    }
+
+    /// The group if there is one and it accepted the signal, the pid
+    /// otherwise. Never both: a group signal already reached the child.
+    private func signal(_ code: Int32, to process: Process, group: pid_t?) {
+        if let group, kill(-group, code) == 0 { return }
+        let pid = process.processIdentifier
+        guard pid > 0 else { return }
+        kill(pid, code)
     }
 }
 

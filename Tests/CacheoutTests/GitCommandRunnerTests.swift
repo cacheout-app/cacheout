@@ -382,6 +382,95 @@ final class GitCommandRunnerTests: XCTestCase {
         )
     }
 
+    /// Reads a pid a stub wrote to `url`, or `nil` while it has not yet.
+    private func recordedPid(at url: URL) -> pid_t? {
+        guard let text = try? String(contentsOf: url, encoding: .utf8) else {
+            return nil
+        }
+        return pid_t(text.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
+    /// **C8 — THE TIMEOUT KILLED THE PARENT AND LEFT WHAT IT SPAWNED
+    /// RUNNING** (PR #460 codex r18).
+    ///
+    /// Both termination steps targeted `process.processIdentifier` alone. A
+    /// timed-out `git` that had spawned a descendant — a helper used while
+    /// inspecting a submodule — therefore lost its parent and kept the
+    /// descendant, which goes on holding the inherited pipe write end and
+    /// traversing repositories after the runner has returned `.timeout`.
+    ///
+    /// `…SigtermIgnoringStubIsEscalatedToSigkill…` could not see it: its
+    /// fixture launches `sleep`, and it asserts only on the SHELL's pid.
+    /// This cell asserts on the DESCENDANT's. The stub blocks in `wait` — a
+    /// BUILTIN, so it spawns exactly ONE extra process and every pid this
+    /// cell creates is accounted for — and the descendant is
+    /// `( trap '' TERM; exec sleep 300 )`, i.e. a single process, at the pid
+    /// `$!` records, whose SIGTERM disposition is SIG_IGN and SURVIVES the
+    /// `exec`. So the descendant dies of neither a signal aimed at the
+    /// parent nor a SIGTERM aimed at the group. The shell itself takes the
+    /// DEFAULT disposition and exits inside the grace, which makes this
+    /// specifically the arm where the parent is already gone and the
+    /// escalation has to be decided on the GROUP.
+    ///
+    /// MUTATIONS, each measured on this fixture with the target rebuilt,
+    /// `swift test --filter …testATimedOutCommandsDescendantIsKilledWithIt`
+    /// — one per ARM of the fix, because the two are independent:
+    ///
+    /// | mutation | result |
+    /// |---|---|
+    /// | `signal(_:to:group:)` aimed at the pid alone | RED 8/8 |
+    /// | `treeStillThere` pinned to `false` (no group escalation) | RED 8/8 |
+    ///
+    /// The parent assertion passes on every one of those runs, which is
+    /// exactly the blind spot `…SigtermIgnoringStubIsEscalatedToSigkill…`
+    /// has: its fixture launches `sleep` and it checks only the shell's pid.
+    func testATimedOutCommandsDescendantIsKilledWithIt() async throws {
+        let stubs = base.appendingPathComponent("stubs-descendant")
+        let parentPidFile = base.appendingPathComponent("parent.pid")
+        let childPidFile = base.appendingPathComponent("descendant.pid")
+        _ = try GitFixture.makeStubGit(in: stubs, body: """
+        export PATH=/bin:/usr/bin
+        echo $$ > "\(parentPidFile.path)"
+        ( trap '' TERM; exec sleep 300 ) &
+        echo $! > "\(childPidFile.path)"
+        wait
+        """)
+        // HYGIENE: whatever this test spawns dies with it, mutation or not.
+        defer {
+            for file in [parentPidFile, childPidFile] {
+                if let pid = recordedPid(at: file), pid > 0 {
+                    kill(pid, SIGKILL)
+                }
+            }
+        }
+        let runner = GitCommandRunner(
+            environment: stubEnvironment(pathDirectories: [stubs]),
+            defaultTimeout: 30,
+            terminationGrace: 0.5,
+            drainJoinBudget: 1
+        )
+        let invocation = await runner.run(["status", "--porcelain"], timeout: 0.5)
+        XCTAssertEqual(invocation.outcome, .timeout)
+
+        XCTAssertTrue(
+            waitUntil(5) { self.recordedPid(at: childPidFile) != nil },
+            "the stub must have recorded the descendant it spawned"
+        )
+        let parent = try XCTUnwrap(recordedPid(at: parentPidFile))
+        let descendant = try XCTUnwrap(recordedPid(at: childPidFile))
+        XCTAssertNotEqual(parent, descendant)
+        XCTAssertTrue(
+            waitUntil(5) { kill(parent, 0) != 0 },
+            "the timed-out child itself must be gone"
+        )
+        XCTAssertTrue(
+            waitUntil(5) { kill(descendant, 0) != 0 },
+            "the descendant must be killed WITH its parent — an orphan of a "
+                + "timed-out git goes on holding the inherited pipe and "
+                + "traversing repositories after the runner has answered"
+        )
+    }
+
     // MARK: - The drain's lock: bounded turns, and a closer nobody barges past
 
     /// A shell that starts `count` writers on the pipe's write end and then

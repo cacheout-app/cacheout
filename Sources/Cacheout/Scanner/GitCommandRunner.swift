@@ -26,6 +26,10 @@
 ///   close the pipe file handles → boundedly join BOTH drain workers. Every
 ///   step is bounded, so the runner returns `.timeout` even against a
 ///   SIGTERM-ignoring child, with no wedged reader and no surviving child.
+///   "Every step" INCLUDES the close, which is the step that used to be the
+///   exception: it takes the drain's lock, and until PR #460 codex r14 the
+///   drain could hold that lock indefinitely against a live stream. What
+///   bounds it now is stated where it lives, on `PipeDrain`.
 /// - **A per-INVOCATION timeout.** Scan fan-out uses the ~10 s default (the
 ///   2 s probe precedent is too tight for `status` on a multi-GB worktree;
 ///   the 30 s clean timeout is too loose for scan fan-out), while
@@ -348,6 +352,13 @@ final class GitCommandRunner: GitCommandRunning, @unchecked Sendable {
     /// Check-probe-store under ONE lock acquisition: two concurrent first
     /// callers can never both spawn a probe, and the verdict a caller sees
     /// is always this instance's own.
+    ///
+    /// This DOES hold `lock` across a whole subprocess execution, which is
+    /// the longest hold in the file. Stated rather than left to be
+    /// discovered: it is bounded — `defaultTimeout` + the termination grace
+    /// + SIGKILL reap + both drain joins, all of them injected — and it is
+    /// paid at most once per instance. It is not the shape r14's N2 was
+    /// about; there is no second unbounded hold here.
     private func availability() -> Bool {
         lock.lock()
         defer { lock.unlock() }
@@ -489,22 +500,81 @@ final class GitCommandRunner: GitCommandRunning, @unchecked Sendable {
 /// deliberately unused — its EOF notification is known to be missed
 /// (SR-12080), which would hang the join.
 ///
+/// ## What bounds `close()` (PR #460 codex r14, N2)
+///
+/// The worker holds `lock` across its whole turn, so `close()` — which needs
+/// the same lock — waits for it. TWO mechanisms used to be able to make that
+/// wait long, and the poll interval bounded NEITHER of them:
+///
+/// 1. The read loop `continue`d on every `count > 0` WITHOUT releasing the
+///    lock. A descriptor whose write end is held open and written to
+///    continuously (the inherited-write-end case this runner exists to
+///    survive: a grandchild outliving the child the runner SIGKILLs) kept
+///    `read` returning bytes, so the turn — and the lock — never ended.
+///    `maxReadsPerLockedBatch` ends every turn instead.
+/// 2. Even a SHORT turn starves a waiter if the worker unlocks and
+///    immediately re-locks: `NSLock` lets the re-locker barge past a parked
+///    waiter, and this worker's outer loop does exactly that thousands of
+///    times a second under a live stream. MEASURED at commit 08deb6e over a
+///    pipe fed by eight `dd bs=64` writers: a competing lock acquisition
+///    waited 21-616 ms (median 201 ms over 20 samples) against an advertised
+///    20 ms. `closeRequested` — announced WITHOUT `lock` and read by the
+///    worker before it contends — is what actually removes the contention:
+///    the worker returns rather than re-acquiring, so the closer's wait is
+///    one bounded turn, not an unbounded queue of them.
+///
+/// LOCK ORDER, and the only rule that matters: `stateLock` is NEVER held
+/// while `lock` is acquired. `close()` takes `stateLock`, releases it, then
+/// takes `lock`; the worker holds `lock` and takes `stateLock` briefly
+/// inside it. Hold-and-wait therefore never forms.
+///
 /// `@unchecked Sendable`: `captured`/`isClosed` are only touched under
-/// `lock`, and `handle` is only used under it as well.
-private final class PipeDrain: @unchecked Sendable {
+/// `lock`, `closeRequested` only under `stateLock`, and `handle` is only
+/// used under `lock` as well.
+///
+/// INTERNAL rather than file-private so `GitCommandRunnerTests` can time
+/// `close()` against a live flood
+/// (`testCloseIsNotStarvedByAContinuouslyWrittenWriteEnd`) and against a
+/// descriptor that never runs dry
+/// (`testAReadTurnThatNeverRunsDryStillEndsOnItsOwnBound`). Nothing outside
+/// this file constructs one.
+final class PipeDrain: @unchecked Sendable {
 
     /// How long a single `poll` waits before the worker rechecks `isClosed`.
-    /// It also bounds how long `close()` can wait for the lock.
     private static let pollIntervalMilliseconds: Int32 = 20
+
+    /// The most `read(2)` calls one LOCKED turn may make before it hands the
+    /// lock back. Large enough that an ordinary burst is drained in one turn
+    /// (16 x 64 KiB = 1 MiB, sixteen times the pipe's own capacity), small
+    /// enough that a turn is microseconds even when every read is full.
+    private static let maxReadsPerLockedBatch = 16
 
     private let handle: FileHandle
     private let lock = NSLock()
+    /// Guards `closeRequested` ALONE. A second lock rather than a field on
+    /// `lock` because its whole job is to be reachable while `lock` is held
+    /// by the worker — that is what lets `close()` announce itself without
+    /// queueing behind the very loop it is trying to stop.
+    private let stateLock = NSLock()
     private let finished = DispatchSemaphore(value: 0)
     private var buffer = Data()
     private var isClosed = false
+    private var closeRequested = false
 
     init(pipe: Pipe) {
         handle = pipe.fileHandleForReading
+    }
+
+    /// A drain over an ARBITRARY read handle. Production passes a pipe and
+    /// nothing else; this exists so a test can hand the loop a descriptor
+    /// that NEVER runs dry, which is the only scope that can notice
+    /// `maxReadsPerLockedBatch`. A macOS pipe cannot be that scope: measured
+    /// at commit 08deb6e, a reader of this shape outruns every writer this
+    /// suite can spawn — 52k EAGAINs/s behind eight `yes` processes, 375k
+    /// behind one — so a pipe turn ends on its own before the bound is
+    /// reached, and deleting the bound reddens no pipe-fed cell.
+    init(readingFrom handle: FileHandle) {
+        self.handle = handle
     }
 
     /// Everything read so far, snapshotted under the lock — safe to call
@@ -532,6 +602,13 @@ private final class PipeDrain: @unchecked Sendable {
     }
 
     func close() {
+        // ANNOUNCE FIRST, without `lock`. The worker reads this before it
+        // contends for `lock` again, so it stops re-acquiring instead of
+        // barging past this call.
+        stateLock.lock()
+        closeRequested = true
+        stateLock.unlock()
+
         lock.lock()
         defer { lock.unlock() }
         guard !isClosed else { return }
@@ -539,9 +616,21 @@ private final class PipeDrain: @unchecked Sendable {
         try? handle.close()
     }
 
+    private var isCloseRequested: Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return closeRequested
+    }
+
     private func drain() {
         var scratch = [UInt8](repeating: 0, count: 65_536)
         while true {
+            // BEFORE contending: a closer that has announced itself must not
+            // have to win a lock race against this loop. Returning here is
+            // what makes its wait one turn rather than an unbounded queue of
+            // them; `close()` still sets `isClosed` and closes the handle
+            // under `lock`, which is now uncontended.
+            if isCloseRequested { return }
             lock.lock()
             if isClosed {
                 lock.unlock()
@@ -549,10 +638,23 @@ private final class PipeDrain: @unchecked Sendable {
             }
             let descriptor = handle.fileDescriptor
             var isDone = false
+            // Set when the turn ended because it hit its bound rather than
+            // because the descriptor ran dry — data is known to be waiting,
+            // so the turn hands the lock back WITHOUT polling for it.
+            var yieldedLock = false
+            var readsThisTurn = 0
             readAvailable: while true {
                 let count = read(descriptor, &scratch, scratch.count)
                 if count > 0 {
                     buffer.append(contentsOf: scratch[0..<count])
+                    readsThisTurn += 1
+                    // THE BOUND. Without it a continuously written descriptor
+                    // keeps this branch true forever and the lock is never
+                    // handed back.
+                    if readsThisTurn >= Self.maxReadsPerLockedBatch {
+                        yieldedLock = true
+                        break readAvailable
+                    }
                     continue
                 }
                 if count == 0 {
@@ -570,6 +672,17 @@ private final class PipeDrain: @unchecked Sendable {
                 break readAvailable
             }
             if isDone {
+                lock.unlock()
+                return
+            }
+            if yieldedLock {
+                lock.unlock()
+                continue
+            }
+            // The poll is the ONE remaining bounded hold. Skipped outright
+            // once a close is pending, so a closer never waits on a sleep
+            // taken for a descriptor nobody is going to read again.
+            if isCloseRequested {
                 lock.unlock()
                 return
             }

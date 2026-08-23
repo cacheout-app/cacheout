@@ -382,6 +382,176 @@ final class GitCommandRunnerTests: XCTestCase {
         )
     }
 
+    // MARK: - The drain's lock: bounded turns, and a closer nobody barges past
+
+    /// A shell that starts `count` writers on the pipe's write end and then
+    /// blocks. The writers are GRANDCHILDREN — killing the shell leaves them
+    /// running, which is exactly the shape the runner's timeout path meets
+    /// (the child is SIGKILLed, something it spawned still holds the
+    /// inherited write end) and the shape the drain has to survive.
+    ///
+    /// `dd bs=64` deliberately, not `cat /dev/zero`: what starves a waiter is
+    /// the RATE OF READS, not the byte rate, and 64-byte writes keep the
+    /// drain's loop spinning at full speed while pouring ~10 MB/s rather than
+    /// ~3 GB/s into the capture buffer.
+    @discardableResult
+    private func startWriters(
+        on pipe: Pipe, count: Int, pidFile: URL
+    ) throws -> Process {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = ["-c", """
+        export PATH=/bin:/usr/bin
+        i=0
+        while [ $i -lt \(count) ]; do
+          dd if=/dev/zero bs=64 2>/dev/null &
+          echo $! >> "\(pidFile.path)"
+          i=$((i + 1))
+        done
+        wait
+        """]
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        process.standardInput = FileHandle.nullDevice
+        try process.run()
+        return process
+    }
+
+    private func killRecordedWriters(_ pidFile: URL) {
+        let text = (try? String(contentsOf: pidFile, encoding: .utf8)) ?? ""
+        for line in text.split(separator: "\n") {
+            if let pid = pid_t(line.trimmingCharacters(in: .whitespaces)) { kill(pid, SIGKILL) }
+        }
+    }
+
+    /// One (pipe, writers, drain) trio: start the flood, let it reach steady
+    /// state, then time `close()` COLD. Cold matters — a thread that has just
+    /// released `NSLock` wins the next race trivially, so a warm probe would
+    /// measure the wrong thing entirely.
+    private func measureCloseWaitMilliseconds(
+        writers: Int, settle: TimeInterval
+    ) throws -> Double {
+        let pidFile = base.appendingPathComponent("writers-\(UUID().uuidString).pid")
+        let pipe = Pipe()
+        let shell = try startWriters(on: pipe, count: writers, pidFile: pidFile)
+        defer {
+            shell.terminate()
+            killRecordedWriters(pidFile)
+        }
+        let drain = PipeDrain(pipe: pipe)
+        drain.start()
+        Thread.sleep(forTimeInterval: settle)
+        XCTAssertGreaterThan(
+            drain.captured.count, 0,
+            "the fixture never fed the drain — nothing would be contended"
+        )
+        Thread.sleep(forTimeInterval: 0.05)
+        let started = DispatchTime.now().uptimeNanoseconds
+        drain.close()
+        let waited = Double(DispatchTime.now().uptimeNanoseconds - started) / 1e6
+        XCTAssertTrue(
+            drain.join(within: 5), "the worker must return once the close is announced"
+        )
+        return waited
+    }
+
+    /// N2 (PR #460 codex r14). `drain()` took `lock`, entered
+    /// `readAvailable: while true` and `continue`d on every `count > 0`
+    /// WITHOUT releasing it — so a descriptor being written continuously kept
+    /// the turn, and the lock, alive indefinitely. `close()` takes the same
+    /// lock before it can set `isClosed`, so the runner's advertised bounded
+    /// termination was bypassed in precisely the inherited-write-end case its
+    /// own comments say it handles.
+    ///
+    /// The header claimed the 20 ms poll interval "bounds how long `close()`
+    /// can wait for the lock". It bounded NEITHER half of the real wait: the
+    /// unbounded read turn rides in FRONT of the poll, and even a short turn
+    /// starves a waiter because the worker unlocks and immediately re-locks,
+    /// which `NSLock` lets it win.
+    ///
+    /// Seven cold trios rather than one: a single sample from a barging lock
+    /// is a coin flip, and the MEDIAN is what separates the two régimes
+    /// cleanly. Measured red rates for both mutations are in the commit
+    /// message.
+    ///
+    /// MUTATION A (the turn bound): delete the `readsThisTurn >=
+    /// Self.maxReadsPerLockedBatch` break in `drain()`.
+    /// MUTATION B (the announcement): drop the `stateLock`/`closeRequested`
+    /// half — `close()` back to taking `lock` first, and the worker back to
+    /// re-acquiring unconditionally.
+    func testCloseIsNotStarvedByAContinuouslyWrittenWriteEnd() throws {
+        var waits: [Double] = []
+        for _ in 0..<7 {
+            waits.append(try measureCloseWaitMilliseconds(writers: 8, settle: 0.3))
+        }
+        let sorted = waits.sorted()
+        let median = sorted[sorted.count / 2]
+        XCTAssertLessThan(
+            median, 25,
+            "median cold `close()` wait \(median) ms against a live stream; "
+                + "the advertised bound is one poll interval, 20 ms "
+                + "(samples: \(sorted))"
+        )
+    }
+
+    /// The TURN BOUND, at the only seam that can see it.
+    ///
+    /// `drain()`'s read turn used to have no exit but EOF, a read error, or
+    /// the descriptor running dry — it `continue`d, holding `lock`, for as
+    /// long as bytes kept arriving, and `close()` needs that lock before it
+    /// can set `isClosed`. Announcing a close does not help against that
+    /// shape: the announcement is only read BETWEEN turns.
+    ///
+    /// A pipe cannot express the shape. MEASURED against a faithful copy of
+    /// the loop at commit 08deb6e, a reader of this shape outruns every
+    /// writer this suite can spawn (52k EAGAINs/s behind eight `yes`
+    /// processes, 375k behind one; longest turn seen 116 ms), so a pipe turn
+    /// ends on its own and deleting the bound reddens no pipe-fed cell —
+    /// `testCloseIsNotStarvedByAContinuouslyWrittenWriteEnd` was measured
+    /// GREEN with it deleted, 8 runs, and so was a twelve-trio variant fed by
+    /// `yes` (that variant is not in the suite: no mutation of the turn bound
+    /// could redden it, so it evidenced nothing this cell does not).
+    /// A regular file does
+    /// express it exactly: `read` returns a full buffer every time until EOF
+    /// and never EAGAIN, which is what a write end held open and written to
+    /// continuously looks like from inside the loop.
+    ///
+    /// The double is LESS capable than production, never more: a file cannot
+    /// block, cannot be closed by a peer, and reaches a real EOF — so a
+    /// mutation cannot hide behind it.
+    ///
+    /// MUTATION: delete the `readsThisTurn >= Self.maxReadsPerLockedBatch`
+    /// break in `drain()` — RED here, because `close()` then waits out the
+    /// whole gibibyte.
+    func testAReadTurnThatNeverRunsDryStillEndsOnItsOwnBound() throws {
+        // A SPARSE gibibyte: no disk is consumed and no bytes are written,
+        // but every read returns 64 KiB of it.
+        let file = base.appendingPathComponent("never-dry.bin")
+        XCTAssertTrue(fm.createFile(atPath: file.path, contents: nil))
+        let writing = try FileHandle(forWritingTo: file)
+        XCTAssertEqual(ftruncate(writing.fileDescriptor, 1 << 30), 0)
+        try writing.close()
+
+        let reading = try FileHandle(forReadingFrom: file)
+        let drain = PipeDrain(readingFrom: reading)
+        drain.start()
+        // Long enough that the worker is provably inside a turn.
+        Thread.sleep(forTimeInterval: 0.05)
+
+        let started = DispatchTime.now().uptimeNanoseconds
+        drain.close()
+        let waited = Double(DispatchTime.now().uptimeNanoseconds - started) / 1e6
+
+        XCTAssertLessThan(
+            waited, 25,
+            "cold `close()` waited \(waited) ms behind a descriptor that never "
+                + "runs dry; the advertised bound is one poll interval, 20 ms"
+        )
+        XCTAssertTrue(
+            drain.join(within: 5), "the worker must return once the close lands"
+        )
+    }
+
     // MARK: - D17 profiles, per COMMAND class
 
     private func assertReadOnlyProfile(

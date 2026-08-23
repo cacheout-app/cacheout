@@ -953,16 +953,29 @@ final class TrashDisposalHopProofTests: XCTestCase {
     /// Trash-open guard two cells up, one directory over, and until r14 it
     /// answered the OPPOSITE cause (PR #460 codex r14, V1-D1).
     ///
-    /// `observed` is non-`nil` by the time either open is attempted, so the
-    /// item IS in the Trash in both cases; what failed is the put-back, not
-    /// the finding. `.lastSeenInTrash` sent the user looking for an object
-    /// whose exact path the refusal was holding.
+    /// `observed` is non-`nil` and the Trash-side re-bind has already passed
+    /// by the time this open is attempted, so the item IS in the Trash; what
+    /// failed is the put-back, not the finding. `.lastSeenInTrash` sent the
+    /// user looking for an object whose exact path the refusal was holding.
     ///
-    /// The double denies the TARGET's container rather than the Trash, which
-    /// leaves every other read in the disposal intact: `openAdmittedContainer`
-    /// is a raw following `open` and never goes through the provider, and
-    /// `look`'s pre-move read of the target falls back to its path-spelled
-    /// open on the permission class, exactly as it does for `~/.Trash`.
+    /// THE DENIAL IS A REAL `EACCES`, AND SINCE r15 IT HAS TO BE (D-P1). The
+    /// destination now goes through `DepthSafeRemoval.openAdmittedContainer`,
+    /// whose open is a RAW following `open(2)` that no provider double can
+    /// intercept — which is the whole point of the alignment, and which
+    /// retired the `TrashDeniedProvider` version of this cell: with the
+    /// double in place the open simply succeeded, the `RENAME_EXCL` then
+    /// failed `EEXIST` on an occupied target name, and `.strandedInTrash` came
+    /// back for a reason that had nothing to do with the arm under test.
+    /// MEASURED: with that fixture the V1-D1 mutation reddened NOTHING —
+    /// 27 executed / 0 failures — so the cell was re-pointed rather than kept.
+    ///
+    /// THE DISCRIMINATION IS EXPLICIT: the mover really moves the object and
+    /// leaves the target's name FREE, so the put-back would SUCCEED
+    /// (`.putBack`, evidenced by
+    /// `…UndoPutsBackUnderASymlinkedContainerWhatItPutsBackUnderAPlainOne`)
+    /// if the container were openable. Mode `0111` is the same traverse-but-
+    /// not-read class `…AnswersOneCodePerFailureAndAdmitsMode0111` pins at
+    /// `EACCES`.
     ///
     /// MUTATION: restore `.lastSeenInTrash` on `rollBack`'s destination-open
     /// arm and this cell alone fails.
@@ -970,30 +983,39 @@ final class TrashDisposalHopProofTests: XCTestCase {
         async throws
     {
         let landings = try XCTUnwrap(self.landings)
-        let base = try XCTUnwrap(self.base)
-        let provider = TrashDeniedProvider(denying: base)
-        let target = base.appendingPathComponent("victim-dest-denied")
+        let provider = FileSystemIdentityProvider()
+        let container = try makeCacheContainer()
+        let target = container.appendingPathComponent("victim-dest-denied")
         try fm.createDirectory(at: target, withIntermediateDirectories: true)
         try Data("ours".utf8).write(
             to: target.appendingPathComponent("ours.txt")
         )
         let identity = try XCTUnwrap(provider.identity(of: target))
         let parent = try admittedParent(of: target, provider: provider)
-        // A STRANGER'S TREE at the landing, so the after-proof disagrees and
-        // the rollback runs at all.
-        let landed = landings.appendingPathComponent("someone-elses")
-        try fm.createDirectory(at: landed, withIntermediateDirectories: true)
-        try Data("theirs".utf8).write(
-            to: landed.appendingPathComponent("their-work.txt")
-        )
+        let landed = landings.appendingPathComponent("victim-dest-denied")
+        let fileManager = fm
+        defer {
+            try? fm.setAttributes([.posixPermissions: 0o755],
+                                  ofItemAtPath: container.path)
+        }
 
         var thrown: Error?
         do {
             try await TrashDisposal.dispose(
                 target, expecting: .directory(identity), provider: provider,
                 containedIn: parent,
-                via: { _, prove in
+                via: { url, prove in
                     try prove()
+                    // The swap the hop admits, and a REAL move: the target's
+                    // name is left free, so nothing but the destination open
+                    // can stop the put-back.
+                    try self.swapInAStranger(at: url, directory: true)
+                    try fileManager.moveItem(at: url, to: landed)
+                    // …and THEN the container stops being openable.
+                    try fileManager.setAttributes(
+                        [.posixPermissions: 0o111],
+                        ofItemAtPath: container.path
+                    )
                     return landed
                 }
             )
@@ -1003,7 +1025,7 @@ final class TrashDisposalHopProofTests: XCTestCase {
 
         let failure = try XCTUnwrap(
             thrown as? TrashDisposal.Failure,
-            "a stranger's tree at the landing must be refused: "
+            "a stranger's tree the disposal really took must be refused: "
                 + "\(String(describing: thrown))"
         )
         XCTAssertEqual(failure.cause, .strandedInTrash(landed.path))
@@ -1013,10 +1035,11 @@ final class TrashDisposalHopProofTests: XCTestCase {
             ),
             "the item is where the refusal says it is"
         )
-        XCTAssertTrue(
-            fm.fileExists(atPath: target.appendingPathComponent("ours.txt").path),
-            "nothing may be moved into the target when the put-back is "
-                + "refused"
+        XCTAssertFalse(
+            fm.fileExists(atPath: target.path),
+            "the disclosed residual: an unopenable container means the "
+                + "put-back was never attempted, so the target's name stays "
+                + "empty and the refusal has to name the Trash"
         )
     }
 
@@ -1856,5 +1879,223 @@ final class TrashDisposalHopProofTests: XCTestCase {
         )
         XCTAssertTrue(fm.fileExists(atPath: child.path),
                       "nothing may be disturbed")
+    }
+
+    // ================================================================
+    // MARK: - The UNDO under the SAME symlinked container (r15, D-P1)
+    // ================================================================
+
+    /// The four Trash entry points, named so a disagreement between them
+    /// reads as one row of a table rather than as four cells that happen to
+    /// differ.
+    private enum TrashArm: String, CaseIterable {
+        case noVerdict, noDirectoryTree, nonDirectoryLeaf, directory
+
+        /// Two of the four bind a NON-directory by construction:
+        /// `.noDirectoryTree`'s admission is `.anythingButADirectory`, and a
+        /// `.nonDirectoryLeaf` verdict is a statement about a leaf that is
+        /// not one. The other two take a tree.
+        var targetIsADirectory: Bool {
+            switch self {
+            case .noVerdict, .directory: return true
+            case .noDirectoryTree, .nonDirectoryLeaf: return false
+            }
+        }
+    }
+
+    /// Dispose of `target` through ONE of the four Trash arms, with the
+    /// object REPLACED inside the mover and the replacement really moved to
+    /// `landed` — the shape that reaches `rollBack` with something to put
+    /// back and the target's own name left free for it.
+    ///
+    /// Returns the error the disposal threw (every row here must throw).
+    private func undoOutcome(
+        _ arm: TrashArm, of target: URL, to landed: URL,
+        provider: FileSystemIdentityProvider
+    ) async throws -> Error? {
+        let parent = try admittedParent(of: target, provider: provider)
+        let fileManager = fm
+        let directory = arm.targetIsADirectory
+        let mover: TrashDisposal.Mover = { url, prove in
+            // The far-side proof PASSES — everything is still ours — and the
+            // swap lands in the window `trashItem`'s own URL resolution owns.
+            try prove()
+            try self.swapInAStranger(at: url, directory: directory)
+            try fileManager.moveItem(at: url, to: landed)
+            return landed
+        }
+        do {
+            switch arm {
+            case .noVerdict:
+                try await TrashDisposal.dispose(
+                    target, containedIn: parent, provider: provider,
+                    via: mover
+                )
+            case .noDirectoryTree:
+                try await TrashDisposal.dispose(
+                    target, expecting: .noDirectoryTree, provider: provider,
+                    containedIn: parent, via: mover
+                )
+            case .nonDirectoryLeaf:
+                let identity = try XCTUnwrap(provider.identity(of: target))
+                try await TrashDisposal.dispose(
+                    target, expecting: .nonDirectoryLeaf(identity),
+                    provider: provider, containedIn: parent, via: mover
+                )
+            case .directory:
+                let identity = try XCTUnwrap(provider.identity(of: target))
+                try await TrashDisposal.dispose(
+                    target, expecting: .directory(identity),
+                    provider: provider, containedIn: parent, via: mover
+                )
+            }
+        } catch {
+            return error
+        }
+        return nil
+    }
+
+    /// **D-P1 — THE UNDO REFUSED UNDER THE CONTAINER SPELLING r14 TAUGHT THE
+    /// FORWARD PATH TO ACCEPT** (PR #460 codex r15).
+    ///
+    /// r14's V1-D2 aligned the `.directory` arm's PRE-move container open
+    /// with `DepthSafeRemoval.openContainer`, which deliberately FOLLOWS.
+    /// `rollBack`'s destination open was left on `openDirectoryNoFollow`, so
+    /// the round moved this arm from "refuses before the move" to "moves the
+    /// item to the Trash and then cannot put it back" — strictly worse.
+    ///
+    /// MEASURED at 8f71459, identical event, same fixture, ONLY the container
+    /// spelling differing: a PLAIN container answers `.putBack` on all four
+    /// arms, the landing is emptied and the object is restored to the
+    /// target's name; a SYMLINKED one answers `.strandedInTrash` on all four,
+    /// the put-back is NEVER ATTEMPTED, and the target is left ABSENT with
+    /// the object in the Trash.
+    ///
+    /// MUTATION: put `rollBack`'s destination open back on
+    /// `provider.openDirectoryNoFollow(at: target.deletingLastPathComponent())`
+    /// and this cell fails on the four symlinked rows.
+    func testTheUndoPutsBackUnderASymlinkedContainerWhatItPutsBackUnderAPlainOne()
+        async throws
+    {
+        let landings = try XCTUnwrap(self.landings)
+        let provider = FileSystemIdentityProvider()
+        let real = base.appendingPathComponent("undo-real")
+        try fm.createDirectory(at: real, withIntermediateDirectories: true)
+        let link = base.appendingPathComponent("undo-link")
+        try fm.createSymbolicLink(at: link, withDestinationURL: real)
+
+        for spelling in ["plain": real, "symlinked": link]
+            .sorted(by: { $0.key < $1.key })
+        {
+            for arm in TrashArm.allCases {
+                let name = "\(spelling.key)-\(arm.rawValue)"
+                let target = spelling.value.appendingPathComponent(name)
+                if arm.targetIsADirectory {
+                    try fm.createDirectory(
+                        at: target, withIntermediateDirectories: true
+                    )
+                    try Data("ours".utf8).write(
+                        to: target.appendingPathComponent("ours.txt")
+                    )
+                } else {
+                    try Data("ours".utf8).write(to: target)
+                }
+                let landed = landings.appendingPathComponent(name)
+
+                let thrown = try await undoOutcome(
+                    arm, of: target, to: landed, provider: provider
+                )
+                let failure = try XCTUnwrap(
+                    thrown as? TrashDisposal.Failure,
+                    "\(name): an object replaced inside the mover must be "
+                        + "refused: \(String(describing: thrown))"
+                )
+                XCTAssertEqual(
+                    failure.cause, .putBack,
+                    "\(name): the object the disposal really took was named, "
+                        + "re-bound and moved back"
+                )
+                XCTAssertFalse(
+                    fm.fileExists(atPath: landed.path),
+                    "\(name): the object may not be left in the Trash"
+                )
+                XCTAssertTrue(
+                    fm.fileExists(atPath: target.path),
+                    "\(name): the target's name must not be left EMPTY"
+                )
+            }
+        }
+    }
+
+    /// **AND THE PROOF THE UNDO RESTORES INTO THE ADMITTED FOLDER, REACHED
+    /// UNDER THAT SAME SPELLING** (PR #460 codex r15, D-P1(a)).
+    ///
+    /// `.destinationNotTheAdmittedContainer` was evidenced only under a plain
+    /// container (`…RefusesAContainerSwappedInsideTheMover`). Under a
+    /// symlinked one it was UNREACHABLE: the no-follow destination open
+    /// returned `.strandedInTrash` first, so the arm the r14 documentation
+    /// calls "the proof that the undo restores into the admitted folder"
+    /// could not answer at all. The swap here is behind the LINK — the link
+    /// still resolves, and what it resolves to is a stranger's directory.
+    ///
+    /// MUTATION: the same one as the cell above; this cell then answers
+    /// `.strandedInTrash`, which names the right residual for the wrong
+    /// reason.
+    func testTheUndoNamesContainerDriftUnderASymlinkedContainer()
+        async throws
+    {
+        let landings = try XCTUnwrap(self.landings)
+        let provider = FileSystemIdentityProvider()
+        let real = base.appendingPathComponent("drift-real")
+        try fm.createDirectory(at: real, withIntermediateDirectories: true)
+        let link = base.appendingPathComponent("drift-link")
+        try fm.createSymbolicLink(at: link, withDestinationURL: real)
+        let target = link.appendingPathComponent("entry")
+        try Data("ours".utf8).write(to: target)
+        let parent = try admittedParent(of: target, provider: provider)
+        let landed = landings.appendingPathComponent("drift-entry")
+        let fileManager = fm
+        let stash = base.appendingPathComponent("drift-stash")
+
+        var thrown: Error?
+        do {
+            try await TrashDisposal.dispose(
+                target, expecting: .noDirectoryTree, provider: provider,
+                containedIn: parent,
+                via: { url, prove in
+                    try prove()
+                    // The container swap, performed BEHIND the link: the
+                    // spelling still resolves, and what it resolves to is a
+                    // different inode holding a stranger's file.
+                    try fileManager.moveItem(at: real, to: stash)
+                    try fileManager.createDirectory(
+                        at: real, withIntermediateDirectories: true
+                    )
+                    try Data("stranger".utf8).write(
+                        to: real.appendingPathComponent("entry")
+                    )
+                    try fileManager.moveItem(at: url, to: landed)
+                    return landed
+                }
+            )
+        } catch {
+            thrown = error
+        }
+
+        let failure = try XCTUnwrap(
+            thrown as? TrashDisposal.Failure,
+            "a container swapped inside the mover must be refused: "
+                + "\(String(describing: thrown))"
+        )
+        XCTAssertEqual(
+            failure.cause, .destinationNotTheAdmittedContainer(landed.path),
+            "the FOLDER changed, and the undo must say so rather than "
+                + "reporting that it could not open the destination at all"
+        )
+        XCTAssertEqual(
+            try String(contentsOf: landed, encoding: .utf8), "stranger",
+            "the disclosed residual: the wrongly-taken object stays in the "
+                + "landing, named by the refusal"
+        )
     }
 }

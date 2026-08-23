@@ -1616,17 +1616,6 @@ enum TrashDisposal {
         )
         guard trashFD >= 0 else { return .strandedInTrash(landed.path) }
         defer { close(trashFD) }
-        // THE DESTINATION CANNOT BE OPENED — the SAME fact as the guard
-        // above, one directory over, and until r14 it answered the opposite
-        // cause (PR #460 codex r14, V1-D1). `observed` is non-`nil` on this
-        // line too, so the item IS in the Trash; what failed is the put-back,
-        // not the finding. `.lastSeenInTrash` told the user to go and look
-        // for an item whose exact path we are holding.
-        let containerFD = provider.openDirectoryNoFollow(
-            at: target.deletingLastPathComponent()
-        )
-        guard containerFD >= 0 else { return .strandedInTrash(landed.path) }
-        defer { close(containerFD) }
 
         let bound = FileSystemIdentityProvider.ChildProbe.facts(observed)
         guard provider.probeChild(
@@ -1635,29 +1624,70 @@ enum TrashDisposal {
             return .lastSeenInTrash(landed.path)
         }
 
-        // WHOSE FOLDER ARE WE RESTORING INTO? Asked of the HELD DESTINATION
-        // INODE, against a fact taken OUTSIDE it — the identity the cleaner
-        // captured before the disposal. `containerFD` was held across the
-        // whole disposal and never interrogated, so a container swap in that
-        // window aimed the undo at a stranger's directory; and the arrival
-        // proof below runs under THIS SAME descriptor, so it confirmed the
-        // move rather than catching it. A descriptor cannot be its own
-        // reference point.
+        // THE DESTINATION IS OPENED AND PROVED AS ONE ACT, THROUGH THE ONE
+        // SPELLING EVERY OTHER DESTRUCTIVE OPEN OF THIS CONTAINER USES (PR
+        // #460 codex r15, D-P1).
         //
-        // Taken AFTER the re-bind on purpose: by here the object is known to
+        // Until r15 this was `provider.openDirectoryNoFollow`, and the
+        // identity comparison was a separate guard below it. Both halves were
+        // wrong in the same way. `DepthSafeRemoval.openContainer` — which
+        // `remove`, `boundLeaf`, `admittedParent`'s capture and (since r14's
+        // V1-D2) `proveStandingUnderAdmittedContainer` all go through —
+        // deliberately FOLLOWS, and its header says why verbatim: "a
+        // no-follow open would refuse it while `remove`'s open succeeded — a
+        // binding that refuses every deletion under a symlinked cache root".
+        // So the undo refused exactly the spelling the forward path had just
+        // been taught to accept.
+        //
+        // MEASURED at 8f71459, identical event (the object replaced inside
+        // the mover and the replacement really moved), same fixture, ONLY the
+        // container spelling differing: PLAIN — all four Trash arms `.putBack`,
+        // landing emptied, object restored to the target's name. SYMLINKED —
+        // all four `.strandedInTrash`, the put-back NEVER ATTEMPTED, the
+        // target left ABSENT and the object left in the Trash. r14's V1-D2
+        // made this arm STRICTLY WORSE rather than fixing it: commit d6bdde2
+        // measured the `.directory` arm at 6866012 as refusing `.posix(20)`
+        // BEFORE the move on this exact fixture; after the fix it moved the
+        // item to the Trash and then could not put it back. Evidenced by
+        // `TrashDisposalHopProofTests`'
+        // `…UndoPutsBackUnderASymlinkedContainerWhatItPutsBackUnderAPlainOne`.
+        //
+        // THE TWO ERRORS THE PAIR THROWS ARE THE TWO CAUSES THIS FUNCTION
+        // ALREADY HAD, and they are kept apart for the reason
+        // `DepthSafeRemoval.Failure.Cause` keeps its own two apart:
+        //
+        // * THE OPEN FAILED — the SAME fact as the Trash-open guard above,
+        //   one directory over, and until r14 it answered the opposite cause
+        //   (PR #460 codex r14, V1-D1). `observed` is non-`nil` on this line,
+        //   so the item IS in the Trash; what failed is the put-back, not the
+        //   finding. `.lastSeenInTrash` told the user to go and look for an
+        //   item whose exact path we are holding.
+        // * THE IDENTITY DISAGREED — WHOSE FOLDER ARE WE RESTORING INTO?
+        //   Asked of the HELD DESTINATION INODE, against a fact taken OUTSIDE
+        //   it: the identity the cleaner captured before the disposal.
+        //   `containerFD` used to be held across the whole disposal and never
+        //   interrogated, so a container swap in that window aimed the undo at
+        //   a stranger's directory; and the arrival proof below runs under
+        //   THIS SAME descriptor, so it confirmed the move rather than
+        //   catching it. A descriptor cannot be its own reference point.
+        //
+        // TAKEN AFTER THE RE-BIND ON PURPOSE: by here the object is known to
         // still be at `landed`, which is exactly what the refusal tells the
-        // user to go and get. Comparing an `fstat` of this descriptor with an
-        // identity captured through `DepthSafeRemoval.admittedParent` is
-        // apples to apples — both are `fstat`s of a following open, and
-        // reaching this line at all means `openDirectoryNoFollow` succeeded,
-        // i.e. the container's last component is a real directory and not a
-        // link the two opens could disagree about.
-        if case .identity(let expected) = admittedParent {
-            guard provider.identity(ofDescriptor: containerFD) == expected
-            else {
-                return .destinationNotTheAdmittedContainer(landed.path)
-            }
+        // user to go and get.
+        let containerFD: Int32
+        do {
+            containerFD = try DepthSafeRemoval.openAdmittedContainer(
+                at: target.deletingLastPathComponent(),
+                provenAgainst: admittedParent, displayPath: target.path,
+                provider: provider
+            )
+        } catch let refusal as DepthSafeRemoval.Failure
+            where refusal.cause == .notTheAdmittedContainer {
+            return .destinationNotTheAdmittedContainer(landed.path)
+        } catch {
+            return .strandedInTrash(landed.path)
         }
+        defer { close(containerFD) }
 
         var failure: Int32 = 0
         let moved = source.withCString { from in

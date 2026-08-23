@@ -1488,20 +1488,87 @@ final class OneShotGate: @unchecked Sendable {
     }
 }
 
-/// Which scanners have delivered an event — read by the watchdog to decide
-/// whose absence it must REPORT rather than swallow.
-final class ReportedScanners: @unchecked Sendable {
-    private let lock = NSLock()
-    private var ids = Set<String>()
-
-    func record(_ id: String) {
-        lock.lock(); ids.insert(id); lock.unlock()
+/// WHO HAS BEEN PUBLISHED, AND WHETHER THE SESSION IS OVER — one lock over
+/// BOTH, which is the whole point (PR #460 codex r13, C).
+///
+/// Through r12 these were two unsynchronized steps. The watchdog read
+/// `missing(from:)`, yielded a `.scanDidNotFinish` for each, and called
+/// `finish()`, while the producer's loop was independently recording and
+/// yielding real outcomes. Nothing ordered the two, and MEASURED with 12
+/// blocked scanners at a 200 ms bound the overlap was not theoretical: of 19
+/// events, SEVEN scanners were reported as timed out AND published, with
+/// `M:blocked_1:scan_did_not_finish` printed before `O:blocked_1`. That
+/// ordering is the dangerous one — `CacheoutViewModel.handle` runs
+/// `reconcile` for the later `.outcome`, and `reconcile` ends with
+/// `malformedIssuesByScannerID[scannerID] = nil`, so the timeout row the user
+/// was supposed to see disappears and the scanner is republished as healthy.
+/// The same run showed the converse: five scanners that HAD completed lost
+/// their outcomes when `finish()` beat their yield, which the shipped
+/// doc-comment on `ScanSessionBounds` promises cannot happen ("a partial scan
+/// is reported as partial"). The race needs no starvation — only a scanner
+/// finishing inside the watchdog's own window.
+///
+/// So publishing and concluding are mutually exclusive in BOTH directions:
+/// `publish` records the id and yields the event under the SAME lock
+/// `conclude` takes to latch the session closed. Every selected scanner
+/// therefore gets EXACTLY ONE event — its real outcome if it beat the
+/// conclusion, `.scanDidNotFinish` if it did not, never both and never
+/// neither.
+///
+/// Yielding under the lock is safe and deliberate: `AsyncStream` is unbounded
+/// here, so `yield` appends and at most ENQUEUES a waiting consumer (it never
+/// runs consumer code inline), and it does not invoke `onTermination`.
+/// `finish()`, which does, is deliberately called OUTSIDE the lock.
+final class ScanSessionLedger: @unchecked Sendable {
+    /// Why the session stopped accepting events — and the answer to "may
+    /// this session's items be adopted" (see `ValidatedScanSession
+    /// .didExceedBounds`).
+    enum Conclusion {
+        /// The producer drained its group: every scanner reported.
+        case producerFinished
+        /// The wall-clock deadline ended the session early.
+        case boundFired
     }
 
-    func missing(from selected: [String]) -> [String] {
+    private let lock = NSLock()
+    private var ids = Set<String>()
+    private var conclusion: Conclusion?
+
+    /// Publishes one scanner's event unless the session has already been
+    /// concluded, recording it as reported in the same atomic step.
+    /// Returns whether the event was published.
+    @discardableResult
+    func publish(
+        _ event: ValidatedScannerEvent,
+        to continuation: AsyncStream<ValidatedScannerEvent>.Continuation
+    ) -> Bool {
         lock.lock()
         defer { lock.unlock() }
+        guard conclusion == nil else { return false }
+        ids.insert(event.scannerID)
+        continuation.yield(event)
+        return true
+    }
+
+    /// Latches the session closed and returns the selected scanners that
+    /// never published — or nil if somebody else concluded it first, in
+    /// which case the caller must do nothing.
+    func conclude(
+        _ reason: Conclusion, selected: [String]
+    ) -> [String]? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard conclusion == nil else { return nil }
+        conclusion = reason
         return selected.filter { !ids.contains($0) }
+    }
+
+    /// Whether the session was ended by its wall-clock bound rather than by
+    /// the producer finishing. False while the session is still running.
+    var boundDidFire: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return conclusion == .boundFired
     }
 }
 
@@ -2959,7 +3026,7 @@ struct SpaceScannerRuntime {
         // the watchdog needs is captured HERE, before any task starts.
         let bounds = sessionBounds
         let selectedIDs = selected.map(\.id)
-        let reported = ReportedScanners()
+        let ledger = ScanSessionLedger()
         let woundDown = OneShotGate()
         // THE PRODUCER RUNS IN A LOWER PRIORITY BAND THAN ITS CONSUMER, and
         // that is the OTHER half of making the bound observable (PR #460
@@ -3024,10 +3091,17 @@ struct SpaceScannerRuntime {
                     }
                 }
                 for await event in group {
-                    reported.record(event.scannerID)
-                    continuation.yield(event)
+                    // Recorded and yielded ATOMICALLY against the watchdog's
+                    // conclusion (C): after the bound has fired this drops the
+                    // event rather than publishing an outcome for a scanner
+                    // already reported as timed out.
+                    ledger.publish(event, to: continuation)
                 }
             }
+            // The producer's own conclusion, latched for the same reason: a
+            // watchdog that wakes after this must not yield a
+            // `.scanDidNotFinish` for a scanner that finished.
+            _ = ledger.conclude(.producerFinished, selected: [])
             continuation.finish()
             woundDown.open()
         }
@@ -3047,7 +3121,15 @@ struct SpaceScannerRuntime {
             // the event that says so, BEFORE the stream ends, so the
             // consumer's fail-closed path runs for it exactly as it would
             // for a rejected outcome.
-            for id in reported.missing(from: selectedIDs) {
+            //
+            // The missing set is read in the SAME atomic step that closes the
+            // session (C), so a scanner cannot be both reported here and
+            // published by the producer a moment later. `nil` means the
+            // producer concluded first and there is nothing to report.
+            guard let missing = ledger.conclude(
+                .boundFired, selected: selectedIDs
+            ) else { return }
+            for id in missing {
                 continuation.yield(.malformed(
                     scannerID: id,
                     ScanIssue(

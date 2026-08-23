@@ -1707,6 +1707,102 @@ final class CacheoutViewModelTests: XCTestCase {
         XCTAssertFalse(viewModel.isAnyScanInProgress)
     }
 
+    /// EXACTLY ONE EVENT PER SCANNER, EVER — the watchdog's report and the
+    /// real outcome must be exclusive in BOTH directions (PR #460 codex r13,
+    /// C).
+    ///
+    /// r12 read `missing(from:)`, yielded, and called `finish()` with no
+    /// atomicity against the producer's own yield loop. MEASURED with 12
+    /// blocked scanners at a 200 ms bound: of 19 events, SEVEN scanners were
+    /// reported as timed out AND published, `M:blocked_1:scan_did_not_finish`
+    /// before `O:blocked_1`. That order is the harmful one — `reconcile`
+    /// clears `malformedIssuesByScannerID[scannerID]`, so the timeout row the
+    /// user was supposed to see disappears and the scanner is republished as
+    /// healthy. The same run lost five completed scanners' outcomes when
+    /// `finish()` beat their yield.
+    ///
+    /// THE RACE NEEDS NO STARVATION — only a scanner finishing inside the
+    /// watchdog's window — so this cell aims scanners AT the window rather
+    /// than blocking anything, and repeats: each trial has every scanner
+    /// return at about the deadline, and the invariant is checked over the
+    /// raw event stream, which is where "both" and "neither" are both
+    /// visible. `.trials` is what makes it a gate rather than a coin flip;
+    /// r12's own measurement put the per-run failure rate at 7 scanners in 12.
+    ///
+    /// MUTATION: replace the `ledger.publish(event, to: continuation)` call
+    /// with `ledger.record(event.scannerID); continuation.yield(event)` and
+    /// the watchdog's `conclude` with an unsynchronized `missing(from:)`
+    /// read — duplicates appear and this cell is red.
+    @MainActor
+    func testEveryScannerGetsExactlyOneEventEvenAtTheDeadline() async throws {
+        let trials = 12
+        let scannerCount = 6
+        let deadlineMilliseconds = 40
+        var sawBoth: [String] = []
+        var sawNeither: [String] = []
+
+        for trial in 0..<trials {
+            let scanners: [any SpaceScanner] = (0..<scannerCount).map { index in
+                let outcome = ScanOutcome(
+                    items: [perItem(scanner: "racer_\(index)",
+                                    id: "i\(index)", bytes: 100)],
+                    errors: []
+                )
+                return FixtureScanner(
+                    id: "racer_\(index)",
+                    trustedContainerRoots: [
+                        base.appendingPathComponent("racer_\(index)"),
+                    ]
+                ) {
+                    // Aimed AT the deadline, spread either side of it so a
+                    // trial covers both orders of the race.
+                    let jitter = Double(index) - Double(scannerCount) / 2
+                    let target = Double(deadlineMilliseconds) + jitter * 4
+                    try? await Task.sleep(
+                        for: .milliseconds(max(1, Int(target)))
+                    )
+                    return outcome
+                }
+            }
+            let runtime = try makeRuntime(
+                scanners,
+                sessionBounds: ScanSessionBounds(
+                    eventDeadline: .milliseconds(deadlineMilliseconds),
+                    producerWindDownGrace: .milliseconds(50)
+                )
+            )
+            let session = runtime.scanValidatedSession(
+                context: ScanContext(trigger: .automatic)
+            )
+            var counts: [String: Int] = [:]
+            for await event in session.events {
+                counts[event.scannerID, default: 0] += 1
+            }
+            await session.untilProducerFinishes()
+
+            for index in 0..<scannerCount {
+                let id = "racer_\(index)"
+                switch counts[id] ?? 0 {
+                case 1: continue
+                case 0: sawNeither.append("trial \(trial): \(id)")
+                default: sawBoth.append("trial \(trial): \(id) x\(counts[id]!)")
+                }
+            }
+        }
+
+        XCTAssertEqual(
+            sawBoth, [],
+            "a scanner reported as timed out must not ALSO publish an "
+                + "outcome — `reconcile` would clear the timeout row and "
+                + "republish it as healthy"
+        )
+        XCTAssertEqual(
+            sawNeither, [],
+            "and a scanner that finished must not lose its outcome to "
+                + "`finish()`: a partial scan is reported as partial"
+        )
+    }
+
     /// How long this file's polling blockers hold a thread when nothing ever
     /// cancels them — the cap that turns a regression into a RED cell
     /// instead of a hung run.

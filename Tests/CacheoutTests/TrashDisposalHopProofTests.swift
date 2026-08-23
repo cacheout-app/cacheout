@@ -2616,6 +2616,77 @@ final class TrashDisposalHopProofTests: XCTestCase {
     }
 
     // ================================================================
+    // MARK: - The derivation table's own rot gate (r18, E3)
+    // ================================================================
+
+    /// The production source of one repo-relative file.
+    private func repoSource(_ relativePath: String) throws -> String {
+        let url = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()   // CacheoutTests
+            .deletingLastPathComponent()   // Tests
+            .deletingLastPathComponent()   // repo root
+            .appendingPathComponent(relativePath)
+        return try String(contentsOf: url, encoding: .utf8)
+    }
+
+    /// **E3 — THE DERIVATION WAS ALREADY WRONG ABOUT ITS OWN CODE, IN THE
+    /// COMMIT THAT INTRODUCED IT** (PR #460 codex r18).
+    ///
+    /// `established(for: .strandedInTrash)` said "Reached from two places,
+    /// and BOTH have an object identified at the landing". `rollBack` has
+    /// THREE raise sites: the trash-open failure, the `openAdmittedContainer`
+    /// catch-all, and `renameatx_np` failing with a non-`ENOENT` errno
+    /// (`EEXIST`/`ENOTEMPTY` from `RENAME_EXCL`, `EACCES`, `EROFS`, `EXDEV`).
+    /// The CONCLUSION survived — every one of those errnos leaves the source
+    /// at the landing — so no user-facing clause was false because of it.
+    /// What it cost is the `EEXIST` half: something now stands at the target,
+    /// and the message told the user to move the item back onto it.
+    ///
+    /// THE FENCE CANNOT CATCH THIS, AND SAYS SO: its residual reads "nothing
+    /// here can check a derivation against the code". This cell is the
+    /// narrow thing that CAN be checked — the COUNT of raise sites the
+    /// derivation claims to have enumerated. It is a rot gate, not a proof:
+    /// a fourth `return .strandedInTrash` reddens it, and whoever adds one
+    /// has to go and read the entry that says there are three.
+    ///
+    /// MUTATION: add a fourth `return .strandedInTrash(landed.path)` to
+    /// `rollBack` (or delete one of the three) and this cell fails.
+    func testTheStrandedDerivationEnumeratesEveryRaiseSiteInRollBack() throws {
+        let source = try repoSource("Sources/Cacheout/Cleaner/TrashDisposal.swift")
+        let rollBack = try XCTUnwrap(
+            source.range(of: "private static func rollBack("),
+            "rollBack must still be spelled this way"
+        )
+        let body = String(source[rollBack.lowerBound...])
+        // COUNTED ON THE VALUE, NOT ON `return` — the third site is the
+        // ternary's else branch and carries no `return` of its own, which is
+        // exactly the shape that made it easy to miss when the entry was
+        // written.
+        let raises = body.components(
+            separatedBy: ".strandedInTrash(landed.path)"
+        ).count - 1
+        XCTAssertEqual(
+            raises, 3,
+            "`established(for: .strandedInTrash)` enumerates THREE raise "
+                + "sites in `rollBack`; found \(raises). Adding or removing "
+                + "one changes what that entry has to justify — go and read "
+                + "it before changing this number."
+        )
+        // The three, named — so a REPLACEMENT (one deleted, one added) that
+        // keeps the count cannot slip past.
+        for anchor in [
+            "guard trashFD >= 0 else { return .strandedInTrash(landed.path) }",
+            "} catch {\n            return .strandedInTrash(landed.path)\n        }",
+            "? .lastSeenInTrash(landed.path)\n                : .strandedInTrash(landed.path)",
+        ] {
+            XCTAssertTrue(
+                body.contains(anchor),
+                "a raise site the derivation enumerates is gone: «\(anchor)»"
+            )
+        }
+    }
+
+    // ================================================================
     // MARK: - The WHOLE message, not its opening (r16, A-P1/A-P2)
     // ================================================================
 

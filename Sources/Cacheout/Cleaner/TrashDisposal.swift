@@ -530,11 +530,34 @@ enum TrashDisposal {
                     .theItemIsBackAtTheTarget,
                 ])
             case .strandedInTrash:
-                // Reached from two places, and BOTH have an object identified
-                // at the landing: the Trash open failed (`observed` is
-                // non-`nil` on that line) or the destination open failed
-                // after the re-bind matched. Nothing was moved either way, so
-                // the object is still where the disposal put it.
+                // Reached from THREE places in `rollBack`, and all three have
+                // an object identified at the landing. The count was TWO in
+                // the commit that introduced this table, and the entry was
+                // written to be exhaustive (PR #460 codex r18, E3):
+                //
+                // 1. THE TRASH OPEN FAILED — `observed` is non-`nil` on that
+                //    line, so the caller identified the object at `landed` a
+                //    moment ago. Nothing was moved.
+                // 2. `openAdmittedContainer` THREW ANYTHING BUT
+                //    `.notTheAdmittedContainer` — the catch-all, reached after
+                //    the re-bind matched at the landing. Nothing was moved.
+                // 3. `renameatx_np` FAILED WITH A NON-`ENOENT` ERRNO — the
+                //    arm this entry did not enumerate. `EEXIST`/`ENOTEMPTY`
+                //    from `RENAME_EXCL`, `EACCES`, `EROFS`, `EXDEV`: every one
+                //    of them leaves the SOURCE where it was, which is why the
+                //    conclusion survived the omission and no user-facing
+                //    clause was ever false because of it.
+                //
+                // WHAT THE OMISSION DID COST is the `EEXIST` half of arm 3:
+                // that errno means something NOW STANDS AT THE TARGET, so
+                // "Move it back from there" collides with it. The clause says
+                // so; see `claims(path:cause:)`.
+                //
+                // AND THE CELL'S OWN RESIDUAL BIT ON DAY ONE. The fence's
+                // disclosure says "nothing here can check a derivation
+                // against the code" — and this is the entry that was written
+                // to be exhaustive and was not. Read that residual as load
+                // bearing, not as boilerplate.
                 return always.union([
                     .theDisposalWasNotProvedToHaveMovedTheItem,
                     .theItemIsAtTheLanding,
@@ -692,7 +715,10 @@ enum TrashDisposal {
                     ),
                     Claim(
                         establishes: .theItemIsAtTheLanding,
-                        text: " Move it back from there"
+                        text: " Move it back from there — and if something "
+                            + "already stands at \(path), move that aside "
+                            + "first, because the automatic put-back refuses "
+                            + "to overwrite"
                     ),
                     nothingFreed, rescan,
                 ]

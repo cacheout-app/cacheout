@@ -1949,23 +1949,69 @@ class CacheoutViewModel: ObservableObject {
         // act on a half-built result set — and on items not yet paired
         // with an adopted session snapshot.
         guard !isCleaning && !isAnyScanInProgress else { return }
-        isCleaning = true
-        // The cleaner is built PER CLEAN from the adopted session's
-        // snapshot (R9): every caller derives `items` from `selectedItems`,
-        // which already excludes every scanner whose outcome that session
-        // did not produce, so items and snapshot are the atomic pair the
-        // session adoption established.
-        // No completed session (nil snapshot) fail-closes `.removeItem`.
-        // After a runtime rebuild the SAME gate empties `selectedItems`
-        // wholesale (fn-4.10, R8), so this current-runtime cleaner can
-        // never act on a snapshot the previous composition captured.
-        let cleaner = runtime.makeCleaner(snapshot: adoptedSnapshot)
-        let report = await cleaner.clean(
-            items: items, moveToTrash: moveToTrash,
-            authorization: authorization
-        )
+
+        // RECORDED, NOT BOUNDED (PR #460 codex r15, S-P4), and the sibling of
+        // the two waits disclosed at r13's e29ffb4.
+        //
+        // Nothing bounds the await below. `CacheCleaner.clean` walks the
+        // items sequentially and each one ends in `removefile(3)` or
+        // `FileManager.trashItem` — work whose duration is the tree's, not a
+        // budget's, and which can block indefinitely on an unresponsive
+        // volume or a wedged Finder. `isCleaning` is one of the TWO flags
+        // `scan`'s re-entrancy guard reads, and it has exactly two writers in
+        // the whole app (this method: the `true` above and the `defer`
+        // below — COUNTED, `grep -n 'isCleaning ='`). No watchdog, no
+        // timeout and no view ever clears it. So a clean that never returns
+        // latches BOTH the clean path and the scan path shut for the life of
+        // the app, exactly as `dockerPrune`'s unbounded `waitUntilExit()`
+        // latches its own button.
+        //
+        // NOT BOUNDED, deliberately, and this is the product decision: a
+        // deletion cannot be abandoned. `removefile`/`trashItem` keep running
+        // after any timeout this method could impose, so a bound would hand
+        // control back — and publish a report — while the filesystem work
+        // continued, and would re-open the door for a second clean to race
+        // the first over the same paths. Bounding it means making deletion
+        // itself cancellable, which is a change to the cleaner, not to this
+        // flag.
+        //
+        // The `defer` is scoped to this block ON PURPOSE: the trailing
+        // `scan(trigger:)` below is refused by its own guard while
+        // `isCleaning` is true, so a `defer` at METHOD scope would silently
+        // disable the post-cleanup rescan — no error, no report change, just
+        // a stale window. That scope IS evidenced: moving the `defer` out
+        // reddens `testACleanClearsItsFlagBeforeItsTrailingRescanRatherThan
+        // AtMethodExit` and SpaceScannerIntegrationTests' trailing-rescan
+        // assertion, 2/2 runs each.
+        //
+        // NEGATIVE RESULT, recorded so the next round does not re-derive it:
+        // the `defer` ITSELF is not evidenceable here. Replacing it with the
+        // plain assignment at the same site left the WHOLE suite green
+        // (1549 executed / 2 skipped / 0 failures, exit 0, 165 s). There is
+        // no reachable early exit from this block today — the awaited call
+        // does not throw, and cancelling the surrounding task does not unwind
+        // a non-throwing await — so it is scope hygiene against a future
+        // `try` or early `return`, not a guard covering a live path.
+        let report: CleanupReport
+        do {
+            isCleaning = true
+            defer { isCleaning = false }
+            // The cleaner is built PER CLEAN from the adopted session's
+            // snapshot (R9): every caller derives `items` from
+            // `selectedItems`, which already excludes every scanner whose
+            // outcome that session did not produce, so items and snapshot are
+            // the atomic pair the session adoption established.
+            // No completed session (nil snapshot) fail-closes `.removeItem`.
+            // After a runtime rebuild the SAME gate empties `selectedItems`
+            // wholesale (fn-4.10, R8), so this current-runtime cleaner can
+            // never act on a snapshot the previous composition captured.
+            let cleaner = runtime.makeCleaner(snapshot: adoptedSnapshot)
+            report = await cleaner.clean(
+                items: items, moveToTrash: moveToTrash,
+                authorization: authorization
+            )
+        }
         lastReport = report
-        isCleaning = false
         showCleanupReport = true
 
         // Rescan to update sizes. `.userInitiated`: a confirmed cleanup is

@@ -628,6 +628,49 @@ final class ScanPresentationTests: XCTestCase {
         XCTAssertEqual(viewModel.scanGeneration, 0)
     }
 
+    /// S-P4 (PR #460 codex r15). `clean` raised `isCleaning`, awaited the
+    /// cleaner with NO bound and NO `defer`, and cleared the flag by a plain
+    /// assignment on the one straight-line path. The flag is one of the two
+    /// `scan`'s re-entrancy guard reads, so leaking it latches BOTH paths
+    /// shut for the life of the app.
+    ///
+    /// The `defer` that fixes the hygiene has a trap in it, which is what
+    /// this cell pins: `clean` ends with its own `scan(trigger:)`, and that
+    /// scan is REFUSED by its own guard while `isCleaning` is true. A `defer`
+    /// at METHOD scope therefore clears the flag one statement too late and
+    /// silently disables the post-cleanup rescan — no error, no report
+    /// change, just a stale window. Scoped to the cleaner call, the flag
+    /// clears first and the rescan runs.
+    ///
+    /// `scanGeneration` is the observable: it advances once per COMPLETED
+    /// scan, so "the trailing rescan ran" is a count, not an inference.
+    ///
+    /// MUTATION: move the `defer { isCleaning = false }` out to method scope
+    /// — RED here (the generation stays at 1), and RED on
+    /// SpaceScannerIntegrationTests' "clean()'s trailing rescan saw the new
+    /// truth".
+    @MainActor
+    func testACleanClearsItsFlagBeforeItsTrailingRescanRatherThanAtMethodExit()
+        async throws
+    {
+        let viewModel = try makeViewModel()
+        await viewModel.scan(trigger: .userInitiated)
+        XCTAssertEqual(viewModel.scanGeneration, 1, "the seeding scan completed")
+        XCTAssertFalse(viewModel.isCleaning)
+
+        await viewModel.clean()
+
+        XCTAssertFalse(
+            viewModel.isCleaning,
+            "the flag must not survive the clean — it gates the scan path too"
+        )
+        XCTAssertEqual(
+            viewModel.scanGeneration, 2,
+            "clean()'s trailing rescan must RUN; it is refused by its own "
+                + "guard if the flag is still up when it is reached"
+        )
+    }
+
     @MainActor
     func testScanRefusedWhileCleaning() async throws {
         let viewModel = try makeViewModel()

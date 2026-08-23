@@ -3045,10 +3045,27 @@ final class TrashDisposalHopProofTests: XCTestCase {
     /// was wrong was publishing it as a change to the outcome the default user
     /// sees.
     ///
-    /// MUTATION: this cell is not a guard, it is the reachability measurement
-    /// the CHANGELOG and `rollBack`'s trash-open guard now cite. Delete
+    /// MUTATION — RUN, AND THE NOTE THAT STOOD HERE HAD IT BACKWARDS (PR
+    /// #460 codex r17, M3). It said "this cell is not a guard … Delete
     /// `rollBack`'s trash-open guard and the run dies rather than reddening —
-    /// the descriptor is `-1` and `probeChild` is asked about it.
+    /// the descriptor is `-1` and `probeChild` is asked about it", and cited
+    /// no run. MEASURED at cd58104 with exactly that line — `guard trashFD >=
+    /// 0 else { return .strandedInTrash(landed.path) }` — deleted and the
+    /// target rebuilt, `swift test --filter TrashDisposalHopProofTests`: THE
+    /// RUN DOES NOT DIE. 36 executed, 5 failures, exit 1, no crash, 6 s. The
+    /// `-1` is harmless on both counts — `close(-1)` is an `EBADF` no-op and
+    /// `probeChild` on `-1` answers a MISMATCH rather than trapping — so the
+    /// deletion silently downgrades `.strandedInTrash` to `.lastSeenInTrash`
+    /// — a WRONG CAUSE, on ALL FOUR arms of this cell (measured by printing
+    /// `failure.cause` per arm under the mutation; the run's own log records
+    /// two of the four as assertion failures, and the reason it records two
+    /// and not four is NOT established here) — and THREE cells assert
+    /// against it:
+    /// `…AnUnopenableLandingStillCatchesAnObjectThatIsNotOurs`,
+    /// `…TheDirectoryVerdictArmStillCatchesAStrangerUnderADeniedLanding`, and
+    /// THIS ONE. So this cell is BOTH the reachability measurement the
+    /// CHANGELOG cites AND one of that guard's three witnesses; the guard is
+    /// evidenced, and the note that said otherwise was never run.
     ///
     /// TRASH HYGIENE: each arm's landing name is UNIQUE, so `trashItem` never
     /// suffixes it and the exact path is known before the run; each is

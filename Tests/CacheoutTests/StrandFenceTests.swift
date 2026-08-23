@@ -68,6 +68,26 @@ import XCTest
 ///    `testNoUniquelyKeyedDictionaryCanStrandTheRun` fences it; the sites and
 ///    the replacement live in `TestElementAccess.swift`.
 ///
+/// 6. **AN UNBOUNDED PARK** (PR #460 codex r11, D2) — and this one is worse
+///    than a trap, because a trap ENDS. A cell that `await`s a hand-built
+///    gate nobody will resume prints the name of the cell it entered and then
+///    NOTHING: no failure, no total line, no exit status, no signal — the run
+///    simply stops, for as long as anyone is willing to wait, and every cell
+///    after it never runs.
+///
+///    MEASURED with ONE production line mutated —
+///    `Sources/Cacheout/Scanner/SpaceScanner.swift`, `var
+///    includeProtectedRoots: Bool { trigger == .userInitiated }` → `{ true }`
+///    — the log ended at `EphemeralTempRegistrationTests`'
+///    `testADecliningScannerIsNotPendingWhileTheSessionRuns` started. and
+///    stayed there for 120 s until the runner was killed. The cell awaited
+///    `ScanRendezvous.waitUntilStarted()`, whose only resumer is a
+///    `signalStarted()` inside a fixture scanner PRODUCTION invokes on
+///    exactly that flag. FOUR hand-built gates had the shape; all four now
+///    park on `BoundedRendezvous` (`TestElementAccess.swift`), which resumes
+///    an abandoned waiter after a deadline and fails that ONE cell.
+///    `testNoHandBuiltGateCanParkTheRunForever` fences it.
+///
 /// ## And it reads BOTH TEST TARGETS (PR #460 codex r6, D3)
 ///
 /// Through r5 the scan root was `URL(fileURLWithPath: #filePath)
@@ -1183,6 +1203,155 @@ final class StrandFenceTests: XCTestCase {
             "let byID = Dictionary(pairs, uniquingKeysWith: { first, _ in first })",
             // The replacement.
             "let byID = XCTUniquelyKeyed(report.entries.map { ($0.itemID, $0) })",
+        ] {
+            XCTAssertEqual(offenders(quiet), [], "must NOT be reported: \(quiet)")
+        }
+    }
+
+    // MARK: - Position 6: an UNBOUNDED PARK (r11, D2)
+
+    /// The one construct here that does not kill the process — it stops it.
+    ///
+    /// `Continuation` is the whole needle: it is what
+    /// `withCheckedContinuation`, `withUnsafeContinuation`, their throwing
+    /// spellings and a stored `CheckedContinuation<…>` property all have in
+    /// common, and a hand-built gate cannot be written without one.
+    static let continuationNeedle = "Continuation"
+
+    /// The ONE file allowed to spell it: the file that declares
+    /// `BoundedRendezvous`, the bounded park every gate in the suite now
+    /// uses. Asserted to actually declare it, so moving the type without
+    /// moving this constant fails HERE instead of opening a silent hole.
+    static let boundedParkFile = "TestElementAccess.swift"
+
+    /// Line numbers (1-based) of every `Continuation` in one already blanked
+    /// source.
+    static func continuationParks(in source: String) -> [Int] {
+        var lines: [Int] = []
+        for (offset, line) in source.split(
+            separator: "\n", omittingEmptySubsequences: false
+        ).enumerated() where line.contains(continuationNeedle) {
+            lines.append(offset + 1)
+        }
+        return lines
+    }
+
+    /// **NOTHING IN THE SUITE MAY PARK ON A CONTINUATION IT BUILT ITSELF**
+    /// (PR #460 codex r11, D2).
+    ///
+    /// A trap ENDS the run: the shell gets a signal, the total line is
+    /// missing, and anybody looking at the log can see it. A park on a
+    /// continuation nobody resumes does not end. MEASURED, with ONE
+    /// production line mutated —
+    /// `Sources/Cacheout/Scanner/SpaceScanner.swift`, `var
+    /// includeProtectedRoots: Bool { trigger == .userInitiated }` → `{ true
+    /// }`:
+    ///
+    ///     Test Suite 'EphemeralTempRegistrationTests' started at 17:14:20.935
+    ///     Test Case '…testADecliningScannerIsNotPendingWhileTheSessionRuns' started.
+    ///     <nothing at all, for 120 s, until the runner was killed>
+    ///
+    /// no failure, no total line, no exit code. The cell awaited
+    /// `ScanRendezvous.waitUntilStarted()`, whose only resumer is a
+    /// `signalStarted()` that PRODUCTION reaches only on that flag.
+    ///
+    /// FOUR hand-built gates had the shape — `ScanRendezvous`
+    /// (`EphemeralTempRegistrationTests`), `ScanGate`
+    /// (`CacheoutViewModelTests`), `ScanHoldGate`
+    /// (`OrphanedCachesScannerTests`) and `AsyncGate`
+    /// (`CategoryScannerTests`) — and all four now park on
+    /// `BoundedRendezvous`, which resumes an abandoned waiter after a
+    /// deadline and FAILS that one cell.
+    ///
+    /// WHAT THIS CELL DOES NOT COVER, counted rather than implied. Three
+    /// Dispatch parks with no timeout remain: `group.wait()` in
+    /// `DocumentedContractTests` and `CLIGateTests` (both wait for two pipe
+    /// readers of a subprocess that has already exited under a
+    /// `DispatchWorkItem` watchdog) and `flipperDone.wait()` in
+    /// `EphemeralTempScannerTests` (waits for a detached thread whose loop
+    /// exits on a flag the same `defer` just set). All three are resumed by
+    /// something the TEST controls, which is the property that makes the
+    /// continuation population dangerous and these three not. They are not
+    /// scanned; if a future one waits on a production decision, it belongs
+    /// here.
+    func testNoHandBuiltGateCanParkTheRunForever() throws {
+        var offenders: [String] = []
+        var scannedFiles = 0
+        var sanctionedSeen = 0
+
+        for file in try testSources() {
+            let source = Self.blankingLiteralText(
+                Self.blankingComments(
+                    try String(contentsOf: file, encoding: .utf8)
+                )
+            )
+            scannedFiles += 1
+            let lines = Self.continuationParks(in: source)
+            guard file.lastPathComponent != Self.boundedParkFile else {
+                sanctionedSeen = lines.count
+                XCTAssertTrue(
+                    source.contains("final class BoundedRendezvous"),
+                    "\(Self.boundedParkFile) is the sanctioned home of the "
+                        + "bounded park and no longer declares it — move the "
+                        + "constant with the type"
+                )
+                continue
+            }
+            for line in lines {
+                offenders.append(
+                    "\(target(of: file))/\(file.lastPathComponent):\(line)"
+                )
+            }
+        }
+
+        XCTAssertGreaterThan(
+            scannedFiles, 40,
+            "the fence must actually have read the suite, not an empty listing"
+        )
+        XCTAssertGreaterThan(
+            sanctionedSeen, 0,
+            "the sanctioned file must still contain the park this fence "
+                + "points every other file at — otherwise the fence is "
+                + "vacuously green"
+        )
+        XCTAssertEqual(
+            offenders, [],
+            "a park on a hand-built continuation does not fail the cell and "
+                + "does not kill the process — it STOPS the run, with no "
+                + "failure and no total line, for as long as anybody waits "
+                + "(measured: 120 s and counting, from one mutated production "
+                + "line). Park on `BoundedRendezvous` instead: it fails one "
+                + "cell after a deadline and lets the rest of the run finish."
+        )
+    }
+
+    /// The new fence's own regression guard, in both directions.
+    func testTheUnboundedParkFenceIsExactlyWhatItClaims() {
+        func offenders(_ source: String) -> [Int] {
+            Self.continuationParks(
+                in: Self.blankingLiteralText(Self.blankingComments(source))
+            )
+        }
+
+        // Reported: every spelling a hand-built gate can use.
+        for shape in [
+            "private var startWaiter: CheckedContinuation<Void, Never>?",
+            "await withCheckedContinuation { waiters.append($0) }",
+            "await withUnsafeContinuation { continuation in park(continuation) }",
+            "try await withCheckedThrowingContinuation { self.store($0) }",
+        ] {
+            XCTAssertEqual(offenders(shape), [1], "must be reported: \(shape)")
+        }
+
+        // Not reported, each for the reason the header states.
+        for quiet in [
+            // A comment that explains the rule is not a breach of it.
+            "// never store a CheckedContinuation in a test",
+            "/// `withCheckedContinuation` parks with no deadline.",
+            // The needle inside string-literal text — a failure message.
+            "XCTFail(\"do not build a CheckedContinuation here\")",
+            // The replacement, which spells no continuation at all.
+            "await gate.park(\"a staggered scan gate\")",
         ] {
             XCTAssertEqual(offenders(quiet), [], "must NOT be reported: \(quiet)")
         }

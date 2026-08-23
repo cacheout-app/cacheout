@@ -6521,19 +6521,22 @@ private struct GatedFixtureScanner: SpaceScanner {
 }
 
 /// A hold-open gate for pinning mid-scan windows.
+///
+/// BOUNDED (PR #460 codex r11, D2) — see `BoundedRendezvous`: a park with no
+/// deadline strands the whole runner when the signal it waits for stops
+/// arriving, which is precisely what a production regression does.
 private actor ScanHoldGate {
-    private var opened = false
-    private var waiters: [CheckedContinuation<Void, Never>] = []
+    private let gate = BoundedRendezvous()
 
-    func open() {
-        opened = true
-        for waiter in waiters { waiter.resume() }
-        waiters = []
-    }
+    func open() { gate.open() }
 
-    func wait() async {
-        if opened { return }
-        await withCheckedContinuation { waiters.append($0) }
+    @discardableResult
+    func wait(
+        _ what: String = "a mid-scan hold gate",
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async -> Bool {
+        await gate.park(what, file: file, line: line)
     }
 }
 

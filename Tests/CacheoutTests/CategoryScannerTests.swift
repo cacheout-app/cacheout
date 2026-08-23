@@ -297,17 +297,17 @@ final class CategoryScannerTests: XCTestCase {
         func count() -> Int { calls }
     }
 
+    /// BOUNDED (PR #460 codex r11, D2) — see `BoundedRendezvous`.
     private actor AsyncGate {
-        private var opened = false
-        private var waiters: [CheckedContinuation<Void, Never>] = []
-        func open() {
-            opened = true
-            for waiter in waiters { waiter.resume() }
-            waiters.removeAll()
-        }
-        func wait() async {
-            guard !opened else { return }
-            await withCheckedContinuation { waiters.append($0) }
+        private let gate = BoundedRendezvous()
+        func open() { gate.open() }
+        @discardableResult
+        func wait(
+            _ what: String = "a fixture scanner gate",
+            file: StaticString = #filePath,
+            line: UInt = #line
+        ) async -> Bool {
+            await gate.park(what, file: file, line: line)
         }
     }
 

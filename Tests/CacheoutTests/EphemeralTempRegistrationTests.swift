@@ -1596,7 +1596,14 @@ final class EphemeralTempRegistrationTests: XCTestCase {
         )
 
         let session = Task { await viewModel.scan(trigger: .automatic) }
-        await rendezvous.waitUntilStarted()
+        // BOUNDED (D2): if production stops invoking the holder the cell
+        // fails HERE and unwinds, instead of parking the whole runner on a
+        // signal that is never coming.
+        guard await rendezvous.waitUntilStarted() else {
+            rendezvous.release()
+            await session.value
+            return
+        }
 
         // OBSERVED WHILE THE SESSION IS LIVE — the epilogue has not run.
         XCTAssertTrue(
@@ -1939,55 +1946,49 @@ final class InvocationCounter: @unchecked Sendable {
 /// A two-phase rendezvous so a test can observe view-model state WHILE a scan
 /// session is live. No sleeping and no polling: the scanner signals that it
 /// has been entered, then parks until the test releases it.
+///
+/// BOTH PHASES ARE BOUNDED (PR #460 codex r11, D2), and the START phase is
+/// why. Its only resumer is a `signalStarted()` inside a fixture scanner that
+/// PRODUCTION invokes — `RendezvousFixtureScanner.scan` runs it only when
+/// `context.includeProtectedRoots == false` — so an ordinary production
+/// regression makes the signal never arrive. Measured with ONE mutated line
+/// (`ScanContext.includeProtectedRoots` → `{ true }`) the old unbounded
+/// `waitUntilStarted()` parked the runner for as long as anyone waited: the
+/// log ended at this cell's `started.` line, with no failure, no total line
+/// and no exit. See `BoundedRendezvous` in `TestElementAccess.swift`.
 final class ScanRendezvous: @unchecked Sendable {
-    private let lock = NSLock()
-    private var started = false
-    private var startWaiter: CheckedContinuation<Void, Never>?
-    private var released = false
-    private var releaseWaiter: CheckedContinuation<Void, Never>?
+    private let start = BoundedRendezvous()
+    private let releaseGate = BoundedRendezvous()
 
-    func signalStarted() {
-        lock.lock()
-        started = true
-        let waiter = startWaiter
-        startWaiter = nil
-        lock.unlock()
-        waiter?.resume()
+    func signalStarted() { start.open() }
+
+    /// `false` (and one failed cell) if nothing signalled within the bound.
+    @discardableResult
+    func waitUntilStarted(
+        within seconds: TimeInterval = 30,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async -> Bool {
+        await start.park(
+            "the fixture scanner was never entered, so it never signalled "
+                + "that the session had started",
+            within: seconds, file: file, line: line
+        )
     }
 
-    func waitUntilStarted() async {
-        await withCheckedContinuation { continuation in
-            lock.lock()
-            if started {
-                lock.unlock()
-                continuation.resume()
-            } else {
-                startWaiter = continuation
-                lock.unlock()
-            }
-        }
-    }
+    func release() { releaseGate.open() }
 
-    func release() {
-        lock.lock()
-        released = true
-        let waiter = releaseWaiter
-        releaseWaiter = nil
-        lock.unlock()
-        waiter?.resume()
-    }
-
-    func waitForRelease() async {
-        await withCheckedContinuation { continuation in
-            lock.lock()
-            if released {
-                lock.unlock()
-                continuation.resume()
-            } else {
-                releaseWaiter = continuation
-                lock.unlock()
-            }
-        }
+    /// `false` (and one failed cell) if the cell never released it.
+    @discardableResult
+    func waitForRelease(
+        within seconds: TimeInterval = 30,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async -> Bool {
+        await releaseGate.park(
+            "the cell never released the scanner it parked",
+            within: seconds, file: file, line: line
+        )
     }
 }
 

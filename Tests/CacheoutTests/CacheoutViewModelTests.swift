@@ -2048,21 +2048,27 @@ private actor CallCounter {
 }
 
 /// An openable/closable gate the staggered fixtures block on.
+///
+/// BOUNDED (PR #460 codex r11, D2). Both directions of this gate can be
+/// decided by production: a fixture scanner parks on it waiting for the CELL,
+/// and the cell parks on `entered` waiting for the SESSION to invoke that
+/// scanner. An unbounded park in the second direction turns a production
+/// regression into a runner that never finishes and never says why — measured
+/// on the twin in `EphemeralTempRegistrationTests`. See `BoundedRendezvous`.
 private actor ScanGate {
-    private var opened = false
-    private var waiters: [CheckedContinuation<Void, Never>] = []
+    private let gate = BoundedRendezvous()
 
-    func open() {
-        opened = true
-        for waiter in waiters { waiter.resume() }
-        waiters = []
-    }
+    func open() { gate.open() }
 
-    func close() { opened = false }
+    func close() { gate.close() }
 
-    func wait() async {
-        if opened { return }
-        await withCheckedContinuation { waiters.append($0) }
+    @discardableResult
+    func wait(
+        _ what: String = "a staggered scan gate",
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async -> Bool {
+        await gate.park(what, file: file, line: line)
     }
 }
 

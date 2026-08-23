@@ -134,3 +134,146 @@ func XCTUniquelyKeyed<Key: Hashable, Value>(
     }
     return result
 }
+
+// MARK: - The same rule, one AWAIT further
+
+/// # A rendezvous PRODUCTION decides, awaited with no bound, is worse than a
+/// # trap
+///
+/// The four constructs above all kill the process, and a killed process at
+/// least ENDS: the run stops, the shell gets a non-zero status, and the
+/// missing total line is visible to anyone who looks. A test that parks on a
+/// continuation nobody will ever resume does not end. It prints the name of
+/// the cell it entered and then nothing — no failure, no total, no exit — and
+/// every cell after it never runs, for as long as anyone is willing to wait.
+///
+/// MEASURED (PR #460 codex r11, D2), with ONE production line mutated —
+/// `Sources/Cacheout/Scanner/SpaceScanner.swift`, `var includeProtectedRoots:
+/// Bool { trigger == .userInitiated }` → `{ true }`, which is an ordinary
+/// regression in a derived TCC gate:
+///
+///     Test Suite 'EphemeralTempRegistrationTests' started at 17:14:20.935
+///     Test Case '…testADecliningScannerIsNotPendingWhileTheSessionRuns' started.
+///     <nothing, for 120 s, until the runner was killed>
+///
+/// The cell awaited `ScanRendezvous.waitUntilStarted()`, whose only resumer
+/// is a `signalStarted()` inside a fixture scanner that PRODUCTION invokes
+/// only when `context.includeProtectedRoots == false`. The mutation removed
+/// that call, so nothing was ever going to resume it.
+///
+/// ## The rule
+///
+/// **In tests, never `await` a hand-built gate that has no deadline.** Park
+/// on `BoundedRendezvous`, which fails exactly one cell and lets the rest of
+/// the run finish. `StrandFenceTests.testNoHandBuiltGateCanParkTheRunForever`
+/// enforces it: a stored `CheckedContinuation` in the test targets must be
+/// stored BY this type.
+///
+/// The bound is deliberately generous (30 s by default). It costs nothing on
+/// the healthy path — a rendezvous that is going to be signalled is signalled
+/// in microseconds — and it is not a scheduling assertion: this type never
+/// fails a cell for being SLOW, only for being ABANDONED.
+
+/// A gate that can be parked on and opened, where parking is BOUNDED: after
+/// `seconds` with nothing having opened it, the waiter is resumed anyway and
+/// the cell FAILS.
+///
+/// Lock-guarded rather than an actor so that an actor, a `@unchecked
+/// Sendable` class and a plain `struct` fixture can all hold one — the four
+/// hand-rolled gates it replaces were two of each.
+final class BoundedRendezvous: @unchecked Sendable {
+    private let lock = NSLock()
+    private var opened = false
+    private var waiters: [Int: CheckedContinuation<Void, Never>] = [:]
+    /// Tickets whose deadline fired BEFORE the continuation was stored. The
+    /// window is microscopic and the default bound is 30 s, but a park that
+    /// resumes nobody is exactly the bug this type exists to remove, so it is
+    /// closed rather than reasoned away.
+    private var abandoned: Set<Int> = []
+    private var nextTicket = 0
+
+    var isOpen: Bool {
+        lock.lock(); defer { lock.unlock() }; return opened
+    }
+
+    /// Open the gate and resume everyone parked on it. Idempotent.
+    func open() {
+        lock.lock()
+        opened = true
+        let waiting = Array(waiters.values)
+        waiters.removeAll()
+        lock.unlock()
+        for waiter in waiting { waiter.resume() }
+    }
+
+    /// Shut the gate again for the next park. Never resumes anybody.
+    func close() {
+        lock.lock(); opened = false; lock.unlock()
+    }
+
+    /// Park until `open()`, or fail the cell after `seconds` and return
+    /// `false`.
+    ///
+    /// - Parameter what: what the caller is waiting FOR, in the failure text
+    ///   — the whole value of the bound is that the message names the
+    ///   rendezvous that was never signalled.
+    @discardableResult
+    func park(
+        _ what: String,
+        within seconds: TimeInterval = 30,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async -> Bool {
+        lock.lock()
+        if opened { lock.unlock(); return true }
+        let ticket = nextTicket
+        nextTicket += 1
+        lock.unlock()
+
+        let deadline = Task { [weak self] in
+            try? await Task.sleep(
+                nanoseconds: UInt64(seconds * 1_000_000_000)
+            )
+            self?.abandon(ticket)
+        }
+        await withCheckedContinuation {
+            (continuation: CheckedContinuation<Void, Never>) in
+            lock.lock()
+            if opened || abandoned.contains(ticket) {
+                abandoned.remove(ticket)
+                lock.unlock()
+                continuation.resume()
+            } else {
+                waiters[ticket] = continuation
+                lock.unlock()
+            }
+        }
+        deadline.cancel()
+
+        lock.lock()
+        let released = opened
+        abandoned.remove(ticket)
+        lock.unlock()
+        if !released {
+            XCTFail(
+                "\(what): nothing opened this rendezvous within \(seconds)s. "
+                    + "The cell fails here rather than parking the process "
+                    + "forever — see BoundedRendezvous (PR #460 codex r11, "
+                    + "D2). If the signal comes from a closure PRODUCTION "
+                    + "invokes, production has stopped invoking it.",
+                file: file, line: line
+            )
+        }
+        return released
+    }
+
+    /// The deadline's side: resume one abandoned waiter WITHOUT opening the
+    /// gate, so `park` can tell "released" from "gave up".
+    private func abandon(_ ticket: Int) {
+        lock.lock()
+        let waiter = waiters.removeValue(forKey: ticket)
+        if waiter == nil { abandoned.insert(ticket) }
+        lock.unlock()
+        waiter?.resume()
+    }
+}

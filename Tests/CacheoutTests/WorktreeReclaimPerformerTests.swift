@@ -5295,6 +5295,72 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         XCTAssertTrue(message.contains("Re-scan"), message)
     }
 
+    /// C3 (PR #460 codex r18). `git worktree lock` on an entry whose checkout
+    /// is MISSING succeeds and moves the entry from `prunable` to `locked` in
+    /// `worktree list --porcelain` (verified on git 2.43), which is why the
+    /// mapper excludes locked entries and why
+    /// `testAnEntryLockedBetweenTheTwoOracleChecksIsNotRemoved` passes: that
+    /// lock lands before an ORACLE call.
+    ///
+    /// A lock landing after the LAST oracle call had nothing to catch it. The
+    /// stale arm re-probes `<admin>/locked` at its last instant
+    /// (`reproveFromTheFilesystem`'s G4 step) and an earlier round deleted the
+    /// fallback prune path that lacked the same probe; the DIRECT prune path
+    /// added since then re-created the bypass, because its only far-side check
+    /// is `revivedCheckoutRefusal`, which reads the back-link and never looks
+    /// at `locked`.
+    func testTheDirectPruneRefusesAnAdminDirectoryLockedInsideItsOwnHop()
+        async throws
+    {
+        let fixture = try makePruneFixture(orphans: ["gone"])
+        let orphan = try XCTUnwrapElement(fixture.admin, 0)
+        let plan = prunePlan(membership: fixture.membership, disclosed: [orphan])
+        let staged = InvocationCounter()
+        let removed = TrashRecorder()
+        let fileManager = fm
+
+        let outcome = await perform(
+            item(plan, id: "prune"), plan: plan,
+            with: makePerformer(
+                runner: InterceptingGitRunner(wrapping: realRunner()),
+                removeTree: { url, _, prove in
+                    // `git worktree lock` writes exactly this file; writing it
+                    // directly is what a lock IS to every reader in this app
+                    // and to git itself, which tests for existence.
+                    if (try? Data("in use on laptop\n".utf8).write(
+                        to: url.appendingPathComponent(
+                            WorktreeReclaimPerformer.lockFileName
+                        )
+                    )) != nil { staged.bump() }
+                    try prove()
+                    removed.record(url)
+                    try fileManager.removeItem(at: url)
+                }
+            )
+        )
+
+        XCTAssertEqual(staged.count, 1, "the fixture never staged the lock")
+        XCTAssertEqual(
+            removed.urls, [],
+            "the refusal is BEFORE the removal: nothing may be unlinked"
+        )
+        XCTAssertTrue(
+            fm.fileExists(atPath: orphan.path),
+            "an entry the user locked was pruned anyway"
+        )
+        XCTAssertTrue(
+            fm.fileExists(atPath: orphan.appendingPathComponent(
+                WorktreeReclaimPerformer.lockFileName
+            ).path),
+            "…and the lock itself went with it"
+        )
+        XCTAssertNil(outcome.entry, "a refused removal accepts nothing")
+        let message = try XCTUnwrapElement(outcome.errors, 0).message
+        XCTAssertTrue(message.contains("LOCKED"), message)
+        XCTAssertTrue(message.contains("Re-scan"), message)
+    }
+
+
     // MARK: - R8: the traversal guard in PRUNE mode
 
     func testPruneModeRefusesASwappedLeafBeforeAnyGitOrAnyMeasurement()

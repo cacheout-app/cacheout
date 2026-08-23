@@ -128,7 +128,7 @@ final class SourceAnchorIntegrityTests: XCTestCase {
          "private func isBlockedFromDestructivePaths(_ sca"),
         ("ContentView.swift:203-208",
          "ForEach(viewModel.perItemSections) { section in"),
-        ("DepthSafeRemoval.swift:641-878",
+        ("DepthSafeRemoval.swift:671-908",
          "private static func removeTree("),
         ("DevRootsStore.swift:28-38",
          "walker's `originRoot` carry these verbatim; vali"),

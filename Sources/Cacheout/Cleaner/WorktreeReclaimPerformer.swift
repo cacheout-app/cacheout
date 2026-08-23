@@ -1452,25 +1452,47 @@ struct WorktreeReclaimPerformer {
             if let revived = revivedCheckoutRefusal(for: directory) {
                 return ("prune-checkout-revived", revived)
             }
+            // AND THE OTHER TWO PROPOSITIONS THIS LOOP OWNS, READ THE SAME
+            // WAY (PR #460 codex r18, C2/C3).
+            //
+            // THE NEAR-SIDE TRIO IS SUBSUMED, MEASURED RATHER THAN ASSUMED:
+            // deleting these two calls — keeping the far-side copies inside
+            // the proof below — leaves the full suite GREEN at 1567 executed
+            // / 2 skipped, because whatever they refuse the far-side copy
+            // refuses one hop later off the same reading. They stay for the
+            // reason the revival check above has always stayed: they refuse
+            // without paying the hop, and the three propositions are then
+            // stated in ONE place rather than only inside a closure a seam is
+            // trusted to call. The load-bearing copies are below.
+            if let locked = lockRefusalForPrunedAdmin(directory) {
+                return locked
+            }
             if let replaced = replacementRefusal(
                 for: bound, Self.prunedAdminBinding
             ) {
                 return replaced
             }
             do {
-                // AND BOTH CROSS THE HOP (PR #460 codex r7 D1 for the
-                // revival; r18 C2 for the binding). The near-side calls a few
-                // lines up are the cheap refusals; these are the load-bearing
-                // ones, because between them sits `removeItemConcurrently`'s
-                // hop onto `DispatchQueue.global`. A checkout repaired inside
-                // it is live state; a directory REPLACED inside it was never
-                // examined by anything. Each is the SAME function on both
-                // sides, so no pair of readings can disagree.
+                // AND ALL THREE CROSS THE HOP (PR #460 codex r7 D1 for the
+                // revival; r18 C2/C3 for the other two). The near-side calls
+                // a few lines up are the cheap refusals; these are the
+                // load-bearing ones, because between them sits
+                // `removeItemConcurrently`'s hop onto `DispatchQueue.global`.
+                // A checkout repaired inside it is live state; an entry
+                // LOCKED inside it is an explicit do-not-touch mark; a
+                // directory REPLACED inside it was never examined by anything.
+                // Each is the SAME function on both sides, so no pair of
+                // readings can disagree about what it means.
                 try await removeTree(
                     directory, bound.containedIn, LastInstantProof {
                         if let revived = revivedCheckoutRefusal(for: directory) {
                             throw LastInstantRefusal(
                                 tag: "prune-checkout-revived", detail: revived
+                            )
+                        }
+                        if let locked = lockRefusalForPrunedAdmin(directory) {
+                            throw LastInstantRefusal(
+                                tag: locked.tag, detail: locked.detail
                             )
                         }
                         if let replaced = replacementRefusal(
@@ -2657,11 +2679,13 @@ struct WorktreeReclaimPerformer {
         // porcelain record, because the record costs a subprocess and this
         // costs one `lstat`. ANY object at that name is a lock — git tests
         // for existence, not for kind.
-        let lockFile = adminEntry.appendingPathComponent(Self.lockFileName)
-        switch provider.probeKind(of: lockFile) {
-        case .absent:
+        //
+        // THE READING IS SHARED WITH THE PRUNE ARM (PR #460 codex r18, C3);
+        // only the wording differs, because only the remedy does.
+        switch readLock(adminEntry: adminEntry) {
+        case .unlocked:
             break
-        case .kind:
+        case .locked(let lockFile):
             return .refuse(
                 tag: "worktree-locked",
                 detail: "refused: this worktree was LOCKED while the "
@@ -2671,7 +2695,7 @@ struct WorktreeReclaimPerformer {
                     + "re-scan alone will keep refusing while the lock is "
                     + "held."
             )
-        case .failed(let code):
+        case .unreadable(let lockFile, let code):
             return .refuse(
                 tag: "worktree-lock-unreadable",
                 detail: "refused: whether this worktree is locked could not "
@@ -2738,6 +2762,66 @@ struct WorktreeReclaimPerformer {
             return .refuse(tag: replaced.tag, detail: replaced.detail)
         }
         return .proceed
+    }
+
+    /// What `<admin>/locked` says. ONE reading, used by the stale arm's
+    /// last-instant re-proof and by the prune arm's (PR #460 codex r18, C3),
+    /// so the two can never disagree about what "locked" means — only about
+    /// how to say it, because only the remedy differs.
+    private enum LockReading {
+        case unlocked
+        case locked(URL)
+        case unreadable(URL, Int32)
+    }
+
+    private func readLock(adminEntry: URL) -> LockReading {
+        let lockFile = adminEntry.appendingPathComponent(Self.lockFileName)
+        switch provider.probeKind(of: lockFile) {
+        case .absent: return .unlocked
+        case .kind: return .locked(lockFile)
+        case .failed(let code): return .unreadable(lockFile, code)
+        }
+    }
+
+    /// The prune arm's wording for the same reading.
+    ///
+    /// A LOCK ON AN ENTRY WHOSE CHECKOUT IS GONE IS A REAL STATE, NOT A
+    /// CONTRADICTION: `git worktree lock` on a missing checkout succeeds and
+    /// moves the entry from `prunable` to `locked` in `worktree list
+    /// --porcelain` (verified on git 2.43), which is why the mapper excludes
+    /// locked entries — git's own prune skips them — and why an entry locked
+    /// between the two oracle checks already survives. A lock landing after
+    /// the LAST oracle call had nothing to catch it: the only far-side check
+    /// this path ran was `revivedCheckoutRefusal`, which reads the back-link
+    /// and never looks at `locked`.
+    private func lockRefusalForPrunedAdmin(
+        _ adminDirectory: URL
+    ) -> (tag: String, detail: String)? {
+        switch readLock(adminEntry: adminDirectory) {
+        case .unlocked:
+            return nil
+        case .locked(let lockFile):
+            return (
+                "prune-admin-locked",
+                "refused: the orphaned admin directory "
+                    + "\(adminDirectory.path) was LOCKED while the "
+                    + "delete-time checks were running (\(lockFile.path) "
+                    + "exists) — a lock is an explicit do-not-touch mark and "
+                    + "git's own prune honours it; nothing was pruned. "
+                    + "Release it (`git worktree unlock`, or remove "
+                    + "\(lockFile.path)) first. Re-scan once it is released; "
+                    + "a re-scan while it is held will keep refusing."
+            )
+        case .unreadable(let lockFile, let code):
+            return (
+                "prune-admin-lock-unreadable",
+                "refused: whether the orphaned admin directory "
+                    + "\(adminDirectory.path) is locked could not be "
+                    + "determined at the last instant (\(lockFile.path): "
+                    + "errno \(code)) — nothing was pruned. Re-scan once "
+                    + "that directory is readable."
+            )
+        }
     }
 
     /// `<admin>/HEAD`, no-follow: the inode it IS and the bytes it holds.

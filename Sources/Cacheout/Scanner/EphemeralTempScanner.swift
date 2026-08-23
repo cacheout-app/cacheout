@@ -2736,7 +2736,7 @@ struct EphemeralTempScanner: @unchecked Sendable {
     /// project already has a lesson for, and this walk was the last instance.
     ///
     /// THE SHAPE IS `DepthSafeRemoval.removeTree`'s
-    /// (`DepthSafeRemoval.swift:641-878`): descend by `openat`, CLOSE the
+    /// (`DepthSafeRemoval.swift:671-908`): descend by `openat`, CLOSE the
     /// parent, and climb back with `openat(current, "..")`, proving at every
     /// step that `..` landed on the identity the walk recorded when it left.
     /// Peak descriptors: the caller's root, the level the walk stands on, and

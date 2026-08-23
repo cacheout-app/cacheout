@@ -1692,6 +1692,16 @@ actor CacheCleaner {
                 // locked, or whether its HEAD moved. Those three are the
                 // performer's propositions and only the performer can state
                 // them, so they ride across in `prove`.
+                //
+                // FOUR, NOT THREE (PR #460 codex r18, C1/C2). The list above
+                // left out the object itself. `expecting: nil` means this
+                // call binds the FOLDER and nothing in it, so a directory
+                // renamed onto `url` after the performer's last check was
+                // destroyed here — measured on both arms at 9ca1129. The
+                // performer now binds what it is about to destroy
+                // (`BoundObject`) and re-proves it in `prove` too, under the
+                // same `admittedParent` value this call is given, so the two
+                // sides cannot be about different folders.
                 try await Self.removeItemConcurrently(
                     at: url, expecting: nil, provider: provider,
                     containedIn: admittedParent,

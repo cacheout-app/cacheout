@@ -261,6 +261,39 @@ private final class FailingProbeProvider: FileSystemIdentityProvider {
     }
 }
 
+/// Fires a side effect the FIRST time the scanner lstats a named admin
+/// ENTRY (`<gitdir>/worktrees/<name>`) once `armed` has been claimed.
+///
+/// The arming latch is what makes the hook name a window rather than a call:
+/// the scanner lstats the same admin entry at DISCOVERY (before any listing)
+/// and again inside `process`'s (e2) witness loop (after the listing), and a
+/// cell about the second must not fire on the first.
+private final class ReplaceOnAdminEntryIdentityProvider: FileSystemIdentityProvider,
+    @unchecked Sendable
+{
+    private let name: String
+    private let armed: OneShotLatch
+    private let effect: () -> Void
+
+    init(adminEntryNamed name: String, armed: OneShotLatch, effect: @escaping () -> Void) {
+        self.name = name
+        self.armed = armed
+        self.effect = effect
+        super.init()
+    }
+
+    override func identity(of url: URL) -> Identity? {
+        if armed.didFire,
+           url.lastPathComponent == name,
+           url.deletingLastPathComponent().lastPathComponent
+            == GitWorktreeGitdirResolver.adminContainerName
+        {
+            effect()
+        }
+        return super.identity(of: url)
+    }
+}
+
 /// A one-shot latch for an interception closure that must fire EXACTLY once —
 /// the scan issues several commands per record, and a fixture that mutated the
 /// tree on each of them would be testing a different story every time.
@@ -1142,6 +1175,262 @@ final class GitWorktreeScannerTests: XCTestCase {
         XCTAssertTrue(fm.fileExists(atPath: trigger.path))
         try assertNonMalformed(outcome, from: scanner)
     }
+
+
+    /// B-P1 (PR #460 codex r16). r15 moved the witness capture out of
+    /// `handle` and into `process`'s (e2) — AFTER the one `git worktree list`
+    /// that produces the records. The code, the CHANGELOG and
+    /// `docs/v1/CATEGORIES.md` all then said the binding "spans the scan's own
+    /// window", and that the only uncovered sliver was inside the listing
+    /// command itself, answered at delete time by R1b.
+    ///
+    /// MEASURED FALSE, and this cell is the falsification. The replacement
+    /// here lands the INSTANT the listing returned — the scanner has not yet
+    /// read a single admin inode — and every read the scan makes afterwards
+    /// (the (e2) witness, the membership, the re-proof) describes the
+    /// REPLACEMENT, while `record` (G1, G4 and the detached/HEAD clause of the
+    /// evidence, all read off the listing and never re-read) still describes
+    /// the checkout that is gone. Before the fix: `items` carried the row,
+    /// `errors` was silent, and the armed identity was the replacement's — so
+    /// the delete-time gate agreed with itself and destroyed a brand-new
+    /// checkout together with its ignored payload.
+    ///
+    /// R1b CANNOT answer this: the identity R1b re-stats against is the very
+    /// one poisoned here, so both sides of its comparison are the
+    /// replacement. That claim is retired in code, CHANGELOG and docs by the
+    /// same commit as this cell.
+    ///
+    /// The fix is a witness taken at DISCOVERY — `repositoryGroups` resolves
+    /// every linked checkout's `<wt>/.git` before any listing runs, so the
+    /// identity is captured on the far side of the listing from the (e2) one.
+    ///
+    /// MUTATION (the discovery capture): drop the `discoveryWitness` guard in
+    /// `handle`, or stop populating `RepositoryGroup.discoveryWitnesses` —
+    /// RED here, GREEN on the r14/r15 cells above, which is what tells this
+    /// window from theirs.
+    func testAWorktreeReplacedTheInstantTheListingReturnedIsRefusedRatherThanOffered()
+        async throws
+    {
+        let repository = try makeRepositoryIgnoringPayloads(
+            at: dev.appendingPathComponent("repo")
+        )
+        let target = dev.appendingPathComponent("wt-a")
+        try addWorktree(of: repository, at: target, branch: "a")
+
+        let identityProvider = FileSystemIdentityProvider()
+        let originalAdmin = try XCTUnwrap(
+            GitWorktreeGitdirResolver().adminDirectory(forWorktreeAt: target),
+            "the fixture must have a resolvable admin directory"
+        )
+        let originalIdentity = try XCTUnwrap(identityProvider.identity(of: originalAdmin))
+
+        let latch = OneShotLatch()
+        let fixtureHome = try XCTUnwrap(home)
+        let payload = target.appendingPathComponent("payload.bin")
+        let runner = InterceptingGitRunner(wrapping: makeRunner()) { arguments, _ in
+            guard arguments.contains("list"), latch.claim() else { return nil }
+            // THE ONE LISTING, run for real by the FIXTURE and handed back
+            // VERBATIM — so the scanner's records describe the ORIGINAL
+            // checkout...
+            guard let listed = try? GitFixture.git(arguments, home: fixtureHome),
+                  listed.status == 0
+            else { return nil }
+            // ...and the developer's replacement lands the instant it
+            // returned, before the scan has read one admin inode. REAL git:
+            // the admin entry is genuinely destroyed and recreated.
+            _ = try? GitFixture.git(
+                ["-C", repository.path, "worktree", "remove", target.path],
+                home: fixtureHome
+            )
+            _ = try? GitFixture.git(
+                ["-C", repository.path, "worktree", "add", target.path, "-b", "brand-new"],
+                home: fixtureHome
+            )
+            try? Data(repeating: 0xCD, count: 8192).write(to: payload)
+            return .success(stdout: listed.stdout)
+        }
+
+        let scanner = makeScanner(runner: runner)
+        let outcome = await scanner.scan(context: ScanContext(trigger: .userInitiated))
+
+        XCTAssertTrue(latch.didFire, "the fixture never intercepted the listing")
+        XCTAssertEqual(
+            runner.argvs.filter { $0.contains("list") }.count, 1,
+            "the ONE listing per repository — the record's only source"
+        )
+        let replacementAdmin = try XCTUnwrap(
+            GitWorktreeGitdirResolver().adminDirectory(forWorktreeAt: target),
+            "the replacement must itself be a well-formed linked worktree"
+        )
+        XCTAssertNotEqual(
+            identityProvider.identity(of: replacementAdmin), originalIdentity,
+            "the fixture must have replaced the OBJECT, not merely the path"
+        )
+
+        let offered = try outcome.items.filter { item in
+            guard case .gitWorktreeReclaim = item.action else { return false }
+            let reclaim = try plan(of: item)
+            return reclaim.mode == .removeStaleWorktree
+                && reclaim.worktreePath?.path.hasSuffix("/wt-a") == true
+        }
+        let armed = try offered.first.map { try plan(of: $0).worktreeAdminEntryIdentity }
+        XCTAssertTrue(
+            offered.isEmpty,
+            "an item was offered for a checkout replaced the instant the "
+                + "listing returned; its armed identity is "
+                + "\(String(describing: armed)) while the LISTED checkout's "
+                + "was \(originalIdentity)"
+        )
+        // SILENCE IS THE DEFECT, not a lesser form of it.
+        let issue = try XCTUnwrap(
+            outcome.errors.first {
+                $0.detail.contains("replaced") && $0.detail.contains("/wt-a")
+            },
+            "the refusal must be VISIBLE, not a silent omission: \(outcome.errors)"
+        )
+        XCTAssertEqual(issue.kind, .unreadable)
+        XCTAssertTrue(issue.detail.contains("no item is offered"), issue.detail)
+        // The replacement and the 8 KiB written into it are left alone.
+        XCTAssertTrue(fm.fileExists(atPath: target.path))
+        XCTAssertEqual(try Data(contentsOf: payload).count, 8192)
+        try assertNonMalformed(outcome, from: scanner)
+    }
+
+    /// B-P2 (PR #460 codex r16). The second half of the same measurement:
+    /// r15 called the uncovered window "a sliver inside the listing command,
+    /// bounded by one git process's own runtime". It is not bounded by that.
+    /// (e2) walks EVERY assessable record of the repository, paying one
+    /// `adminDirectory` read plus one `identity` lstat each, so the window
+    /// grows with the worktree count — in the very loop r15's fix added.
+    ///
+    /// This cell enters the window through an EARLIER record's admin-entry
+    /// lstat: the provider fires the replacement of `wt-z` while (e2) is
+    /// witnessing `wt-a`, after the listing has returned and before any
+    /// assessment has started. No git command has yet mentioned `wt-z`.
+    ///
+    /// MUTATION (the discovery capture): the same one the B-P1 cell names —
+    /// RED here too. Both cells are needed: B-P1 proves the boundary moved to
+    /// the far side of the listing, this one proves the (e2) loop itself is
+    /// inside the covered span.
+    func testAWorktreeReplacedInsideTheWitnessLoopIsRefusedRatherThanOffered()
+        async throws
+    {
+        let repository = try makeRepositoryIgnoringPayloads(
+            at: dev.appendingPathComponent("repo")
+        )
+        // Records are listed in admin-directory name order, so `wt-a` is
+        // witnessed first and `wt-z` is still nothing but a row from the
+        // listing when the replacement lands. The cell asserts that ordering
+        // below rather than assuming it.
+        let trigger = try addWorktree(
+            of: repository, at: dev.appendingPathComponent("wt-a"), branch: "a"
+        )
+        let target = dev.appendingPathComponent("wt-z")
+        try addWorktree(of: repository, at: target, branch: "z")
+
+        let identityProvider = FileSystemIdentityProvider()
+        let originalAdmin = try XCTUnwrap(
+            GitWorktreeGitdirResolver().adminDirectory(forWorktreeAt: target),
+            "the fixture must have a resolvable admin directory"
+        )
+        let originalIdentity = try XCTUnwrap(identityProvider.identity(of: originalAdmin))
+
+        let listingReturned = OneShotLatch()
+        let listingLatch = OneShotLatch()
+        let replaced = OneShotLatch()
+        let fixtureHome = try XCTUnwrap(home)
+        let payload = target.appendingPathComponent("payload.bin")
+
+        let runner = InterceptingGitRunner(wrapping: makeRunner()) { arguments, _ in
+            guard arguments.contains("list"), listingLatch.claim() else { return nil }
+            guard let listed = try? GitFixture.git(arguments, home: fixtureHome),
+                  listed.status == 0
+            else { return nil }
+            // The listing has RETURNED — everything after this line runs in
+            // the window (e2) opens.
+            _ = listingReturned.claim()
+            return .success(stdout: listed.stdout)
+        }
+
+        let provider = ReplaceOnAdminEntryIdentityProvider(
+            adminEntryNamed: "wt-a", armed: listingReturned
+        ) {
+            guard replaced.claim() else { return }
+            _ = try? GitFixture.git(
+                ["-C", repository.path, "worktree", "remove", target.path],
+                home: fixtureHome
+            )
+            _ = try? GitFixture.git(
+                ["-C", repository.path, "worktree", "add", target.path, "-b", "brand-new"],
+                home: fixtureHome
+            )
+            try? Data(repeating: 0xCD, count: 8192).write(to: payload)
+        }
+
+        let scanner = makeScanner(runner: runner, provider: provider)
+        let outcome = await scanner.scan(context: ScanContext(trigger: .userInitiated))
+
+        XCTAssertTrue(listingReturned.didFire, "the fixture never saw the listing return")
+        XCTAssertTrue(
+            replaced.didFire,
+            "the fixture never entered the witness loop: \(runner.argvs)"
+        )
+        let replacementAdmin = try XCTUnwrap(
+            GitWorktreeGitdirResolver().adminDirectory(forWorktreeAt: target),
+            "the replacement must itself be a well-formed linked worktree"
+        )
+        XCTAssertNotEqual(
+            identityProvider.identity(of: replacementAdmin), originalIdentity,
+            "the fixture must have replaced the OBJECT, not merely the path"
+        )
+        // THE WINDOW: no command had yet been issued about the target when
+        // the replacement landed — the whole exchange is inside (e2).
+        XCTAssertEqual(
+            runner.argvs.filter { $0.contains("list") }.count, 1,
+            "the ONE listing per repository"
+        )
+        XCTAssertEqual(
+            runner.argvs.first, ["git", "-c", GitCommandRunner.fsmonitorNeutralization]
+                + GitWorktreeOracle.listArguments(forRepositoryAt: repository),
+            "the listing must be the FIRST command, so the replacement fired "
+                + "before any assessment: \(runner.argvs)"
+        )
+
+        let stale = try outcome.items.filter { item in
+            guard case .gitWorktreeReclaim = item.action else { return false }
+            return try plan(of: item).mode == .removeStaleWorktree
+        }
+        let offered = try stale.filter {
+            try plan(of: $0).worktreePath?.path.hasSuffix("/wt-z") == true
+        }
+        let armed = try offered.first.map { try plan(of: $0).worktreeAdminEntryIdentity }
+        XCTAssertTrue(
+            offered.isEmpty,
+            "an item was offered for a checkout replaced inside the witness "
+                + "loop; its armed identity is \(String(describing: armed)) "
+                + "while the listed checkout's was \(originalIdentity)"
+        )
+        let issue = try XCTUnwrap(
+            outcome.errors.first {
+                $0.detail.contains("replaced") && $0.detail.contains("/wt-z")
+            },
+            "the refusal must be VISIBLE, not a silent omission: \(outcome.errors)"
+        )
+        XCTAssertEqual(issue.kind, .unreadable)
+        XCTAssertTrue(issue.detail.contains("no item is offered"), issue.detail)
+        // THE CONTROL: only the replaced record is refused.
+        XCTAssertEqual(
+            try stale.compactMap { try plan(of: $0).worktreePath?.lastPathComponent },
+            ["wt-a"],
+            "the sibling that was never replaced must still be offered"
+        )
+        XCTAssertTrue(fm.fileExists(atPath: target.path))
+        XCTAssertEqual(try Data(contentsOf: payload).count, 8192)
+        XCTAssertTrue(fm.fileExists(atPath: trigger.path))
+        try assertNonMalformed(outcome, from: scanner)
+    }
+
+
 
     // MARK: - R6: the orphaned-admin tier
 

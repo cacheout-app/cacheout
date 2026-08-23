@@ -2055,6 +2055,21 @@ struct WorktreeReclaimPerformer {
     /// one: `git worktree move` rewrites its `gitdir` file, `git worktree
     /// repair` rewrites its pointers, and neither replaces the directory.
     ///
+    /// WHAT THIS GATE CANNOT BE A BACKSTOP FOR (PR #460 codex r16, B-P1).
+    /// This gate compares the LIVE admin directory against the identity the
+    /// PLAN carries, so it answers only replacements that landed after that
+    /// identity was captured. A replacement that lands BEFORE the capture,
+    /// while the scan is still running, poisons the carried identity itself —
+    /// both sides of the comparison below become the replacement, they match,
+    /// and this gate passes. Three places (the scanner's own witness comment,
+    /// the CHANGELOG and `docs/v1/CATEGORIES.md`) claimed the scan's
+    /// residual window was "answered at delete time by this same identity";
+    /// it was measured false end to end and the claim is withdrawn. What
+    /// closes that window is entirely on the scan side: `GitWorktreeScanner`
+    /// witnesses each checkout at DISCOVERY, before the listing that produces
+    /// the row's evidence, and again after it, and refuses the row unless
+    /// both agree with the live identity it is about to arm.
+    ///
     /// WHERE THIS GATE IS REACHABLE FROM — CORRECTED (PR #460 codex r4, D4).
     /// r3 claimed here, in the CHANGELOG, in `docs/v1/CATEGORIES.md` and in
     /// 26e8bdf's own commit message that `Cacheout --cli clean` is protected

@@ -78,19 +78,27 @@ below are both part of that coordination, and the latter BLOCKS this release.
   object the scan saw. So a checkout you moved onto that path, and equally
   one you removed and re-created there, is refused rather than removed — the
   replacement is judged on its own merits by the next scan. That identity is
-  taken at the repository listing that produced the row — not later, when
-  that row's own examination starts — and proved again before the row is
-  armed, so the same binding covers the scan's own window: a checkout
-  replaced at any point after this scan listed it is never offered at all,
-  because the row's evidence would describe a checkout that is already gone.
-  (An earlier draft of this entry said that identity was taken before the
-  worktree was examined and called that the scan's own window. It was taken
-  one window too late: a checkout replaced between the listing and its own
-  examination was offered anyway — silently, and armed with the
-  REPLACEMENT's identity. That was measured, and is now refused. The one
-  sliver left is inside the listing command itself, between git reading an
-  admin directory and the identity being taken; a replacement there is
-  answered at delete time by this same identity.) (This window is
+  taken when the scan first WALKS onto the checkout, before it asks git for
+  the repository's list of worktrees, and it is taken a second time once
+  that list comes back and a third time before the row is armed. All three
+  must agree, so a checkout replaced at any point after the scan walked onto
+  it — including while git was producing the list itself — is refused with a
+  visible reason rather than offered, because the row's evidence would
+  describe a checkout that is already gone.
+  (Two earlier drafts of this entry were wrong about where that identity was
+  taken, each in the same direction. The first said it was taken before the
+  worktree was examined; the second said it was taken at the repository
+  listing. Both were still taken AFTER the read that produced the row's
+  evidence, so a checkout replaced the instant the listing returned was
+  offered anyway — silently, with no reason shown at all, armed with the
+  REPLACEMENT's identity, and destroyed by the clean that followed. Both
+  drafts also said the remaining gap was answered at delete time by this
+  same identity. IT WAS NOT, and that claim is withdrawn: the delete-time
+  check compares against the very identity that had been poisoned, so both
+  sides of it were the replacement and it agreed with itself. The window was
+  also larger than the second draft said — it grew with the number of
+  worktrees in the repository. All of this was measured, and is now
+  refused.) (This window is
   the desktop app's, where one scan's results stay on screen across your
   click. An earlier draft of this entry said `--cli clean` was protected
   because its re-scan answers a replacement with "unknown item id — rescan

@@ -557,6 +557,164 @@ final class GitWorktreeEndToEndTests: XCTestCase {
         }
     }
 
+    /// **B-P1 THROUGH THE PRODUCTION SEAM** (PR #460 codex r16).
+    ///
+    /// The scanner-level cells for this defect live in
+    /// `GitWorktreeScannerTests`; this one is the end-to-end measurement the
+    /// review reported, run against the composition the GUI actually uses.
+    /// Before the fix it produced, 4/4 deterministic runs: `items` carrying
+    /// the row, `viewModel.issues(forScanner:) == []` — SILENT — an armed
+    /// identity belonging to the REPLACEMENT, and a `clean()` that returned
+    /// `errors == []` with one SUCCESS entry while destroying a brand-new
+    /// checkout together with its ignored payload, its `secret.env` and its
+    /// `node_modules/dep.bin`.
+    ///
+    /// The replacement fires the instant `git worktree list` returns: the
+    /// fixture runs that ONE listing itself and hands the scanner its real
+    /// bytes, so every record describes the checkout that is now gone while
+    /// every subsequent read describes the new one. `runner.argvs` proves the
+    /// single listing.
+    ///
+    /// Everything the replacement carries is `.gitignore`d, so the new
+    /// checkout reads CLEAN to git and to this app — which is precisely why
+    /// the four gates passed on it and why the destruction was silent.
+    @MainActor
+    func testACheckoutReplacedTheInstantTheListingReturnedIsRefusedAndSurvivesTheClean()
+        async throws
+    {
+        // A repository that ignores every file the replacement will carry, so
+        // the replacement is a CANDIDATE rather than a dirty tree the gates
+        // would have refused for an unrelated reason.
+        let repository = dev.appendingPathComponent("repo")
+        try GitFixture.makeRepository(at: repository, home: home)
+        try "payload.bin\nsecret.env\nnode_modules/\n".write(
+            to: repository.appendingPathComponent(".gitignore"),
+            atomically: true, encoding: .utf8
+        )
+        try GitFixture.git(["-C", repository.path, "add", ".gitignore"], home: home)
+        try GitFixture.git(
+            ["-C", repository.path, "-c", "user.name=t", "-c", "user.email=t@t",
+             "commit", "-m", "ignore"],
+            home: home
+        )
+        let target = try addWorktree(
+            of: repository, at: dev.appendingPathComponent("wt-live"), branch: "live"
+        )
+
+        let provider = FileSystemIdentityProvider()
+        let listedAdmin = try XCTUnwrap(
+            GitWorktreeGitdirResolver().adminDirectory(forWorktreeAt: target)
+        )
+        let listedIdentity = try XCTUnwrap(provider.identity(of: listedAdmin))
+
+        let payload = target.appendingPathComponent("payload.bin")
+        let secret = target.appendingPathComponent("secret.env")
+        let nested = target.appendingPathComponent("node_modules/dep.bin")
+        let fixtureHome = try XCTUnwrap(home)
+        let listingLatch = NSLock()
+        var intercepted = false
+        let runner = InterceptingGitRunner(
+            wrapping: GitCommandRunner(environment: GitFixture.environment(home: home))
+        ) { arguments, _ in
+            listingLatch.lock()
+            let first = arguments.contains("list") && !intercepted
+            if first { intercepted = true }
+            listingLatch.unlock()
+            guard first else { return nil }
+            guard let listed = try? GitFixture.git(arguments, home: fixtureHome),
+                  listed.status == 0
+            else { return nil }
+            // THE LISTING HAS RETURNED. The developer retires the checkout and
+            // creates a fresh one at the same path — REAL git, so the admin
+            // entry is genuinely destroyed and recreated — then fills it with
+            // the content a new checkout carries before its first commit.
+            _ = try? GitFixture.git(
+                ["-C", repository.path, "worktree", "remove", target.path],
+                home: fixtureHome
+            )
+            _ = try? GitFixture.git(
+                ["-C", repository.path, "worktree", "add", target.path, "-b", "brand-new"],
+                home: fixtureHome
+            )
+            try? Data(repeating: 0xEF, count: 8192).write(to: payload)
+            try? Data("TOKEN=live\n".utf8).write(to: secret)
+            try? self.fm.createDirectory(
+                at: nested.deletingLastPathComponent(), withIntermediateDirectories: true
+            )
+            try? Data(repeating: 0x11, count: 4096).write(to: nested)
+            return .success(stdout: listed.stdout)
+        }
+
+        let viewModel = CacheoutViewModel(runtime: productionRuntime(runner: runner))
+        await viewModel.scan(
+            trigger: .userInitiated, scannerIDs: [GitWorktreeScanner.registeredID]
+        )
+
+        XCTAssertEqual(
+            runner.argvs.filter { $0.contains("list") }.count, 1,
+            "the ONE listing per repository — the records' only source"
+        )
+        let replacementAdmin = try XCTUnwrap(
+            GitWorktreeGitdirResolver().adminDirectory(forWorktreeAt: target),
+            "the replacement must itself be a well-formed linked worktree"
+        )
+        XCTAssertNotEqual(
+            provider.identity(of: replacementAdmin), listedIdentity,
+            "the fixture must have replaced the OBJECT, not merely the path"
+        )
+
+        let items = viewModel.perItemSections.first {
+            $0.scannerID == GitWorktreeScanner.registeredID
+        }?.items ?? []
+        let offered = try items.filter { item in
+            guard case .gitWorktreeReclaim = item.action else { return false }
+            let reclaim = try plan(of: item)
+            return reclaim.mode == .removeStaleWorktree
+                && reclaim.worktreePath?.lastPathComponent == "wt-live"
+        }
+        let armed = try offered.first.map { try plan(of: $0).worktreeAdminEntryIdentity }
+        XCTAssertTrue(
+            offered.isEmpty,
+            "the GUI was offered a row for a checkout replaced the instant the "
+                + "listing returned; its armed identity is "
+                + "\(String(describing: armed)) while the listed checkout's was "
+                + "\(listedIdentity)"
+        )
+        // THE SILENCE WAS THE DEFECT: the refusal must reach the GUI's own
+        // issue surface, not merely omit the row.
+        let issues = viewModel.issues(forScanner: GitWorktreeScanner.registeredID)
+        let issue = try XCTUnwrap(
+            issues.first {
+                $0.detail.contains("replaced") && $0.detail.contains("wt-live")
+            },
+            "the GUI shows nothing at all about the refusal: \(issues)"
+        )
+        XCTAssertTrue(issue.detail.contains("no item is offered"), issue.detail)
+
+        // ---- CLEAN: whatever the GUI DID offer, executed for real ---------
+        viewModel.moveToTrash = false
+        for item in items { viewModel.toggleSelection(for: item.key) }
+        await viewModel.clean()
+
+        let report = viewModel.lastReport
+        XCTAssertEqual(
+            report?.entries.count ?? 0, 0,
+            "the clean acted on something: nothing was offered, so nothing "
+                + "could be selected: \(String(describing: report?.entries))"
+        )
+        // The brand-new checkout and everything the developer put in it.
+        XCTAssertTrue(fm.fileExists(atPath: target.path), "the checkout is gone")
+        XCTAssertEqual(try Data(contentsOf: payload).count, 8192)
+        XCTAssertEqual(try String(contentsOf: secret, encoding: .utf8), "TOKEN=live\n")
+        XCTAssertEqual(try Data(contentsOf: nested).count, 4096)
+        XCTAssertTrue(
+            try worktreeListing(of: repository).contains("wt-live"),
+            "the replacement stays registered — the scan refused it, it did "
+                + "not act on it"
+        )
+    }
+
+
     // ====================================================================
     // MARK: - R11: the GUI's DEFAULT disposal, through the production seam
     // ====================================================================

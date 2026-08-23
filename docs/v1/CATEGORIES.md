@@ -506,17 +506,26 @@ git.
   the assessed path must still back-link to the admin directory the scan
   resolved, and that directory must still be the same object — so a checkout
   moved onto that path, or removed and re-created there, is refused rather
-  than removed. The identity it compares against is captured at
-  the repository listing that produced the row — not later, when that row's
-  own assessment starts — and re-proved immediately before the row is armed,
-  so the binding spans the scan's own window as well as the scan-to-click
-  one: a checkout replaced at any point after this scan listed it is never
-  offered, because the evidence on that row would describe a checkout that no
-  longer exists. What that does not cover is stated rather than implied: git
-  read those admin directories somewhere inside the listing command itself,
-  and the sliver between that read and the capture is witnessed by nothing —
-  a replacement there is answered at delete time instead, by this same
-  identity.
+  than removed. The identity it compares against is captured when the scan
+  WALKS onto the checkout — before it asks git for the repository's worktree
+  list — captured again as soon as that list returns, and re-proved
+  immediately before the row is armed. All three must agree, so the binding
+  spans the scan's own window as well as the scan-to-click one, and it spans
+  the listing command itself: git reads those admin directories inside that
+  command, and a replacement while it does so shows up as a disagreement
+  between the first two captures. A checkout replaced at any point after
+  this scan walked onto it is never offered, and the reason is shown rather
+  than the row simply vanishing.
+  What that does not cover is stated rather than implied: a checkout already
+  replaced before the walk reached it is not a substitution this scan can
+  see — it is simply the checkout the scan finds, judged on its own evidence
+  — and a registered worktree the walk never reached at all (below the depth
+  budget, or under a directory it could not read) has no such identity, so
+  it is refused with that reason instead of being offered. An earlier
+  revision of this page said the uncovered part was answered at delete time
+  by this same identity; that was wrong and is withdrawn — the delete-time
+  check re-stats against the identity the scan carried, so a poisoned one
+  simply agrees with itself.
   (That scan-to-click window is the desktop app's, where one
   scan's results stay on screen across your click. `--cli clean` re-scans
   in-process first, so what it removes is what a fresh scan just judged — but

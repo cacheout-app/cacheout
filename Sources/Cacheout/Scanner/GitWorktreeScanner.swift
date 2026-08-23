@@ -453,6 +453,24 @@ struct GitWorktreeScanner: @unchecked Sendable {
         let gitDirectory: URL
         /// Discovered checkouts of this repository, in walk order.
         let discoveries: [GitWorktreeDiscovery]
+        /// THE PRE-LISTING WITNESSES (PR #460 codex r16, B-P1/B-P2), keyed by
+        /// the CANONICAL admin-entry path (`resolveTargetKeepingLeaf`), which
+        /// is the same key `handle` re-derives from the porcelain record.
+        ///
+        /// Every linked discovery already resolves `<wt>/.git` here, one
+        /// `lstat` short of its admin entry's identity — and the whole
+        /// grouping runs BEFORE the first `git worktree list`. That is the
+        /// only capture point on the far side of the listing from (e2)'s, so
+        /// it is the only one that can witness a replacement landing INSIDE
+        /// the listing command, or after it returned, or anywhere in (e2)'s
+        /// own loop.
+        ///
+        /// The map keys the ADMIN ENTRY rather than the worktree path on
+        /// purpose: discoveries are spelled under the declared root and
+        /// porcelain records are spelled by git, but both sides resolve the
+        /// SAME `gitdir:` pointer, so the admin entry is the one spelling the
+        /// two agree on.
+        let discoveryWitnesses: [String: FileSystemIdentityProvider.Identity]
     }
 
     /// Group discoveries by the canonical common git directory they resolve
@@ -479,10 +497,16 @@ struct GitWorktreeScanner: @unchecked Sendable {
         provider: FileSystemIdentityProvider
     ) -> [RepositoryGroup] {
         var order: [String] = []
-        var grouped: [String: (gitDirectory: URL, discoveries: [GitWorktreeDiscovery])] = [:]
+        typealias Witnesses = [String: FileSystemIdentityProvider.Identity]
+        var grouped: [String: (
+            gitDirectory: URL,
+            discoveries: [GitWorktreeDiscovery],
+            witnesses: Witnesses
+        )] = [:]
 
         for discovery in discoveries {
             let gitDirectory: URL?
+            var witness: (key: String, identity: FileSystemIdentityProvider.Identity)?
             switch discovery.kind {
             case .mainCheckout:
                 // The entry lstat'd as a DIRECTORY named `.git`, which IS the
@@ -493,22 +517,45 @@ struct GitWorktreeScanner: @unchecked Sendable {
                     discovery.directory.appendingPathComponent(".git")
                 )
             case .linkedWorktree:
-                gitDirectory = resolver
-                    .adminDirectory(forWorktreeAt: discovery.directory)
+                let admin = resolver.adminDirectory(forWorktreeAt: discovery.directory)
+                // THE PRE-LISTING WITNESS (PR #460 codex r16, B-P1/B-P2).
+                // Taken HERE because this whole grouping completes before the
+                // first `git worktree list` of the first repository runs —
+                // Swift evaluates the sequence expression of `scan`'s
+                // `for group in` once, up front — so no listing, no parse, no
+                // cross-validation and no (e2) loop separates this `lstat`
+                // from the walk that found the checkout.
+                //
+                // The TCC gate is honoured by the RESOLVER, not by a check
+                // here: on an automatic scan its identity provider reports
+                // every deferred path as absent, so `adminDirectory` returns
+                // nil for a deferred worktree (and for a worktree whose admin
+                // directory is itself deferred) and nothing is stat'd.
+                if let admin {
+                    let entry = provider.resolveTargetKeepingLeaf(admin)
+                    if let identity = provider.identity(of: entry) {
+                        witness = (entry.path, identity)
+                    }
+                }
+                gitDirectory = admin
                     .flatMap { resolver.commonGitDirectory(forAdminDirectory: $0) }
             }
             guard let gitDirectory else { continue }
             let key = gitDirectory.path
             if grouped[key] == nil {
                 order.append(key)
-                grouped[key] = (gitDirectory, [])
+                grouped[key] = (gitDirectory, [], [:])
             }
             grouped[key]?.discoveries.append(discovery)
+            if let witness { grouped[key]?.witnesses[witness.key] = witness.identity }
         }
 
         return order.compactMap { key in
             grouped[key].map {
-                RepositoryGroup(gitDirectory: $0.gitDirectory, discoveries: $0.discoveries)
+                RepositoryGroup(
+                    gitDirectory: $0.gitDirectory, discoveries: $0.discoveries,
+                    discoveryWitnesses: $0.witnesses
+                )
             }
         }
     }
@@ -630,45 +677,58 @@ struct GitWorktreeScanner: @unchecked Sendable {
         let adminContainer = group.gitDirectory
             .appendingPathComponent(GitWorktreeGitdirResolver.adminContainerName)
 
-        // (e2) THE WITNESSES (PR #460 codex r15, S-P1; r14 N1 for the re-proof
-        //      they feed). ONE identity per assessable record, taken HERE —
-        //      the tightest point after the listing at (b) that the TCC policy
-        //      allows — because the window a record can go stale in OPENS at
-        //      that listing, not at its own assessment.
+        // (e2) THE SECOND WITNESS (PR #460 codex r15's S-P1 capture, kept;
+        //      r14 N1 for the re-proof it feeds). ONE identity per assessable
+        //      record, taken immediately AFTER the listing at (b).
         //
-        //      r14 captured this inside `handle`, which is after the listing
-        //      AND after every earlier record's whole assessment (several git
-        //      subprocesses each). A `git worktree remove` + `git worktree add
-        //      <same path>` landing in that stretch left EVERY later read
-        //      describing the replacement — `worktreeIdentity`, the
-        //      membership, `sameLocation`, the witness and the re-proof alike
-        //      — so the re-proof compared the replacement with itself and
-        //      passed, while `record` (G1, G4 and the detached/HEAD clause of
-        //      the evidence are read off the LISTING and never re-read) still
-        //      described the checkout that is gone. MEASURED at r15: offered,
-        //      silent, armed with the replacement's inode.
+        //      IT IS NOT THE ONE THE RE-PROOF IS ANCHORED ON — that is
+        //      `group.discoveryWitnesses`, captured before the listing ran.
+        //      r14 captured the witness inside `handle` (after every earlier
+        //      record's whole assessment); r15 moved it here (after the
+        //      listing). Both were still on the SAME side of the listing as
+        //      the reads they were meant to police, so a `git worktree
+        //      remove` + `git worktree add <same path>` landing anywhere in
+        //      [listing returns → this loop reaches that record] left EVERY
+        //      read describing the replacement — the witness and the re-proof
+        //      included — while `record` (G1, G4 and the detached/HEAD clause
+        //      of the evidence are read off the LISTING and never re-read)
+        //      still described the checkout that is gone. MEASURED at r16,
+        //      end to end through `SpaceScannerRuntime.production`: offered,
+        //      `errors == []`, armed with the replacement's inode, and the
+        //      brand-new checkout destroyed by the following `clean()`.
         //
-        //      RESIDUAL, stated rather than implied: git itself read these
-        //      admin entries somewhere inside `worktree list`, so the sliver
-        //      between that read and this capture is not witnessed by anything
-        //      — closing it would need the listing and the identity to be one
-        //      atomic act, which no filesystem here offers. It is bounded by
-        //      one git process's own runtime rather than by the whole scan,
-        //      and a replacement inside it is answered by the delete-time gate
-        //      (R1b), which re-stats against this same identity.
+        //      r15 called that window a sliver inside the listing command,
+        //      "bounded by one git process's own runtime". It is not: this
+        //      loop pays one `adminDirectory` read plus one `identity` lstat
+        //      for every assessable record, so the window GREW with the
+        //      worktree count — in the very loop the fix added.
         //
-        //      The TCC gate is honoured here exactly as `handle` honours it:
-        //      `adminDirectory` reads `<worktree>/.git`, so a deferred
-        //      worktree is never touched to witness it.
-        var witnesses: [String: FileSystemIdentityProvider.Identity] = [:]
+        //      Kept because two captures taken on OPPOSITE sides of the
+        //      listing are what witness the listing command itself: git read
+        //      these admin entries somewhere inside `worktree list`, and a
+        //      replacement in that sliver changes the inode between the
+        //      discovery capture and this one. One capture compared with
+        //      itself could never see it.
+        //
+        //      Keyed by the CANONICAL admin-entry path so both maps share one
+        //      key (see `RepositoryGroup.discoveryWitnesses`). The TCC gate is
+        //      honoured here exactly as `handle` honours it: `adminDirectory`
+        //      reads `<worktree>/.git`, so a deferred worktree is never
+        //      touched to witness it.
+        var assessmentWitnesses: [String: FileSystemIdentityProvider.Identity] = [:]
+        var discoveryWitnesses: [String: FileSystemIdentityProvider.Identity] = [:]
         for record in inventory.entries {
             if Task.isCancelled { return .processed }
             if record.isMain || record.isPrunable { continue }
             if isDeferred(record.path, context: context) { continue }
-            guard let admin = resolver.adminDirectory(forWorktreeAt: record.path),
-                  let identity = provider.identity(of: provider.resolveTargetKeepingLeaf(admin))
-            else { continue } // an unwitnessed record is refused below
-            witnesses[record.path.path] = identity
+            // An unresolvable admin directory is published by `handle`'s own
+            // guard, which says so in those terms — not silently re-cast here
+            // as a missing witness.
+            guard let admin = resolver.adminDirectory(forWorktreeAt: record.path)
+            else { continue }
+            let entry = provider.resolveTargetKeepingLeaf(admin)
+            discoveryWitnesses[record.path.path] = group.discoveryWitnesses[entry.path]
+            assessmentWitnesses[record.path.path] = provider.identity(of: entry)
         }
 
         // (f) STALE TIER — driven by the porcelain records, which are git's own
@@ -687,7 +747,8 @@ struct GitWorktreeScanner: @unchecked Sendable {
                 parentRepoWorkingDir: parentRepoWorkingDir,
                 adminContainer: adminContainer,
                 groupGitDirectory: group.gitDirectory,
-                assessmentWitness: witnesses[record.path.path],
+                discoveryWitness: discoveryWitnesses[record.path.path],
+                assessmentWitness: assessmentWitnesses[record.path.path],
                 context: context, bindings: bindings, resolver: resolver,
                 issues: &issues, emissions: &emissions, log: &log
             )
@@ -712,9 +773,19 @@ struct GitWorktreeScanner: @unchecked Sendable {
         parentRepoWorkingDir: URL,
         adminContainer: URL,
         groupGitDirectory: URL,
-        /// The admin entry's identity as it stood at the listing that produced
-        /// `record` (see (e2)). `nil` is itself a refusal — an unwitnessed
-        /// record cannot arm the delete-time gate.
+        /// The admin entry's identity as it stood at DISCOVERY — before this
+        /// repository's porcelain listing ran (see
+        /// `RepositoryGroup.discoveryWitnesses`). This is the anchor of the
+        /// re-proof: it is the only capture the listing, the parse, the
+        /// cross-validation, the dedupe and (e2)'s whole loop all come after.
+        /// `nil` is itself a refusal, and it is NOT the same refusal as a
+        /// mismatch — see the guards below.
+        discoveryWitness: FileSystemIdentityProvider.Identity?,
+        /// The same object's identity as it stood immediately AFTER that
+        /// listing (see (e2)). It is what witnesses the listing command
+        /// itself: a replacement while git was reading these admin entries
+        /// shows up as a discovery/assessment DISAGREEMENT and nowhere else.
+        /// `nil` is itself a refusal.
         assessmentWitness: FileSystemIdentityProvider.Identity?,
         context: ScanContext,
         bindings: [RootBinding],
@@ -774,19 +845,21 @@ struct GitWorktreeScanner: @unchecked Sendable {
             return
         }
 
-        // THE WITNESS THE RECORD IS ABOUT (PR #460 codex r14 N1, widened by
-        // r15's S-P1) arrives as a parameter, captured at (e2) immediately
-        // after the ONE listing that produced `record`. It is NOT taken here:
-        // `lstat` SUCCEEDING is not the same fact as `lstat` answering about
-        // the object the RECORD describes, and by the time this function runs,
-        // every earlier record's assessment has already had its turn. A
-        // worktree removed and re-added at the SAME path leaves a well-formed
-        // directory at every path this function reads — the resolve below
-        // succeeds, the back-link validates, the containment holds — so
-        // nothing here can tell the replacement from the checkout `record` and
-        // `assessment.evidence` describe. Only an identity taken at the
-        // listing and re-proved before the plan is armed can. `nil` is itself
-        // a refusal (see the re-proof below).
+        // THE WITNESSES THE RECORD IS ABOUT (PR #460 codex r14 N1, r15 S-P1,
+        // r16 B-P1/B-P2) arrive as parameters — one captured at DISCOVERY,
+        // before the ONE listing that produced `record`, and one at (e2),
+        // immediately after it. Neither is taken here: `lstat` SUCCEEDING is
+        // not the same fact as `lstat` answering about the object the RECORD
+        // describes, and by the time this function runs, the listing has
+        // returned and every earlier record has been witnessed and assessed.
+        // A worktree removed and re-added at the SAME path leaves a
+        // well-formed directory at every path this function reads — the
+        // resolve below succeeds, the back-link validates, the containment
+        // holds — so nothing here can tell the replacement from the checkout
+        // `record` and `assessment.evidence` describe. Only an identity taken
+        // BEFORE the read that produced the evidence, and re-proved before
+        // the plan is armed, can. `nil` on either is itself a refusal (see
+        // the re-proof below).
 
         // ASSESSMENT — runs even when containment will refuse the item (D13):
         // read-only git against a parent outside the roots is not gated by
@@ -885,9 +958,37 @@ struct GitWorktreeScanner: @unchecked Sendable {
             return
         }
 
-        // THE RE-PROOF (PR #460 codex r14 N1; the witness it re-proves was
-        // widened to the whole listing→arming window by r15's S-P1). The guard
-        // above was written against `lstat` FAILING — its own comment
+        // UNWITNESSED BEFORE THE LISTING (PR #460 codex r16, B-P1). The
+        // discovery capture is the anchor, so a record it does not cover
+        // cannot be armed at all: there is no identity from before the read
+        // that produced this row's evidence, and every later capture would be
+        // comparing the post-listing world with itself. The two ways to land
+        // here are the walk not reaching the checkout (it is registered
+        // inside a declared root but below the depth budget, or under a
+        // directory the walk could not read) and its `<wt>/.git` pointer not
+        // resolving at discovery. It CLEARS: the next scan re-walks.
+        guard let discoveryWitness else {
+            issues.append(ScanIssue(
+                url: record.path, kind: .unreadable,
+                detail: "worktree '\(record.path.path)' was not identified "
+                    + "before this scan listed its repository (this scan's "
+                    + "walk did not reach it, or its admin directory could "
+                    + "not be resolved then), so there is no identity older "
+                    + "than the evidence to prove the checkout was not "
+                    + "replaced mid-scan — the delete-time gate that tells a "
+                    + "re-created checkout from this one could not be armed "
+                    + "and no item is offered"
+            ))
+            log.entries.append(GitWorktreeAssessmentLog.Entry(
+                worktreePath: record.path, isCandidate: true,
+                emittedItem: false, evidence: assessment.evidence
+            ))
+            return
+        }
+
+        // THE RE-PROOF (PR #460 codex r14 N1; r15's S-P1 capture; anchored on
+        // the DISCOVERY capture by r16's B-P1/B-P2). The `adminEntryIdentity`
+        // guard above was written against `lstat` FAILING — its own comment
         // anticipates "the directory vanishing between the resolve above and
         // the plan build" — and a vanished directory is the benign half of
         // that window. The dangerous half is REPLACEMENT: `lstat` succeeds and
@@ -898,16 +999,25 @@ struct GitWorktreeScanner: @unchecked Sendable {
         // content and all — on the strength of a row the user read about the
         // old one.
         //
+        // THREE identities of one object, taken at three points, must agree:
+        // discovery (before the listing), (e2) (after it) and live (now).
+        // Each pair covers a span no single capture could: discovery↔(e2)
+        // spans the listing command git read those same admin entries inside,
+        // and (e2)↔live spans the parse, the dedupe, (e2)'s own per-record
+        // loop and this record's whole assessment.
+        //
         // A mismatch is not an error state: the next scan simply assesses
         // whatever is there now and offers it on its own evidence.
-        guard let assessmentWitness, assessmentWitness == adminEntryIdentity else {
+        guard let assessmentWitness, discoveryWitness == assessmentWitness,
+              assessmentWitness == adminEntryIdentity
+        else {
             issues.append(ScanIssue(
                 url: record.path, kind: .unreadable,
                 detail: "worktree '\(record.path.path)' was replaced while this "
                     + "scan was running: the admin directory at "
                     + "'\(strict[2].path)' is no longer the object this scan "
-                    + "listed and assessed, so the evidence belongs to a "
-                    + "checkout that is gone — no item is offered (the next "
+                    + "walked, listed and assessed, so the evidence belongs to "
+                    + "a checkout that is gone — no item is offered (the next "
                     + "scan assesses the checkout that is there now)"
             ))
             log.entries.append(GitWorktreeAssessmentLog.Entry(

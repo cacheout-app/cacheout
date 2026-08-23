@@ -506,11 +506,17 @@ git.
   the assessed path must still back-link to the admin directory the scan
   resolved, and that directory must still be the same object — so a checkout
   moved onto that path, or removed and re-created there, is refused rather
-  than removed. The identity it compares against is captured BEFORE the
-  worktree is assessed and re-proved immediately after, so the binding spans
-  the scan's own examination window as well as the scan-to-click one: a
-  checkout replaced while it is being assessed is never offered, because the
-  evidence on that row would describe a checkout that no longer exists.
+  than removed. The identity it compares against is captured at
+  the repository listing that produced the row — not later, when that row's
+  own assessment starts — and re-proved immediately before the row is armed,
+  so the binding spans the scan's own window as well as the scan-to-click
+  one: a checkout replaced at any point after this scan listed it is never
+  offered, because the evidence on that row would describe a checkout that no
+  longer exists. What that does not cover is stated rather than implied: git
+  read those admin directories somewhere inside the listing command itself,
+  and the sliver between that read and the capture is witnessed by nothing —
+  a replacement there is answered at delete time instead, by this same
+  identity.
   (That scan-to-click window is the desktop app's, where one
   scan's results stay on screen across your click. `--cli clean` re-scans
   in-process first, so what it removes is what a fresh scan just judged — but

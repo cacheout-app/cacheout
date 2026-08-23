@@ -284,6 +284,29 @@ private final class OneShotLatch: @unchecked Sendable {
     }
 }
 
+/// The one-based call index an interception fired at. Read back after the
+/// scan, it is what proves WHICH window a fixture entered — a claim a cell
+/// about overlapping windows cannot afford to assume.
+private final class AtomicIndexBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: Int?
+
+    /// FIRST writer wins, so a fixture that fired twice cannot quietly
+    /// re-date itself.
+    func store(_ value: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        if stored == nil { stored = value }
+    }
+
+    /// `-1` when nothing ever fired — never a plausible index.
+    var value: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return stored ?? -1
+    }
+}
+
 // MARK: - Tests
 
 final class GitWorktreeScannerTests: XCTestCase {
@@ -885,11 +908,18 @@ final class GitWorktreeScannerTests: XCTestCase {
     /// candidate (`show -s --format=%ct HEAD`, display-only): every gate has
     /// already answered about the original when the replacement lands.
     ///
-    /// MUTATION A (the re-verify): delete the `guard let assessmentWitness,
-    /// assessmentWitness == adminEntryIdentity` block in `handle` — RED here.
-    /// MUTATION B (the capture): move the `assessmentWitness` capture below
-    /// `await assessor.assess(...)` so it witnesses the post-assessment world
-    /// — the comparison becomes a tautology and this cell goes RED too.
+    /// MUTATION A (the re-proof): delete the `guard let assessmentWitness,
+    /// assessmentWitness == adminEntryIdentity` block in `handle` — RED here
+    /// (2/2 at r15).
+    /// MUTATION B (the capture): re-take the witness inside `handle`, below
+    /// `await assessor.assess(...)`, so it witnesses the post-assessment
+    /// world — the comparison becomes a tautology and this cell goes RED too.
+    ///
+    /// r15 note: the capture itself now lives at `process`'s (e2), one window
+    /// EARLIER than this cell needs — so moving it back to the top of
+    /// `handle` (r14's own spelling) leaves this cell GREEN and reddens only
+    /// the S-P1 cell below. That asymmetry is what tells the two windows
+    /// apart; neither cell subsumes the other.
     func testAWorktreeReplacedInsideItsAssessmentWindowIsRefusedRatherThanOffered()
         async throws
     {
@@ -967,6 +997,149 @@ final class GitWorktreeScannerTests: XCTestCase {
         // The replacement is left entirely alone — the scan refuses it, it
         // does not touch it.
         XCTAssertTrue(fm.fileExists(atPath: path.path))
+        try assertNonMalformed(outcome, from: scanner)
+    }
+
+    /// S-P1 (PR #460 codex r15). r14's N1 witness spanned `assessor.assess`
+    /// ONLY. It was captured at the top of `handle(record:)` — which is AFTER
+    /// the ONE `git worktree list` that produced `record`, and after every
+    /// EARLIER record's whole assessment. A `git worktree remove` + `git
+    /// worktree add <same path>` landing in THAT stretch left every later read
+    /// describing the REPLACEMENT: `worktreeIdentity`, `resolver.membership`,
+    /// `sameLocation`, the witness and the re-proof alike — so the re-proof
+    /// compared the replacement with itself and passed.
+    ///
+    /// The record is the stale half, and it is load-bearing: G1 ("linked (not
+    /// main/bare)"), G4 ("not locked") and the detached/HEAD clause of the
+    /// evidence are read off the LISTING, never re-read. So the row names a
+    /// checkout that no longer exists while the plan is armed with the NEW
+    /// one's inode; R1b then compares the live inode against that identity,
+    /// both are the replacement, they match, and the deletion takes a
+    /// brand-new checkout with whatever ignored content it already carries.
+    ///
+    /// The window is entered through an EARLIER record's assessment — the one
+    /// production-reachable seam between the listing and the witness. Records
+    /// are listed in admin-directory name order (git 2.50.1, verified), so
+    /// `wt-a` is assessed while `wt-z` is still nothing but a row from the
+    /// listing; the cell asserts that ordering rather than assuming it.
+    ///
+    /// MUTATION (the widened capture): move the capture back into `handle` —
+    /// RED here and GREEN on the r14 cell above, which is exactly what
+    /// distinguishes the two windows.
+    func testAWorktreeReplacedBetweenTheListingAndItsAssessmentIsRefusedRatherThanOffered()
+        async throws
+    {
+        let repository = try makeRepositoryIgnoringPayloads(
+            at: dev.appendingPathComponent("repo")
+        )
+        // `wt-a` is assessed FIRST and is only the trigger; `wt-z` is the
+        // target, replaced while `wt-a` is still being assessed.
+        let trigger = try addWorktree(
+            of: repository, at: dev.appendingPathComponent("wt-a"), branch: "a"
+        )
+        let target = dev.appendingPathComponent("wt-z")
+        try addWorktree(of: repository, at: target, branch: "z")
+
+        let identityProvider = FileSystemIdentityProvider()
+        let originalAdmin = try XCTUnwrap(
+            GitWorktreeGitdirResolver().adminDirectory(forWorktreeAt: target),
+            "the fixture must have a resolvable admin directory"
+        )
+        let originalIdentity = try XCTUnwrap(identityProvider.identity(of: originalAdmin))
+
+        let latch = OneShotLatch()
+        let interceptionIndex = AtomicIndexBox()
+        let fixtureHome = try XCTUnwrap(home)
+        let payload = target.appendingPathComponent("payload.bin")
+        let runner = InterceptingGitRunner(wrapping: makeRunner()) { arguments, index in
+            guard arguments.contains("show"),
+                  arguments.contains(where: { $0.hasSuffix("/wt-a") }),
+                  latch.claim()
+            else { return nil }
+            interceptionIndex.store(index)
+            // The developer retires `wt-z` and creates a fresh checkout at the
+            // same path, then writes 8 KiB of ignored content into it — REAL
+            // git, so the admin entry is genuinely destroyed and recreated.
+            _ = try? GitFixture.git(
+                ["-C", repository.path, "worktree", "remove", target.path],
+                home: fixtureHome
+            )
+            _ = try? GitFixture.git(
+                ["-C", repository.path, "worktree", "add", target.path, "-b", "brand-new"],
+                home: fixtureHome
+            )
+            try? Data(repeating: 0xCD, count: 8192).write(to: payload)
+            return nil // delegate: `wt-a`'s own `show` still runs for real
+        }
+
+        let scanner = makeScanner(runner: runner)
+        let outcome = await scanner.scan(context: ScanContext(trigger: .userInitiated))
+
+        XCTAssertTrue(latch.didFire, "the fixture never entered the window")
+        let replacementAdmin = try XCTUnwrap(
+            GitWorktreeGitdirResolver().adminDirectory(forWorktreeAt: target),
+            "the replacement must itself be a well-formed linked worktree"
+        )
+        XCTAssertNotEqual(
+            identityProvider.identity(of: replacementAdmin), originalIdentity,
+            "the fixture must have replaced the OBJECT, not merely the path"
+        )
+        // THE WINDOW THIS CELL IS ABOUT: the replacement landed after the ONE
+        // listing and BEFORE the first command ever issued about `wt-z`.
+        let firstTargetCall = try XCTUnwrap(
+            runner.argvs.firstIndex { argv in
+                argv.contains { $0.hasSuffix("/wt-z") }
+            },
+            "no command ever mentioned the target: \(runner.argvs)"
+        ) + 1 // `argvs` is 0-based; the interception index is 1-based
+        XCTAssertGreaterThan(
+            firstTargetCall, interceptionIndex.value,
+            "the fixture replaced the target AFTER its assessment began, so it "
+                + "exercises r14's window and not this one: \(runner.argvs)"
+        )
+        XCTAssertEqual(
+            runner.argvs.filter { $0.contains("list") }.count, 1,
+            "the ONE listing per repository — the record's only source"
+        )
+
+        let stale = try outcome.items.filter { item in
+            guard case .gitWorktreeReclaim = item.action else { return false }
+            return try plan(of: item).mode == .removeStaleWorktree
+        }
+        let offered = try stale.filter {
+            try plan(of: $0).worktreePath?.path.hasSuffix("/wt-z") == true
+        }
+        let armed = try offered.first.map { try plan(of: $0).worktreeAdminEntryIdentity }
+        XCTAssertTrue(
+            offered.isEmpty,
+            "an item was offered for a checkout that was replaced between the "
+                + "listing and its assessment; its armed identity is "
+                + "\(String(describing: armed)) while the listed checkout's was "
+                + "\(originalIdentity)"
+        )
+        let issue = try XCTUnwrap(
+            outcome.errors.first {
+                $0.detail.contains("replaced") && $0.detail.contains("/wt-z")
+            },
+            "the refusal must be visible, not silent: \(outcome.errors)"
+        )
+        XCTAssertEqual(issue.kind, .unreadable)
+        XCTAssertTrue(issue.detail.contains("no item is offered"), issue.detail)
+
+        // THE CONTROL: widening the witness refuses the REPLACED record only.
+        // The untouched sibling is still offered on its own evidence.
+        XCTAssertEqual(
+            try stale.compactMap { try plan(of: $0).worktreePath?.lastPathComponent },
+            ["wt-a"],
+            "the sibling that was never replaced must still be offered"
+        )
+        // The replacement and the 8 KiB the user wrote into it are left alone.
+        XCTAssertTrue(fm.fileExists(atPath: target.path))
+        XCTAssertEqual(
+            try Data(contentsOf: payload).count, 8192,
+            "the scan refuses the replacement; it never touches it"
+        )
+        XCTAssertTrue(fm.fileExists(atPath: trigger.path))
         try assertNonMalformed(outcome, from: scanner)
     }
 

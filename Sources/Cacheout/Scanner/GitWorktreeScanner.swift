@@ -630,6 +630,47 @@ struct GitWorktreeScanner: @unchecked Sendable {
         let adminContainer = group.gitDirectory
             .appendingPathComponent(GitWorktreeGitdirResolver.adminContainerName)
 
+        // (e2) THE WITNESSES (PR #460 codex r15, S-P1; r14 N1 for the re-proof
+        //      they feed). ONE identity per assessable record, taken HERE —
+        //      the tightest point after the listing at (b) that the TCC policy
+        //      allows — because the window a record can go stale in OPENS at
+        //      that listing, not at its own assessment.
+        //
+        //      r14 captured this inside `handle`, which is after the listing
+        //      AND after every earlier record's whole assessment (several git
+        //      subprocesses each). A `git worktree remove` + `git worktree add
+        //      <same path>` landing in that stretch left EVERY later read
+        //      describing the replacement — `worktreeIdentity`, the
+        //      membership, `sameLocation`, the witness and the re-proof alike
+        //      — so the re-proof compared the replacement with itself and
+        //      passed, while `record` (G1, G4 and the detached/HEAD clause of
+        //      the evidence are read off the LISTING and never re-read) still
+        //      described the checkout that is gone. MEASURED at r15: offered,
+        //      silent, armed with the replacement's inode.
+        //
+        //      RESIDUAL, stated rather than implied: git itself read these
+        //      admin entries somewhere inside `worktree list`, so the sliver
+        //      between that read and this capture is not witnessed by anything
+        //      — closing it would need the listing and the identity to be one
+        //      atomic act, which no filesystem here offers. It is bounded by
+        //      one git process's own runtime rather than by the whole scan,
+        //      and a replacement inside it is answered by the delete-time gate
+        //      (R1b), which re-stats against this same identity.
+        //
+        //      The TCC gate is honoured here exactly as `handle` honours it:
+        //      `adminDirectory` reads `<worktree>/.git`, so a deferred
+        //      worktree is never touched to witness it.
+        var witnesses: [String: FileSystemIdentityProvider.Identity] = [:]
+        for record in inventory.entries {
+            if Task.isCancelled { return .processed }
+            if record.isMain || record.isPrunable { continue }
+            if isDeferred(record.path, context: context) { continue }
+            guard let admin = resolver.adminDirectory(forWorktreeAt: record.path),
+                  let identity = provider.identity(of: provider.resolveTargetKeepingLeaf(admin))
+            else { continue } // an unwitnessed record is refused below
+            witnesses[record.path.path] = identity
+        }
+
         // (f) STALE TIER — driven by the porcelain records, which are git's own
         //     authority on what worktrees exist.
         for record in inventory.entries {
@@ -646,6 +687,7 @@ struct GitWorktreeScanner: @unchecked Sendable {
                 parentRepoWorkingDir: parentRepoWorkingDir,
                 adminContainer: adminContainer,
                 groupGitDirectory: group.gitDirectory,
+                assessmentWitness: witnesses[record.path.path],
                 context: context, bindings: bindings, resolver: resolver,
                 issues: &issues, emissions: &emissions, log: &log
             )
@@ -670,6 +712,10 @@ struct GitWorktreeScanner: @unchecked Sendable {
         parentRepoWorkingDir: URL,
         adminContainer: URL,
         groupGitDirectory: URL,
+        /// The admin entry's identity as it stood at the listing that produced
+        /// `record` (see (e2)). `nil` is itself a refusal — an unwitnessed
+        /// record cannot arm the delete-time gate.
+        assessmentWitness: FileSystemIdentityProvider.Identity?,
         context: ScanContext,
         bindings: [RootBinding],
         resolver: GitWorktreeGitdirResolver,
@@ -728,24 +774,19 @@ struct GitWorktreeScanner: @unchecked Sendable {
             return
         }
 
-        // THE WITNESS THE ASSESSMENT IS ABOUT (PR #460 codex r14, N1).
-        //
-        // Captured BEFORE the assessment because `lstat` SUCCEEDING is not the
-        // same fact as `lstat` answering about the object that was assessed. A
-        // worktree removed and re-added at the SAME path during the assessment
-        // window leaves a well-formed directory at every path this function
-        // reads — the resolve below succeeds, the back-link validates, the
-        // containment holds — so nothing downstream can tell the replacement
-        // from the checkout `record` and `assessment.evidence` describe. Only
-        // an identity taken before the window and re-proved after it can.
-        //
-        // Same shape as r4's HEAD witness: taken before the check, re-proved
-        // immediately before the guarantee is handed on, so it spans the whole
-        // window rather than ending when the check returns. `nil` here is
-        // itself a refusal (see the re-proof below) — an unwitnessed
-        // assessment cannot arm the delete-time gate.
-        let assessmentWitness = resolver.adminDirectory(forWorktreeAt: record.path)
-            .flatMap { provider.identity(of: provider.resolveTargetKeepingLeaf($0)) }
+        // THE WITNESS THE RECORD IS ABOUT (PR #460 codex r14 N1, widened by
+        // r15's S-P1) arrives as a parameter, captured at (e2) immediately
+        // after the ONE listing that produced `record`. It is NOT taken here:
+        // `lstat` SUCCEEDING is not the same fact as `lstat` answering about
+        // the object the RECORD describes, and by the time this function runs,
+        // every earlier record's assessment has already had its turn. A
+        // worktree removed and re-added at the SAME path leaves a well-formed
+        // directory at every path this function reads — the resolve below
+        // succeeds, the back-link validates, the containment holds — so
+        // nothing here can tell the replacement from the checkout `record` and
+        // `assessment.evidence` describe. Only an identity taken at the
+        // listing and re-proved before the plan is armed can. `nil` is itself
+        // a refusal (see the re-proof below).
 
         // ASSESSMENT — runs even when containment will refuse the item (D13):
         // read-only git against a parent outside the roots is not gated by
@@ -844,26 +885,28 @@ struct GitWorktreeScanner: @unchecked Sendable {
             return
         }
 
-        // THE RE-PROOF (PR #460 codex r14, N1). The guard above was written
-        // against `lstat` FAILING — its own comment anticipates "the directory
-        // vanishing between the resolve above and the plan build" — and a
-        // vanished directory is the benign half of that window. The dangerous
-        // half is REPLACEMENT: `lstat` succeeds and reports the NEW checkout's
-        // inode, which would then be bound as the identity R1b re-checks.
-        // Live inode and carried identity would both be the replacement, they
-        // would match, the gate would pass, and the GUI would delete a
-        // newly-created checkout — pre-existing ignored content and all — on
-        // the strength of a row the user read about the old one.
+        // THE RE-PROOF (PR #460 codex r14 N1; the witness it re-proves was
+        // widened to the whole listing→arming window by r15's S-P1). The guard
+        // above was written against `lstat` FAILING — its own comment
+        // anticipates "the directory vanishing between the resolve above and
+        // the plan build" — and a vanished directory is the benign half of
+        // that window. The dangerous half is REPLACEMENT: `lstat` succeeds and
+        // reports the NEW checkout's inode, which would then be bound as the
+        // identity R1b re-checks. Live inode and carried identity would both
+        // be the replacement, they would match, the gate would pass, and the
+        // GUI would delete a newly-created checkout — pre-existing ignored
+        // content and all — on the strength of a row the user read about the
+        // old one.
         //
         // A mismatch is not an error state: the next scan simply assesses
         // whatever is there now and offers it on its own evidence.
         guard let assessmentWitness, assessmentWitness == adminEntryIdentity else {
             issues.append(ScanIssue(
                 url: record.path, kind: .unreadable,
-                detail: "worktree '\(record.path.path)' was replaced while it "
-                    + "was being assessed: the admin directory at "
-                    + "'\(strict[2].path)' is no longer the object the "
-                    + "assessment describes, so the evidence belongs to a "
+                detail: "worktree '\(record.path.path)' was replaced while this "
+                    + "scan was running: the admin directory at "
+                    + "'\(strict[2].path)' is no longer the object this scan "
+                    + "listed and assessed, so the evidence belongs to a "
                     + "checkout that is gone — no item is offered (the next "
                     + "scan assesses the checkout that is there now)"
             ))

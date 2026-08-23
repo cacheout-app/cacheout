@@ -2449,6 +2449,201 @@ final class TrashDisposalHopProofTests: XCTestCase {
         )
     }
 
+    // ================================================================
+    // MARK: - WHICH OF THESE CAUSES A REAL USER CAN REACH (r16, A-P3)
+    // ================================================================
+
+    /// **A-P3 — THROUGH THE SHIPPED SEAM THE UNDO PUTS THE ITEM BACK UNDER
+    /// NEITHER SPELLING** (PR #460 codex r16).
+    ///
+    /// Every measurement behind r15's D-P1 — "PLAIN: all four arms
+    /// `.putBack`" against "SYMLINKED: all four `.strandedInTrash`" — was
+    /// taken through an INJECTED `trashHandler` landing in a fixture
+    /// directory. That is the precise property this file's own r11 D4 note
+    /// records as having hidden a defect for eight rounds: a fixture landing's
+    /// PARENT is freely openable and `~/.Trash` is not.
+    ///
+    /// `rollBack` returns at its FIRST guard —
+    /// `provider.openDirectoryNoFollow(~/.Trash)`, three statements BEFORE the
+    /// destination open D-P1 moved — and that open is EPERM on every machine
+    /// without Full Disk Access (measured; see `facts` and the r10 D1 note).
+    /// So `.putBack`, `.putBackTookAnotherObject` and
+    /// `.destinationNotTheAdmittedContainer` are ALL UNREACHABLE for the
+    /// default user, under either container spelling.
+    ///
+    /// THIS CELL IS THE ONE THAT CANNOT BE FOOLED BY A FIXTURE: no
+    /// `trashHandler` is injected, the mover is the shipped
+    /// `FileManager.trashItem` inside the production main-actor hop, and the
+    /// landing is the user's REAL `~/.Trash`. It asserts the outcome AGAINST
+    /// THE PERMISSION, so it is a fact about this machine either way:
+    ///
+    /// * Trash unopenable (the shipped default — measured on this machine,
+    ///   Darwin 25.5: `ls ~/.Trash` is "Operation not permitted" from this
+    ///   process, 8/8 runs at 3110d1e): all four arms answer
+    ///   `.strandedInTrash`, the stranger is LEFT in the real Trash and the
+    ///   target's name is left EMPTY.
+    ///   THE FORWARD DISPOSAL SUCCEEDS EVERY TIME — the defect is entirely in
+    ///   the undo.
+    /// * Trash openable (Full Disk Access granted): the D-P1 row, `.putBack`.
+    ///
+    /// D-P1's fix is still right and is still load-bearing — it is what makes
+    /// the second row true for the population that HAS the permission. What
+    /// was wrong was publishing it as a change to the outcome the default user
+    /// sees.
+    ///
+    /// MUTATION: this cell is not a guard, it is the reachability measurement
+    /// the CHANGELOG and `rollBack`'s trash-open guard now cite. Delete
+    /// `rollBack`'s trash-open guard and the run dies rather than reddening —
+    /// the descriptor is `-1` and `probeChild` is asked about it.
+    ///
+    /// TRASH HYGIENE: each arm's landing name is UNIQUE, so `trashItem` never
+    /// suffixes it and the exact path is known before the run; each is
+    /// registered for removal BY NAME before anything is moved, and absence is
+    /// re-checked with `lstat` afterwards. Nothing else in the Trash is
+    /// touched and the Trash is never emptied.
+    func testWithoutFullDiskAccessEveryUndoStrandsTheItemInTheRealTrash()
+        async throws
+    {
+        let provider = FileSystemIdentityProvider()
+        let container = base.appendingPathComponent("real-trash-container")
+        try fm.createDirectory(at: container, withIntermediateDirectories: true)
+        let trash = fm.homeDirectoryForCurrentUser
+            .appendingPathComponent(".Trash")
+
+        // THE PERMISSION, READ THROUGH THE SAME CALL `rollBack` MAKES.
+        let trashFD = provider.openDirectoryNoFollow(at: trash)
+        let fullDiskAccess = trashFD >= 0
+        if fullDiskAccess { close(trashFD) }
+
+        for arm in TrashArm.allCases {
+            // UNIQUE per run, so `trashItem` cannot suffix the landing and
+            // the cleanup below can name it before anything moves.
+            let name = "cacheout-r16-ap3-\(arm.rawValue)-"
+                + "\(UUID().uuidString.prefix(8))"
+            let target = container.appendingPathComponent(name)
+            let landing = trash.appendingPathComponent(name)
+            XCTAssertFalse(
+                fm.fileExists(atPath: landing.path),
+                "\(name): the landing name must be free before the run"
+            )
+            // Registered BEFORE the disposal: this exact path is removed
+            // however the cell ends. Only this path — never the Trash itself.
+            addTeardownBlock { try? FileManager.default.removeItem(at: landing) }
+
+            let directory = arm.targetIsADirectory
+            if directory {
+                try fm.createDirectory(
+                    at: target, withIntermediateDirectories: true
+                )
+                try Data("ours".utf8).write(
+                    to: target.appendingPathComponent("ours.txt")
+                )
+            } else {
+                try Data("ours".utf8).write(to: target)
+            }
+            let parent = try admittedParent(of: target, provider: provider)
+
+            // THE PRODUCTION MOVER, SPELLED THE WAY `CacheCleaner` SPELLS ITS
+            // DEFAULT: the main-actor hop, `prove()` on its far side, then
+            // `FileManager.trashItem`. The swap rides the window
+            // `trashItem`'s own URL resolution owns.
+            let mover: TrashDisposal.Mover = { url, prove in
+                try await MainActor.run {
+                    try prove()
+                    // `FileManager.default` rather than a captured instance:
+                    // the hop's closure is `@Sendable` and `FileManager` is
+                    // not, which is a Swift 6 error rather than a warning.
+                    let manager = FileManager.default
+                    try manager.removeItem(at: url)
+                    if directory {
+                        try manager.createDirectory(
+                            at: url, withIntermediateDirectories: true
+                        )
+                        try Data("stranger".utf8).write(
+                            to: url.appendingPathComponent("their-work.txt")
+                        )
+                    } else {
+                        try Data("stranger".utf8).write(to: url)
+                    }
+                    var landed: NSURL?
+                    try manager.trashItem(at: url, resultingItemURL: &landed)
+                    return landed as URL?
+                }
+            }
+
+            var thrown: Error?
+            do {
+                switch arm {
+                case .noVerdict:
+                    try await TrashDisposal.dispose(
+                        target, containedIn: parent, provider: provider,
+                        via: mover
+                    )
+                case .noDirectoryTree:
+                    try await TrashDisposal.dispose(
+                        target, expecting: .noDirectoryTree,
+                        provider: provider, containedIn: parent, via: mover
+                    )
+                case .nonDirectoryLeaf:
+                    let identity = try XCTUnwrap(provider.identity(of: target))
+                    try await TrashDisposal.dispose(
+                        target, expecting: .nonDirectoryLeaf(identity),
+                        provider: provider, containedIn: parent, via: mover
+                    )
+                case .directory:
+                    let identity = try XCTUnwrap(provider.identity(of: target))
+                    try await TrashDisposal.dispose(
+                        target, expecting: .directory(identity),
+                        provider: provider, containedIn: parent, via: mover
+                    )
+                }
+            } catch {
+                thrown = error
+            }
+
+            let failure = try XCTUnwrap(
+                thrown as? TrashDisposal.Failure,
+                "\(name): an object replaced inside the mover must be "
+                    + "refused: \(String(describing: thrown))"
+            )
+            // THE FORWARD HALF SUCCEEDED, ON EVERY ARM AND EITHER
+            // PERMISSION: the stranger really did reach the real Trash.
+            XCTAssertTrue(
+                fm.fileExists(atPath: landing.path),
+                "\(name): the shipped seam must really have moved the "
+                    + "stranger into \(trash.path)"
+            )
+
+            if fullDiskAccess {
+                XCTAssertEqual(
+                    failure.cause, .putBack,
+                    "\(name): with the Trash openable this is the D-P1 row"
+                )
+            } else {
+                XCTAssertEqual(
+                    failure.cause, .strandedInTrash(landing.path),
+                    "\(name): without Full Disk Access `rollBack` returns at "
+                        + "its FIRST guard — the Trash open — three "
+                        + "statements before the destination open D-P1 fixed"
+                )
+                XCTAssertFalse(
+                    fm.fileExists(atPath: target.path),
+                    "\(name): and the target's name is left EMPTY — the "
+                        + "put-back was never attempted"
+                )
+            }
+
+            // REMOVED BY NAME, AND THE ABSENCE VERIFIED — not left for the
+            // teardown block alone.
+            try? fm.removeItem(at: landing)
+            var probe = stat()
+            XCTAssertNotEqual(
+                lstat(landing.path, &probe), 0,
+                "\(name): this cell's own leaving must be gone from the Trash"
+            )
+        }
+    }
+
     /// Drive one of the four Trash arms with a mover that PROVES, moves
     /// nothing, and reports `landed` anyway.
     private func outcomeOfAMoverThatMovesNothing(

@@ -732,9 +732,11 @@ below are both part of that coordination, and the latter BLOCKS this release.
   it, so nothing was moved" while it was at exactly that path and the
   original name was left empty. The undo now identifies every kind of object,
   so what the Trash took is put back where it came from and the refusal says
-  so. When the put-back genuinely cannot be performed — the Trash or the
-  destination folder cannot be opened — the message gives you the path in the
-  Trash to drag it back from, rather than claiming it is not there.
+  so. When the put-back cannot be performed — the Trash or the destination
+  folder cannot be opened — the message gives you the path in the Trash to
+  drag it back from, rather than claiming it is not there. **Without Full
+  Disk Access that second case is not the exception, it is what happens every
+  time**; see the Full Disk Access note two entries below.
 - **One disposal path refused to work under a symlinked folder while the
   other four worked.** Cacheout deliberately follows symlinks when it opens
   the folder that HOLDS the item it is about to remove — a cache root reached
@@ -766,7 +768,18 @@ below are both part of that coordination, and the latter BLOCKS this release.
   app does, so it puts the item back under either spelling; and the refusal
   that says "the folder that holds this item is not the one that was
   admitted", which such a folder could never reach before, is now reached and
-  reported.
+  reported. **Both of those need Full Disk Access, and the entry above did
+  not say so.** Putting an item back means opening the Trash folder, and macOS
+  refuses that to any app without Full Disk Access — which Cacheout does not
+  ask for and does not have by default. So on an ordinary Mac the undo stops
+  one step earlier than either sentence above describes, under EITHER
+  spelling: nothing is put back, the item stays in the Trash, and the message
+  is the one that gives you its path so you can drag it back in one move.
+  Measured through the shipped Trash seam into the real Trash, on all four
+  Move to Trash paths, eight runs out of eight. What is fixed for everyone is
+  that the move itself still succeeds and the message names where the item
+  is; what is fixed only once you grant Full Disk Access is the automatic
+  put-back and the "folder that holds this item" refusal.
 - **A folder that is simply GONE is no longer reported as one somebody
   replaced.** If an item vanishes between the safety check and the deletion —
   an ordinary race with an installer, an uninstaller or a synced folder —

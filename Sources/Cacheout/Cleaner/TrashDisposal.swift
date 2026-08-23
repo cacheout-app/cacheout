@@ -1680,6 +1680,42 @@ enum TrashDisposal {
         // the user the path to drag it back from. Reporting
         // `.lastSeenInTrash` here told them the opposite of what they can see
         // in the Trash (PR #460 codex r10, D1).
+        //
+        // AND THIS GUARD IS WHERE THE DEFAULT USER'S UNDO ENDS — WHICH IS THE
+        // REACHABILITY EVERY NOTE BELOW WAS MISSING (PR #460 codex r16,
+        // A-P3). Three statements below this one, r15's D-P1 taught the
+        // DESTINATION open to follow a symlinked container, and its CHANGELOG
+        // entry said the undo "puts the item back under either spelling".
+        // Through the shipped seam it puts it back under NEITHER: this open
+        // is `~/.Trash`, and without Full Disk Access it is EPERM, so
+        // `rollBack` returns HERE and never reaches the line D-P1 changed.
+        //
+        // MEASURED at 3110d1e with NO `trashHandler` injected — the shipped
+        // `FileManager.trashItem` inside the production main-actor hop, into
+        // the real `~/.Trash` — all four verdict arms, 8/8 runs
+        // (`TrashDisposalHopProofTests`'
+        // `…WithoutFullDiskAccessEveryUndoStrandsTheItemInTheRealTrash`): the
+        // FORWARD disposal succeeds every time, and the undo answers
+        // `.strandedInTrash` every time, leaving the object in the user's real
+        // Trash and the target's name EMPTY.
+        //
+        // SO THE CAUSES SPLIT BY POPULATION, and this is the list:
+        //
+        // * WITHOUT Full Disk Access (the shipped GUI's default) the only
+        //   causes reachable are `.strandedInTrash` — from HERE, whatever the
+        //   container spelling — plus `.lastSeenInTrash` and
+        //   `.destinationUnknown`, both of which are decided before this line.
+        // * WITH it, the other three become reachable: `.putBack`,
+        //   `.putBackTookAnotherObject` and
+        //   `.destinationNotTheAdmittedContainer`. Every cell that evidences
+        //   those three injects a landing in a fixture directory whose parent
+        //   IS openable, which is exactly the property this file's r11 D4 note
+        //   records as having hidden a defect for eight rounds.
+        //
+        // D-P1's fix is not undone by that and is not being questioned: it is
+        // what makes the second row true, and it removed a real regression for
+        // the population that has the permission. What was wrong was
+        // publishing it as a change to what the DEFAULT user sees.
         let trashFD = provider.openDirectoryNoFollow(
             at: landed.deletingLastPathComponent()
         )
@@ -1720,6 +1756,16 @@ enum TrashDisposal {
         // item to the Trash and then could not put it back. Evidenced by
         // `TrashDisposalHopProofTests`'
         // `…UndoPutsBackUnderASymlinkedContainerWhatItPutsBackUnderAPlainOne`.
+        //
+        // AND EVERY FIGURE IN THAT PARAGRAPH WAS TAKEN THROUGH AN INJECTED
+        // LANDING, SO IT IS A FACT ABOUT A POPULATION AND NOT ABOUT THE
+        // DEFAULT (PR #460 codex r16, A-P3). This line is reached ONLY when
+        // the Trash-open guard above succeeded, i.e. only with Full Disk
+        // Access. Without it `rollBack` has already returned
+        // `.strandedInTrash` three statements up — measured at 3110d1e
+        // through the shipped `FileManager.trashItem` into the real
+        // `~/.Trash`, all four arms, 8/8 runs. Read the paragraph above as
+        // "what the undo does once it can open the Trash at all".
         //
         // THE TWO ERRORS THE PAIR THROWS ARE THE TWO CAUSES THIS FUNCTION
         // ALREADY HAD, and they are kept apart for the reason

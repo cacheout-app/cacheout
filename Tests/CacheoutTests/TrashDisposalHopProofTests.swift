@@ -2450,6 +2450,154 @@ final class TrashDisposalHopProofTests: XCTestCase {
     }
 
     // ================================================================
+    // MARK: - The taxonomy gap `.strandedInTrash` covers (r16, A-P4a)
+    // ================================================================
+
+    /// **A-P4(a) — RECORDED, NOT FIXED: a destination container that is no
+    /// longer a FOLDER answers `.strandedInTrash`, and only
+    /// `.destinationNotTheAdmittedContainer` tells the user their folder
+    /// changed** (PR #460 codex r16).
+    ///
+    /// `rollBack`'s destination open goes through
+    /// `DepthSafeRemoval.openAdmittedContainer`, and its `catch` splits
+    /// exactly two ways: `.notTheAdmittedContainer` becomes
+    /// `.destinationNotTheAdmittedContainer`, and EVERYTHING ELSE becomes
+    /// `.strandedInTrash`. A container replaced by a regular file cannot even
+    /// be OPENED as a directory, so it never reaches the identity comparison
+    /// and lands in the second bucket.
+    ///
+    /// MEASURED by this cell: all four Trash arms, both container spellings —
+    /// eight rows, `.strandedInTrash` on every one. The refusal then says
+    /// "it is in the Trash at <path>. Move it back from there", which is TRUE
+    /// and actionable, and carries no hint that the folder it came from is no
+    /// longer a folder.
+    ///
+    /// WHY IT IS RECORDED RATHER THAN SPLIT. The item is safe and its path is
+    /// named, which is the whole of what the cause promises; a seventh cause
+    /// would need its own user-facing entry and its own evidence, and this
+    /// round is not the place to add one on the strength of a note. This cell
+    /// exists so the claim is a measurement rather than a reading, and so the
+    /// row moves visibly if anyone does split it.
+    func testADestinationContainerTurnedIntoAFileIsReportedAsAStranding()
+        async throws
+    {
+        let landings = try XCTUnwrap(self.landings)
+        let provider = FileSystemIdentityProvider()
+
+        for spelling in ["plain", "symlinked"] {
+            for arm in TrashArm.allCases {
+                let name = "notafolder-\(spelling)-\(arm.rawValue)"
+                // The REAL directory, and the spelling the disposal is given.
+                let real = base.appendingPathComponent("\(name)-real")
+                try fm.createDirectory(
+                    at: real, withIntermediateDirectories: true
+                )
+                let container: URL
+                if spelling == "symlinked" {
+                    container = base.appendingPathComponent("\(name)-link")
+                    try fm.createSymbolicLink(
+                        at: container, withDestinationURL: real
+                    )
+                } else {
+                    container = real
+                }
+                let target = container.appendingPathComponent("entry")
+                if arm.targetIsADirectory {
+                    try fm.createDirectory(
+                        at: target, withIntermediateDirectories: true
+                    )
+                    try Data("ours".utf8).write(
+                        to: target.appendingPathComponent("ours.txt")
+                    )
+                } else {
+                    try Data("ours".utf8).write(to: target)
+                }
+                let parent = try admittedParent(
+                    of: target, provider: provider
+                )
+                let landed = landings.appendingPathComponent(name)
+                let directory = arm.targetIsADirectory
+                let fileManager = fm
+
+                let mover: TrashDisposal.Mover = { url, prove in
+                    try prove()
+                    // The object is replaced and the replacement really moved,
+                    // so the after-proof refuses and the rollback runs …
+                    try fileManager.removeItem(at: url)
+                    if directory {
+                        try fileManager.createDirectory(
+                            at: url, withIntermediateDirectories: true
+                        )
+                        try Data("stranger".utf8).write(
+                            to: url.appendingPathComponent("their-work.txt")
+                        )
+                    } else {
+                        try Data("stranger".utf8).write(to: url)
+                    }
+                    try fileManager.moveItem(at: url, to: landed)
+                    // … and the folder that HELD it is no longer a folder.
+                    try fileManager.removeItem(at: real)
+                    try Data("not a folder".utf8).write(to: real)
+                    return landed
+                }
+
+                var thrown: Error?
+                do {
+                    switch arm {
+                    case .noVerdict:
+                        try await TrashDisposal.dispose(
+                            target, containedIn: parent, provider: provider,
+                            via: mover
+                        )
+                    case .noDirectoryTree:
+                        try await TrashDisposal.dispose(
+                            target, expecting: .noDirectoryTree,
+                            provider: provider, containedIn: parent,
+                            via: mover
+                        )
+                    case .nonDirectoryLeaf:
+                        let identity = try XCTUnwrap(
+                            provider.identity(of: target)
+                        )
+                        try await TrashDisposal.dispose(
+                            target, expecting: .nonDirectoryLeaf(identity),
+                            provider: provider, containedIn: parent,
+                            via: mover
+                        )
+                    case .directory:
+                        let identity = try XCTUnwrap(
+                            provider.identity(of: target)
+                        )
+                        try await TrashDisposal.dispose(
+                            target, expecting: .directory(identity),
+                            provider: provider, containedIn: parent,
+                            via: mover
+                        )
+                    }
+                } catch {
+                    thrown = error
+                }
+
+                let failure = try XCTUnwrap(
+                    thrown as? TrashDisposal.Failure,
+                    "\(name): \(String(describing: thrown))"
+                )
+                XCTAssertEqual(
+                    failure.cause, .strandedInTrash(landed.path),
+                    "\(name): a container that is not a directory cannot be "
+                        + "opened, so it never reaches the identity "
+                        + "comparison that would name the drift"
+                )
+                XCTAssertTrue(
+                    fm.fileExists(atPath: landed.path),
+                    "\(name): the disclosed residual — the object stays at "
+                        + "the landing the refusal names"
+                )
+            }
+        }
+    }
+
+    // ================================================================
     // MARK: - The WHOLE message, not its opening (r16, A-P1/A-P2)
     // ================================================================
 
@@ -2508,10 +2656,13 @@ final class TrashDisposalHopProofTests: XCTestCase {
         let fences: [WholeMessageFence] = [
             WholeMessageFence(
                 cause: .putBack,
-                forbidden: [],
-                required: ["PUT BACK"],
-                because: "the arrival WAS identified under the held "
-                    + "destination descriptor"
+                // A-P4b: "Nothing was moved to the Trash" was a NET-EFFECT
+                // claim, and an object WAS moved there and retrieved.
+                forbidden: ["Nothing was moved to the Trash"],
+                required: ["PUT BACK", "identified at this path"],
+                because: "what this arm proved is that the object was moved "
+                    + "back OUT of the Trash and identified at the target "
+                    + "under the held, admitted destination descriptor"
             ),
             WholeMessageFence(
                 cause: .strandedInTrash(landed),

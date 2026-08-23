@@ -484,9 +484,17 @@ enum TrashDisposal {
                 + "moved the item that was inspected"
             switch cause {
             case .putBack:
-                return "\(unproved), so what it did take has been PUT BACK at "
-                    + "this path. Nothing was moved to the Trash and nothing "
-                    + "was freed; refused, re-scan required"
+                // "Nothing was moved to the Trash" was a NET-EFFECT claim,
+                // and the net effect is not what happened (PR #460 codex
+                // r16, A-P4b): an object WAS moved to the Trash and then
+                // retrieved from it. What this arm PROVED is narrower and is
+                // now what it says — the object was moved back out under the
+                // held Trash descriptor and IDENTIFIED at this path under the
+                // held, admitted destination descriptor.
+                return "\(unproved), so what it did take has been PUT BACK: "
+                    + "it was moved back out of the Trash and identified at "
+                    + "this path; nothing was freed; refused, re-scan "
+                    + "required"
             case .strandedInTrash(let landed):
                 return "\(unproved), and what it did take could not be put "
                     + "back automatically — it is in the Trash at \(landed). "
@@ -1620,6 +1628,32 @@ enum TrashDisposal {
             // THE FROZEN GHOST-TARGET BEHAVIOUR, and the one absence that
             // PROVES its verdict: `.noDirectoryTree` is precisely a statement
             // that no directory tree of ours stood at this name.
+            //
+            // AND IT IS NO LONGER ON A PRODUCTION PATH, WHICH IS WORTH
+            // SAYING RATHER THAN LEAVING TO BE INFERRED (PR #460 codex r16,
+            // A-P4c). `absenceProves: true` is reached in production only
+            // through `proveStandingUnderAdmittedContainer`, which
+            // `dispose(_:expecting:…)` calls for the `.directory` and
+            // `.unestablished` verdicts — never for `.noDirectoryTree`,
+            // which r13 routed to `disposeBoundLeaf`. That arm throws
+            // `.posix(ENOENT)` one call EARLIER, which is the deliberate
+            // choice recorded at the `case .noDirectoryTree` above: it keeps
+            // the user's Trash untouched for an item that was never there.
+            // So this line is held alive by a TEST-ONLY entry point:
+            // `TrashDisposal.proveStanding`, whose only callers are
+            // `TrashDisposalHopProofTests`'
+            // `…ALookInsideAContainerThatIsGoneIsStillAnAbsence` and
+            // `OrphanedCachesScannerTests`'
+            // `…AnAbsenceProvesTheVerdictBeforeTheDisposalOnly`.
+            //
+            // MEASURED at 073371c: replacing this `return nil` with
+            // `.posix(ENOENT)` and running the FULL SUITE reddens exactly
+            // those TWO cells and nothing else — 1558 executed / 2 skipped /
+            // 2 failures, exit 1, 205 s. Neither reaches production; both
+            // call `proveStanding` directly. It is kept because the asymmetry
+            // it encodes is the contract `absenceProves` exists to express,
+            // and because a deleted branch is a contract nobody can
+            // re-check.
             return nil
         case .unidentifiable:
             return .notTheInspectedObject

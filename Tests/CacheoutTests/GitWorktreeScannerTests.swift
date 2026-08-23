@@ -1449,10 +1449,14 @@ final class GitWorktreeScannerTests: XCTestCase {
     /// suppression as well so a future edit cannot buy the wording by
     /// offering the item.
     ///
-    /// The double fails the SECOND `identity` call for the admin entry: the
-    /// first is the discovery capture, the second is (e2)'s, the third is the
+    /// The double fails the THIRD `identity` call for the admin entry: the
+    /// first is the discovery capture, the second is (a2)'s admin-container
+    /// pass (PR #460 codex r17, W1), the third is (e2)'s, the fourth is the
     /// live one in `handle`. Its call counter is asserted so a re-ordering of
-    /// those captures cannot leave this cell exercising a different arm.
+    /// those captures cannot leave this cell exercising a different arm — and
+    /// it did exactly that job when r17 inserted (a2): the counter went red
+    /// and the cell had to be re-aimed rather than silently drifting onto the
+    /// container pass.
     ///
     /// MUTATION: collapse this arm back into the re-proof's `guard let
     /// assessmentWitness, assessmentWitness == adminEntryIdentity` — RED
@@ -1471,16 +1475,17 @@ final class GitWorktreeScannerTests: XCTestCase {
             "the fixture must have a resolvable admin directory"
         )
 
-        let provider = BlindOnNthIdentityCallProvider(blinded: adminEntry, onCall: 2)
+        let provider = BlindOnNthIdentityCallProvider(blinded: adminEntry, onCall: 3)
         let outcome = await makeScanner(provider: provider)
             .scan(context: ScanContext(trigger: .userInitiated))
 
         XCTAssertEqual(
-            provider.calls, 4,
-            "the admin entry is identified four times — discovery, the "
-                + "witness loop, the live read in `handle`, and the prune "
-                + "tier's admin-container mapping; this cell names the "
-                + "SECOND and cannot be read if that ordering changes"
+            provider.calls, 5,
+            "the admin entry is identified five times — discovery, (a2)'s "
+                + "pre-listing admin-container pass, the witness loop, the "
+                + "live read in `handle`, and the prune tier's admin-container "
+                + "mapping; this cell names the THIRD and cannot be read if "
+                + "that ordering changes"
         )
         // Suppression is unchanged: an unwitnessed record is never armed.
         XCTAssertTrue(
@@ -1504,6 +1509,219 @@ final class GitWorktreeScannerTests: XCTestCase {
         XCTAssertTrue(fm.fileExists(atPath: worktree.path))
     }
 
+
+
+    // MARK: - W1: the walk's depth budget must not decide what is reclaimable
+
+    /// W1 (PR #460 codex r17). r16's `guard let discoveryWitness` refuses any
+    /// porcelain-listed worktree the WALK never reached, and its comment said
+    /// "It CLEARS: the next scan re-walks." For the DEPTH cause that sentence
+    /// was false: `discoveryWitnesses` was populated only from walk
+    /// discoveries, the walk is bounded by `ProjectTreeWalker.defaultMaxDepth`
+    /// (8), no production call site overrides it and no user setting reaches
+    /// it — so every future scan re-walked to the same depth and refused
+    /// again. A deterministic bound cannot be cleared by the remedy the
+    /// refusal named.
+    ///
+    /// This fixture straddles the bound inside ONE repository: `dev` is depth
+    /// 0, the deepest directory the walk VISITS is depth 8, so `wt-edge` (8)
+    /// is walked and `wt-deep` (9) never is. Both are ordinary candidates and
+    /// git lists both.
+    ///
+    /// MEASURED at e6afc9f: `wt-edge` offered, `wt-deep` refused, byte-identical
+    /// across three consecutive scans. The three scans are part of the cell
+    /// because permanence — not the refusal — is the defect.
+    ///
+    /// MUTATION: delete the admin-container witness pass in `process` (a2), or
+    /// stop consulting `containerWitnesses` in (e2) — RED here, GREEN on every
+    /// replacement cell above.
+    func testAWorktreeBelowTheWalksDepthBudgetIsOfferedOnEveryScan() async throws {
+        let repository = try makeRepositoryIgnoringPayloads(
+            at: dev.appendingPathComponent("repo")
+        )
+        let shallowPrefix = "l1/l2/l3/l4/l5/l6/l7"
+        let edge = try addWorktree(
+            of: repository,
+            at: dev.appendingPathComponent("\(shallowPrefix)/wt-edge"),
+            branch: "edge"
+        )
+        let deep = try addWorktree(
+            of: repository,
+            at: dev.appendingPathComponent("\(shallowPrefix)/l8/wt-deep"),
+            branch: "deep"
+        )
+
+        // The fixture must actually straddle the bound, or the cell proves
+        // nothing: the walk sees `wt-edge`'s `.git` and never sees `wt-deep`'s.
+        var walked: Set<String> = []
+        let walker = ProjectTreeWalker(
+            home: home,
+            pathGuard: PathGuard(
+                home: home, containerRoots: [dev],
+                provider: FileSystemIdentityProvider()
+            ),
+            provider: FileSystemIdentityProvider()
+        )
+        _ = walker.walk(roots: [dev], consumers: [{ event in
+            walked.insert(event.directory.path)
+            return []
+        }])
+        XCTAssertTrue(
+            walked.contains(edge.path),
+            "the depth-8 control must be inside the walk's budget"
+        )
+        XCTAssertFalse(
+            walked.contains(deep.path),
+            "the depth-9 subject must be OUTSIDE the walk's budget — the "
+                + "fixture no longer straddles `defaultMaxDepth`"
+        )
+
+        let liveAdmin = try XCTUnwrap(
+            GitWorktreeGitdirResolver().adminDirectory(forWorktreeAt: deep)
+        )
+        let liveIdentity = try XCTUnwrap(
+            FileSystemIdentityProvider().identity(of: liveAdmin)
+        )
+
+        // THREE consecutive scans of an UNCHANGED tree. A refusal that a
+        // re-scan cannot clear reproduces identically every time; that is the
+        // property this asserts, and it is the one r16 shipped false.
+        for attempt in 1...3 {
+            let scanner = makeScanner()
+            let outcome = await scanner.scan(context: ScanContext(trigger: .userInitiated))
+            let stale = try outcome.items.filter {
+                guard case .gitWorktreeReclaim = $0.action else { return false }
+                return try plan(of: $0).mode == .removeStaleWorktree
+            }
+            XCTAssertEqual(
+                try stale.compactMap { try plan(of: $0).worktreePath?.lastPathComponent }
+                    .sorted(),
+                ["wt-deep", "wt-edge"],
+                "scan \(attempt): the walk's depth budget decided what is "
+                    + "reclaimable — git listed both worktrees and both are "
+                    + "candidates. Issues: \(outcome.errors.map(\.detail))"
+            )
+            let deepItem = try XCTUnwrap(stale.first {
+                try plan(of: $0).worktreePath?.lastPathComponent == "wt-deep"
+            })
+            XCTAssertEqual(
+                try plan(of: deepItem).worktreeAdminEntryIdentity, liveIdentity,
+                "scan \(attempt): the walk-unreached checkout must be armed "
+                    + "with its OWN admin entry's identity"
+            )
+            XCTAssertFalse(
+                outcome.errors.contains { $0.detail.contains("wt-deep") },
+                "scan \(attempt): \(outcome.errors.map(\.detail))"
+            )
+            try assertNonMalformed(outcome, from: scanner)
+        }
+    }
+
+    /// W1's other half (PR #460 codex r17). The walk-unreached population is
+    /// no longer refused, so the thing that must be proved is that it is not
+    /// merely WAIVED: the identity it is armed with has to be one taken
+    /// BEFORE the listing that produced its evidence, or the fix would be a
+    /// hole rather than a witness.
+    ///
+    /// Both subjects here are checkouts the walk cannot reach. ONE of them is
+    /// replaced the instant the listing returns, exactly as the B-P1 cell
+    /// does for a walked one. The pre-listing capture is the admin-container
+    /// pass at (a2); the assessment capture at (e2) and the live one in
+    /// `handle` both see the replacement, so the three-way re-proof disagrees
+    /// and that row alone is refused.
+    ///
+    /// THE UNTOUCHED SIBLING IS THE DISCRIMINATOR, and it is why this cell is
+    /// not satisfiable by the strand it replaces: a refusal that fires on the
+    /// walk-unreached POPULATION refuses both, and no wording of it can
+    /// offer `wt-keep`. Asserting "an issue mentioning wt-deep exists" alone
+    /// would have passed at e6afc9f — MEASURED, which is how this cell came
+    /// to be written this way.
+    ///
+    /// MUTATION: take the container witnesses AFTER the listing instead of
+    /// before it — RED here, GREEN on the cell above.
+    func testAWalkUnreachedWorktreeReplacedTheInstantTheListingReturnedIsRefused()
+        async throws
+    {
+        let repository = try makeRepositoryIgnoringPayloads(
+            at: dev.appendingPathComponent("repo")
+        )
+        let prefix = "l1/l2/l3/l4/l5/l6/l7/l8"
+        let keep = try addWorktree(
+            of: repository,
+            at: dev.appendingPathComponent("\(prefix)/wt-keep"),
+            branch: "keep"
+        )
+        let deep = try addWorktree(
+            of: repository,
+            at: dev.appendingPathComponent("\(prefix)/wt-deep"),
+            branch: "deep"
+        )
+
+        let identityProvider = FileSystemIdentityProvider()
+        let originalAdmin = try XCTUnwrap(
+            GitWorktreeGitdirResolver().adminDirectory(forWorktreeAt: deep)
+        )
+        let originalIdentity = try XCTUnwrap(identityProvider.identity(of: originalAdmin))
+
+        let latch = OneShotLatch()
+        let fixtureHome = try XCTUnwrap(home)
+        let payload = deep.appendingPathComponent("payload.bin")
+        let runner = InterceptingGitRunner(wrapping: makeRunner()) { arguments, _ in
+            guard arguments.contains("list"), latch.claim() else { return nil }
+            guard let listed = try? GitFixture.git(arguments, home: fixtureHome),
+                  listed.status == 0
+            else { return nil }
+            _ = try? GitFixture.git(
+                ["-C", repository.path, "worktree", "remove", deep.path],
+                home: fixtureHome
+            )
+            _ = try? GitFixture.git(
+                ["-C", repository.path, "worktree", "add", deep.path, "-b", "brand-new"],
+                home: fixtureHome
+            )
+            try? Data(repeating: 0xCD, count: 8192).write(to: payload)
+            return .success(stdout: listed.stdout)
+        }
+
+        let scanner = makeScanner(runner: runner)
+        let outcome = await scanner.scan(context: ScanContext(trigger: .userInitiated))
+
+        XCTAssertTrue(latch.didFire, "the fixture never intercepted the listing")
+        let replacementAdmin = try XCTUnwrap(
+            GitWorktreeGitdirResolver().adminDirectory(forWorktreeAt: deep)
+        )
+        XCTAssertNotEqual(
+            identityProvider.identity(of: replacementAdmin), originalIdentity,
+            "the fixture must have replaced the OBJECT, not merely the path"
+        )
+
+        let stale = try outcome.items.filter {
+            guard case .gitWorktreeReclaim = $0.action else { return false }
+            return try plan(of: $0).mode == .removeStaleWorktree
+        }
+        let armed = try stale.first {
+            try plan(of: $0).worktreePath?.lastPathComponent == "wt-deep"
+        }.map { try plan(of: $0).worktreeAdminEntryIdentity }
+        XCTAssertEqual(
+            try stale.compactMap { try plan(of: $0).worktreePath?.lastPathComponent }
+                .sorted(),
+            ["wt-keep"],
+            "the replaced checkout must be refused and the untouched sibling "
+                + "must still be offered — armed identity for wt-deep was "
+                + "\(String(describing: armed)) while the LISTED checkout's "
+                + "was \(originalIdentity). Issues: \(outcome.errors.map(\.detail))"
+        )
+        let issue = try XCTUnwrap(
+            outcome.errors.first { $0.detail.contains("/wt-deep") },
+            "the refusal must be VISIBLE, not a silent omission: \(outcome.errors)"
+        )
+        XCTAssertEqual(issue.kind, .unreadable)
+        XCTAssertTrue(issue.detail.contains("no item is offered"), issue.detail)
+        XCTAssertTrue(fm.fileExists(atPath: deep.path))
+        XCTAssertTrue(fm.fileExists(atPath: keep.path))
+        XCTAssertEqual(try Data(contentsOf: payload).count, 8192)
+        try assertNonMalformed(outcome, from: scanner)
+    }
 
     // MARK: - R6: the orphaned-admin tier
 
@@ -1788,20 +2006,91 @@ final class GitWorktreeScannerTests: XCTestCase {
         )
     }
 
-    func testOracleToAdminMappingFlowsThroughTheOneSharedComponent() throws {
-        // ONE implementation, two call sites (fn-5.4's delete-time recompute is
-        // the other). A second mapping would let detection and execution
-        // disagree about which admin directories are destroyed, so the scanner must
-        // neither enumerate the admin container itself nor re-derive the
-        // oracle's argv.
+    /// ONE implementation, two call sites (fn-5.4's delete-time recompute is
+    /// the other). A second mapping would let detection and execution
+    /// disagree about which admin directories are destroyed.
+    ///
+    /// THROUGH r16 THIS WAS A LITERAL BAN on the string `contentsOfDirectory`
+    /// appearing in the scanner source, and that is phrasing-fencing in both
+    /// directions (PR #460 codex r17). It passes a hand-rolled `readdir`, a
+    /// `FileManager.enumerator` or a `Glob` — any second mapping that spells
+    /// itself differently — and it FAILS a read of the container that derives
+    /// no removal target at all, which is exactly what r17's pre-listing
+    /// witness pass at (a2) is. A ban on one API spelling is not the
+    /// proposition; this is:
+    ///
+    ///   whatever else the scanner reads, the set of admin directories it
+    ///   OFFERS for removal is the shared mapper's answer for the same
+    ///   container and the same porcelain records.
+    ///
+    /// So the cell recomputes that answer independently — fresh listing,
+    /// fresh `GitWorktreeAdminMapper` — and asserts set equality against the
+    /// emitted plan. A second derivation only survives this by agreeing, and
+    /// a derivation that agrees is not the failure mode the fence exists for.
+    ///
+    /// MUTATION: have `pruneTier` filter `directories` by anything of its own
+    /// (drop the last entry, re-add a locked one) — RED here whatever it is
+    /// spelled with.
+    func testOracleToAdminMappingFlowsThroughTheOneSharedComponent() async throws {
+        let repository = try makeRepositoryIgnoringPayloads(
+            at: dev.appendingPathComponent("repo")
+        )
+        // Two orphans and one LIVE worktree, so the mapper's answer is a
+        // strict subset of the container's entries and an enumeration that
+        // simply listed the container would not match it.
+        for index in 0..<2 {
+            let orphan = try addWorktree(
+                of: repository, at: dev.appendingPathComponent("gone-\(index)"),
+                branch: "gone-\(index)"
+            )
+            try fm.removeItem(at: orphan)
+        }
+        try addWorktree(
+            of: repository, at: dev.appendingPathComponent("wt-live"), branch: "live"
+        )
+
+        let scanner = makeScanner()
+        let outcome = await scanner.scan(context: ScanContext(trigger: .userInitiated))
+        let pruneItem = try XCTUnwrap(
+            outcome.items.first { (try? plan(of: $0).mode) == .pruneOrphanedAdmin },
+            "the prune item must be published: \(outcome.errors.map(\.detail))"
+        )
+        let reclaim = try plan(of: pruneItem)
+
+        // THE INDEPENDENT RECOMPUTE: the oracle's own argv, re-run against
+        // the unchanged fixture, parsed by the shared inventory and mapped by
+        // the shared mapper.
+        let listed = try GitFixture.git(
+            GitWorktreeOracle.listArguments(forRepositoryAt: repository), home: home
+        )
+        XCTAssertEqual(listed.status, 0)
+        let inventory = try XCTUnwrap(GitWorktreeInventory.parse(listed.stdout))
+        let verdict = GitWorktreeAdminMapper().map(
+            prunableRecordsIn: inventory.entries,
+            adminContainer: reclaim.parentAdminContainer
+        )
+        guard case .complete(let expected) = verdict else {
+            return XCTFail("the shared mapper refused the fixture: \(verdict)")
+        }
+        XCTAssertEqual(
+            expected.count, 2,
+            "the recompute must be non-vacuous — two orphans, one live "
+                + "worktree, so the container holds three entries and the "
+                + "mapper names two"
+        )
+        XCTAssertEqual(
+            Set(reclaim.disclosedAdminDirectories.map { $0.path }),
+            Set(expected.map { $0.path }),
+            "the offered removal set is not the shared mapper's answer"
+        )
+
+        // The oracle argv itself is still never re-spelled locally: a second
+        // porcelain grammar would fork the contract before the mapping is
+        // even reached.
         let text = try scannerSource()
         XCTAssertTrue(
             text.contains("mapper.map("),
             "the scanner must consume fn-5.1's shared mapper"
-        )
-        XCTAssertFalse(
-            text.contains("contentsOfDirectory"),
-            "enumerating the admin container here would be a SECOND mapping"
         )
         XCTAssertTrue(
             text.contains("GitWorktreeOracle.listArguments"),
@@ -1811,6 +2100,7 @@ final class GitWorktreeScannerTests: XCTestCase {
             text.contains("--porcelain"),
             "a locally-spelled porcelain argv would fork the oracle contract"
         )
+        try assertNonMalformed(outcome, from: scanner)
     }
 
     private func scannerSource() throws -> String {

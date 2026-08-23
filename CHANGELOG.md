@@ -85,6 +85,18 @@ below are both part of that coordination, and the latter BLOCKS this release.
   it — including while git was producing the list itself — is refused with a
   visible reason rather than offered, because the row's evidence would
   describe a checkout that is already gone.
+
+  A worktree the walk never reaches is offered too, and its identity is read
+  straight out of the repository's own worktree registry immediately before
+  that list is asked for. For one release it was not: such a worktree was
+  refused by every scan, with a message saying the next scan would clear it.
+  Nothing could. The walk stops at a fixed depth below each of your dev
+  roots, no setting changes it, and a checkout registered deeper than that —
+  or under a directory the walk cannot read — was invisible to the walk on
+  every future scan just as it was on the first, while git listed it every
+  time. What can still refuse a row for want of an identity is a read that
+  FAILS on both paths — a permission blip, an entry that vanished — and that
+  one a re-scan genuinely can clear.
   (Two earlier drafts of this entry were wrong about where that identity was
   taken, each in the same direction. The first said it was taken before the
   worktree was examined; the second said it was taken at the repository
@@ -431,8 +443,13 @@ below are both part of that coordination, and the latter BLOCKS this release.
   descriptors are bounded (the probe holds at most `clamp((RLIMIT_NOFILE −
   64)/4, 4, 64)` anchors plus two transients; the tree walker holds at most
   its depth budget), and exceeding that bound is never a refusal — anchors
-  are released and restored with an identity-verified `..` step, so no tree
-  depth can strand an item the way the retired depth cap did.
+  are released and restored with an identity-verified `..` step, so
+  exceeding it can never strand an item the way the retired depth cap did.
+  That is a claim about THIS bound — the anchors a walk holds open — and not
+  about every depth limit in the product; it has since been read wider than
+  it was written, so the scope is now explicit. The project tree walk still
+  carries a fixed per-root depth budget, and a directory beyond it is never
+  visited at all.
 - **The post-walk pass re-proves CONTAINMENT instead of re-resolving a
   path.** Anchoring the walks was not enough on its own: the scanner threw the
   walker's vetted descriptor away and kept a bare URL, then re-resolved that

@@ -560,6 +560,61 @@ struct GitWorktreeScanner: @unchecked Sendable {
         }
     }
 
+    /// PRE-LISTING identities for every admin ENTRY of one repository, read
+    /// straight out of `<gitDirectory>/worktrees` (PR #460 codex r17, W1).
+    ///
+    /// This is the capture that does not need the walk. `repositoryGroups`
+    /// can only witness checkouts the walk REACHED, and the walk carries a
+    /// fixed depth budget, so before r17 a worktree registered below it had
+    /// no pre-listing identity and was refused by every scan for ever. The
+    /// admin entries are enumerable directly, so depth cannot decide the
+    /// question.
+    ///
+    /// Keyed by the CANONICAL admin-entry path, the same key
+    /// `RepositoryGroup.discoveryWitnesses` and (e2) use: both sides spell
+    /// the entry as `resolveTargetKeepingLeaf` of a fully-resolved
+    /// `<commonGitDir>/worktrees/<id>`, one arriving through the worktree's
+    /// `gitdir:` pointer and this one by appending to the group's own
+    /// canonical git directory.
+    ///
+    /// SILENT AND TOTAL on failure: an absent, unreadable or non-directory
+    /// container, and an entry that cannot be `lstat`ed, all simply
+    /// contribute nothing. Nothing is suppressed by the silence — a record
+    /// that ends up with no witness from EITHER pass is refused by `handle`,
+    /// which says so in those terms. Publishing an issue here would fire for
+    /// every repository that has no linked worktree at all.
+    ///
+    /// NO SYMLINK IS FOLLOWED to the leaf: `resolveTargetKeepingLeaf`
+    /// resolves the container and keeps the entry name, and `identity` is an
+    /// `lstat`. A symlinked entry therefore witnesses the SYMLINK — which is
+    /// exactly what (e2) and `handle` would witness for the same path, so the
+    /// three-way re-proof still compares like with like, and the prune tier's
+    /// own mapper refuses such an entry independently.
+    static func adminContainerWitnesses(
+        inGitDirectory gitDirectory: URL,
+        provider: FileSystemIdentityProvider,
+        fileManager: FileManager = .default
+    ) -> [String: FileSystemIdentityProvider.Identity] {
+        let container = gitDirectory.appendingPathComponent(
+            GitWorktreeGitdirResolver.adminContainerName
+        )
+        guard provider.probeKind(of: container) == .kind(.directory),
+              let names = try? fileManager.contentsOfDirectory(atPath: container.path)
+        else { return [:] }
+
+        var witnesses: [String: FileSystemIdentityProvider.Identity] = [:]
+        witnesses.reserveCapacity(names.count)
+        for name in names {
+            guard FileSystemIdentityProvider.isSafeComponent(name) else { continue }
+            let entry = provider.resolveTargetKeepingLeaf(
+                container.appendingPathComponent(name)
+            )
+            guard let identity = provider.identity(of: entry) else { continue }
+            witnesses[entry.path] = identity
+        }
+        return witnesses
+    }
+
     // MARK: - Per-repository processing
 
     private enum RepositoryOutcome {
@@ -594,6 +649,49 @@ struct GitWorktreeScanner: @unchecked Sendable {
                                    ?? reachable.first)?.directory else {
             return .processed // every reachable checkout is protected — deferred
         }
+
+        // (a2) THE WALK-INDEPENDENT PRE-LISTING WITNESSES (PR #460 codex
+        //      r17, W1). The walk and the porcelain listing are two
+        //      enumerations with DIFFERENT REACH, and r16 resolved the
+        //      disagreement by refusing everything only git knew about.
+        //      `discoveryWitnesses` came from walk discoveries alone, and the
+        //      walk is bounded by `ProjectTreeWalker.defaultMaxDepth` = 8 — a
+        //      bound no production call site overrides and no user setting
+        //      reaches — so a worktree registered below it was refused by
+        //      EVERY scan, under a message promising "the next scan
+        //      re-walks". MEASURED at e6afc9f: depths 6/7/8 offered, depths
+        //      9/10/11 refused byte-identically across three consecutive
+        //      scans. A fail-closed refusal on a DETERMINISTIC limit is a
+        //      permanent strand, and "re-scan" is not a remedy for it.
+        //
+        //      THE DESIGN ANSWER is that the witness does not need the walk.
+        //      What the witness must be is an identity of the admin entry
+        //      taken BEFORE the read that produced the record's evidence —
+        //      that read is the listing at (b) — and the admin entries are
+        //      `lstat`-able straight out of `<gitDirectory>/worktrees`
+        //      without walking anything. So this pass witnesses EVERY linked
+        //      worktree of the repository, whatever depth its checkout sits
+        //      at, immediately before the listing runs.
+        //
+        //      IT IS A WEAKER WITNESS THAN THE WALK'S, and deliberately the
+        //      second choice: (e2) prefers the discovery capture wherever the
+        //      walk supplied one, because that one is taken at the instant
+        //      the checkout was OBSERVED and so also covers the rest of the
+        //      walk. This one covers [this lstat → the listing → the
+        //      assessment]. For a checkout the walk never reached that is not
+        //      a loss: the scanner made no earlier observation of it to be
+        //      inconsistent with, and every fact the row rests on is read
+        //      after this point.
+        //
+        //      WHAT REMAINS REFUSABLE, and it CAN differ on a retry: an entry
+        //      that neither pass could `lstat` (EPERM, a momentary vanish, an
+        //      unreadable container). Those are I/O outcomes, not a bound.
+        //
+        //      The TCC gate is already honoured: (a) returned above when the
+        //      git directory is deferred, and this container is inside it.
+        let containerWitnesses = Self.adminContainerWitnesses(
+            inGitDirectory: group.gitDirectory, provider: provider
+        )
 
         // (b) THE ONE LISTING per repository. `-c gc.worktreePruneExpire=now`
         //     rides fn-5.1's shared oracle argv so the stale tier and the
@@ -727,7 +825,11 @@ struct GitWorktreeScanner: @unchecked Sendable {
             guard let admin = resolver.adminDirectory(forWorktreeAt: record.path)
             else { continue }
             let entry = provider.resolveTargetKeepingLeaf(admin)
-            discoveryWitnesses[record.path.path] = group.discoveryWitnesses[entry.path]
+            // The walk's capture FIRST (it is the earlier of the two), the
+            // admin-container pass at (a2) as the fallback that keeps the
+            // depth budget from deciding what is reclaimable (r17, W1).
+            discoveryWitnesses[record.path.path] =
+                group.discoveryWitnesses[entry.path] ?? containerWitnesses[entry.path]
             // nil = an lstat that failed HERE (EPERM, a momentary vanish).
             // That is a different fact from a replacement and `handle` says
             // so in different words (PR #460 codex r16, B-P4).
@@ -962,24 +1064,38 @@ struct GitWorktreeScanner: @unchecked Sendable {
             return
         }
 
-        // UNWITNESSED BEFORE THE LISTING (PR #460 codex r16, B-P1). The
-        // discovery capture is the anchor, so a record it does not cover
-        // cannot be armed at all: there is no identity from before the read
-        // that produced this row's evidence, and every later capture would be
-        // comparing the post-listing world with itself. The two ways to land
-        // here are the walk not reaching the checkout (it is registered
-        // inside a declared root but below the depth budget, or under a
-        // directory the walk could not read) and its `<wt>/.git` pointer not
-        // resolving at discovery. It CLEARS: the next scan re-walks.
+        // UNWITNESSED BEFORE THE LISTING (PR #460 codex r16, B-P1;
+        // re-scoped r17, W1). A pre-listing identity is the anchor, so a
+        // record neither capture covers cannot be armed at all: there is no
+        // identity from before the read that produced this row's evidence,
+        // and every later capture would be comparing the post-listing world
+        // with itself.
+        //
+        // TWO independent passes offer one: the walk's, taken when the
+        // checkout was observed, and (a2)'s, taken from the repository's
+        // admin container immediately before the listing. r16 had only the
+        // first, so the walk's DEPTH BUDGET — a `static let` no production
+        // call site overrides — decided which registered worktrees could ever
+        // be reclaimed, and this refusal's own comment promised a clearing
+        // re-walk that could not happen. (a2) removed that cause.
+        //
+        // CAN A RETRY DIFFER? Yes, for every cause that still reaches here.
+        // What is left is a failed `lstat`/read on BOTH sides: the walk did
+        // not reach the checkout AND the container pass could not identify
+        // its entry (an unreadable or absent container, EPERM, a momentary
+        // vanish), or the walk reached it and `<wt>/.git` did not resolve
+        // while the container pass also failed. Those are I/O outcomes, not a
+        // bound, and the next scan re-reads.
         guard let discoveryWitness else {
             issues.append(ScanIssue(
                 url: record.path, kind: .unreadable,
-                detail: "worktree '\(record.path.path)' was not identified "
-                    + "before this scan listed its repository (this scan's "
-                    + "walk did not reach it, or its admin directory could "
-                    + "not be resolved then), so there is no identity older "
-                    + "than the evidence to prove the checkout was not "
-                    + "replaced mid-scan — the delete-time gate that tells a "
+                detail: "worktree '\(record.path.path)' could not be "
+                    + "identified before this scan listed its repository: "
+                    + "neither the tree walk nor the pre-listing read of "
+                    + "'\(adminContainer.path)' could stat its admin "
+                    + "directory, so there is no identity older than the "
+                    + "evidence to prove the checkout was not replaced "
+                    + "mid-scan — the delete-time gate that tells a "
                     + "re-created checkout from this one could not be armed "
                     + "and no item is offered"
             ))

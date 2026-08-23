@@ -519,9 +519,17 @@ git.
   What that does not cover is stated rather than implied: a checkout already
   replaced before the walk reached it is not a substitution this scan can
   see — it is simply the checkout the scan finds, judged on its own evidence
-  — and a registered worktree the walk never reached at all (below the depth
-  budget, or under a directory it could not read) has no such identity, so
-  it is refused with that reason instead of being offered. An earlier
+  — and a read that fails on a worktree's admin directory leaves it with no
+  identity at all, so it is refused with that reason instead of being
+  offered, and a later scan that can read it offers it again.
+  A worktree the walk never reached (below the walk's depth budget, or under
+  a directory it could not read) is NOT in that population: its identity is
+  read directly out of the repository's worktree registry, immediately
+  before the list is asked for, so the walk's reach does not decide what can
+  be reclaimed. A previous revision of this page described those worktrees
+  as refused for want of an identity; that refusal was permanent, because
+  the depth budget is fixed and every re-scan reproduced it, and it has been
+  removed rather than re-worded. An earlier
   revision of this page said the uncovered part was answered at delete time
   by this same identity; that was wrong and is withdrawn — the delete-time
   check re-stats against the identity the scan carried, so a poisoned one

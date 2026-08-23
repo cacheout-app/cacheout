@@ -874,6 +874,86 @@ final class TrashDisposalHopProofTests: XCTestCase {
         )
     }
 
+    // ================================================================
+    // MARK: - What the errno-carrying open actually promises (r12, D3)
+    // ================================================================
+
+    /// TWO CLAIMS IN `openDirectoryNoFollowCarryingErrno`'s HEADER, MEASURED
+    /// RATHER THAN ASSERTED (PR #460 codex r12, D3).
+    ///
+    /// **(a) The errno-read discipline is EMPIRICAL, not structural.** That
+    /// header said the global `errno` "is read on the statement immediately
+    /// after, with no intervening call". There IS intervening work between
+    /// the `open(2)` and the read: the delegated `openDirectoryNoFollow(at:)`
+    /// call and its return, the `url.path` String construction and its
+    /// teardown, and the epilogue that builds the result. None of it makes a
+    /// syscall or touches `errno` — and that is a property of THIS
+    /// delegation as compiled, not a language guarantee, so it is measured
+    /// here rather than claimed. 500 consecutive real failing opens, one
+    /// errno each.
+    ///
+    /// **(b) The permitted class has a THIRD cause, and it is neither TCC
+    /// nor a directory denied to everyone.** `open(dir, O_RDONLY)` needs READ
+    /// on the container; `lstat(dir/name)` needs only TRAVERSAL. So a
+    /// container at mode `0111` answers `EACCES` to the container open while
+    /// the path read the fallback performs succeeds — the permission class
+    /// fires, and the header's "they are the whole measured cause" (TCC's
+    /// `EPERM` and its mode-bit spelling) did not cover it.
+    ///
+    /// IT IS SOUND, WHICH IS WHY THIS IS A WORDING FIX AND NOT A DEFECT:
+    /// reaching `EACCES` at all means the container's LAST COMPONENT is a
+    /// real directory that `O_NOFOLLOW` accepted — a symlink there answers
+    /// `ENOTDIR`/`ELOOP` first, and this cell asserts that too — so the
+    /// fallback resolves no link the descriptor-relative read refused.
+    func testTheErrnoCarryingOpenAnswersOneCodePerFailureAndAdmitsMode0111()
+        throws
+    {
+        let provider = FileSystemIdentityProvider()
+        let container = base.appendingPathComponent("read-denied")
+        try fm.createDirectory(at: container, withIntermediateDirectories: true)
+        let child = container.appendingPathComponent("child")
+        try fm.createDirectory(at: child, withIntermediateDirectories: true)
+        // TRAVERSE but not READ — the third cause.
+        try fm.setAttributes([.posixPermissions: 0o111],
+                             ofItemAtPath: container.path)
+        defer {
+            try? fm.setAttributes([.posixPermissions: 0o755],
+                                  ofItemAtPath: container.path)
+        }
+
+        // (b) the premise: the container open is refused for PERMISSION…
+        var codes = Set<Int32>()
+        for _ in 0..<500 {
+            guard case .failed(let code) = provider
+                .openDirectoryNoFollowCarryingErrno(at: container)
+            else {
+                return XCTFail("the container open must be refused")
+            }
+            codes.insert(code)
+        }
+        // (a) …and 500 consecutive calls carry exactly ONE code out.
+        XCTAssertEqual(codes, [EACCES],
+                       "the errno must survive the delegation intact, every "
+                           + "time: \(codes.map(String.init).sorted())")
+
+        // …while the path read the fallback performs is permitted, which is
+        // what makes this a member of the class at all.
+        guard case .facts = provider.probeLeaf(at: child) else {
+            return XCTFail("traversal must be permitted where READ is not")
+        }
+
+        // AND THE SOUNDNESS BOUND, asserted beside it: a SYMLINKED container
+        // never reaches the permission class — it is refused first, so no
+        // permission-class fallback can ever resolve one.
+        let link = base.appendingPathComponent("read-denied-link")
+        try fm.createSymbolicLink(at: link, withDestinationURL: container)
+        XCTAssertEqual(
+            provider.openDirectoryNoFollowCarryingErrno(at: link),
+            .failed(errno: ENOTDIR),
+            "a symlinked container must answer OUTSIDE the permitted class"
+        )
+    }
+
     // MARK: - The control: an UNDISTURBED hop still disposes
 
     func testAnUndisturbedHopStillDisposesOnEveryArm() async throws {

@@ -427,12 +427,31 @@ class FileSystemIdentityProvider {
     /// fact, so it is not returned as one.
     ///
     /// DELEGATES to `openDirectoryNoFollow(at:)` rather than re-spelling the
-    /// `open` on purpose: every existing subclass override of that method —
-    /// the suite's TCC doubles among them — still governs this call, so the
-    /// two can never disagree about which directories are refusable. The
-    /// global `errno` is read on the statement immediately after, with no
-    /// intervening call, which is the read this shape exists to make
-    /// unclobberable at the CALLER (see `openChildDirectoryCarryingErrno`).
+    /// `open` on purpose: any subclass override of that method still governs
+    /// this call, so the two can never disagree about which directories are
+    /// refusable. (COUNTED, PR #460 codex r12, D3, rather than left as the
+    /// plural "the suite's TCC doubles among them": there is exactly ONE
+    /// override in the repo — `TrashDeniedProvider` in
+    /// `TrashDisposalHopProofTests`.)
+    ///
+    /// WHAT THE ERRNO READ ACTUALLY PROMISES, corrected in the same round.
+    /// This paragraph used to say the global `errno` "is read on the
+    /// statement immediately after, with no intervening call". It is not:
+    /// between the `open(2)` and the read sit the delegated call and its
+    /// return, `url.path`'s String construction and teardown, and this
+    /// function's own epilogue. None of them makes a syscall or touches
+    /// `errno` — which is a property of THIS delegation as compiled, not a
+    /// guarantee the language gives, so it is MEASURED and not asserted:
+    /// `TrashDisposalHopProofTests.testTheErrnoCarryingOpenAnswersOneCodePerFailureAndAdmitsMode0111`
+    /// runs 500 consecutive real failing opens and requires exactly one code
+    /// out of all of them.
+    ///
+    /// The spelling with genuinely NO intervening work is the `withCString`
+    /// closure form — the errno read INSIDE the closure, next to the call
+    /// that set it — which `openChildDirectoryCarryingErrno` and
+    /// `TrashDisposal.look`'s path fallback both use. This one buys the
+    /// override seam instead, and pays for it with an empirical claim rather
+    /// than a structural one.
     func openDirectoryNoFollowCarryingErrno(at url: URL) -> DescriptorOpen {
         let fd = openDirectoryNoFollow(at: url)
         return fd >= 0 ? .opened(fd) : .failed(errno: errno)

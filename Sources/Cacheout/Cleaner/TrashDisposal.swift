@@ -737,16 +737,30 @@ enum TrashDisposal {
     /// for a self-referential one alike. Neither code is permitted, so the
     /// gate is the same either way.)
     ///
-    /// `EPERM`/`EACCES` are the whole permitted class because they are the
-    /// whole measured cause: TCC answers this open with `EPERM` (above), and
-    /// `EACCES` is the ordinary mode-bit spelling of the same fact about the
-    /// same open. Neither can be produced by a symlink, a missing directory
-    /// or a non-directory, so neither can license a resolution the
-    /// descriptor-relative read would have refused. All three directions are
-    /// evidenced: `testAnUnopenableLandingIsIdentifiedRatherThanRefused`
-    /// (`EPERM` must SUCCEED),
-    /// `testAModeDeniedLandingIsIdentifiedRatherThanRefused` (`EACCES` must
-    /// SUCCEED) and the symlinked-container cell above (must REFUSE).
+    /// WHY `EPERM`/`EACCES` ARE THE WHOLE PERMITTED CLASS — and the argument
+    /// is about what reaching them PROVES, not about how many causes produce
+    /// them (corrected, PR #460 codex r12, D3). r11 wrote that they "are the
+    /// whole measured cause": TCC's `EPERM`, and `EACCES` as its mode-bit
+    /// spelling. THERE IS AT LEAST A THIRD, MEASURED — `open(dir, O_RDONLY)`
+    /// needs READ on the container while `lstat(container/name)` needs only
+    /// TRAVERSAL, so a container at mode `0111` answers `EACCES` here while
+    /// the fallback's path read succeeds
+    /// (`testTheErrnoCarryingOpenAnswersOneCodePerFailureAndAdmitsMode0111`).
+    ///
+    /// It is SOUND anyway, and the enumeration was never what made it sound.
+    /// Reaching either code AT ALL means the container's LAST COMPONENT is a
+    /// real directory that `O_NOFOLLOW` accepted — a symlink there answers
+    /// `ENOTDIR`/`ELOOP` first, before any permission check, measured in the
+    /// same cell — so no member of this class can license a resolution the
+    /// descriptor-relative read refused, whatever produced it. A missing
+    /// directory and a non-directory answer outside the class for the same
+    /// reason.
+    ///
+    /// All three directions are evidenced:
+    /// `testAnUnopenableLandingIsIdentifiedRatherThanRefused` (`EPERM` must
+    /// SUCCEED), `testAModeDeniedLandingIsIdentifiedRatherThanRefused`
+    /// (`EACCES` must SUCCEED) and the symlinked-container cell above (must
+    /// REFUSE).
     ///
     /// It is reached only when the container open has ALREADY failed; while
     /// that open succeeds the descriptor-relative answer, including its
@@ -929,11 +943,13 @@ enum TrashDisposal {
     /// descriptor-relative rewrite without a fallback would have broken it
     /// for the first time. `EPERM`/`EACCES` on the CONTAINER open therefore
     /// fall back to the path-spelled open, under the identical bound `facts`
-    /// carries: reaching either code means the container's last component IS
-    /// a real directory that `O_NOFOLLOW` accepted (a symlink there answers
-    /// `ENOTDIR`/`ELOOP` first, measured), so the fallback resolves no link
-    /// this open refused, and its identity is only ever compared for EQUALITY
-    /// against one bound before the move. Every other failure refuses.
+    /// carries — and stated there in full, including the THIRD cause that
+    /// reaches this class (a container at mode `0111`) and why the class is
+    /// sound regardless of how many causes produce it. In short: reaching
+    /// either code means the container's last component IS a real directory
+    /// that `O_NOFOLLOW` accepted, so the fallback resolves no link this open
+    /// refused, and its identity is only ever compared for EQUALITY against
+    /// one bound before the move. Every other failure refuses.
     ///
     /// Both directions are evidenced, and each by its own cell:
     /// `…IdentifiesAnUnopenableLanding` (`EPERM` must SUCCEED),

@@ -154,12 +154,33 @@ final class CLIGateTests: XCTestCase {
         }
     }
 
+    /// A scanner that HOLDS ITS THREAD past the session bound, the way a walk
+    /// parked in a syscall does, and records that it was asked to scan at
+    /// all. Uncancellable on purpose: the watchdog cancels the producer, and
+    /// a blocker that exited on cancellation would let the session conclude
+    /// normally and hide the very cut-off this cell needs. The hold is short
+    /// and finite so no thread outlives the cell.
+    private struct WedgedFixtureScanner: SpaceScanner {
+        let id: String
+        var displayName: String { "Wedged \(id)" }
+        var trustedContainerRoots: [URL] = []
+        var recorder: ScanCallRecorder?
+        var holdSeconds: TimeInterval = 1.0
+
+        func scan(context: ScanContext) async -> ScanOutcome {
+            await recorder?.record()
+            Thread.sleep(forTimeInterval: holdSeconds)
+            return ScanOutcome(items: [], errors: [])
+        }
+    }
+
     /// The injected dependency bundle over a fixture registry: the
     /// CategoryScanner adapter (anchored to the fixture home) plus any
     /// extra per-item scanners.
     private func makeDeps(
         categories: [CacheCategory],
-        extraScanners: [any SpaceScanner] = []
+        extraScanners: [any SpaceScanner] = [],
+        sessionBounds: ScanSessionBounds = .default
     ) throws -> CLIHandler.CLIRuntimeDependencies {
         let categoryScanner = CategoryScanner(
             categories: categories,
@@ -169,7 +190,8 @@ final class CLIGateTests: XCTestCase {
             scanners: [categoryScanner] + extraScanners,
             categories: categories,
             home: fixtureHome,
-            provider: FileSystemIdentityProvider()
+            provider: FileSystemIdentityProvider(),
+            sessionBounds: sessionBounds
         )
         return CLIHandler.CLIRuntimeDependencies(
             runtime: runtime,
@@ -1366,6 +1388,150 @@ final class CLIGateTests: XCTestCase {
             calls, 0,
             "a category-targeted clean records ZERO per-item scanner scan calls "
             + "— without the subset it would walk Documents/Desktop (TCC prompts)"
+        )
+    }
+
+    /// WHAT ACTUALLY CLOSES A BOUNDED-OUT DESTRUCTIVE CLI INVOCATION
+    /// (PR #460 codex r14, V2-3) — and it is NOT the session bound's
+    /// `adoptedGeneration`, which the CLI has no equivalent of and never
+    /// reads. It is TARGET-SCOPED REFUSAL, and this cell exists because a
+    /// production comment asserted the opposite: that items belonging to
+    /// scanners which DID report in a cut-off invocation "remain cleanable"
+    /// and the residual "is NOT closed". Measured, that residual does not
+    /// exist — and an invented residual is expensive, because it sends a
+    /// future round to fix a non-bug.
+    ///
+    /// The closure rests on TWO facts, and this cell pins both, because
+    /// either one alone would be a different (and reopenable) story:
+    ///
+    ///   1. `cleanCLIOutcome`'s session runs EXACTLY the scanners the parsed
+    ///      targets name. The wedged scanner here records ZERO scan calls
+    ///      when only the category is targeted — so a scanner nobody
+    ///      addressed can never be the one that cuts the session off. A
+    ///      change that widened the subset (a preflight scanner, an
+    ///      "always scan X" rule) would reopen the residual without touching
+    ///      `SpaceScanner.swift`.
+    ///   2. When a target DOES name the wedged scanner, `resolveCleanTargets`
+    ///      refuses THE WHOLE INVOCATION on its `.scanDidNotFinish` — not
+    ///      just that target — and the healthy scanner's real bytes survive.
+    ///
+    /// THE THREE ARMS ARE NOT EQUALLY LOAD-BEARING, and mutation is how that
+    /// came out. On `.allScannerItems` the `malformed` check is the whole
+    /// refusal: without it a cut-off scanner reads as the documented "zero
+    /// items is a legitimate no-op" and the invocation PROCEEDS — measured,
+    /// it deleted the healthy category's real 4096 bytes. On `.scannerItem`
+    /// (and `.category`) the target fails either way, because a cut-off
+    /// scanner published no outcome for the id to resolve against; what the
+    /// check buys there is the accurate REASON rather than "Unknown item id
+    /// … rescan and retry". The assertions below are written to match, so
+    /// each guard is evidenced at the level it actually operates.
+    ///
+    /// MUTATIONS, all run:
+    ///   - `cleanCLIOutcome` scans the full set instead of `scannerSubset`
+    ///     -> RED on the call-count assertion (4 vs 3), and the
+    ///     category-only clean still deleted the file out of a cut-off
+    ///     session: r13's imagined residual, made real by exactly the change
+    ///     the comment on `didExceedBounds` warns about.
+    ///   - drop `.allScannerItems`' `malformed` check -> RED on the
+    ///     surviving-file assertion (4096 bytes freed).
+    ///   - drop `.scannerItem`'s -> RED on the message assertion.
+    func testABoundedOutCLICleanRefusesTheWholeInvocation() async throws {
+        let catRoot = base.appendingPathComponent("bounded-root")
+        try fm.createDirectory(at: catRoot, withIntermediateDirectories: true)
+        let victim = catRoot.appendingPathComponent("victim.bin")
+        try Data(repeating: 0x66, count: 4096).write(to: victim)
+
+        let recorder = ScanCallRecorder()
+        let wedged = WedgedFixtureScanner(id: "wedged", recorder: recorder)
+        // A bound far below the wedge, so the session is CUT OFF rather than
+        // slow, and far above a fixture category scan, so the healthy half
+        // reports normally.
+        let deps = try makeDeps(
+            categories: [makeCategory(name: "cat_a", path: catRoot.path)],
+            extraScanners: [wedged],
+            sessionBounds: ScanSessionBounds(
+                eventDeadline: .milliseconds(250),
+                producerWindDownGrace: .milliseconds(100)
+            )
+        )
+
+        // FIRST, PROVE THE PREMISE OF THE WHOLE CELL: this session really is
+        // cut off BY THE BOUND. `malformedTargetMessage` reads the same for
+        // any malformed scanner, so without this the refusals below could be
+        // passing for a reason that has nothing to do with `.scanDidNotFinish`.
+        let envelope = await CLIHandler.scanEnvelope(deps: deps)
+        let scannerErrors = try XCTUnwrap(
+            envelope["scanner_errors"] as? [[String: Any]]
+        )
+        XCTAssertEqual(
+            scannerErrors.compactMap { $0["scanner_id"] as? String }, ["wedged"]
+        )
+        XCTAssertEqual(
+            try XCTUnwrapElement(scannerErrors, 0)["kind"] as? String,
+            "scan_did_not_finish",
+            "the wedged scanner must be cut off by the 250 ms bound, not "
+                + "rejected by outcome validation"
+        )
+
+        // (2) A confirmed clean naming BOTH — the shape that produces a
+        // cut-off destructive session at all — is refused wholesale.
+        let mixed = try failureOutcome(await CLIHandler.cleanCLIOutcome(
+            targets: ["cat_a", "wedged"],
+            dryRun: false, confirmed: true, euid: 501, deps: deps
+        ))
+        XCTAssertEqual(mixed.code, "INVALID_ARGUMENTS")
+        XCTAssertTrue(
+            mixed.message.contains("'wedged' cannot be resolved"),
+            "the refusal must name the cut-off scanner: \(mixed.message)"
+        )
+        XCTAssertTrue(
+            fm.fileExists(atPath: victim.path),
+            "the HEALTHY scanner's real bytes must survive a bounded-out "
+                + "invocation — this is the residual r13's comment claimed "
+                + "was open"
+        )
+
+        // The `<scanner>:<item>` arm refuses identically — a cut-off scanner
+        // is unaddressable at every granularity — but for a DIFFERENT
+        // reason, and the message is where that shows. Measured: delete this
+        // arm's `malformed` check and the target still fails, because a
+        // cut-off scanner published no outcome and the item id resolves to
+        // nothing. What the check buys here is the TRUE reason ("produced a
+        // malformed outcome") instead of "Unknown item id … rescan and
+        // retry", which invites the user to retry an address that was never
+        // wrong. So the assertion is on the message, at the level the guard
+        // actually operates.
+        let byItem = try failureOutcome(await CLIHandler.cleanCLIOutcome(
+            targets: ["wedged:anything"],
+            dryRun: false, confirmed: true, euid: 501, deps: deps
+        ))
+        XCTAssertEqual(byItem.code, "INVALID_ARGUMENTS")
+        XCTAssertTrue(
+            byItem.message.contains("'wedged:anything' cannot be resolved")
+                && byItem.message.contains("malformed outcome"),
+            "the item-granular refusal must say the scanner was cut off, not "
+                + "that the address was unknown: \(byItem.message)"
+        )
+        XCTAssertTrue(fm.fileExists(atPath: victim.path))
+
+        // (1) THE PREMISE: with only the category targeted, the wedged
+        // scanner is not in the session at all, so nothing can cut it off —
+        // and the clean proceeds and deletes for real. This is what makes
+        // "every scanner that can be cut off is named by a target" true.
+        let scoped = try successPayload(await CLIHandler.cleanCLIOutcome(
+            targets: ["cat_a"],
+            dryRun: false, confirmed: true, euid: 501, deps: deps
+        ))
+        XCTAssertEqual(scoped["schema_version"] as? Int, 4)
+        XCTAssertFalse(
+            fm.fileExists(atPath: victim.path),
+            "an unbounded, fully-reported invocation still cleans"
+        )
+        let calls = await recorder.count()
+        XCTAssertEqual(
+            calls, 3,
+            "the wedged scanner runs in the unscoped `scan` and in the two "
+                + "cleans that named it — never in the category-only clean"
         )
     }
 

@@ -1549,11 +1549,15 @@ class CacheoutViewModel: ObservableObject {
         // wedged scanner: `hasScanned` true, the healthy scanner's items
         // selected and passing `isBlockedFromDestructivePaths`, i.e.
         // deletable, while an orphaned read-only walk may still have been
-        // traversing the same trees. `ScanSessionBounds`' own mitigation is
-        // the sentence "a session whose bound fired adopts nothing"; this is
-        // where that becomes true. A bounded session is treated exactly as a
-        // cancelled one: rows already reconciled stay VISIBLE, and nothing
-        // this session saw is vouched for.
+        // traversing the same trees. `untilProducerFinishes()` discloses a
+        // residual whose mitigation is that nothing a cut-off session saw
+        // becomes deletable; THIS LINE IS THE GUI HALF OF THAT, and the only
+        // half `adoptedGeneration` covers — the CLI's is a different
+        // mechanism entirely (target-scoped refusal, argued and pinned at
+        // `ValidatedScanSession.didExceedBounds`; PR #460 codex r14, V2-3).
+        // A bounded session is treated exactly as a cancelled one: rows
+        // already reconciled stay VISIBLE, and nothing this session saw is
+        // vouched for.
         let completed = !Task.isCancelled && !session.didExceedBounds
 
         // Early termination only CANCELS the producer; its filesystem walks

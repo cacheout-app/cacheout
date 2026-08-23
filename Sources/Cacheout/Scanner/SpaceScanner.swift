@@ -1620,15 +1620,72 @@ struct ValidatedScanSession {
     ///
     /// ONE OF THE TWO CONSUMERS READS IT TODAY, and saying which is the point
     /// of writing this down. `CacheoutViewModel.scan` does, and that is where
-    /// the measured defect was. `CLIHandler.collectValidatedScan` does NOT:
-    /// it collects the `.scanDidNotFinish` issues into `malformed`, so a
-    /// clean TARGETING a cut-off scanner is refused, but items belonging to
-    /// scanners that DID report in the same cut-off session remain
-    /// cleanable in that invocation. That is the same class as the defect
-    /// fixed here and it is NOT closed — recorded rather than claimed, and
-    /// left to its own change because the CLI has no `adoptedGeneration` to
-    /// gate and refusing mid-invocation needs a wire-contract decision this
-    /// round did not take.
+    /// the measured defect was. `CLIHandler.collectValidatedScan` does NOT —
+    /// it never reads this flag at all — AND THE CLI IS CLOSED ANYWAY, by a
+    /// different mechanism, which is the sentence that matters here.
+    ///
+    /// r13 wrote the opposite: that items belonging to scanners which DID
+    /// report in the same cut-off invocation "remain cleanable" and that the
+    /// residual "is NOT closed". THAT IS FALSE, AND IT IS THE MORE EXPENSIVE
+    /// KIND OF FALSE — a residual that does not exist sends a future round to
+    /// fix a non-bug (PR #460 codex r14, V2-3). What actually closes it is
+    /// TARGET-SCOPED REFUSAL, and it closes it completely:
+    ///
+    ///   - `cleanCLIOutcome` builds its session with `scannerIDs:
+    ///     scannerSubset`, and that subset is derived EXCLUSIVELY from the
+    ///     parsed targets (`CLIHandler.swift`, "Target-scoped scan (R2)").
+    ///     So EVERY scanner that can be cut off in a destructive CLI session
+    ///     is named by some target — a scanner no target names never runs.
+    ///   - `resolveCleanTargets` then refuses the WHOLE invocation for any
+    ///     target whose scanner is in `malformed`, on all three target kinds
+    ///     (`.category`, `.allScannerItems`, `.scannerItem`), and every
+    ///     cut-off scanner IS in `malformed`: the watchdog yields one
+    ///     `.scanDidNotFinish` per scanner in `conclude`'s missing set before
+    ///     `finish()`. The three arms are not equally load-bearing — only
+    ///     `.allScannerItems` would otherwise PROCEED (a cut-off scanner
+    ///     reads there as the documented "zero items is a legitimate no-op");
+    ///     the other two fail anyway for want of an outcome to resolve
+    ///     against, and their check buys the accurate reason. Mutation
+    ///     figures are on the cell.
+    ///
+    /// DRIVEN END TO END rather than reasoned: `clean <category> <wedged>
+    /// --confirm` against a 250 ms-bounded session returns
+    /// `INVALID_ARGUMENTS` — "Target '<wedged>' cannot be resolved … Nothing
+    /// was cleaned." — and the real fixture file survives. See
+    /// `testABoundedOutCLICleanRefusesTheWholeInvocation`, which pins BOTH
+    /// halves so this cannot silently regress into the residual r13 imagined.
+    ///
+    /// SAY WHAT IS AND IS NOT GUARANTEED. The CLI's closure is NOT this
+    /// bound's: `didExceedBounds` and `adoptedGeneration` have nothing to do
+    /// with it, and a future change that widened the session beyond the
+    /// targets — a preflight scanner, an "always scan X" rule — would reopen
+    /// it without touching a line of this file. NOT A WORRY, A MEASUREMENT:
+    /// with `scannerIDs: scannerSubset` mutated to the full set, a
+    /// `clean <category> --confirm` whose session was cut off by the wedged
+    /// scanner it never addressed went through and freed the healthy
+    /// category's real 4096 bytes — r13's imagined residual, made real by
+    /// exactly that change. That is why this is written down here, next to
+    /// the flag a reader would otherwise assume was doing the work.
+    ///
+    /// THE OTHER THREE `collectValidatedScan` CALLERS, so the enumeration is
+    /// complete rather than gestured at. `smartCleanCLIOutcome` scans
+    /// `CategoryScanner` alone and returns `MALFORMED_SCANNER_OUTPUT` before
+    /// the gate switch on its `.scanDidNotFinish`, so all three of its
+    /// surfaces (unconfirmed plan, `--dry-run`, confirmed run) refuse
+    /// identically. `spotlightOutcome` also scans that scanner alone and
+    /// fails closed the same way — worth stating rather than filing under
+    /// "read-only", because it is not: it writes Finder comments and marker
+    /// files. It deletes nothing. `scanEnvelope` is the only genuinely
+    /// read-only one, and it reports the cut-off scanners as
+    /// `scan_did_not_finish` rows in `scanner_errors`.
+    ///
+    /// FINALLY, THE FLAG IS NOT A CLAIM THAT ANY SCANNER WAS LOST. `conclude`
+    /// latches on whoever gets there first, so a bound that fires in the
+    /// instant after the last scanner published leaves this TRUE with an
+    /// EMPTY missing set and no `.scanDidNotFinish` anywhere. The GUI then
+    /// declines to adopt a session that in fact completed (conservative, and
+    /// the direction to be wrong in); the CLI cleans it, correctly, because
+    /// every scanner it addressed reported a real outcome.
     var didExceedBounds: Bool { ledger.boundDidFire }
 
     /// Suspends until the producer task has ACTUALLY returned — scanners
@@ -1652,22 +1709,36 @@ struct ValidatedScanSession {
     /// cancelled walk may still be reading — exactly what this method
     /// existed to prevent. That is the price of not being stuck forever, and
     /// it is bounded in the way that matters: the orphaned walk is
-    /// READ-ONLY, and a session whose bound fired adopts nothing, so
-    /// `adoptedGeneration` never advances and every DESTRUCTIVE path stays
-    /// closed on that session's items.
+    /// READ-ONLY, and nothing this session saw becomes deletable on the
+    /// strength of having seen it.
     ///
-    /// THAT LAST SENTENCE WAS FALSE WHEN r12 WROTE IT (PR #460 codex r13, D),
-    /// and it is the mitigation that makes the residual acceptable, so it had
-    /// to become true rather than be softened. The watchdog cancels the
-    /// PRODUCER (`task.cancel()`), never the consumer, so `let completed =
-    /// !Task.isCancelled` in `CacheoutViewModel.scan` was TRUE on a cut-off
-    /// session and the adoption block ran. MEASURED at a 200 ms bound with
-    /// one healthy and one wedged scanner: the wedged one correctly carried
-    /// `.scanDidNotFinish`, and then `hasScanned == true` with the healthy
-    /// scanner's items selected and passing `isBlockedFromDestructivePaths` —
-    /// deletable. `ValidatedScanSession.didExceedBounds` is what closes it:
-    /// the session now says out loud that it was cut off, and its consumers
-    /// adopt nothing when it was.
+    /// THAT MITIGATION IS WHAT MAKES THE RESIDUAL ACCEPTABLE, so it is stated
+    /// as two mechanisms rather than one, because that is what it is (PR #460
+    /// codex r14, V2-3 — the single-mechanism wording over-claimed):
+    ///
+    ///   - THE GUI, by adoption. `CacheoutViewModel.scan` reads
+    ///     `didExceedBounds` and treats a cut-off session exactly as a
+    ///     cancelled one, so `adoptedGeneration` never advances and
+    ///     `isBlockedFromDestructivePaths` holds every destructive path shut
+    ///     on that session's items.
+    ///   - THE CLI, by TARGET-SCOPED REFUSAL, which this bound neither owns
+    ///     nor guarantees. `collectValidatedScan` never reads
+    ///     `didExceedBounds`; the invocation is refused wholesale because
+    ///     every scanner in a destructive CLI session is named by a target
+    ///     and any cut-off one is `malformed`. The argument, the measurement
+    ///     and the cell that pins it are on `didExceedBounds` above.
+    ///
+    /// THE FIRST OF THE TWO WAS FALSE WHEN r12 WROTE IT (PR #460 codex r13,
+    /// D), which is why it is spelled out rather than asserted. The watchdog
+    /// cancels the PRODUCER (`task.cancel()`), never the consumer, so `let
+    /// completed = !Task.isCancelled` in `CacheoutViewModel.scan` was TRUE on
+    /// a cut-off session and the adoption block ran. MEASURED at a 200 ms
+    /// bound with one healthy and one wedged scanner: the wedged one
+    /// correctly carried `.scanDidNotFinish`, and then `hasScanned == true`
+    /// with the healthy scanner's items selected and passing
+    /// `isBlockedFromDestructivePaths` — deletable. `ValidatedScanSession
+    /// .didExceedBounds` is what closes it: the session now says out loud
+    /// that it was cut off, and the GUI adopts nothing when it was.
     ///
     /// The wedged producer task itself is leaked — one per wedged session,
     /// which is already a session that cannot finish.

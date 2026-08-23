@@ -1447,10 +1447,48 @@ struct WorktreeReclaimPerformer {
     private func removeAdminDirectories(
         _ directories: [BoundObject]
     ) async -> (tag: String, detail: String)? {
+        // EVERY PRE-REMOVAL REFUSAL, OVER THE WHOLE SET, BEFORE THE FIRST
+        // DELETION (PR #460 codex r18, C5). The loop below removes entries
+        // one at a time, and each refusal it can raise says the repository is
+        // untouched. For a set of one — the field shape and the only shape
+        // the gated post-removal prune can have — that was always true. For a
+        // set of several it was a claim about the FIRST entry applied to the
+        // whole item: entry 1 removed, entry 2 revived or locked in the
+        // meantime, and the user was told "nothing was pruned" about a
+        // registry that had just been half cleaned.
+        //
+        // This pass makes that sentence true for every refusal it can see, at
+        // the cost of a few `lstat`s. It CANNOT see them all — a checkout
+        // repaired after this pass but before its own turn still refuses
+        // mid-loop — which is why the accumulator below exists as well. The
+        // per-directory copies inside the loop stay: they are what re-reads
+        // state that the removals themselves may have changed.
+        for bound in directories {
+            if let revived = revivedCheckoutRefusal(for: bound.url) {
+                return ("prune-checkout-revived", revived)
+            }
+            if let locked = lockRefusalForPrunedAdmin(bound.url) {
+                return locked
+            }
+            if let replaced = replacementRefusal(
+                for: bound, Self.prunedAdminBinding
+            ) {
+                return replaced
+            }
+        }
+
+        // WHAT THIS OPERATION HAS ALREADY DESTROYED. Any refusal raised past
+        // the first successful removal is reported THROUGH
+        // `disclosePartialPrune`, so no message can assert an untouched
+        // repository that is not one.
+        var removed: [URL] = []
         for bound in directories {
             let directory = bound.url
             if let revived = revivedCheckoutRefusal(for: directory) {
-                return ("prune-checkout-revived", revived)
+                return (
+                    "prune-checkout-revived",
+                    Self.disclosePartialPrune(revived, removed: removed)
+                )
             }
             // AND THE OTHER TWO PROPOSITIONS THIS LOOP OWNS, READ THE SAME
             // WAY (PR #460 codex r18, C2/C3).
@@ -1465,12 +1503,18 @@ struct WorktreeReclaimPerformer {
             // stated in ONE place rather than only inside a closure a seam is
             // trusted to call. The load-bearing copies are below.
             if let locked = lockRefusalForPrunedAdmin(directory) {
-                return locked
+                return (
+                    locked.tag,
+                    Self.disclosePartialPrune(locked.detail, removed: removed)
+                )
             }
             if let replaced = replacementRefusal(
                 for: bound, Self.prunedAdminBinding
             ) {
-                return replaced
+                return (
+                    replaced.tag,
+                    Self.disclosePartialPrune(replaced.detail, removed: removed)
+                )
             }
             do {
                 // AND ALL THREE CROSS THE HOP (PR #460 codex r7 D1 for the
@@ -1505,7 +1549,10 @@ struct WorktreeReclaimPerformer {
                     }
                 )
             } catch let refusal as LastInstantRefusal {
-                return (refusal.tag, refusal.detail)
+                return (
+                    refusal.tag,
+                    Self.disclosePartialPrune(refusal.detail, removed: removed)
+                )
             } catch {
                 // A mid-loop failure leaves the directories already removed
                 // genuinely gone. Their bytes are NOT reported: this returns
@@ -1513,15 +1560,53 @@ struct WorktreeReclaimPerformer {
                 // rather than over-reporting it. (In practice the set is one
                 // directory — the field shape and the only shape the gated
                 // post-removal prune can ever have.)
+                //
+                // "MAY BE" was as much as this arm could say before the
+                // accumulator existed (PR #460 codex r18, C5); the clause the
+                // helper appends now NAMES what is actually gone.
                 return (
                     CacheCleaner.refusalTag(error),
-                    "refused: the orphaned admin directory \(directory.path) "
-                        + "could not be removed (\(error.localizedDescription))"
-                        + " — the registry may be PARTIALLY cleaned; re-scan."
+                    Self.disclosePartialPrune(
+                        "refused: the orphaned admin directory \(directory.path) "
+                            + "could not be removed (\(error.localizedDescription))"
+                            + " — the registry may be PARTIALLY cleaned; re-scan.",
+                        removed: removed
+                    )
                 )
             }
+            removed.append(directory)
         }
         return nil
+    }
+
+    /// The phrases a pre-removal refusal uses to say this repository's
+    /// registry is untouched. Each is true only while nothing has been
+    /// removed yet (PR #460 codex r18, C5).
+    static let untouchedRegistryClaims = ["nothing was pruned", "nothing was removed"]
+
+    /// Rewrite a refusal raised AFTER earlier members of the same removal set
+    /// were already destroyed, so the message states the partial result
+    /// instead of an untouched repository.
+    ///
+    /// SUBSTITUTION RATHER THAN APPENDING, because appending would leave the
+    /// false clause standing beside its own correction — the shape this
+    /// branch has retired nine times. If a future refusal carries neither
+    /// phrase the clause is APPENDED instead, so a message can never lose the
+    /// disclosure by being reworded.
+    static func disclosePartialPrune(_ detail: String, removed: [URL]) -> String {
+        guard !removed.isEmpty else { return detail }
+        let clause = "\(removed.count) orphaned admin "
+            + "\(removed.count == 1 ? "directory was" : "directories were") "
+            + "ALREADY REMOVED before this refusal "
+            + "(\(removed.map(\.path).joined(separator: ", "))), so this "
+            + "repository's registry is PARTIALLY cleaned"
+        var rewritten = detail
+        var substituted = false
+        for claim in untouchedRegistryClaims where rewritten.contains(claim) {
+            rewritten = rewritten.replacingOccurrences(of: claim, with: clause)
+            substituted = true
+        }
+        return substituted ? rewritten : rewritten + " — " + clause
     }
 
     /// PER-OBJECT re-establishment of the fact that made this directory

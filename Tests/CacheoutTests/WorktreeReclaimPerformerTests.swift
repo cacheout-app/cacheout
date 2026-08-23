@@ -5315,6 +5315,84 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         let message = try XCTUnwrap(outcome.errors.first?.message)
         XCTAssertTrue(message.contains("is registered again"), message)
         XCTAssertTrue(message.contains("Re-scan"), message)
+
+        // AND IT SAYS WHAT ACTUALLY HAPPENED (PR #460 codex r18, C5). The
+        // first directory IS gone: this refusal is raised past a completed
+        // removal, so the revival message's own "nothing was pruned" was a
+        // false claim about a half-cleaned registry — the class this branch
+        // has retired nine times, and the reason the failed-removal arm below
+        // has always warned about partial cleanup.
+        let firstAdmin = try XCTUnwrapElement(fixture.admin, 0)
+        XCTAssertFalse(
+            fm.fileExists(atPath: firstAdmin.path),
+            "the fixture only proves anything if the first removal completed"
+        )
+        for claim in WorktreeReclaimPerformer.untouchedRegistryClaims {
+            XCTAssertFalse(
+                message.contains(claim),
+                "the refusal must not claim '\(claim)': \(message)"
+            )
+        }
+        XCTAssertTrue(
+            message.contains("PARTIALLY cleaned"), message
+        )
+        XCTAssertTrue(
+            message.contains(firstAdmin.path),
+            "the message must NAME what is already gone: \(message)"
+        )
+    }
+
+    /// THE REFUSALS THAT CAN BE SEEN BEFORE THE FIRST DELETION ARE RAISED
+    /// THERE (PR #460 codex r18, C5), so "nothing was pruned" is TRUE rather
+    /// than merely rewritten.
+    ///
+    /// A second entry already locked when the removal starts used to be
+    /// discovered on its own turn, one completed deletion later. The
+    /// pre-removal pass evaluates the whole set first.
+    ///
+    /// MUTATION: delete the pre-flight loop — RED here, because the first
+    /// directory is then removed and the message becomes the PARTIAL one.
+    func testAnEntryAlreadyLockedWhenTheRemovalStartsCostsNoOtherEntry()
+        async throws
+    {
+        let fixture = try makePruneFixture(orphans: ["first", "locked-one"])
+        let plan = prunePlan(
+            membership: fixture.membership, disclosed: fixture.admin
+        )
+        let firstAdmin = try XCTUnwrapElement(fixture.admin, 0)
+        let lockedAdmin = try XCTUnwrapElement(fixture.admin, 1)
+        let lockFile = lockedAdmin.appendingPathComponent(
+            WorktreeReclaimPerformer.lockFileName
+        )
+        // THE WINDOW THIS PASS OWNS: a lock present before the FIRST removal
+        // but after the last oracle answer — an earlier one is filtered out
+        // by the mapper and never reaches the removal at all. R0's `rev-parse`
+        // is the last git call before `removeAdminDirectories`.
+        let runner = InterceptingGitRunner(wrapping: realRunner()) { arguments, _ in
+            if arguments.contains("--git-common-dir") {
+                try? Data("in use on laptop\n".utf8).write(to: lockFile)
+            }
+            return nil
+        }
+        let outcome = await perform(
+            item(plan, id: "prune"), plan: plan,
+            with: makePerformer(runner: runner)
+        )
+
+        XCTAssertNil(outcome.entry)
+        let message = try XCTUnwrap(outcome.errors.first?.message)
+        XCTAssertTrue(message.contains("was LOCKED"), message)
+        XCTAssertTrue(
+            message.contains("nothing was pruned"),
+            "with nothing removed, the untouched claim is the TRUE one: \(message)"
+        )
+        XCTAssertFalse(message.contains("PARTIALLY cleaned"), message)
+        XCTAssertTrue(
+            fm.fileExists(atPath: firstAdmin.path),
+            "the sibling must not be spent on a set that was never going to "
+                + "complete"
+        )
+        XCTAssertTrue(fm.fileExists(atPath: lockedAdmin.path))
     }
 
     // MARK: - C2/C3: the pruned ADMIN DIRECTORY's own last instant (r18)

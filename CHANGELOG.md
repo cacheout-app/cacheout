@@ -768,8 +768,8 @@ below are both part of that coordination, and the latter BLOCKS this release.
   app does, so it puts the item back under either spelling; and the refusal
   that says "the folder that holds this item is not the one that was
   admitted", which such a folder could never reach before, is now reached and
-  reported. **Both of those need Full Disk Access, and the entry above did
-  not say so.** Putting an item back means opening the Trash folder, and macOS
+  reported. **Both of those need Full Disk Access, and neither sentence
+  above said so.** Putting an item back means opening the Trash folder, and macOS
   refuses that to any app without Full Disk Access — which Cacheout does not
   ask for and does not have by default. So on an ordinary Mac the undo stops
   one step earlier than either sentence above describes, under EITHER

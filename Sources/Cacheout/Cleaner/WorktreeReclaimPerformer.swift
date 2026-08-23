@@ -2557,7 +2557,15 @@ struct WorktreeReclaimPerformer {
         // as a replacement (B-P4) and one source fence pinning the drain's
         // bounded end-a-drain spelling (B-P3) — taking it to 1554: `swift
         // test` AT COMMIT afaea66 reported 1554 executed / 2 skipped /
-        // 0 failures, exit 0, 174 s.
+        // 0 failures, exit 0, 174 s. Its SECOND fixer added five — one
+        // driving all four Trash arms through the SHIPPED
+        // `FileManager.trashItem` into the real `~/.Trash` (A-P3), one
+        // fencing the WHOLE of every failure message rather than its opening
+        // (A-P1/A-P2), two proving the two false tails FALSE on the events
+        // their causes are named for, and one measuring what a destination
+        // container that is no longer a folder produces (A-P4a) — taking it
+        // to 1559: `swift test` AT COMMIT bce1cd9 reported 1559 executed /
+        // 2 skipped / 0 failures, exit 0, 180 s.
         // Every figure here names the
         // commit it was taken at, which is the only spelling that cannot rot.
         // The half that survives every commit — and the half a mutation

@@ -1708,8 +1708,19 @@ final class TrashDisposalHopProofTests: XCTestCase {
     /// O_DIRECTORY)` = fd). No shipped scanner reaches it today — both
     /// `.directory` producers emit only DIRECT children of their admitted
     /// roots, and when the symlink IS the admitted root `ContainerSnapshot`
-    /// refuses both arms upstream — so it was latent, not shipping. It is
-    /// still one-refuses/four-succeed with a message naming the wrong fact.
+    /// refuses both arms upstream — so it was latent, not shipping. Latent is
+    /// not harmless: it was one-refuses/four-succeed with a message naming the
+    /// wrong fact.
+    ///
+    /// WHAT THIS CELL DOES AND DOES NOT COVER, SINCE ITS NAME USED TO OVERSTATE
+    /// BOTH (PR #460 codex r15, D-P4a). It was called
+    /// `…EveryDestructivePathAgreesUnderASymlinkedContainer` while exercising
+    /// THREE of the five paths and only the FORWARD half of each — and the
+    /// undo half was, at the time, exactly where the paths still disagreed
+    /// (D-P1). It now runs all FIVE forward disposals, and its name says
+    /// forward. The undo half is
+    /// `…UndoPutsBackUnderASymlinkedContainerWhatItPutsBackUnderAPlainOne`
+    /// and `…UndoNamesContainerDriftUnderASymlinkedContainer`.
     ///
     /// THE LANDING KEEPS ITS `O_NOFOLLOW` CONTAINER OPEN. The two opens are
     /// not the same question: the target's container is PROVED against the
@@ -1720,7 +1731,7 @@ final class TrashDisposalHopProofTests: XCTestCase {
     /// MUTATION: give the verdict arm back its path-spelled leaf read
     /// (`try proveStanding(inspected, at: target, provider: provider)` beside
     /// the container proof) and this cell alone fails with `.posix(20)`.
-    func testEveryDestructivePathAgreesUnderASymlinkedContainer()
+    func testEveryDestructivePathDisposesUnderASymlinkedContainer()
         async throws
     {
         let landings = try XCTUnwrap(self.landings)
@@ -1795,6 +1806,34 @@ final class TrashDisposalHopProofTests: XCTestCase {
             ),
             "the item the verdict arm disposed of is not at the landing"
         )
+
+        // 4 AND 5. THE TWO NON-DIRECTORY VERDICT ARMS — measured in the doc
+        // above and, until r15, not exercised here at all (D-P4a).
+        for (name, verdict) in [
+            ("victim-no-tree", UserDataProbeResult.InspectedRoot.noDirectoryTree),
+            ("victim-leaf", nil),
+        ] {
+            let leaf = link.appendingPathComponent(name)
+            try Data("ours".utf8).write(to: leaf)
+            let leafParent = try admittedParent(of: leaf, provider: provider)
+            let inspected = try verdict
+                ?? .nonDirectoryLeaf(XCTUnwrap(provider.identity(of: leaf)))
+            let leafLanding = landings.appendingPathComponent(name)
+            try await TrashDisposal.dispose(
+                leaf, expecting: inspected, provider: provider,
+                containedIn: leafParent,
+                via: { url, prove in
+                    try prove()
+                    try fm.moveItem(at: url, to: leafLanding)
+                    return leafLanding
+                }
+            )
+            XCTAssertFalse(fm.fileExists(atPath: leaf.path), name)
+            XCTAssertEqual(
+                try String(contentsOf: leafLanding, encoding: .utf8), "ours",
+                "\(name): the item this arm disposed of is not at the landing"
+            )
+        }
     }
 
     /// AND THE SAME GUARD ON THE DESCRIPTOR-RELATIVE ARM, WHICH r14 GAVE A

@@ -758,7 +758,12 @@ enum TrashDisposal {
     /// shipped scanner reached it (both `.directory` producers emit only
     /// direct children of their admitted roots), so it was latent rather than
     /// shipping. Evidenced by
-    /// `TrashDisposalHopProofTests.testEveryDestructivePathAgreesUnderASymlinkedContainer`.
+    /// `TrashDisposalHopProofTests.testEveryDestructivePathDisposesUnderASymlinkedContainer`
+    /// — the FORWARD half, all five paths. The undo half is r15's D-P1, and
+    /// until that round it was where the paths still disagreed:
+    /// `rollBack`'s destination open was left on `openDirectoryNoFollow`, so
+    /// this fix moved the arm from "refuses before the move" to "moves the
+    /// item to the Trash and then cannot put it back".
     ///
     /// The re-open also went away with it: the container was being resolved
     /// twice per proof, and the second resolution was the unbound one.

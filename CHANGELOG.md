@@ -675,6 +675,21 @@ below are both part of that coordination, and the latter BLOCKS this release.
   and report the folder as freed when nothing had moved at all. That path is
   now read the same way as the others, so the link is refused rather than
   followed and no disposal can report a move that did not happen.
+- **And it no longer abandons a FILE in your Trash while denying it is
+  there.** The same message had a second way of being wrong, on the same
+  shipped default. When the folder Cacheout was about to trash was swapped
+  for a plain file in the instant between the last check and the Trash's own
+  move — the window that check exists to catch — the Trash took the file, and
+  the undo that should have put it back refused to name it: the identification
+  step recognised folders and nothing else, so a file, a symbolic link or a
+  pipe sitting in your Trash came back as "nothing found". You were told the
+  item "is no longer at `~/.Trash/<name>`, where the Trash reported putting
+  it, so nothing was moved" while it was at exactly that path and the
+  original name was left empty. The undo now identifies every kind of object,
+  so what the Trash took is put back where it came from and the refusal says
+  so. When the put-back genuinely cannot be performed — the Trash or the
+  destination folder cannot be opened — the message gives you the path in the
+  Trash to drag it back from, rather than claiming it is not there.
 - **A background refresh no longer reads the folders it has already decided
   to skip.** The ephemeral-temp scanner runs only when you ask for a scan, but
   before each scan Cacheout records the identity of every folder it might

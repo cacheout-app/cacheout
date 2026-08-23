@@ -809,6 +809,17 @@ final class TrashDisposalHopProofTests: XCTestCase {
     /// Green before r12 as well as after — it is the control that stops the
     /// descriptor-relative rewrite from reading the identity of a
     /// non-directory and calling it a match.
+    ///
+    /// ITS CAUSE CHANGED IN r14, AND THE NEW ONE IS THE ACCURATE ONE FOR THIS
+    /// FIXTURE (PR #460 codex r14, V1-D1). The mover here MOVES NOTHING, so
+    /// the plain file at `landed` is still sitting there when the refusal is
+    /// composed — and `.lastSeenInTrash` says the object "is no longer at"
+    /// that path. It said so because `identified` discarded every
+    /// non-directory sighting and `rollBack` refused a `nil`; now the file is
+    /// named, re-bound, and the put-back is ATTEMPTED — `RENAME_EXCL` refuses
+    /// it because the target's own name is still occupied (this fixture never
+    /// vacated it), which is `.strandedInTrash`: the item is in the Trash at
+    /// this exact path, go and get it.
     func testTheDirectoryVerdictArmRefusesALandingThatIsNotADirectory()
         async throws
     {
@@ -843,10 +854,169 @@ final class TrashDisposalHopProofTests: XCTestCase {
             "a landing that is not a directory tree cannot satisfy a "
                 + "`.directory` verdict: \(String(describing: thrown))"
         )
-        XCTAssertEqual(failure.cause, .lastSeenInTrash(landed.path))
+        XCTAssertEqual(failure.cause, .strandedInTrash(landed.path))
         XCTAssertTrue(
             fm.fileExists(atPath: target.appendingPathComponent("ours.txt").path),
             "nothing was moved"
+        )
+        XCTAssertTrue(
+            fm.fileExists(atPath: landed.path),
+            "the refusal names a path the file is actually at"
+        )
+    }
+
+    /// THE COVERAGE GAP THE ONE ABOVE LEFT: a non-directory landing whose
+    /// mover ACTUALLY PERFORMED THE MOVE (PR #460 codex r14, V1-D1).
+    ///
+    /// Every cell that drove a non-directory landing used a mover that moved
+    /// NOTHING, so the target's own name stayed occupied and every rollback
+    /// was going to be refused by `RENAME_EXCL` anyway — which is why
+    /// `identified`'s `guard case .directory` could discard the landing for
+    /// three rounds without a single cell noticing. This is the shape the
+    /// production defect had: the name is re-pointed at a plain file INSIDE
+    /// the hop (the window `trashItem`'s own URL resolution owns), the mover
+    /// takes whatever answers to it, and the target's name is left FREE.
+    ///
+    /// The measured production report before the fix — real `CacheCleaner`,
+    /// real `OrphanedCachesScanner.preDeleteRevalidator`, real PathGuard,
+    /// `moveToTrash: true` — was `.lastSeenInTrash`, `entries=0`, with the
+    /// object still at the landing and the target NOT restored. The
+    /// container-bound overload answered `.putBack` on the identical event.
+    ///
+    /// MUTATION: narrow `identified` back to `guard case .directory(let
+    /// identity) = sighting else { return nil }` and this cell alone fails —
+    /// `.lastSeenInTrash`, the stranger's file abandoned in the landing
+    /// directory, nothing back at the target.
+    func testTheDirectoryVerdictArmPutsBackANonDirectoryItReallyMoved()
+        async throws
+    {
+        let landings = try XCTUnwrap(self.landings)
+        let provider = FileSystemIdentityProvider()
+        let target = base.appendingPathComponent("victim-dv-moved")
+        try fm.createDirectory(at: target, withIntermediateDirectories: true)
+        try Data("ours".utf8).write(
+            to: target.appendingPathComponent("ours.txt")
+        )
+        let identity = try XCTUnwrap(provider.identity(of: target))
+        let parent = try admittedParent(of: target, provider: provider)
+        let landed = landings.appendingPathComponent(target.lastPathComponent)
+        let log = MoveLog()
+        let fileManager = fm
+
+        var thrown: Error?
+        do {
+            try await TrashDisposal.dispose(
+                target, expecting: .directory(identity), provider: provider,
+                containedIn: parent,
+                via: { url, prove in
+                    try prove()
+                    // The swap the hop admits, AFTER the far-side proof:
+                    // exactly what a racing writer does between the proof
+                    // and `trashItem`'s own resolution of the URL.
+                    try fileManager.removeItem(at: url)
+                    try Data("a stranger's file".utf8).write(to: url)
+                    log.record(url)
+                    try fileManager.moveItem(at: url, to: landed)
+                    return landed
+                }
+            )
+        } catch {
+            thrown = error
+        }
+
+        let failure = try XCTUnwrap(
+            thrown as? TrashDisposal.Failure,
+            "a plain file the disposal really took cannot satisfy a "
+                + "`.directory` verdict: \(String(describing: thrown))"
+        )
+        XCTAssertEqual(log.urls.count, 1, "the fixture never moved anything")
+        XCTAssertEqual(
+            failure.cause, .putBack,
+            "the object the disposal took was named, re-bound and moved back"
+        )
+        XCTAssertFalse(
+            fm.fileExists(atPath: landed.path),
+            "the object may not be abandoned in the landing directory"
+        )
+        XCTAssertEqual(
+            provider.kind(of: target), .regularFile,
+            "what came back must be the object the disposal took, not a "
+                + "tree: \(String(describing: provider.kind(of: target)))"
+        )
+        XCTAssertEqual(
+            try Data(contentsOf: target), Data("a stranger's file".utf8),
+            "a DIFFERENT object was put back"
+        )
+    }
+
+    /// THE PUT-BACK'S DESTINATION CANNOT BE OPENED — the same fact as the
+    /// Trash-open guard two cells up, one directory over, and until r14 it
+    /// answered the OPPOSITE cause (PR #460 codex r14, V1-D1).
+    ///
+    /// `observed` is non-`nil` by the time either open is attempted, so the
+    /// item IS in the Trash in both cases; what failed is the put-back, not
+    /// the finding. `.lastSeenInTrash` sent the user looking for an object
+    /// whose exact path the refusal was holding.
+    ///
+    /// The double denies the TARGET's container rather than the Trash, which
+    /// leaves every other read in the disposal intact: `openAdmittedContainer`
+    /// is a raw following `open` and never goes through the provider, and
+    /// `look`'s pre-move read of the target falls back to its path-spelled
+    /// open on the permission class, exactly as it does for `~/.Trash`.
+    ///
+    /// MUTATION: restore `.lastSeenInTrash` on `rollBack`'s destination-open
+    /// arm and this cell alone fails.
+    func testAPutBackWhoseDestinationCannotBeOpenedSaysWhereTheItemIs()
+        async throws
+    {
+        let landings = try XCTUnwrap(self.landings)
+        let base = try XCTUnwrap(self.base)
+        let provider = TrashDeniedProvider(denying: base)
+        let target = base.appendingPathComponent("victim-dest-denied")
+        try fm.createDirectory(at: target, withIntermediateDirectories: true)
+        try Data("ours".utf8).write(
+            to: target.appendingPathComponent("ours.txt")
+        )
+        let identity = try XCTUnwrap(provider.identity(of: target))
+        let parent = try admittedParent(of: target, provider: provider)
+        // A STRANGER'S TREE at the landing, so the after-proof disagrees and
+        // the rollback runs at all.
+        let landed = landings.appendingPathComponent("someone-elses")
+        try fm.createDirectory(at: landed, withIntermediateDirectories: true)
+        try Data("theirs".utf8).write(
+            to: landed.appendingPathComponent("their-work.txt")
+        )
+
+        var thrown: Error?
+        do {
+            try await TrashDisposal.dispose(
+                target, expecting: .directory(identity), provider: provider,
+                containedIn: parent,
+                via: { _, prove in
+                    try prove()
+                    return landed
+                }
+            )
+        } catch {
+            thrown = error
+        }
+
+        let failure = try XCTUnwrap(
+            thrown as? TrashDisposal.Failure,
+            "a stranger's tree at the landing must be refused: "
+                + "\(String(describing: thrown))"
+        )
+        XCTAssertEqual(failure.cause, .strandedInTrash(landed.path))
+        XCTAssertTrue(
+            fm.fileExists(
+                atPath: landed.appendingPathComponent("their-work.txt").path
+            ),
+            "the item is where the refusal says it is"
+        )
+        XCTAssertTrue(
+            fm.fileExists(atPath: target.appendingPathComponent("ours.txt").path),
+            "nothing may be moved into the target when the put-back is "
+                + "refused"
         )
     }
 

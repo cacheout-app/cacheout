@@ -333,10 +333,42 @@ enum TrashDisposal {
             /// drag.
             case strandedInTrash(String)
             /// NOT PROVED, so NOTHING WAS MOVED: the object the disposal took
-            /// is no longer at the name the disposal reported (it was moved,
-            /// replaced, or cannot be read). The payload is the last place it
-            /// was seen. Moving whatever took its place is the bug, not the
-            /// undo.
+            /// could not be shown to be at the name the disposal reported.
+            /// The payload is the last place it was seen. Moving whatever
+            /// took its place is the bug, not the undo.
+            ///
+            /// WHAT ACTUALLY PRODUCES IT, ENUMERATED RATHER THAN SUMMARISED
+            /// (PR #460 codex r14, V1-D1). The sentence that stood here said
+            /// the object "is no longer at the name the disposal reported (it
+            /// was moved, replaced, or cannot be read)", and the arm that
+            /// broke it made all three false at once: a NON-DIRECTORY landing
+            /// reached `rollBack` as `nil` because `identified` narrowed to
+            /// `.directory` alone, so this cause was reported for an object
+            /// that was at that name, had not been replaced, and HAD been
+            /// read (`look` classified it `.noDirectoryTree`, which takes a
+            /// real open attempt). That arm is fixed — `identified` now names
+            /// every kind — and these are the four ways left in:
+            ///
+            /// * the landing is ABSENT (`ENOENT`) — the object is genuinely
+            ///   not where the disposal said;
+            /// * `rollBack`'s re-bind under the held Trash descriptor found
+            ///   something ELSE at the name — it was replaced;
+            /// * the put-back's own `renameatx_np` answered `ENOENT` — the
+            ///   source went away inside the one-syscall window;
+            /// * the landing could not be READ — `look` answered
+            ///   `.unreadable(errno)` or `.unidentifiable`, or `facts` could
+            ///   not name a non-directory at it.
+            ///
+            /// The FOURTH is the one where the user-facing wording ("it is no
+            /// longer at …") is STRONGER than what was established: something
+            /// may well still be there. It is disclosed rather than dressed:
+            /// reaching it needs the landing to become unreadable AFTER
+            /// `proveStanding` read the same object at the target, since
+            /// `disagreement` refuses `.unreadable` on the way IN
+            /// (`.posix(errno)`, before any disposal), and the four shipped
+            /// arms all pass through it. `.strandedInTrash` is what the two
+            /// cases that DO establish the object's presence report instead —
+            /// the Trash open and the destination open, both below.
             case lastSeenInTrash(String)
             /// The rollback moved an object out of the Trash and the arrival
             /// is NOT the one it looked at — the name was re-pointed inside
@@ -617,7 +649,8 @@ enum TrashDisposal {
             throw Failure(
                 path: target.path,
                 cause: rollBack(
-                    identified(sighting), from: landed, to: target,
+                    identified(sighting, at: landed, provider: provider),
+                    from: landed, to: target,
                     containedIn: admittedParent, provider: provider
                 )
             )
@@ -1044,16 +1077,58 @@ enum TrashDisposal {
         return facts
     }
 
-    /// The `Sighting` → `ChildFacts` narrowing, in ONE place: only a
-    /// `.directory` sighting names an object, and every other case is
-    /// "nothing identified".
+    /// The `Sighting` → `ChildFacts` narrowing, in ONE place: what the
+    /// landing IS, for the rollback that has to name the object it moves.
+    ///
+    /// ## THE NON-DIRECTORY LANDING WAS ABANDONED, AND THE USER WAS TOLD IT
+    /// ## WAS NOT THERE (PR #460 codex r14, V1-D1)
+    ///
+    /// Through r13 this was `guard case .directory` and nothing else, so
+    /// EVERY other sighting reached `rollBack` as `nil` — including a landing
+    /// that is a perfectly ordinary regular file, symlink or fifo, sitting
+    /// exactly where the Trash said it put it. `rollBack`'s first guard then
+    /// returned `.lastSeenInTrash`, whose message tells the user the object
+    /// "is no longer at <landing>, where the Trash reported putting it, so
+    /// nothing was moved".
+    ///
+    /// MEASURED through the production composition (real `CacheCleaner`, real
+    /// `OrphanedCachesScanner.preDeleteRevalidator`, real PathGuard, real
+    /// `ContainerSnapshot`, `moveToTrash: true` — the GUI's shipped default —
+    /// with only the seam injected, to put the swap in the window
+    /// `trashItem`'s own URL resolution owns): that message was reported with
+    /// the object STILL AT THE LANDING and the target NOT restored,
+    /// `entries=0`. The identical event through `dispose(_:containedIn:…)`
+    /// yields `.putBack`, because the `disposeBoundLeaf` arms read their
+    /// landing with `facts(at:)` — which identifies every KIND — instead of
+    /// this narrowing.
+    ///
+    /// WHY A SECOND READ RATHER THAN A RICHER `Sighting`: `look`'s kind gate
+    /// IS its `O_DIRECTORY` open, so a non-directory landing is classified by
+    /// ERRNO (`ENOTDIR`/`ELOOP`) and no inode is ever read. There is no
+    /// identity in the sighting to hand over — naming the object requires the
+    /// `fstatat` `facts` takes, and that is what this now does for exactly
+    /// that case.
+    ///
+    /// THE `.directory` CASE STILL COMES OFF THE OPENED INODE and is NOT
+    /// re-read: it is the stronger fact (an `fstat` of a descriptor `look`
+    /// held open, versus a name resolved a second time), and `rollBack`'s
+    /// re-bind is what turns either into a move. `.absent`, `.unreadable` and
+    /// `.unidentifiable` stay `nil` — nothing was identified, so nothing may
+    /// be moved.
     private static func identified(
-        _ sighting: Sighting
+        _ sighting: Sighting, at landed: URL,
+        provider: FileSystemIdentityProvider
     ) -> FileSystemIdentityProvider.ChildFacts? {
-        guard case .directory(let identity) = sighting else { return nil }
-        return FileSystemIdentityProvider.ChildFacts(
-            kind: .directory, identity: identity
-        )
+        switch sighting {
+        case .directory(let identity):
+            return FileSystemIdentityProvider.ChildFacts(
+                kind: .directory, identity: identity
+            )
+        case .noDirectoryTree:
+            return facts(at: landed, provider: provider)
+        case .absent, .unidentifiable, .unreadable:
+            return nil
+        }
     }
 
     // MARK: - The proofs
@@ -1387,6 +1462,15 @@ enum TrashDisposal {
         // unidentifiable landing means the object the disposal took cannot be
         // named, and an undo that moves an unnamed object is the bug.
         //
+        // AND A LANDING THAT IS SIMPLY NOT A DIRECTORY IS NOT ONE OF THOSE
+        // (PR #460 codex r14, V1-D1). It used to arrive here as `nil` — the
+        // fourth case this comment did not enumerate, and the one that made
+        // the enumeration false — because the verdict-bound caller narrowed
+        // its sighting with a `guard case .directory`. It now arrives NAMED,
+        // through the same `facts` the bound arms read their landing with, so
+        // the three cases above are again the whole of what reaches this
+        // guard as `nil`.
+        //
         // NOT AN INDEPENDENTLY-EVIDENCED GUARD, AND SAID SO: it is the
         // extraction of the value everything below binds to, and it is
         // SUBSUMED by the re-bind — measured, by substituting an identity
@@ -1397,11 +1481,10 @@ enum TrashDisposal {
         // fact.
         //
         // IT TAKES FACTS, NOT A `Sighting`, because both arms roll back
-        // through it and one of them binds NON-DIRECTORIES (see
-        // `dispose(_:containedIn:…)`). The verdict-bound arm narrows its own
-        // sighting at the call (`identified`), so a `.directory` landing is
-        // the only thing that ever reached this code before and the only
-        // thing it can produce now.
+        // through it and BOTH of them can bind non-directories: the bound
+        // arms by construction (see `dispose(_:containedIn:…)`), and the
+        // verdict-bound one since r14 — its `identified` reads a
+        // non-directory landing with `facts` rather than discarding it.
         guard let observed else {
             return .lastSeenInTrash(landed.path)
         }
@@ -1444,10 +1527,16 @@ enum TrashDisposal {
         )
         guard trashFD >= 0 else { return .strandedInTrash(landed.path) }
         defer { close(trashFD) }
+        // THE DESTINATION CANNOT BE OPENED — the SAME fact as the guard
+        // above, one directory over, and until r14 it answered the opposite
+        // cause (PR #460 codex r14, V1-D1). `observed` is non-`nil` on this
+        // line too, so the item IS in the Trash; what failed is the put-back,
+        // not the finding. `.lastSeenInTrash` told the user to go and look
+        // for an item whose exact path we are holding.
         let containerFD = provider.openDirectoryNoFollow(
             at: target.deletingLastPathComponent()
         )
-        guard containerFD >= 0 else { return .lastSeenInTrash(landed.path) }
+        guard containerFD >= 0 else { return .strandedInTrash(landed.path) }
         defer { close(containerFD) }
 
         let bound = FileSystemIdentityProvider.ChildProbe.facts(observed)

@@ -729,6 +729,43 @@ below are both part of that coordination, and the latter BLOCKS this release.
   root that is itself checked), so nothing you could clean was affected. The
   Trash side of the same check still refuses to follow a link, because the
   folder the Trash reports is not one anybody proved.
+- **And the UNDO under such a folder no longer strands your item in the
+  Trash.** Fixing the check above only fixed the way IN. When a Move to Trash
+  is undone — Cacheout puts the item straight back if it cannot prove the
+  Trash took the right thing — the folder it restores INTO was still opened
+  the refusing way. So under a folder reached through a symbolic link, all
+  four Move to Trash paths moved the item to the Trash and then could not put
+  it back: the put-back was never attempted, your item was left in the Trash
+  and the original name was left empty. Under an ordinary folder the identical
+  event put the item back every time. That made the fix above strictly worse
+  than the refusal it replaced, on that one path — before it, the item was
+  refused before the move and your Trash was never touched. The undo now opens
+  and identity-checks that folder exactly the way every other removal in the
+  app does, so it puts the item back under either spelling; and the refusal
+  that says "the folder that holds this item is not the one that was
+  admitted", which such a folder could never reach before, is now reached and
+  reported.
+- **A folder that is simply GONE is no longer reported as one somebody
+  replaced.** If an item vanishes between the safety check and the deletion —
+  an ordinary race with an installer, an uninstaller or a synced folder —
+  permanent delete and three of the four Move to Trash paths say "No such file
+  or directory". The fourth said "the folder at this path is no longer the one
+  that was inspected — it was replaced between the safety check and the
+  deletion", and the cleanup log recorded it as the item having changed.
+  Nothing had been replaced: the name was empty. All five now report the
+  absence as an absence.
+- **Refusal messages no longer tell you your folder was replaced when nothing
+  looked at it.** Five of the six Move to Trash refusals opened by asserting
+  that the folder at the item's path was no longer the one that was inspected.
+  Nothing in the disposal re-reads that path: what it checks after the move is
+  what the Trash actually took. On a disposal that moved NOTHING and reported
+  a Trash location where nothing stands, the item was still on disk,
+  untouched — and you were told it had been replaced AND to go and look in the
+  Trash for it. The five now open with what was actually established: the
+  disposal could not be proved to have moved the item that was inspected. Each
+  one's remaining clauses are unchanged except where they were also stronger
+  than the evidence: the message no longer says the item "is no longer at" the
+  Trash path it names, only that it cannot be found there now.
 - **A background refresh no longer reads the folders it has already decided
   to skip.** The ephemeral-temp scanner runs only when you ask for a scan, but
   before each scan Cacheout records the identity of every folder it might

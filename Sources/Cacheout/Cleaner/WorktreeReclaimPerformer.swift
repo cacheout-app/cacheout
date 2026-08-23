@@ -2525,7 +2525,12 @@ struct WorktreeReclaimPerformer {
         // checkout replaced inside its own assessment window (N1) and two
         // bounding `PipeDrain.close()` against a live stream (N2) — taking it
         // to 1540: `swift test` AT COMMIT 12c8320 reported 1540 executed /
-        // 2 skipped / 0 failures, exit 0, 167 s. Every figure here names the
+        // 2 skipped / 0 failures, exit 0, 167 s. r15 added six — two on the
+        // Trash UNDO under a symlinked container (D-P1), two on a target that
+        // is simply gone (D-P2) and two on what the failure messages may
+        // assert (D-P3) — taking it to 1546: `swift test` AT COMMIT d76246f
+        // reported 1546 executed / 2 skipped / 0 failures, exit 0, 154 s.
+        // Every figure here names the
         // commit it was taken at, which is the only spelling that cannot rot.
         // The half that survives every commit — and the half a mutation
         // actually establishes — is the ZERO FAILURES.

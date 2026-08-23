@@ -2572,6 +2572,10 @@ struct WorktreeReclaimPerformer {
         // on a checkout replaced after the walk observed it and before the
         // listing (W2) — taking it to 1562: `swift test` AT COMMIT ac5215f
         // reported 1562 executed / 2 skipped / 0 failures, exit 0, 177 s.
+        // r17's SECOND fixer added ONE — the non-home-volume undo, on a
+        // temporary APFS disk image (M2) — taking it to 1563: `swift test`
+        // AT COMMIT b73b639 reported 1563 executed / 2 skipped / 0 failures,
+        // exit 0, 178 s.
         // Every figure here names the
         // commit it was taken at, which is the only spelling that cannot rot.
         // The half that survives every commit — and the half a mutation

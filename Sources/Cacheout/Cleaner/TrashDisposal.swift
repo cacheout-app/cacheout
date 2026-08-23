@@ -1499,9 +1499,40 @@ enum TrashDisposal {
             }
             return nil
         case .absent:
-            guard absenceProves, case .noDirectoryTree = inspected else {
+            // NOTHING IS AT THE NAME, AND "NOTHING" IS NOT "SOMETHING ELSE"
+            // (PR #460 codex r15, D-P2).
+            //
+            // The two positions are two different questions, so they get two
+            // different refusals rather than one.
+            guard absenceProves else {
+                // THE LANDING. The disposal CLAIMED to put an item at this
+                // URL; an empty name establishes nothing about what it took,
+                // and unestablished is refused. The clause is literally true
+                // here — nothing at the landing is the inspected object — and
+                // no production caller surfaces this value anyway: `dispose`
+                // reads only whether it is `nil` and reports `rollBack`'s own
+                // cause, and `proveTaken` has no production caller.
                 return .notTheInspectedObject
             }
+            guard case .noDirectoryTree = inspected else {
+                // THE TARGET, BEFORE THE MOVE — a plain race: the item
+                // vanishes between the revalidator's verdict and the
+                // disposal. MEASURED at 48073c9 on one absent-target fixture:
+                // `DepthSafeRemoval.remove`, `dispose(_:containedIn:)`, the
+                // `.noDirectoryTree` arm and the `.nonDirectoryLeaf` arm all
+                // answered `.posix(2)` — the other four reach `boundLeaf`'s
+                // `.absent` arm or the removal's own leaf open, both of which
+                // keep ENOENT — while THIS arm answered
+                // `.notTheInspectedObject`, surfaced as "it was replaced
+                // between the safety check and the deletion" and logged
+                // `content-drift`. Nothing was replaced; the name is empty,
+                // and a user told the wrong fact goes and looks at the wrong
+                // thing (the r13-A2 class, one arm over).
+                return .posix(ENOENT)
+            }
+            // THE FROZEN GHOST-TARGET BEHAVIOUR, and the one absence that
+            // PROVES its verdict: `.noDirectoryTree` is precisely a statement
+            // that no directory tree of ours stood at this name.
             return nil
         case .unidentifiable:
             return .notTheInspectedObject

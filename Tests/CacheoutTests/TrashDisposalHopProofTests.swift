@@ -2098,4 +2098,190 @@ final class TrashDisposalHopProofTests: XCTestCase {
                 + "landing, named by the refusal"
         )
     }
+
+    // ================================================================
+    // MARK: - A target that is simply GONE (r15, D-P2)
+    // ================================================================
+
+    /// **D-P2 — A TARGET THAT IS SIMPLY GONE WAS REPORTED AS A REPLACED ONE,
+    /// ON ONE ARM OF FIVE** (PR #460 codex r15).
+    ///
+    /// MEASURED at 48073c9 on this fixture: `DepthSafeRemoval.remove`,
+    /// `dispose(_:containedIn:)`, the `.noDirectoryTree` arm and the
+    /// `.nonDirectoryLeaf` arm all answered `.posix(2)` — "…/victim: No such
+    /// file or directory". The `.directory` verdict arm answered
+    /// `.notTheInspectedObject` — "…the folder at this path is no longer the
+    /// one that was inspected — it was REPLACED between the safety check and
+    /// the deletion; refused, re-scan required" — and `CacheCleaner` logged it
+    /// under `content-drift`. NOTHING WAS REPLACED; THE NAME IS EMPTY.
+    ///
+    /// Cause: `disagreement`'s `.absent` arm folded "gone" into "not the
+    /// inspected object" for every verdict except `.noDirectoryTree`, while
+    /// the other four paths reach `boundLeaf`'s `.absent` arm or the removal's
+    /// own leaf open, both of which keep `ENOENT`.
+    ///
+    /// It is the r13-A2 / r14-V1-D2 class one arm over — the user is told the
+    /// wrong fact and goes and looks at the wrong thing — and it is reachable
+    /// as a plain race: the item vanishes between the revalidator's verdict
+    /// and the disposal.
+    ///
+    /// MUTATION: return `.notTheInspectedObject` from `disagreement`'s
+    /// `.absent` arm again and this cell alone fails, on the `.directory` row.
+    func testAVanishedTargetIsNotReportedAsAReplacedOne() async throws {
+        let provider = FileSystemIdentityProvider()
+        let container = try makeCacheContainer()
+        let log = MoveLog()
+
+        /// A victim that EXISTS long enough to be inspected and is gone by
+        /// the time the disposal runs — the race, spelled deterministically.
+        func vanished(
+            _ name: String, directory: Bool
+        ) throws -> (URL, DepthSafeRemoval.AdmittedParent,
+                     FileSystemIdentityProvider.Identity) {
+            let url = container.appendingPathComponent(name)
+            if directory {
+                try fm.createDirectory(
+                    at: url, withIntermediateDirectories: true
+                )
+            } else {
+                try Data("ours".utf8).write(to: url)
+            }
+            let identity = try XCTUnwrap(provider.identity(of: url))
+            let parent = try admittedParent(of: url, provider: provider)
+            try fm.removeItem(at: url)
+            XCTAssertFalse(fm.fileExists(atPath: url.path))
+            return (url, parent, identity)
+        }
+
+        let mover: TrashDisposal.Mover = { url, prove in
+            try prove()
+            log.record(url)
+            return nil
+        }
+
+        var causes: [String: DepthSafeRemoval.Failure.Cause?] = [:]
+
+        // 1. PERMANENT.
+        let (permanent, permanentParent, permanentIdentity) =
+            try vanished("victim-permanent", directory: true)
+        do {
+            try DepthSafeRemoval.remove(
+                at: permanent, expecting: .directory(permanentIdentity),
+                provider: provider, containedIn: permanentParent
+            )
+            causes["permanent"] = .some(nil)
+        } catch {
+            causes["permanent"] = (error as? DepthSafeRemoval.Failure)?.cause
+        }
+
+        // 2. THE CONTAINER-BOUND OVERLOAD.
+        let (bound, boundParent, _) =
+            try vanished("victim-bound", directory: true)
+        do {
+            try await TrashDisposal.dispose(
+                bound, containedIn: boundParent, provider: provider,
+                via: mover
+            )
+            causes["bound"] = .some(nil)
+        } catch {
+            causes["bound"] = (error as? DepthSafeRemoval.Failure)?.cause
+        }
+
+        // 3. THE `.noDirectoryTree` ARM.
+        let (tree, treeParent, _) =
+            try vanished("victim-no-tree", directory: false)
+        do {
+            try await TrashDisposal.dispose(
+                tree, expecting: .noDirectoryTree, provider: provider,
+                containedIn: treeParent, via: mover
+            )
+            causes["noDirectoryTree"] = .some(nil)
+        } catch {
+            causes["noDirectoryTree"] =
+                (error as? DepthSafeRemoval.Failure)?.cause
+        }
+
+        // 4. THE `.nonDirectoryLeaf` ARM.
+        let (leaf, leafParent, leafIdentity) =
+            try vanished("victim-leaf", directory: false)
+        do {
+            try await TrashDisposal.dispose(
+                leaf, expecting: .nonDirectoryLeaf(leafIdentity),
+                provider: provider, containedIn: leafParent, via: mover
+            )
+            causes["nonDirectoryLeaf"] = .some(nil)
+        } catch {
+            causes["nonDirectoryLeaf"] =
+                (error as? DepthSafeRemoval.Failure)?.cause
+        }
+
+        // 5. THE `.directory` VERDICT ARM — the one that said "replaced".
+        let (verdict, verdictParent, verdictIdentity) =
+            try vanished("victim-verdict", directory: true)
+        do {
+            try await TrashDisposal.dispose(
+                verdict, expecting: .directory(verdictIdentity),
+                provider: provider, containedIn: verdictParent, via: mover
+            )
+            causes["directory"] = .some(nil)
+        } catch {
+            causes["directory"] = (error as? DepthSafeRemoval.Failure)?.cause
+        }
+
+        for path in ["permanent", "bound", "noDirectoryTree",
+                     "nonDirectoryLeaf", "directory"] {
+            XCTAssertEqual(
+                causes[path] ?? nil, .posix(ENOENT),
+                "\(path): a name nothing occupies is an ABSENCE, and telling "
+                    + "the user their folder was REPLACED sends them to look "
+                    + "at the wrong thing — "
+                    + "\(String(describing: causes[path] ?? nil))"
+            )
+        }
+        XCTAssertEqual(
+            log.urls, [],
+            "nothing may be handed to the mover for an item that is gone"
+        )
+    }
+
+    /// The refusal a vanished target produces is the one the USER reads, and
+    /// `CacheCleaner` tags it — so the two-fact split is asserted on the
+    /// MESSAGE as well as on the cause.
+    ///
+    /// Before r15 the `.directory` arm's message opened "the folder at this
+    /// path is no longer the one that was inspected — it was REPLACED between
+    /// the safety check and the deletion", about an empty name.
+    func testAVanishedTargetSaysNoSuchFileRatherThanReplaced() async throws {
+        let provider = FileSystemIdentityProvider()
+        let container = try makeCacheContainer()
+        let target = container.appendingPathComponent("ghost")
+        try fm.createDirectory(at: target, withIntermediateDirectories: true)
+        let identity = try XCTUnwrap(provider.identity(of: target))
+        let parent = try admittedParent(of: target, provider: provider)
+        try fm.removeItem(at: target)
+
+        var thrown: Error?
+        do {
+            try await TrashDisposal.dispose(
+                target, expecting: .directory(identity), provider: provider,
+                containedIn: parent, via: { _, prove in try prove(); return nil }
+            )
+        } catch {
+            thrown = error
+        }
+
+        let failure = try XCTUnwrap(
+            thrown as? DepthSafeRemoval.Failure,
+            String(describing: thrown)
+        )
+        let described = try XCTUnwrap(failure.errorDescription)
+        XCTAssertTrue(
+            described.contains(String(cString: strerror(ENOENT))),
+            "the message must name the absence: \(described)"
+        )
+        XCTAssertFalse(
+            described.contains("it was replaced between the safety check"),
+            "nothing was replaced — the name is empty: \(described)"
+        )
+    }
 }

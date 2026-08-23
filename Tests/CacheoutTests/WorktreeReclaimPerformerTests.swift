@@ -87,8 +87,11 @@ import XCTest
 /// at its first fixer's head (d6bdde2), → 1537 at its second's (`swift test`
 /// AT COMMIT a45b89b: 1537 executed / 2 skipped / 0 failures, exit 0, 157 s)
 /// and → 1540 at its third's (`swift test` AT COMMIT 12c8320: 1540 executed /
-/// 2 skipped / 0 failures, exit 0, 167 s), and r15 → 1546 (`swift test` AT
-/// COMMIT d76246f: 1546 executed / 2 skipped / 0 failures, exit 0, 154 s).
+/// 2 skipped / 0 failures, exit 0, 167 s), and r15 → 1546 at its first
+/// fixer's head (`swift test` AT COMMIT d76246f: 1546 executed / 2 skipped /
+/// 0 failures, exit 0, 154 s) and
+/// → 1549 at its second's (`swift test` AT COMMIT d3d62b4: 1549 executed /
+/// 2 skipped / 0 failures, exit 0, 174 s).
 /// The previous
 /// spelling was "r8 → 1486 (`swift test`, this commit)" — true at 7e9b2c5,
 /// which wrote it, and stale at the very next commit, because "this commit"

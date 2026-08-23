@@ -2529,7 +2529,13 @@ struct WorktreeReclaimPerformer {
         // Trash UNDO under a symlinked container (D-P1), two on a target that
         // is simply gone (D-P2) and two on what the failure messages may
         // assert (D-P3) — taking it to 1546: `swift test` AT COMMIT d76246f
-        // reported 1546 executed / 2 skipped / 0 failures, exit 0, 154 s.
+        // reported 1546 executed / 2 skipped / 0 failures, exit 0, 154 s. Its
+        // SECOND fixer added three — one on the checkout replaced between the
+        // listing and its assessment (S-P1), one bounding the drain's CAPTURE
+        // against a live stream (S-P2) and one pinning the scope of the clean
+        // flag's release (S-P4) — taking it to 1549: `swift test` AT COMMIT
+        // d3d62b4 reported 1549 executed / 2 skipped / 0 failures, exit 0,
+        // 174 s.
         // Every figure here names the
         // commit it was taken at, which is the only spelling that cannot rot.
         // The half that survives every commit — and the half a mutation

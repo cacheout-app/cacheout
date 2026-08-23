@@ -117,7 +117,8 @@ import XCTest
 /// PR's own `WorktreeReclaimPerformerTests` appeared in the log zero times.
 /// (The suite WAS 1486 at r8's head 7e9b2c5, 1496 at 101753b, 1500 at
 /// a917447, 1511 at 592eb0a, 1522 at 350fa31, 1528 at e29ffb4, 1532 at
-/// d6bdde2, 1537 at a45b89b, 1540 at 12c8320, and IS 1546 at d76246f; a total
+/// d6bdde2, 1537 at a45b89b, 1540 at 12c8320, 1546 at d76246f, and IS 1549 at
+/// d3d62b4; a total
 /// is only ever a fact about the commit it was taken at — see
 /// `WorktreeReclaimPerformerTests`' class header, D5, and r10's D4.)
 ///

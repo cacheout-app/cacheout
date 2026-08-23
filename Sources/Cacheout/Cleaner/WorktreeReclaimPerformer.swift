@@ -2514,7 +2514,14 @@ struct WorktreeReclaimPerformer {
         // one that a bounded session adopts nothing (D), and one that the
         // wind-down grace is off the pool too — taking it to 1528: `swift
         // test` AT COMMIT e29ffb4 reported 1528 executed / 2 skipped /
-        // 0 failures, exit 0, 149 s. Every figure here names the
+        // 0 failures, exit 0, 149 s. r14's first fixer added four — two on
+        // the Trash undo's abandoned non-directory, two on the `.directory`
+        // arm under a symlinked container — reaching 1532 at d6bdde2, and
+        // its second added five — four bounding `scan`'s header refresh in
+        // front of the session bound (V2-1) and one pinning what actually
+        // closes a bounded-out CLI clean (V2-3) — taking it to 1537: `swift
+        // test` AT COMMIT a45b89b reported 1537 executed / 2 skipped /
+        // 0 failures, exit 0, 157 s. Every figure here names the
         // commit it was taken at, which is the only spelling that cannot rot.
         // The half that survives every commit — and the half a mutation
         // actually establishes — is the ZERO FAILURES.

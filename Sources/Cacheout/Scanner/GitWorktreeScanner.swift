@@ -1442,15 +1442,44 @@ struct GitWorktreeScanner: @unchecked Sendable {
 /// `.automatic` one. This scanner takes the default — it runs in every
 /// session — for two reasons:
 ///
-///  1. DECLINING IS ALL-OR-NOTHING, AND THIS SCANNER'S POLICY IS NOT. A
-///     non-participating scanner publishes no outcome at all, deliberately, so
-///     an auto-refresh cannot erase prior findings or the user's ticks. This
-///     scanner's trigger sensitivity is per-ROOT and per-ITEM instead: it skips
+///  1. DECLINING IS ALL-OR-NOTHING, AND THIS SCANNER'S POLICY IS NOT. This
+///     scanner's trigger sensitivity is per-ROOT and per-ITEM: it skips
 ///     PROTECTED roots on `.automatic` (`ProjectTreeWalker.isProtectedRoot`,
 ///     the one definition) and defers protected-PARENT assessment on the same
 ///     trigger, while still walking the ordinary dev roots. Whole-scanner
 ///     deferral would throw away the part that is safe to do in the background
 ///     along with the part that is not.
+///
+///     AND IT COSTS SOMETHING THIS COMMENT USED TO DENY (PR #460 codex r13,
+///     G). The retired sentence read: a non-participating scanner publishes
+///     no outcome, "so an auto-refresh cannot erase prior findings or the
+///     user's ticks" — offered as the property declining buys and per-root
+///     sensitivity keeps. It does not keep it. `ProjectTreeWalker.walk`'s
+///     protected-root gate is a BARE `continue` that records no `ScanIssue`
+///     (`ProjectTreeWalker.swift`, the `!includeProtectedRoots` arm), and this
+///     scanner overrides no `participates(in:)` and passes
+///     `context.includeProtectedRoots` straight through, so on an
+///     `.automatic` scan the walker silently omits e.g. a repo under
+///     `~/Documents` and this scanner still returns a NORMAL outcome.
+///     `CacheoutViewModel.reconcile` replaces a scanner's entry wholesale, so
+///     rows the user saw and TICKED after a user-initiated scan vanish on the
+///     next automatic refresh while the worktrees are still on disk. The
+///     walker's own doc records the same mechanism as MEASURED for
+///     `build_artifacts` on a dev root under `~/Documents`; nothing about it
+///     is specific to that scanner, and this one reaches it the same way.
+///
+///     THE ROOT GAP IS NOT IN EITHER SCANNER: the outcome model has no
+///     "not inspected" representation, so "I did not look there" and "there
+///     is nothing there" are the same value — named at
+///     `EphemeralTempScanner`'s participation guard, which calls this a
+///     separate defect rather than a precedent. Closing it means disclosing a
+///     skipped root as an issue AND teaching `reconcile` to retain prior
+///     items under a root disclosed as not-inspected; that is a wire-contract
+///     and reconciliation change, it fixes `build_artifacts` at the same
+///     time, and it is deliberately NOT done in this round. What is done here
+///     is retiring the false claim: the erasure is real, it is this scanner's
+///     too, and the reason to participate is (2), not an erasure guarantee
+///     participation does not provide.
 ///  2. A GENUINE DENIAL MUST STAY VISIBLE ON A BACKGROUND SCAN, which is a
 ///     thing only a PARTICIPATING scanner can do —
 ///     `testGenuineWalkDenialStaysVisibleUnderBothTriggers` asserts the

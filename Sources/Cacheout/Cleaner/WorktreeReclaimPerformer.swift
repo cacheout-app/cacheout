@@ -2521,7 +2521,11 @@ struct WorktreeReclaimPerformer {
         // front of the session bound (V2-1) and one pinning what actually
         // closes a bounded-out CLI clean (V2-3) — taking it to 1537: `swift
         // test` AT COMMIT a45b89b reported 1537 executed / 2 skipped /
-        // 0 failures, exit 0, 157 s. Every figure here names the
+        // 0 failures, exit 0, 157 s. Its THIRD added three — one on the
+        // checkout replaced inside its own assessment window (N1) and two
+        // bounding `PipeDrain.close()` against a live stream (N2) — taking it
+        // to 1540: `swift test` AT COMMIT 12c8320 reported 1540 executed /
+        // 2 skipped / 0 failures, exit 0, 167 s. Every figure here names the
         // commit it was taken at, which is the only spelling that cannot rot.
         // The half that survives every commit — and the half a mutation
         // actually establishes — is the ZERO FAILURES.

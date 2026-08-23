@@ -603,6 +603,15 @@ final class PipeDrain: @unchecked Sendable {
     /// PRODUCTION NEVER CALLS THIS DIRECTLY; `closeAndCapture()` does, in the
     /// bounded order. It stays internal because a test may legitimately
     /// observe a drain that is deliberately still running.
+    ///
+    /// That sentence was ENFORCED BY NOTHING until PR #460 codex r16 (B-P3):
+    /// no fence, no allowlist and no source cell anywhere under `Tests/` so
+    /// much as mentioned `captured`, and the only thing standing against
+    /// r14's starving order was a TIMING cell measured at RED 15/16 on that
+    /// exact mutation. `testTheDrainIsEndedOnlyThroughTheBoundedSpelling`
+    /// now pins it off the source: the order inside `closeAndCapture()`, the
+    /// fact that nothing else in this file reads the buffer, and the fact
+    /// that no other production file names `PipeDrain` at all.
     var captured: Data {
         lock.lock()
         defer { lock.unlock() }
@@ -634,6 +643,16 @@ final class PipeDrain: @unchecked Sendable {
     /// both on every run and asserts the bounded half only — the starved half
     /// is recorded rather than asserted, because a cell that demands a wait BE
     /// long is a cell that goes red on a quiet machine.
+    ///
+    /// THAT CELL IS PROBABILISTIC (PR #460 codex r16, B-P3). Commit a269fc8
+    /// recorded "RED 8/8" for the swapped-order mutation and a worst
+    /// unmutated sample of 1.75 ms; re-measurement put the mutant at RED 6/8
+    /// (reviewer) and RED 15/16 (here, two sweeps), and the worst unmutated
+    /// sample at 9.2457 ms (reviewer) and 4.1117 ms over 192 samples (here).
+    /// The cell now asserts the AGGREGATE — no sample past the 20 ms bound,
+    /// not just the median — and the DETERMINISTIC guard on this order is
+    /// the source fence `testTheDrainIsEndedOnlyThroughTheBoundedSpelling`,
+    /// RED 8/8.
     ///
     /// WHAT THIS GIVES UP, stated rather than implied: after a join that
     /// timed out, closing before reading drops whatever is still sitting in

@@ -516,9 +516,47 @@ final class GitCommandRunnerTests: XCTestCase {
     /// would be a cell that goes red on a quiet machine. The starved figure
     /// is printed instead, so it stays re-derivable on every run.
     ///
+    /// ## THIS CELL IS PROBABILISTIC, AND ITS COMMIT SAID IT WAS NOT
+    /// ## (PR #460 codex r16, B-P3)
+    ///
+    /// Commit a269fc8 recorded "RED 8/8 runs, mutated medians 26.2-146.3 ms"
+    /// and "UNMUTATED: GREEN 8/8, worst single sample 1.75 ms". Neither
+    /// figure survived re-measurement:
+    ///
+    /// - the reviewer's controlled comparison (same machine, same fixture,
+    ///   one variable) put the mutant at RED 6/8 — runs whose medians were
+    ///   13.7064 ms and 8.6280 ms exited 0 — with mutant medians spanning
+    ///   8.63-138.67 ms, and put the UNMUTATED worst single sample at
+    ///   9.2457 ms across 64 trios, 5x the recorded figure;
+    /// - re-measured here at r16: mutant RED 15/16 over two 8-run sweeps (the
+    ///   one green run's eight samples were all under 10 ms, max 9.9261),
+    ///   and unmutated GREEN 24/24 over three 8-run sweeps — 192 cold
+    ///   samples, worst single sample 4.1117 ms.
+    ///
+    /// So the true red rate is load-dependent and no single number states it.
+    /// A regression restoring r14's starving order ships GREEN some runs.
+    ///
+    /// WHAT CHANGED HERE. The assertion is no longer the median alone: NO
+    /// sample of the eight may exceed the advertised 20 ms bound. That is
+    /// what the reviewer's two green mutant runs would have failed — a median
+    /// of 13.7 ms is not a bounded wait, it is a distribution whose tail is
+    /// already past the bound — and it costs nothing unmutated, where 192
+    /// cold samples peaked at 4.1117 ms (a 4.9x margin). It does NOT make the
+    /// cell deterministic and is not claimed to: a mutant on a quiet machine
+    /// still passes it.
+    ///
+    /// WHAT MAKES THE REGRESSION UN-SHIPPABLE is therefore not this cell but
+    /// `testTheDrainIsEndedOnlyThroughTheBoundedSpelling`, which reads the
+    /// production source and pins the ORDER inside `closeAndCapture()` and
+    /// the fact that nothing else in the tree reads the buffer. That one is
+    /// RED 8/8 on the same mutation, deterministically. Until r16 the
+    /// property "PRODUCTION NEVER CALLS THIS DIRECTLY", asserted in
+    /// `PipeDrain.captured`'s own doc, was enforced by NOTHING: a grep over
+    /// `Tests/` for a fence, an allowlist or a source cell mentioning
+    /// `captured` returned nothing at all.
+    ///
     /// MUTATION: swap the two lines inside `closeAndCapture()` (capture, then
-    /// close) — r14's exact order. Red rate over 8 runs is in the commit
-    /// message.
+    /// close) — r14's exact order. Measured red rates above.
     func testCapturingOutputIsNotStarvedByAContinuouslyWrittenWriteEnd() throws {
         var starved: [Double] = []
         for _ in 0..<8 {
@@ -534,10 +572,12 @@ final class GitCommandRunnerTests: XCTestCase {
         )
 
         var waits: [Double] = []
+        var byteCounts: [Int] = []
         for _ in 0..<8 {
             let trio = try measureDrainEndWaitMilliseconds(
                 ending: true, writers: 8, settle: 0.3
             )
+            byteCounts.append(trio.bytes)
             XCTAssertGreaterThan(
                 trio.bytes, 0,
                 "the capture must carry the flood's bytes — a close that "
@@ -552,12 +592,212 @@ final class GitCommandRunnerTests: XCTestCase {
             "MEASURED-DRAIN-CLOSE-AND-CAPTURE-MS",
             sorted.map { String(format: "%.4f", $0) }
         )
+        print("MEASURED-DRAIN-CLOSE-AND-CAPTURE-BYTES", byteCounts)
         XCTAssertLessThan(
             median, 25,
             "median cold `closeAndCapture()` wait \(median) ms against a live "
                 + "stream; the advertised bound is one poll interval, 20 ms "
                 + "(samples: \(sorted))"
         )
+        // THE AGGREGATE, not the median alone (PR #460 codex r16, B-P3). A
+        // median inside the bound with a tail well past it is exactly what
+        // the starved order looks like on a half-loaded machine, and it is
+        // what let the mutant exit 0 in two of the reviewer's eight runs.
+        // Unmutated this costs nothing: 192 cold samples peaked at 4.1117 ms.
+        let overBound = sorted.filter { $0 > 20 }
+        XCTAssertEqual(
+            overBound.count, 0,
+            "\(overBound.count) of \(sorted.count) cold `closeAndCapture()` "
+                + "waits exceeded the advertised 20 ms poll interval "
+                + "(\(overBound)); a bounded call has no tail past its own "
+                + "bound (all samples: \(sorted), bytes: \(byteCounts))"
+        )
+    }
+
+
+    /// **THE FENCE THAT MAKES THE ORDER UN-SHIPPABLE** (PR #460 codex r16,
+    /// B-P3).
+    ///
+    /// `PipeDrain.captured`'s own doc says "PRODUCTION NEVER CALLS THIS
+    /// DIRECTLY; `closeAndCapture()` does, in the bounded order". Until this
+    /// cell existed that sentence was enforced by NOTHING — a grep over
+    /// `Tests/` for a fence, an allowlist or a source cell mentioning
+    /// `captured` returned nothing — and the only thing standing between the
+    /// repository and r14's starving order was
+    /// `testCapturingOutputIsNotStarvedByAContinuouslyWrittenWriteEnd`, a
+    /// TIMING cell measured at RED 15/16 on that exact mutation. One run in
+    /// sixteen, the regression ships.
+    ///
+    /// Three propositions, read off the production tree rather than off a
+    /// convention:
+    ///
+    /// 1. `closeAndCapture()`'s body CLOSES BEFORE IT READS. The bound comes
+    ///    entirely from that order: `close()` is the only call that announces
+    ///    itself through `stateLock`/`closeRequested`, so the snapshot after
+    ///    it runs against a worker that is provably not going to contend
+    ///    again. Reversed, the snapshot parks behind a barging worker.
+    /// 2. NOTHING ELSE IN THE PRODUCTION TREE READS THE BUFFER. Every
+    ///    `captured` outside that body is either the property's own
+    ///    declaration or a comment; a name like `capturedStdout` is a
+    ///    different word and is not matched.
+    /// 3. `PipeDrain` is constructed in ONE production file. A second file
+    ///    building one is a second end-a-drain path that this cell has no
+    ///    reason to have checked.
+    ///
+    /// TWO LAYERS, because `captured` legitimately appears throughout the
+    /// prose that explains the rule: layer 1 is the narrow claim that must
+    /// return ZERO, layer 2 is the full inventory with each line categorised,
+    /// so a reviewer sees what was admitted and why rather than trusting a
+    /// regex.
+    ///
+    /// MUTATION: swap the two statements inside `closeAndCapture()` — RED
+    /// 8/8, deterministically, which is the whole point of adding it beside a
+    /// probabilistic cell rather than instead of one.
+    func testTheDrainIsEndedOnlyThroughTheBoundedSpelling() throws {
+        let relative = "Sources/Cacheout/Scanner/GitCommandRunner.swift"
+        let source = try repoSource(relative)
+        let lines = source.split(separator: "\n", omittingEmptySubsequences: false)
+            .map(String.init)
+        XCTAssertGreaterThan(
+            lines.count, 400,
+            "the fence must have read the runner, not an empty file"
+        )
+
+        // ---- (1) THE ORDER INSIDE `closeAndCapture()` --------------------
+        let signature = "    func closeAndCapture() -> Data {"
+        let opened = try XCTUnwrap(
+            lines.firstIndex(of: signature),
+            "`closeAndCapture()` is gone or was re-spelled — the bounded "
+                + "spelling this fence pins no longer exists"
+        )
+        let closed = try XCTUnwrap(
+            lines[(opened + 1)...].firstIndex(of: "    }"),
+            "the body of `closeAndCapture()` never ends at its own indent"
+        )
+        let body = Array(lines[(opened + 1)..<closed])
+        XCTAssertFalse(body.isEmpty, "the body reader found nothing")
+        let closeAt = try XCTUnwrap(
+            body.firstIndex { $0.contains("close()") },
+            "`closeAndCapture()` no longer closes at all: \(body)"
+        )
+        let captureAt = try XCTUnwrap(
+            body.firstIndex { line in
+                line.range(of: "\\bcaptured\\b", options: .regularExpression) != nil
+            },
+            "`closeAndCapture()` no longer reads the buffer: \(body)"
+        )
+        XCTAssertLessThan(
+            closeAt, captureAt,
+            "`closeAndCapture()` reads the buffer BEFORE it closes — r14's "
+                + "starving order. The bound is the announcement: only "
+                + "`close()` sets `closeRequested`, and only after it has "
+                + "does the snapshot run against a worker that will not "
+                + "contend again. Body: \(body)"
+        )
+
+        // ---- (2) NOTHING ELSE READS THE BUFFER ---------------------------
+        func isComment(_ line: String) -> Bool {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            return trimmed.hasPrefix("//") || trimmed.hasPrefix("///")
+        }
+        // LAYER 2, the inventory: every production line mentioning the word,
+        // categorised. LAYER 1 is `unexplained` and must be empty.
+        var declaration: [String] = []
+        var insideBoundedSpelling: [String] = []
+        var prose: [String] = []
+        var unexplained: [String] = []
+        // Scoped to the ONE file that can name the property: `captured` is
+        // an ordinary English word and an ordinary local name elsewhere in
+        // the tree (`PathGuard`, `WorktreeReclaimPerformer`, `CacheCleaner`),
+        // and none of those lines can touch a drain. What makes the scope
+        // sufficient is (3) below: no other production file so much as
+        // mentions `PipeDrain`, so no other file can hold one to read.
+        for (offset, line) in lines.enumerated() {
+            guard line.range(
+                of: "\\bcaptured\\b", options: .regularExpression
+            ) != nil else { continue }
+            let anchor = "\(relative):\(offset + 1)"
+            if isComment(line) {
+                prose.append(anchor)
+            } else if line == "    var captured: Data {" {
+                declaration.append(anchor)
+            } else if offset > opened, offset < closed {
+                insideBoundedSpelling.append(anchor)
+            } else {
+                unexplained.append(
+                    "\(anchor): \(line.trimmingCharacters(in: .whitespaces))"
+                )
+            }
+        }
+        XCTAssertEqual(
+            unexplained, [],
+            "production reads `PipeDrain.captured` outside the bounded "
+                + "spelling. That read takes the drain's lock WITHOUT "
+                + "announcing itself, so it parks behind a worker that "
+                + "unlocks and immediately re-locks — the starvation r15 "
+                + "measured at an 83.8 ms median against an advertised 20 ms"
+        )
+        XCTAssertEqual(
+            declaration.count, 1,
+            "the buffer accessor must be declared exactly once: \(declaration)"
+        )
+        XCTAssertEqual(
+            insideBoundedSpelling.count, 1,
+            "`closeAndCapture()` must read the buffer exactly once: "
+                + "\(insideBoundedSpelling)"
+        )
+        XCTAssertFalse(prose.isEmpty, "the inventory read no comments at all "
+                           + "— layer 2 has stopped parsing")
+
+        // ---- (3) ONE FILE CAN EVEN NAME A DRAIN --------------------------
+        // This is what makes (2)'s single-file scope sufficient, so it is not
+        // a decorative extra: a `PipeDrain` held anywhere else would be a
+        // second end-a-drain path with no fence over it.
+        var mentions: [String] = []
+        for file in try productionSwiftSources() where
+            file.lastPathComponent != "GitCommandRunner.swift"
+        {
+            let text = try String(contentsOf: file, encoding: .utf8)
+            for (offset, line) in text.split(
+                separator: "\n", omittingEmptySubsequences: false
+            ).enumerated() where line.contains("PipeDrain")
+                && !isComment(String(line))
+            {
+                mentions.append(
+                    "\(file.lastPathComponent):\(offset + 1): "
+                        + "\(line.trimmingCharacters(in: .whitespaces))"
+                )
+            }
+        }
+        XCTAssertEqual(
+            mentions, [],
+            "another production file has CODE naming `PipeDrain`, so it can "
+                + "hold one and read its buffer — and layer 2 above only "
+                + "looked at \(relative). (Comments naming the type are "
+                + "admitted: prose explaining the rule is not a use of it.)"
+        )
+    }
+
+    /// Every `.swift` under `Sources/Cacheout` — the tree the fence above
+    /// makes its claims about.
+    private func productionSwiftSources() throws -> [URL] {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()   // CacheoutTests
+            .deletingLastPathComponent()   // Tests
+            .deletingLastPathComponent()   // repo root
+            .appendingPathComponent("Sources")
+            .appendingPathComponent("Cacheout")
+        var files: [URL] = []
+        let enumerator = FileManager.default.enumerator(
+            at: root, includingPropertiesForKeys: nil
+        )
+        while let next = enumerator?.nextObject() as? URL {
+            if next.pathExtension == "swift" { files.append(next) }
+        }
+        XCTAssertGreaterThan(
+            files.count, 20, "the production tree was not read"
+        )
+        return files
     }
 
     /// N2 (PR #460 codex r14). `drain()` took `lock`, entered

@@ -110,7 +110,18 @@ below are both part of that coordination, and the latter BLOCKS this release.
   sides of it were the replacement and it agreed with itself. The window was
   also larger than the second draft said — it grew with the number of
   worktrees in the repository. All of this was measured, and is now
-  refused. A related message correction rides with it: a checkout whose admin
+  refused. A THIRD correction, to the entry that reported the second: it said
+  the identity was taken when the scan walks onto the checkout, and for one
+  release the code did not do that — it took it once the whole walk had
+  finished, for every checkout in the tree at once. So a checkout replaced
+  after the scan had walked onto it but before that pass reached it was
+  offered silently, armed with the replacement's identity, and destroyed by
+  the clean that followed; and the window grew with the size of your tree and
+  with the number of worktrees in the repository, rather than being the fixed
+  thing that entry described. The identity is now taken where the entry always
+  said — the moment the scan sees the checkout's `.git` — and what is left
+  uncovered is one step of the scan's own directory read, which does not grow
+  with anything. A related message correction rides with it: a checkout whose admin
   directory could not be stat'd for a moment — a permission blip, an entry
   that vanished and came back — used to be reported as one that "was replaced
   while this scan was running". It now says the identity could not be read

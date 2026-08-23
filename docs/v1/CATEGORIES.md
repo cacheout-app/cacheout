@@ -517,9 +517,16 @@ git.
   this scan walked onto it is never offered, and the reason is shown rather
   than the row simply vanishing.
   What that does not cover is stated rather than implied: a checkout already
-  replaced before the walk reached it is not a substitution this scan can
-  see — it is simply the checkout the scan finds, judged on its own evidence
-  — and a read that fails on a worktree's admin directory leaves it with no
+  replaced before the scan saw its `.git` entry is not a substitution this
+  scan can see — it is simply the checkout the scan finds, judged on its own
+  evidence. The gap between the scan reading a directory's contents and
+  identifying the checkout it just found there is the whole of what is left,
+  and it does not grow with the size of your tree or with the number of
+  worktrees. Through the previous release it did: this page said the identity
+  was captured when the scan walked onto the checkout, and it was actually
+  captured once the entire walk had finished, so a checkout replaced in
+  between was offered with no reason shown at all.
+  A read that fails on a worktree's admin directory leaves it with no
   identity at all, so it is refused with that reason instead of being
   offered, and a later scan that can read it offers it again.
   A worktree the walk never reached (below the walk's depth budget, or under

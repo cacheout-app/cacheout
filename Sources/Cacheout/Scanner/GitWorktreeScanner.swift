@@ -203,10 +203,41 @@ enum GitWorktreeDiscoveryKind: Equatable, Sendable {
 
 /// One directory the walk proved to be a checkout, in walk order.
 struct GitWorktreeDiscovery: Equatable, Sendable {
+    /// The admin ENTRY a linked worktree's `.git` pointed at, and its
+    /// identity, AS OF THE INSTANT THE WALK OBSERVED THAT `.git` ENTRY
+    /// (PR #460 codex r17, W2).
+    ///
+    /// `entryPath` is the canonical admin-entry path — the key
+    /// `RepositoryGroup.discoveryWitnesses`, the (a2) container pass and
+    /// (e2) all share.
+    struct AdminWitness: Equatable, Sendable {
+        let entryPath: String
+        let identity: FileSystemIdentityProvider.Identity
+    }
+
     /// Spelled under the DECLARED root (the walker builds every URL by
     /// appending entry names to the declared spelling).
     let directory: URL
     let kind: GitWorktreeDiscoveryKind
+    /// LINKED worktrees only: the admin directory `<directory>/.git` resolved
+    /// to when the walk observed it. `nil` for a main checkout, and for a
+    /// pointer that did not resolve then.
+    let adminDirectory: URL?
+    /// That admin entry's identity at the SAME instant. `nil` when the
+    /// pointer did not resolve or the `lstat` failed then.
+    let adminWitness: AdminWitness?
+
+    init(
+        directory: URL,
+        kind: GitWorktreeDiscoveryKind,
+        adminDirectory: URL? = nil,
+        adminWitness: AdminWitness? = nil
+    ) {
+        self.directory = directory
+        self.kind = kind
+        self.adminDirectory = adminDirectory
+        self.adminWitness = adminWitness
+    }
 }
 
 // MARK: - Assessment observability (D15)
@@ -352,12 +383,21 @@ struct GitWorktreeScanner: @unchecked Sendable {
         let walker = ProjectTreeWalker(
             home: home, pathGuard: pathGuard, provider: provider
         )
+        // The resolver is PER-SCAN because the secondary gate is: on
+        // `.automatic` it follows pointers through a provider that reports
+        // every deferred path as absent (see `DeferringIdentityProvider`). It
+        // is built BEFORE the walk because the walk consumer uses it — see
+        // `consume`.
+        let resolver = GitWorktreeGitdirResolver(identity: identityProvider(for: context))
+        let provider = self.provider
         let walkIssues = walker.walk(
             roots: devRoots.keptRoots,
             maxDepth: maxDepth,
             includeProtectedRoots: context.includeProtectedRoots,
             consumers: [{ event in
-                Self.consume(event, into: &discoveries)
+                Self.consume(
+                    event, into: &discoveries, resolver: resolver, provider: provider
+                )
             }]
         )
 
@@ -368,10 +408,6 @@ struct GitWorktreeScanner: @unchecked Sendable {
         var log = GitWorktreeAssessmentLog()
         var processedRepoKeys = Set<String>()
         let bindings = rootBindings()
-        // The resolver is PER-SCAN because the secondary gate is: on
-        // `.automatic` it follows pointers through a provider that reports every
-        // deferred path as absent (see `DeferringIdentityProvider`).
-        let resolver = GitWorktreeGitdirResolver(identity: identityProvider(for: context))
 
         for group in Self.repositoryGroups(
             from: discoveries, resolver: resolver, provider: provider
@@ -419,9 +455,45 @@ struct GitWorktreeScanner: @unchecked Sendable {
     /// walker already hard-prunes `.git`, and pruning anything else would hide
     /// the nested repositories and hidden parents this scanner exists to find.
     ///
-    /// Static so the walk consumer captures no scanner state.
+    /// Static so the walk consumer captures no scanner state beyond the two
+    /// collaborators it is handed.
+    ///
+    /// THE WITNESS IS TAKEN HERE (PR #460 codex r17, W2), at the instant the
+    /// `.git` entry is observed for this directory, and that is the whole
+    /// point of doing the pointer resolution in the walk rather than in
+    /// `repositoryGroups`.
+    ///
+    /// r16 took it in `repositoryGroups`, which runs after `walk` has
+    /// RETURNED. A checkout removed and re-added at the same path in between
+    /// was then described by every read the scan made — the grouping capture
+    /// included — so the three-way re-proof agreed with itself, the row was
+    /// offered silently and the plan was armed with the REPLACEMENT's inode.
+    /// MEASURED: one item, `issues == []`, and the following `clean()`
+    /// destroyed a brand-new checkout and its payload. r16's disclosed
+    /// residual was also wrong in both directions: the window ended at that
+    /// checkout's OWN grouping capture rather than at the walk, and
+    /// `repositoryGroups` pays one `adminDirectory` read plus one `identity`
+    /// lstat per linked discovery, so the window for the Nth discovery
+    /// contained N-1 of those PLUS the whole walk — it grew with the tree and
+    /// with the worktree count.
+    ///
+    /// Capturing here is the only point whose window is CONSTANT per
+    /// checkout: the discovery record and its witness describe the same
+    /// object, and the residual is exactly
+    /// [the parent's `readdir` returned this `.git` entry -> this `lstat`].
+    /// That one is not closable from here — the walker's `readdir` already
+    /// happened — and it is disclosed rather than implied.
+    ///
+    /// The TCC gate is honoured by the RESOLVER: on an automatic scan its
+    /// identity provider reports every deferred path as absent, so
+    /// `adminDirectory` returns nil for a deferred worktree and nothing is
+    /// stat'd. Nothing is read here that `repositoryGroups` did not read
+    /// before — the same pointer, the same lstat, in the same numbers.
     private static func consume(
-        _ event: ProjectTreeEvent, into discoveries: inout [GitWorktreeDiscovery]
+        _ event: ProjectTreeEvent,
+        into discoveries: inout [GitWorktreeDiscovery],
+        resolver: GitWorktreeGitdirResolver,
+        provider: FileSystemIdentityProvider
     ) -> Set<String> {
         for entry in event.entries where entry.name == ".git" {
             // lstat identity is the discriminator — NEVER a casefolded name
@@ -433,8 +505,19 @@ struct GitWorktreeScanner: @unchecked Sendable {
                     directory: event.directory, kind: .mainCheckout
                 ))
             case .regularFile:
+                let admin = resolver.adminDirectory(forWorktreeAt: event.directory)
+                var witness: GitWorktreeDiscovery.AdminWitness?
+                if let admin {
+                    let adminEntry = provider.resolveTargetKeepingLeaf(admin)
+                    if let identity = provider.identity(of: adminEntry) {
+                        witness = GitWorktreeDiscovery.AdminWitness(
+                            entryPath: adminEntry.path, identity: identity
+                        )
+                    }
+                }
                 discoveries.append(GitWorktreeDiscovery(
-                    directory: event.directory, kind: .linkedWorktree
+                    directory: event.directory, kind: .linkedWorktree,
+                    adminDirectory: admin, adminWitness: witness
                 ))
             case .symlink, .other:
                 continue
@@ -453,17 +536,19 @@ struct GitWorktreeScanner: @unchecked Sendable {
         let gitDirectory: URL
         /// Discovered checkouts of this repository, in walk order.
         let discoveries: [GitWorktreeDiscovery]
-        /// THE PRE-LISTING WITNESSES (PR #460 codex r16, B-P1/B-P2), keyed by
-        /// the CANONICAL admin-entry path (`resolveTargetKeepingLeaf`), which
-        /// is the same key `handle` re-derives from the porcelain record.
+        /// THE WALK-INSTANT WITNESSES (PR #460 codex r16, B-P1/B-P2; moved to
+        /// the walk consumer by r17, W2), keyed by the CANONICAL admin-entry
+        /// path (`resolveTargetKeepingLeaf`), which is the same key `handle`
+        /// re-derives from the porcelain record and the same one the (a2)
+        /// container pass uses.
         ///
-        /// Every linked discovery already resolves `<wt>/.git` here, one
-        /// `lstat` short of its admin entry's identity — and the whole
-        /// grouping runs BEFORE the first `git worktree list`. That is the
-        /// only capture point on the far side of the listing from (e2)'s, so
-        /// it is the only one that can witness a replacement landing INSIDE
-        /// the listing command, or after it returned, or anywhere in (e2)'s
-        /// own loop.
+        /// They are CARRIED here, not taken here. `consume` resolves
+        /// `<wt>/.git` and lstats the admin entry at the instant the walk
+        /// observes that `.git` entry, so the discovery record and its
+        /// witness describe the same object. Taking them in this function
+        /// instead — as r16 did — left the whole rest of the walk, plus one
+        /// `adminDirectory` read and one `identity` lstat for every earlier
+        /// linked discovery, inside the uncovered window.
         ///
         /// The map keys the ADMIN ENTRY rather than the worktree path on
         /// purpose: discoveries are spelled under the declared root and
@@ -517,27 +602,15 @@ struct GitWorktreeScanner: @unchecked Sendable {
                     discovery.directory.appendingPathComponent(".git")
                 )
             case .linkedWorktree:
-                let admin = resolver.adminDirectory(forWorktreeAt: discovery.directory)
-                // THE PRE-LISTING WITNESS (PR #460 codex r16, B-P1/B-P2).
-                // Taken HERE because this whole grouping completes before the
-                // first `git worktree list` of the first repository runs —
-                // Swift evaluates the sequence expression of `scan`'s
-                // `for group in` once, up front — so no listing, no parse, no
-                // cross-validation and no (e2) loop separates this `lstat`
-                // from the walk that found the checkout.
-                //
-                // The TCC gate is honoured by the RESOLVER, not by a check
-                // here: on an automatic scan its identity provider reports
-                // every deferred path as absent, so `adminDirectory` returns
-                // nil for a deferred worktree (and for a worktree whose admin
-                // directory is itself deferred) and nothing is stat'd.
-                if let admin {
-                    let entry = provider.resolveTargetKeepingLeaf(admin)
-                    if let identity = provider.identity(of: entry) {
-                        witness = (entry.path, identity)
-                    }
+                // BOTH the pointer resolution and the witness were performed
+                // in the walk consumer (PR #460 codex r17, W2) — this
+                // function only groups. Re-resolving here would re-open the
+                // window `consume` exists to close, so nothing about the
+                // admin entry is read again.
+                if let carried = discovery.adminWitness {
+                    witness = (carried.entryPath, carried.identity)
                 }
-                gitDirectory = admin
+                gitDirectory = discovery.adminDirectory
                     .flatMap { resolver.commonGitDirectory(forAdminDirectory: $0) }
             }
             guard let gitDirectory else { continue }

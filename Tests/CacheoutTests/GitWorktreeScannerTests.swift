@@ -294,6 +294,36 @@ private final class ReplaceOnAdminEntryIdentityProvider: FileSystemIdentityProvi
     }
 }
 
+/// Fires a side effect the FIRST time the WALK probes a named path.
+///
+/// The walk probes its root by path and every child through the DESCRIPTOR
+/// overload, so that is the seam hooked here. Roots are walked in caller
+/// order, which is what makes a path under a LATER root a deterministic
+/// "after the earlier root's walk finished, before the walk ends" instant —
+/// no ordering inside a single directory is assumed.
+private final class ReplaceOnWalkProbeProvider: FileSystemIdentityProvider,
+    @unchecked Sendable
+{
+    private let triggerPath: String
+    private let fired = OneShotLatch()
+    private let effect: () -> Void
+
+    init(probing url: URL, effect: @escaping () -> Void) {
+        self.triggerPath = url.path
+        self.effect = effect
+        super.init()
+    }
+
+    var didFire: Bool { fired.didFire }
+
+    override func probeKind(
+        inDirectory parent: Int32, named name: String, logical url: URL
+    ) -> DescriptorKindProbe {
+        if url.path == triggerPath, fired.claim() { effect() }
+        return super.probeKind(inDirectory: parent, named: name, logical: url)
+    }
+}
+
 /// A one-shot latch for an interception closure that must fire EXACTLY once —
 /// the scan issues several commands per record, and a fixture that mutated the
 /// tree on each of them would be testing a different story every time.
@@ -1510,6 +1540,139 @@ final class GitWorktreeScannerTests: XCTestCase {
     }
 
 
+
+    /// W2 (PR #460 codex r17). r16 moved the discovery capture to
+    /// `repositoryGroups` and closed the listing window — that part holds and
+    /// is not re-derived here. But it stopped one loop short: the capture was
+    /// taken after `walker.walk(...)` had RETURNED, so a replacement landing
+    /// between the walk observing a checkout and the grouping lstat reaching
+    /// it was invisible. Every read the scan then made — the grouping
+    /// capture, the listing, (e2), the live one — described the replacement,
+    /// they all agreed, and the row was offered SILENTLY and armed with the
+    /// replacement's inode.
+    ///
+    /// The residual r16 disclosed was wrong in both its boundary and its
+    /// growth: the window ends at that checkout's OWN grouping capture, not
+    /// at the walk, and `repositoryGroups` pays one `adminDirectory` read
+    /// plus one `identity` lstat for EVERY linked discovery, so the window
+    /// for the Nth discovery contained N-1 of those plus the whole walk.
+    ///
+    /// THE BOUNDARY THIS FIXES TO: the capture is taken inside the walk
+    /// consumer, at the instant the `.git` entry is observed for that
+    /// directory. The discovery record and its witness then describe the same
+    /// object, and the residual is [the parent's `readdir` returned the
+    /// `.git` entry -> that checkout's admin lstat] — constant per checkout,
+    /// independent of tree size and worktree count.
+    ///
+    /// THE FIXTURE'S WINDOW is deterministic without assuming any ordering
+    /// inside a directory: roots are walked in caller order, so a probe of a
+    /// path under the SECOND declared root is necessarily after the whole
+    /// walk of the first, and the cell asserts that no git command had run
+    /// when it fired.
+    ///
+    /// THE UNTOUCHED SIBLING IS THE DISCRIMINATOR — a refusal that fired on
+    /// the whole repository, or on the walk-unreached population, cannot
+    /// offer `wt-a`.
+    ///
+    /// MUTATION: take the capture in `repositoryGroups` again (after the
+    /// walk) — RED here, GREEN on the B-P1/B-P2 cells above, which is what
+    /// tells this window from theirs.
+    func testAWorktreeReplacedAfterTheWalkObservedItAndBeforeTheListingIsRefused()
+        async throws
+    {
+        let repository = try makeRepositoryIgnoringPayloads(
+            at: dev.appendingPathComponent("repo")
+        )
+        let sibling = try addWorktree(
+            of: repository, at: dev.appendingPathComponent("wt-a"), branch: "a"
+        )
+        let target = try addWorktree(
+            of: repository, at: dev.appendingPathComponent("wt-z"), branch: "z"
+        )
+        // The SECOND declared root exists only to give the fixture an instant
+        // the walk reaches after it has finished with `dev`.
+        let later = base.appendingPathComponent("dev2")
+        let trigger = later.appendingPathComponent("trigger")
+        try fm.createDirectory(at: trigger, withIntermediateDirectories: true)
+
+        let identityProvider = FileSystemIdentityProvider()
+        let originalAdmin = try XCTUnwrap(
+            GitWorktreeGitdirResolver().adminDirectory(forWorktreeAt: target)
+        )
+        let originalIdentity = try XCTUnwrap(identityProvider.identity(of: originalAdmin))
+
+        let fixtureHome = try XCTUnwrap(home)
+        let payload = target.appendingPathComponent("payload.bin")
+        let runner = InterceptingGitRunner(wrapping: makeRunner()) { _, _ in nil }
+        let commandsAtTriggerTime = AtomicIndexBox()
+        let provider = ReplaceOnWalkProbeProvider(probing: trigger) {
+            commandsAtTriggerTime.store(runner.argvs.count)
+            _ = try? GitFixture.git(
+                ["-C", repository.path, "worktree", "remove", target.path],
+                home: fixtureHome
+            )
+            // The SAME branch, so the replacement is itself an ordinary
+            // CANDIDATE — clean, linked, unlocked, merged. A replacement that
+            // failed a gate would be omitted for a reason that has nothing to
+            // do with the witness, and the cell would prove nothing (it did,
+            // on its first draft: `-b brand-new` is unmerged, so `wt-z`
+            // vanished silently and the assertion below passed for free).
+            _ = try? GitFixture.git(
+                ["-C", repository.path, "worktree", "add", target.path, "z"],
+                home: fixtureHome
+            )
+            // Ignored by the fixture's committed `.gitignore`, so the brand-new
+            // checkout stays status-clean while carrying the developer's bytes.
+            try? Data(repeating: 0xCD, count: 8192).write(to: payload)
+        }
+
+        let scanner = makeScanner(roots: [dev, later], runner: runner, provider: provider)
+        let outcome = await scanner.scan(context: ScanContext(trigger: .userInitiated))
+
+        XCTAssertTrue(provider.didFire, "the fixture never reached the second root")
+        XCTAssertEqual(
+            commandsAtTriggerTime.value, 0,
+            "the replacement must land while the WALK is still running — the "
+                + "scanner had already issued \(commandsAtTriggerTime.value) "
+                + "git command(s) when it fired, so this is not the window "
+                + "the cell names"
+        )
+        let replacementAdmin = try XCTUnwrap(
+            GitWorktreeGitdirResolver().adminDirectory(forWorktreeAt: target)
+        )
+        XCTAssertNotEqual(
+            identityProvider.identity(of: replacementAdmin), originalIdentity,
+            "the fixture must have replaced the OBJECT, not merely the path"
+        )
+
+        let stale = try outcome.items.filter {
+            guard case .gitWorktreeReclaim = $0.action else { return false }
+            return try plan(of: $0).mode == .removeStaleWorktree
+        }
+        let armed = try stale.first {
+            try plan(of: $0).worktreePath?.lastPathComponent == "wt-z"
+        }.map { try plan(of: $0).worktreeAdminEntryIdentity }
+        XCTAssertEqual(
+            try stale.compactMap { try plan(of: $0).worktreePath?.lastPathComponent }
+                .sorted(),
+            ["wt-a"],
+            "a checkout replaced AFTER the walk observed it was offered "
+                + "anyway; armed identity \(String(describing: armed)) while "
+                + "the walked checkout's was \(originalIdentity). Issues: "
+                + "\(outcome.errors.map(\.detail))"
+        )
+        let issue = try XCTUnwrap(
+            outcome.errors.first { $0.detail.contains("/wt-z") },
+            "SILENCE IS THE DEFECT, not a lesser form of it: \(outcome.errors)"
+        )
+        XCTAssertEqual(issue.kind, .unreadable)
+        XCTAssertTrue(issue.detail.contains("no item is offered"), issue.detail)
+        // The brand-new checkout and everything the developer put in it.
+        XCTAssertTrue(fm.fileExists(atPath: target.path))
+        XCTAssertTrue(fm.fileExists(atPath: sibling.path))
+        XCTAssertEqual(try Data(contentsOf: payload).count, 8192)
+        try assertNonMalformed(outcome, from: scanner)
+    }
 
     // MARK: - W1: the walk's depth budget must not decide what is reclaimable
 

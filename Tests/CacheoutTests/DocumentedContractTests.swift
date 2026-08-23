@@ -1454,19 +1454,29 @@ final class DocumentedCLIFramingTests: XCTestCase {
         let stderr: String
     }
 
-    private var productsDirectory: URL {
-        for bundle in Bundle.allBundles where bundle.bundlePath.hasSuffix(".xctest") {
-            return bundle.bundleURL.deletingLastPathComponent()
-        }
-        preconditionFailure(
+    /// The build-products directory containing both this .xctest bundle and
+    /// the Cacheout executable (SPM builds all products for `swift test`).
+    ///
+    /// IT FAILS ONE CELL RATHER THAN KILLING THE PROCESS (PR #460 codex r11,
+    /// D3). This ended in a trapping `preconditionFailure`, and `runCLI`
+    /// reads it on EVERY CLI-framing cell in this class — so a SwiftPM or
+    /// Xcode layout change that stopped `Bundle.allBundles` yielding a
+    /// `.xctest` path would have killed the runner with no failure and no
+    /// total line, for a fact about the build layout rather than about the
+    /// product. `StrandFenceTests`' header claimed no occurrence of that
+    /// family sat in the strand position; this was one of two that did.
+    private func productsDirectory() throws -> URL {
+        let bundle = try XCTUnwrap(
+            Bundle.allBundles.first { $0.bundlePath.hasSuffix(".xctest") },
             "cannot locate the build-products directory from the XCTest bundles"
         )
+        return bundle.bundleURL.deletingLastPathComponent()
     }
 
     private func runCLI(
         _ arguments: [String], timeout: TimeInterval = 300
     ) throws -> CLIRun {
-        let binary = productsDirectory.appendingPathComponent("Cacheout")
+        let binary = try productsDirectory().appendingPathComponent("Cacheout")
         guard FileManager.default.isExecutableFile(atPath: binary.path) else {
             XCTFail("Cacheout executable missing at \(binary.path)")
             throw XCTSkip("executable not built")

@@ -176,11 +176,44 @@ import XCTest
 ///   `testNoLoopBoundIndexSubscriptCanStrandTheRun` covers exactly that
 ///   subset — **7 hits on 5 lines**, not 117 — and its own header states
 ///   both its limits and how that figure was taken.
-/// - **`as!`, `precondition`, `fatalError`, arithmetic overflow, out-of-range
-///   `Range` subscripts, `Array(repeating:count:)` with a negative count** —
-///   not scanned at all. No occurrence of any of them has stranded a run
-///   here. An OUT-OF-ORDER `Range` is no longer in this list: it stranded a
-///   run at r9 and has its own cell (position 4 above).
+/// - **`as!`, `precondition` and its `…Failure` spelling, `fatalError`,
+///   arithmetic overflow, out-of-range `Range` subscripts,
+///   `Array(repeating:count:)` with a negative count** — not scanned at all.
+///
+///   WHAT THIS BULLET USED TO SAY, AND WHY IT WAS WITHDRAWN (PR #460 codex
+///   r11, D3). It said "No occurrence of any of them has stranded a run
+///   here." That sentence is true of HISTORY — none of them ever has — and
+///   it READ as a claim about the POPULATION, i.e. that no occurrence sits
+///   anywhere a strand could come from. Two did. `CLIGateFramingTests` and
+///   `DocumentedCLIFramingTests` each ended a `productsDirectory` property
+///   with a trapping `…Failure`, and `runCLI` reads that property on EVERY
+///   CLI-framing cell in both classes: a SwiftPM or Xcode layout change that
+///   stopped `Bundle.allBundles` yielding a `.xctest` path would have killed
+///   the runner with no total line, for a fact about the build layout rather
+///   than about the product. Both are converted to `try XCTUnwrap` in the
+///   same commit as this paragraph, so each fails ONE cell.
+///
+///   WHAT IS LEFT, COUNTED RATHER THAN ASSERTED. At this commit
+///
+///       grep -rnE '\bprecondition\(|\bpreconditionFailure\(|\bfatalError\(|[^A-Za-z0-9_] as! ' \
+///           Tests --include='*.swift'
+///
+///   prints **3** lines, and ONE OF THEM IS THE COMMAND LINE ITSELF — the
+///   last alternative matches its own text, exactly as this file's
+///   subscript-population bullet matches its own. Labelled rather than
+///   silently netted off, because an unlabelled 2 and an unlabelled 3 are how
+///   r8's two subscript figures got published as one.
+///
+///   The other **2** are both the `!outcomes.isEmpty` assertion in
+///   `OutcomeSequenceBox.next()` (`CacheoutViewModelTests`,
+///   `OrphanedCachesScannerTests`), whose array is a literal list the CELL
+///   writes and which is documented as fixture-controlled at both sites.
+///   `as!` and `fatalError` occur ZERO times in code. The claim this bullet
+///   now makes is therefore about the population, and it is re-derivable in
+///   one command.
+///
+///   An OUT-OF-ORDER `Range` is no longer in this list: it stranded a run at
+///   r9 and has its own cell (position 4 above).
 /// - **raw string literals (`#"…"#`)** are blanked WHOLE, so a trap inside a
 ///   raw-string interpolation would be missed. No test uses one.
 ///

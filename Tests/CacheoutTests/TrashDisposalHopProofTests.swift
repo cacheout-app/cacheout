@@ -2634,135 +2634,355 @@ final class TrashDisposalHopProofTests: XCTestCase {
         }
     }
 
-    /// One cause, and the propositions its OWN after-proof does not
-    /// establish — checked against the WHOLE message.
-    private struct WholeMessageFence {
-        let cause: TrashDisposal.Failure.Cause
-        /// Must not appear ANYWHERE in the message.
-        let forbidden: [String]
-        /// Must appear — the honest replacement, so a silent deletion of the
-        /// disclosure fails too.
-        let required: [String]
-        /// What the code actually establishes on this path.
-        let because: String
+    /// WHAT ONE PROPOSITION'S TEXT MUST — AND MUST NOT — LOOK LIKE.
+    ///
+    /// `all`/`any` are ANTI-DELETION: they keep a disclosure from being
+    /// quietly dropped. The other four are the ANTI-ADDITION half, and they
+    /// are the reason this is not another phrase list: they are stated over
+    /// CATEGORIES of word (does this clause name a place at all? does it
+    /// claim a net effect at all?) rather than over sentences anybody had to
+    /// think of first.
+    private struct FactContract {
+        /// Every one of these must appear in a clause tagged with the fact.
+        var all: [String] = []
+        /// At least one of these must, when the list is non-empty.
+        var any: [String] = []
+        /// The fact is ABOUT where something is, so a clause carrying it may
+        /// name places. A clause tagged with any other fact may not.
+        var isWhereabouts = false
+        /// …and it places something POSITIVELY. An unhedged clause that
+        /// names a place must carry a fact of this kind.
+        var isPositivePlacement = false
+        /// The fact is about the REPORT or the REMEDY: it may name no place.
+        var forbidsPlaces = false
+        /// …and may make no claim about bytes.
+        var forbidsNetEffect = false
     }
 
-    /// **A-P1/A-P2 — TWO FALSE TAILS WALKED THROUGH r15'S OWN GUARD** (PR
-    /// #460 codex r16).
-    ///
-    /// `…NoFailureMessageAssertsTheTargetWasReplacedWithoutReadingIt` and
-    /// `…EveryTrashFailureMessageOpensWithWhatWasActuallyProved` inspect the
-    /// OPENING clause only. So D-P3 retired one false proposition from the
-    /// front of five messages and left two more sitting in the tails of two
-    /// of them — one of which commit `1849f86`'s own body had NAMED
-    /// ("…AND TOLD THEM TO GO AND LOOK IN THE TRASH, for an item that never
-    /// left") before changing only the opening.
-    ///
-    /// This is the same shape as the opening fence, applied to the whole
-    /// string, with the cause list spelled through `label(for:)` so a seventh
-    /// cause cannot be added without a compile error here.
-    ///
-    /// MUTATION: restore either tail — "Look in the Trash for it" on
-    /// `.lastSeenInTrash`, or "the item the Trash took is still in the Trash"
-    /// on `.putBackTookAnotherObject` — and this cell fails on that row. The
-    /// two fixture cells below prove the propositions are FALSE on the events
-    /// the causes are named for; this one keeps them out of every message.
-    func testNoTrashFailureMessageAssertsAnythingItsOwnProofDidNotEstablish()
-        throws
-    {
-        let landed = "/tmp/landed"
-        let fences: [WholeMessageFence] = [
-            WholeMessageFence(
-                cause: .putBack,
-                // A-P4b: "Nothing was moved to the Trash" was a NET-EFFECT
-                // claim, and an object WAS moved there and retrieved.
-                forbidden: ["Nothing was moved to the Trash"],
-                required: ["PUT BACK", "identified at this path"],
-                because: "what this arm proved is that the object was moved "
-                    + "back OUT of the Trash and identified at the target "
-                    + "under the held, admitted destination descriptor"
-            ),
-            WholeMessageFence(
-                cause: .strandedInTrash(landed),
-                forbidden: [],
-                required: [landed],
-                because: "an object WAS identified at the landing and the "
-                    + "move could not be performed, so the path is a fact"
-            ),
-            WholeMessageFence(
-                cause: .lastSeenInTrash(landed),
-                forbidden: [
-                    "Look in the Trash for it",
-                    "it is in the Trash",
-                    "is still in the Trash",
-                ],
-                required: ["was NOT established"],
-                because: "this cause IS the failure to establish where the "
-                    + "object is; the fixture below reaches it with the item "
-                    + "still at the target and nothing in the Trash at all"
-            ),
-            WholeMessageFence(
-                cause: .putBackTookAnotherObject(landed),
-                forbidden: [
-                    "is still in the Trash",
-                    "still in the Trash",
-                    "Look in the Trash",
-                ],
-                required: ["was NOT established"],
-                because: "the rename proved the NAME was re-pointed, which "
-                    + "says nothing about where the taken object went"
-            ),
-            WholeMessageFence(
-                cause: .destinationNotTheAdmittedContainer(landed),
-                forbidden: [],
-                required: [landed],
-                because: "nothing was moved, so the item IS where the "
-                    + "disposal put it and the path is a fact"
-            ),
-            WholeMessageFence(
-                cause: .destinationUnknown,
-                forbidden: ["was inspected", "Trash at"],
-                required: [],
-                because: "raised before anything about a landing is known"
-            ),
-        ]
-
-        // THE ROT GATE: every case of the enum is fenced, and `label(for:)`
-        // is a `default`-less switch, so a seventh cause breaks the build.
-        XCTAssertEqual(
-            Set(fences.map { label(for: $0.cause) }).count, 6,
-            "every cause must be fenced exactly once"
-        )
-
-        for fence in fences {
-            let name = label(for: fence.cause)
-            let failure = TrashDisposal.Failure(
-                path: "/tmp/x", cause: fence.cause
+    /// The contract for each proposition, spelled through a `default`-less
+    /// `switch` so a new one cannot enter the vocabulary unexamined.
+    private func contract(
+        for fact: TrashDisposal.Failure.Established
+    ) -> FactContract {
+        switch fact {
+        case .theDisposalWasNotProvedToHaveMovedTheItem:
+            return FactContract(
+                all: ["could not be proved to have moved the item"],
+                isWhereabouts: true
             )
-            let described = try XCTUnwrap(failure.errorDescription)
-            for phrase in fence.forbidden {
-                XCTAssertFalse(
-                    described.contains(phrase),
-                    "\(name) may not assert \"\(phrase)\" ANYWHERE in its "
-                        + "message — \(fence.because): \(described)"
-                )
-            }
-            for phrase in fence.required {
-                XCTAssertTrue(
-                    described.contains(phrase),
-                    "\(name) must still say \"\(phrase)\": \(described)"
-                )
-            }
-            // AND THE OPENING FENCE STILL APPLIES TO ALL SIX, so this cell
-            // cannot be satisfied by moving a false clause from the tail to
-            // the front.
-            XCTAssertFalse(
-                described.contains("no longer the one that was inspected"),
-                "\(name): \(described)"
+        case .theItemIsBackAtTheTarget:
+            return FactContract(
+                all: ["identified at this path"], any: ["PUT BACK"],
+                isWhereabouts: true, isPositivePlacement: true
             )
+        case .theItemIsAtTheLanding:
+            return FactContract(
+                any: [Self.landingToken, "from there"],
+                isWhereabouts: true, isPositivePlacement: true
+            )
+        case .theLandingDidNotYieldTheItem:
+            return FactContract(
+                all: [Self.landingToken, "cannot be found"],
+                isWhereabouts: true
+            )
+        case .theLandingNameWasRepointed:
+            return FactContract(
+                all: [Self.landingToken], any: ["re-used", "re-pointed"],
+                isWhereabouts: true, isPositivePlacement: true
+            )
+        case .aStrangerStandsAtTheTarget:
+            return FactContract(
+                all: [Self.targetToken, "stands at"],
+                isWhereabouts: true, isPositivePlacement: true
+            )
+        case .theHoldingFolderIsNotTheAdmittedOne:
+            return FactContract(
+                all: ["folder"], isWhereabouts: true,
+                isPositivePlacement: true
+            )
+        case .theLandingWasNotReported:
+            return FactContract(
+                all: ["did not report where"], isWhereabouts: true
+            )
+        case .theTrashHoldsWhatItTook:
+            return FactContract(
+                all: ["Trash"], isWhereabouts: true,
+                isPositivePlacement: true
+            )
+        case .theItemsWhereaboutsAreNotEstablished:
+            return FactContract(
+                all: ["was NOT established"], isWhereabouts: true
+            )
+        case .nothingWasReportedFreed:
+            return FactContract(all: ["reported freed"], forbidsPlaces: true)
+        case .theRemedyForThisRefusal:
+            return FactContract(forbidsPlaces: true, forbidsNetEffect: true)
+        case .nothingWasFreedOnDisk, .theTargetWasReplaced:
+            // Unsatisfiable ON PURPOSE. No arm establishes these, the fence
+            // below asserts that no cause claims them, and the contract is
+            // written so that a claim tagged with one fails even if the
+            // `established` table is edited to admit it.
+            return FactContract(all: ["\u{0}NO ARM ESTABLISHES THIS\u{0}"])
         }
     }
 
+    private static let targetToken = "«target»"
+    private static let landingToken = "«landing»"
+    private static let targetPath = "/fixture/TARGET-PATH"
+    private static let landingPath = "/fixture/LANDING-PATH"
+
+    /// A clause with its two payload paths replaced by tokens.
+    ///
+    /// THE ONE NORMALISATION THAT IS A JUDGEMENT, DISCLOSED AS ONE: the
+    /// string "Move to Trash" is the NAME OF THE APP'S CHECKBOX, not a
+    /// location, and it is removed before the place scan so that the remedy
+    /// clause naming that control is not read as placing the item in the
+    /// Trash. A false sentence that hid behind those four words would evade
+    /// the place rule; see the residual list on the fence itself.
+    private func normalised(_ text: String) -> String {
+        var out = text.replacingOccurrences(
+            of: "Move to Trash", with: "«control»"
+        )
+        out = out.replacingOccurrences(
+            of: Self.landingPath, with: Self.landingToken
+        )
+        return out.replacingOccurrences(
+            of: Self.targetPath, with: Self.targetToken
+        )
+    }
+
+    /// Does this clause name a place? A CATEGORY, not a phrase: the two
+    /// payload paths, the Trash, and the locative pronouns.
+    private func namesAPlace(_ normalisedText: String) -> Bool {
+        if normalisedText.contains(Self.targetToken)
+            || normalisedText.contains(Self.landingToken)
+            || normalisedText.contains("Trash")
+            || normalisedText.contains("this path") { return true }
+        return normalisedText.range(
+            of: "\\b(there|here|somewhere|elsewhere)\\b",
+            options: [.regularExpression, .caseInsensitive]
+        ) != nil
+    }
+
+    /// Does it claim, or deny, a net effect on the disk?
+    private func namesANetEffect(_ normalisedText: String) -> Bool {
+        normalisedText.range(
+            of: "\\b(free|freed|frees|reclaimed|deleted|removed)\\b",
+            options: [.regularExpression, .caseInsensitive]
+        ) != nil
+    }
+
+    /// Is the clause HEDGED — does it say, in its own words, that the thing
+    /// it mentions was not established?
+    private func isHedged(_ normalisedText: String) -> Bool {
+        for marker in [
+            "could not", "cannot", "was NOT", "were NOT", "not established",
+            "did not", "no longer", "may ", "might ",
+        ] where normalisedText.contains(marker) { return true }
+        return false
+    }
+
+    /// **M1 — THE FENCE AGAINST PHRASING-FIXES WAS ITSELF A PHRASING-FIX**
+    /// (PR #460 codex r17).
+    ///
+    /// r16 widened r15's opening-clause guard to the whole message by adding
+    /// a list of FORBIDDEN PHRASES. MEASURED at e6afc9f, `swift test --filter
+    /// TrashDisposalHopProofTests` (36 cells), each mutation rebuilt:
+    ///
+    /// | mutation | result |
+    /// |---|---|
+    /// | restore "Look in the Trash for it" on `.lastSeenInTrash` | RED |
+    /// | restore "…the item the Trash took is still in the Trash" | RED |
+    /// | **"Check your Trash for the item."** on `.lastSeenInTrash` | **GREEN 36/36** |
+    /// | **"The object the Trash took remains where the Trash put it."** | **GREEN** |
+    ///
+    /// A blocklist catches the sentences somebody already wrote down and
+    /// nothing else. This cell asserts a PROPERTY instead, over the type:
+    ///
+    /// 1. every clause of every message is TAGGED with the one proposition
+    ///    it asserts, and `errorDescription` is the join of those clauses and
+    ///    nothing else — so there is no untagged text to hide in;
+    /// 2. no clause may carry a proposition its own cause's code path did not
+    ///    establish (`TrashDisposal.Failure.established(for:)`, derived at the
+    ///    raise sites);
+    /// 3. a clause that NAMES A PLACE AT ALL — either payload path, the
+    ///    Trash, or a locative pronoun — must carry a whereabouts
+    ///    proposition, and if it does so without hedging, a POSITIVE one;
+    /// 4. a clause that makes a NET-EFFECT claim at all must be the one about
+    ///    the report, and must say "reported freed";
+    /// 5. a clause may contain no sentence break, so a new sentence is
+    ///    necessarily a new clause and necessarily tagged;
+    /// 6. the two propositions this file has shipped and retired — "the
+    ///    target was replaced" and "nothing was freed on disk" — are
+    ///    established by NO cause, and their contract is unsatisfiable.
+    ///
+    /// None of (2)–(6) mentions a sentence, so a NEW false sentence fails
+    /// without anyone having predicted its wording. MEASURED at 36cf469,
+    /// eight mutations of `TrashDisposal.Failure.claims(path:cause:)`, each
+    /// rebuilt and run as `swift test --filter TrashDisposalHopProofTests`
+    /// (37 cells). NONE of these wordings appears anywhere in this repository
+    /// before this round:
+    ///
+    /// | mutation | fence |
+    /// |---|---|
+    /// | `" Check your Trash for the item."` added to `.lastSeenInTrash`, tagged `.theItemsWhereaboutsAreNotEstablished` | **RED** (2 failures) |
+    /// | the same sentence tagged `.theTrashHoldsWhatItTook` | **RED** (1) |
+    /// | the same sentence GRAFTED onto the end of the whereabouts clause | **RED** (1) |
+    /// | `" The object the Trash took remains where the Trash put it."` added to `.putBackTookAnotherObject` | **RED** (2) |
+    /// | `"; nothing was reported freed"` reworded to `"; the bytes it took were reclaimed"` | **RED** (8) |
+    /// | `" Empty your Trash when you are done"` added to `.strandedInTrash` as a REMEDY | **RED** (3) |
+    /// | `"; your disk now has that space back"` added to `.putBack` as a REMEDY | GREEN |
+    /// | `"at this path"` → `"at this path within the last second"` | GREEN |
+    ///
+    /// Every RED row is this cell. The two GREEN rows are the residual, and
+    /// they are what it CANNOT catch, stated rather than left to be
+    /// discovered:
+    ///
+    /// * A NET-EFFECT claim made without any word in the net-effect lexicon
+    ///   ("your disk now has that space back"). The lexicon is a category,
+    ///   but it is a category of WORDS.
+    /// * A false clause GRAFTED INTO an existing clause, when the result
+    ///   still satisfies that fact's `all`/`any` markers and adds no place
+    ///   and no net-effect word — a claim about TIME, or about who did it.
+    ///   Rule (5) forces a new SENTENCE to be a new clause; it cannot force
+    ///   a new CLAUSE to be one.
+    /// * A sentence hidden behind the literal string "Move to Trash", which
+    ///   `normalised(_:)` removes as the app's control name.
+    /// * An author who edits `established(for:)` itself to admit a
+    ///   proposition the code path does not prove. That table is the
+    ///   derivation, and nothing here can check a derivation against the
+    ///   code — but it is one visible, reviewable edit rather than a
+    ///   sentence buried in a string literal, which is the whole of what
+    ///   this change buys.
+    func testNoTrashFailureMessageAssertsAnythingItsOwnProofDidNotEstablish()
+        throws
+    {
+        let causes: [TrashDisposal.Failure.Cause] = [
+            .putBack, .strandedInTrash(Self.landingPath),
+            .lastSeenInTrash(Self.landingPath),
+            .putBackTookAnotherObject(Self.landingPath),
+            .destinationNotTheAdmittedContainer(Self.landingPath),
+            .destinationUnknown,
+        ]
+        // THE ROT GATE: `label(for:)` is a `default`-less switch, so a
+        // seventh cause breaks the build, and this count catches one that was
+        // added to the enum but not to the list above.
+        XCTAssertEqual(
+            Set(causes.map { label(for: $0) }).count, 6,
+            "every cause must be audited exactly once"
+        )
+
+        var used: Set<TrashDisposal.Failure.Established> = []
+        for cause in causes {
+            let name = label(for: cause)
+            let established = TrashDisposal.Failure.established(for: cause)
+            let claims = TrashDisposal.Failure.claims(
+                path: Self.targetPath, cause: cause
+            )
+
+            // (6) The two retired propositions are established by nobody.
+            XCTAssertFalse(
+                established.contains(.theTargetWasReplaced),
+                "\(name): no arm re-reads the target after the move"
+            )
+            XCTAssertFalse(
+                established.contains(.nothingWasFreedOnDisk),
+                "\(name): no arm counts bytes after the move"
+            )
+
+            // (1) The message is the join and nothing else.
+            let failure = TrashDisposal.Failure(
+                path: Self.targetPath, cause: cause
+            )
+            XCTAssertEqual(
+                failure.errorDescription, claims.map(\.text).joined(),
+                "\(name): errorDescription must carry no free text"
+            )
+
+            for claim in claims {
+                used.insert(claim.establishes)
+                let fact = claim.establishes
+                let text = normalised(claim.text)
+                let rule = contract(for: fact)
+                let where_ = "\(name)/\(fact.rawValue): \(text)"
+
+                // (2) The proposition must be one this cause proved.
+                XCTAssertTrue(
+                    established.contains(fact),
+                    "\(where_) — this cause's code path does not establish it"
+                )
+                // (5) One clause, no sentence break.
+                XCTAssertFalse(
+                    text.contains(". "),
+                    "\(where_) — a new sentence must be a new, tagged clause"
+                )
+                // Anti-deletion: the disclosure cannot be silently dropped.
+                for marker in rule.all {
+                    XCTAssertTrue(text.contains(marker), "\(where_) — «\(marker)»")
+                }
+                if !rule.any.isEmpty {
+                    XCTAssertTrue(
+                        rule.any.contains(where: { text.contains($0) }),
+                        "\(where_) — one of \(rule.any)"
+                    )
+                }
+                // (3) Naming a place commits the clause to a whereabouts
+                // proposition, and doing so unhedged to a positive one.
+                let place = namesAPlace(text)
+                if place {
+                    XCTAssertTrue(
+                        rule.isWhereabouts,
+                        "\(where_) — names a place under a proposition that "
+                            + "is not about where anything is"
+                    )
+                    if !isHedged(text) {
+                        XCTAssertTrue(
+                            rule.isPositivePlacement,
+                            "\(where_) — places something without hedging, "
+                                + "so the proposition must be one that was "
+                                + "positively established"
+                        )
+                    }
+                }
+                if rule.forbidsPlaces {
+                    XCTAssertFalse(
+                        place, "\(where_) — this proposition names no place"
+                    )
+                }
+                // (4) Any net-effect word belongs to the report clause.
+                if namesANetEffect(text) {
+                    XCTAssertEqual(
+                        fact, .nothingWasReportedFreed,
+                        "\(where_) — a claim about what happened on disk"
+                    )
+                    XCTAssertTrue(
+                        text.contains("reported freed"),
+                        "\(where_) — the report is what was established, not "
+                            + "the disk"
+                    )
+                }
+                if rule.forbidsNetEffect {
+                    XCTAssertFalse(namesANetEffect(text), where_)
+                }
+                // r15's retired opening, still fenced everywhere.
+                XCTAssertFalse(
+                    text.contains("no longer the one that was inspected"),
+                    where_
+                )
+            }
+        }
+
+        // ROT: every proposition in the vocabulary is either used by some
+        // cause or is one of the two no arm establishes.
+        for fact in TrashDisposal.Failure.Established.allCases
+        where !used.contains(fact) {
+            XCTAssertTrue(
+                fact == .nothingWasFreedOnDisk
+                    || fact == .theTargetWasReplaced,
+                "\(fact.rawValue) is dead vocabulary — remove it or use it"
+            )
+        }
+    }
     /// **A-P2 — `.lastSeenInTrash` SENT THE USER TO THE TRASH FOR AN ITEM
     /// THAT NEVER LEFT** (PR #460 codex r16).
     ///

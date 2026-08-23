@@ -414,142 +414,384 @@ enum TrashDisposal {
         let path: String
         let cause: Cause
 
-        var errorDescription: String? {
-            // THE SHARED OPENING, AND WHY IT IS THIS ONE (PR #460 codex r15,
-            // D-P3).
-            //
-            // Five of these six messages used to open "the folder at this
-            // path is no longer the one that was inspected — it was replaced
-            // between the safety check and the disposal". NO ARM'S AFTER-PROOF
-            // TESTS THAT. Everything this file establishes after the mover
-            // returns is about the LANDING: `facts(at: landed)` / `look(at:
-            // landed)` compared with what was bound. THE TARGET IS NEVER
-            // RE-READ.
-            //
-            // MEASURED at df551b1, event `moverMovedNothing` (the mover
-            // proves, moves nothing, and reports a landing where nothing
-            // stands), all four Trash paths: `.lastSeenInTrash`, zero moves,
-            // and the target still on disk, untouched, SAME INODE. The message
-            // told the user their folder had been replaced — and told them to
-            // go and look in the Trash — for an item that never left.
-            //
-            // WHAT IS TRUE IN EVERY ROW is exactly one proposition: the
-            // disposal could not be PROVED to have moved the inspected item.
-            // That is the opening the five now share, and it is the strongest
-            // one the after-proof licenses. Pinned by
-            // `TrashDisposalHopProofTests`'
-            // `…NoFailureMessageAssertsTheTargetWasReplacedWithoutReadingIt`
-            // (the fixture) and
-            // `…EveryTrashFailureMessageOpensWithWhatWasActuallyProved` (every
-            // cause, off the type).
-            //
-            // `.destinationUnknown` never carried the clause and must not gain
-            // one: it is raised before anything about a landing is known.
-            //
-            // AND THE OPENING WAS ONLY THE OPENING (PR #460 codex r16,
-            // A-P1/A-P2). r15's two guards —
-            // `…NoFailureMessageAssertsTheTargetWasReplacedWithoutReadingIt`
-            // and `…EveryTrashFailureMessageOpensWithWhatWasActuallyProved` —
-            // inspected the FIRST CLAUSE and nothing else, so two false TAILS
-            // walked straight through them:
-            //
-            // * `.lastSeenInTrash` ended "Look in the Trash for it". MEASURED
-            //   on the `moverMovedNothing` fixture at 3110d1e, all four Trash
-            //   arms: this cause, ZERO moves, the item STILL AT THE TARGET at
-            //   the SAME INODE, and nothing in the Trash at all — the same
-            //   event whose OPENING clause D-P3 had just retired for saying
-            //   the folder had been replaced. Commit 1849f86's own body named
-            //   the Trash half of it ("…AND TOLD THEM TO GO AND LOOK IN THE
-            //   TRASH, for an item that never left") and then changed only
-            //   the opening.
-            // * `.putBackTookAnotherObject` ended "…and the item the Trash
-            //   took is still in the Trash". `rollBack` establishes nothing of
-            //   the sort. The re-bind proved the object was at the landing
-            //   NAME; the `renameatx_np` then moved a DIFFERENT object out of
-            //   that name, which says the NAME was re-pointed and NOTHING
-            //   about where the original went. MEASURED at 3110d1e with the
-            //   swap placed in the real one-syscall window between the two:
-            //   the object the Trash took is moved OUT of the landing's own
-            //   container, a stranger takes its Trash name, the undo moves the
-            //   stranger to the target — and the message sent the user to look
-            //   in the Trash for an object whose inode the cell proves is not
-            //   present under the landing's container at all.
-            //
-            // BOTH now say what was actually established and say plainly that
-            // the item's whereabouts were NOT. The guards are widened to the
-            // WHOLE message (`TrashDisposalHopProofTests`'
-            // `…NoTrashFailureMessageAssertsAnythingItsOwnProofDidNotEstablish`),
-            // because a fence on the opening clause is a fence on one clause.
-            let unproved = "\(path): the disposal could not be proved to have "
-                + "moved the item that was inspected"
+        /// ONE PROPOSITION A REFUSAL MESSAGE CAN CARRY — and the reason this
+        /// is a TYPE rather than a list of banned phrases (PR #460 codex r17,
+        /// M1).
+        ///
+        /// r15 fenced the OPENING clause of these messages; r16 found two
+        /// false TAILS behind that fence and widened it to the whole message
+        /// by adding a list of FORBIDDEN PHRASES. Measured at e6afc9f, that
+        /// widening catches only the sentences somebody had already written
+        /// down: restoring either retired tail reddens the guard, and saying
+        /// the SAME FALSE THING IN NEW WORDS passes — `"Check your Trash for
+        /// the item."` on `.lastSeenInTrash` was green on all 36 cells. A
+        /// blocklist of strings is phrasing-fencing, which is the failure
+        /// this branch has now repeated eight times.
+        ///
+        /// So the message is no longer a string literal per cause. It is a
+        /// sequence of `Claim`s, each of which names exactly ONE proposition
+        /// out of this closed vocabulary, and `established(for:)` says which
+        /// propositions each cause's own code path actually proved. A new
+        /// sentence cannot be added to a message without being tagged, and a
+        /// tag the cause does not establish fails — WITHOUT anyone having
+        /// predicted the sentence's wording.
+        ///
+        /// The last two cases are here precisely because NO arm establishes
+        /// them: they are the two propositions this file has shipped and
+        /// retired (r15's "the folder was replaced", r16/r17's net-effect
+        /// claims), kept nameable so the fence can assert that no cause
+        /// claims them.
+        enum Established: String, CaseIterable, Sendable {
+            /// The one proposition every row of the after-proof licenses:
+            /// the disposal could not be PROVED to have moved the inspected
+            /// item. Raised by every arm that reaches a comparison at all.
+            case theDisposalWasNotProvedToHaveMovedTheItem
+            /// `rollBack` completed its `renameatx_np` and IDENTIFIED the
+            /// arrival at the target under the held, admitted destination
+            /// descriptor. Only `.putBack` reaches that line.
+            case theItemIsBackAtTheTarget
+            /// An object WAS identified at `landed` — by the after-proof's
+            /// own read or by `rollBack`'s re-bind — and it was not moved
+            /// away afterwards, so it is still there.
+            case theItemIsAtTheLanding
+            /// The after-proof read the landing the disposal reported and
+            /// could NOT name the inspected object there (absent, replaced,
+            /// or unreadable). A negative fact about one name.
+            case theLandingDidNotYieldTheItem
+            /// The put-back's `renameatx_np` moved an object out of the
+            /// landing name and the arrival was NOT the object the re-bind
+            /// had identified there, so that NAME was re-pointed inside the
+            /// one-syscall window.
+            case theLandingNameWasRepointed
+            /// …and what the put-back moved is now standing at the target.
+            case aStrangerStandsAtTheTarget
+            /// The directory the put-back would restore INTO is not the
+            /// container the caller admitted — the identity comparison on
+            /// `DepthSafeRemoval.openAdmittedContainer` failed.
+            case theHoldingFolderIsNotTheAdmittedOne
+            /// The mover returned no landing URL at all, so which object it
+            /// took cannot be established.
+            case theLandingWasNotReported
+            /// The mover is a TRASH disposal and it returned without
+            /// throwing, so whatever it took went to the Trash — only the
+            /// name it went to is unknown. Established on
+            /// `.destinationUnknown` and on nothing else: every other cause
+            /// has read the landing the mover DID report.
+            case theTrashHoldsWhatItTook
+            /// The disclosure, not a claim: where the item is now was NOT
+            /// established on this path.
+            case theItemsWhereaboutsAreNotEstablished
+            /// A fact about the REPORT this code writes — no entry, no
+            /// bytes. Every cause establishes it, because every cause is a
+            /// refusal.
+            case nothingWasReportedFreed
+            /// What the user can do next. Carries no proposition about the
+            /// file system and may name no place.
+            case theRemedyForThisRefusal
+            /// NEVER ESTABLISHED BY ANY ARM: a claim about the DISK. Nothing
+            /// after the mover returns counts bytes or re-reads the target's
+            /// contents. `.putBack` shipped it as "nothing was freed" until
+            /// r17's M4.
+            case nothingWasFreedOnDisk
+            /// NEVER ESTABLISHED BY ANY ARM: the target is never re-read
+            /// after the move. Five messages opened with it until r15's
+            /// D-P3.
+            case theTargetWasReplaced
+        }
+
+        /// One clause of a refusal message, and the single proposition it
+        /// asserts. `errorDescription` is the JOIN of these and contains no
+        /// free text of its own, which is what makes the tag mandatory.
+        struct Claim: Equatable, Sendable {
+            let establishes: Established
+            let text: String
+        }
+
+        /// WHAT THE PATH THAT RAISES EACH CAUSE ACTUALLY ESTABLISHED —
+        /// derived from the code, cause by cause, and the reference every
+        /// message is checked against.
+        ///
+        /// This `switch` has no `default:`, so a seventh cause cannot be
+        /// added without answering this question for it.
+        static func established(for cause: Cause) -> Set<Established> {
+            // Every one of the six is a REFUSAL, so no entry and no bytes are
+            // written for it, and every one of the six may say what to do
+            // next.
+            let always: Set<Established> = [
+                .nothingWasReportedFreed, .theRemedyForThisRefusal,
+            ]
             switch cause {
             case .putBack:
-                // "Nothing was moved to the Trash" was a NET-EFFECT claim,
-                // and the net effect is not what happened (PR #460 codex
-                // r16, A-P4b): an object WAS moved to the Trash and then
-                // retrieved from it. What this arm PROVED is narrower and is
-                // now what it says — the object was moved back out under the
-                // held Trash descriptor and IDENTIFIED at this path under the
-                // held, admitted destination descriptor.
-                //
-                // AND ITS SIBLING NET-EFFECT CLAIM SURVIVED THAT FIX BY ONE
-                // CLAUSE (PR #460 codex r17, M4). r16 retired "Nothing was
-                // moved to the Trash" from this very message and left
-                // "nothing was freed" standing beside it — the only one of
-                // the six that made the claim BARE. The other five say
-                // "nothing was REPORTED freed", which is a fact about the
-                // report this code writes; "nothing was freed" is a fact
-                // about the DISK, and this arm establishes no such thing. On
-                // the fixture that produces the cause the inspected object is
-                // gone from where it stood: the mover really did remove it
-                // and really did trash a replacement, and what came back is
-                // the replacement. Whether anything was freed is not
-                // something the after-proof looked at. It now says what it
-                // can: nothing was reported freed. r16's whole-message guard
-                // did not catch it, because that guard is a list of phrases
-                // somebody had already thought of and this phrase was not on
-                // it; keeping the class out needs a structural fence, not a
-                // longer list.
-                return "\(unproved), so what it did take has been PUT BACK: "
-                    + "it was moved back out of the Trash and identified at "
-                    + "this path; nothing was reported freed; refused, "
-                    + "re-scan required"
-            case .strandedInTrash(let landed):
-                return "\(unproved), and what it did take could not be put "
-                    + "back automatically — it is in the Trash at \(landed). "
-                    + "Move it back from there; nothing was reported freed; "
-                    + "refused, re-scan required"
-            case .lastSeenInTrash(let landed):
-                return "\(unproved), and nothing could be put back — what it "
-                    + "reported putting at \(landed) cannot be found there "
-                    + "now, so nothing was moved rather than moving whatever "
-                    + "took its place. Where the item is now was NOT "
-                    + "established: it may never have left \(path), and it "
-                    + "may be somewhere this could not read. Nothing was "
-                    + "reported freed; refused, re-scan required"
-            case .putBackTookAnotherObject(let landed):
-                return "\(unproved), and putting back what it did take moved "
-                    + "a DIFFERENT object — the Trash name it came from "
-                    + "(\(landed)) was re-used while the undo was running. "
-                    + "Whatever now stands at \(path) came out of the Trash "
-                    + "and was NOT put there by you. Where the item the Trash "
-                    + "took is now was NOT established — all that was proved "
-                    + "is that its Trash name was re-pointed; nothing was "
-                    + "reported freed; refused, re-scan required"
-            case .destinationNotTheAdmittedContainer(let landed):
-                return "\(unproved), and the folder that HOLDS this path is "
-                    + "no longer the one the safety check admitted — so what "
-                    + "the Trash took was NOT put back into it. It is in the "
-                    + "Trash at \(landed). Move it back once the folder at "
-                    + "\(path) is the one you expect; nothing was reported "
-                    + "freed; refused, re-scan required"
+                // `rollBack` got past the Trash open, re-bound the landing,
+                // opened AND PROVED the destination against the admitted
+                // container, renamed, and identified the arrival there.
+                return always.union([
+                    .theDisposalWasNotProvedToHaveMovedTheItem,
+                    .theItemIsBackAtTheTarget,
+                ])
+            case .strandedInTrash:
+                // Reached from two places, and BOTH have an object identified
+                // at the landing: the Trash open failed (`observed` is
+                // non-`nil` on that line) or the destination open failed
+                // after the re-bind matched. Nothing was moved either way, so
+                // the object is still where the disposal put it.
+                return always.union([
+                    .theDisposalWasNotProvedToHaveMovedTheItem,
+                    .theItemIsAtTheLanding,
+                ])
+            case .lastSeenInTrash:
+                // The landing could not be named — absent, replaced,
+                // unreadable, or the rename answered ENOENT. Nothing was
+                // moved, and where the object is was NOT established: it may
+                // never have left the target, and it may be somewhere this
+                // process could not read.
+                return always.union([
+                    .theDisposalWasNotProvedToHaveMovedTheItem,
+                    .theLandingDidNotYieldTheItem,
+                    .theItemsWhereaboutsAreNotEstablished,
+                ])
+            case .putBackTookAnotherObject:
+                // The re-bind identified an object at the landing NAME and
+                // the rename then moved a DIFFERENT one out of it. That is a
+                // fact about the name and about what now stands at the
+                // target; it says nothing about where the first object went
+                // (r16, A-P1 — measured: it is not under the landing's
+                // container at all).
+                return always.union([
+                    .theDisposalWasNotProvedToHaveMovedTheItem,
+                    .theLandingNameWasRepointed, .aStrangerStandsAtTheTarget,
+                    .theItemsWhereaboutsAreNotEstablished,
+                ])
+            case .destinationNotTheAdmittedContainer:
+                // The destination open+prove failed on IDENTITY, after the
+                // re-bind had matched at the landing. So the object is still
+                // at the landing and the folder that holds the target is not
+                // the admitted one.
+                return always.union([
+                    .theDisposalWasNotProvedToHaveMovedTheItem,
+                    .theHoldingFolderIsNotTheAdmittedOne,
+                    .theItemIsAtTheLanding,
+                ])
             case .destinationUnknown:
-                return "\(path): the Trash did not report where it put the "
-                    + "item, so which folder it took cannot be established — "
-                    + "nothing was reported freed. Check the Trash, and use "
-                    + "permanent delete (turn off Move to Trash) for a "
-                    + "disposal that proves the folder it acts on"
+                // Raised before anything about a landing is known — the
+                // mover returned `nil`. It did NOT throw, and the seam's
+                // contract is a move to the Trash, so what it took is in the
+                // Trash under a name this code was never told.
+                // `.theDisposalWasNotProvedToHaveMovedTheItem` is NOT here:
+                // this message never carried the shared opening, and must not
+                // gain one (r15, D-P3).
+                return always.union([
+                    .theLandingWasNotReported, .theTrashHoldsWhatItTook,
+                ])
             }
+        }
+
+        /// THE MESSAGE, CLAUSE BY CLAUSE.
+        ///
+        /// THE SHARED OPENING, AND WHY IT IS THIS ONE (PR #460 codex r15,
+        /// D-P3). Five of these six messages used to open "the folder at this
+        /// path is no longer the one that was inspected — it was replaced
+        /// between the safety check and the disposal". NO ARM'S AFTER-PROOF
+        /// TESTS THAT. Everything this file establishes after the mover
+        /// returns is about the LANDING: `facts(at: landed)` / `look(at:
+        /// landed)` compared with what was bound. THE TARGET IS NEVER
+        /// RE-READ. MEASURED at df551b1, event `moverMovedNothing` (the mover
+        /// proves, moves nothing, and reports a landing where nothing
+        /// stands), all four Trash paths: `.lastSeenInTrash`, zero moves, and
+        /// the target still on disk, untouched, SAME INODE. The message told
+        /// the user their folder had been replaced — and told them to go and
+        /// look in the Trash — for an item that never left.
+        ///
+        /// AND THE OPENING WAS ONLY THE OPENING (PR #460 codex r16,
+        /// A-P1/A-P2). r15's two guards inspected the FIRST CLAUSE and
+        /// nothing else, so two false TAILS walked straight through them:
+        /// `.lastSeenInTrash` ended "Look in the Trash for it" (measured on
+        /// the `moverMovedNothing` fixture at 3110d1e: this cause, ZERO
+        /// moves, the item STILL AT THE TARGET at the SAME INODE, nothing in
+        /// the Trash at all), and `.putBackTookAnotherObject` ended "…and the
+        /// item the Trash took is still in the Trash" (measured at 3110d1e
+        /// with the swap in the real one-syscall window: the taken object is
+        /// moved OUT of the landing's container entirely).
+        ///
+        /// AND THE FENCE THAT CAUGHT THOSE TWO CAUGHT ONLY THOSE TWO (PR #460
+        /// codex r17, M1) — see `Established`. The messages are assembled
+        /// here from tagged clauses so that the FENCE CAN BE A PROPERTY: no
+        /// clause may assert a proposition its own cause did not establish,
+        /// and there is no untagged text for a new false sentence to hide in.
+        ///
+        /// Pinned by `TrashDisposalHopProofTests`'
+        /// `…NoTrashFailureMessageAssertsAnythingItsOwnProofDidNotEstablish`
+        /// (the property fence, off the type),
+        /// `…NoFailureMessageAssertsTheTargetWasReplacedWithoutReadingIt` and
+        /// `…EveryTrashFailureMessageOpensWithWhatWasActuallyProved` (r15's
+        /// opening guards, kept), and the two fixture cells that prove the
+        /// retired propositions FALSE on the events their causes are named
+        /// for —
+        /// `…TheLastSeenMessageDoesNotSendTheUserToTheTrashForAnItemStillOnDisk`
+        /// and `…APutBackThatTookAnotherObjectDoesNotClaimWhereTheTakenOneIs`.
+        static func claims(path: String, cause: Cause) -> [Claim] {
+            let unproved = Claim(
+                establishes: .theDisposalWasNotProvedToHaveMovedTheItem,
+                text: "\(path): the disposal could not be proved to have "
+                    + "moved the item that was inspected"
+            )
+            let nothingFreed = Claim(
+                establishes: .nothingWasReportedFreed,
+                text: "; nothing was reported freed"
+            )
+            let rescan = Claim(
+                establishes: .theRemedyForThisRefusal,
+                text: "; refused, re-scan required"
+            )
+            switch cause {
+            case .putBack:
+                // THIS MESSAGE HAS CARRIED TWO NET-EFFECT CLAIMS AND BOTH
+                // ARE RETIRED, one round apart.
+                //
+                // "Nothing was moved to the Trash" (retired r16, A-P4b) was
+                // false about the net effect: an object WAS moved to the
+                // Trash and then retrieved from it. What this arm PROVED is
+                // narrower and is what the clause below says — the object
+                // was moved back out under the held Trash descriptor and
+                // IDENTIFIED at this path under the held, admitted
+                // destination descriptor.
+                //
+                // "nothing was freed" (retired r17, M4) survived that fix by
+                // one clause, and was the only one of the six messages to
+                // make the claim BARE — the other five say "nothing was
+                // REPORTED freed", which is a fact about the report this
+                // code writes. "Nothing was freed" is a fact about the DISK,
+                // and this arm establishes no such thing: on the fixture
+                // that produces the cause the inspected object really is
+                // gone from where it stood, and the after-proof never looks
+                // at bytes. r16's whole-message guard did not catch it,
+                // because that guard was a list of phrases somebody had
+                // already thought of and this phrase was not on it. What
+                // keeps the class out now is `Established`'s
+                // `.nothingWasFreedOnDisk` — a proposition NO arm
+                // establishes, against which every clause carrying a
+                // net-effect word is checked.
+                return [
+                    unproved,
+                    Claim(
+                        establishes: .theItemIsBackAtTheTarget,
+                        text: ", so what it did take has been PUT BACK: it "
+                            + "was moved back out of the Trash and identified "
+                            + "at this path"
+                    ),
+                    nothingFreed, rescan,
+                ]
+            case .strandedInTrash(let landed):
+                return [
+                    unproved,
+                    Claim(
+                        establishes: .theItemIsAtTheLanding,
+                        text: ", and what it did take could not be put back "
+                            + "automatically — it is in the Trash at "
+                            + "\(landed)."
+                    ),
+                    Claim(
+                        establishes: .theItemIsAtTheLanding,
+                        text: " Move it back from there"
+                    ),
+                    nothingFreed, rescan,
+                ]
+            case .lastSeenInTrash(let landed):
+                return [
+                    unproved,
+                    Claim(
+                        establishes: .theLandingDidNotYieldTheItem,
+                        text: ", and nothing could be put back — what it "
+                            + "reported putting at \(landed) cannot be found "
+                            + "there now, so nothing was moved rather than "
+                            + "moving whatever took its place."
+                    ),
+                    Claim(
+                        establishes: .theItemsWhereaboutsAreNotEstablished,
+                        text: " Where the item is now was NOT established: it "
+                            + "may never have left \(path), and it may be "
+                            + "somewhere this could not read."
+                    ),
+                    Claim(
+                        establishes: .nothingWasReportedFreed,
+                        text: " Nothing was reported freed"
+                    ),
+                    rescan,
+                ]
+            case .putBackTookAnotherObject(let landed):
+                return [
+                    unproved,
+                    Claim(
+                        establishes: .theLandingNameWasRepointed,
+                        text: ", and putting back what it did take moved a "
+                            + "DIFFERENT object — the Trash name it came from "
+                            + "(\(landed)) was re-used while the undo was "
+                            + "running."
+                    ),
+                    Claim(
+                        establishes: .aStrangerStandsAtTheTarget,
+                        text: " Whatever now stands at \(path) came out of "
+                            + "the Trash and was NOT put there by you."
+                    ),
+                    Claim(
+                        establishes: .theItemsWhereaboutsAreNotEstablished,
+                        text: " Where the item the Trash took is now was NOT "
+                            + "established — all that was proved is that its "
+                            + "Trash name was re-pointed"
+                    ),
+                    nothingFreed, rescan,
+                ]
+            case .destinationNotTheAdmittedContainer(let landed):
+                return [
+                    unproved,
+                    Claim(
+                        establishes: .theHoldingFolderIsNotTheAdmittedOne,
+                        text: ", and the folder that HOLDS this path is no "
+                            + "longer the one the safety check admitted — so "
+                            + "what the Trash took was NOT put back into it."
+                    ),
+                    Claim(
+                        establishes: .theItemIsAtTheLanding,
+                        text: " It is in the Trash at \(landed)."
+                    ),
+                    Claim(
+                        establishes: .theHoldingFolderIsNotTheAdmittedOne,
+                        text: " Move it back once the folder at \(path) is "
+                            + "the one you expect"
+                    ),
+                    nothingFreed, rescan,
+                ]
+            case .destinationUnknown:
+                return [
+                    Claim(
+                        establishes: .theLandingWasNotReported,
+                        text: "\(path): the Trash did not report where it put "
+                            + "the item, so which folder it took cannot be "
+                            + "established"
+                    ),
+                    Claim(
+                        establishes: .nothingWasReportedFreed,
+                        text: " — nothing was reported freed."
+                    ),
+                    Claim(
+                        establishes: .theTrashHoldsWhatItTook,
+                        text: " Check the Trash,"
+                    ),
+                    Claim(
+                        establishes: .theRemedyForThisRefusal,
+                        text: " and use permanent delete (turn off Move to "
+                            + "Trash) for a disposal that proves the folder "
+                            + "it acts on"
+                    ),
+                ]
+            }
+        }
+
+        /// The join, and NOTHING ELSE. Every word the user sees comes from a
+        /// `Claim` that named the proposition it asserts; there is no free
+        /// text here for an unfenced sentence to live in.
+        var errorDescription: String? {
+            Self.claims(path: path, cause: cause).map(\.text).joined()
         }
     }
 

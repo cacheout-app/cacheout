@@ -856,6 +856,20 @@ below are both part of that coordination, and the latter BLOCKS this release.
   both still name every path they do know. The check that keeps false claims
   out of these messages used to read only their first sentence; it now reads
   the whole message.
+- **And the last refusal that claimed something about your disk no longer
+  does.** One of the six — the one you see when Cacheout takes something back
+  out of the Trash because it could not prove the Trash took the right thing
+  — ended "nothing was freed". The other five say "nothing was REPORTED
+  freed", which is what Cacheout actually knows: it wrote no entry and
+  counted no bytes. Whether anything on the disk was freed is not something
+  that check looks at, and on the very event that produces this message
+  something else HAD been moved. It now says "nothing was reported freed",
+  like its five siblings. The check behind all six changed shape too: it used
+  to be a list of sentences that had been caught being wrong, so a NEW way of
+  saying the same wrong thing passed it. Each message is now assembled from
+  clauses that each name the one thing they claim, and every clause is
+  checked against what that refusal's own code path proved — so a false
+  sentence nobody has thought of yet fails as well.
 - **A background refresh no longer reads the folders it has already decided
   to skip.** The ephemeral-temp scanner runs only when you ask for a scan, but
   before each scan Cacheout records the identity of every folder it might

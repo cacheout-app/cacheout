@@ -1591,6 +1591,9 @@ struct ValidatedScanSession {
     /// `scanValidated` returns (that API is now a thin wrapper over this).
     let events: AsyncStream<ValidatedScannerEvent>
     fileprivate let producer: Task<Void, Never>
+    /// The session's publish/conclude ledger — also the authority on WHY it
+    /// ended (see `didExceedBounds`).
+    fileprivate let ledger: ScanSessionLedger
     /// Opened when the producer returns, and — if it does not — by the
     /// watchdog once the wind-down grace expires. See
     /// `untilProducerFinishes()`.
@@ -1598,6 +1601,35 @@ struct ValidatedScanSession {
     /// How long `untilProducerFinishes()` waits for a cancelled producer
     /// that is not winding down.
     fileprivate let windDownGrace: Duration
+
+    /// TRUE when this session was ended by its wall-clock bound rather than
+    /// by the producer finishing — i.e. at least one scanner was cut off and
+    /// reported `.scanDidNotFinish` (PR #460 codex r13, D).
+    ///
+    /// A CONSUMER MUST TREAT THIS EXACTLY AS IT TREATS ITS OWN CANCELLATION,
+    /// and that is not a style note. The watchdog cancels the PRODUCER; it
+    /// cannot cancel the consumer, so `Task.isCancelled` is FALSE in a
+    /// consumer whose session was cut off, and every "did this scan finish"
+    /// test written against it silently answered yes. `CacheoutViewModel
+    /// .scan` read exactly that, ran its adoption block, and MEASURED: a
+    /// first-ever scan with one healthy and one wedged scanner at a 200 ms
+    /// bound left `hasScanned == true` and the healthy scanner's items
+    /// SELECTED and cleanable — while, by this bound's own admission, an
+    /// orphaned read-only walk may still be traversing the same trees. Read
+    /// this after the event stream ends; it is false while the session runs.
+    ///
+    /// ONE OF THE TWO CONSUMERS READS IT TODAY, and saying which is the point
+    /// of writing this down. `CacheoutViewModel.scan` does, and that is where
+    /// the measured defect was. `CLIHandler.collectValidatedScan` does NOT:
+    /// it collects the `.scanDidNotFinish` issues into `malformed`, so a
+    /// clean TARGETING a cut-off scanner is refused, but items belonging to
+    /// scanners that DID report in the same cut-off session remain
+    /// cleanable in that invocation. That is the same class as the defect
+    /// fixed here and it is NOT closed — recorded rather than claimed, and
+    /// left to its own change because the CLI has no `adoptedGeneration` to
+    /// gate and refusing mid-invocation needs a wire-contract decision this
+    /// round did not take.
+    var didExceedBounds: Bool { ledger.boundDidFire }
 
     /// Suspends until the producer task has ACTUALLY returned — scanners
     /// finished or wound down, the group drained. Deliberately
@@ -1622,9 +1654,23 @@ struct ValidatedScanSession {
     /// it is bounded in the way that matters: the orphaned walk is
     /// READ-ONLY, and a session whose bound fired adopts nothing, so
     /// `adoptedGeneration` never advances and every DESTRUCTIVE path stays
-    /// closed on that session's items. The wedged producer task itself is
-    /// leaked — one per wedged session, which is already a session that
-    /// cannot finish.
+    /// closed on that session's items.
+    ///
+    /// THAT LAST SENTENCE WAS FALSE WHEN r12 WROTE IT (PR #460 codex r13, D),
+    /// and it is the mitigation that makes the residual acceptable, so it had
+    /// to become true rather than be softened. The watchdog cancels the
+    /// PRODUCER (`task.cancel()`), never the consumer, so `let completed =
+    /// !Task.isCancelled` in `CacheoutViewModel.scan` was TRUE on a cut-off
+    /// session and the adoption block ran. MEASURED at a 200 ms bound with
+    /// one healthy and one wedged scanner: the wedged one correctly carried
+    /// `.scanDidNotFinish`, and then `hasScanned == true` with the healthy
+    /// scanner's items selected and passing `isBlockedFromDestructivePaths` —
+    /// deletable. `ValidatedScanSession.didExceedBounds` is what closes it:
+    /// the session now says out loud that it was cut off, and its consumers
+    /// adopt nothing when it was.
+    ///
+    /// The wedged producer task itself is leaked — one per wedged session,
+    /// which is already a session that cannot finish.
     func untilProducerFinishes() async {
         // THE GRACE TIMER IS ARMED ONLY WHEN SOMEBODY IS ACTUALLY WAITING,
         // and it runs OFF THE COOPERATIVE POOL. Both matter. Armed here, a
@@ -3149,7 +3195,7 @@ struct SpaceScannerRuntime {
         }
         return ValidatedScanSession(
             snapshot: snapshot, events: events, producer: task,
-            woundDown: woundDown,
+            ledger: ledger, woundDown: woundDown,
             windDownGrace: bounds.producerWindDownGrace
         )
     }

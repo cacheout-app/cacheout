@@ -1493,10 +1493,26 @@ class CacheoutViewModel: ObservableObject {
             handle(event, generation: generation)
         }
 
+        // DID THIS SESSION ACTUALLY FINISH — and there are TWO ways for the
+        // answer to be no, not one (PR #460 codex r13, D).
+        //
         // If the consuming task was cancelled the stream may have ended
         // early — some scanners never delivered. Pruning then would drop
         // selections for items whose scanner simply never reported.
-        let completed = !Task.isCancelled
+        //
+        // AND `Task.isCancelled` DOES NOT COVER THE BOUND. The session's
+        // watchdog cancels the PRODUCER, never this consumer, so a session
+        // cut off by its wall-clock deadline left this flag TRUE and the
+        // adoption block below ran — measured on a first-ever scan with one
+        // wedged scanner: `hasScanned` true, the healthy scanner's items
+        // selected and passing `isBlockedFromDestructivePaths`, i.e.
+        // deletable, while an orphaned read-only walk may still have been
+        // traversing the same trees. `ScanSessionBounds`' own mitigation is
+        // the sentence "a session whose bound fired adopts nothing"; this is
+        // where that becomes true. A bounded session is treated exactly as a
+        // cancelled one: rows already reconciled stay VISIBLE, and nothing
+        // this session saw is vouched for.
+        let completed = !Task.isCancelled && !session.didExceedBounds
 
         // Early termination only CANCELS the producer; its filesystem walks
         // wind down cooperatively rather than instantly (review P2).

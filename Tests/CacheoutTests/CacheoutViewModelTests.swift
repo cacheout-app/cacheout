@@ -1782,10 +1782,11 @@ final class CacheoutViewModelTests: XCTestCase {
 
             for index in 0..<scannerCount {
                 let id = "racer_\(index)"
-                switch counts[id] ?? 0 {
+                let seen = counts[id] ?? 0
+                switch seen {
                 case 1: continue
                 case 0: sawNeither.append("trial \(trial): \(id)")
-                default: sawBoth.append("trial \(trial): \(id) x\(counts[id]!)")
+                default: sawBoth.append("trial \(trial): \(id) x\(seen)")
                 }
             }
         }
@@ -1801,6 +1802,109 @@ final class CacheoutViewModelTests: XCTestCase {
             "and a scanner that finished must not lose its outcome to "
                 + "`finish()`: a partial scan is reported as partial"
         )
+    }
+
+    /// A SESSION CUT OFF BY ITS BOUND VOUCHES FOR NOTHING — the mitigation
+    /// r12 wrote down and did not implement (PR #460 codex r13, D).
+    ///
+    /// `untilProducerFinishes()` discloses a real residual: when the grace
+    /// expires the caller releases its "scan in progress" guard while an
+    /// orphaned walk may still be reading the same trees. What made that
+    /// acceptable was the next sentence — "a session whose bound fired adopts
+    /// nothing, so `adoptedGeneration` never advances and every DESTRUCTIVE
+    /// path stays closed on that session's items". It was false. The watchdog
+    /// cancels the PRODUCER, never the consumer, so `let completed =
+    /// !Task.isCancelled` was TRUE and the adoption block ran: MEASURED on a
+    /// first-ever scan with one healthy and one wedged scanner at a 200 ms
+    /// bound, `hasScanned == true` and the healthy scanner's item selected
+    /// and CLEANABLE.
+    ///
+    /// This is a FIRST-EVER scan on purpose: it is the case with no earlier
+    /// adopted generation to fall back on, so nothing but this gate stands
+    /// between a cut-off session and a delete.
+    ///
+    /// MUTATION: restore `let completed = !Task.isCancelled` in
+    /// `CacheoutViewModel.scan` and every assertion below flips.
+    @MainActor
+    func testABoundedSessionAdoptsNothingAndCleansNothing() async throws {
+        let gate = StallGate()
+        let healthy = ScanOutcome(
+            items: [perItem(scanner: "ok", id: "o1", bytes: 5000,
+                            risk: .safe, defaultSelected: true,
+                            automaticCleanEligible: true)],
+            errors: []
+        )
+        let runtime = try makeRuntime(
+            [
+                fixtureScanner("ok") { healthy },
+                FixtureScanner(
+                    id: "wedged",
+                    trustedContainerRoots: [
+                        base.appendingPathComponent("wedged"),
+                    ]
+                ) {
+                    await gate.hold()
+                    return ScanOutcome(items: [], errors: [])
+                },
+            ],
+            sessionBounds: ScanSessionBounds(
+                eventDeadline: .milliseconds(200),
+                producerWindDownGrace: .milliseconds(100)
+            )
+        )
+        let viewModel = CacheoutViewModel(runtime: runtime)
+
+        // `hold()` does not return until the test releases it, so the only
+        // thing that can end this scan is the bound.
+        await gate.wedge()
+        await viewModel.scan(trigger: .automatic)
+
+        // The bound fired and said so.
+        XCTAssertEqual(
+            viewModel.malformedIssuesByScannerID["wedged"]?.kind,
+            .scanDidNotFinish
+        )
+        // The healthy scanner's row is still VISIBLE — a partial scan is
+        // reported as partial, which is the other half of the contract.
+        XCTAssertEqual(viewModel.items(forScanner: "ok").map(\.id), ["o1"])
+
+        // AND NOTHING IS VOUCHED FOR. This is the sentence made true. The
+        // item IS ticked — `defaultSelected` selected it on its first
+        // emission, exactly as the measurement found — so this is the gate
+        // refusing a live selection, not an empty one trivially passing.
+        XCTAssertTrue(viewModel.selectedItemKeys.contains(key("ok", "o1")))
+        XCTAssertEqual(
+            viewModel.selectedItems.map(\.id), [],
+            "the measurement found `selectedItems == [\"o1\"]` here: items "
+                + "from a cut-off session must not reach a destructive path"
+        )
+        XCTAssertFalse(
+            viewModel.hasCleanableSelection,
+            "a session cut off by its bound must not leave its items "
+                + "cleanable — an orphaned read-only walk may still be in "
+                + "the same trees"
+        )
+        XCTAssertEqual(viewModel.totalCleanableSelectedSize, 0)
+        XCTAssertEqual(viewModel.automaticCleanableSize, 0)
+        XCTAssertFalse(
+            viewModel.hasScanned,
+            "…and the session must not present itself as a completed scan"
+        )
+
+        // Bulk selection cannot re-open the door either.
+        viewModel.selectAllSafe()
+        XCTAssertFalse(viewModel.hasCleanableSelection,
+                       "Quick Clean must not stage an unadopted session")
+
+        // AND A RETRY CAN DIFFER: releasing the wedge and re-scanning adopts
+        // normally, so the fail-closed state is a state and not a trap.
+        await gate.release()
+        await viewModel.scan(trigger: .automatic)
+        XCTAssertNil(viewModel.malformedIssuesByScannerID["wedged"])
+        XCTAssertTrue(viewModel.hasScanned)
+        viewModel.selectAllSafe()
+        XCTAssertTrue(viewModel.hasCleanableSelection)
+        XCTAssertEqual(viewModel.totalCleanableSelectedSize, 5000)
     }
 
     /// How long this file's polling blockers hold a thread when nothing ever

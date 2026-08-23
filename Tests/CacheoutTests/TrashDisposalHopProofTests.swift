@@ -1712,6 +1712,24 @@ final class TrashDisposalHopProofTests: XCTestCase {
     /// not harmless: it was one-refuses/four-succeed with a message naming the
     /// wrong fact.
     ///
+    /// AND THE THIRD PRODUCER IS OUT FOR A REASON THOSE TWO DO NOT COVER (PR
+    /// #460 codex r16, G2). The sentence above accounts for the two
+    /// `.directory` producers and for `ContainerSnapshot`; it says nothing
+    /// about the GIT-WORKTREE path, which does not reach its target by
+    /// listing an admitted root at all — it reads the REGISTRY
+    /// (`GitWorktreeInventory` runs `git worktree list --porcelain -z`).
+    /// `git worktree add` RESOLVES the symlink before it writes that
+    /// registry, so the spelling the scanner reads back is always the real
+    /// one and the symlinked-container arm is unreachable through it.
+    ///
+    /// MEASURED at r16 on this machine (git 2.50.1, Apple Git-155), THREE
+    /// fresh repositories, each worktree created at `<base>/link<N>/wt<N>`
+    /// where `link<N>` is a symlink to `<base>/real/holder<N>`: both
+    /// `.git/worktrees/wt<N>/gitdir` and `git worktree list --porcelain` came
+    /// back naming `<base>/real/holder<N>/wt<N>` — the RESOLVED spelling — in
+    /// 3 of 3 cells. That is a property of `git`, not of this repository, so
+    /// it is recorded here rather than fenced by a cell of ours.
+    ///
     /// WHAT THIS CELL DOES AND DOES NOT COVER, SINCE ITS NAME USED TO OVERSTATE
     /// BOTH (PR #460 codex r15, D-P4a). It was called
     /// `…EveryDestructivePathAgreesUnderASymlinkedContainer` while exercising

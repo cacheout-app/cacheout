@@ -167,7 +167,7 @@ import XCTest
 /// (The suite WAS 1486 at r8's head 7e9b2c5, 1496 at 101753b, 1500 at
 /// a917447, 1511 at 592eb0a, 1522 at 350fa31, 1528 at e29ffb4, 1532 at
 /// d6bdde2, 1537 at a45b89b, 1540 at 12c8320, 1546 at d76246f, 1549 at
-/// d3d62b4, 1554 at afaea66, and IS 1559 at bce1cd9; a total
+/// d3d62b4, 1554 at afaea66, 1559 at bce1cd9, and IS 1562 at ac5215f; a total
 /// is only ever a fact about the commit it was taken at — see
 /// `WorktreeReclaimPerformerTests`' class header, D5, and r10's D4.)
 ///

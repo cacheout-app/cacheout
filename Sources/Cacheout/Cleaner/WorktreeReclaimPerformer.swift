@@ -2565,7 +2565,13 @@ struct WorktreeReclaimPerformer {
         // their causes are named for, and one measuring what a destination
         // container that is no longer a folder produces (A-P4a) — taking it
         // to 1559: `swift test` AT COMMIT bce1cd9 reported 1559 executed /
-        // 2 skipped / 0 failures, exit 0, 180 s.
+        // 2 skipped / 0 failures, exit 0, 180 s. r17's FIRST fixer added
+        // three — one on a worktree below the WALK's depth budget being
+        // offered on every scan (W1), one on a walk-unreached checkout
+        // replaced the instant the listing returned (W1's other half) and one
+        // on a checkout replaced after the walk observed it and before the
+        // listing (W2) — taking it to 1562: `swift test` AT COMMIT ac5215f
+        // reported 1562 executed / 2 skipped / 0 failures, exit 0, 177 s.
         // Every figure here names the
         // commit it was taken at, which is the only spelling that cannot rot.
         // The half that survives every commit — and the half a mutation

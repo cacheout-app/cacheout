@@ -66,13 +66,15 @@ final class CacheoutViewModelTests: XCTestCase {
     private func makeRuntime(
         _ scanners: [any SpaceScanner],
         categories: [CacheCategory] = [],
-        provider: FileSystemIdentityProvider = FileSystemIdentityProvider()
+        provider: FileSystemIdentityProvider = FileSystemIdentityProvider(),
+        sessionBounds: ScanSessionBounds = .default
     ) throws -> SpaceScannerRuntime {
         try SpaceScannerRuntime(
             scanners: scanners,
             categories: categories,
             home: fixtureHome,
-            provider: provider
+            provider: provider,
+            sessionBounds: sessionBounds
         )
     }
 
@@ -1235,6 +1237,223 @@ final class CacheoutViewModelTests: XCTestCase {
         XCTAssertNil(issue.url)
     }
 
+    // ====================================================================
+    // MARK: - THE SESSION'S WALL-CLOCK BOUND (PR #460 codex r12, D2)
+    // ====================================================================
+    //
+    // THE MECHANISM, AND WHY IT NEEDED A DESIGN AND NOT A PATCH.
+    // `for await event in session.events` — one line of PRODUCTION, four
+    // lines below `scanValidatedSession` — consumes a stream whose ONLY
+    // terminator was `continuation.finish()`, reached only after the scan
+    // `TaskGroup` completes. A scanner that never returns therefore parked
+    // that loop forever: no failure, no total line, no exit status, and the
+    // 87 `await viewModel.scan(` call sites in this suite reach it without
+    // spelling a continuation of their own, so no fence over the TEST
+    // sources can see it.
+    //
+    // REPRODUCED at 46f9640 with ONE production line mutated —
+    // `SpaceScanner.swift`'s `continuation.finish()` deleted — run under a
+    // pty so nothing is lost to buffering:
+    //
+    //     Test Suite 'CacheoutViewModelTests' started at 18:49:31.850.
+    //     Test Case '…testACleanScanStillDisplaysASectionThatWasNeverInspected' started.
+    //     <nothing, 240 s, killed>
+    //
+    // `grep -c "Executed .* tests"` = 0.
+    //
+    // THE BOUND IS ON THE SESSION, not on the consumer: see
+    // `ScanSessionBounds`. These cells drive it through the SAME production
+    // path every other cell in this file uses — `await viewModel.scan(…)` —
+    // with the bound injected in milliseconds instead of minutes.
+
+    /// THE WHOLE MECHANISM, END TO END, THROUGH PRODUCTION.
+    ///
+    /// A wedged scanner must not park the scan; the bound must REPORT it
+    /// rather than swallow it; everything else in the session must still be
+    /// published; and the next scan must be able to succeed.
+    ///
+    /// THE CELL ITSELF IS THE STRAND ASSERTION: without the bound, the
+    /// `await viewModel.scan(…)` below never returns and this cell prints
+    /// its name and nothing else, forever.
+    ///
+    /// MUTATION: delete the watchdog `Task` in `scanValidatedSession` and
+    /// this cell hangs rather than fails — which is exactly the mechanism,
+    /// so the run must be given a wall-clock timeout.
+    @MainActor
+    func testAWedgedScannerIsReportedAndDoesNotParkTheScan() async throws {
+        let gate = StallGate()
+        let okOutcome = ScanOutcome(
+            items: [perItem(scanner: "ok", id: "o1", bytes: 5000)], errors: []
+        )
+        let wedgedOutcome = ScanOutcome(
+            items: [perItem(scanner: "wedged", id: "w1")], errors: []
+        )
+        let wedgedSequence = OutcomeSequence([wedgedOutcome, wedgedOutcome])
+        let runtime = try makeRuntime(
+            [
+                fixtureScanner("ok") { okOutcome },
+                FixtureScanner(
+                    id: "wedged",
+                    trustedContainerRoots: [
+                        base.appendingPathComponent("wedged"),
+                    ]
+                ) {
+                    await gate.hold()
+                    return await wedgedSequence.next()
+                },
+            ],
+            sessionBounds: ScanSessionBounds(
+                eventDeadline: .milliseconds(250),
+                producerWindDownGrace: .milliseconds(50)
+            )
+        )
+        let viewModel = CacheoutViewModel(runtime: runtime)
+
+        // (1) A HEALTHY session first, so the retention assertion below is
+        // about real previous results rather than about emptiness.
+        await viewModel.scan(trigger: .automatic)
+        XCTAssertEqual(viewModel.items(forScanner: "wedged").map(\.id), ["w1"])
+        viewModel.toggleSelection(for: key("wedged", "w1"))
+
+        // (2) THE WEDGE. `hold()` does not return until the test releases
+        // it, and the test does not release it until after the scan has
+        // come back — so the only thing that can end this scan is the bound.
+        await gate.wedge()
+        await viewModel.scan(trigger: .automatic)
+
+        // (3) REPORTED, not swallowed.
+        let issue = try XCTUnwrap(
+            viewModel.malformedIssuesByScannerID["wedged"],
+            "a scanner the bound cut off must be reported, not dropped"
+        )
+        XCTAssertEqual(issue.kind, .scanDidNotFinish)
+        XCTAssertNil(issue.url, "a NON-filesystem kind never invents a path")
+        XCTAssertTrue(
+            viewModel.perItemSections.first { $0.scannerID == "wedged" }?
+                .issues.contains(issue) ?? false,
+            "the row is surfaced on that scanner's own section"
+        )
+
+        // (4) FAIL-CLOSED, and the same fail-closed the malformed path
+        // already had: nothing published for it, previous rows and the
+        // user's ticks retained.
+        XCTAssertEqual(viewModel.items(forScanner: "wedged").map(\.id), ["w1"])
+        XCTAssertTrue(viewModel.selectedItemKeys.contains(key("wedged", "w1")))
+
+        // (5) A PARTIAL SCAN IS REPORTED AS PARTIAL. The scanner that DID
+        // report keeps its results — the bound is not a session-wide erase.
+        XCTAssertEqual(viewModel.items(forScanner: "ok").map(\.id), ["o1"])
+
+        // (6) THE GUARD IS RELEASED, which is what makes a retry possible at
+        // all: before the bound the spinner never stopped and no second scan
+        // and no cleanup could start.
+        XCTAssertFalse(viewModel.isAnyScanInProgress,
+                       "the scan guard must not survive the bound")
+
+        // (7) AND A RETRY CAN DIFFER — the property this branch demands of
+        // every incompleteness it reports. The wedge is a wall-clock
+        // condition, not a deterministic cap, so releasing it and re-scanning
+        // clears the row.
+        await gate.release()
+        await viewModel.scan(trigger: .automatic)
+        XCTAssertNil(viewModel.malformedIssuesByScannerID["wedged"],
+                     "a re-scan that finishes clears the row — the remedy the "
+                         + "label names is real")
+        XCTAssertEqual(viewModel.items(forScanner: "wedged").map(\.id), ["w1"])
+    }
+
+    /// THE SECOND BOUND, AND THE ONE THAT IS EASY TO FORGET: ending the
+    /// event stream alone would have moved the strand ONE LINE DOWN, to
+    /// `await session.untilProducerFinishes()`.
+    ///
+    /// A task group does not return until every child does, so a scanner
+    /// that ignores cancellation keeps the producer alive however firmly it
+    /// is cancelled. This scanner blocks its thread outright — the honest
+    /// simulation of a walk inside a syscall — for far longer than the
+    /// session's two bounds combined, and `scan` must still come back.
+    ///
+    /// MUTATION: restore `untilProducerFinishes()` to `await producer.value`
+    /// and this cell alone takes the full wedge (≈2 s) instead of the bound,
+    /// and the assertion on elapsed time fails.
+    @MainActor
+    func testTheWindDownGraceReleasesAWalkThatIgnoresCancellation()
+        async throws
+    {
+        let wedgeSeconds = 2.0
+        let runtime = try makeRuntime(
+            [
+                FixtureScanner(
+                    id: "uncancellable",
+                    trustedContainerRoots: [
+                        base.appendingPathComponent("uncancellable"),
+                    ]
+                ) {
+                    // NOT `Task.sleep`: this must ignore cancellation the
+                    // way a thread inside a syscall does.
+                    Thread.sleep(forTimeInterval: wedgeSeconds)
+                    return ScanOutcome(items: [], errors: [])
+                },
+            ],
+            sessionBounds: ScanSessionBounds(
+                eventDeadline: .milliseconds(200),
+                producerWindDownGrace: .milliseconds(100)
+            )
+        )
+        let viewModel = CacheoutViewModel(runtime: runtime)
+
+        let started = Date()
+        await viewModel.scan(trigger: .automatic)
+        let elapsed = Date().timeIntervalSince(started)
+
+        XCTAssertLessThan(
+            elapsed, wedgeSeconds,
+            "the scan must return on the session's bounds, not on the "
+                + "wedged walk: \(elapsed) s"
+        )
+        XCTAssertFalse(viewModel.isAnyScanInProgress,
+                       "…and the guard must be released with it")
+        let issue = try XCTUnwrap(
+            viewModel.malformedIssuesByScannerID["uncancellable"]
+        )
+        XCTAssertEqual(issue.kind, .scanDidNotFinish)
+    }
+
+    /// THE HEALTHY PATH PAYS NOTHING, asserted rather than assumed: a
+    /// session whose scanners all report ends on the producer's own
+    /// terminator, immediately, and NO `scan_did_not_finish` row appears —
+    /// even with the bound set to a few milliseconds, which every other cell
+    /// in this file exercises at the 30 s default.
+    ///
+    /// Without this, the two cells above would pass against a session that
+    /// reported every scanner as timed out.
+    @MainActor
+    func testAHealthySessionEndsOnItsOwnTerminatorAndReportsNoBound()
+        async throws
+    {
+        let outcome = ScanOutcome(
+            items: [perItem(scanner: "ok", id: "o1", bytes: 5000)], errors: []
+        )
+        let runtime = try makeRuntime(
+            [fixtureScanner("ok") { outcome }],
+            sessionBounds: ScanSessionBounds(
+                eventDeadline: .milliseconds(250),
+                producerWindDownGrace: .milliseconds(50)
+            )
+        )
+        let viewModel = CacheoutViewModel(runtime: runtime)
+
+        let started = Date()
+        await viewModel.scan(trigger: .automatic)
+        let elapsed = Date().timeIntervalSince(started)
+
+        XCTAssertLessThan(elapsed, 0.25,
+                          "a healthy session must not wait out the deadline: "
+                              + "\(elapsed) s")
+        XCTAssertNil(viewModel.malformedIssuesByScannerID["ok"])
+        XCTAssertEqual(viewModel.items(forScanner: "ok").map(\.id), ["o1"])
+        XCTAssertTrue(viewModel.hasScanned)
+    }
+
     // MARK: - Malformed-BLOCKED scanners: retained records are display-only
     // (every destructive path excludes them until a valid outcome arrives)
 
@@ -2055,6 +2274,37 @@ private actor CallCounter {
 /// scanner. An unbounded park in the second direction turns a production
 /// regression into a runner that never finishes and never says why — measured
 /// on the twin in `EphemeralTempRegistrationTests`. See `BoundedRendezvous`.
+/// A gate a fixture scanner passes through instantly until the test WEDGES
+/// it, after which `hold()` does not return until `release()`.
+///
+/// Built on `BoundedRendezvous` — the r11 primitive — so a wedge the test
+/// forgets to release fails the cell after the rendezvous' own bound instead
+/// of parking the run. The session's wall-clock bound is what these cells
+/// are measuring; the rendezvous' is the backstop under it.
+private actor StallGate {
+    private let gate = BoundedRendezvous()
+    private var wedged = false
+
+    init() { gate.open() }
+
+    func wedge() {
+        wedged = true
+        gate.close()
+    }
+
+    func release() {
+        wedged = false
+        gate.open()
+    }
+
+    func hold(
+        file: StaticString = #filePath, line: UInt = #line
+    ) async {
+        guard wedged else { return }
+        await gate.park("a wedged fixture scanner", file: file, line: line)
+    }
+}
+
 private actor ScanGate {
     private let gate = BoundedRendezvous()
 

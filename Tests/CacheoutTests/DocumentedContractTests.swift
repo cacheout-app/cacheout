@@ -463,7 +463,7 @@ final class DocumentedContractTests: XCTestCase {
             .symlinkRoot, .nonDirectoryRoot, .tccDenied,
             .permissionDenied,
             .unreadable, .enumerationTruncated, .configInvalid,
-            .toolUnavailable, .malformedOutcome,
+            .toolUnavailable, .malformedOutcome, .scanDidNotFinish,
         ]
         for kind in allKinds {
             XCTAssertTrue(text.contains("`\"\(kind.wireString)\"`"),
@@ -482,7 +482,10 @@ final class DocumentedContractTests: XCTestCase {
         XCTAssertTrue(pathRow.contains("NON-FILESYSTEM"),
                       "the rule is stated over a KIND CLASS: \(pathRow)")
         // fn-5.6 EXTENDS the named set rather than restating the rule.
-        for kind in ["malformed_outcome", "config_invalid", "tool_unavailable"] {
+        for kind in [
+            "malformed_outcome", "config_invalid", "tool_unavailable",
+            "scan_did_not_finish",
+        ] {
             XCTAssertTrue(pathRow.contains(kind),
                           "the rule must name `\(kind)`: \(pathRow)")
         }

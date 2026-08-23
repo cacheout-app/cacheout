@@ -292,9 +292,9 @@ refreshes.
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `scanner_id` | string | yes | Which scanner reported (or failed validation) |
-| `kind` | string | yes | One of: `"container_refused"`, `"mounted_volume_root"`, `"mounted_volume_root_at_registration"`, `"policy_refused_root"`, `"symlink_root"`, `"non_directory_root"`, `"tcc_denied"`, `"permission_denied"`, `"unreadable"`, `"enumeration_truncated"`, `"config_invalid"`, `"tool_unavailable"`, `"malformed_outcome"`. The list is EXTENSIBLE — consumers must tolerate unknown kinds |
+| `kind` | string | yes | One of: `"container_refused"`, `"mounted_volume_root"`, `"mounted_volume_root_at_registration"`, `"policy_refused_root"`, `"symlink_root"`, `"non_directory_root"`, `"tcc_denied"`, `"permission_denied"`, `"unreadable"`, `"enumeration_truncated"`, `"config_invalid"`, `"tool_unavailable"`, `"malformed_outcome"`, `"scan_did_not_finish"`. The list is EXTENSIBLE — consumers must tolerate unknown kinds |
 | `detail` | string | yes | Human-readable description |
-| `path` | string | conditional | Present for the FILESYSTEM kinds; ABSENT for the NON-FILESYSTEM kinds — `"malformed_outcome"`, `"config_invalid"` and `"tool_unavailable"` — where no filesystem location exists and a fake path is therefore never invented |
+| `path` | string | conditional | Present for the FILESYSTEM kinds; ABSENT for the NON-FILESYSTEM kinds — `"malformed_outcome"`, `"config_invalid"`, `"tool_unavailable"` and `"scan_did_not_finish"` — where no filesystem location exists and a fake path is therefore never invented |
 | `grant_hint` | string | no | Present only when `kind == "tcc_denied"` — the same user-side remedy (Full Disk Access) as category and `scanner_items` rows, since macOS denies CLI processes silently |
 
 A `malformed_outcome` row means that scanner's ENTIRE outcome failed
@@ -356,6 +356,16 @@ had already built is WITHDRAWN, because a tool-less scan reporting zero
 findings is indistinguishable from a machine with no stale worktrees. It
 carries no `path` for the same reason `config_invalid` does not: the problem
 is the toolchain, not a location.
+
+A `scan_did_not_finish` row means the SESSION's wall-clock bound expired
+before that scanner reported anything. Nothing it might have found is
+published — the row travels the same fail-closed path a rejected outcome
+does — while every scanner that DID report keeps its results, so a partial
+scan is reported as partial rather than as complete or as empty. It carries
+no `path`: no single location is the cause. **A retry can differ**, which is
+why the remedy is a re-scan: the bound is over wall-clock time spent on real
+filesystem work, so a warmer cache, an answered privacy prompt, an unmounted
+volume or a less loaded machine can all change the outcome.
 
 **Per-item valuables element (pinned, shared by three surfaces):** the same
 six-field object appears in `scanner_items[].valuables`, in clean plan rows

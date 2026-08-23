@@ -597,6 +597,20 @@ below are both part of that coordination, and the latter BLOCKS this release.
 
 ### Fixed
 
+- **A scan can no longer hang the app forever.** The window showed each
+  scanner's progress and stopped when they all reported — and if one of them
+  never reported, nothing ever ended it: the spinner ran until the app was
+  quit, and while it ran no second scan and no cleanup could start. A scan
+  session now runs under a time limit. When it expires, every scanner that has
+  not reported is listed with "did not finish in time — nothing from it was
+  used; re-scan to try again", nothing that scanner might have found is
+  published, whatever it showed before is kept but cannot be cleaned, and
+  every scanner that DID finish keeps its results — a partial scan is
+  reported as partial, never as complete and never as empty. The limit is far
+  above any real scan, and re-scanning genuinely can succeed: it is a limit on
+  elapsed time, so a warmer cache, an answered privacy prompt or an unmounted
+  volume changes the outcome. `scan --format json` reports it as a
+  `scan_did_not_finish` row in `scanner_errors`.
 - **"Move to Trash" no longer tells you your folder could not be put back
   while it is sitting in the Trash.** Move to Trash is the shipped default,
   and after moving an item Cacheout re-identifies it where the Trash said it

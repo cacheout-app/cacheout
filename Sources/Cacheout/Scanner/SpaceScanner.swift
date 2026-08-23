@@ -949,6 +949,28 @@ struct ScanIssue: Equatable, Sendable {
         /// and its items excluded, so a scanner must not be able to publish
         /// items BESIDE a `malformed_outcome` row.
         case malformedOutcome
+        /// The session's WALL-CLOCK BOUND fired before this scanner reported
+        /// (PR #460 codex r12, D2). Synthesized ONLY by
+        /// `SpaceScannerRuntime.scanValidatedSession`'s watchdog, for each
+        /// scanner that had not delivered an event when the bound expired.
+        ///
+        /// ITS OWN KIND, and specifically NOT `.malformedOutcome`, because
+        /// the two differ in the one thing a kind-derived label must get
+        /// right — what happened and what the user can do. Nothing was
+        /// REJECTED here: nothing ARRIVED. And the remedy is real, which is
+        /// the property this branch demands of every incompleteness it
+        /// reports: the bound is over WALL-CLOCK time spent on real
+        /// filesystem work, so a re-scan on a warmer cache, an answered
+        /// privacy prompt, an unmounted volume or a less loaded machine can
+        /// genuinely differ — unlike a deterministic cap, which the "re-scan
+        /// and retry" a label prints can never clear.
+        ///
+        /// A NON-filesystem kind: no single path is the cause, so `url` is
+        /// nil and a fake path is never invented. `detail` names the bound
+        /// that fired. It is FAIL-CLOSED downstream by construction — it
+        /// travels as a `.malformed` event, which every consumer already
+        /// treats as "this scanner published nothing this session".
+        case scanDidNotFinish
 
         /// FROZEN wire strings, case-by-case (epic contract).
         var wireString: String {
@@ -967,14 +989,15 @@ struct ScanIssue: Equatable, Sendable {
             case .configInvalid: return "config_invalid"
             case .toolUnavailable: return "tool_unavailable"
             case .malformedOutcome: return "malformed_outcome"
+            case .scanDidNotFinish: return "scan_did_not_finish"
             }
         }
     }
 
     /// Required BY CONVENTION for the filesystem kinds; nil for the
     /// NON-filesystem kinds (`.malformedOutcome`, `.configInvalid`,
-    /// `.toolUnavailable`) — no filesystem location exists, and a fake path
-    /// must never be invented.
+    /// `.toolUnavailable`, `.scanDidNotFinish`) — no filesystem location
+    /// exists, and a fake path must never be invented.
     /// The wire `path` key is conditional on the same rule.
     let url: URL?
     let kind: Kind
@@ -1214,6 +1237,152 @@ extension SpaceScanner {
 enum ValidatedScannerEvent: Sendable {
     case outcome(scannerID: String, ScanOutcome)
     case malformed(scannerID: String, ScanIssue)
+
+    /// WHO this event is about — both cases carry it, and the session's
+    /// watchdog needs it to tell a scanner that reported from one that did
+    /// not (PR #460 codex r12, D2).
+    var scannerID: String {
+        switch self {
+        case .outcome(let id, _), .malformed(let id, _): return id
+        }
+    }
+}
+
+/// THE TWO WALL-CLOCK BOUNDS A SCAN SESSION RUNS UNDER (PR #460 codex r12,
+/// D2), and why a session has any.
+///
+/// ## The mechanism
+///
+/// `ValidatedScanSession.events` is an `AsyncStream` whose ONLY terminator
+/// was `continuation.finish()`, reached only after the scan `TaskGroup`
+/// completes — so a scanner that never returns parks EVERY consumer of that
+/// stream forever. That is not a test problem with a test remedy: the park is
+/// in PRODUCTION (`CacheoutViewModel.scan`'s `for await event in
+/// session.events`, and `CLIHandler.collectValidatedScan`'s), it is reached
+/// from 101 sites in the suite that spell no continuation of their own, and
+/// what the user sees is a spinner that never stops, no second scan and no
+/// cleanup — for as long as anybody is willing to wait.
+///
+/// ## Why the bound is HERE and not on the producer
+///
+/// The producer is `await withTaskGroup { … }`, and a task group does not
+/// return until every child returns. A scanner wedged in a call that does not
+/// observe cancellation cannot be made to return by cancelling it. So the
+/// producer's completion is precisely the thing that CANNOT be bounded, and
+/// any design that waits on it inherits the park — which is why
+/// `untilProducerFinishes()` is bounded too, and not only the stream.
+///
+/// One bound in the session covers every consumer, present and future, GUI
+/// and CLI, without any of them knowing: the alternative is one deadline per
+/// `for await`, fourteen of them today, that nothing can hold in step.
+///
+/// ## What happens when one fires
+///
+/// NOT a silent truncation — that is its own defect. The watchdog first
+/// yields one `.malformed` event carrying `ScanIssue.Kind.scanDidNotFinish`
+/// for EACH scanner that has not reported, so the timeout reaches the user
+/// through the same fail-closed path a rejected outcome already takes:
+/// nothing is published for that scanner, its previous rows are retained but
+/// excluded from every destructive path, and its section carries a row saying
+/// what did not happen. Scanners that DID report keep their results — a
+/// partial scan is reported as partial, never as complete and never as empty.
+struct ScanSessionBounds: Sendable {
+    /// How long the whole session may take before the event stream is ended
+    /// on its behalf. Deliberately FAR above any measured scan: it exists to
+    /// convert "never" into "reported", not to hurry a slow machine.
+    let eventDeadline: Duration
+    /// After the deadline fires, how long the cancelled producer is given to
+    /// wind down before `untilProducerFinishes()` stops waiting for it. See
+    /// that method for what is given up when this one expires.
+    let producerWindDownGrace: Duration
+
+    /// What the SHIPPED composition runs under — `production(…)` is the
+    /// only construction in the repo that names it. Ten minutes is far above
+    /// any measured scan of a real machine; it exists to convert "never"
+    /// into "reported", and a scan that legitimately needs longer than this
+    /// has a different problem.
+    static let production = ScanSessionBounds(
+        eventDeadline: .seconds(600), producerWindDownGrace: .seconds(30)
+    )
+
+    /// WHAT A COMPOSITION THAT DID NOT NAME A BOUND GETS, and why it is not
+    /// `.production`.
+    ///
+    /// Every construction of `SpaceScannerRuntime` in this repo other than
+    /// `production(…)` is a composition of FIXTURE scanners — closures that
+    /// return in microseconds, or ones a test releases by hand a few
+    /// MainActor steps later. Thirty seconds is three orders of magnitude of
+    /// headroom for that, and it is the same figure `BoundedRendezvous`
+    /// chose for the same reason (PR #460 codex r11, D2): it never fails
+    /// anything for being SLOW, only for being ABANDONED.
+    ///
+    /// It matters that the two differ. With `.production` here, ONE wedged
+    /// fixture would cost the suite ten minutes per scan and the run would
+    /// look, to anyone watching, exactly like the strand this bound exists
+    /// to end. A default that is short enough to READ is the whole point of
+    /// having a default at all.
+    ///
+    /// A future SHIPPING composition that forgets to name `.production` gets
+    /// this one, and fails VISIBLY (a `scan_did_not_finish` row per scanner
+    /// that ran long, nothing published, a re-scan offered) rather than
+    /// dangerously — which is the direction to be wrong in.
+    static let `default` = ScanSessionBounds(
+        eventDeadline: .seconds(30), producerWindDownGrace: .seconds(5)
+    )
+}
+
+/// A one-shot gate: opened at most once, by whichever party gets there
+/// first, and waited on WITHOUT observing cancellation.
+///
+/// Lock-guarded rather than an actor because `open()` is called from
+/// `Task.detached` closures and must not suspend, and because the wait must
+/// be a plain `withCheckedContinuation` — the ONE spelling that ignores the
+/// caller's cancellation, which is the property `untilProducerFinishes()`
+/// documents and depends on.
+final class OneShotGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var isOpen = false
+    private var waiting: [CheckedContinuation<Void, Never>] = []
+
+    func open() {
+        lock.lock()
+        guard !isOpen else { lock.unlock(); return }
+        isOpen = true
+        let resuming = waiting
+        waiting = []
+        lock.unlock()
+        for continuation in resuming { continuation.resume() }
+    }
+
+    func wait() async {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if isOpen {
+                lock.unlock()
+                continuation.resume()
+                return
+            }
+            waiting.append(continuation)
+            lock.unlock()
+        }
+    }
+}
+
+/// Which scanners have delivered an event — read by the watchdog to decide
+/// whose absence it must REPORT rather than swallow.
+final class ReportedScanners: @unchecked Sendable {
+    private let lock = NSLock()
+    private var ids = Set<String>()
+
+    func record(_ id: String) {
+        lock.lock(); ids.insert(id); lock.unlock()
+    }
+
+    func missing(from selected: [String]) -> [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return selected.filter { !ids.contains($0) }
+    }
 }
 
 /// One RUNNING validated scan (review P2): the progressive event stream
@@ -1235,17 +1404,57 @@ struct ValidatedScanSession {
     /// `scanValidated` returns (that API is now a thin wrapper over this).
     let events: AsyncStream<ValidatedScannerEvent>
     fileprivate let producer: Task<Void, Never>
+    /// Opened when the producer returns, and — if it does not — by the
+    /// watchdog once the wind-down grace expires. See
+    /// `untilProducerFinishes()`.
+    fileprivate let woundDown: OneShotGate
+    /// How long `untilProducerFinishes()` waits for a cancelled producer
+    /// that is not winding down.
+    fileprivate let windDownGrace: Duration
 
     /// Suspends until the producer task has ACTUALLY returned — scanners
     /// finished or wound down, the group drained. Deliberately
-    /// NON-cancellable: `Task<_, Never>.value` cannot throw, so awaiting it
-    /// from an already-cancelled task still waits out the wind-down — the
-    /// entire point is to hold a "scan in progress" guard honestly PAST the
-    /// consumer's own cancellation. In the normal completion path the
-    /// producer has already finished by the time `events` ends, so the
-    /// await returns immediately.
+    /// NON-cancellable: the wait is a plain `withCheckedContinuation`, so
+    /// awaiting it from an already-cancelled task still waits out the
+    /// wind-down — the entire point is to hold a "scan in progress" guard
+    /// honestly PAST the consumer's own cancellation. In the normal
+    /// completion path the producer has already finished by the time
+    /// `events` ends, so the await returns immediately.
+    ///
+    /// AND IT IS BOUNDED (PR #460 codex r12, D2). Through r11 this was
+    /// `await producer.value`, which is unbounded by construction: a task
+    /// group does not return until every child does, so one wedged scanner
+    /// parked this await forever — and bounding only the event stream would
+    /// have moved the strand one line down in the ONE consumer that matters,
+    /// `CacheoutViewModel.scan`, which awaits both.
+    ///
+    /// WHAT IS GIVEN UP WHEN THE GRACE EXPIRES, DISCLOSED RATHER THAN
+    /// GLOSSED: the caller releases its "scan in progress" guard while a
+    /// cancelled walk may still be reading — exactly what this method
+    /// existed to prevent. That is the price of not being stuck forever, and
+    /// it is bounded in the way that matters: the orphaned walk is
+    /// READ-ONLY, and a session whose bound fired adopts nothing, so
+    /// `adoptedGeneration` never advances and every DESTRUCTIVE path stays
+    /// closed on that session's items. The wedged producer task itself is
+    /// leaked — one per wedged session, which is already a session that
+    /// cannot finish.
     func untilProducerFinishes() async {
-        await producer.value
+        // THE GRACE TIMER IS ARMED ONLY WHEN SOMEBODY IS ACTUALLY WAITING,
+        // and it is DETACHED. Both matter. Armed here, a healthy session —
+        // where the producer opened the gate before `events` even ended —
+        // pays for no sleeping task at all: `wait()` returns on the spot and
+        // the timer is cancelled before it runs. Detached, because a `Task`
+        // created inside a CANCELLED caller starts cancelled, `Task.sleep`
+        // throws immediately, and the grace would collapse to zero in
+        // exactly the case this method exists for — the consumer that has
+        // just been cancelled.
+        let gate = woundDown
+        let timer = Task.detached { [windDownGrace] in
+            try? await Task.sleep(for: windDownGrace)
+            gate.open()
+        }
+        await gate.wait()
+        timer.cancel()
     }
 }
 
@@ -1329,6 +1538,12 @@ struct SpaceScannerRuntime {
     /// fresh one per consumer.
     let gitRunner: (any GitCommandRunning)?
 
+    /// The session's two wall-clock bounds (PR #460 codex r12, D2) — see
+    /// `ScanSessionBounds`. Injectable so a test can put the deadline in
+    /// milliseconds; every existing composition gets `.production`, whose
+    /// values no healthy scan reaches.
+    let sessionBounds: ScanSessionBounds
+
     /// Registration + FOLDED validation as one check (epic rounds 6-7):
     /// scanner-id slug syntax, scanner-id uniqueness, and the combined
     /// category-slug/scanner-slug namespace collision check. Injectable for
@@ -1347,7 +1562,8 @@ struct SpaceScannerRuntime {
         categories: [CacheCategory],
         home: URL,
         provider: FileSystemIdentityProvider,
-        gitRunner: (any GitCommandRunning)? = nil
+        gitRunner: (any GitCommandRunning)? = nil,
+        sessionBounds: ScanSessionBounds = .default
     ) throws {
         var namespace = Set<String>()
         for scanner in scanners {
@@ -1404,6 +1620,7 @@ struct SpaceScannerRuntime {
         self.home = home
         self.provider = provider
         self.gitRunner = gitRunner
+        self.sessionBounds = sessionBounds
     }
 
     /// CROSS-SCANNER alias suppression over the FINAL union (fn-4.5 review,
@@ -1685,7 +1902,12 @@ struct SpaceScannerRuntime {
             categories: categories,
             home: home,
             provider: provider,
-            gitRunner: sharedGitRunner
+            gitRunner: sharedGitRunner,
+            // THE ONLY CONSTRUCTION IN THE REPO THAT NAMES `.production`
+            // (PR #460 codex r12, D2) — and the only one that scans a real
+            // machine. See `ScanSessionBounds.default` for why the two
+            // differ.
+            sessionBounds: .production
         )
     }
 
@@ -2605,6 +2827,13 @@ struct SpaceScannerRuntime {
         let preDeleteRevalidators = self.preDeleteRevalidators
         let (events, continuation) =
             AsyncStream<ValidatedScannerEvent>.makeStream()
+        // THE SESSION'S WALL-CLOCK BOUNDS (PR #460 codex r12, D2) — see
+        // `ScanSessionBounds` for the mechanism and the decision. Everything
+        // the watchdog needs is captured HERE, before any task starts.
+        let bounds = sessionBounds
+        let selectedIDs = selected.map(\.id)
+        let reported = ReportedScanners()
+        let woundDown = OneShotGate()
         let task = Task {
             // Parallelism must not regress: scanners run concurrently
             // across the group (and internally parallel as today);
@@ -2632,14 +2861,49 @@ struct SpaceScannerRuntime {
                     }
                 }
                 for await event in group {
+                    reported.record(event.scannerID)
                     continuation.yield(event)
                 }
             }
             continuation.finish()
+            woundDown.open()
         }
-        continuation.onTermination = { _ in task.cancel() }
+        // THE WATCHDOG. On the healthy path it is cancelled by
+        // `onTermination` the instant the stream ends and never runs a line
+        // of its body; `continuation.finish()` is idempotent, so the two can
+        // race without either being wrong.
+        let watchdog = Task {
+            do {
+                try await Task.sleep(for: bounds.eventDeadline)
+            } catch {
+                return  // cancelled: the session finished on its own.
+            }
+            // REPORTED, NOT SWALLOWED. Every scanner still outstanding gets
+            // the event that says so, BEFORE the stream ends, so the
+            // consumer's fail-closed path runs for it exactly as it would
+            // for a rejected outcome.
+            for id in reported.missing(from: selectedIDs) {
+                continuation.yield(.malformed(
+                    scannerID: id,
+                    ScanIssue(
+                        url: nil, kind: .scanDidNotFinish,
+                        detail: "the scan did not finish within "
+                            + "\(bounds.eventDeadline); nothing from this "
+                            + "scanner was used"
+                    )
+                ))
+            }
+            continuation.finish()
+            task.cancel()
+        }
+        continuation.onTermination = { _ in
+            task.cancel()
+            watchdog.cancel()
+        }
         return ValidatedScanSession(
-            snapshot: snapshot, events: events, producer: task
+            snapshot: snapshot, events: events, producer: task,
+            woundDown: woundDown,
+            windDownGrace: bounds.producerWindDownGrace
         )
     }
 

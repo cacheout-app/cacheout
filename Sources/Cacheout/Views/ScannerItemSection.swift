@@ -267,8 +267,9 @@ struct ScanIssueRowPresentation: Equatable {
     let text: String
     /// Where the problem is, home-collapsed. `ScanIssue.url` is nil for the
     /// non-filesystem kinds (`.malformedOutcome`, `.configInvalid`,
-    /// `.toolUnavailable`) — no filesystem location exists, and a fake path
-    /// is never invented; they render the generic "Scanner output" location.
+    /// `.toolUnavailable`, `.scanDidNotFinish`) — no filesystem location
+    /// exists, and a fake path is never invented; they render the generic
+    /// "Scanner output" location.
     let location: String
     let label: String
     /// TCC denials have a user-side remedy (System Settings deep link);
@@ -331,6 +332,13 @@ struct ScanIssueRowPresentation: Equatable {
         // tool.
         case .toolUnavailable: return "required tool unavailable — not scanned"
         case .malformedOutcome: return "rejected — malformed scanner output; previous results kept"
+        // NOT "rejected" and not "malformed" (PR #460 codex r12, D2):
+        // nothing arrived to reject. The row says what did not happen and
+        // names a remedy that CAN differ — the bound is wall-clock over real
+        // filesystem work, so a re-scan on a warmer cache or a less loaded
+        // machine genuinely can succeed. `detail` carries the bound.
+        case .scanDidNotFinish:
+            return "did not finish in time — nothing from it was used; re-scan to try again"
         }
     }
 }

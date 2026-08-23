@@ -773,6 +773,27 @@ struct WorktreeReclaimPerformer {
                 directory: worktreePath.deletingLastPathComponent(),
                 displayPath: worktreePath.path, provider: provider
             )
+            // AND WHICH TREE, TAKEN IN THE SAME ACT (PR #460 codex r18, C1).
+            // The container binding says WHERE; nothing said WHAT. It is
+            // taken here, under the container that was just proved, for the
+            // reason the paragraph above gives for the container: everything
+            // after the capture is what the binding covers — the two path
+            // re-admissions, the traversal guard, the clean check, the D2
+            // ignored witness, and both arms' hops. Taken any later it would
+            // cover only the hop, which is the window that was already
+            // closed; taken here it covers the window the clean check
+            // OPENS, which is the one that was not.
+            //
+            // WHAT IT DOES NOT COVER, STATED: the delete-time measurement
+            // and the `reestablishStaleGates` subprocesses run BEFORE this
+            // point, in `removeStaleWorktree`. A swap in that earlier window
+            // is refused all the same — the replacement's own `.git` would
+            // have to name the assessed admin directory to get past R1b —
+            // but the bytes this run reports would have been measured on the
+            // object that was swapped out, and no gate here can say so.
+            let boundCheckout = try bindObject(
+                worktreePath, containedIn: admittedParent
+            )
             let recheck = try pathGuard.admitContainer(origin, snapshot: snapshot)
             try pathGuard.validateRemovableItem(worktreePath, inside: recheck)
 
@@ -879,9 +900,17 @@ struct WorktreeReclaimPerformer {
             // itself", was measured false; it is true only from HERE.
             if case .refuse(let tag, let detail) = reproveFromTheFilesystem(
                 worktreePath: worktreePath, adminEntry: adminEntry,
-                carriedIdentity: plan.worktreeAdminEntryIdentity, head: head
+                carriedIdentity: plan.worktreeAdminEntryIdentity, head: head,
+                checkout: boundCheckout
             ) {
-                logRefusal(tag, detail)
+                // ONE LOG LINE, AS ON THE FAR SIDE (PR #460 codex r18). r7
+                // removed the explicit `logRefusal` beside `failure(…,
+                // tag:)` from the `catch let refusal as LastInstantRefusal`
+                // arm — `failure` logs whenever a tag is present — and left
+                // it standing HERE, so every refusal this near-side call
+                // raised was written to `~/.cacheout` twice. Nothing
+                // asserted on the log at this site, so nothing caught it
+                // until r18's C1 cell read `refusals.tags`.
                 return failure(item, detail, tag: tag)
             }
 
@@ -906,6 +935,17 @@ struct WorktreeReclaimPerformer {
                 // own leaf binding. Identity first, then the leaf: the same
                 // order `reproveFromTheFilesystem` gives its own steps, with
                 // the binding the mover acts on left closest to the move.
+                //
+                // AND THE BINDING THAT OVERLOAD CANNOT TAKE IS TAKEN OUT
+                // HERE (PR #460 codex r18, C1). `disposeBoundLeaf` reads the
+                // leaf with `.whateverStandsThere` on the NEAR side of the
+                // mover's hop and compares that reading with itself on the
+                // FAR side — so it catches a swap INSIDE the hop and cannot
+                // catch one BEFORE it: both of its readings then describe the
+                // replacement, and the after-proof confirms the replacement
+                // landed. `boundCheckout` above was taken before the clean
+                // check, and `reproveFromTheFilesystem` inside this closure
+                // is where the two are compared.
                 try await TrashDisposal.dispose(
                     worktreePath, containedIn: admittedParent,
                     provider: provider,
@@ -917,7 +957,7 @@ struct WorktreeReclaimPerformer {
                                     adminEntry: adminEntry,
                                     carriedIdentity:
                                         plan.worktreeAdminEntryIdentity,
-                                    head: head
+                                    head: head, checkout: boundCheckout
                                 )
                             {
                                 throw LastInstantRefusal(
@@ -940,6 +980,14 @@ struct WorktreeReclaimPerformer {
                 // were proved on the far side. Same closure, same order, same
                 // refusal type as the mover's above: the two arms differ only
                 // in what performs the destruction.
+                //
+                // FOUR PROPOSITIONS NOW, NOT THREE (PR #460 codex r18, C1).
+                // The list above — which checkout, whether locked, whether
+                // HEAD moved — left out the tree ITSELF, and
+                // `DepthSafeRemoval` is handed `expecting: nil` for this
+                // deletion, so past the admitted parent it destroyed whatever
+                // answered to the name. `reproveFromTheFilesystem` carries
+                // that fourth one across too.
                 try await removeTree(
                     worktreePath, admittedParent,
                     LastInstantProof {
@@ -949,7 +997,7 @@ struct WorktreeReclaimPerformer {
                                 adminEntry: adminEntry,
                                 carriedIdentity:
                                     plan.worktreeAdminEntryIdentity,
-                                head: head
+                                head: head, checkout: boundCheckout
                             )
                         {
                             throw LastInstantRefusal(tag: tag, detail: detail)
@@ -1689,7 +1737,7 @@ struct WorktreeReclaimPerformer {
     //    `--ignored` DOES NOT NARROW THAT WINDOW, and r7 said it did (PR
     //    #460 codex r8, D4). The ignored comparison is `appeared =
     //    ignoredNow.subtracting(ignoredWitness)`
-    //    (`WorktreeReclaimPerformer.swift:832-844`), computed from the SAME
+    //    (`WorktreeReclaimPerformer.swift:853-865`), computed from the SAME
     //    `status --ignored` reading this proposition is about, and taken
     //    BEFORE `reproveFromTheFilesystem`,
     //    i.e. entirely on the NEAR side of both hops. Nothing re-reads the
@@ -2302,6 +2350,136 @@ struct WorktreeReclaimPerformer {
     // unevidenced guard this project has shipped twice; it was deleted rather
     // than asserted.
 
+    // MARK: - The OBJECT binding (PR #460 codex r18, C1/C2)
+
+    /// WHAT THIS PERFORMER IS ABOUT TO DESTROY, AS AN OBJECT RATHER THAN A
+    /// NAME.
+    ///
+    /// Every gate on both of this file's destructive paths was about
+    /// something ELSE. The stale arm's R1b and last-instant re-proof are about
+    /// the ADMIN DIRECTORY — its inode, its `locked` file, its HEAD witness —
+    /// and the clean check is about a PATH. The prune arm's oracle, its two
+    /// recomputes, its per-directory admission, its measurement and its mount
+    /// gate are all about PATHNAMES. `DepthSafeRemoval.admittedParent` binds
+    /// the FOLDER THAT HOLDS the target. Nothing bound the target itself: both
+    /// arms reached `DepthSafeRemoval.remove(at:expecting: nil …)`, so past
+    /// the admitted parent the removal destroyed whatever answered to the
+    /// name, and the Trash arm's own binding is taken INSIDE the disposal —
+    /// after the window — so its two readings agree with each other about a
+    /// replacement and the after-proof confirms the replacement landed.
+    ///
+    /// ONE MECHANISM FOR BOTH ARMS AND BOTH MODES, WHICH IS THE POINT. This
+    /// is the same shape `TrashDisposal.disposeBoundLeaf` proves with, reached
+    /// through the same function (`TrashDisposal.boundLeaf`): the container is
+    /// opened and `fstat`ed against the caller's admitted identity
+    /// (`DepthSafeRemoval.openAdmittedContainer`), and the leaf is read under
+    /// THAT descriptor with one `fstatat` — kind and identity from a single
+    /// resolution no rename can re-point. Two spellings of this proof is how
+    /// the checkout arm and the prune arm would drift apart, which is the
+    /// drift that left the Trash arm unbound for three rounds.
+    struct BoundObject {
+        let url: URL
+        /// The container the binding was read under — and the SAME value the
+        /// removal is then proved against, so the two cannot be about
+        /// different folders.
+        let containedIn: DepthSafeRemoval.AdmittedParent
+        let facts: FileSystemIdentityProvider.ChildFacts
+    }
+
+    /// The two tags one binding's refusals carry. Spelled as literals rather
+    /// than interpolated from a prefix so every tag in this file stays
+    /// greppable.
+    struct BindingTags {
+        let replaced: String
+        let unreadable: String
+        /// The noun the refusal wording opens with.
+        let noun: String
+    }
+
+    static let checkoutBinding = BindingTags(
+        replaced: "worktree-replaced", unreadable: "worktree-unreadable",
+        noun: "the checkout"
+    )
+    static let prunedAdminBinding = BindingTags(
+        replaced: "prune-admin-replaced",
+        unreadable: "prune-admin-unreadable",
+        noun: "the orphaned admin directory"
+    )
+
+    /// Take the binding. FAIL CLOSED and at no cost: a container this cannot
+    /// open is a container the removal cannot open either.
+    ///
+    /// NO KIND GATE HERE ON PURPOSE. `ChildFacts` carries the kind, and the
+    /// re-read below compares the WHOLE value, so a leaf that changed kind is
+    /// already a replacement. A separate "must be a directory" throw would be
+    /// an arm no fixture could kill — `validateRemovableItem` refuses a
+    /// non-directory target several gates earlier — and this branch has
+    /// shipped two of those.
+    private func bindObject(
+        _ url: URL, containedIn admittedParent: DepthSafeRemoval.AdmittedParent
+    ) throws -> BoundObject {
+        BoundObject(
+            url: url, containedIn: admittedParent,
+            facts: try TrashDisposal.boundLeaf(
+                of: url, containedIn: admittedParent, provider: provider
+            )
+        )
+    }
+
+    /// Re-read the bound object THE SAME WAY and require it to be the same
+    /// one. `nil` means it still is.
+    ///
+    /// SAME FUNCTION ON BOTH SIDES, so the two readings cannot disagree about
+    /// what the object IS — the argument that made `disposeBoundLeaf` right
+    /// at r13, applied to the two propositions this file owns that
+    /// `DepthSafeRemoval` cannot express.
+    private func replacementRefusal(
+        for bound: BoundObject, _ tags: BindingTags
+    ) -> (tag: String, detail: String)? {
+        let now: FileSystemIdentityProvider.ChildFacts
+        do {
+            now = try TrashDisposal.boundLeaf(
+                of: bound.url, containedIn: bound.containedIn,
+                provider: provider
+            )
+        } catch {
+            // SUBSUMED, MEASURED, AND KEPT ANYWAY (PR #460 codex r18).
+            // Replacing this refusal with `return nil` leaves the full suite
+            // GREEN — 1567 executed / 2 skipped, the inherited
+            // `testDescriptorPeakDuringAReAnchorClimb` flake aside — because
+            // every way `boundLeaf` can throw here is a way the removal one
+            // moment later throws too: an unopenable or swapped container is
+            // `openAdmittedContainer`'s refusal on both sides, and a leaf
+            // that is gone is the `ENOENT` the disposal raises for itself.
+            // It stays for the reason `DepthSafeRemoval.admittedParent`
+            // gives for its own subsumed OPEN arm: "I could not read it"
+            // must not be spelled as "there is nothing to object to", which
+            // is the silently permissive shape this binding exists to
+            // remove — and here it also names the failure where the caller
+            // can attribute it.
+            return (
+                tags.unreadable,
+                "refused: \(tags.noun) at \(bound.url.path) could not be "
+                    + "re-identified under its own folder at the last instant "
+                    + "(\(error.localizedDescription)), so it cannot be "
+                    + "proved to be the object the delete-time checks "
+                    + "inspected — nothing was removed. Re-scan to see what "
+                    + "is actually there."
+            )
+        }
+        guard now != bound.facts else { return nil }
+        return (
+            tags.replaced,
+            "refused: \(tags.noun) at \(bound.url.path) is NOT the object the "
+                + "delete-time checks inspected — a different one was renamed "
+                + "onto that path while they ran, and removing it would "
+                + "destroy work nothing in this run ever looked at; nothing "
+                + "was removed. Re-scan; whatever is there now is judged on "
+                + "its own merits."
+        )
+    }
+
+
     /// git's OWN representation of a worktree lock: `git worktree lock`
     /// creates `<admin>/locked` (empty, or holding the `--reason` text) and
     /// `git worktree unlock` removes it — verified on git 2.50.1 both ways.
@@ -2364,7 +2542,8 @@ struct WorktreeReclaimPerformer {
         worktreePath: URL,
         adminEntry: URL,
         carriedIdentity: FileSystemIdentityProvider.Identity?,
-        head: HeadWitness?
+        head: HeadWitness?,
+        checkout: BoundObject
     ) -> GateReestablishment {
         // (1) WHICH CHECKOUT. Same function R1b runs — one implementation, so
         // the last instant and the gate can never disagree about identity.
@@ -2406,28 +2585,58 @@ struct WorktreeReclaimPerformer {
         // (3) HEAD UNMOVED. Absent witness ⇒ this proposition is not in the
         // last-instant set at all, and `reestablishStaleGates` has already
         // refused the one case where that absence is unrecoverable.
-        guard let head else { return .proceed }
-        guard let live = readWitness(
-            adminEntry: adminEntry, substrate: head.substrate
-        ) else {
-            return .refuse(
-                tag: "worktree-head-unreadable",
-                detail: "refused: this worktree's HEAD witness "
-                    + "(\(adminEntry.appendingPathComponent(head.substrate.relativePath).path)) "
-                    + "could not be re-read at the last instant, so the "
-                    + "ancestry answer cannot be tied to a commit — nothing "
-                    + "was removed. Re-scan to rebuild this item."
-            )
+        //
+        // IT IS AN `if`, NOT AN EARLY `return` (PR #460 codex r18, C1): step
+        // (4) below is in the set whether or not a HEAD witness exists, and
+        // an absent witness must not skip it.
+        if let head {
+            guard let live = readWitness(
+                adminEntry: adminEntry, substrate: head.substrate
+            ) else {
+                return .refuse(
+                    tag: "worktree-head-unreadable",
+                    detail: "refused: this worktree's HEAD witness "
+                        + "(\(adminEntry.appendingPathComponent(head.substrate.relativePath).path)) "
+                        + "could not be re-read at the last instant, so the "
+                        + "ancestry answer cannot be tied to a commit — nothing "
+                        + "was removed. Re-scan to rebuild this item."
+                )
+            }
+            guard live == head else {
+                return .refuse(
+                    tag: "worktree-head-moved",
+                    detail: "refused: this worktree's HEAD MOVED while the "
+                        + "delete-time checks were running, so the ancestry "
+                        + "answer is no longer about the commit that is checked "
+                        + "out — nothing was removed. Re-scan; the checkout is "
+                        + "judged on its new HEAD."
+                )
+            }
         }
-        guard live == head else {
-            return .refuse(
-                tag: "worktree-head-moved",
-                detail: "refused: this worktree's HEAD MOVED while the "
-                    + "delete-time checks were running, so the ancestry "
-                    + "answer is no longer about the commit that is checked "
-                    + "out — nothing was removed. Re-scan; the checkout is "
-                    + "judged on its new HEAD."
-            )
+
+        // (4) THE TREE ITSELF (PR #460 codex r18, C1) — the one object every
+        // step above is ABOUT and none of them bound.
+        //
+        // (1) resolves `<worktree>/.git` and compares the ADMIN directory it
+        // names; a directory renamed onto this path whose `.git` file names
+        // the SAME admin entry answers (1), (2) and (3) truthfully, because
+        // all three read the admin directory, which the swap does not touch.
+        // The clean check and the D2 ignored witness then describe a tree
+        // that is no longer there, and the removal — `expecting: nil` on the
+        // permanent arm, `.whateverStandsThere` on the Trash one — takes the
+        // replacement with every ignored and untracked file in it. MEASURED
+        // at 9ca1129 on both arms: the stranger's `secret.env` destroyed
+        // (Trash arm: left in the Trash), `errors == []`, and a SUCCESS entry
+        // of 45056 bytes.
+        //
+        // IT IS LAST, NOT FIRST. Every gate above states a MORE SPECIFIC fact
+        // about the same event when it can see it — a same-path re-add is
+        // `worktree-identity-recreated`, which names the admin directory the
+        // user has to look at — and this is the catch-all for the event none
+        // of them can express. A user told the wrong fact goes and looks at
+        // the wrong thing.
+        if let replaced = replacementRefusal(for: checkout, Self.checkoutBinding) {
+            return .refuse(tag: replaced.tag, detail: replaced.detail)
         }
         return .proceed
     }

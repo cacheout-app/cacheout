@@ -1581,6 +1581,232 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
     }
 
 
+    // MARK: - C1: the CHECKOUT DIRECTORY was bound by NOTHING (r18)
+
+    /// A REPLACEMENT THAT PASSES EVERY GATE THIS PATH HAS.
+    ///
+    /// The r3 attack (`removeAndReAdd`) makes a NEW admin directory, which is
+    /// what `worktree-identity-recreated` catches. This one leaves the admin
+    /// directory ALONE: the checkout is renamed aside and a directory whose
+    /// `.git` file names the SAME admin entry is renamed onto the path. Every
+    /// proposition `reproveFromTheFilesystem` states is then TRUE of the
+    /// replacement — the back-link resolves to the unchanged entry, its inode
+    /// equals the carried one, `<admin>/locked` is absent, and the HEAD
+    /// witness is read from the admin directory, which nothing touched.
+    @discardableResult
+    private static func swapInACompatibleCheckout(
+        at worktree: URL, aside: URL, replacement: URL
+    ) -> Bool {
+        let fileManager = FileManager.default
+        guard (try? fileManager.moveItem(at: worktree, to: aside)) != nil,
+              (try? fileManager.moveItem(at: replacement, to: worktree)) != nil
+        else { return false }
+        return true
+    }
+
+    /// `(st_dev, st_ino)` of `url` itself, compared the way
+    /// `FileSystemIdentityProvider` builds an `Identity` — spelled with a raw
+    /// `lstat` because this runs inside a `@Sendable` staging closure, where
+    /// the test case's own provider is not reachable.
+    private static func stillHasIdentity(
+        _ url: URL, _ expected: FileSystemIdentityProvider.Identity
+    ) -> Bool {
+        var status = stat()
+        guard lstat(url.path, &status) == 0 else { return false }
+        return UInt64(bitPattern: Int64(status.st_dev)) == expected.device
+            && status.st_ino == expected.inode
+    }
+
+    /// A directory that answers to a linked worktree's shape: a `.git` FILE
+    /// naming `adminEntry`, plus one file `git status --porcelain` would
+    /// never report — the population D2 exists for, and the population this
+    /// swap destroys.
+    private func makeCompatibleCheckout(
+        named name: String, pointingAt adminEntry: URL, hostage: String
+    ) throws -> URL {
+        let url = container.appendingPathComponent(name)
+        try fm.createDirectory(at: url, withIntermediateDirectories: true)
+        try Data("gitdir: \(adminEntry.path)\n".utf8)
+            .write(to: url.appendingPathComponent(".git"))
+        try Data("API_KEY=live\n".utf8)
+            .write(to: url.appendingPathComponent(hostage))
+        return url
+    }
+
+    /// C1 (PR #460 codex r18), the PERMANENT arm.
+    ///
+    /// Every gate on this path is about something OTHER than the tree being
+    /// destroyed: R1b and the last-instant re-proof are about the ADMIN
+    /// DIRECTORY (its inode, its `locked` file, its HEAD witness), the
+    /// container binding is about the FOLDER THAT HOLDS the checkout, and the
+    /// clean check is about a PATH. The one object nobody bound was the
+    /// checkout directory itself — `removeTree` reaches
+    /// `DepthSafeRemoval.remove(at:expecting: nil …)`, so past the admitted
+    /// parent the removal destroys whatever answers to the name.
+    ///
+    /// So the attack does not need to defeat a gate; it only needs to arrive
+    /// after the clean check and leave the admin directory alone.
+    func testThePermanentArmRefusesACheckoutSwappedAfterTheCleanCheck()
+        async throws
+    {
+        let repository = try makeRepository(named: "repo")
+        let assessed = try addWorktree(
+            named: "wt", branch: "feature", in: repository
+        )
+        // A second worktree keeps the admin CONTAINER alive, which is the
+        // field shape.
+        try addWorktree(named: "anchor", branch: "anchor", in: repository)
+        let plan = staleplan(
+            worktree: assessed,
+            membership: try membership(of: assessed, in: repository)
+        )
+        let adminEntry = try XCTUnwrap(plan.worktreeAdminEntry)
+        let replacement = try makeCompatibleCheckout(
+            named: "stranger", pointingAt: adminEntry, hostage: "secret.env"
+        )
+        let aside = container.appendingPathComponent("wt-aside")
+        let staged = InvocationCounter()
+        let adminUntouched = InvocationCounter()
+        let removed = TrashRecorder()
+        let refusals = RefusalLog()
+        let fileManager = fm
+        let carried = try XCTUnwrap(plan.worktreeAdminEntryIdentity)
+
+        let runner = lastGateRunner(staging: {
+            guard Self.swapInACompatibleCheckout(
+                at: assessed, aside: aside, replacement: replacement
+            ) else { return }
+            staged.bump()
+            if Self.stillHasIdentity(adminEntry, carried) {
+                adminUntouched.bump()
+            }
+        })
+        let outcome = await perform(
+            item(plan), plan: plan,
+            with: makePerformer(
+                runner: runner, moveToTrash: false,
+                removeTree: { url, _, prove in
+                    try prove()
+                    removed.record(url)
+                    try fileManager.removeItem(at: url)
+                },
+                refusals: refusals
+            )
+        )
+
+        XCTAssertEqual(staged.count, 1, "the fixture never staged the swap")
+        XCTAssertEqual(
+            adminUntouched.count, 1,
+            "the admin directory must still be the scanned INODE at the "
+                + "instant of the swap, or this cell is only the r3 re-add "
+                + "attack wearing a new name"
+        )
+        XCTAssertEqual(
+            removed.urls, [],
+            "the refusal is BEFORE the removal: nothing may be unlinked"
+        )
+        XCTAssertNil(outcome.entry, "nothing may be reported as freed")
+        XCTAssertTrue(
+            fm.fileExists(
+                atPath: assessed.appendingPathComponent("secret.env").path
+            ),
+            "the stranger's ignored work was destroyed — the clean check "
+                + "inspected a tree that is no longer there"
+        )
+        XCTAssertTrue(
+            fm.fileExists(atPath: aside.path),
+            "the assessed tree must still be where the swap put it"
+        )
+        let message = try XCTUnwrapElement(outcome.errors, 0).message
+        XCTAssertTrue(message.contains("Re-scan"), message)
+        XCTAssertEqual(refusals.tags, ["worktree-replaced"])
+        XCTAssertEqual(refusals.details, [message])
+    }
+
+    /// C1, the TRASH arm — the GUI's default disposal.
+    ///
+    /// `TrashDisposal.dispose(_:containedIn:…)` DOES bind a leaf, and that is
+    /// exactly why this window is the one that matters: its binding is taken
+    /// inside the disposal, which is AFTER the swap, so the two `boundLeaf`
+    /// readings agree with each other about the replacement and the
+    /// after-proof confirms the replacement landed. Nothing in that chain
+    /// says the object is the one the clean check inspected.
+    func testTheTrashArmRefusesACheckoutSwappedAfterTheCleanCheck()
+        async throws
+    {
+        let repository = try makeRepository(named: "repo")
+        let assessed = try addWorktree(
+            named: "wt", branch: "feature", in: repository
+        )
+        try addWorktree(named: "anchor", branch: "anchor", in: repository)
+        let plan = staleplan(
+            worktree: assessed,
+            membership: try membership(of: assessed, in: repository)
+        )
+        let adminEntry = try XCTUnwrap(plan.worktreeAdminEntry)
+        let replacement = try makeCompatibleCheckout(
+            named: "stranger", pointingAt: adminEntry, hostage: "secret.env"
+        )
+        let aside = container.appendingPathComponent("wt-aside")
+        let staged = InvocationCounter()
+        let adminUntouched = InvocationCounter()
+        let moved = TrashRecorder()
+        let refusals = RefusalLog()
+        let fileManager = fm
+        let trashRoot = try XCTUnwrap(trashDirectory)
+        let carried = try XCTUnwrap(plan.worktreeAdminEntryIdentity)
+
+        let runner = lastGateRunner(staging: {
+            guard Self.swapInACompatibleCheckout(
+                at: assessed, aside: aside, replacement: replacement
+            ) else { return }
+            staged.bump()
+            if Self.stillHasIdentity(adminEntry, carried) {
+                adminUntouched.bump()
+            }
+        })
+        let outcome = await perform(
+            item(plan), plan: plan,
+            with: makePerformer(
+                runner: runner, moveToTrash: true,
+                trash: { url, prove in
+                    try prove()
+                    moved.record(url)
+                    let landed = trashRoot.appendingPathComponent(
+                        url.lastPathComponent
+                    )
+                    try fileManager.moveItem(at: url, to: landed)
+                    return landed
+                },
+                refusals: refusals
+            )
+        )
+
+        XCTAssertEqual(staged.count, 1, "the fixture never staged the swap")
+        XCTAssertEqual(
+            adminUntouched.count, 1,
+            "the admin directory must still be the scanned INODE at the "
+                + "instant of the swap"
+        )
+        XCTAssertEqual(
+            moved.urls, [],
+            "the refusal is BEFORE the move: the Trash must be untouched"
+        )
+        XCTAssertNil(outcome.entry, "nothing may be reported as freed")
+        XCTAssertTrue(
+            fm.fileExists(
+                atPath: assessed.appendingPathComponent("secret.env").path
+            ),
+            "the stranger's ignored work was moved to the user's Trash"
+        )
+        XCTAssertTrue(fm.fileExists(atPath: aside.path))
+        let message = try XCTUnwrapElement(outcome.errors, 0).message
+        XCTAssertTrue(message.contains("Re-scan"), message)
+        XCTAssertEqual(refusals.tags, ["worktree-replaced"])
+        XCTAssertEqual(refusals.details, [message])
+    }
+
+
     // MARK: - The permanent arm's window, measured under load (r7, D1/D2)
 
     /// Every filesystem question, timestamped, plus the two boundaries this

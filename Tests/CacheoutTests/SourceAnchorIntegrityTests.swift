@@ -208,7 +208,7 @@ final class SourceAnchorIntegrityTests: XCTestCase {
          "state.entries.append(entry)"),
         ("ValuablesDetector.swift:1754-1756",
          "is the only discriminator, so it is cleared before ea"),
-        ("WorktreeReclaimPerformer.swift:832-844",
+        ("WorktreeReclaimPerformer.swift:853-865",
          "let appeared = ignoredNow.subtracting(ignoredWitne"),
     ]
 

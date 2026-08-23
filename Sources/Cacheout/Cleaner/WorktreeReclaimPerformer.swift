@@ -1097,6 +1097,18 @@ struct WorktreeReclaimPerformer {
             )
         }
 
+        // THE BINDING, TAKEN HERE (PR #460 codex r18, C2) — right after the
+        // gate that proves this set is exactly this worktree's own admin
+        // entry, so the traversal guard and R0's subprocess below are inside
+        // what it covers.
+        let bound: [BoundObject]
+        switch bindPrunable(recomputed) {
+        case .bound(let objects):
+            bound = objects
+        case .refuse(_, let detail):
+            return warning(detail)
+        }
+
         // The guard re-runs over both paths the scoped removal covers.
         do {
             try guardTraversal(prunePaths(for: plan), inside: container)
@@ -1121,7 +1133,7 @@ struct WorktreeReclaimPerformer {
         // here would re-enumerate the container after the gate and could
         // sweep a sibling that vanished in between — exactly what the
         // "exactly this worktree's admin entry" gate above exists to prevent.
-        if let refusal = await removeAdminDirectories(recomputed) {
+        if let refusal = await removeAdminDirectories(bound) {
             return warning(refusal.detail)
         }
         return nil
@@ -1250,6 +1262,20 @@ struct WorktreeReclaimPerformer {
             removalSet = finalSet
         }
 
+        // (8b) THE BINDING (PR #460 codex r18, C2). Taken here, one line
+        // after the final oracle answer and the final re-admission, because
+        // everything after it — the traversal guard, R0's subprocess, and
+        // the removal's own hop onto `DispatchQueue.global` — is what it
+        // covers. Every check above was about a PATHNAME.
+        let boundRemovalSet: [BoundObject]
+        switch bindPrunable(removalSet) {
+        case .bound(let objects):
+            boundRemovalSet = objects
+        case .refuse(let tag, let detail):
+            logRefusal(tag, detail)
+            return failure(item, detail, tag: nil)
+        }
+
         // (9) The guard re-runs over the paths the removal traverses.
         do {
             try guardTraversal(prunePaths(for: plan), inside: container)
@@ -1269,7 +1295,7 @@ struct WorktreeReclaimPerformer {
         }
 
         // (9c) THE SCOPED REMOVAL.
-        if let refusal = await removeAdminDirectories(removalSet) {
+        if let refusal = await removeAdminDirectories(boundRemovalSet) {
             logRefusal(refusal.tag, refusal.detail)
             return failure(item, refusal.detail, tag: nil)
         }
@@ -1321,6 +1347,59 @@ struct WorktreeReclaimPerformer {
 
     // MARK: - The SCOPED admin-directory removal (PR #460 codex r1 / C4)
 
+    /// What one attempt to bind the final set answered.
+    private enum PrunableBinding {
+        case bound([BoundObject])
+        case refuse(tag: String, detail: String)
+    }
+
+    /// Bind each directory of the set a caller has just finished checking
+    /// (PR #460 codex r18, C2).
+    ///
+    /// CALLED AT THE POINT THE LAST CHECK ANSWERED, not inside the removal:
+    /// a binding taken immediately before the destruction would prove only
+    /// that the object did not change during the syscall that destroyed it.
+    /// Both callers take it as early as they can — the prune-only mode right
+    /// after its final oracle recompute and re-admission, the gated
+    /// post-removal prune right after the gate that proves the set is exactly
+    /// this worktree's own admin entry — so the traversal guard and the R0
+    /// subprocess that follow are inside what the binding covers.
+    private func bindPrunable(_ directories: [URL]) -> PrunableBinding {
+        var bound: [BoundObject] = []
+        for directory in directories {
+            do {
+                let admittedParent = try DepthSafeRemoval.admittedParent(
+                    directory: directory.deletingLastPathComponent(),
+                    displayPath: directory.path, provider: provider
+                )
+                bound.append(
+                    try bindObject(directory, containedIn: admittedParent)
+                )
+            } catch {
+                // SUBSUMED, MEASURED, KEPT (PR #460 codex r18). Dropping an
+                // unbindable directory silently (`continue`) instead leaves
+                // the FULL suite green at 1567 executed / 2 skipped / 0
+                // failures: an object this cannot bind is one
+                // `removeAdminDirectories` cannot remove either, so both
+                // spellings end in the same under-report of freed bytes. It
+                // refuses because a removal set that quietly SHRINKS between
+                // the check and the mutation is the shape `prune-set-grew`
+                // and the verified-removal accounting exist to keep out, and
+                // a caller cannot attribute a failure it was never told about.
+                return .refuse(
+                    tag: Self.prunedAdminBinding.unreadable,
+                    detail: "refused: the orphaned admin directory "
+                        + "\(directory.path) could not be identified under "
+                        + "its own folder (\(error.localizedDescription)), so "
+                        + "the removal could not be bound to the object the "
+                        + "checks examined — nothing was pruned. Re-scan."
+                )
+            }
+        }
+        return .bound(bound)
+    }
+
+
     /// Why this is a per-directory removal and not
     /// `git worktree prune --expire=now`.
     ///
@@ -1355,30 +1434,50 @@ struct WorktreeReclaimPerformer {
     /// The removal itself is `DepthSafeRemoval` through the cleaner's own
     /// seam, under a container binding captured from a DESCRIPTOR immediately
     /// before it — fn-6's primitive, not a hand-rolled deleter.
+    ///
+    /// IT TAKES BOUND OBJECTS, NOT URLs (PR #460 codex r18, C2). Every gate
+    /// that decided these directories may be destroyed — the oracle, both
+    /// recomputes, the per-directory admission, the measurement, the mount
+    /// gate — is about a PATHNAME, and the removal reached
+    /// `DepthSafeRemoval.remove(at:expecting: nil …)`, so what it destroyed
+    /// was whatever answered to the name past the admitted parent. The
+    /// binding is captured by the CALLER, at the point its last check
+    /// answered, and the container it was read under is the same value the
+    /// removal is proved against — one identity, not two.
     private func removeAdminDirectories(
-        _ directories: [URL]
+        _ directories: [BoundObject]
     ) async -> (tag: String, detail: String)? {
-        for directory in directories {
+        for bound in directories {
+            let directory = bound.url
             if let revived = revivedCheckoutRefusal(for: directory) {
                 return ("prune-checkout-revived", revived)
             }
+            if let replaced = replacementRefusal(
+                for: bound, Self.prunedAdminBinding
+            ) {
+                return replaced
+            }
             do {
-                let admittedParent = try DepthSafeRemoval.admittedParent(
-                    directory: directory.deletingLastPathComponent(),
-                    displayPath: directory.path, provider: provider
-                )
-                // AND THE REVIVAL CHECK CROSSES THE HOP TOO (PR #460 codex r7,
-                // D1). The near-side call a few lines up is the cheap refusal;
-                // this one is the load-bearing one, because between them sits
-                // `removeItemConcurrently`'s hop onto `DispatchQueue.global`
-                // and a checkout repaired inside it is live state. It is the
-                // SAME function, so the two readings cannot disagree about
-                // what "revived" means.
+                // AND BOTH CROSS THE HOP (PR #460 codex r7 D1 for the
+                // revival; r18 C2 for the binding). The near-side calls a few
+                // lines up are the cheap refusals; these are the load-bearing
+                // ones, because between them sits `removeItemConcurrently`'s
+                // hop onto `DispatchQueue.global`. A checkout repaired inside
+                // it is live state; a directory REPLACED inside it was never
+                // examined by anything. Each is the SAME function on both
+                // sides, so no pair of readings can disagree.
                 try await removeTree(
-                    directory, admittedParent, LastInstantProof {
+                    directory, bound.containedIn, LastInstantProof {
                         if let revived = revivedCheckoutRefusal(for: directory) {
                             throw LastInstantRefusal(
                                 tag: "prune-checkout-revived", detail: revived
+                            )
+                        }
+                        if let replaced = replacementRefusal(
+                            for: bound, Self.prunedAdminBinding
+                        ) {
+                            throw LastInstantRefusal(
+                                tag: replaced.tag, detail: replaced.detail
                             )
                         }
                     }

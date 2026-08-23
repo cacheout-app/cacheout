@@ -5216,6 +5216,85 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         XCTAssertTrue(message.contains("Re-scan"), message)
     }
 
+    // MARK: - C2/C3: the pruned ADMIN DIRECTORY's own last instant (r18)
+
+    /// C2 (PR #460 codex r18). Every prune gate — the oracle, the two
+    /// recomputes, the per-directory admission, the measurement, the mount
+    /// check — is about a PATHNAME. The removal then reached
+    /// `DepthSafeRemoval.remove(at:expecting: nil …)`, so the only thing
+    /// proved past the queue hop was the CONTAINER, and the object destroyed
+    /// was whatever answered to the name at that instant.
+    ///
+    /// The replacement here is the field shape Codex named: the old entry is
+    /// pruned by another process and the name is REUSED by a newly created
+    /// worktree whose checkout has not been written yet. Its `gitdir`
+    /// back-link names a `.git` that is not there, so `revivedCheckoutRefusal`
+    /// — the only far-side check this path had — ACCEPTS it, and its HEAD and
+    /// reflog go with it.
+    func testTheDirectPruneRefusesAnAdminDirectoryReplacedInsideItsOwnHop()
+        async throws
+    {
+        let fixture = try makePruneFixture(orphans: ["gone"])
+        let orphan = try XCTUnwrapElement(fixture.admin, 0)
+        let plan = prunePlan(membership: fixture.membership, disclosed: [orphan])
+        let aside = fixture.membership.parentAdminContainer
+            .appendingPathComponent("gone-aside")
+        // The new entry's checkout has not been written yet, so its
+        // back-link names a `.git` that is not there — which is precisely
+        // what `revivedCheckoutRefusal` reads as "still orphaned".
+        let missingCheckout = fixture.repository
+            .appendingPathComponent("not-yet-written")
+            .appendingPathComponent(".git")
+        let staged = InvocationCounter()
+        let removed = TrashRecorder()
+        let fileManager = fm
+
+        let outcome = await perform(
+            item(plan, id: "prune"), plan: plan,
+            with: makePerformer(
+                runner: InterceptingGitRunner(wrapping: realRunner()),
+                removeTree: { url, _, prove in
+                    // THE HOP. Production reaches this closure on
+                    // `DispatchQueue.global`, strictly after the final oracle
+                    // check, the final re-admission, the traversal guard and
+                    // R0.
+                    if (try? fileManager.moveItem(at: url, to: aside)) != nil,
+                       (try? fileManager.createDirectory(
+                           at: url, withIntermediateDirectories: false
+                       )) != nil,
+                       (try? Data("ref: refs/heads/brand-new\n".utf8).write(
+                           to: url.appendingPathComponent("HEAD")
+                       )) != nil,
+                       (try? Data("\(missingCheckout.path)\n".utf8).write(
+                           to: url.appendingPathComponent("gitdir")
+                       )) != nil
+                    { staged.bump() }
+                    try prove()
+                    removed.record(url)
+                    try fileManager.removeItem(at: url)
+                }
+            )
+        )
+
+        XCTAssertEqual(staged.count, 1, "the fixture never staged the reuse")
+        XCTAssertEqual(
+            removed.urls, [],
+            "the refusal is BEFORE the removal: nothing may be unlinked"
+        )
+        XCTAssertTrue(
+            fm.fileExists(atPath: orphan.appendingPathComponent("HEAD").path),
+            "the new entry's HEAD was destroyed — no gate on this path ever "
+                + "examined that object"
+        )
+        XCTAssertTrue(
+            fm.fileExists(atPath: aside.path),
+            "the measured entry must still be where the swap put it"
+        )
+        XCTAssertNil(outcome.entry, "a refused removal accepts nothing")
+        let message = try XCTUnwrapElement(outcome.errors, 0).message
+        XCTAssertTrue(message.contains("Re-scan"), message)
+    }
+
     // MARK: - R8: the traversal guard in PRUNE mode
 
     func testPruneModeRefusesASwappedLeafBeforeAnyGitOrAnyMeasurement()

@@ -39,6 +39,25 @@ import XCTest
 ///
 /// With the far-side proof deleted, (1) and (3) both fail: the stranger goes
 /// to the Trash and the disposal returns normally.
+///
+/// ## AND THE r13 GROUP: the arm that bound NOTHING
+///
+/// `dispose(_:expecting:…)`'s `.noDirectoryTree` path never opened
+/// `admittedParent` and had no identity to compare, so both of its proofs
+/// reduced to "some non-directory answers to this name". The five cells under
+/// "A (r13)" evidence the fix, and the mutation table is MEASURED on this
+/// branch rather than asserted — `swift test --filter
+/// TrashDisposalHopProofTests`, 20 cells:
+///
+/// | mutation | red |
+/// |---|---|
+/// | `.noDirectoryTree` back on `proveStanding`, container proof KEPT | **2** — `…RefusesALeafSwappedInsideTheMoversHop`, `…RefusesAContainerSwappedInsideTheMover` |
+/// | …and step (0)'s `proveAdmittedContainer` deleted as well (the r12 state) | **4** — the two above, `…RefusesAStrangerInAnotherContainer`, `…NamesContainerDriftAsContainerDrift` |
+/// | `.anythingButADirectory` admits everything | **1** — `…RefusesADirectoryThatAppearedAtTheName` |
+///
+/// The first row is the whole of A1: adding the container binding alone fixes
+/// the ordinary case and leaves the one that matters — the swap inside the
+/// mover, where the after-proof cannot discriminate an identity-free verdict.
 final class TrashDisposalHopProofTests: XCTestCase {
 
     private let fm = FileManager.default
@@ -1001,5 +1020,331 @@ final class TrashDisposalHopProofTests: XCTestCase {
             via: { try move($0, $1) }
         )
         XCTAssertFalse(fm.fileExists(atPath: verdictTree.path))
+
+        // FOUR arms since r13: the identity-free verdict is a disposal too,
+        // and without this the r13 cells below would pass against a
+        // `.noDirectoryTree` path that refused everything.
+        let noTree = base.appendingPathComponent("no-tree.txt")
+        try Data("ours".utf8).write(to: noTree)
+        try await TrashDisposal.dispose(
+            noTree, expecting: .noDirectoryTree, provider: provider,
+            containedIn: try admittedParent(of: noTree, provider: provider),
+            via: { try move($0, $1) }
+        )
+        XCTAssertFalse(fm.fileExists(atPath: noTree.path))
+    }
+
+    // MARK: - A (r13): the `.noDirectoryTree` arm, which bound NOTHING
+
+    /// The container for the r13 cells: a directory of its own, so that
+    /// swapping it does not disturb `landings`.
+    private func makeCacheContainer() throws -> URL {
+        let container = base.appendingPathComponent("cache-\(UUID().uuidString)")
+        try fm.createDirectory(at: container, withIntermediateDirectories: true)
+        return container
+    }
+
+    /// Replace the DIRECTORY that holds `target` with a different directory of
+    /// the same name, carrying a stranger's file at the same leaf name — the
+    /// two `rename(2)`s an attacker performs, spelled deterministically.
+    ///
+    /// Returns the stranger's file, which is what a disposal that binds
+    /// nothing takes.
+    @discardableResult
+    private func swapTheContainer(of target: URL) throws -> URL {
+        let container = target.deletingLastPathComponent()
+        let stash = base.appendingPathComponent("stash-\(UUID().uuidString)")
+        try fm.moveItem(at: container, to: stash)
+        try fm.createDirectory(at: container, withIntermediateDirectories: true)
+        let stranger = container.appendingPathComponent(
+            target.lastPathComponent
+        )
+        try Data("stranger".utf8).write(to: stranger)
+        return stranger
+    }
+
+    /// **THE P1** (PR #460 codex r13, A): a `.noDirectoryTree` verdict carries
+    /// no identity, so before this round BOTH of the arm's proofs reduced to
+    /// "some non-directory answers to this name" — which ANY non-directory in
+    /// ANY directory satisfies. The arm never opened `admittedParent` at all.
+    ///
+    /// Measured at 0139713 with exactly this fixture: the stranger's file was
+    /// moved to the landing and `dispose` RETURNED NORMALLY.
+    ///
+    /// MUTATION: route `.noDirectoryTree` back through `proveStanding` and
+    /// this cell fails — the disposal succeeds on a file it never inspected.
+    func testTheNoTreeVerdictArmRefusesAStrangerInAnotherContainer()
+        async throws
+    {
+        let provider = FileSystemIdentityProvider()
+        let container = try makeCacheContainer()
+        let target = container.appendingPathComponent("entry")
+        try Data("ours".utf8).write(to: target)
+        let parent = try admittedParent(of: target, provider: provider)
+        let log = MoveLog()
+        let landings = try XCTUnwrap(self.landings)
+        let fileManager = fm
+
+        // The swap lands BEFORE the disposal — the ordinary case, which must
+        // be refused without disturbing the user's Trash at all.
+        let stranger = try swapTheContainer(of: target)
+
+        var thrown: Error?
+        do {
+            try await TrashDisposal.dispose(
+                target, expecting: .noDirectoryTree, provider: provider,
+                containedIn: parent,
+                via: { url, prove in
+                    try prove()
+                    log.record(url)
+                    let landed = landings.appendingPathComponent(
+                        url.lastPathComponent
+                    )
+                    try fileManager.moveItem(at: url, to: landed)
+                    return landed
+                }
+            )
+        } catch {
+            thrown = error
+        }
+
+        let failure = try XCTUnwrap(
+            thrown as? DepthSafeRemoval.Failure,
+            "a stranger's file in a stranger's folder must be refused: "
+                + "\(String(describing: thrown))"
+        )
+        // AND THE CAUSE NAMES THE FOLDER, not the item (A2's taxonomy): the
+        // permanent arm and the container-bound overload both say this for
+        // the identical event.
+        XCTAssertEqual(failure.cause, .notTheAdmittedContainer)
+        XCTAssertTrue(log.urls.isEmpty,
+                      "the refusal is BEFORE the move — the Trash is untouched")
+        XCTAssertTrue(fm.fileExists(atPath: stranger.path),
+                      "the stranger's file is still where its owner left it")
+    }
+
+    /// The SAME verdict, the same fixture, and the swap moved INSIDE the
+    /// mover's hop — the window the seam's far-side proof exists to catch.
+    ///
+    /// MUTATION: delete the far-side `boundLeaf` comparison in
+    /// `disposeBoundLeaf` and this cell fails; the stranger goes to the
+    /// landing and the disposal returns normally.
+    func testTheNoTreeVerdictArmRefusesALeafSwappedInsideTheMoversHop()
+        async throws
+    {
+        let provider = FileSystemIdentityProvider()
+        let container = try makeCacheContainer()
+        let target = container.appendingPathComponent("entry")
+        try Data("ours".utf8).write(to: target)
+        let parent = try admittedParent(of: target, provider: provider)
+        let log = MoveLog()
+        let landings = try XCTUnwrap(self.landings)
+        let fileManager = fm
+
+        var thrown: Error?
+        do {
+            try await TrashDisposal.dispose(
+                target, expecting: .noDirectoryTree, provider: provider,
+                containedIn: parent,
+                via: { url, prove in
+                    try self.swapInAStranger(at: url, directory: false)
+                    try prove()
+                    log.record(url)
+                    let landed = landings.appendingPathComponent(
+                        url.lastPathComponent
+                    )
+                    try fileManager.moveItem(at: url, to: landed)
+                    return landed
+                }
+            )
+        } catch {
+            thrown = error
+        }
+
+        let failure = try XCTUnwrap(
+            thrown as? DepthSafeRemoval.Failure,
+            "a leaf swapped inside the hop must be refused: "
+                + "\(String(describing: thrown))"
+        )
+        XCTAssertEqual(failure.cause, .notTheInspectedObject)
+        XCTAssertTrue(log.urls.isEmpty, "nothing may be moved")
+        XCTAssertEqual(
+            try String(contentsOf: target, encoding: .utf8), "stranger",
+            "the stranger is still on disk, untrashed"
+        )
+    }
+
+    /// **A1 — THE HALF A CONTAINER BINDING ALONE DOES NOT FIX.** The swap is
+    /// the CONTAINER, and it lands inside the mover: the window
+    /// `trashItem`'s own URL resolution owns, and the one the file header
+    /// says the after-proof exists to catch.
+    ///
+    /// It does not catch it for THIS verdict, and that was measured: a probe
+    /// that added `openAdmittedContainer` on both sides of the seam but kept
+    /// `proveStanding` as the after-proof still trashed the stranger with
+    /// `errors=[]`, because `look(at: landed)` answers `.noDirectoryTree`,
+    /// the verdict IS `.noDirectoryTree`, and `disagreement` returns nil. The
+    /// BINDING is the load-bearing half here, not the after-proof.
+    ///
+    /// THE OUTCOME IS THE DISCLOSED, HONEST ONE: the item is REFUSED — no
+    /// entry, no bytes — and the stranger's file stays in the landing,
+    /// because the rollback will not restore into a container it cannot
+    /// prove. That is `.destinationNotTheAdmittedContainer`, whose message
+    /// names the path the user can drag it back from.
+    func testTheNoTreeVerdictArmRefusesAContainerSwappedInsideTheMover()
+        async throws
+    {
+        let provider = FileSystemIdentityProvider()
+        let container = try makeCacheContainer()
+        let target = container.appendingPathComponent("entry")
+        try Data("ours".utf8).write(to: target)
+        let parent = try admittedParent(of: target, provider: provider)
+        let landings = try XCTUnwrap(self.landings)
+        let fileManager = fm
+        let landed = landings.appendingPathComponent(target.lastPathComponent)
+
+        var thrown: Error?
+        do {
+            try await TrashDisposal.dispose(
+                target, expecting: .noDirectoryTree, provider: provider,
+                containedIn: parent,
+                via: { url, prove in
+                    // The proof passes — everything is still ours — and the
+                    // swap lands in the window no proof out here reaches.
+                    try prove()
+                    try self.swapTheContainer(of: url)
+                    try fileManager.moveItem(at: url, to: landed)
+                    return landed
+                }
+            )
+        } catch {
+            thrown = error
+        }
+
+        let failure = try XCTUnwrap(
+            thrown as? TrashDisposal.Failure,
+            "a container swapped inside the mover must be refused: "
+                + "\(String(describing: thrown))"
+        )
+        XCTAssertEqual(
+            failure.cause, .destinationNotTheAdmittedContainer(landed.path)
+        )
+        let described = try XCTUnwrap(failure.errorDescription)
+        XCTAssertTrue(
+            described.contains("It is in the Trash at \(landed.path)"),
+            described
+        )
+        XCTAssertEqual(
+            try String(contentsOf: landed, encoding: .utf8), "stranger",
+            "the disclosed residual: the wrongly-taken object stays in the "
+                + "landing, named by the refusal, and nothing is reported freed"
+        )
+    }
+
+    /// The verdict's OWN proposition, kept: `.noDirectoryTree` says no
+    /// directory TREE of ours stood at this name, so a directory appearing
+    /// there voids it. The permanent arm gets this refusal from the kernel
+    /// (`unlinkat` without `AT_REMOVEDIR` cannot remove a directory —
+    /// measured EPERM); `trashItem` would take it happily, so the kind check
+    /// is what keeps the two arms level.
+    ///
+    /// MUTATION: change `.anythingButADirectory`'s `admits` to `true` and
+    /// this cell fails — a directory nobody walked is trashed.
+    func testTheNoTreeVerdictArmRefusesADirectoryThatAppearedAtTheName()
+        async throws
+    {
+        let provider = FileSystemIdentityProvider()
+        let container = try makeCacheContainer()
+        let target = container.appendingPathComponent("entry")
+        // The verdict was taken when the name held a file (or nothing); a
+        // DIRECTORY stands there now.
+        try fm.createDirectory(at: target, withIntermediateDirectories: true)
+        try Data("theirs".utf8).write(
+            to: target.appendingPathComponent("their-work.txt")
+        )
+        let parent = try admittedParent(of: target, provider: provider)
+        let log = MoveLog()
+
+        var thrown: Error?
+        do {
+            try await TrashDisposal.dispose(
+                target, expecting: .noDirectoryTree, provider: provider,
+                containedIn: parent,
+                via: { url, prove in
+                    try prove()
+                    log.record(url)
+                    return nil
+                }
+            )
+        } catch {
+            thrown = error
+        }
+
+        let failure = try XCTUnwrap(
+            thrown as? DepthSafeRemoval.Failure,
+            "a directory at the name voids the verdict: "
+                + "\(String(describing: thrown))"
+        )
+        XCTAssertEqual(failure.cause, .notTheInspectedObject)
+        XCTAssertTrue(log.urls.isEmpty, "the refusal precedes the move")
+        XCTAssertTrue(fm.fileExists(
+            atPath: target.appendingPathComponent("their-work.txt").path
+        ))
+    }
+
+    /// **A2 — THE TAXONOMY.** The `.directory` arm survived a container swap
+    /// only INCIDENTALLY: `Identity` is dev+inode, so a stranger's directory
+    /// can never equal the inspected inode and the refusal came back as
+    /// `.notTheInspectedObject` — logged `content-drift`, the tag for "the
+    /// item changed", for an event in which the item did not change and its
+    /// FOLDER did.
+    ///
+    /// MUTATION: delete step (0)'s `proveAdmittedContainer` and this cell
+    /// fails on the cause (the disposal is still refused — that is the
+    /// point: it is a taxonomy defect, not a destruction one).
+    func testTheDirectoryVerdictArmNamesContainerDriftAsContainerDrift()
+        async throws
+    {
+        let provider = FileSystemIdentityProvider()
+        let container = try makeCacheContainer()
+        let target = container.appendingPathComponent("tree")
+        try fm.createDirectory(at: target, withIntermediateDirectories: true)
+        let identity = try XCTUnwrap(provider.identity(of: target))
+        let parent = try admittedParent(of: target, provider: provider)
+        let log = MoveLog()
+
+        // A stranger's DIRECTORY at the same name inside a stranger's folder.
+        let strangerContainer = target.deletingLastPathComponent()
+        let stash = base.appendingPathComponent("stash-\(UUID().uuidString)")
+        try fm.moveItem(at: strangerContainer, to: stash)
+        try fm.createDirectory(
+            at: target, withIntermediateDirectories: true
+        )
+
+        var thrown: Error?
+        do {
+            try await TrashDisposal.dispose(
+                target, expecting: .directory(identity), provider: provider,
+                containedIn: parent,
+                via: { url, prove in
+                    try prove()
+                    log.record(url)
+                    return nil
+                }
+            )
+        } catch {
+            thrown = error
+        }
+
+        let failure = try XCTUnwrap(
+            thrown as? DepthSafeRemoval.Failure,
+            String(describing: thrown)
+        )
+        XCTAssertEqual(
+            failure.cause, .notTheAdmittedContainer,
+            "the folder changed, so the refusal must say the folder changed "
+                + "— `content-drift` sends the user to look at the wrong thing"
+        )
+        XCTAssertTrue(log.urls.isEmpty)
     }
 }

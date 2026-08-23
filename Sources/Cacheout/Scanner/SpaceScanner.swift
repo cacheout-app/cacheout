@@ -1061,6 +1061,18 @@ enum PreDeleteInspectedObject: Equatable, Sendable {
     /// probe whose root open FAILED and therefore never had an identity to
     /// carry (`OrphanedCachesScanner`), and it keeps that probe's disclosed
     /// residual: any non-directory at the name satisfies it.
+    ///
+    /// THAT RESIDUAL IS ABOUT THE LEAF, AND FOR ONE DISPOSAL ARM IT USED TO
+    /// BE ABOUT THE CONTAINER TOO (PR #460 codex r13, A3). "Any
+    /// non-directory at the name" was read as bounded to the folder the
+    /// cleaner admitted, and on `TrashDisposal.dispose(_:expecting:…)` it was
+    /// not: that arm never opened `admittedParent`, so any non-directory in
+    /// ANY directory satisfied it and a stranger's file was trashed with its
+    /// bytes reported freed (measured through the shipped
+    /// `FileManager.trashItem` into the real `~/.Trash`). Both disposals now
+    /// resolve the leaf INSIDE the proved container — the permanent arm
+    /// always did — so the residual is what it always said it was: one
+    /// unidentified non-directory, inside one proved folder.
     case noDirectoryTree
     /// Nothing was established: either the inspection refused before it could
     /// bind anything, or this revalidator has no object binding to offer at

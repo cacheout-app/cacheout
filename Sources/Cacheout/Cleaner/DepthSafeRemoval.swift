@@ -147,12 +147,23 @@
 //     FAILED (`OrphanedCachesScanner.swift` — ENOENT/ENOTDIR, so it never
 //     had an identity to carry), plus this file's one-syscall
 //     `fstatat`→`unlinkat` window (no `funlinkat(2)` on macOS; residual 2's
-//     shape, one leaf, never a tree). None of it applies to
-//     `TrashDisposal.dispose(_:containedIn:…)`, which always bound by
-//     `fstatat` under a proved container. A future note here must not
+//     shape, one leaf, never a tree). A future note here must not
 //     generalise "the Trash arm binds the same way" in either direction:
 //     the arms bind differently, on purpose, because they have different
 //     facts available.
+//
+//     AND THE VERSION OF THAT SENTENCE WHICH STOOD HERE WAS EXACTLY THE
+//     GENERALISATION IT WARNS AGAINST (PR #460 codex r13). It said "none of
+//     it applies to `TrashDisposal.dispose(_:containedIn:…)`, which always
+//     bound by `fstatat` under a proved container" — true of that overload,
+//     and read as covering the Trash arm, while the OTHER entry point's
+//     `.noDirectoryTree` path opened no container and bound nothing at all:
+//     any non-directory in any directory satisfied it, measured through the
+//     shipped `FileManager.trashItem` into the real `~/.Trash`. Both Trash
+//     entry points now bind the leaf by `fstatat` under the proved container
+//     for this verdict, so what remains on the Trash side is the kind check
+//     plus the identity-free leaf — the same residual this file has, minus
+//     the `unlinkat` window and plus `trashItem`'s own resolution.
 //
 //  POSIX offers no primitive that closes 1, 2 or 3: there is no way to pin a
 //  directory to its parent for the duration of a read, no way to remove a

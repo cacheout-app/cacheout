@@ -68,15 +68,26 @@
 //  Trash destroys nothing. So the proof is taken TWICE, and the second one is
 //  taken where it can still be acted on:
 //
-//  1. BEFORE — `open(O_DIRECTORY|O_NOFOLLOW)` of the target and `fstat` of
-//     THAT descriptor, not an `lstat` of the path. The kind gate is the open,
-//     so there is no window between deciding what stands there and holding it,
-//     and the identity is read from the object rather than from a second
-//     resolution of a name. This refuses the ordinary case without disturbing
-//     the user's Trash at all. (The container-bound arm asks the same question
-//     one step further in: it opens and PROVES the container first, and reads
-//     the leaf under that descriptor with one `fstatat`, which additionally
-//     identifies non-directory leaves — see that arm for why that matters.)
+//  1. BEFORE — the container is opened and PROVED against the identity the
+//     cleaner captured (`DepthSafeRemoval.openAdmittedContainer`), and then
+//     the leaf is read: `fstatat` of the name under that held descriptor on
+//     the three arms that can use it, or `open(O_DIRECTORY|O_NOFOLLOW)` +
+//     `fstat` of THAT descriptor on the `.directory` verdict's arm, whose
+//     rollback needs an OPENED inode. Never an `lstat` of the path: the kind
+//     gate is the read itself, so there is no window between deciding what
+//     stands there and holding it, and the identity comes off the object
+//     rather than off a second resolution of a name. This refuses the
+//     ordinary case without disturbing the user's Trash at all.
+//
+//     THE PARAGRAPH THAT STOOD HERE DESCRIBED ONLY THE SECOND HALF OF THAT
+//     SENTENCE, AND IT WAS FALSE FOR ONE ARM (PR #460 codex r13, A3). It
+//     said step (1) was an `open(O_DIRECTORY|O_NOFOLLOW)` of the target —
+//     which on a `.noDirectoryTree` verdict ALWAYS fails by construction,
+//     because the target is a non-directory, so no identity was ever read —
+//     and it mentioned the container proof only as something "the
+//     container-bound arm" does, when in fact `dispose(_:expecting:…)`'s
+//     `.noDirectoryTree` arm opened no container at all and bound nothing.
+//     See that arm for what was measured and what it now does.
 //  2. AFTER — the disposal reports WHERE IT PUT THE ITEM, and that object's
 //     identity is compared with the inspection's. A mismatch means the Trash
 //     took something nobody inspected, so it is PUT BACK
@@ -170,9 +181,22 @@
 //  it — `renamex_np(RENAME_SWAP)` of two directories, the atomic form of the
 //  fixture's `rename(2)` + `mkdir(2)` — takes 61 µs (min) / 69–83 µs (median)
 //  on the same volume. So the swap still fits inside the call that follows the
-//  proof, which is why the load-bearing proof here remains the one taken AFTER
-//  the disposal: narrowing the prefix removes the unbounded part of the
-//  window, it does not close the part `trashItem` owns.
+//  proof, which is why narrowing the prefix removes the unbounded part of the
+//  window and does not close the part `trashItem` owns.
+//
+//  WHICH PROOF IS LOAD-BEARING DEPENDS ON THE ARM, AND THIS PARAGRAPH USED TO
+//  SAY IT WAS ALWAYS THE ONE TAKEN AFTER (corrected, PR #460 codex r13, A1).
+//  The after-proof is load-bearing wherever it can DISCRIMINATE — the three
+//  arms that bind an object compare `facts(at: landed)` for equality with a
+//  bound identity, and a stranger fails that. It cannot discriminate for a
+//  verdict that carries no identity: with the container swapped inside the
+//  mover, `look(at: landed)` answers `.noDirectoryTree`, the verdict IS
+//  `.noDirectoryTree`, and `disagreement` returns nil. Measured — the
+//  stranger's file was trashed with `errors=[]` by a probe that had added the
+//  container proof on both sides of the seam but kept this after-proof. For
+//  that verdict the BINDING is the load-bearing half, which is why
+//  `.noDirectoryTree` now goes through `disposeBoundLeaf` like every other
+//  non-directory arm.
 //
 //  WHAT REMAINS AFTER THE PUT-BACK, HONESTLY: the wrongly-taken item is in the
 //  Trash for the width of one `renamex_np`, and if the put-back cannot be
@@ -260,6 +284,17 @@ import Foundation
 /// stayed unbound for three review rounds. The difference between the two
 /// entry points is now WHICH FACT the leaf is bound to, not WHETHER it is
 /// bound.
+///
+/// THAT SENTENCE WAS WRITTEN ONE ROUND TOO EARLY, AND ONE ARM MADE IT FALSE
+/// (PR #460 codex r13, A3). `dispose(_:expecting:…)`'s `.noDirectoryTree`
+/// path bound NOTHING: it never opened `admittedParent`, and the verdict
+/// carries no identity, so both of its proofs reduced to "some non-directory
+/// answers to this name" — satisfied by any non-directory in any directory.
+/// Measured at 0139713 through the production composition and again through
+/// the shipped `FileManager.trashItem` into the real `~/.Trash`: a stranger's
+/// file trashed, `entries=[… exactBytes: 4096, disposal: .trash]`,
+/// `errors=[]`. It is true now because that arm was routed through the same
+/// `disposeBoundLeaf` the other three use, not because it was true then.
 enum TrashDisposal {
 
     /// Why a Trash disposal was refused AFTER the fact — the causes that
@@ -424,64 +459,131 @@ enum TrashDisposal {
         containedIn admittedParent: DepthSafeRemoval.AdmittedParent,
         via disposal: Mover
     ) async throws {
-        // A NON-DIRECTORY leaf verdict cannot be proved by `look` — its kind
-        // gate is an `O_DIRECTORY` open, which can only ever IDENTIFY a
-        // directory (ENOTDIR/ELOOP name no inode). The carried identity is
-        // bound the way the no-leaf-verdict arm below binds: one `fstatat`
-        // under the PROVED container, on BOTH sides of the move, required
-        // equal to the identity the revalidator verified (PR #459 review r5
-        // — before this branch, ANY `.noDirectoryTree` sighting satisfied
-        // the file arm's verdict and a swapped-in file was trashed and KEPT
-        // with success reported).
-        if case .nonDirectoryLeaf(let expected) = inspected {
-            let bound = try boundLeaf(
-                of: target, containedIn: admittedParent, provider: provider
+        // WHICH ARM, AND WHY TWO OF THE FOUR VERDICTS LEAVE THIS FUNCTION
+        // IMMEDIATELY (PR #460 codex r13, A).
+        //
+        // `look` is the only proof `proveStanding` has, and `look`'s kind
+        // gate is an `O_DIRECTORY` open: it can IDENTIFY a directory and
+        // nothing else. So it answers a verdict ABOUT a directory
+        // (`.directory(identity)`) and cannot answer either verdict about a
+        // non-directory — `.nonDirectoryLeaf` because ENOTDIR/ELOOP name no
+        // inode, `.noDirectoryTree` because the verdict itself carries no
+        // identity to compare against and so reduces, on BOTH sides of the
+        // move, to "some non-directory answers to this name". ANY
+        // non-directory in ANY directory satisfies that, and until r13 this
+        // arm never opened `admittedParent` at all: the parameter was
+        // consulted only inside `.nonDirectoryLeaf`'s `boundLeaf` and inside
+        // `rollBack`.
+        //
+        // MEASURED AT 0139713, three ways, with the production provider and
+        // two real `rename(2)`s: at this level the stranger's file was moved
+        // to the landing and `dispose` RETURNED NORMALLY; through the
+        // production composition (real `CacheCleaner`, real
+        // `OrphanedCachesScanner.preDeleteRevalidator`, real PathGuard
+        // admission, `moveToTrash: true` — the GUI's shipped default) the
+        // report read `entries=[… exactBytes: 4096, disposal: .trash],
+        // errors=[]`; and with NOTHING injected at the seam — the shipped
+        // `FileManager.trashItem`, into the REAL `~/.Trash` — the stranger's
+        // file was left sitting in the user's Trash and its bytes reported
+        // freed. The PERMANENT arm refuses the identical event on the
+        // identical fixture, because `DepthSafeRemoval.remove` goes through
+        // `openAdmittedContainer` for EVERY verdict; so does the sibling
+        // overload below. This was the one destructive path in the product
+        // that did not bind its container.
+        //
+        // BINDING THE CONTAINER ALONE IS NOT ENOUGH, AND THAT WAS MEASURED
+        // TOO. A probe that only added `openAdmittedContainer` on both sides
+        // of the seam still trashed the stranger with `errors=[]` when the
+        // container was swapped INSIDE the mover — the window `trashItem`'s
+        // own resolution owns, the window the file header says the
+        // after-proof exists to catch — because the after-proof then reads
+        // `look(at: landed) == .noDirectoryTree` and
+        // `disagreement(.noDirectoryTree, .noDirectoryTree)` is `nil`. FOR
+        // THIS VERDICT THE AFTER-PROOF IS NOT LOAD-BEARING; THE BINDING IS.
+        //
+        // So both non-directory verdicts take the one shape that binds an
+        // OBJECT: `boundLeaf` under the PROVED container, on both sides of
+        // the move. `disposeBoundLeaf` is that shape, spelled once, and the
+        // container-bound overload below is the same call with the widest
+        // admission — three arms that cannot drift because they are one
+        // function.
+        switch inspected {
+        case .nonDirectoryLeaf(let expected):
+            // The revalidator held this leaf open and read its inode (PR
+            // #459 review r5 — before that, ANY `.noDirectoryTree` sighting
+            // satisfied the file arm's verdict and a swapped-in file was
+            // trashed and KEPT with success reported).
+            try await disposeBoundLeaf(
+                target, containedIn: admittedParent, provider: provider,
+                admitting: .exactly(expected), via: disposal
             )
-            guard bound.identity == expected else {
-                // Refused BEFORE the move: the Trash is untouched. The same
-                // cause the permanent arm throws for the same event, so the
-                // cleaner's log tags both `content-drift`.
-                throw DepthSafeRemoval.Failure(
-                    path: target.path, cause: .notTheInspectedObject, depth: 0
-                )
-            }
-            // AND AGAIN ON THE FAR SIDE OF THE SEAM'S HOP (D1): the binding
-            // above is taken here, the move happens after a main-actor hop,
-            // and the interval between them is the main thread's queue depth.
-            let landed = try await disposal(target) {
-                let atTheInstant = try boundLeaf(
-                    of: target, containedIn: admittedParent, provider: provider
-                )
-                guard atTheInstant == bound else {
-                    throw DepthSafeRemoval.Failure(
-                        path: target.path, cause: .notTheInspectedObject,
-                        depth: 0
-                    )
-                }
-            }
-            guard let landed else {
-                throw Failure(path: target.path, cause: .destinationUnknown)
-            }
-            let observed = facts(at: landed, provider: provider)
-            guard observed == bound else {
-                throw Failure(
-                    path: target.path,
-                    cause: rollBack(
-                        observed, from: landed, to: target,
-                        containedIn: admittedParent, provider: provider
-                    )
-                )
-            }
             return
+        case .noDirectoryTree:
+            // NO IDENTITY EXISTS TO REQUIRE — the verdict's one producer is
+            // the probe whose root open FAILED (`OrphanedCachesScanner`), so
+            // it never held one. What CAN be required is the residual's own
+            // shape: a directory appearing at that name since voids the
+            // verdict (`PreDeleteInspectedObject.noDirectoryTree` says so),
+            // and it is a kind the permanent arm gets refused by the kernel
+            // — `unlinkat` without `AT_REMOVEDIR` cannot remove a directory,
+            // measured EPERM — while `trashItem` takes it happily. So the
+            // kind check is kept HERE, where it is the only thing keeping
+            // the two arms level, and the identity-free residual ("any
+            // non-directory at the name satisfies it") is now bounded to ONE
+            // directory: the admitted container, proved on both sides.
+            //
+            // GHOST TARGETS MOVE ONE CALL EARLIER, DELIBERATELY. Through r12
+            // an absent target satisfied `proveStanding`
+            // (`absenceProves: true`) and the disposal produced its own
+            // ENOENT; `boundLeaf` throws `.posix(ENOENT)` before the move
+            // instead. Both are item-keyed POSIX errors and neither is a
+            // silent skip, so the choice is between two spellings of one
+            // outcome — and this one keeps the user's Trash UNTOUCHED for an
+            // item that was never there, which the other cannot promise,
+            // because it hands the NAME to `trashItem` and whatever answers
+            // to it a moment later is what gets taken.
+            try await disposeBoundLeaf(
+                target, containedIn: admittedParent, provider: provider,
+                admitting: .anythingButADirectory, via: disposal
+            )
+            return
+        case .directory, .unestablished:
+            break
         }
+
+        // (0) WHOSE FOLDER IS THIS? (PR #460 codex r13, A2.) Asked before
+        // anything is read at the target's name, and asked the way every
+        // other destructive arm asks it — `DepthSafeRemoval`'s
+        // `openAdmittedContainer`, which opens the container and `fstat`s
+        // the descriptor against the identity the cleaner captured.
+        //
+        // The `.directory` arm SURVIVED a container swap without this, but
+        // only INCIDENTALLY: `Identity` is dev+inode, so a stranger's
+        // directory can never equal the inspected inode and the refusal came
+        // back as `.notTheInspectedObject` — logged `content-drift`, the tag
+        // for "the item changed", for an event in which the item did not
+        // change and its FOLDER did. The permanent arm and the
+        // container-bound overload both answer `.notTheAdmittedContainer` /
+        // `container-drift` for the identical event. A user told the wrong
+        // fact goes and looks at the wrong thing.
+        //
+        // `.unestablished` reaches here too and every arm below refuses it
+        // (`disagreement`'s `guard case`s each name a different case), which
+        // is the fail-closed default rather than a fourth shape.
+        try proveAdmittedContainer(
+            of: target, containedIn: admittedParent, provider: provider
+        )
 
         // (1) The cheap refusal, and the one that keeps the Trash untouched.
         try proveStanding(inspected, at: target, provider: provider)
 
-        // (1b) THE SAME PROOF, ON THE FAR SIDE OF THE SEAM'S HOP (D1). (1) is
-        // taken here; the move happens after a main-actor hop whose length is
-        // the main thread's queue depth, not a syscall.
+        // (1b) THE SAME PROOFS, ON THE FAR SIDE OF THE SEAM'S HOP (D1). (0)
+        // and (1) are taken here; the move happens after a main-actor hop
+        // whose length is the main thread's queue depth, not a syscall.
         let landed = try await disposal(target) {
+            try proveAdmittedContainer(
+                of: target, containedIn: admittedParent, provider: provider
+            )
             try proveStanding(inspected, at: target, provider: provider)
         }
 
@@ -504,6 +606,124 @@ enum TrashDisposal {
                 path: target.path,
                 cause: rollBack(
                     identified(sighting), from: landed, to: target,
+                    containedIn: admittedParent, provider: provider
+                )
+            )
+        }
+    }
+
+    /// WHAT THE PRE-MOVE BINDING MUST SHOW for a disposal to proceed — the
+    /// ONLY thing that differs between the three arms that bind a leaf under
+    /// a proved container.
+    ///
+    /// A value rather than a closure so nothing about an arm can be
+    /// captured, escape, or cross the mover's hop.
+    enum LeafAdmission: Equatable {
+        /// NO leaf verdict exists (all of contents mode, plus every item
+        /// whose scanner registers no revalidator): the binding under the
+        /// proved container IS the whole proposition, and the after-proof
+        /// carries the rest.
+        case whateverStandsThere
+        /// `.nonDirectoryLeaf(identity)` — the revalidator held the leaf open
+        /// and read its inode, so equality is available and required.
+        case exactly(FileSystemIdentityProvider.Identity)
+        /// `.noDirectoryTree` — identity-free by construction (its producer's
+        /// root open FAILED), so the only proposition the verdict carries is
+        /// that no directory TREE of ours stood at the name.
+        case anythingButADirectory
+
+        func admits(_ facts: FileSystemIdentityProvider.ChildFacts) -> Bool {
+            switch self {
+            case .whateverStandsThere: return true
+            case .exactly(let identity): return facts.identity == identity
+            case .anythingButADirectory: return facts.kind != .directory
+            }
+        }
+    }
+
+    /// PROVE THE CONTAINER AND DROP IT — the container half of the binding,
+    /// for the one arm that reads its leaf by path afterwards.
+    ///
+    /// `dispose(_:expecting:…)`'s `.directory` path proves the leaf with
+    /// `look`, which resolves the name inside its own container; this asks
+    /// the separate question `look` cannot ask, which is WHICH container that
+    /// is. It is the identical `openAdmittedContainer` the permanent arm and
+    /// `boundLeaf` use, so the three cannot answer differently.
+    ///
+    /// The descriptor is closed immediately and ON PURPOSE: holding it would
+    /// suggest the leaf read that follows goes through it, and it does not —
+    /// that stronger shape is `boundLeaf`, and every arm that can use it now
+    /// does.
+    private static func proveAdmittedContainer(
+        of target: URL,
+        containedIn admittedParent: DepthSafeRemoval.AdmittedParent,
+        provider: FileSystemIdentityProvider
+    ) throws {
+        let fd = try DepthSafeRemoval.openAdmittedContainer(
+            at: target.deletingLastPathComponent(),
+            provenAgainst: admittedParent, displayPath: target.path,
+            provider: provider
+        )
+        close(fd)
+    }
+
+    /// THE ONE DISPOSAL SHAPE THAT BINDS AN OBJECT — used by every arm that
+    /// can have one, which since PR #460 codex r13 is every arm except the
+    /// `.directory` verdict's (whose proof must come off an OPENED inode,
+    /// because its rollback depends on `look`'s `.unidentifiable`).
+    ///
+    /// 1. BEFORE — the container is opened and `fstat`ed against
+    ///    `DepthSafeRemoval.admittedParent`'s identity, and the leaf is bound
+    ///    under THAT descriptor with one `fstatat` (`probeChild`: kind and
+    ///    identity from a single resolution no rename can re-point). What the
+    ///    binding must SHOW is `admission`'s business and nothing else's.
+    /// 2. AGAIN, IMMEDIATELY BEFORE THE MOVE, wherever the mover runs — the
+    ///    load-bearing one, because the production seam hops to the main
+    ///    actor and that hop is the main thread's queue depth (PR #460 codex
+    ///    r6, D1). Both readings are the SAME `boundLeaf` under the SAME
+    ///    proved container, so a difference is a swap inside the hop and
+    ///    nothing else.
+    /// 3. AFTER — what landed is read the same descriptor-relative way and
+    ///    required EQUAL to the bound facts. A mismatch is PUT BACK through
+    ///    `rollBack`, which proves its own destination against the same
+    ///    admitted container, and reported as a refusal: no entry, no bytes.
+    private static func disposeBoundLeaf(
+        _ target: URL,
+        containedIn admittedParent: DepthSafeRemoval.AdmittedParent,
+        provider: FileSystemIdentityProvider,
+        admitting admission: LeafAdmission,
+        via disposal: Mover
+    ) async throws {
+        let bound = try boundLeaf(
+            of: target, containedIn: admittedParent, provider: provider
+        )
+        guard admission.admits(bound) else {
+            // Refused BEFORE the move: the Trash is untouched. The same
+            // cause the permanent arm throws for the same event, so the
+            // cleaner's log tags both `content-drift`.
+            throw DepthSafeRemoval.Failure(
+                path: target.path, cause: .notTheInspectedObject, depth: 0
+            )
+        }
+        let landed = try await disposal(target) {
+            let atTheInstant = try boundLeaf(
+                of: target, containedIn: admittedParent, provider: provider
+            )
+            guard atTheInstant == bound else {
+                throw DepthSafeRemoval.Failure(
+                    path: target.path, cause: .notTheInspectedObject, depth: 0
+                )
+            }
+        }
+        guard let landed else {
+            throw Failure(path: target.path, cause: .destinationUnknown)
+        }
+        let observed = facts(at: landed, provider: provider)
+        guard observed == bound else {
+            throw Failure(
+                path: target.path,
+                cause: rollBack(
+                    observed, from: landed, to: target,
                     containedIn: admittedParent, provider: provider
                 )
             )
@@ -563,41 +783,15 @@ enum TrashDisposal {
         provider: FileSystemIdentityProvider,
         via disposal: Mover
     ) async throws {
-        let bound = try boundLeaf(
-            of: target, containedIn: admittedParent, provider: provider
+        // THE SAME SHAPE THE OTHER ENTRY POINT'S TWO NON-DIRECTORY ARMS TAKE,
+        // SPELLED ONCE (PR #460 codex r13, A). This arm has no verdict, so
+        // its admission is the widest one there is — but the binding, the
+        // proof across the hop, the after-proof and the rollback are
+        // literally the same code, which is what stops the arms drifting.
+        try await disposeBoundLeaf(
+            target, containedIn: admittedParent, provider: provider,
+            admitting: .whateverStandsThere, via: disposal
         )
-
-        // AND AGAIN IMMEDIATELY BEFORE THE MOVE, WHEREVER THE MOVER RUNS
-        // (PR #460 codex r6, D1). The binding above is the cheap refusal that
-        // keeps the Trash untouched; this one is the load-bearing one, because
-        // the production seam hops to the main actor and that hop is the main
-        // thread's queue depth. Both readings are the SAME `boundLeaf` under
-        // the SAME proved container, so a difference between them is a swap
-        // inside the hop and nothing else.
-        let landed = try await disposal(target) {
-            let atTheInstant = try boundLeaf(
-                of: target, containedIn: admittedParent, provider: provider
-            )
-            guard atTheInstant == bound else {
-                throw DepthSafeRemoval.Failure(
-                    path: target.path, cause: .notTheInspectedObject, depth: 0
-                )
-            }
-        }
-
-        guard let landed else {
-            throw Failure(path: target.path, cause: .destinationUnknown)
-        }
-        let observed = facts(at: landed, provider: provider)
-        guard observed == bound else {
-            throw Failure(
-                path: target.path,
-                cause: rollBack(
-                    observed, from: landed, to: target,
-                    containedIn: admittedParent, provider: provider
-                )
-            )
-        }
     }
 
     /// WHAT STANDS AT `target`'s NAME INSIDE THE ADMITTED CONTAINER — the

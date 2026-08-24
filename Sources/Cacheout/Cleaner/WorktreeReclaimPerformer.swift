@@ -651,6 +651,46 @@ struct WorktreeReclaimPerformer {
             )
         }
 
+        // (2b) BIND THE CONTAINER AND THE CHECKOUT BEFORE ANYTHING READS
+        // THE TREE (PR #460 codex r19, R1).
+        //
+        // r18 took both of these inside `removeUnderLastInstantProof`, i.e.
+        // AFTER the (3) measurement and after all five
+        // `reestablishStaleGates` subprocesses, and its comment claimed a
+        // swap in that earlier window "is refused all the same — the
+        // replacement's own `.git` would have to name the assessed admin
+        // directory to get past R1b". MEASURED FALSE: a look-alike with
+        // identical tracked content, the SAME COMMITTED `.gitignore` (so the
+        // D2 ignored-witness sets match) and a `.git` file naming the
+        // assessed admin directory passes every gate and is destroyed, on
+        // both arms.
+        //
+        // THIS IS THE FOURTH PLACEMENT OF THIS BINDING ON THIS BRANCH, and
+        // each of the previous three moved it one step earlier than the
+        // finding that prompted it. The rule those moves kept missing: put
+        // the binding where the protected fact is FIRST READ, not one call
+        // before the site that noticed. The checkout is first read by (3)
+        // `measure`, so it goes above it — which makes the covered window the
+        // whole of delete time, and CONSTANT rather than a span that grows
+        // with the number of git calls between here and the disposal.
+        //
+        // It also retires r18's disclosed residual rather than restating it:
+        // the bytes this run reports are now measured under the same binding
+        // the removal is proved against.
+        let admittedParent: DepthSafeRemoval.AdmittedParent
+        let boundCheckout: BoundObject
+        do {
+            admittedParent = try DepthSafeRemoval.admittedParent(
+                directory: worktreePath.deletingLastPathComponent(),
+                displayPath: worktreePath.path, provider: provider
+            )
+            boundCheckout = try bindObject(
+                worktreePath, containedIn: admittedParent
+            )
+        } catch {
+            return refusal(item, error, at: worktreePath)
+        }
+
         // (3) MEASURE — only now, after admission passed.
         let report = measure(
             worktreePath, .deletionTarget, await registry.knownIdentities
@@ -724,7 +764,8 @@ struct WorktreeReclaimPerformer {
             item: item, plan: plan, origin: origin, container: container,
             worktreePath: worktreePath, adminEntry: adminEntry,
             registry: registry, token: token, head: head,
-            ignoredWitness: ignoredWitness
+            ignoredWitness: ignoredWitness,
+            admittedParent: admittedParent, boundCheckout: boundCheckout
         )
     }
 
@@ -745,55 +786,26 @@ struct WorktreeReclaimPerformer {
         registry: InodeAccountingRegistry,
         token: RegisteredChild,
         head: HeadWitness?,
-        ignoredWitness: Set<String>
+        ignoredWitness: Set<String>,
+        admittedParent: DepthSafeRemoval.AdmittedParent,
+        boundCheckout: BoundObject
     ) async -> WorktreeReclaimOutcome {
         // The guarded removal, `removeGuardedItem`'s doctrine
         // verbatim: TOCTOU re-admission immediately pre-delete, then the
         // trash toggle (a trash failure is an error, NEVER a fall-through to
         // a permanent delete).
         do {
-            // WHICH FOLDER THIS DISPOSAL WILL OPEN, bound from a descriptor —
-            // fn-6's doctrine, and its ORDERING verbatim (see the item path in
-            // CacheCleaner): taken FIRST, before the rechecks below, because
-            // everything after the capture is what the binding covers; taken
-            // last it would cover only the hop onto the removal's background
-            // queue. Nothing else here binds that folder — `admitContainer`
-            // binds the container ROOT and the worktree is a strict descendant
-            // of it. It fails closed and costs nothing to do so: the removal
-            // performs the identical open a moment later.
-            //
-            // BOTH DISPOSALS USE IT. It was captured for the permanent one
-            // alone and the Trash one — the GUI's default, `moveToTrash` is
-            // `true` out of the box — handed the mover a bare URL beside it,
-            // which made this the one deletion path in the app with no
-            // container binding (fn-5/fn-6 reconciliation). The ordering the
-            // capture already had is the ordering Trash needs: the binding
-            // covers the two rechecks below, not merely the seam call.
-            let admittedParent = try DepthSafeRemoval.admittedParent(
-                directory: worktreePath.deletingLastPathComponent(),
-                displayPath: worktreePath.path, provider: provider
-            )
-            // AND WHICH TREE, TAKEN IN THE SAME ACT (PR #460 codex r18, C1).
-            // The container binding says WHERE; nothing said WHAT. It is
-            // taken here, under the container that was just proved, for the
-            // reason the paragraph above gives for the container: everything
-            // after the capture is what the binding covers — the two path
-            // re-admissions, the traversal guard, the clean check, the D2
-            // ignored witness, and both arms' hops. Taken any later it would
-            // cover only the hop, which is the window that was already
-            // closed; taken here it covers the window the clean check
-            // OPENS, which is the one that was not.
-            //
-            // WHAT IT DOES NOT COVER, STATED: the delete-time measurement
-            // and the `reestablishStaleGates` subprocesses run BEFORE this
-            // point, in `removeStaleWorktree`. A swap in that earlier window
-            // is refused all the same — the replacement's own `.git` would
-            // have to name the assessed admin directory to get past R1b —
-            // but the bytes this run reports would have been measured on the
-            // object that was swapped out, and no gate here can say so.
-            let boundCheckout = try bindObject(
-                worktreePath, containedIn: admittedParent
-            )
+            // THE CONTAINER AND THE CHECKOUT ARE ALREADY BOUND — both were
+            // taken by the caller at (2b), above the (3) measurement, for the
+            // reason stated there. They are parameters rather than locals so
+            // there is exactly ONE capture per item and no second reading
+            // that could disagree with it; the ordering argument that used to
+            // live here (bind FIRST, because everything after the capture is
+            // what the binding covers) is unchanged and now covers strictly
+            // more: the measurement, the revalidator seam, the registration,
+            // the (7) traversal guard and all five (8) gate subprocesses, as
+            // well as the two rechecks below, the clean check, the D2 ignored
+            // witness and both arms' hops.
             let recheck = try pathGuard.admitContainer(origin, snapshot: snapshot)
             try pathGuard.validateRemovableItem(worktreePath, inside: recheck)
 
@@ -1968,7 +1980,7 @@ struct WorktreeReclaimPerformer {
     //    `--ignored` DOES NOT NARROW THAT WINDOW, and r7 said it did (PR
     //    #460 codex r8, D4). The ignored comparison is `appeared =
     //    ignoredNow.subtracting(ignoredWitness)`
-    //    (`WorktreeReclaimPerformer.swift:853-865`), computed from the SAME
+    //    (`WorktreeReclaimPerformer.swift:877-889`), computed from the SAME
     //    `status --ignored` reading this proposition is about, and taken
     //    BEFORE `reproveFromTheFilesystem`,
     //    i.e. entirely on the NEAR side of both hops. Nothing re-reads the

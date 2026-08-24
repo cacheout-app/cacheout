@@ -1809,6 +1809,129 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         XCTAssertEqual(refusals.details, [message])
     }
 
+    /// A CLEAN look-alike swapped in during the gate ladder — the window
+    /// r18's binding did not cover, and which its own comment claimed was
+    /// "refused all the same" (PR #460 codex r19, R1).
+    ///
+    /// `merge-base` is R2's last rung, so the swap lands after the (3)
+    /// delete-time measurement and after four of the five gate subprocesses,
+    /// but BEFORE the point r18 took its binding.
+    ///
+    /// THE REPLACEMENT DEFEATS EVERY OTHER GATE BY CONSTRUCTION, which is
+    /// what makes this a test of the binding and not of its neighbours. It is
+    /// a COPY of the assessed checkout, so `status --porcelain` is clean and
+    /// G2 passes; the repository commits a `.gitignore` naming `secret.env`
+    /// and BOTH trees carry that file, so the D2 ignored-witness sets match;
+    /// its `.git` file names the assessed admin directory, so R1b resolves
+    /// exactly as it did for the original; and the admin directory is never
+    /// touched, so the inode and HEAD witnesses match. The ONLY difference is
+    /// the checkout's own inode — which is precisely what nothing bound.
+    ///
+    /// An earlier draft of this cell used `makeCompatibleCheckout`, a bare
+    /// directory carrying only a `.git` file. It was refused `worktree-dirty`
+    /// — G2 caught it first — so it proved nothing about the binding. The
+    /// difference is recorded because a dirty look-alike is the easy mistake
+    /// here and it reads as a passing test.
+    ///
+    /// MUTATION: move the (2b) capture back below the (3) measurement and the
+    /// gate ladder (r18's placement) and this cell goes red, with the
+    /// stranger's `secret.env` destroyed.
+    func testTheGateLadderWindowRefusesACleanLookAlikeCheckout()
+        async throws
+    {
+        let repository = try makeRepository(named: "repo")
+        // A COMMITTED ignore rule, so the hostage is ignored rather than
+        // untracked in both trees — an untracked file is `worktree-dirty` and
+        // never reaches the binding.
+        try Data("secret.env\n".utf8)
+            .write(to: repository.appendingPathComponent(".gitignore"))
+        XCTAssertEqual(
+            try GitFixture.git(
+                ["-C", repository.path, "add", ".gitignore"], home: home
+            ).status, 0
+        )
+        XCTAssertEqual(
+            try GitFixture.git(
+                ["-C", repository.path, "-c", "user.name=t",
+                 "-c", "user.email=t@t", "commit", "-m", "ignore"], home: home
+            ).status, 0
+        )
+        let assessed = try addWorktree(
+            named: "wt", branch: "feature", in: repository
+        )
+        try addWorktree(named: "anchor", branch: "anchor", in: repository)
+        try Data("ORIGINAL\n".utf8)
+            .write(to: assessed.appendingPathComponent("secret.env"))
+
+        let plan = staleplan(
+            worktree: assessed,
+            membership: try membership(of: assessed, in: repository)
+        )
+        let adminEntry = try XCTUnwrap(plan.worktreeAdminEntry)
+        let carried = try XCTUnwrap(plan.worktreeAdminEntryIdentity)
+
+        // The stranger: a byte-for-byte copy of the assessed tree, then its
+        // OWN secret.env. Clean, same ignored set, same admin back-link.
+        let replacement = container.appendingPathComponent("stranger")
+        try fm.copyItem(at: assessed, to: replacement)
+        try Data("STRANGER\n".utf8)
+            .write(to: replacement.appendingPathComponent("secret.env"))
+
+        let aside = container.appendingPathComponent("wt-aside")
+        let staged = InvocationCounter()
+        let adminUntouched = InvocationCounter()
+        let removed = TrashRecorder()
+        let refusals = RefusalLog()
+        let fileManager = fm
+
+        let runner = ancestryWindowRunner(staging: {
+            guard Self.swapInACompatibleCheckout(
+                at: assessed, aside: aside, replacement: replacement
+            ) else { return }
+            staged.bump()
+            if Self.stillHasIdentity(adminEntry, carried) {
+                adminUntouched.bump()
+            }
+        })
+        let outcome = await perform(
+            item(plan), plan: plan,
+            with: makePerformer(
+                runner: runner, moveToTrash: false,
+                removeTree: { url, _, prove in
+                    try prove()
+                    removed.record(url)
+                    try fileManager.removeItem(at: url)
+                },
+                refusals: refusals
+            )
+        )
+
+        XCTAssertEqual(staged.count, 1, "the fixture never staged the swap")
+        XCTAssertEqual(
+            adminUntouched.count, 1,
+            "the admin directory must still be the scanned INODE at the "
+                + "instant of the swap, or this cell is a re-add attack "
+                + "wearing a new name"
+        )
+        XCTAssertEqual(
+            removed.urls, [],
+            "the refusal is BEFORE the removal: nothing may be unlinked"
+        )
+        XCTAssertNil(outcome.entry, "nothing may be reported as freed")
+        let hostage = assessed.appendingPathComponent("secret.env")
+        XCTAssertEqual(
+            try? String(contentsOf: hostage, encoding: .utf8), "STRANGER\n",
+            "the stranger's ignored work was destroyed — the tree the "
+                + "measurement and the gate ladder inspected is not the tree "
+                + "that was deleted"
+        )
+        XCTAssertTrue(
+            fm.fileExists(atPath: aside.path),
+            "the assessed tree must still be where the swap put it"
+        )
+    }
+
+
 
     // MARK: - The permanent arm's window, measured under load (r7, D1/D2)
 

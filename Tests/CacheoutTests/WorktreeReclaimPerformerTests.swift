@@ -1809,6 +1809,165 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         XCTAssertEqual(refusals.details, [message])
     }
 
+    /// The `head == nil` population, and the decision that keeps step (4)
+    /// running for it (PR #460 codex r19, R2).
+    ///
+    /// `reproveFromTheFilesystem`'s HEAD step is an `if let head`, NOT an
+    /// early `return`, so an item with no HEAD witness still reaches step (4)
+    /// — the checkout re-proof. That decision had NO cell: inserting
+    /// `if head == nil { return .proceed }` immediately before the `if let
+    /// head` block left the whole worktree suite green (250 executed, 0
+    /// failures), because every other cell on this path has a witness.
+    ///
+    /// REACHING THE POPULATION. On `--ref-format=reftable`, `<admin>/HEAD` is
+    /// a constant stub reading `ref: refs/heads/.invalid` — a readable
+    /// regular file, so `readWitness` returns a value, but CORROBORATION
+    /// fails because git reports the real branch. `captureHead` then tries
+    /// the per-worktree ref stack, and a SYMLINKED `<admin>/reftable/
+    /// tables.list` fails `probeKind == .kind(.regularFile)` (an `lstat`)
+    /// while git itself follows the link and answers normally — MEASURED on
+    /// git 2.50.1: `status --porcelain` exits 0 through the symlink. So
+    /// `captureHead` returns `.uncorroborated`, and an ATTACHED record falls
+    /// through to `.proceed(head: nil)`. A DETACHED record refuses instead,
+    /// which is why this fixture is attached.
+    ///
+    /// A SYMLINKED `<admin>/HEAD` DOES NOT WORK and was tried first: git
+    /// refuses to follow it (`status` exits 128), so the fixture would be a
+    /// broken repository rather than an unwitnessable one. The assertion that
+    /// git still answers is kept below for exactly that reason.
+    ///
+    /// THE CONTROL IS PART OF THE CELL: the same fixture with no swap must
+    /// still be DELETED. Without it a refusal proves nothing — the fixture
+    /// could be refusing for its own reasons and the cell would pass while
+    /// testing nothing.
+    ///
+    /// MUTATION: `if head == nil { return .proceed }` before the `if let
+    /// head` block — the faithful revert of the decision — and the swap arm
+    /// destroys the stranger's tree.
+    func testAnItemWithNoHeadWitnessStillReprovesItsCheckout()
+        async throws
+    {
+        for swapping in [false, true] {
+            let repository = container
+                .appendingPathComponent("rt-repo-\(swapping)")
+            try fm.createDirectory(
+                at: repository, withIntermediateDirectories: true
+            )
+            XCTAssertEqual(
+                try GitFixture.git(
+                    ["-c", "init.defaultBranch=main", "init",
+                     "--ref-format=reftable", repository.path], home: home
+                ).status, 0, "reftable init failed"
+            )
+            try Data(repeating: 7, count: 40_000)
+                .write(to: repository.appendingPathComponent("tracked.txt"))
+            try Data("secret.env\n".utf8)
+                .write(to: repository.appendingPathComponent(".gitignore"))
+            XCTAssertEqual(
+                try GitFixture.git(
+                    ["-C", repository.path, "add", "tracked.txt", ".gitignore"],
+                    home: home
+                ).status, 0
+            )
+            XCTAssertEqual(
+                try GitFixture.git(
+                    ["-C", repository.path, "-c", "user.name=t",
+                     "-c", "user.email=t@t", "commit", "-m", "seed"], home: home
+                ).status, 0
+            )
+            let assessed = try addWorktree(
+                named: "rt-wt-\(swapping)", branch: "feature-\(swapping)",
+                in: repository
+            )
+            try addWorktree(
+                named: "rt-anchor-\(swapping)", branch: "anchor-\(swapping)",
+                in: repository
+            )
+            try Data("ORIGINAL\n".utf8)
+                .write(to: assessed.appendingPathComponent("secret.env"))
+
+            let plan = staleplan(
+                worktree: assessed,
+                membership: try membership(of: assessed, in: repository)
+            )
+            let adminEntry = try XCTUnwrap(plan.worktreeAdminEntry)
+
+            // The ref stack, symlinked: git follows it, `probeKind` does not.
+            let stack = adminEntry
+                .appendingPathComponent("reftable/tables.list")
+            let real = adminEntry
+                .appendingPathComponent("reftable/tables.real")
+            try fm.moveItem(at: stack, to: real)
+            try fm.createSymbolicLink(at: stack, withDestinationURL: real)
+            XCTAssertEqual(
+                try GitFixture.git(
+                    ["-C", assessed.path, "status", "--porcelain"], home: home
+                ).status, 0,
+                "git must still answer through the symlinked ref stack, or "
+                    + "this fixture is a broken repository rather than an "
+                    + "unwitnessable one"
+            )
+
+            let replacement = container
+                .appendingPathComponent("rt-stranger-\(swapping)")
+            try fm.copyItem(at: assessed, to: replacement)
+            try Data("STRANGER\n".utf8)
+                .write(to: replacement.appendingPathComponent("secret.env"))
+            let aside = container
+                .appendingPathComponent("rt-aside-\(swapping)")
+            let staged = InvocationCounter()
+            let removed = TrashRecorder()
+            let refusals = RefusalLog()
+            let fileManager = fm
+            let shouldSwap = swapping
+
+            let runner = ancestryWindowRunner(staging: {
+                guard shouldSwap else { return }
+                if Self.swapInACompatibleCheckout(
+                    at: assessed, aside: aside, replacement: replacement
+                ) { staged.bump() }
+            })
+            let outcome = await perform(
+                item(plan), plan: plan,
+                with: makePerformer(
+                    runner: runner, moveToTrash: false,
+                    removeTree: { url, _, prove in
+                        try prove()
+                        removed.record(url)
+                        try fileManager.removeItem(at: url)
+                    },
+                    refusals: refusals
+                )
+            )
+
+            if shouldSwap {
+                XCTAssertEqual(staged.count, 1, "the swap never staged")
+                XCTAssertEqual(
+                    removed.urls, [],
+                    "an item with no HEAD witness skipped its checkout "
+                        + "re-proof — step (4) must run whether or not the "
+                        + "HEAD proposition is in the set"
+                )
+                XCTAssertNil(outcome.entry, "nothing may be reported as freed")
+                XCTAssertEqual(
+                    try? String(
+                        contentsOf: assessed
+                            .appendingPathComponent("secret.env"),
+                        encoding: .utf8
+                    ), "STRANGER\n",
+                    "the stranger's ignored work was destroyed"
+                )
+            } else {
+                XCTAssertNotNil(
+                    outcome.entry,
+                    "the control was refused, so this fixture never reaches "
+                        + "the head == nil population and the swap arm is "
+                        + "meaningless — refusals: \(refusals.tags)"
+                )
+            }
+        }
+    }
+
     /// A CLEAN look-alike swapped in during the gate ladder — the window
     /// r18's binding did not cover, and which its own comment claimed was
     /// "refused all the same" (PR #460 codex r19, R1).

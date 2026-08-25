@@ -5894,6 +5894,183 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
     }
 
 
+    // MARK: - r19 R3: the refusal arms that had zero executions
+
+    /// A provider that cannot read a `locked` file — the `.failed` branch of
+    /// `readLock`, which 243 real `readLock` calls across the suite never
+    /// produced (PR #460 codex r19, R3).
+    private final class LockUnreadableProvider: FileSystemIdentityProvider,
+        @unchecked Sendable
+    {
+        override func probeKind(of url: URL) -> KindProbe {
+            url.lastPathComponent == WorktreeReclaimPerformer.lockFileName
+                ? .failed(errno: EIO)
+                : super.probeKind(of: url)
+        }
+    }
+
+    /// `worktree-lock-unreadable`: whether the worktree is locked could not be
+    /// determined at the last instant, so it is refused rather than assumed
+    /// unlocked (PR #460 codex r19, R3a).
+    ///
+    /// The arm existed with NO execution in the whole suite: `probeKind` never
+    /// answered `.failed` for a lock file in any cell, so the `.unreadable`
+    /// consumer never ran while its `.locked` sibling had one. An unexercised
+    /// fail-closed arm is how two regressions reached this branch.
+    ///
+    /// MUTATION: map `.unreadable` to `.unlocked` in `readLock` and this cell
+    /// goes red with the tree destroyed.
+    func testAWorktreeWhoseLockCannotBeReadIsRefusedRatherThanAssumedUnlocked()
+        async throws
+    {
+        let repository = try makeRepository(named: "repo")
+        let assessed = try addWorktree(
+            named: "wt", branch: "feature", in: repository
+        )
+        try addWorktree(named: "anchor", branch: "anchor", in: repository)
+        let plan = staleplan(
+            worktree: assessed,
+            membership: try membership(of: assessed, in: repository)
+        )
+        let removed = TrashRecorder()
+        let refusals = RefusalLog()
+        let fileManager = fm
+
+        let outcome = await perform(
+            item(plan), plan: plan,
+            with: makePerformer(
+                runner: InterceptingGitRunner(wrapping: realRunner()),
+                removeTree: { url, _, prove in
+                    try prove()
+                    removed.record(url)
+                    try fileManager.removeItem(at: url)
+                },
+                provider: LockUnreadableProvider(),
+                refusals: refusals
+            )
+        )
+
+        XCTAssertEqual(
+            removed.urls, [],
+            "a worktree whose lock could not be read was removed anyway"
+        )
+        XCTAssertNil(outcome.entry, "a refused removal accepts nothing")
+        XCTAssertTrue(
+            fm.fileExists(atPath: assessed.path),
+            "the tree is gone, so the refusal did not fire"
+        )
+        XCTAssertEqual(refusals.tags, ["worktree-lock-unreadable"])
+    }
+
+    /// `prune-admin-lock-unreadable`: the same reading on the prune arm
+    /// (PR #460 codex r19, R3b). Same zero-execution history, same fix.
+    func testAnAdminEntryWhoseLockCannotBeReadIsRefusedRatherThanPruned()
+        async throws
+    {
+        let fixture = try makePruneFixture(orphans: ["gone"])
+        let orphan = try XCTUnwrapElement(fixture.admin, 0)
+        let plan = prunePlan(membership: fixture.membership, disclosed: [orphan])
+        let removed = TrashRecorder()
+        let refusals = RefusalLog()
+        let fileManager = fm
+
+        let outcome = await perform(
+            item(plan, id: "prune"), plan: plan,
+            with: makePerformer(
+                runner: InterceptingGitRunner(wrapping: realRunner()),
+                removeTree: { url, _, prove in
+                    try prove()
+                    removed.record(url)
+                    try fileManager.removeItem(at: url)
+                },
+                provider: LockUnreadableProvider(),
+                refusals: refusals
+            )
+        )
+
+        XCTAssertEqual(
+            removed.urls, [],
+            "an admin entry whose lock could not be read was pruned anyway"
+        )
+        XCTAssertNil(outcome.entry, "a refused removal accepts nothing")
+        XCTAssertTrue(fm.fileExists(atPath: orphan.path))
+        XCTAssertEqual(refusals.tags, ["prune-admin-lock-unreadable"])
+    }
+
+    /// The FAR-SIDE `prune-checkout-revived`, inside `LastInstantProof`
+    /// (PR #460 codex r19, R3c).
+    ///
+    /// The near-side copy has a cell; this one did not — although the comment
+    /// beside them calls the far-side copies "the load-bearing ones", because
+    /// between the near-side read and this one sits the hop onto the removal's
+    /// background queue, and a checkout repaired inside that hop is live state.
+    /// Its far-side LOCK sibling one line below IS exercised, which is what
+    /// made the gap visible.
+    ///
+    /// The revival is what `git worktree add` at the old path leaves behind:
+    /// the checkout's `.git` FILE naming the admin directory, and the admin
+    /// directory's own `gitdir` back-link already names that `.git`.
+    ///
+    /// MUTATION: delete the `revivedCheckoutRefusal` call from inside the
+    /// `LastInstantProof` closure — keeping the near-side copy — and this cell
+    /// goes red with the revived checkout's admin entry pruned.
+    func testTheDirectPruneRefusesACheckoutRevivedInsideItsOwnHop()
+        async throws
+    {
+        let fixture = try makePruneFixture(orphans: ["gone"])
+        let orphan = try XCTUnwrapElement(fixture.admin, 0)
+        let plan = prunePlan(membership: fixture.membership, disclosed: [orphan])
+        let staged = InvocationCounter()
+        let removed = TrashRecorder()
+        let fileManager = fm
+
+        let outcome = await perform(
+            item(plan, id: "prune"), plan: plan,
+            with: makePerformer(
+                runner: InterceptingGitRunner(wrapping: realRunner()),
+                removeTree: { url, _, prove in
+                    // Revive INSIDE the hop: recreate the checkout the admin
+                    // entry's `gitdir` back-link still names, with a `.git`
+                    // file pointing back at it.
+                    if let backlink = try? String(
+                        contentsOf: url.appendingPathComponent("gitdir"),
+                        encoding: .utf8
+                    ) {
+                        let dotGit = URL(
+                            fileURLWithPath: backlink
+                                .trimmingCharacters(in: .whitespacesAndNewlines)
+                        )
+                        let checkout = dotGit.deletingLastPathComponent()
+                        if (try? fileManager.createDirectory(
+                            at: checkout, withIntermediateDirectories: true
+                        )) != nil,
+                           (try? Data("gitdir: \(url.path)\n".utf8)
+                               .write(to: dotGit)) != nil {
+                            staged.bump()
+                        }
+                    }
+                    try prove()
+                    removed.record(url)
+                    try fileManager.removeItem(at: url)
+                }
+            )
+        )
+
+        XCTAssertEqual(staged.count, 1, "the fixture never staged the revival")
+        XCTAssertEqual(
+            removed.urls, [],
+            "the refusal is BEFORE the removal: nothing may be unlinked"
+        )
+        XCTAssertTrue(
+            fm.fileExists(atPath: orphan.path),
+            "a checkout that came back had its admin entry pruned anyway"
+        )
+        XCTAssertNil(outcome.entry, "a refused removal accepts nothing")
+        let message = try XCTUnwrapElement(outcome.errors, 0).message
+        XCTAssertTrue(message.contains("registered again"), message)
+    }
+
+
     // MARK: - R8: the traversal guard in PRUNE mode
 
     func testPruneModeRefusesASwappedLeafBeforeAnyGitOrAnyMeasurement()

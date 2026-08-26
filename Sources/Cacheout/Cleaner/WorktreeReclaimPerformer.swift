@@ -3242,15 +3242,41 @@ struct WorktreeReclaimPerformer {
             return .failed("the prunable set is not provably complete: \(reason)")
         }
 
-        // THE DETACHED-HEAD PROOF, AT DELETE TIME TOO (PR #460 codex r18,
-        // C4). The scanner refuses to publish a prune item whose removal
-        // would leave a commit named by nothing; asking it only there would
-        // make the guarantee a scan-time reading that any later `git branch
-        // -d` invalidates, and this recompute is the delete-time authority on
-        // WHICH directories are removed. Placing it here rather than in
-        // `pruneOrphanedAdmin` puts it on the SAME re-listing all three
-        // callers already pay for — the two prune-mode recomputes and the
-        // stale mode's gated post-removal prune — so no path can miss it.
+        // THE DETACHED-HEAD READING, AT DELETE TIME (PR #460 codex r18, C4;
+        // its claim corrected at r20). The scanner refuses to publish a prune
+        // item whose removal would leave a commit named by nothing, and this
+        // recompute is the delete-time authority on WHICH directories are
+        // removed, so the reading belongs here as well. Placing it on the
+        // re-listing all three callers already pay for — the two prune-mode
+        // recomputes and the stale mode's gated post-removal prune — is what
+        // stops any path missing it.
+        //
+        // IT IS A READING, NOT A HELD PROOF, AND THE COMMENT HERE USED TO SAY
+        // OTHERWISE. It argued that asking only at scan time "would make the
+        // guarantee a scan-time reading that any later `git branch -d`
+        // invalidates" — an argument that applies to this site verbatim.
+        // Moving the question later does not hold its answer: a ref deleted
+        // by another process AFTER this returns invalidates it exactly the
+        // same way, and the last-instant proof carried into
+        // `removeAdminDirectories` re-checks revival, the lock and the admin
+        // inode — not reachability.
+        //
+        // THE RESIDUAL, STATED IN THE TERMS IT WAS FOUND IN: for a detached
+        // orphan whose commit is reachable from EXACTLY ONE ref, another
+        // process deleting that ref between this return and the unlink leaves
+        // the commit reachable from nothing once the admin directory's HEAD
+        // and reflog go with it. The window is [this return -> that
+        // directory's unlink]: the app's own code, containing NO subprocess,
+        // rather than the 19.9-159.5 ms a `git worktree remove` owned before
+        // r5 removed it. It is not closed here because both ways to close it
+        // are worse than disclosing it. Writing a durable ref would mutate
+        // the user's repository as a side effect of a cleanup — a thing this
+        // product does not do, and r18 declined it deliberately. Re-proving
+        // without git would mean reimplementing ref resolution (loose refs,
+        // packed-refs, reftable) at the destructive boundary, which is the
+        // "replacing a primitive inherits its guarantees" trap this codebase
+        // has already been bitten by. Holding a repository lock is git's to
+        // give and it does not give one for this.
         //
         // It traverses nothing new: the queries are `git -C
         // <parentRepoWorkingDir>`, the target the guard above already covers

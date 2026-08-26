@@ -14,6 +14,20 @@ DIST_DIR="dist"
 DMG_NAME="${APP_NAME}-${VERSION}.dmg"
 APP_BUNDLE="${RELEASE_DIR}/${APP_NAME}.app"
 
+PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+
+# RELEASE GATES BEFORE ANY ARTIFACT IS PRODUCED (PR #460 codex r20).
+#
+# This script is the repository's DOCUMENTED distribution command, and it
+# creates a distributable DMG and then prints the signing, notarization and
+# `gh release upload` steps. Until now the gate lived only inside bundle.sh,
+# so following the documented path shipped past any open RELEASE-BLOCKING
+# status — defeating the guarantee the gate exists to make. The check runs
+# FIRST, before the clean build, so a blocked release costs nothing.
+# shellcheck source=scripts/release-gates.sh
+. "$PROJECT_DIR/scripts/release-gates.sh"
+check_release_gates || exit 1
+
 echo "=== Building ${APP_NAME} v${VERSION} ==="
 
 # ─── Step 1: Clean build ────────────────────────────────────

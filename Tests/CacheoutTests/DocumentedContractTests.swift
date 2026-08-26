@@ -697,8 +697,16 @@ final class DocumentedContractTests: XCTestCase {
     /// command (review r3).
     func testEveryDistributionModeRunsTheReleaseGateFirst() throws {
         let script = try document("scripts/bundle.sh")
-        XCTAssertTrue(script.contains("check_release_gates() {"),
-                      "bundle.sh must define the release-gate check")
+        // The gate is DEFINED once, in a shared helper, and SOURCED here
+        // (PR #460 codex r20). It used to be defined inline in bundle.sh,
+        // which is what let the documented `build-dmg.sh` path ship past it.
+        XCTAssertTrue(
+            try document("scripts/release-gates.sh")
+                .contains("check_release_gates() {"),
+            "scripts/release-gates.sh must define the release-gate check"
+        )
+        XCTAssertTrue(script.contains("release-gates.sh"),
+                      "bundle.sh must source the shared release-gate helper")
 
         for (arm, steps) in [
             ("--direct)", ["build_release", "create_bundle", "create_dmg"]),
@@ -722,13 +730,73 @@ final class DocumentedContractTests: XCTestCase {
         }
     }
 
+    /// THE SAME PRINCIPLE ONE LEVEL UP: every SCRIPT that can produce a
+    /// distributable artifact must run the gate, not merely every arm of one
+    /// script (PR #460 codex r20).
+    ///
+    /// Round 3 established the rule for bundle.sh's arms. It was then found
+    /// bypassable at the level above: `scripts/build-dmg.sh` — the command
+    /// docs/v1/BUILD-AND-DISTRIBUTION.md actually documents — independently
+    /// creates a DMG and prints the signing, notarization and
+    /// `gh release upload` steps, and called no gate at all.
+    ///
+    /// THIS ASSERTS A PROPERTY, NOT A LIST. Any script under `scripts/` that
+    /// creates a disk image is required to reference the gate, so a NEW
+    /// distribution path fails this cell without anyone remembering to add it
+    /// here — the difference between a fence and a blocklist, which this
+    /// branch has had to learn more than once.
+    func testEveryDistributionProducingScriptRunsTheReleaseGate() throws {
+        let scriptsDirectory = repoRoot.appendingPathComponent("scripts")
+        let entries = try FileManager.default.contentsOfDirectory(
+            at: scriptsDirectory, includingPropertiesForKeys: nil
+        ).filter { $0.pathExtension == "sh" }
+        XCTAssertFalse(entries.isEmpty, "no shell scripts found under scripts/")
+
+        var producers: [String] = []
+        for entry in entries {
+            let body = try String(contentsOf: entry, encoding: .utf8)
+            // What makes a script a distribution producer: it creates the
+            // disk image. Both spellings count — the direct `hdiutil create`
+            // and bundle.sh's own `create_dmg` step.
+            let makesAnImage = body.contains("hdiutil create")
+                || body.range(of: #"(?m)^create_dmg\(\) \{"#,
+                              options: .regularExpression) != nil
+            guard makesAnImage else { continue }
+            producers.append(entry.lastPathComponent)
+            // A CALL, NOT A MENTION. The first draft of this assertion was
+            // `body.contains("check_release_gates")`, and its mutation —
+            // commenting the call out — left it GREEN, because the commented
+            // line still contains the string. A substring test over source is
+            // a blocklist wearing a fence's name, which is the mistake this
+            // repository has made repeatedly; the line must INVOKE the gate,
+            // so the pattern requires it at the start of a line with nothing
+            // but whitespace before it.
+            let invocation = #"(?m)^[ \t]*check_release_gates\b"#
+            XCTAssertNotNil(
+                body.range(of: invocation, options: .regularExpression),
+                "\(entry.lastPathComponent) produces a distributable image "
+                    + "but never RUNS the release gate — a release can follow "
+                    + "it while a RELEASE-BLOCKING status is open"
+            )
+        }
+        // The scan must actually have found the producers, or the assertions
+        // above are vacuous.
+        XCTAssertTrue(
+            producers.contains("bundle.sh") && producers.contains("build-dmg.sh"),
+            "the producer scan missed a known distribution script: \(producers)"
+        )
+    }
+
     /// The gate, EXECUTED — string presence proves wiring, not behavior.
     /// Three states over fixture CHANGELOGs, plus the one that matters most:
     /// applying the CHANGELOG's own documented close instruction really does
     /// unblock the build. A close instruction that does not match what the
     /// script keys on would leave the release permanently blocked (review r3).
     func testTheReleaseGateOpensAndClosesExactlyAsDocumented() throws {
-        let script = try document("scripts/bundle.sh")
+        // The function now lives in the SHARED helper, not inline in
+        // bundle.sh (PR #460 codex r20) — this cell extracts and RUNS the real
+        // shell, so it must read it from where it is defined.
+        let script = try document("scripts/release-gates.sh")
         let changelog = try document("CHANGELOG.md")
 
         // The DOCUMENTED transition, quoted from the CHANGELOG itself.

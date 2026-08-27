@@ -399,6 +399,34 @@ struct GitWorktreeScanner: @unchecked Sendable {
         // prunes NOTHING (the walker's own `.git` hard prune is the only prune
         // this scanner needs, and a name-based skip list is the anti-pattern
         // that made the field case invisible).
+        //
+        // YES, `BuildArtifactsScanner.scan` walks the same kept roots
+        // (fn-4.18, Codex PR #460 P2: "nearly double filesystem I/O and
+        // latency"). MEASURED before designing anything, and the claim is
+        // CORRECTED, not inherited — the numbers and their pinned facts live
+        // in DevTreeWalkMeasurementTests. The two walks are asymmetric: the
+        // build walk prunes every matched artifact directory while this one
+        // deliberately descends everything (nested repositories are its
+        // quarry), so on an artifact-bearing tree the duplicated enumeration
+        // is only their intersection — 249 of 11544 entry probes (2.2%) on
+        // the measured tree. A fused walk must carry THIS walk's unpruned
+        // reach, and the build scanner pays its sizing census either way.
+        // True doubling exists only on a tree with no artifacts and no
+        // repository, where a whole walk measured single-digit milliseconds.
+        //
+        // WHY THE FAN-IN IS RECORDED RATHER THAN BUILT: the walker already
+        // takes N consumers, but a shared walk must be PER SCAN SESSION —
+        // the witness this consumer captures is walk-instant and is what the
+        // whole r16/r17 re-proof chain hangs off, so it can never be served
+        // from an earlier session's walk. Scanners run concurrently in the
+        // session task group, are also scanned individually (the GUI's and
+        // CLI's scanner filters), and nothing at the `SpaceScanner` boundary
+        // names a session for two `scan(context:)` calls to rendezvous on —
+        // coalescing on accidental concurrency would make the walk count
+        // timing-dependent in the safety path. Buying the measured 2% would
+        // therefore mean rewriting the protocol's "a scanner does its own
+        // I/O" contract, which the task's own boundary forbids: recorded,
+        // with the numbers, and stopped (fn-4.18).
         var discoveries: [GitWorktreeDiscovery] = []
         let walker = ProjectTreeWalker(
             home: home, pathGuard: pathGuard, provider: provider

@@ -3033,7 +3033,7 @@ final class EphemeralTempScannerTests: XCTestCase {
     /// payload; the delete-time revalidator allowed them; and the cleaner
     /// deleted them. No later gate refused, because the container-root policy
     /// refuses only `/`, volume roots and `$HOME` itself — `~/Documents` is a
-    /// legal container by design (`PathGuard.swift:350-361`).
+    /// legal container by design (`PathGuard.swift:424-435`).
     ///
     /// The victim is deliberately `<home>/Documents`, the production shape,
     /// and the disposal is the PERMANENT arm so the assertion observes a real

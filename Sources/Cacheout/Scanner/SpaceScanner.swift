@@ -2040,7 +2040,7 @@ struct SpaceScannerRuntime {
             // #459 codex r16). `sessionContainerRoots` needs to know which
             // union entries a participating scanner's declared root can
             // MATCH, and matching is by canonical identity
-            // (`PathGuard.matchConfiguredRoot`, PathGuard.swift:462-469), not
+            // (`PathGuard.matchConfiguredRoot`, PathGuard.swift:536-543), not
             // by spelling. Re-canonicalizing at session time would pay this
             // construction's realpath bill again — per session, per trigger,
             // on exactly the roots the participation gate exists to leave
@@ -3047,7 +3047,7 @@ struct SpaceScannerRuntime {
     ///
     /// WHY IT CANNOT STRAND A LATER CLEAN. Omission from the snapshot is
     /// fail-closed: `PathGuard.admitContainer` refuses a root it cannot find
-    /// there (PathGuard.swift:400-403). Both consumers already refuse the
+    /// there (PathGuard.swift:474-477). Both consumers already refuse the
     /// same items for an independent reason:
     ///
     /// - the ViewModel gates every destructive path on the scanner's
@@ -3069,7 +3069,7 @@ struct SpaceScannerRuntime {
     ///
     /// WHY CANONICAL KEYS AND NOT JUST PATHS. Delete-time root matching is by
     /// canonical identity over the whole union, returning the FIRST match
-    /// (PathGuard.swift:462-469), and the snapshot is keyed by THAT root's
+    /// (PathGuard.swift:536-543), and the snapshot is keyed by THAT root's
     /// declared spelling. So a participating scanner's claim can legitimately
     /// key off a union entry only a NON-participating scanner declared — an
     /// alias spelling of the same location, including the case where the

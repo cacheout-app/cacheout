@@ -720,7 +720,7 @@ final class EphemeralTempRootsTests: XCTestCase {
     /// turns on. A root KEPT here would reach the runtime's cross-scanner
     /// union, where `SpaceScannerRuntime.suppressingAliasShadows`
     /// (`suppressingAliasShadows`' probe pair,
-    /// `SpaceScanner.swift:1992-1996`) canonicalizes and probes every root
+    /// `SpaceScanner.swift:2021-2025`) canonicalizes and probes every root
     /// it is given, still during construction — so the block would simply
     /// move one function along. Measured against this fixture before the
     /// preflight existed: `production()` made 5 calls naming the mounted

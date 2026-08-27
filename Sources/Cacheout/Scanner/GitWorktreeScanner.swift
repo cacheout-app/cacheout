@@ -132,15 +132,17 @@ import os
 /// can name a path under a TCC-protected ancestor. The path is unknowable
 /// before the pointer is read, so the gate cannot precede the resolution — it
 /// is applied INSIDE it, by making the deferred paths look like they are not
-/// there. The resolver probes each pointer target before it opens anything, so
-/// on an automatic scan nothing under a protected ancestor is ever opened,
-/// enumerated or read.
-///
-/// What DOES still happen on a deferred path is `canonicalize` — `realpath(3)`,
-/// the same operation fn-4's pinned protected-root classification performs on a
-/// protected root before skipping it (`ProjectTreeWalker.isProtectedRoot`
-/// canonicalizes first, by design). The house doctrine already draws the line
-/// there, and this wrapper does not move it.
+/// there. The resolver probes each pointer target before it opens — and,
+/// since fn-4.26, before it CANONICALIZES — anything: `realpath(3)` traverses
+/// every component it resolves, so the probe-then-canonicalize order is what
+/// keeps an automatic scan from walking a protected path while ruling it
+/// untouchable. (This doc used to claim a pre-gate `canonicalize` was fine
+/// because `ProjectTreeWalker.isProtectedRoot` "canonicalizes first, by
+/// design" — that predicate now classifies a directly-protected spelling
+/// LEXICALLY before it ever canonicalizes, so neither side dereferences such
+/// a path, and the line the claim leaned on no longer exists.) On an
+/// automatic scan nothing under a protected ancestor is opened, enumerated,
+/// read, or realpath'd through.
 ///
 /// `.absent` rather than `.failed` deliberately: a policy deferral is not a
 /// problem to report (the walker skips a vanished entry quietly for the same
@@ -182,7 +184,14 @@ private final class DeferringIdentityProvider: FileSystemIdentityProvider {
 
     // Path arithmetic is delegated UNCHANGED so an injected test provider's
     // aliasing still flows through (and so the deferral above is the only
-    // behavioural difference).
+    // behavioural difference). SAFE only because of ORDER (fn-4.26): the
+    // resolver asks `probeKind` — which the deferral intercepts — for every
+    // pointer-derived path BEFORE it canonicalizes it, and the deferral
+    // predicate itself classifies directly-protected spellings lexically. A
+    // caller that canonicalized first would traverse the protected path
+    // through this very pass-through; that ordering is pinned red by
+    // `testAutomaticScanNeverRealpathsThroughAProtectedAdminDirectory` and
+    // the resolver-level deferral cells.
     override func realPath(of path: String) -> String? { wrapped.realPath(of: path) }
 
     override func canonicalize(_ url: URL) -> URL { wrapped.canonicalize(url) }
@@ -1768,9 +1777,11 @@ struct GitWorktreeScanner: @unchecked Sendable {
     ///
     /// So on `.automatic` the resolver runs on a provider that reports every
     /// deferred path as ABSENT. The resolver is fail-closed by construction —
-    /// it `probeKind`s each pointer target BEFORE reading it — so the deferral
-    /// lands before any `open`, and the worktree simply attributes nowhere
-    /// (silent, exactly like every other policy skip).
+    /// it `probeKind`s each pointer target BEFORE reading it, and (fn-4.26)
+    /// before CANONICALIZING it, `realpath(3)` being a traversal of its own —
+    /// so the deferral lands before any `open` and before any dereference,
+    /// and the worktree simply attributes nowhere (silent, exactly like every
+    /// other policy skip).
     private func identityProvider(for context: ScanContext) -> FileSystemIdentityProvider {
         guard !context.includeProtectedRoots else { return provider }
         let home = self.home

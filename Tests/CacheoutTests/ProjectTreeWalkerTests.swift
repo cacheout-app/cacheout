@@ -1047,6 +1047,54 @@ final class ProjectTreeWalkerTests: XCTestCase {
 
     // MARK: - R12: TCC protection by canonical prefix, never basename
 
+    /// Counts `realpath(3)` arguments — `canonicalize` funnels through
+    /// `realPath(of:)`, so one seam counts every dereference the
+    /// classification performs (fn-4.26).
+    private final class RealpathRecordingProvider: FileSystemIdentityProvider {
+        private(set) var realPathArguments: [String] = []
+
+        override func realPath(of path: String) -> String? {
+            realPathArguments.append(path)
+            return super.realPath(of: path)
+        }
+    }
+
+    func testDirectlyProtectedSpellingClassifiesWithoutDereferencing() throws {
+        // The predicate is the secondary TCC gate's classification, so it
+        // must answer for a spelling that ALREADY lies under a protected
+        // ancestor without dereferencing it — `realpath(3)` on `~/Documents/…`
+        // is itself a traversal of the protected path, and the previous
+        // canonicalize-first body performed it on exactly the paths it was
+        // about to rule untouchable (fn-4.26).
+        let documents = home.appendingPathComponent("Documents")
+        try mkdir(documents.appendingPathComponent("GitHub"))
+        let recorder = RealpathRecordingProvider()
+
+        XCTAssertTrue(ProjectTreeWalker.isProtectedRoot(
+            documents.appendingPathComponent("GitHub"), home: home, provider: recorder
+        ))
+        XCTAssertEqual(
+            recorder.realPathArguments, [],
+            "classifying a directly-protected spelling must not traverse it"
+        )
+        // Lexical `.`/`..` folds stay lexical too — no filesystem access.
+        XCTAssertTrue(ProjectTreeWalker.isProtectedRoot(
+            home.appendingPathComponent("Desktop/./x"), home: home, provider: recorder
+        ))
+        XCTAssertEqual(recorder.realPathArguments, [])
+
+        // CONTROL: an unprotected spelling still reaches the CANONICAL stage
+        // (the alias shapes in the cell below depend on it) — so the zeros
+        // above are a property of the lexical match, not of a dead seam.
+        XCTAssertFalse(ProjectTreeWalker.isProtectedRoot(
+            home.appendingPathComponent("work"), home: home, provider: recorder
+        ))
+        XCTAssertFalse(
+            recorder.realPathArguments.isEmpty,
+            "the canonical stage ran for the unmatched spelling"
+        )
+    }
+
     func testProtectedRootDeterminationIsCanonicalPrefixNotBasename() throws {
         let documents = home.appendingPathComponent("Documents")
         try mkdir(documents.appendingPathComponent("GitHub"))

@@ -152,17 +152,47 @@ struct ProjectTreeWalker {
 
     // MARK: - TCC-protected-root determination (R12)
 
-    /// Is `root` gated behind a macOS TCC consent prompt? True iff the
-    /// CANONICAL root path is equal to or under a canonical protected
-    /// ancestor (`home/Documents`, `home/Desktop`, `home/Downloads`) —
-    /// prefix by `pathComponents`, never string `hasPrefix`, never basename:
-    /// `~/Documents/GitHub` is protected because `Documents` is; a directory
-    /// merely NAMED `Documents` outside home is not; an alias spelling that
-    /// resolves INTO `~/Documents` through a symlinked ancestor is protected
-    /// as `~/Documents`.
+    /// Is `root` gated behind a macOS TCC consent prompt? True iff the root
+    /// is equal to or under a protected ancestor (`home/Documents`,
+    /// `home/Desktop`, `home/Downloads`) — prefix by `pathComponents`, never
+    /// string `hasPrefix`, never basename: `~/Documents/GitHub` is protected
+    /// because `Documents` is; a directory merely NAMED `Documents` outside
+    /// home is not; an alias spelling that resolves INTO `~/Documents`
+    /// through a symlinked ancestor is protected as `~/Documents`.
+    ///
+    /// TWO STAGES, and the ORDER is load-bearing (fn-4.26): this predicate
+    /// IS the TCC gates' classification, so it must answer for a
+    /// directly-protected spelling without dereferencing it — `realpath(3)`
+    /// traverses every component it resolves, and the previous
+    /// canonicalize-first body performed that traversal on exactly the paths
+    /// it was about to rule untouchable.
+    ///
+    /// 1. LEXICAL — the spelling as given, `.`/`..` folded with no
+    ///    filesystem access, against the spelled ancestors. A match
+    ///    classifies protected with NOTHING dereferenced. A spelling under a
+    ///    protected ancestor that a symlink would resolve elsewhere now
+    ///    classifies protected too — fail-closed, and every caller's
+    ///    true-arm is a silent skip or deferral, never a mutation.
+    /// 2. CANONICAL — only for spellings stage 1 could not match: the alias
+    ///    shapes (a symlinked ancestor, a case/NFD respelling) classify on
+    ///    the canonical path exactly as before. The argument handed to
+    ///    `canonicalize` here is never a directly-protected spelling; an
+    ///    ALIAS argument's resolution does still traverse its target — the
+    ///    disclosed residual, and not one the worktree resolver's pointer
+    ///    chase can reach (its targets arrive spelled by git, and stage 1
+    ///    answers for those).
     static func isProtectedRoot(
         _ root: URL, home: URL, provider: FileSystemIdentityProvider
     ) -> Bool {
+        let spelled = root.standardizedFileURL.pathComponents
+        for name in tccProtectedAncestorNames {
+            let ancestor = home.appendingPathComponent(name)
+                .standardizedFileURL.pathComponents
+            if spelled.count >= ancestor.count,
+               Array(spelled.prefix(ancestor.count)) == ancestor {
+                return true
+            }
+        }
         let rootComponents = provider.canonicalize(root).pathComponents
         for name in tccProtectedAncestorNames {
             let ancestor = provider

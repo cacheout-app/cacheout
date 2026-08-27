@@ -318,6 +318,23 @@ struct GitWorktreeGitdirResolver {
               let pointer = pointerPath(inFileAt: dotGit, relativeTo: worktreePath)
         else { return nil }
 
+        // THE GATE READS THE POINTER FIRST, AS SPELLED (fn-4.26). On an
+        // `.automatic` scan the injected provider answers `.absent` for a
+        // deferred (TCC-protected) target — and its predicate classifies a
+        // directly-protected spelling lexically — so `canonicalize` below,
+        // which is `realpath(3)` and therefore itself a traversal of every
+        // component it resolves, runs only on a target the gate permitted.
+        // The previous order canonicalized first, which walked the protected
+        // path before the deferral could answer. No verdict changed: the
+        // kinds that pass here are exactly the ones the canonical probe
+        // below could still map onto a directory (a directory spelling, or a
+        // symlink to one); every other kind, absence, and probe failure
+        // produced nil AFTER the traversal — now before it.
+        switch identity.probeKind(of: pointer) {
+        case .kind(.directory), .kind(.symlink): break
+        default: return nil
+        }
+
         let adminDirectory = identity.canonicalize(pointer)
         guard identity.probeKind(of: adminDirectory) == .kind(.directory),
               adminDirectory.deletingLastPathComponent().lastPathComponent
@@ -326,9 +343,20 @@ struct GitWorktreeGitdirResolver {
 
         // BACK-LINK: the admin directory must point back at THIS worktree's
         // `.git` file. One-way, stale, and forged pointers all stop here.
+        //
+        // The back-link TARGET is data too, and `sameLocation`'s fallback
+        // canonicalizes BOTH sides when either identity is missing — which a
+        // deferred side always is — so the same gate answers for it before
+        // the comparison (fn-4.26). A deferred target could never have
+        // verified anyway: `dotGit` demonstrably exists, and a comparison of
+        // an existing file against an untouchable one proves nothing.
+        // Absence and probe failure fail exactly as they did before — the
+        // fallback comparison they used to reach could not answer true for a
+        // target that is not there while `dotGit` is.
         let backlinkFile = adminDirectory.appendingPathComponent("gitdir")
         guard identity.probeKind(of: backlinkFile) == .kind(.regularFile),
               let backlinkTarget = pathContents(of: backlinkFile, relativeTo: adminDirectory),
+              case .kind = identity.probeKind(of: backlinkTarget),
               identity.sameLocation(backlinkTarget, dotGit)
         else { return nil }
 
@@ -343,6 +371,15 @@ struct GitWorktreeGitdirResolver {
         guard identity.probeKind(of: commonDirFile) == .kind(.regularFile),
               let target = pathContents(of: commonDirFile, relativeTo: adminDirectory)
         else { return nil }
+        // The same first-read gate as `adminDirectory(forWorktreeAt:)`
+        // (fn-4.26): a `commondir` is usually the relative `../..`, but the
+        // file's content is DATA — an absolute spelling into a deferred
+        // location must be answered by the gate before `realpath(3)` walks
+        // it. Verdicts are unchanged for every non-deferred shape.
+        switch identity.probeKind(of: target) {
+        case .kind(.directory), .kind(.symlink): break
+        default: return nil
+        }
         let resolved = identity.canonicalize(target)
         guard identity.probeKind(of: resolved) == .kind(.directory) else { return nil }
         return resolved
@@ -392,6 +429,17 @@ struct GitWorktreeGitdirResolver {
         case .kind(.regularFile):
             guard let pointer = pointerPath(inFileAt: dotGit, relativeTo: mainRecord.path)
             else { return false }
+            // The same first-read gate (fn-4.26): `sameLocation`'s fallback
+            // canonicalizes BOTH sides when either identity is missing — and
+            // a deferred side always is — so the gate answers for the
+            // pointer target before the comparison. Worse than the
+            // traversal, the fallback's canonical PATH equality would have
+            // answered true for a deferred target, validating a repository
+            // the scan was told not to touch. A genuinely absent target
+            // could never compare equal to `parentGitDir`, which was probed
+            // a directory moments ago — failing closed changes no reachable
+            // verdict.
+            guard case .kind = identity.probeKind(of: pointer) else { return false }
             return identity.sameLocation(pointer, parentGitDir)
         default:
             return false

@@ -198,15 +198,34 @@ private final class MountPointInjectingProvider: FileSystemIdentityProvider {
 
 /// Records every lstat PROBE (the operation that precedes every read the
 /// resolver and the mapper perform) so a test can prove nothing under a
-/// protected ancestor was ever inspected.
+/// protected ancestor was ever inspected — and every `realpath(3)` ARGUMENT
+/// (fn-4.26), because `realpath` is not a probe: it traverses every component
+/// it resolves, so canonicalizing a protected path is itself the access the
+/// deferral exists to prevent, and counting probes alone left it invisible.
+/// `canonicalize` funnels through `realPath(of:)`, so recording the one seam
+/// counts both.
 private final class ProbeRecordingProvider: FileSystemIdentityProvider {
     private let lock = NSLock()
     private var probed: [String] = []
+    private var realpathed: [String] = []
 
     var probedPaths: [String] {
         lock.lock()
         defer { lock.unlock() }
         return probed
+    }
+
+    var realPathArguments: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return realpathed
+    }
+
+    override func realPath(of path: String) -> String? {
+        lock.lock()
+        realpathed.append(path)
+        lock.unlock()
+        return super.realPath(of: path)
     }
 
     override func probeKind(of url: URL) -> KindProbe {
@@ -3074,6 +3093,69 @@ final class GitWorktreeScannerTests: XCTestCase {
         XCTAssertTrue(user.items.isEmpty, "the admin container is outside every root")
         XCTAssertTrue(user.errors.contains { $0.kind == .containerRefused })
         try assertNonMalformed(user, from: userScanner)
+    }
+
+    func testAutomaticScanNeverRealpathsThroughAProtectedAdminDirectory()
+        async throws
+    {
+        // The cell above proves nothing under the protected git directory was
+        // ever PROBED — but `realpath(3)` is not a probe, and the resolver
+        // used to `canonicalize` a worktree's `gitdir:` pointer target BEFORE
+        // its first gated `probeKind`, while the deferral predicate itself
+        // canonicalized the path it was classifying. So a background scan
+        // traversed the protected path with the probe cell green (fn-4.26,
+        // PR #460 codex). This cell counts the DEREFERENCE itself, on the
+        // injected provider.
+        let protectedHome = base.appendingPathComponent("protected-home")
+        let gitDirectory = protectedHome.appendingPathComponent("Documents/repo.git")
+        let workingTree = dev.appendingPathComponent("wd")
+        let worktree = dev.appendingPathComponent("wt")
+        try makeSplitRepository(
+            gitDirectory: gitDirectory, workingTree: workingTree, worktree: worktree
+        )
+        let listing = Self.porcelain([
+            ["worktree \(workingTree.path)", "HEAD \(String(repeating: "a", count: 40))", "branch refs/heads/main"],
+            ["worktree \(worktree.path)", "HEAD \(String(repeating: "a", count: 40))", "branch refs/heads/feature"],
+        ])
+
+        // Both spellings, exactly as the probe cell matches them: the `/var`
+        // alias the fixture rides and its canonical `/private/var` form.
+        let protectedPrefixes = [
+            gitDirectory.path,
+            FileSystemIdentityProvider().canonicalize(gitDirectory).path,
+        ]
+        func protectedRealpaths(_ provider: ProbeRecordingProvider) -> [String] {
+            provider.realPathArguments.filter { path in
+                protectedPrefixes.contains { path.hasPrefix($0) }
+            }
+        }
+
+        let automaticProvider = ProbeRecordingProvider()
+        let automaticRunner = ScriptedGitRunner(listing: listing)
+        let automatic = await makeScanner(
+            runner: automaticRunner, provider: automaticProvider, home: protectedHome
+        ).scan(context: ScanContext(trigger: .automatic))
+        XCTAssertTrue(automatic.items.isEmpty)
+        XCTAssertTrue(automatic.errors.isEmpty, "a deferral is silent: \(automatic.errors)")
+        XCTAssertEqual(
+            protectedRealpaths(automaticProvider), [],
+            "an automatic scan realpath'd THROUGH the protected git directory "
+                + "— the gate must answer before any dereference"
+        )
+
+        // POSITIVE control: the very same fixture under a user-initiated scan
+        // DOES realpath through it (the deferral is policy, not a
+        // capability) — without this the zero above would be vacuous.
+        let userProvider = ProbeRecordingProvider()
+        let user = await makeScanner(
+            runner: ScriptedGitRunner(listing: listing), provider: userProvider,
+            home: protectedHome
+        ).scan(context: ScanContext(trigger: .userInitiated))
+        XCTAssertFalse(
+            protectedRealpaths(userProvider).isEmpty,
+            "a user-initiated scan resolves the pointer — the counting seam is live"
+        )
+        XCTAssertTrue(user.errors.contains { $0.kind == .containerRefused })
     }
 
     func testFirstRecordAuthorityWinsWhenTheGitDirsParentIsNotTheWorkingTree()

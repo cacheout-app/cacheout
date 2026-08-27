@@ -43,6 +43,56 @@ private final class RedirectingIdentityProvider: FileSystemIdentityProvider {
     }
 }
 
+/// The scanner's `.automatic`-scan provider, reduced to exactly the arms the
+/// RESOLVER consumes (fn-4.26): a deferred path probes `.absent` and carries
+/// no identity, and every `realpath(3)` ARGUMENT is recorded so a cell can
+/// count the dereferences the gate must forestall. Deliberately NO more
+/// capable than the production `DeferringIdentityProvider` — a double that
+/// answered more would hide exactly the ordering bug under test. The deferral
+/// predicate is a plain string prefix, dereferencing nothing, so every
+/// recorded realpath is attributable to the RESOLVER's own ordering, never to
+/// the predicate's.
+private final class DeferralRecordingProvider: FileSystemIdentityProvider {
+    private let deferredPrefix: String?
+    private let lock = NSLock()
+    private var recorded: [String] = []
+
+    init(deferring prefix: String? = nil) {
+        self.deferredPrefix = prefix
+        super.init()
+    }
+
+    var realPathArguments: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return recorded
+    }
+
+    func realPathArguments(under prefix: String) -> [String] {
+        realPathArguments.filter { $0.hasPrefix(prefix) }
+    }
+
+    private func isDeferred(_ path: String) -> Bool {
+        guard let deferredPrefix else { return false }
+        return path.hasPrefix(deferredPrefix)
+    }
+
+    override func probeKind(of url: URL) -> KindProbe {
+        isDeferred(url.path) ? .absent : super.probeKind(of: url)
+    }
+
+    override func identity(of url: URL) -> Identity? {
+        isDeferred(url.path) ? nil : super.identity(of: url)
+    }
+
+    override func realPath(of path: String) -> String? {
+        lock.lock()
+        recorded.append(path)
+        lock.unlock()
+        return super.realPath(of: path)
+    }
+}
+
 final class GitWorktreeInventoryTests: XCTestCase {
 
     private var base: URL!
@@ -391,6 +441,142 @@ final class GitWorktreeInventoryTests: XCTestCase {
             at: main.appendingPathComponent(".git"), withIntermediateDirectories: true
         )
         XCTAssertNil(GitWorktreeGitdirResolver().adminDirectory(forWorktreeAt: main))
+    }
+
+    // MARK: - Resolver: the secondary TCC gate reads the pointer FIRST (fn-4.26)
+
+    func testADeferredPointerTargetIsNeverRealpathedBeforeTheGateAnswers() throws {
+        let fixture = try makeHandBuiltPair()
+
+        // CONTROL first: the same fixture over the same double WITHOUT a
+        // deferral resolves, and the resolution DOES realpath the pointer
+        // target — so whatever the deferring half refuses below, it refuses
+        // because of the deferral, not for the fixture's own reasons, and the
+        // zero below is measured on a live seam.
+        let control = DeferralRecordingProvider()
+        XCTAssertNotNil(
+            GitWorktreeGitdirResolver(identity: control)
+                .adminDirectory(forWorktreeAt: fixture.worktree)
+        )
+        XCTAssertFalse(
+            control.realPathArguments(under: fixture.gitDir.path).isEmpty,
+            "an ungated resolution realpaths the pointer target — without "
+                + "this the deferring half's zero would be vacuous"
+        )
+
+        let deferring = DeferralRecordingProvider(deferring: fixture.gitDir.path)
+        XCTAssertNil(
+            GitWorktreeGitdirResolver(identity: deferring)
+                .adminDirectory(forWorktreeAt: fixture.worktree),
+            "a deferred pointer target attributes NOWHERE"
+        )
+        XCTAssertEqual(
+            deferring.realPathArguments(under: fixture.gitDir.path), [],
+            "realpath(3) traverses every component it resolves — the gate "
+                + "must answer before it runs, not after"
+        )
+    }
+
+    func testADeferredCommondirTargetIsNeverRealpathedBeforeTheGateAnswers() throws {
+        // An absolute `commondir` spelling into deferred territory: the
+        // file's content is DATA, so the gate must answer for it before
+        // `canonicalize` walks it.
+        let outside = base.appendingPathComponent("hand/elsewhere-common")
+        try fm.createDirectory(at: outside, withIntermediateDirectories: true)
+        let fixture = try makeHandBuiltPair(commonDirSpelling: outside.path)
+
+        let control = DeferralRecordingProvider()
+        XCTAssertNotNil(
+            GitWorktreeGitdirResolver(identity: control)
+                .commonGitDirectory(forAdminDirectory: fixture.adminDir)
+        )
+        XCTAssertFalse(
+            control.realPathArguments(under: outside.path).isEmpty,
+            "an ungated resolution realpaths the commondir target"
+        )
+
+        let deferring = DeferralRecordingProvider(deferring: outside.path)
+        XCTAssertNil(
+            GitWorktreeGitdirResolver(identity: deferring)
+                .commonGitDirectory(forAdminDirectory: fixture.adminDir),
+            "a deferred commondir target resolves NOWHERE"
+        )
+        XCTAssertEqual(
+            deferring.realPathArguments(under: outside.path), [],
+            "the gate answers before the dereference"
+        )
+    }
+
+    func testADeferredSeparateGitDirPointerFailsCrossValidationWithoutRealpath() throws {
+        // A non-bare first record whose `.git` FILE points into deferred
+        // territory. `sameLocation`'s fallback canonicalizes BOTH sides when
+        // either identity is missing — and a deferred path carries none — so
+        // without the pointer gate the COMPARISON itself would traverse the
+        // deferred target (and, worse, canonical path equality would answer
+        // true for a path the scan was told not to touch).
+        let record = base.appendingPathComponent("hand/sep-wd")
+        try fm.createDirectory(at: record, withIntermediateDirectories: true)
+        let external = base.appendingPathComponent("hand/sep-git")
+        try fm.createDirectory(at: external, withIntermediateDirectories: true)
+        try "gitdir: \(external.path)\n".write(
+            to: record.appendingPathComponent(".git"), atomically: true, encoding: .utf8
+        )
+
+        // CONTROL: ungated, the shape cross-validates — the deferring half's
+        // false below is the deferral firing, not a broken fixture.
+        let control = DeferralRecordingProvider()
+        XCTAssertTrue(
+            GitWorktreeGitdirResolver(identity: control).crossValidate(
+                mainRecord: mainRecord(at: record), against: external
+            )
+        )
+
+        let deferring = DeferralRecordingProvider(deferring: external.path)
+        XCTAssertFalse(
+            GitWorktreeGitdirResolver(identity: deferring).crossValidate(
+                mainRecord: mainRecord(at: record), against: external
+            ),
+            "a deferred pointer target fails cross-validation CLOSED"
+        )
+        XCTAssertEqual(
+            deferring.realPathArguments(under: external.path), [],
+            "the comparison must not canonicalize a deferred side"
+        )
+    }
+
+    func testADeferredBacklinkTargetIsNeverRealpathedByTheComparison() throws {
+        // The back-link file lives in an UNdeferred admin directory, but its
+        // content is data and can spell a path under a deferred ancestor. The
+        // back-link can never verify against such a target (the worktree's
+        // own `.git` is reachable, or the resolution would have stopped
+        // sooner) — so the comparison must fail closed WITHOUT dereferencing
+        // the spelled target.
+        let elsewhere = base.appendingPathComponent("hand/protected-elsewhere")
+        try fm.createDirectory(at: elsewhere, withIntermediateDirectories: true)
+        let target = elsewhere.appendingPathComponent(".git")
+        try "gitdir: nothing\n".write(to: target, atomically: true, encoding: .utf8)
+        let fixture = try makeHandBuiltPair(backlinkTarget: target)
+
+        // CONTROL: ungated this is the forged-backlink shape — refused, and
+        // refused by the COMPARISON (both sides carry identities, so the
+        // comparison runs and answers false).
+        let control = DeferralRecordingProvider()
+        XCTAssertNil(
+            GitWorktreeGitdirResolver(identity: control)
+                .adminDirectory(forWorktreeAt: fixture.worktree)
+        )
+
+        let deferring = DeferralRecordingProvider(deferring: elsewhere.path)
+        XCTAssertNil(
+            GitWorktreeGitdirResolver(identity: deferring)
+                .adminDirectory(forWorktreeAt: fixture.worktree),
+            "a deferred back-link target verifies NOTHING"
+        )
+        XCTAssertEqual(
+            deferring.realPathArguments(under: elsewhere.path), [],
+            "a deferred side must fail the comparison closed, not be "
+                + "canonicalized by its fallback"
+        )
     }
 
     // MARK: - Resolver: real git, ordinary parent

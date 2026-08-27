@@ -201,8 +201,10 @@ private final class DeferringIdentityProvider: FileSystemIdentityProvider {
 
 // MARK: - Discovery
 
-/// What a `.git` entry proved about the directory that holds it. Both kinds
-/// come from ONE lstat no-follow probe the walker already performed.
+/// What a walk event proved about the directory it describes. The first two
+/// kinds come from ONE lstat no-follow probe of a `.git` entry the walker
+/// already performed; the third from the resolver's bare-shape proof over a
+/// directory that has no `.git` entry at all.
 enum GitWorktreeDiscoveryKind: Equatable, Sendable {
     /// `.git` is a DIRECTORY — the holder is a main checkout, and that
     /// directory IS the repository's git directory.
@@ -210,6 +212,13 @@ enum GitWorktreeDiscoveryKind: Equatable, Sendable {
     /// `.git` is a regular FILE — the holder is a linked worktree whose
     /// pointer the fn-5.1 resolver validates bidirectionally.
     case linkedWorktree
+    /// The directory has NO `.git` entry and IS a git directory itself: the
+    /// bare-repository shape, proved by the resolver's
+    /// `bareRepositoryGitDirectory` (fn-4.28). Without this kind a bare
+    /// parent whose checkouts were all deleted was never discovered, and the
+    /// prune tier never ran for exactly the all-checkouts-gone case it
+    /// exists to reclaim.
+    case bareRepository
 }
 
 /// One directory the walk proved to be a checkout, in walk order.
@@ -534,6 +543,36 @@ struct GitWorktreeScanner: @unchecked Sendable {
                 continue
             }
         }
+
+        // THE BARE BRANCH (fn-4.28). A bare repository stores `HEAD`,
+        // `objects` and its refs backend directly at its root, with no
+        // `.git` entry — so once its linked checkouts are all deleted,
+        // nothing above could discover it and the prune tier never ran for
+        // exactly the all-checkouts-gone case it exists for.
+        //
+        // The event's OWN lstat'd entries are the cost gate: only a
+        // directory that already shows the full bare shape — and no `.git`
+        // entry of ANY kind, because a directory holding one is a checkout
+        // or nothing — pays for the resolver's proof, which re-probes every
+        // component through the (possibly deferring) provider and reads
+        // `HEAD` and `config` only behind their `probeKind` gates. A
+        // directory that merely LOOKS bare fails that proof and contributes
+        // nothing: no discovery, no issue, no git subprocess.
+        if !event.entries.contains(where: { $0.name == ".git" }),
+           event.entries.contains(where: {
+               $0.name == "HEAD" && $0.kind == .regularFile
+           }),
+           event.entries.contains(where: {
+               $0.name == "objects" && $0.kind == .directory
+           }),
+           event.entries.contains(where: {
+               ($0.name == "refs" || $0.name == "reftable") && $0.kind == .directory
+           }),
+           resolver.bareRepositoryGitDirectory(at: event.directory) != nil {
+            discoveries.append(GitWorktreeDiscovery(
+                directory: event.directory, kind: .bareRepository
+            ))
+        }
         return []
     }
 
@@ -623,6 +662,14 @@ struct GitWorktreeScanner: @unchecked Sendable {
                 }
                 gitDirectory = discovery.adminDirectory
                     .flatMap { resolver.commonGitDirectory(forAdminDirectory: $0) }
+            case .bareRepository:
+                // The directory ITSELF is the git directory — the resolver's
+                // bare-shape proof said so in the walk consumer (fn-4.28).
+                // Canonicalized exactly as the main-checkout arm
+                // canonicalizes `<dir>/.git`, so a bare parent reached both
+                // ways (its own shape AND a live checkout's `gitdir:`
+                // pointer) names ONE group and pays for ONE listing.
+                gitDirectory = provider.canonicalize(discovery.directory)
             }
             guard let gitDirectory else { continue }
             let key = gitDirectory.path
@@ -728,7 +775,10 @@ struct GitWorktreeScanner: @unchecked Sendable {
             !isDeferred($0.directory, context: context)
         }
         // A main checkout is the friendliest `-C` target; a bare parent has
-        // none, so its linked worktree is used instead.
+        // none, so its own discovered directory — or, before fn-4.28 gave
+        // bare repositories a discovery of their own, a linked worktree —
+        // is used instead (`git -C <bare> worktree list` is the documented
+        // bare workflow).
         guard let listingTarget = (reachable.first { $0.kind == .mainCheckout }
                                    ?? reachable.first)?.directory else {
             return .processed // every reachable checkout is protected — deferred

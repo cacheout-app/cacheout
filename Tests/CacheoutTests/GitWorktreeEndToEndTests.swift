@@ -557,6 +557,81 @@ final class GitWorktreeEndToEndTests: XCTestCase {
         }
     }
 
+    /// **THE ALL-CHECKOUTS-GONE BARE REPOSITORY, END TO END** (fn-4.28).
+    ///
+    /// The case the prune tier exists for: a bare parent whose linked
+    /// checkouts were all deleted by hand. Discovery used to key on a `.git`
+    /// entry, which a bare repository does not have — so this fixture
+    /// produced NO item, NO issue, and the orphaned admin data survived
+    /// every scan. The cell drives the real production composition and then
+    /// asks git itself whether pruning left the repository usable: a clean
+    /// registry, a quiet `fsck`, and a FRESH `git worktree add` that
+    /// succeeds.
+    @MainActor
+    func testABareRepositoryWhoseCheckoutsAreAllGoneIsPrunedAndStaysUsable()
+        async throws
+    {
+        let seed = try makeRepository(at: base.appendingPathComponent("seed"))
+        let bare = dev.appendingPathComponent("repo.git")
+        XCTAssertEqual(
+            try GitFixture.git(
+                ["clone", "--bare", seed.path, bare.path], home: home
+            ).status, 0, "bare clone failed"
+        )
+        let gone = try addWorktree(
+            of: bare, at: dev.appendingPathComponent("gone"), branch: "gone"
+        )
+        try fm.removeItem(at: gone)
+
+        let runner = hermeticRunner()
+        let viewModel = CacheoutViewModel(runtime: productionRuntime(runner: runner))
+        await viewModel.scan(
+            trigger: .userInitiated, scannerIDs: [GitWorktreeScanner.registeredID]
+        )
+        let section = try XCTUnwrap(viewModel.perItemSections.first {
+            $0.scannerID == GitWorktreeScanner.registeredID
+        })
+        let prune = try item(section.items, mode: .pruneOrphanedAdmin)
+        XCTAssertEqual(section.items.count, 1, "the prune item and nothing else")
+        XCTAssertTrue(
+            prune.evidence.contains(gone.lastPathComponent),
+            "the disclosure names the gone checkout: \(prune.evidence)"
+        )
+
+        viewModel.moveToTrash = false   // permanent, fixture-contained
+        viewModel.toggleSelection(for: prune.key)
+        await viewModel.clean()
+
+        let report = try XCTUnwrap(viewModel.lastReport)
+        XCTAssertEqual(report.errors.map(\.message), [])
+        XCTAssertEqual(report.entries.map(\.key), [prune.key])
+
+        // THE REPOSITORY IS USABLE AFTERWARDS, by git's own account.
+        let listing = try worktreeListing(of: bare)
+        XCTAssertFalse(listing.contains("prunable"),
+                       "the registry is clean: \(listing)")
+        let fsck = try GitFixture.git(
+            ["-C", bare.path, "fsck", "--unreachable", "--no-reflogs"], home: home
+        )
+        XCTAssertEqual(fsck.status, 0)
+        XCTAssertEqual(
+            String(decoding: fsck.stdout, as: UTF8.self)
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+            "", "fsck must be quiet after the prune"
+        )
+        let fresh = dev.appendingPathComponent("fresh")
+        XCTAssertEqual(
+            try GitFixture.git(
+                ["-C", bare.path, "worktree", "add", fresh.path, "-b", "fresh"],
+                home: home
+            ).status, 0,
+            "a fresh worktree add must succeed against the pruned repository"
+        )
+        // Branch refs survive the prune — the epic's central promise, on
+        // the bare path too.
+        XCTAssertTrue(try branches(of: bare).isSuperset(of: ["main", "gone"]))
+    }
+
     /// **B-P1 THROUGH THE PRODUCTION SEAM** (PR #460 codex r16).
     ///
     /// The scanner-level cells for this defect live in

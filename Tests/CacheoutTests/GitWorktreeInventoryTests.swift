@@ -443,6 +443,154 @@ final class GitWorktreeInventoryTests: XCTestCase {
         XCTAssertNil(GitWorktreeGitdirResolver().adminDirectory(forWorktreeAt: main))
     }
 
+    // MARK: - Resolver: the bare-repository shape proof (fn-4.28)
+
+    /// A hand-built directory carrying git's bare shape, with each
+    /// requirement individually forgeable.
+    private func makeHandBuiltBare(
+        named name: String = "bare.git",
+        head: String? = "ref: refs/heads/main\n",
+        config: String? = "[core]\n\trepositoryformatversion = 0\n\tbare = true\n",
+        refsBackend: String? = "refs",
+        withObjects: Bool = true
+    ) throws -> URL {
+        let bare = base.appendingPathComponent("hand/\(name)")
+        try fm.createDirectory(at: bare, withIntermediateDirectories: true)
+        if let head {
+            try head.write(
+                to: bare.appendingPathComponent("HEAD"), atomically: true, encoding: .utf8
+            )
+        }
+        if let config {
+            try config.write(
+                to: bare.appendingPathComponent("config"), atomically: true, encoding: .utf8
+            )
+        }
+        if let refsBackend {
+            try fm.createDirectory(
+                at: bare.appendingPathComponent(refsBackend),
+                withIntermediateDirectories: true
+            )
+        }
+        if withObjects {
+            try fm.createDirectory(
+                at: bare.appendingPathComponent("objects"),
+                withIntermediateDirectories: true
+            )
+        }
+        return bare
+    }
+
+    /// CONTROL for every refusal arm below: the intact hand-built shape IS
+    /// accepted, so each refusal is attributable to the one requirement its
+    /// arm forged, never to the fixture's own reasons.
+    func testBareShapeProofAcceptsTheIntactShapeAndARealBareClone() async throws {
+        let resolver = GitWorktreeGitdirResolver()
+        let hand = try makeHandBuiltBare()
+        XCTAssertEqual(
+            resolver.bareRepositoryGitDirectory(at: hand)?.path, hand.path
+        )
+
+        // A detached 40-hex HEAD is a shape git accepts too.
+        let detached = try makeHandBuiltBare(
+            named: "detached.git",
+            head: "221c2f088de2c34c76347bde00820accad4f529c\n"
+        )
+        XCTAssertNotNil(resolver.bareRepositoryGitDirectory(at: detached))
+
+        // The reftable refs backend, in place of a `refs` directory.
+        let reftable = try makeHandBuiltBare(
+            named: "reftable.git", refsBackend: "reftable"
+        )
+        XCTAssertNotNil(resolver.bareRepositoryGitDirectory(at: reftable))
+
+        // And the real thing, produced by git rather than by hand.
+        let seed = base.appendingPathComponent("seed")
+        try GitFixture.makeRepository(at: seed, home: home)
+        let cloned = base.appendingPathComponent("real.git")
+        XCTAssertEqual(
+            try GitFixture.git(
+                ["clone", "--bare", seed.path, cloned.path], home: home
+            ).status, 0
+        )
+        XCTAssertNotNil(resolver.bareRepositoryGitDirectory(at: cloned))
+    }
+
+    /// Every requirement of the bare shape, forged one at a time — a
+    /// directory that merely LOOKS bare is refused on whichever leg its
+    /// forgery breaks. The intact-shape control above keeps each nil honest.
+    func testBareShapeProofRefusesEachForgedRequirement() throws {
+        let resolver = GitWorktreeGitdirResolver()
+
+        // HEAD content no git would accept.
+        XCTAssertNil(resolver.bareRepositoryGitDirectory(
+            at: try makeHandBuiltBare(named: "badhead.git", head: "not a head\n")
+        ))
+        // A symref outside refs/, and a truncated object id.
+        XCTAssertNil(resolver.bareRepositoryGitDirectory(
+            at: try makeHandBuiltBare(named: "strayref.git", head: "ref: HEAD2\n")
+        ))
+        XCTAssertNil(resolver.bareRepositoryGitDirectory(
+            at: try makeHandBuiltBare(named: "shortsha.git", head: "abc123\n")
+        ))
+        // HEAD missing entirely, and HEAD a symlink (never followed).
+        XCTAssertNil(resolver.bareRepositoryGitDirectory(
+            at: try makeHandBuiltBare(named: "nohead.git", head: nil)
+        ))
+        let linkHead = try makeHandBuiltBare(named: "linkhead.git", head: nil)
+        let realHead = base.appendingPathComponent("hand/elsewhere-HEAD")
+        try "ref: refs/heads/main\n".write(to: realHead, atomically: true, encoding: .utf8)
+        try fm.createSymbolicLink(
+            at: linkHead.appendingPathComponent("HEAD"), withDestinationURL: realHead
+        )
+        XCTAssertNil(resolver.bareRepositoryGitDirectory(at: linkHead))
+        // No object database.
+        XCTAssertNil(resolver.bareRepositoryGitDirectory(
+            at: try makeHandBuiltBare(named: "noobjects.git", withObjects: false)
+        ))
+        // No refs backend of either kind.
+        XCTAssertNil(resolver.bareRepositoryGitDirectory(
+            at: try makeHandBuiltBare(named: "norefs.git", refsBackend: nil)
+        ))
+        // A git directory that backs a working tree elsewhere: same
+        // HEAD/objects/refs shape, `bare = false` — the `--separate-git-dir`
+        // layout this proof must not claim.
+        XCTAssertNil(resolver.bareRepositoryGitDirectory(
+            at: try makeHandBuiltBare(
+                named: "sgd.git",
+                config: "[core]\n\trepositoryformatversion = 0\n\tbare = false\n"
+            )
+        ))
+        // No config at all: bareness cannot be established, so nothing is.
+        XCTAssertNil(resolver.bareRepositoryGitDirectory(
+            at: try makeHandBuiltBare(named: "noconfig.git", config: nil)
+        ))
+    }
+
+    /// The TCC gate holds for the bare proof exactly as it does for the
+    /// pointer reads: a deferred directory probes `.absent` at its first
+    /// component read, so nothing under it is opened.
+    func testADeferredBareDirectoryIsRefusedByTheGateNotInspected() throws {
+        let bare = try makeHandBuiltBare(named: "deferred.git")
+
+        let control = DeferralRecordingProvider()
+        XCTAssertNotNil(
+            GitWorktreeGitdirResolver(identity: control)
+                .bareRepositoryGitDirectory(at: bare),
+            "the control must accept the same shape the deferral refuses"
+        )
+
+        let deferring = DeferralRecordingProvider(deferring: bare.path)
+        XCTAssertNil(
+            GitWorktreeGitdirResolver(identity: deferring)
+                .bareRepositoryGitDirectory(at: bare)
+        )
+        XCTAssertEqual(
+            deferring.realPathArguments(under: bare.path), [],
+            "nothing under a deferred directory is ever dereferenced"
+        )
+    }
+
     // MARK: - Resolver: the secondary TCC gate reads the pointer FIRST (fn-4.26)
 
     func testADeferredPointerTargetIsNeverRealpathedBeforeTheGateAnswers() throws {

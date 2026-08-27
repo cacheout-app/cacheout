@@ -363,6 +363,88 @@ struct GitWorktreeGitdirResolver {
         return adminDirectory
     }
 
+    /// The BARE-repository proof (fn-4.28): is this directory a bare
+    /// repository git itself would accept? `nil` = fail closed.
+    ///
+    /// Discovery keys on an entry named `.git`, and a bare repository has
+    /// none — so a bare parent whose checkouts were ALL deleted used to name
+    /// no group and the prune tier never ran for exactly the case it exists
+    /// for. This proof is the discovery half of closing that gap; the
+    /// listing half stays with `crossValidate`, whose bare branch requires
+    /// git's OWN porcelain first record to declare the same directory bare
+    /// before anything downstream is derived from it.
+    ///
+    /// WHAT IS REQUIRED, all probed through the injected identity provider
+    /// (so the TCC deferral answers first, exactly as it does for the
+    /// `gitdir:` pointer reads above), and each read only AFTER its
+    /// `probeKind` gate:
+    ///
+    /// - `HEAD`, a regular file — never a symlink — whose content is a shape
+    ///   git's own `validate_headref` accepts: a `ref: refs/…` symref or a
+    ///   40/64-hex detached object id;
+    /// - `objects`, a directory;
+    /// - a refs backend: `refs` a directory, or the reftable layout's
+    ///   `reftable` directory;
+    /// - `config`, a regular file that DECLARES bareness the way git's own
+    ///   writer spells it (a `bare = true` line). A git directory that backs
+    ///   a working tree elsewhere (`--separate-git-dir`) carries the same
+    ///   HEAD/objects/refs shape with `bare = false`, and admitting it here
+    ///   would publish a cross-validation issue on every scan for a healthy
+    ///   repository this scanner deliberately does not cover.
+    ///
+    /// RESIDUAL, disclosed rather than implied: a bare repository whose
+    /// config spells bareness any way other than git's writer (`bare = yes`,
+    /// an include, no config file at all) stays undiscovered — the same
+    /// silent non-discovery every bare repository had before fn-4.28, never
+    /// a refusal dressed as retryable.
+    func bareRepositoryGitDirectory(at directory: URL) -> URL? {
+        let head = directory.appendingPathComponent("HEAD")
+        guard identity.probeKind(of: head) == .kind(.regularFile),
+              let headContents = try? String(contentsOf: head, encoding: .utf8),
+              Self.isAcceptableHeadContent(headContents)
+        else { return nil }
+        guard identity.probeKind(of: directory.appendingPathComponent("objects"))
+            == .kind(.directory)
+        else { return nil }
+        let hasRefs = identity.probeKind(of: directory.appendingPathComponent("refs"))
+            == .kind(.directory)
+        let hasReftable = identity.probeKind(of: directory.appendingPathComponent("reftable"))
+            == .kind(.directory)
+        guard hasRefs || hasReftable else { return nil }
+        let config = directory.appendingPathComponent("config")
+        guard identity.probeKind(of: config) == .kind(.regularFile),
+              let configContents = try? String(contentsOf: config, encoding: .utf8),
+              Self.declaresBare(configContents)
+        else { return nil }
+        return directory
+    }
+
+    /// The HEAD shapes git's `validate_headref` accepts: `ref: refs/…`
+    /// naming a non-empty ref, or a detached 40-hex (SHA-1) / 64-hex
+    /// (SHA-256) object id.
+    static func isAcceptableHeadContent(_ contents: String) -> Bool {
+        let trimmed = contents.trimmingCharacters(in: .whitespacesAndNewlines)
+        let symrefPrefix = "ref: refs/"
+        if trimmed.hasPrefix(symrefPrefix) {
+            return trimmed.count > symrefPrefix.count
+        }
+        guard trimmed.count == 40 || trimmed.count == 64 else { return false }
+        return trimmed.allSatisfy { $0.isHexDigit && ($0.isNumber || $0.isLowercase) }
+    }
+
+    /// Does this config text carry a `bare = true` line, as git's own
+    /// config writer spells it (case-insensitive, whitespace-tolerant)?
+    static func declaresBare(_ configContents: String) -> Bool {
+        configContents.split(whereSeparator: \.isNewline).contains { line in
+            let trimmed = line.trimmingCharacters(in: .whitespaces).lowercased()
+            guard let equals = trimmed.firstIndex(of: "=") else { return false }
+            let key = trimmed[..<equals].trimmingCharacters(in: .whitespaces)
+            let value = trimmed[trimmed.index(after: equals)...]
+                .trimmingCharacters(in: .whitespaces)
+            return key == "bare" && value == "true"
+        }
+    }
+
     /// The repository's COMMON git directory, via the admin directory's
     /// `commondir` file (usually the relative `../..`). Resolved rather than
     /// stripped so bare mains and `extensions.worktreeConfig` layouts work.

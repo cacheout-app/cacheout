@@ -2541,6 +2541,175 @@ final class GitWorktreeScannerTests: XCTestCase {
         try assertNonMalformed(outcome, from: scanner)
     }
 
+    /// THE CASE THE PRUNE TIER EXISTS FOR (fn-4.28): a BARE repository whose
+    /// linked checkouts are ALL gone. Discovery used to key entirely on an
+    /// entry named `.git`, and a bare repository has none — so once its last
+    /// checkout was deleted, no repository group formed and the prune tier
+    /// never ran for exactly the all-checkouts-gone case it reclaims.
+    ///
+    /// MUTATION (the named red cell the task requires): remove the bare
+    /// branch of `GitWorktreeScanner.consume` (or have
+    /// `bareRepositoryGitDirectory` return nil) — no group forms, no prune
+    /// item is published, and the unwrap below fails.
+    func testABareRepositoryWhoseCheckoutsAreAllGoneIsDiscoveredForPruning()
+        async throws
+    {
+        let bare = dev.appendingPathComponent("repo.git")
+        let seed = try makeRepositoryIgnoringPayloads(
+            at: base.appendingPathComponent("seed")
+        )
+        XCTAssertEqual(
+            try GitFixture.git(
+                ["clone", "--bare", seed.path, bare.path], home: home
+            ).status, 0, "bare clone failed"
+        )
+        let gone = try addWorktree(
+            of: bare, at: dev.appendingPathComponent("bare-wt"), branch: "feature"
+        )
+        try fm.removeItem(at: gone)
+
+        let scanner = makeScanner()
+        let outcome = await scanner.scan(context: ScanContext(trigger: .userInitiated))
+
+        let pruneItem = try XCTUnwrap(
+            outcome.items.first { (try? plan(of: $0).mode) == .pruneOrphanedAdmin },
+            "a bare repository with every checkout gone must still be "
+                + "discovered and offered: \(outcome.errors.map(\.detail))"
+        )
+        let reclaim = try plan(of: pruneItem)
+        XCTAssertEqual(
+            reclaim.parentRepoWorkingDir.resolvingSymlinksInPath().path,
+            bare.resolvingSymlinksInPath().path,
+            "the bare repository directory itself is the `-C` target"
+        )
+        XCTAssertEqual(
+            reclaim.parentAdminContainer.resolvingSymlinksInPath().path,
+            bare.appendingPathComponent("worktrees").resolvingSymlinksInPath().path
+        )
+        XCTAssertEqual(reclaim.disclosedAdminDirectories.count, 1)
+        XCTAssertTrue(
+            pruneItem.evidence.contains(gone.lastPathComponent),
+            "the disclosure names the gone checkout: \(pruneItem.evidence)"
+        )
+
+        // ONE-TO-ONE MAPPING, proved on the bare path with a cell rather
+        // than by argument: the offered set is the SHARED mapper's answer
+        // for the same container and the same porcelain records.
+        let listed = try GitFixture.git(
+            GitWorktreeOracle.listArguments(forRepositoryAt: bare), home: home
+        )
+        XCTAssertEqual(listed.status, 0)
+        let inventory = try XCTUnwrap(GitWorktreeInventory.parse(listed.stdout))
+        let verdict = GitWorktreeAdminMapper().map(
+            prunableRecordsIn: inventory.entries,
+            adminContainer: reclaim.parentAdminContainer
+        )
+        guard case .complete(let expected) = verdict else {
+            return XCTFail("the shared mapper refused the fixture: \(verdict)")
+        }
+        XCTAssertEqual(
+            Set(reclaim.disclosedAdminDirectories.map(\.path)),
+            Set(expected.map(\.path)),
+            "the offered removal set is not the shared mapper's answer"
+        )
+        try assertNonMalformed(outcome, from: scanner)
+    }
+
+    /// The detached-HEAD preservation guard applies to the BARE discovery
+    /// path too — proved with a cell, not by argument (fn-4.28): a bare
+    /// repository whose only gone checkout was detached at a commit no ref
+    /// reaches gets NO prune item and a visible issue naming the commit.
+    func testABareRepositoryWithADetachedOrphanSuppressesThePrune() async throws {
+        let bare = dev.appendingPathComponent("repo.git")
+        let seed = try makeRepositoryIgnoringPayloads(
+            at: base.appendingPathComponent("seed")
+        )
+        XCTAssertEqual(
+            try GitFixture.git(
+                ["clone", "--bare", seed.path, bare.path], home: home
+            ).status, 0
+        )
+        let detached = try addDetachedOrphan(
+            of: bare, at: dev.appendingPathComponent("detached-gone")
+        )
+
+        let scanner = makeScanner()
+        let outcome = await scanner.scan(context: ScanContext(trigger: .userInitiated))
+
+        XCTAssertTrue(
+            outcome.items.isEmpty,
+            "no prune item may ship while a commit hangs off the bare "
+                + "repository's admin directory: \(outcome.items.map(\.displayName))"
+        )
+        let issue = try XCTUnwrap(
+            outcome.errors.first { $0.kind == .unreadable },
+            "the suppression must be VISIBLE: \(outcome.errors)"
+        )
+        XCTAssertTrue(
+            issue.detail.contains(String(detached.commit.prefix(12))),
+            "the issue must name the commit at risk: \(issue.detail)"
+        )
+        try assertNonMalformed(outcome, from: scanner)
+    }
+
+    /// A directory that merely LOOKS bare — the right entry NAMES with the
+    /// right lstat kinds, but a HEAD no git would accept — must not be
+    /// admitted: no item, no issue, and NO git subprocess ever spent on it.
+    func testADirectoryThatMerelyLooksBareIsNeverAdmitted() async throws {
+        let fake = dev.appendingPathComponent("fake.git")
+        try fm.createDirectory(
+            at: fake.appendingPathComponent("objects"), withIntermediateDirectories: true
+        )
+        try fm.createDirectory(
+            at: fake.appendingPathComponent("refs"), withIntermediateDirectories: true
+        )
+        try "not a head at all\n".write(
+            to: fake.appendingPathComponent("HEAD"), atomically: true, encoding: .utf8
+        )
+        try "[core]\n\tbare = true\n".write(
+            to: fake.appendingPathComponent("config"), atomically: true, encoding: .utf8
+        )
+
+        let runner = RecordingGitRunner(wrapping: makeRunner())
+        let scanner = makeScanner(runner: runner)
+        let outcome = await scanner.scan(context: ScanContext(trigger: .userInitiated))
+
+        XCTAssertTrue(outcome.items.isEmpty, "\(outcome.items.map(\.displayName))")
+        XCTAssertTrue(outcome.errors.isEmpty, "\(outcome.errors.map(\.detail))")
+        XCTAssertTrue(
+            runner.requests.isEmpty,
+            "an unproved shape must never reach git: \(runner.requests)"
+        )
+    }
+
+    /// A bare repository with a LIVE checkout is ONE group and ONE listing
+    /// however it is reached — the bare discovery joins the group the
+    /// checkout's `.git` pointer names, it never forks a second listing.
+    func testABareRepositoryAndItsLiveCheckoutShareOneListing() async throws {
+        let bare = dev.appendingPathComponent("repo.git")
+        let seed = try makeRepositoryIgnoringPayloads(
+            at: base.appendingPathComponent("seed")
+        )
+        XCTAssertEqual(
+            try GitFixture.git(
+                ["clone", "--bare", seed.path, bare.path], home: home
+            ).status, 0
+        )
+        try addWorktree(
+            of: bare, at: dev.appendingPathComponent("bare-wt"), branch: "feature"
+        )
+
+        let runner = RecordingGitRunner(wrapping: makeRunner())
+        let scanner = makeScanner(runner: runner)
+        let outcome = await scanner.scan(context: ScanContext(trigger: .userInitiated))
+
+        XCTAssertEqual(
+            runner.listings.count, 1,
+            "one repository, one porcelain listing: \(runner.listings)"
+        )
+        try assertNonMalformed(outcome, from: scanner)
+    }
+
     func testDevRootThatIsARepositoryEmitsWithTheParentEqualToTheRoot()
         async throws
     {

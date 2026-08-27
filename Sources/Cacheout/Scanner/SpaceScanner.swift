@@ -1375,14 +1375,43 @@ struct ScanSessionBounds: Sendable {
     /// wind down before `untilProducerFinishes()` stops waiting for it. See
     /// that method for what is given up when this one expires.
     let producerWindDownGrace: Duration
+    /// How long the PRE-SESSION container-identity capture
+    /// (`ContainerSnapshot.captureBounded`, fn-4.19) may take before the
+    /// session is concluded `.boundFired` with NOTHING scanned. Its own
+    /// bound and not `eventDeadline`'s, because the two cover different
+    /// work: the capture is a handful of `lstat`s (microseconds when every
+    /// volume answers — a hung network mount or unresponsive FUSE
+    /// filesystem under a session root is what spends it), while the event
+    /// deadline covers whole filesystem walks. See `scanValidatedSession`
+    /// for what a session whose capture timed out reports.
+    let captureDeadline: Duration
+
+    /// `captureDeadline` defaults here so the FIXTURE constructions across
+    /// the suite — none of which wedge the capture unless they inject a
+    /// bound of their own — keep their two-argument spelling. Ten seconds is
+    /// the `default` philosophy applied to a microseconds-scale operation:
+    /// it never fails a capture for being SLOW, only for being ABANDONED.
+    init(
+        eventDeadline: Duration,
+        producerWindDownGrace: Duration,
+        captureDeadline: Duration = .seconds(10)
+    ) {
+        self.eventDeadline = eventDeadline
+        self.producerWindDownGrace = producerWindDownGrace
+        self.captureDeadline = captureDeadline
+    }
 
     /// What the SHIPPED composition runs under — `production(…)` is the
     /// only construction in the repo that names it. Ten minutes is far above
     /// any measured scan of a real machine; it exists to convert "never"
     /// into "reported", and a scan that legitimately needs longer than this
-    /// has a different problem.
+    /// has a different problem. The capture deadline is thirty seconds by
+    /// the same rule: four orders of magnitude above a healthy capture,
+    /// short enough that a scan stalled on a dead mount reports within the
+    /// time a user will actually wait for a spinner.
     static let production = ScanSessionBounds(
-        eventDeadline: .seconds(600), producerWindDownGrace: .seconds(30)
+        eventDeadline: .seconds(600), producerWindDownGrace: .seconds(30),
+        captureDeadline: .seconds(30)
     )
 
     /// WHAT A COMPOSITION THAT DID NOT NAME A BOUND GETS, and why it is not
@@ -3087,8 +3116,10 @@ struct SpaceScannerRuntime {
     func scanValidated(
         scannerIDs: Set<String>? = nil,
         context: ScanContext
-    ) -> AsyncStream<ValidatedScannerEvent> {
-        scanValidatedSession(scannerIDs: scannerIDs, context: context).events
+    ) async -> AsyncStream<ValidatedScannerEvent> {
+        await scanValidatedSession(
+            scannerIDs: scannerIDs, context: context
+        ).events
     }
 
     /// `scanValidated` plus the producer's REAL completion (additive over
@@ -3099,10 +3130,18 @@ struct SpaceScannerRuntime {
     /// keeps its "scanning" guard honest until the walk has actually
     /// stopped, instead of releasing it while an orphaned traversal is
     /// still reading the same trees.
+    /// ASYNC SINCE fn-4.19, and the await is the fix: the container-identity
+    /// capture used to run synchronously inside this call, which
+    /// `CacheoutViewModel.scan` reaches on the MainActor — so every session
+    /// root's `lstat` ran ON THE MAIN THREAD, before any bound existed. The
+    /// method is nonisolated, so an async caller hops off its actor to run
+    /// it, and the capture itself is bounded (`captureDeadline`) with its
+    /// expiry reported through the session's own `.scanDidNotFinish`
+    /// vocabulary — see below.
     func scanValidatedSession(
         scannerIDs: Set<String>? = nil,
         context: ScanContext
-    ) -> ValidatedScanSession {
+    ) async -> ValidatedScanSession {
         // TWO independent filters, and the second is the PROTOCOL's rather
         // than the caller's (PR #459 review r2). `scannerIDs` is what the
         // caller asked for; `participates(in:)` is what the scanner will
@@ -3131,50 +3170,57 @@ struct SpaceScannerRuntime {
         // lstat (PR #459 review r6 codex C2 — that lstat is first contact
         // with the mounted filesystem).
         //
-        // RECORDED, NOT FIXED, AND NOT COVERED BY THE BOUND BELOW (PR #460
-        // codex r13). This capture is SYNCHRONOUS — `ContainerSnapshot
-        // .capture` reads the mount table and then runs `provider
-        // .identity(of:)`, an `lstat`, for every remaining session container
-        // root — and `CacheoutViewModel.scan` calls this method without an
-        // `await`, on the MainActor. So it runs ON THE MAIN THREAD, and it
-        // runs BEFORE the stream, the producer, the watchdog and the grace
-        // timer exist: a hung network mount or unresponsive FUSE volume
-        // freezes the app here, unbounded and unreported, with no
-        // `.scanDidNotFinish` possible because nothing is armed yet. r12's
-        // verifier measured a 6.03 s `scan` with `isMainThread == true` from
-        // a 6 s blocking `identity(of:)`; verified here as a code path
-        // rather than re-measured — the loop is straight-line synchronous
-        // and this call site has no suspension point before it. The
-        // `mountPointPaths()` preflight does NOT close it: it skips roots
-        // that ARE mount points, and a root INSIDE a hung mount is still
-        // lstat'ed. Pre-existing on origin/main; its own task.
+        // AND IT IS BOUNDED, OFF THE CALLING THREAD (fn-4.19; through fn-4
+        // round 1 this was RECORDED, NOT FIXED). The capture is synchronous
+        // filesystem work — the mount-table read plus one `lstat` per
+        // remaining session container root — and it ran inline in this
+        // then-synchronous method, which `CacheoutViewModel.scan` reaches
+        // from the MainActor: a hung network mount or unresponsive FUSE
+        // volume under ANY session root froze the app here, unbounded and
+        // unreported, with no `.scanDidNotFinish` possible because nothing
+        // was armed yet (r12's verifier measured a 6.03 s `scan` with
+        // `isMainThread == true` from a 6 s blocking `identity(of:)`; the
+        // `mountPointPaths()` preflight never covered a root INSIDE a hung
+        // mount). `captureBounded` runs the loop in a detached task racing a
+        // `ScanSessionClock` timer — the `BoundedDiskInfo` shape, and the
+        // same off-the-pool clock every session bound uses.
         //
-        // IT IS NOT THE ONLY PRE-SESSION WAIT, and reading it as "the one
-        // place the bound cannot reach" is what let a second one sit
-        // undisclosed for two rounds (PR #460 codex r14, V2-1).
-        // `CacheoutViewModel.scan`'s header refresh also runs after the
-        // in-progress guard and before this method is called; it is now
-        // bounded on its own clock (`BoundedDiskInfo`), which is the shape a
-        // fix for THIS site would take too — a wall-clock budget of its own,
-        // since the session's cannot be armed yet. What stops that here and
-        // not there is the disposition: an abandoned header fetch costs a
-        // stale figure, while an abandoned container snapshot would leave the
-        // session with no identity baseline to admit deletes against, so
-        // giving up on it needs a product decision about what the scan then
-        // reports.
-        let snapshot = ContainerSnapshot.capture(
-            roots: sessionContainerRoots(for: selected), provider: provider
+        // WHAT AN EXPIRED CAPTURE REPORTS — the product decision the r13
+        // record said this fix would owe. An abandoned capture leaves the
+        // session with NO identity baseline to admit deletes against, so
+        // proceeding to scan would publish items that delete-time admission
+        // must refuse wholesale — a scan-shaped success whose cleaning
+        // silently fails is the erasure class this project refuses. The
+        // session therefore runs NO scanner and reports every selected one
+        // through the vocabulary consumers already fail closed on: one
+        // `.scanDidNotFinish` per scanner, the ledger concluded
+        // `.boundFired` (so `didExceedBounds` is true and the GUI declines
+        // adoption; the CLI's target-scoped refusal reads the same rows),
+        // and a detail that names the capture and the retryable causes. CAN
+        // A RETRY DIFFER? Yes — the causes are a stalled volume or a
+        // starved band, both transient — so the re-scan remedy the label
+        // names is real, and this is a bound, not a deterministic strand.
+        // THE SESSION'S WALL-CLOCK BOUNDS (PR #460 codex r12, D2) — see
+        // `ScanSessionBounds` for the mechanism and the decision. Everything
+        // the watchdog needs is captured HERE, before any task starts — and
+        // since fn-4.19 the capture below spends the first of them.
+        let bounds = sessionBounds
+        let selectedIDs = selected.map(\.id)
+        let capture = await ContainerSnapshot.captureBounded(
+            roots: sessionContainerRoots(for: selected), provider: provider,
+            within: bounds.captureDeadline
         )
+        guard case .captured(let snapshot) = capture else {
+            return Self.captureTimedOutSession(
+                selectedIDs: selectedIDs, captureDeadline: bounds.captureDeadline,
+                windDownGrace: bounds.producerWindDownGrace
+            )
+        }
         let registeredCategories = self.registeredCategories
         let declaredContainerRoots = self.declaredContainerRoots
         let preDeleteRevalidators = self.preDeleteRevalidators
         let (events, continuation) =
             AsyncStream<ValidatedScannerEvent>.makeStream()
-        // THE SESSION'S WALL-CLOCK BOUNDS (PR #460 codex r12, D2) — see
-        // `ScanSessionBounds` for the mechanism and the decision. Everything
-        // the watchdog needs is captured HERE, before any task starts.
-        let bounds = sessionBounds
-        let selectedIDs = selected.map(\.id)
         let ledger = ScanSessionLedger()
         let woundDown = OneShotGate()
         // THE PRODUCER RUNS IN A LOWER PRIORITY BAND THAN ITS CONSUMER, and
@@ -3300,6 +3346,55 @@ struct SpaceScannerRuntime {
             snapshot: snapshot, events: events, producer: task,
             ledger: ledger, woundDown: woundDown,
             windDownGrace: bounds.producerWindDownGrace
+        )
+    }
+
+    /// The session a TIMED-OUT container-identity capture produces
+    /// (fn-4.19): nothing scanned, everything said so. One
+    /// `.scanDidNotFinish` per selected scanner — the kind's contract holds
+    /// exactly (nothing was rejected: nothing ARRIVED, and a retry can
+    /// genuinely differ) — with a detail naming the capture rather than the
+    /// walk, the ledger concluded `.boundFired` so `didExceedBounds` reads
+    /// true, and the EMPTY snapshot, which admits no container (the same
+    /// fail-closed refusal an omitted root has always produced).
+    ///
+    /// The stream is fully buffered before it is returned (`makeStream`'s
+    /// unbounded default), the producer is a completed no-op, and the
+    /// wind-down gate opens immediately — `untilProducerFinishes()` returns
+    /// on the spot, because there is no walk to wind down.
+    private static func captureTimedOutSession(
+        selectedIDs: [String], captureDeadline: Duration,
+        windDownGrace: Duration
+    ) -> ValidatedScanSession {
+        let (events, continuation) =
+            AsyncStream<ValidatedScannerEvent>.makeStream()
+        let ledger = ScanSessionLedger()
+        let woundDown = OneShotGate()
+        // The same atomic step the watchdog takes, for the same reason: the
+        // conclusion and the reported set are decided together. This is the
+        // first touch of a fresh ledger, so the missing set is every
+        // selected scanner.
+        let missing = ledger.conclude(.boundFired, selected: selectedIDs) ?? []
+        for id in missing {
+            continuation.yield(.malformed(
+                scannerID: id,
+                ScanIssue(
+                    url: nil, kind: .scanDidNotFinish,
+                    detail: "the container-identity capture did not finish "
+                        + "within \(captureDeadline); no scanner ran and "
+                        + "nothing from this session was used — a volume "
+                        + "that stopped answering (a hung network mount or "
+                        + "unresponsive FUSE filesystem under a scanned "
+                        + "location) can cause this, and a re-scan after it "
+                        + "answers or is unmounted can succeed"
+                )
+            ))
+        }
+        continuation.finish()
+        woundDown.open()
+        return ValidatedScanSession(
+            snapshot: .empty, events: events, producer: Task {},
+            ledger: ledger, woundDown: woundDown, windDownGrace: windDownGrace
         )
     }
 

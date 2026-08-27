@@ -1418,6 +1418,176 @@ final class CacheoutViewModelTests: XCTestCase {
         XCTAssertEqual(issue.kind, .scanDidNotFinish)
     }
 
+    /// A provider whose `identity(of:)` for ONE root blocks the way an
+    /// `lstat` against a hung mount does — the fn-4.19 fixture. The root it
+    /// wedges is a plain directory, NOT a mount point, so the
+    /// `mountPointPaths()` preflight passes it through to the lstat: this is
+    /// the "root INSIDE a hung mount" shape, the one the kernel-table skip
+    /// can never see. It records the thread the block landed on, so the cell
+    /// can assert the capture left the main thread as well as the bound.
+    private final class HungRootIdentityProvider: FileSystemIdentityProvider,
+        @unchecked Sendable
+    {
+        private let lock = NSLock()
+        /// The wedge is RELEASABLE, not a fixed sleep: the losing capture's
+        /// thread stays parked past the cell's assertions by design (the
+        /// disclosed abandonment residual), and a fixed multi-second sleep
+        /// left that parked worker leaking into whichever cell ran next —
+        /// observed as `testScanIsNotParkedByItsOwnDiskInfoPreamble…` going
+        /// red only when scheduled inside this cell's leftover window. The
+        /// cell releases it on the way out; the 10 s timeout is a fallback
+        /// so no mutation can turn this cell into a suite hang.
+        private let wedge = DispatchSemaphore(value: 0)
+        private var hungPath: String?
+        private var recordedMainThread: Bool?
+
+        func arm(root: URL) {
+            lock.lock()
+            defer { lock.unlock() }
+            hungPath = root.path
+        }
+
+        func disarm() {
+            lock.lock()
+            defer { lock.unlock() }
+            hungPath = nil
+        }
+
+        func releaseWedge() {
+            for _ in 0..<8 { wedge.signal() }
+        }
+
+        /// `true`/`false` once the wedge fired; nil if it never did.
+        var blockedOnMainThread: Bool? {
+            lock.lock()
+            defer { lock.unlock() }
+            return recordedMainThread
+        }
+
+        override func identity(of url: URL) -> Identity? {
+            lock.lock()
+            let isHung = url.path == hungPath
+            if isHung { recordedMainThread = Thread.isMainThread }
+            lock.unlock()
+            if isHung {
+                // NOT `Task.sleep`: an lstat against a dead mount blocks the
+                // THREAD, and so must the simulation.
+                _ = wedge.wait(timeout: .now() + 10)
+            }
+            return super.identity(of: url)
+        }
+    }
+
+    /// **fn-4.19, END TO END THROUGH PRODUCTION.** The container-identity
+    /// capture used to run synchronously on the main thread before any
+    /// bound existed: a hung mount under a session root froze the app,
+    /// unbounded and unreported (measured at PR #460 r12: a 6 s blocking
+    /// `identity(of:)` gave a 6.03 s `scan` with `isMainThread == true`).
+    ///
+    /// Now: the scan returns on `captureDeadline` (not the wedge); EVERY
+    /// selected scanner — the one whose root wedged AND the healthy one,
+    /// because nothing ran — gets a `.scanDidNotFinish` row whose detail
+    /// names the CAPTURE (which refusal, not just that one fired); the block
+    /// lands OFF the main thread; the in-progress guard is released; nothing
+    /// is adopted; and a re-scan after the volume answers succeeds — the
+    /// remedy the label names is real, so this is a bound, not a
+    /// deterministic strand.
+    ///
+    /// MUTATION (proved red, fn-4 round 2): (a) restore the synchronous
+    /// unbounded `ContainerSnapshot.capture` call in `scanValidatedSession`
+    /// and this cell reds on the elapsed-time assertion (the scan takes the
+    /// wedge); (b) make the timed-out branch finish the stream WITHOUT
+    /// yielding the per-scanner rows — the silent-skip erasure — and it reds
+    /// on the missing-issue assertion.
+    @MainActor
+    func testAHungMountUnderASessionRootIsBoundedReportedAndOffMain()
+        async throws
+    {
+        let hungRoot = base
+            .appendingPathComponent("inside-hung-mount")
+            .appendingPathComponent("cache-root")
+        try fm.createDirectory(at: hungRoot, withIntermediateDirectories: true)
+        let okOutcome = ScanOutcome(
+            items: [perItem(scanner: "ok", id: "o1", bytes: 5000)], errors: []
+        )
+        let provider = HungRootIdentityProvider()
+        let runtime = try makeRuntime(
+            [
+                fixtureScanner("ok") { okOutcome },
+                FixtureScanner(
+                    id: "victim", trustedContainerRoots: [hungRoot]
+                ) {
+                    ScanOutcome(items: [], errors: [])
+                },
+            ],
+            provider: provider,
+            sessionBounds: ScanSessionBounds(
+                eventDeadline: .milliseconds(500),
+                producerWindDownGrace: .milliseconds(50),
+                captureDeadline: .milliseconds(200)
+            )
+        )
+        let viewModel = CacheoutViewModel(runtime: runtime)
+        // Armed AFTER construction: registration-time reads are not the
+        // capture, and must not be what the cell wedges. Released on every
+        // exit so the abandoned capture thread cannot leak into the next
+        // cell.
+        provider.arm(root: hungRoot)
+        defer { provider.releaseWedge() }
+
+        let started = Date()
+        await viewModel.scan(trigger: .automatic)
+        let elapsed = Date().timeIntervalSince(started)
+
+        // (1) BOUNDED: the scan returned on the capture deadline (200 ms),
+        // not the wedge (a semaphore this cell has not yet released, capped
+        // at 10 s so a mutated run fails rather than hangs).
+        XCTAssertLessThan(
+            elapsed, 2.0,
+            "the scan must return on captureDeadline, not on the hung "
+                + "lstat: \(elapsed) s"
+        )
+        // (2) OFF THE MAIN THREAD: the wedge fired, and not on main.
+        XCTAssertEqual(
+            provider.blockedOnMainThread, false,
+            "the capture's lstat must have left the main thread "
+                + "(nil = never blocked, true = still on main)"
+        )
+        // (3) REPORTED, NOT SWALLOWED — for EVERY selected scanner, since
+        // nothing ran; a silent skip of a container root is the erasure
+        // class this project refuses. And WHICH refusal: the capture's, not
+        // the walk's.
+        for id in ["ok", "victim"] {
+            let issue = try XCTUnwrap(
+                viewModel.malformedIssuesByScannerID[id],
+                "scanner \(id) must carry the capture-expiry row"
+            )
+            XCTAssertEqual(issue.kind, .scanDidNotFinish)
+            XCTAssertNil(issue.url, "a NON-filesystem kind never invents a path")
+            XCTAssertTrue(
+                issue.detail.contains("container-identity capture"),
+                issue.detail
+            )
+        }
+        // (4) NOTHING PUBLISHED, NOTHING ADOPTED, GUARD RELEASED.
+        XCTAssertEqual(viewModel.items(forScanner: "ok"), [])
+        XCTAssertFalse(viewModel.hasScanned,
+                       "a capture-expired first scan is not a completed scan")
+        XCTAssertFalse(viewModel.isAnyScanInProgress,
+                       "the scan guard must not survive the capture bound")
+
+        // (5) A RETRY CAN DIFFER — the volume "answers" (disarm) and the
+        // next scan runs to completion. This is also the cell's CONTROL:
+        // were the fixture refusing for its own reasons, this scan would
+        // still carry the rows and fail here.
+        provider.disarm()
+        await viewModel.scan(trigger: .automatic)
+        XCTAssertNil(viewModel.malformedIssuesByScannerID["ok"])
+        XCTAssertNil(viewModel.malformedIssuesByScannerID["victim"])
+        XCTAssertEqual(viewModel.items(forScanner: "ok").map(\.id), ["o1"])
+        XCTAssertTrue(viewModel.hasScanned)
+    }
+
     /// THE BOUND MUST FIRE WHEN THE COOPERATIVE POOL IS STARVED — i.e. in
     /// exactly the wedge class it exists for (PR #460 codex r13, B).
     ///
@@ -1611,7 +1781,7 @@ final class CacheoutViewModelTests: XCTestCase {
         // `.utility` rather than this cell's, and so the starvation below
         // cannot reach the MainActor the test itself runs on.
         let consumer = Task.detached(priority: .utility) {
-            let session = runtime.scanValidatedSession(
+            let session = await runtime.scanValidatedSession(
                 context: ScanContext(trigger: .automatic)
             )
             for await _ in session.events {}
@@ -1992,7 +2162,7 @@ final class CacheoutViewModelTests: XCTestCase {
                     producerWindDownGrace: .milliseconds(50)
                 )
             )
-            let session = runtime.scanValidatedSession(
+            let session = await runtime.scanValidatedSession(
                 context: ScanContext(trigger: .automatic)
             )
             // THE RAW STREAM, not the view model's reduction of it: this is

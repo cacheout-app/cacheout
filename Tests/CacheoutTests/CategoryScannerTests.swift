@@ -2037,7 +2037,7 @@ final class CategoryScannerTests: XCTestCase {
         let runtime = try makeRuntime(scanners: [fast, gated], home: home)
 
         var events: [ValidatedScannerEvent] = []
-        for await event in runtime.scanValidated(
+        for await event in await runtime.scanValidated(
             context: ScanContext(trigger: .automatic)
         ) {
             events.append(event)

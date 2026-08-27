@@ -742,7 +742,7 @@ final class OrphanedCachesScannerTests: XCTestCase {
 
         let scanner = makeScanner()
         let runtime = try makeRuntime([scanner])
-        let session = runtime.scanValidatedSession(
+        let session = await runtime.scanValidatedSession(
             context: ScanContext(trigger: .userInitiated)
         )
         var items: [ReclaimableItem] = []
@@ -1070,7 +1070,7 @@ final class OrphanedCachesScannerTests: XCTestCase {
     private func scanSession(
         _ runtime: SpaceScannerRuntime
     ) async -> (items: [ReclaimableItem], snapshot: ContainerSnapshot) {
-        let session = runtime.scanValidatedSession(
+        let session = await runtime.scanValidatedSession(
             context: ScanContext(trigger: .userInitiated)
         )
         var items: [ReclaimableItem] = []
@@ -1171,7 +1171,7 @@ final class OrphanedCachesScannerTests: XCTestCase {
         let runtime = try makeRuntime([DelegatingGatedSweepScanner(
             inner: makeScanner(), gate: gate
         )])
-        let session = runtime.scanValidatedSession(
+        let session = await runtime.scanValidatedSession(
             context: ScanContext(trigger: .userInitiated)
         )
         try fm.removeItem(at: cachesRoot)

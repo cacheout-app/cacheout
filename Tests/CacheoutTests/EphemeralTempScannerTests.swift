@@ -3072,7 +3072,7 @@ final class EphemeralTempScannerTests: XCTestCase {
             scanners: [scanner], categories: [], home: home,
             provider: FileSystemIdentityProvider()
         )
-        let session = runtime.scanValidatedSession(
+        let session = await runtime.scanValidatedSession(
             context: ScanContext(trigger: .userInitiated)
         )
         var outcome: ScanOutcome?

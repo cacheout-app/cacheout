@@ -151,7 +151,12 @@ struct CategoryAdmissionPolicy {
 /// a visible refusal naming the unmount remedy. A mount landing between
 /// this table read and a capture that already passed is the accepted
 /// racing residual — the capture's own lstat can then block; no table
-/// re-read closes it.
+/// re-read closes it, but since fn-4.19 that block costs the session its
+/// CAPTURE DEADLINE rather than parking it: `captureBounded` runs the
+/// whole loop off the calling thread under a wall-clock budget, and an
+/// expiry is reported by the session, never swallowed (a root INSIDE a
+/// hung mount — which the table preflight cannot see — is covered by the
+/// same budget).
 struct ContainerSnapshot: Sendable {
 
     private let identities: [String: FileSystemIdentityProvider.Identity]
@@ -180,6 +185,75 @@ struct ContainerSnapshot: Sendable {
             }
         }
         return ContainerSnapshot(identities: identities)
+    }
+
+    /// A snapshot that captured NOTHING. Admits no container — every
+    /// delete-time lookup misses, which is the same fail-closed refusal an
+    /// absent root gets — and exists so the session a timed-out capture
+    /// produces (`scanValidatedSession`, fn-4.19) can still carry the
+    /// non-optional snapshot its shape requires without inventing an
+    /// identity nobody read.
+    static let empty = ContainerSnapshot(identities: [:])
+
+    /// The bounded capture's result. `.captured` and `.timedOut` are kept
+    /// apart — the `BoundedDiskInfo.Outcome` discipline — so a cell cannot
+    /// pass one while asserting the other.
+    enum BoundedCapture: Sendable {
+        case captured(ContainerSnapshot)
+        case timedOut
+    }
+
+    /// `capture(roots:provider:)` under a wall-clock budget, OFF the calling
+    /// thread — the `BoundedDiskInfo.current(within:)` shape (PR #460 codex
+    /// r14, V2-1) applied to the capture fn-4.19 measured freezing the app:
+    /// the synchronous loop ran on the MainActor's thread and each root's
+    /// `lstat` was first contact with whatever answers for that path, so a
+    /// hung network mount or unresponsive FUSE volume under ANY session root
+    /// — including a root INSIDE a mount, which the `mountPointPaths()`
+    /// preflight cannot see — froze the app unbounded and unreported
+    /// (measured: a 6 s blocking `identity(of:)` gave a 6.03 s `scan` with
+    /// `isMainThread == true`).
+    ///
+    /// The loop now runs in a detached task racing a `ScanSessionClock`
+    /// timer — off the cooperative pool, because a `Task.sleep` deadline
+    /// cannot resume while the pool is the thing that is starved — and the
+    /// caller resumes on its own executor with whichever arrives first. The
+    /// detached band is `.utility`, the SAME band-separation decision the
+    /// session producer takes and for the same reason (PR #460 codex r13,
+    /// B): this is scan work, and cooperative-pool width is per-band, so a
+    /// saturated consumer band (the shape
+    /// `testScanIsNotParkedByItsOwnDiskInfoPreambleWhenTheBandIsSaturated`
+    /// drives) cannot stop the capture from even STARTING — measured in that
+    /// cell: with the band unspecified here, the capture queued behind the
+    /// holders and the scan rode this budget instead of finishing. A
+    /// saturated `.utility` band (concurrent sessions' own walks) is the
+    /// residual the timer still covers: “cannot start” reports exactly like
+    /// “started and hung”.
+    ///
+    /// WHAT IS NOT CLOSED, stated rather than glossed: a losing capture is
+    /// ABANDONED, not cancelled — `lstat` takes no deadline, so its thread
+    /// stays parked until the volume answers, exactly as `BoundedDiskInfo`
+    /// leaks its losing fetch. The bound converts the hang into a report; it
+    /// cannot cure the hang. CAN A RETRY DIFFER? Yes — a mount answers or
+    /// is unmounted, a saturated band frees — which is what makes reporting
+    /// the expiry as retryable honest (`scanValidatedSession` says how it is
+    /// reported).
+    static func captureBounded(
+        roots: [URL], provider: FileSystemIdentityProvider,
+        within budget: Duration
+    ) async -> BoundedCapture {
+        let rendezvous = FirstWinsRendezvous<BoundedCapture>()
+        let timer = ScanSessionClock.schedule(after: budget) {
+            rendezvous.settle(.timedOut)
+        }
+        Task.detached(priority: .utility) {
+            rendezvous.settle(
+                .captured(capture(roots: roots, provider: provider))
+            )
+        }
+        let outcome = await rendezvous.wait()
+        timer.cancel()
+        return outcome
     }
 
     /// The captured identity for a registered root's declared path spelling;

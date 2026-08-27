@@ -5266,7 +5266,7 @@ final class BuildArtifactsScannerTests: XCTestCase {
             categories: [], home: fixtureHome,
             provider: FileSystemIdentityProvider()
         )
-        let session = runtime.scanValidatedSession(
+        let session = await runtime.scanValidatedSession(
             context: ScanContext(trigger: .userInitiated)
         )
         var items: [ReclaimableItem] = []

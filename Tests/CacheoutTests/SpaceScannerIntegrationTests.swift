@@ -534,7 +534,7 @@ final class SpaceScannerIntegrationTests: XCTestCase {
         _ runtime: SpaceScannerRuntime, scannerIDs: Set<String>?,
         file: StaticString = #filePath, line: UInt = #line
     ) async -> (outcomes: [String: ScanOutcome], snapshot: ContainerSnapshot) {
-        let session = runtime.scanValidatedSession(
+        let session = await runtime.scanValidatedSession(
             scannerIDs: scannerIDs, context: ScanContext(trigger: .userInitiated)
         )
         var outcomes: [String: ScanOutcome] = [:]

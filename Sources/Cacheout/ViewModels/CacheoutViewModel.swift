@@ -1527,7 +1527,7 @@ class CacheoutViewModel: ObservableObject {
             diskInfo = fetched
         }
 
-        let session = sessionRuntime.scanValidatedSession(
+        let session = await sessionRuntime.scanValidatedSession(
             scannerIDs: participating,
             context: context
         )

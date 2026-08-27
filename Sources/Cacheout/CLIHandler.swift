@@ -474,7 +474,7 @@ struct CLIHandler {
         context: ScanContext
     ) async -> CollectedScanEvents {
         var collected = CollectedScanEvents()
-        let session = runtime.scanValidatedSession(
+        let session = await runtime.scanValidatedSession(
             scannerIDs: scannerIDs, context: context
         )
         collected.snapshot = session.snapshot

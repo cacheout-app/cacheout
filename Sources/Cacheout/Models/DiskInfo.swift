@@ -71,8 +71,10 @@ struct DiskInfo {
 /// `scanValidatedSession` creates the stream, the producer, the watchdog and
 /// the grace timer. So it was covered by NO bound and could produce NO
 /// `.scanDidNotFinish` — the twelfth strand mechanism on this branch, and the
-/// second one (after `ContainerSnapshot.capture`) that sits in front of the
-/// session bound rather than inside it.
+/// second one (after `ContainerSnapshot.capture`) that sat in front of the
+/// session bound rather than inside it. (The capture has since been bounded
+/// on this type's own shape — `ContainerSnapshot.captureBounded`, fn-4.19 —
+/// so neither pre-session wait survives unbounded.)
 ///
 /// `Task.detached` with no stated priority runs on the Swift cooperative
 /// pool, in the unspecified band, so it needs a free worker to START. MEASURED
@@ -149,7 +151,7 @@ enum BoundedDiskInfo {
         within budget: Duration,
         fetch: @escaping @Sendable () -> DiskInfo? = { DiskInfo.current() }
     ) async -> Outcome {
-        let rendezvous = Rendezvous()
+        let rendezvous = FirstWinsRendezvous<Outcome>()
         // OFF THE POOL, deliberately: see the type comment. A `Task.sleep`
         // here would need the very worker the fetch is waiting for.
         let timer = ScanSessionClock.schedule(after: budget) {
@@ -166,40 +168,7 @@ enum BoundedDiskInfo {
         return outcome
     }
 
-    /// One-shot, first-writer-wins, lock-guarded — the two settlers are a
-    /// Dispatch timer body and a detached task, neither of which may suspend.
-    /// The wait is a plain `withCheckedContinuation` (the spelling that
-    /// ignores the caller's cancellation) for the same reason `OneShotGate`
-    /// uses it: the timer ALWAYS settles, so an uncancellable wait cannot
-    /// become an unbounded one, and a cancellation-aware wait would collapse
-    /// the budget to zero in a cancelled caller.
-    private final class Rendezvous: @unchecked Sendable {
-        private let lock = NSLock()
-        private var settled: Outcome?
-        private var waiter: CheckedContinuation<Outcome, Never>?
-
-        func settle(_ outcome: Outcome) {
-            lock.lock()
-            guard settled == nil else { lock.unlock(); return }
-            settled = outcome
-            let waiter = self.waiter
-            self.waiter = nil
-            lock.unlock()
-            waiter?.resume(returning: outcome)
-        }
-
-        func wait() async -> Outcome {
-            await withCheckedContinuation {
-                (continuation: CheckedContinuation<Outcome, Never>) in
-                lock.lock()
-                if let settled {
-                    lock.unlock()
-                    continuation.resume(returning: settled)
-                    return
-                }
-                waiter = continuation
-                lock.unlock()
-            }
-        }
-    }
+    // The rendezvous itself is `FirstWinsRendezvous` — born here as a
+    // private class, extracted when `ContainerSnapshot.captureBounded`
+    // (fn-4.19) and `dockerPrune` (fn-4.20) needed the identical shape.
 }

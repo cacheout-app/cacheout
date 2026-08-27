@@ -723,7 +723,7 @@ struct BuildArtifactsScanner: @unchecked Sendable {
     ///   invented: device-id change against the ANCESTOR, plus the `statfs`
     ///   mount-root check that catches the same-`st_dev` firmlink mounts a
     ///   device comparison is blind to (`DirectorySizer.swift:354-359`,
-    ///   `ProjectTreeWalker.swift:529-532`, `ValuablesDetector.swift`). The sizer
+    ///   `ProjectTreeWalker.swift:559-562`, `ValuablesDetector.swift`). The sizer
     ///   records the boundary and skips its subtree uncounted; the cleaner
     ///   refuses any tree containing one whole
     ///   (`CacheCleaner.deleteGuardedChild`:1151 and `removeGuardedItem`:1371).

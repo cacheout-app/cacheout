@@ -814,8 +814,15 @@ public final class SnapshotCleanup: Intervention {
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
                 if process.isRunning {
                     kill(process.processIdentifier, SIGKILL)
-                    // Wait for child to be reaped before resuming.
-                    process.waitUntilExit()
+                    // Wait for the child to be reaped before resuming —
+                    // BOUNDED (fn-4.20): `waitUntilExit()` is the primitive
+                    // this repo retired after measuring it miss its
+                    // termination wakeup under concurrent reaping, and a
+                    // SIGKILLed child is reaped by the kernel promptly, so
+                    // five seconds is orders of magnitude of headroom. If
+                    // even that expires, the timeout below is resumed
+                    // anyway — a leaked zombie beats a strand.
+                    _ = process.waitForExit(within: 5)
                 }
                 resumer.resume(with: .failure(SnapshotError.timeout))
             }
@@ -864,8 +871,15 @@ public final class SnapshotCleanup: Intervention {
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
                 if process.isRunning {
                     kill(process.processIdentifier, SIGKILL)
-                    // Wait for child to be reaped before resuming.
-                    process.waitUntilExit()
+                    // Wait for the child to be reaped before resuming —
+                    // BOUNDED (fn-4.20): `waitUntilExit()` is the primitive
+                    // this repo retired after measuring it miss its
+                    // termination wakeup under concurrent reaping, and a
+                    // SIGKILLed child is reaped by the kernel promptly, so
+                    // five seconds is orders of magnitude of headroom. If
+                    // even that expires, the timeout below is resumed
+                    // anyway — a leaked zombie beats a strand.
+                    _ = process.waitForExit(within: 5)
                 }
                 resumer.resume(with: .failure(SnapshotError.timeout))
             }

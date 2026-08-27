@@ -2072,6 +2072,96 @@ final class CacheoutViewModelTests: XCTestCase {
         XCTAssertGreaterThan(disk.totalSpace, 0)
     }
 
+    // MARK: - Docker prune bound (fn-4.20)
+
+    /// **fn-4.20: A WEDGED DOCKER CLI MUST NOT LATCH THE BUTTON.** The old
+    /// body awaited `readToEnd()` + a bare `waitUntilExit()` unbounded, so
+    /// a child that neither exited nor closed its pipe held a cooperative
+    /// worker and left `isDockerPruning` true for the life of the app.
+    ///
+    /// The fixture child (`sleep 30`) is exactly that shape: it keeps its
+    /// stdout open, so `readToEnd()` parks — the task-spec's "can the read
+    /// park too?" answered by construction, not only in a comment — and it
+    /// ignores no signals, so the expiry's SIGTERM also cleans the fixture
+    /// up. With a 300 ms budget the prune must return promptly, release the
+    /// button, and REPORT the expiry, not swallow it.
+    ///
+    /// MUTATION (proved red, fn-4 round 2): drop the `ScanSessionClock`
+    /// timer from `dockerPrune` (never settle `.timedOut`) and this cell
+    /// reds on the elapsed assertion — the await rides the child's full 30 s
+    /// instead of the budget. Restoring the bare `waitUntilExit()` INSIDE
+    /// the raced task is caught by the OTHER named cell, the
+    /// `DocumentedContractTests` grep gate: the outer race would still
+    /// bound it, which is precisely why the gate exists as its own cell.
+    @MainActor
+    func testDockerPruneExpiresReportsAndReleasesTheButton() async throws {
+        let runtime = try makeRuntime([])
+        let viewModel = CacheoutViewModel(runtime: runtime)
+        viewModel.dockerPruneBudget = .milliseconds(300)
+        viewModel.dockerPruneCommand = ["sh", "-c", "sleep 30"]
+
+        let started = Date()
+        await viewModel.dockerPrune()
+        let elapsed = Date().timeIntervalSince(started)
+
+        XCTAssertLessThan(
+            elapsed, 5.0,
+            "dockerPrune must return on its budget, not on the wedged "
+                + "child: \(elapsed) s"
+        )
+        XCTAssertFalse(
+            viewModel.isDockerPruning,
+            "the button must be released on the expiry path"
+        )
+        let result = try XCTUnwrap(
+            viewModel.lastDockerPruneResult,
+            "the expiry must be reported, not swallowed"
+        )
+        XCTAssertTrue(result.contains("did not finish"), result)
+    }
+
+    /// CONTROL for the cell above, and the success path's parser: a child
+    /// that prints docker's reclaimed line and exits must be read to EOF
+    /// and reported through the same seams — so the expiry cell's refusal
+    /// is evidenced to come from the wedge, not from the seams themselves.
+    @MainActor
+    func testDockerPruneSuccessStillParsesTheReclaimedLine() async throws {
+        let runtime = try makeRuntime([])
+        let viewModel = CacheoutViewModel(runtime: runtime)
+        viewModel.dockerPruneBudget = .seconds(10)
+        viewModel.dockerPruneCommand = [
+            "sh", "-c", "echo 'Total reclaimed space: 1.234GB'",
+        ]
+
+        await viewModel.dockerPrune()
+
+        XCTAssertFalse(viewModel.isDockerPruning)
+        XCTAssertEqual(
+            viewModel.lastDockerPruneResult, "Total reclaimed space: 1.234GB"
+        )
+    }
+
+    /// AND THE FAILURE PATH IS STILL A COMPLETED FAILURE, NOT A TIMEOUT —
+    /// the two travel different arms of `DockerPruneOutcome` and must not
+    /// be able to trade places: a child that exits non-zero within the
+    /// budget reports the daemon guidance, never the expiry sentence.
+    @MainActor
+    func testDockerPruneCompletedFailureIsNotReportedAsExpiry() async throws {
+        let runtime = try makeRuntime([])
+        let viewModel = CacheoutViewModel(runtime: runtime)
+        viewModel.dockerPruneBudget = .seconds(10)
+        viewModel.dockerPruneCommand = [
+            "sh", "-c", "echo 'Cannot connect to the Docker daemon' >&2; exit 1",
+        ]
+
+        await viewModel.dockerPrune()
+
+        XCTAssertFalse(viewModel.isDockerPruning)
+        XCTAssertEqual(
+            viewModel.lastDockerPruneResult, "Docker must be running to prune"
+        )
+    }
+
     /// EXACTLY ONE EVENT PER SCANNER, EVER — the watchdog's report and the
     /// real outcome must be exclusive in BOTH directions (PR #460 codex r13,
     /// C).

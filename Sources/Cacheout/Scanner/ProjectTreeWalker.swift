@@ -500,9 +500,9 @@ struct ProjectTreeWalker {
                     // mid-walk deletion race, quiet by contract.
                     continue
                 case .failed(let code):
-                    // Classified by errno (EPERM → TCC, EACCES →
-                    // permission) — never a silent zero (R12). No kind was
-                    // proven, so the child is not listed.
+                    // Classified by errno (EACCES → permission; bare EPERM
+                    // is NEUTRAL, fn-4.12) — never a silent zero (R12). No
+                    // kind was proven, so the child is not listed.
                     issues.append(Self.issue(forFailedProbe: child, errno: code))
                 case .kind(let kind, let identity, _):
                     vetted[name] = identity

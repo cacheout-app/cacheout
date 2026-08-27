@@ -540,20 +540,29 @@ struct BuildArtifactsScanner: @unchecked Sendable {
     }
 
     /// A one-denial report for a containment impediment, classified on the
-    /// SAME frozen taxonomy every other denial uses (EPERM → TCC, EACCES →
-    /// BSD permissions, everything else a metadata failure).
+    /// SAME rule every raw-errno probe uses (fn-4.12,
+    /// `DirectorySizer.denial(forFailedProbe:errno:)`): EACCES → BSD
+    /// permissions; a BARE EPERM is NEUTRAL `.metadata` — the errno here
+    /// comes from a raw `openat`, which carries no provenance, so `.tcc`
+    /// (and the `.tccDenied` grant link it becomes on the item row) may not
+    /// be asserted from it; everything else a metadata failure.
     private static func obstruction(
         at url: URL, errno code: Int32 = EIO, detail: String
     ) -> SizeReport {
         var report = SizeReport()
         let kind: SizeDenial.Kind
+        var caveat = ""
         switch code {
-        case EPERM: kind = .tcc
+        case EPERM:
+            kind = .metadata
+            caveat = " — the cause could not be established (a privacy "
+                + "denial and a filesystem refusal are indistinguishable "
+                + "in a bare errno)"
         case EACCES: kind = .permission
         default: kind = .metadata
         }
         report.denials.append(
-            SizeDenial(url: url, kind: kind, detail: detail)
+            SizeDenial(url: url, kind: kind, detail: detail + caveat)
         )
         return report
     }
@@ -723,7 +732,7 @@ struct BuildArtifactsScanner: @unchecked Sendable {
     ///   invented: device-id change against the ANCESTOR, plus the `statfs`
     ///   mount-root check that catches the same-`st_dev` firmlink mounts a
     ///   device comparison is blind to (`DirectorySizer.swift:448-453`,
-    ///   `ProjectTreeWalker.swift:629-632`, `ValuablesDetector.swift`). The sizer
+    ///   `ProjectTreeWalker.swift:637-640`, `ValuablesDetector.swift`). The sizer
     ///   records the boundary and skips its subtree uncounted; the cleaner
     ///   refuses any tree containing one whole
     ///   (`deleteGuardedChild`, `CacheCleaner.swift:1210`, and

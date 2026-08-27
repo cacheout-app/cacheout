@@ -1004,7 +1004,7 @@ final class BuildArtifactsScannerTests: XCTestCase {
     }
 
     func testLogicalBytesPredicateMatchesTheAsBuiltBoundaryCells() {
-        // The as-built predicate VERBATIM (BuildArtifactsScanner.swift:1407-1408)
+        // The as-built predicate VERBATIM (BuildArtifactsScanner.swift:1416-1417)
         // — boundary cells on BOTH sides, which no filesystem fixture can
         // place precisely.
         var equal = SizeReport()
@@ -7256,6 +7256,54 @@ final class BuildArtifactsScannerTests: XCTestCase {
             inDirectory parent: Int32, named name: String, logical url: URL
         ) -> Int32 {
             openat(parent, name, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
+        }
+    }
+
+    /// A child open failing with a chosen raw errno — the seam behind the
+    /// containment descent's denial classification (fn-4.12).
+    private final class FailingChildOpenProvider: FileSystemIdentityProvider {
+        var failErrno: Int32 = EPERM
+        override func openChildDirectory(
+            inDirectory parent: Int32, named name: String, logical url: URL
+        ) -> Int32 {
+            errno = failErrno
+            return -1
+        }
+    }
+
+    /// The descent's own raw-errno classifier follows the shared bare-EPERM
+    /// rule (fn-4.12): a raw `openat` EPERM is NEUTRAL `.metadata` — never
+    /// `.tcc`, whose item-row mapping prints the "Grant access…" remedy on
+    /// a guess — while EACCES (the control, asserting WHICH refusal fired)
+    /// keeps its unambiguous `.permission`.
+    func testDescentOpenEPERMClassifiesNeutrallyEACCESAsPermission() throws {
+        let root = dev.appendingPathComponent("root")
+        let artifact = root.appendingPathComponent("proj/target")
+        try mkdir(artifact)
+
+        for (code, expected): (Int32, SizeDenial.Kind) in [
+            (EPERM, .metadata), (EACCES, .permission),
+        ] {
+            let provider = FailingChildOpenProvider()
+            provider.failErrno = code
+            let held = try anchors([root], provider: provider)
+            switch BuildArtifactsScanner.anchoredArtifactDirectory(
+                try candidate(artifact: artifact, originRoot: root),
+                rootAnchors: held, provider: provider
+            ) {
+            case .obstructed(let report):
+                XCTAssertEqual(report.denials.map(\.kind), [expected],
+                               "errno \(code)")
+                if code == EPERM {
+                    XCTAssertTrue(
+                        report.denials.first?.detail
+                            .contains("could not be established") == true,
+                        "the neutral detail says why: \(report.denials)"
+                    )
+                }
+            default:
+                XCTFail("a failed child open must be a classified obstruction")
+            }
         }
     }
 

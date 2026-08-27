@@ -5535,6 +5535,124 @@ extension CacheCleanerTests {
         )
     }
 
+    /// A provider whose descriptor-relative child read fails with a
+    /// NON-ENOENT errno for the victim child — the bind-failure branch of
+    /// `deleteGuardedChild`'s pipeline capture that is neither "already
+    /// gone" nor a successful binding (`TrashDisposal.boundLeaf` →
+    /// `probeChild` answering `.failed`). Modeled on
+    /// `WorktreeReclaimPerformerTests.LockUnreadableProvider` (PR #460
+    /// codex r19, R3): deny exactly one read, pass everything else through.
+    private final class ChildBindDeniedProvider: FileSystemIdentityProvider,
+        @unchecked Sendable
+    {
+        var deniedName: String!
+        var armed = false
+        private(set) var denied = false
+
+        override func probeChild(
+            inDirectory descriptor: Int32, named name: String,
+            logical: @autoclosure () -> URL
+        ) -> ChildProbe {
+            if armed, name == deniedName {
+                denied = true
+                return .failed(errno: EACCES)
+            }
+            return super.probeChild(
+                inDirectory: descriptor, named: name, logical: logical()
+            )
+        }
+    }
+
+    /// **THE NON-ENOENT BIND-FAILURE BRANCH OF fn-4.21's PIPELINE CAPTURE**
+    /// (fn-4 round 1 gate): `deleteGuardedChild` catches `.posix(ENOENT)`
+    /// from `TrashDisposal.boundLeaf` as `skippedAlreadyGone`; every OTHER
+    /// bind failure must be the child's FAILURE — reported in the cleanup
+    /// report — and never a silent skip, because an EACCES leaf is still
+    /// STANDING THERE: "already gone" would be a lie the report repeats as
+    /// success-shaped silence, and the deletion must not proceed either
+    /// (nothing was bound to prove it against).
+    ///
+    /// WHICH refusal: the report's one error is the binding's own
+    /// `.posix(EACCES)` ("Permission denied" naming the child's path) —
+    /// distinguishable from a skip, which produces NO error row and NO
+    /// entry.
+    ///
+    /// MUTATION: widen the ENOENT catch in `deleteGuardedChild` to swallow
+    /// every `DepthSafeRemoval.Failure` as `skippedAlreadyGone` and this
+    /// cell goes red on the error-count assertion — the EACCES leaf is then
+    /// reported as if it were absent.
+    func testContentsModeChildWhoseBindReadFailsIsRefusedNotSkipped()
+        async throws
+    {
+        let (home, root, victim, marker) = try makeContentsSwapFixture()
+        defer { try? FileManager.default.removeItem(at: home) }
+
+        let provider = ChildBindDeniedProvider()
+        provider.deniedName = victim.lastPathComponent
+
+        let cleaner = CacheCleaner(
+            home: home, containerRoots: [], provider: provider
+        )
+        provider.armed = true
+        let report = await cleaner.clean(
+            items: categoryItems(
+                [makeScanResult(category: makeCategory(at: root))],
+                home: home, provider: provider
+            ),
+            moveToTrash: false
+        )
+
+        XCTAssertTrue(provider.denied, "the fixture never denied the bind")
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: victim.appendingPathComponent(marker).path
+            ),
+            "a child whose bind read failed must survive untouched"
+        )
+        XCTAssertTrue(
+            report.entries.isEmpty,
+            "reported bytes for a child it refused to bind: \(report.entries)"
+        )
+        // NOT a skip: a skip is silent (zero errors); a non-ENOENT bind
+        // failure is the child's failure, with the binding's own errno.
+        XCTAssertEqual(report.errors.count, 1, "\(report.errors)")
+        let message = try XCTUnwrap(report.errors.first?.message)
+        XCTAssertTrue(message.contains("Permission denied"), message)
+        XCTAssertTrue(message.contains(victim.path), message)
+    }
+
+    /// CONTROL for the cell above: identical fixture, identical provider
+    /// double, never armed — the clean must SUCCEED, so the refusal above
+    /// is evidenced to come from the denied bind and not from the fixture
+    /// refusing for its own reasons.
+    func testContentsModeBindDeniedFixtureUnarmedControlCleans() async throws {
+        let (home, root, victim, _) = try makeContentsSwapFixture()
+        defer { try? FileManager.default.removeItem(at: home) }
+
+        let provider = ChildBindDeniedProvider()
+        provider.deniedName = victim.lastPathComponent
+        // NOT armed.
+
+        let cleaner = CacheCleaner(
+            home: home, containerRoots: [], provider: provider
+        )
+        let report = await cleaner.clean(
+            items: categoryItems(
+                [makeScanResult(category: makeCategory(at: root))],
+                home: home, provider: provider
+            ),
+            moveToTrash: false
+        )
+
+        XCTAssertFalse(provider.denied)
+        XCTAssertTrue(report.errors.isEmpty, "\(report.errors)")
+        XCTAssertEqual(report.entries.count, 1)
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: victim.path),
+            "the child is deleted on the unarmed control"
+        )
+    }
+
     /// Deterministic target-swap fixture for ITEM mode with NO revalidator
     /// (`probedObject == nil` — `expecting:` nil at runtime).
     ///

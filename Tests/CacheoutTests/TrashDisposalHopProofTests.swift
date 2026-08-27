@@ -2719,6 +2719,180 @@ final class TrashDisposalHopProofTests: XCTestCase {
         .destinationNotTheAdmittedContainer(landingPath), .destinationUnknown,
     ]
 
+    // MARK: The pinned vocabulary (fn-4.22)
+
+    /// EVERY wording, BYTE-EXACT, keyed by the proposition's raw value —
+    /// `nil` for the retired three that render to nothing. DEFAULT-DENY,
+    /// like the source-anchor table: an `Established` case missing from
+    /// here, or a rendering that differs from its pin by one byte, is a red
+    /// cell until the pin is re-stated — in THIS fence's own diff, where a
+    /// reviewer reads the new sentence.
+    private static let pinnedWordings: [String: String?] = [
+        "theDisposalWasNotProvedToHaveMovedTheItem":
+            "the disposal could not be proved to have moved the item that "
+            + "was inspected.",
+        "theLandingWasNotReported":
+            "the Trash did not report where it put the item, so which folder "
+            + "it took cannot be established.",
+        "theItemIsBackAtTheTarget":
+            "What it did take has been PUT BACK: it was moved back out of "
+            + "the Trash and identified at this path.",
+        "theLandingDidNotYieldTheItem":
+            "Nothing could be put back: what the disposal reported putting "
+            + "at \(landingPath) cannot be found there now, so nothing was "
+            + "moved rather than moving whatever took its place. The item "
+            + "may never have left \(targetPath), and it may be somewhere "
+            + "this could not read.",
+        "theLandingNameWasRepointed":
+            "Putting back what it did take moved a DIFFERENT object — the "
+            + "Trash name it came from (\(landingPath)) was re-used while "
+            + "the undo was running.",
+        "aStrangerStandsAtTheTarget":
+            "Whatever now stands at \(targetPath) came out of the Trash and "
+            + "was NOT put there by you.",
+        "theItemIsAtTheLanding":
+            "What it did take could not be put back automatically — it is "
+            + "in the Trash at \(landingPath). Move it back from there; and "
+            + "if something already stands at this path, move that aside "
+            + "first, because the automatic put-back refuses to overwrite.",
+        "theHoldingFolderIsNotTheAdmittedOne":
+            "What the Trash took was NOT put back: the folder that HOLDS "
+            + "this path is no longer the one the safety check admitted. "
+            + "Move it back once the folder at this path is the one you "
+            + "expect.",
+        "theItemsWhereaboutsAreNotEstablished":
+            "Where the item is now was NOT established.",
+        "nothingWasReportedFreed":
+            "No entry was written and nothing was reported freed.",
+        "theRemedyForThisRefusal": nil,  // varies by remedy — pinned below
+        "theTrashHoldsWhatItTook": nil,
+        "nothingWasFreedOnDisk": nil,
+        "theTargetWasReplaced": nil,
+    ]
+
+    /// The remedy wordings, byte-exact per `Remedy` case. `Remedy` itself
+    /// carries no text any more (fn-4.22): its wording lives in the one
+    /// production wording table and is pinned HERE, never compared against
+    /// production's own rendering — that check was a tautology any prose
+    /// satisfied.
+    private static let pinnedRemedyWordings: [TrashDisposal.Failure.Remedy: String] = [
+        .rescan: "Refused; re-scan required.",
+        .usePermanentDeleteInstead:
+            "Use permanent delete (turn off Move to Trash) for a disposal "
+            + "that proves the folder it acts on.",
+    ]
+
+    /// Which propositions tell the user where the INSPECTED ITEM is — the
+    /// `placesTheItem(_:)` verdicts, pinned so a new case cannot quietly
+    /// declare itself non-placing.
+    private static let pinnedPlacesTheItem: Set<String> = [
+        "theItemIsBackAtTheTarget", "theItemIsAtTheLanding",
+        "theTrashHoldsWhatItTook",
+    ]
+
+    /// **THE EXTENSION FENCE (fn-4.22): the vocabulary, every wording, the
+    /// remedy wordings, the placing verdicts and the retirements are pinned
+    /// byte-exact, so the fence fails CLOSED on any extension or rewording
+    /// — without having predicted it.**
+    ///
+    /// The r18 fence made a false clause unrepresentable at any CALL SITE;
+    /// what it could not see was an edit to the TABLES themselves: a new
+    /// `Established` case satisfies every structural check by construction
+    /// (add it to `messageOrder`, answer `placesTheItem`, write a sentence),
+    /// and the test-side `neverEstablished` list could not know about a
+    /// case added after it. MEASURED for the task: a new case carrying a
+    /// false sentence rode through all 39 cells green.
+    ///
+    /// This cell is the anchor-table answer (the shape
+    /// `SourceAnchorIntegrityTests` uses): DEFAULT-DENY pins.
+    ///
+    /// - A NEW case fails the vocabulary pin the moment it exists — nobody
+    ///   has to have edited this file for the failure to fire; making it
+    ///   green again REQUIRES re-stating the pin here, which puts the new
+    ///   sentence verbatim in this fence's diff.
+    /// - A REWORDED or GRAFTED-INTO sentence — the one mutation r18
+    ///   measured GREEN — fails its byte-exact pin the same way.
+    /// - A new case claimed by NO cause must appear in the production
+    ///   `retired` declaration (checked against the DERIVED unspoken set in
+    ///   the structural cell) and must render nil.
+    ///
+    /// What the pins deliberately do NOT claim: that a pinned sentence is
+    /// TRUE. The fence forces every wording change through this diff; the
+    /// semantic judgement stays with the reviewer reading it, and with the
+    /// measured fixture cells for the placing propositions. See the
+    /// residual-by-mechanism disclosure at `TrashDisposal.Failure.sentence`.
+    func testTheVocabularyAndEveryWordingArePinnedSoExtensionFailsClosed() throws {
+        typealias Failure = TrashDisposal.Failure
+
+        // The vocabulary IS the pinned set — no more, no less.
+        XCTAssertEqual(
+            Set(Failure.Established.allCases.map(\.rawValue)),
+            Set(Self.pinnedWordings.keys),
+            "the Established vocabulary changed: re-state the pin in this "
+                + "fence so the change is reviewed here"
+        )
+        XCTAssertEqual(
+            Failure.Established.allCases.count, Self.pinnedWordings.count,
+            "a raw-value collision would alias two pins"
+        )
+
+        // Every wording, byte-exact, under BOTH remedies (the wording of a
+        // non-remedy proposition must not depend on the remedy).
+        for fact in Failure.Established.allCases
+        where fact != .theRemedyForThisRefusal {
+            let pinned = try XCTUnwrap(Self.pinnedWordings[fact.rawValue])
+            for remedy in Failure.Remedy.allCases {
+                XCTAssertEqual(
+                    Failure.sentence(
+                        for: fact, path: Self.targetPath,
+                        landed: Self.landingPath, remedy: remedy
+                    ),
+                    pinned,
+                    "\(fact.rawValue): the wording differs from its pin — a "
+                        + "reworded or grafted sentence must be re-reviewed "
+                        + "in this fence's own diff"
+                )
+            }
+        }
+
+        // The remedy wordings, byte-exact per remedy, and every remedy
+        // pinned.
+        XCTAssertEqual(
+            Set(Failure.Remedy.allCases),
+            Set(Self.pinnedRemedyWordings.keys),
+            "the Remedy set changed: re-state its pins here"
+        )
+        for remedy in Failure.Remedy.allCases {
+            XCTAssertEqual(
+                Failure.sentence(
+                    for: .theRemedyForThisRefusal, path: Self.targetPath,
+                    landed: Self.landingPath, remedy: remedy
+                ),
+                Self.pinnedRemedyWordings[remedy],
+                "\(remedy.rawValue): the remedy wording differs from its pin"
+            )
+        }
+
+        // The placing verdicts.
+        for fact in Failure.Established.allCases {
+            XCTAssertEqual(
+                Failure.placesTheItem(fact),
+                Self.pinnedPlacesTheItem.contains(fact.rawValue),
+                "\(fact.rawValue): the placesTheItem verdict changed — "
+                    + "re-review the fixture cells that lean on it"
+            )
+        }
+
+        // The production retirement declaration matches the pins' nil rows
+        // (minus the remedy, whose nil here means "pinned separately").
+        XCTAssertEqual(
+            Set(Failure.retired.map(\.rawValue)),
+            Set(Self.pinnedWordings.filter { $0.value == nil }.map(\.key))
+                .subtracting(["theRemedyForThisRefusal"]),
+            "a retirement must be declared in production AND pinned here"
+        )
+    }
+
     /// **E — THE MESSAGE FENCE WAS STILL A BLOCKLIST, AND IS NOT ONE ANY
     /// MORE BECAUSE THERE IS NO LONGER ANY FREE TEXT TO FENCE** (PR #460
     /// codex r18).
@@ -2785,9 +2959,12 @@ final class TrashDisposalHopProofTests: XCTestCase {
     /// 5. `errorDescription` is the path, then the join, and nothing else;
     /// 6. the same proposition renders IDENTICALLY under every cause that
     ///    establishes it (the property that made (b) and (c) possible);
-    /// 7. the remedy is one of the closed set;
-    /// 8. the three propositions no arm establishes are established by no
-    ///    cause and render to `nil` under every remedy;
+    /// 7. the remedy clause is the PINNED wording for the cause's remedy
+    ///    (fn-4.22 — the old check compared it against production's own
+    ///    text, a tautology any prose satisfied);
+    /// 8. the unspoken propositions are DERIVED from the derivation table,
+    ///    required to equal the production `retired` declaration, claimed by
+    ///    no cause, and render to `nil` under every remedy;
     /// 9. the joined grammar holds: openings lower case, every other sentence
     ///    upper case, every sentence terminated — a structural check on the
     ///    join, not a filter on meaning.
@@ -2795,15 +2972,17 @@ final class TrashDisposalHopProofTests: XCTestCase {
     /// ## THE RESIDUAL, STATED PLAINLY BECAUSE AN ACCURATE DISCLOSURE BEATS
     /// ## A TENTH FALSE ONE
     ///
-    /// Nothing here reads the sentences. Someone can still write a wording in
-    /// `sentence(for:…)` that asserts MORE than the proposition it is filed
-    /// under, and no test in this repository can catch that — it is the same
-    /// semantic judgement, and it has simply been moved. What changed is its
-    /// size and shape: fourteen wordings in one `default`-less `switch`,
-    /// reviewed once and shared by every cause, instead of one wording per
-    /// (cause × clause) written afresh at six call sites — which is where all
-    /// nine of this branch's false sentences were written. That is a smaller
-    /// surface, not a proof.
+    /// Nothing HERE reads the sentences — but since fn-4.22 every wording is
+    /// pinned BYTE-EXACT by
+    /// `testTheVocabularyAndEveryWordingArePinnedSoExtensionFailsClosed`, so
+    /// editing one (including grafting a clause into one — the mutation the
+    /// r18 table below measured GREEN) is a red cell until the pin is
+    /// re-stated in the fence's own diff. What remains is the judgement no
+    /// test can make: whether a sentence AS ORIGINALLY PINNED, or as
+    /// re-pinned in the same commit that reworded it, asserts more than its
+    /// proposition. The pin forces that sentence in front of a reviewer; it
+    /// does not prove it. See the residual-by-mechanism disclosure at
+    /// `TrashDisposal.Failure.sentence`.
     ///
     /// Equally: an author can edit `established(for:)` to admit a proposition
     /// the code path does not prove. That table IS the derivation, nothing
@@ -2838,8 +3017,11 @@ final class TrashDisposalHopProofTests: XCTestCase {
     /// | `established(for: .destinationUnknown)` gains back `.theTrashHoldsWhatItTook` and its clause (r18 E2's mutation) | **RED** 8/8 (9) |
     /// | **a false clause GRAFTED INTO an existing wording** (`"…was NOT established, though it was there a second ago."`) | **GREEN** |
     ///
-    /// The last row is the residual, measured rather than asserted away: it
-    /// is the semantic judgement this shape moves and does not remove. The
+    /// The last row was the measured residual of r18 — and is the row
+    /// fn-4.22 closed: the byte-exact wording pins in
+    /// `testTheVocabularyAndEveryWordingArePinnedSoExtensionFailsClosed`
+    /// redden any graft or rewording (re-measured for the task, with ten
+    /// fresh false wordings; see that cell's doc). The
     /// two `established(for:)` rows are RED only because of
     /// `placesTheItem(_:)`; without it the fence sees nothing wrong with
     /// them, because by construction the message IS the established set.
@@ -2867,11 +3049,21 @@ final class TrashDisposalHopProofTests: XCTestCase {
             "messageOrder and the vocabulary must be the same set"
         )
 
-        // (8a) The three no arm establishes.
-        let neverEstablished: Set<Failure.Established> = [
-            .nothingWasFreedOnDisk, .theTargetWasReplaced,
-            .theTrashHoldsWhatItTook,
-        ]
+        // (8a) The retired propositions — DERIVED from the derivation table
+        // over every cause, never hardcoded here (fn-4.22: a list written in
+        // this file cannot know about a case added after it, and silently
+        // SKIPPED every retired-case assertion for one). The derived set
+        // must equal the production declaration: a new proposition claimed
+        // by no cause is a retirement and must say so in production, and one
+        // claimed by any cause must survive the vocabulary pin in
+        // `testTheVocabularyAndEveryWordingArePinnedSoExtensionFailsClosed`.
+        let spokenSomewhere = Set(causes.flatMap { Failure.established(for: $0) })
+        let neverEstablished = Set(Failure.Established.allCases)
+            .subtracting(spokenSomewhere)
+        XCTAssertEqual(
+            neverEstablished, Failure.retired,
+            "the unspoken set must be exactly the declared retirements"
+        )
         for fact in neverEstablished {
             for remedy in Failure.Remedy.allCases {
                 XCTAssertNil(
@@ -2895,11 +3087,14 @@ final class TrashDisposalHopProofTests: XCTestCase {
             let facts = claims.map(\.establishes)
             used.formUnion(facts)
 
-            // (8b) No cause claims a retired proposition.
-            for fact in neverEstablished {
+            // (8b) No cause claims a DECLARED retirement (checked against
+            // the production declaration, which (8a) proved equal to the
+            // derived set — this is the assertion that reddens when an arm
+            // reclaims a retired proposition).
+            for fact in Failure.retired {
                 XCTAssertFalse(
                     established.contains(fact),
-                    "\(name): \(fact.rawValue) is established by no arm"
+                    "\(name): \(fact.rawValue) is a declared retirement"
                 )
             }
 
@@ -2946,11 +3141,16 @@ final class TrashDisposalHopProofTests: XCTestCase {
                 "\(name): errorDescription must carry no free text"
             )
 
-            // (7) The remedy is one of the closed set.
+            // (7) The remedy clause is the PINNED wording for this cause's
+            // remedy. NEVER compared against production's own rendering —
+            // that was a tautology any prose satisfied (fn-4.22; measured:
+            // a placing claim appended to a remedy wording passed the whole
+            // fence). `Remedy` itself carries no text any more.
             let remedyText = try XCTUnwrap(claims.last).text
-            XCTAssertTrue(
-                Failure.Remedy.allCases.map(\.text).contains(remedyText),
-                "\(name): the remedy is chosen from a closed set, not written"
+            XCTAssertEqual(
+                remedyText,
+                Self.pinnedRemedyWordings[Failure.remedy(for: cause)],
+                "\(name): the remedy wording is pinned in this fence"
             )
 
             for claim in claims {
@@ -3007,12 +3207,15 @@ final class TrashDisposalHopProofTests: XCTestCase {
             }
         }
 
-        // ROT: every proposition in the vocabulary is either used by some
-        // cause or is one of the three no arm establishes.
+        // ROT: every proposition in the vocabulary is either RENDERED by
+        // some cause or is a declared retirement. `used` is what actually
+        // reached a message (a fact `established` claims but `sentence`
+        // renders nil would be missing from it), so this is not implied by
+        // (8a)'s derivation.
         for fact in TrashDisposal.Failure.Established.allCases
         where !used.contains(fact) {
             XCTAssertTrue(
-                neverEstablished.contains(fact),
+                TrashDisposal.Failure.retired.contains(fact),
                 "\(fact.rawValue) is dead vocabulary — remove it or use it"
             )
         }

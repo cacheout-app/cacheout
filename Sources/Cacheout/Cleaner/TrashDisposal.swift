@@ -68,20 +68,86 @@
 //  Trash destroys nothing. So the proof is taken TWICE, and the second one is
 //  taken where it can still be acted on:
 //
-//  1. BEFORE — `open(O_DIRECTORY|O_NOFOLLOW)` of the target and `fstat` of
-//     THAT descriptor, not an `lstat` of the path. The kind gate is the open,
-//     so there is no window between deciding what stands there and holding it,
-//     and the identity is read from the object rather than from a second
-//     resolution of a name. This refuses the ordinary case without disturbing
-//     the user's Trash at all. (The container-bound arm asks the same question
-//     one step further in: it opens and PROVES the container first, and reads
-//     the leaf under that descriptor with one `fstatat`, which additionally
-//     identifies non-directory leaves — see that arm for why that matters.)
+//  1. BEFORE — the container is opened and PROVED against the identity the
+//     cleaner captured (`DepthSafeRemoval.openAdmittedContainer`), and then
+//     the leaf is read: `fstatat` of the name under that held descriptor on
+//     the three arms that can use it, or `open(O_DIRECTORY|O_NOFOLLOW)` +
+//     `fstat` of THAT descriptor on the `.directory` verdict's arm, whose
+//     rollback needs an OPENED inode. Never an `lstat` of the path: the kind
+//     gate is the read itself, so there is no window between deciding what
+//     stands there and holding it, and the identity comes off the object
+//     rather than off a second resolution of a name. This refuses the
+//     ordinary case without disturbing the user's Trash at all.
+//
+//     THE PARAGRAPH THAT STOOD HERE DESCRIBED ONLY THE SECOND HALF OF THAT
+//     SENTENCE, AND IT WAS FALSE FOR ONE ARM (PR #460 codex r13, A3). It
+//     said step (1) was an `open(O_DIRECTORY|O_NOFOLLOW)` of the target —
+//     which on a `.noDirectoryTree` verdict ALWAYS fails by construction,
+//     because the target is a non-directory, so no identity was ever read —
+//     and it mentioned the container proof only as something "the
+//     container-bound arm" does, when in fact `dispose(_:expecting:…)`'s
+//     `.noDirectoryTree` arm opened no container at all and bound nothing.
+//     See that arm for what was measured and what it now does.
 //  2. AFTER — the disposal reports WHERE IT PUT THE ITEM, and that object's
 //     identity is compared with the inspection's. A mismatch means the Trash
 //     took something nobody inspected, so it is PUT BACK
 //     (`renamex_np(RENAME_EXCL)`, which never clobbers whatever now stands at
 //     the name) and the item is reported as a refusal: no entry, no bytes.
+//
+//  AND THE AFTER-PROOF HAS TO WORK WHERE THE ITEM ACTUALLY LANDS, WHICH IS A
+//  DIRECTORY THIS PROCESS MAY NOT OPEN (PR #460 codex r10, D1). `~/.Trash` is
+//  TCC-protected: measured on this machine (Darwin 25.5) from an ordinary CLI
+//  process, `open("/Users/<u>/.Trash", O_RDONLY|O_DIRECTORY|O_NOFOLLOW)`
+//  returns -1 with errno 1 (EPERM) — while `lstat` and `open` of
+//  `~/.Trash/<name>`, the item this process just moved there, both SUCCEED.
+//  Full Disk Access is the switch, and the GUI does not have it by default.
+//
+//  So for every user without it, the after-proof's descriptor-relative read
+//  (`facts`, which opens the CONTAINING directory and `fstatat`s the name
+//  under it) could not be taken AT ALL, and its `nil` was read as "the Trash
+//  took something nobody inspected". The disposal then rolled back — a
+//  rollback that could not open the Trash either — and the user was told, of
+//  a checkout sitting in the Trash and recoverable in one drag, that it "is
+//  no longer at ~/.Trash/<name>, where the Trash reported putting it", with
+//  entries=0 and 0 bytes reported. REPRODUCED 3/3 through the real production
+//  composition, `moveToTrash` at its shipped default, nothing injected at the
+//  seam, by `GitWorktreeEndToEndTests`'
+//  `testTheTrashDefaultReportsTheCheckoutItReallyMovedToTheTrash`.
+//
+//  IT SURVIVED BECAUSE EVERY TRASH CELL IN THE SUITE INJECTED A `trashHandler`
+//  LANDING IN A FIXTURE DIRECTORY, whose parent is freely openable — the one
+//  property the guard depends on, and the one production does not have. The
+//  fix is in `facts`: when the containing directory cannot be opened the
+//  landed object is still IDENTIFIED, by the single `lstat` the permission
+//  allows, and the comparison the caller makes is unchanged. A failure to
+//  VERIFY is not evidence of a wrong disposal, and it is not a licence to
+//  skip the verification either — see `facts` for why the weaker binding can
+//  never admit what the stronger one would refuse.
+//
+//  AND THE COVERAGE THAT CLOSED IS ONE ARM OF THREE — RECORDED HERE BECAUSE
+//  THE PARAGRAPH ABOVE READS AS IF IT WERE ALL OF THEM (PR #460 codex r11,
+//  D4). `GitWorktreeEndToEndTests.testTheTrashDefaultReportsTheCheckoutItReallyMovedToTheTrash`
+//  drives the WORKTREE arm through the real `FileManager.trashItem` into the
+//  real `~/.Trash`. `CacheCleaner`'s item-mode and contents-mode Trash
+//  disposal — the app's primary feature, and the population the
+//  container-bound overload was written for — still has ZERO coverage through
+//  that seam: every one of those cells injects a `trashHandler:` landing in a
+//  fixture directory whose parent is freely openable, which is the exact
+//  property that hid this defect for eight rounds. D1 lived in shared code,
+//  so the worktree cell would have caught it for all three arms; nothing
+//  measured says the other two reach `~/.Trash` correctly.
+//
+//  ONE OF THOSE TWO IS NOW MEASURED, AND THE SIZE OF WHAT IS LEFT IS STATED
+//  (PR #460 codex r13, A4).
+//  `CacheCleanerTests.testTrashDefaultReallyTrashesANoTreeSweepItemIntoTheRealTrash`
+//  builds a real `CacheCleaner` with NO `trashHandler:` — the constructor's
+//  default is `FileManager.trashItem` — and drives ITEM MODE on a
+//  `.noDirectoryTree` sweep item into the real `~/.Trash`, asserting the
+//  landing, the entry and the bytes. That closes the arm and the verdict this
+//  round's P1 lived on; the paragraph above must not now be read as closing
+//  the rest. STILL UNCOVERED through the real seam: item mode on the
+//  `.directory` and `.nonDirectoryLeaf` verdicts, and ALL of contents mode.
+//  The gap that hid A was this one, and it is the one that was closed.
 //
 //  THE RESIDUAL, WITH ITS ENDPOINTS AND ITS SIZE MEASURED — not "a syscall
 //  wide", which is what an unmeasured version of this note would have claimed
@@ -93,31 +159,56 @@
 //  question about the opened inode to the instant the disposal seam is
 //  entered, printed by
 //  `testATrashDisposalThatTookTheWrongObjectPutsItBackAndRefuses` as
-//  `MEASURED-TRASH-WINDOW-NS`.
+//  `MEASURED-TRASH-WINDOW-NS` (4166 ns at r6, on an idle main thread, with
+//  the proof now inside the hop; it was ~21–25 µs idle before).
 //
-//  AND IT HAS NO UPPER BOUND, which an earlier version of this note quoted a
-//  five-sample idle range as if it did. That prefix is an `@MainActor` HOP —
-//  `trashItem` talks to Finder — so its width is a SCHEDULING DELAY, not a
-//  syscall cost, and scheduling delays do not have maxima. Measured both
-//  ways, 12 runs each, same machine, same fixture:
+//  THAT PREFIX HAD NO UPPER BOUND — AND SINCE PR #460 codex r6 IT IS NOT WHERE
+//  THE PROOF SITS. The prefix is an `@MainActor` HOP (`trashItem` talks to
+//  Finder), so its width is a SCHEDULING DELAY, not a syscall cost, and
+//  scheduling delays have no maxima. Measured both ways at r5, 12 runs each,
+//  same machine, same fixture, with the proof still on the NEAR side of it:
 //
 //      quiet:     min 21.5 µs   median 24.8 µs   p90 35.5 µs   max 41.2 µs
 //      contended: min 23.7 µs   median 59.7 µs   p90 297 µs    max 1382 µs
 //
 //  (contended = 2×`hw.ncpu` spinners; an incidental sample taken while a
 //  parallel `swift build` was running read 5.60 ms — 170× the quiet max.)
+//  Those figures are CPU contention. Main-thread QUEUE DEPTH is the larger
+//  half and was never measured until r6: under 120 ms work items held on the
+//  main thread the same interval is median 175.736 ms (n=5).
 //
-//  The REST of the window is inside `trashItem`, and its scale is the reason
-//  this file exists. Measured on this machine, on the real home volume: one
-//  `trashItem` call of a 4 KiB directory takes 262 µs (min) / 288 µs (median)
-//  / 456 µs (max) over nine calls, while the ONE syscall that defeats it —
-//  `renamex_np(RENAME_SWAP)` of two directories, the atomic form of the
+//  The earlier version of this note drew the wrong conclusion from its own
+//  numbers — "narrowing the prefix therefore buys nothing" — by comparing the
+//  prefix against the swap syscall and stopping there. What it missed is that
+//  the prefix is not a fixed cost to be compared with anything: it is
+//  UNBOUNDED, and an unbounded interval between a proof and the act it
+//  authorises is not narrowed by argument. `Mover`'s second argument moves the
+//  proof to the FAR side of the hop, which takes the same interval to median
+//  0.004 ms under the identical load. See `Mover` below.
+//
+//  The REST of the window is still inside `trashItem`, and its scale is the
+//  reason this file exists. Measured on this machine, on the real home volume:
+//  one `trashItem` call of a 4 KiB directory takes 262 µs (min) / 288 µs
+//  (median) / 456 µs (max) over nine calls, while the ONE syscall that defeats
+//  it — `renamex_np(RENAME_SWAP)` of two directories, the atomic form of the
 //  fixture's `rename(2)` + `mkdir(2)` — takes 61 µs (min) / 69–83 µs (median)
-//  on the same volume. So the swap fits several times over inside the call
-//  that follows the prefix, and on a BUSY machine it fits inside the prefix
-//  as well. Narrowing the prefix therefore buys nothing, which is precisely
-//  why the load-bearing proof here is the one taken AFTER the disposal: the
-//  window stays open — unboundedly so — and stops deciding the outcome.
+//  on the same volume. So the swap still fits inside the call that follows the
+//  proof, which is why narrowing the prefix removes the unbounded part of the
+//  window and does not close the part `trashItem` owns.
+//
+//  WHICH PROOF IS LOAD-BEARING DEPENDS ON THE ARM, AND THIS PARAGRAPH USED TO
+//  SAY IT WAS ALWAYS THE ONE TAKEN AFTER (corrected, PR #460 codex r13, A1).
+//  The after-proof is load-bearing wherever it can DISCRIMINATE — the three
+//  arms that bind an object compare `facts(at: landed)` for equality with a
+//  bound identity, and a stranger fails that. It cannot discriminate for a
+//  verdict that carries no identity: with the container swapped inside the
+//  mover, `look(at: landed)` answers `.noDirectoryTree`, the verdict IS
+//  `.noDirectoryTree`, and `disagreement` returns nil. Measured — the
+//  stranger's file was trashed with `errors=[]` by a probe that had added the
+//  container proof on both sides of the seam but kept this after-proof. For
+//  that verdict the BINDING is the load-bearing half, which is why
+//  `.noDirectoryTree` now goes through `disposeBoundLeaf` like every other
+//  non-directory arm.
 //
 //  WHAT REMAINS AFTER THE PUT-BACK, HONESTLY: the wrongly-taken item is in the
 //  Trash for the width of one `renamex_np`, and if the put-back cannot be
@@ -205,6 +296,17 @@ import Foundation
 /// stayed unbound for three review rounds. The difference between the two
 /// entry points is now WHICH FACT the leaf is bound to, not WHETHER it is
 /// bound.
+///
+/// THAT SENTENCE WAS WRITTEN ONE ROUND TOO EARLY, AND ONE ARM MADE IT FALSE
+/// (PR #460 codex r13, A3). `dispose(_:expecting:…)`'s `.noDirectoryTree`
+/// path bound NOTHING: it never opened `admittedParent`, and the verdict
+/// carries no identity, so both of its proofs reduced to "some non-directory
+/// answers to this name" — satisfied by any non-directory in any directory.
+/// Measured at 0139713 through the production composition and again through
+/// the shipped `FileManager.trashItem` into the real `~/.Trash`: a stranger's
+/// file trashed, `entries=[… exactBytes: 4096, disposal: .trash]`,
+/// `errors=[]`. It is true now because that arm was routed through the same
+/// `disposeBoundLeaf` the other three use, not because it was true then.
 enum TrashDisposal {
 
     /// Why a Trash disposal was refused AFTER the fact — the causes that
@@ -222,22 +324,79 @@ enum TrashDisposal {
             /// and it now stands at the original name again — the arrival
             /// was identified under the held destination descriptor.
             case putBack
-            /// PROVED: the object was still at `landed` when the rollback
-            /// re-bound it, and the move itself could not be performed
-            /// (typically the original name is occupied again). The payload
-            /// is where the item is, so the user can finish it in one drag.
+            /// PROVED: an object was still identified at `landed` — by the
+            /// rollback's own re-bind, or by the after-proof that sent it
+            /// here when the Trash directory cannot be opened at all — and
+            /// the move itself could not be performed (the original name is
+            /// occupied again, or this process may not open the Trash). The
+            /// payload is where the item is, so the user can finish it in one
+            /// drag.
             case strandedInTrash(String)
             /// NOT PROVED, so NOTHING WAS MOVED: the object the disposal took
-            /// is no longer at the name the disposal reported (it was moved,
-            /// replaced, or cannot be read). The payload is the last place it
-            /// was seen. Moving whatever took its place is the bug, not the
-            /// undo.
+            /// could not be shown to be at the name the disposal reported.
+            /// The payload is the last place it was seen. Moving whatever
+            /// took its place is the bug, not the undo.
+            ///
+            /// WHAT ACTUALLY PRODUCES IT, ENUMERATED RATHER THAN SUMMARISED
+            /// (PR #460 codex r14, V1-D1). The sentence that stood here said
+            /// the object "is no longer at the name the disposal reported (it
+            /// was moved, replaced, or cannot be read)", and the arm that
+            /// broke it made all three false at once: a NON-DIRECTORY landing
+            /// reached `rollBack` as `nil` because `identified` narrowed to
+            /// `.directory` alone, so this cause was reported for an object
+            /// that was at that name, had not been replaced, and HAD been
+            /// read (`look` classified it `.noDirectoryTree`, which takes a
+            /// real open attempt). That arm is fixed — `identified` now names
+            /// every kind — and these are the four ways left in:
+            ///
+            /// * the landing is ABSENT (`ENOENT`) — the object is genuinely
+            ///   not where the disposal said;
+            /// * `rollBack`'s re-bind under the held Trash descriptor found
+            ///   something ELSE at the name — it was replaced;
+            /// * the put-back's own `renameatx_np` answered `ENOENT` — the
+            ///   source went away inside the one-syscall window;
+            /// * the landing could not be READ — `look` answered
+            ///   `.unreadable(errno)` or `.unidentifiable`, or `facts` could
+            ///   not name a non-directory at it.
+            ///
+            /// The FOURTH is the one where the user-facing wording ("it is no
+            /// longer at …") is STRONGER than what was established: something
+            /// may well still be there. It is disclosed rather than dressed:
+            /// reaching it needs the landing to become unreadable AFTER
+            /// `proveStanding` read the same object at the target, since
+            /// `disagreement` refuses `.unreadable` on the way IN
+            /// (`.posix(errno)`, before any disposal), and the four shipped
+            /// arms all pass through it. `.strandedInTrash` is what the two
+            /// cases that DO establish the object's presence report instead —
+            /// the Trash open and the destination open, both below.
+            ///
+            /// AND THE CLAUSE THAT WAS NOT DISCLOSED, NOW RETIRED RATHER THAN
+            /// DISCLOSED (PR #460 codex r15, D-P3). The paragraph above
+            /// discloses that "it is no longer at …" is stronger than what was
+            /// established. The message ALSO opened by asserting that the
+            /// folder at the target's path had been replaced — and the
+            /// after-proof never re-reads the target at all. MEASURED, event
+            /// `moverMovedNothing`, all four Trash paths: this cause, zero
+            /// moves, and the target untouched at the same inode. The opening
+            /// is now the one proposition every row does establish; see
+            /// `errorDescription`.
             case lastSeenInTrash(String)
             /// The rollback moved an object out of the Trash and the arrival
             /// is NOT the one it looked at — the name was re-pointed inside
             /// the one-syscall window the Trash directory descriptor cannot
             /// close. The payload is the Trash name it came from. Nothing
             /// further is attempted: a second unproven move is not a fix.
+            ///
+            /// AND WHERE THE INSPECTED OBJECT WENT IS NOT ESTABLISHED HERE,
+            /// WHICH THE MESSAGE USED TO DENY (PR #460 codex r16, A-P1). The
+            /// message ended "…and the item the Trash took is still in the
+            /// Trash". Nothing on this path shows that: the re-bind proved
+            /// the object stood at the landing NAME, and the rename then
+            /// moved something ELSE out of that name — a fact about the NAME.
+            /// MEASURED with the swap in the real window between the two, the
+            /// taken object is moved OUT of the landing's own container
+            /// entirely and its inode is present nowhere under it. The
+            /// message now says the whereabouts were not established.
             case putBackTookAnotherObject(String)
             /// NOT PROVED, so NOTHING WAS MOVED: the directory the put-back
             /// would restore INTO is not the container the caller admitted.
@@ -255,57 +414,566 @@ enum TrashDisposal {
         let path: String
         let cause: Cause
 
-        var errorDescription: String? {
-            switch cause {
-            case .putBack:
-                // Deliberately opens with the SAME clause the pre-delete
-                // checks produce: to the user this is one event, and the only
-                // new information is that it was undone.
-                return "\(path): the folder at this path is no longer the one "
-                    + "that was inspected — it was replaced between the safety "
-                    + "check and the disposal, so the item the Trash took has "
-                    + "been PUT BACK. Nothing was moved to the Trash and "
-                    + "nothing was freed; refused, re-scan required"
-            case .strandedInTrash(let landed):
-                return "\(path): the folder at this path is no longer the one "
-                    + "that was inspected, and what the Trash took could not "
-                    + "be put back automatically — it is in the Trash at "
-                    + "\(landed). Move it back from there; nothing was "
-                    + "reported freed; refused, re-scan required"
-            case .lastSeenInTrash(let landed):
-                return "\(path): the folder at this path is no longer the one "
-                    + "that was inspected, and what the Trash took could not "
-                    + "be put back — it is no longer at \(landed), where the "
-                    + "Trash reported putting it, so nothing was moved rather "
-                    + "than moving whatever took its place. Look in the Trash "
-                    + "for it; nothing was reported freed; refused, re-scan "
-                    + "required"
-            case .putBackTookAnotherObject(let landed):
-                return "\(path): the folder at this path is no longer the one "
-                    + "that was inspected, and putting back what the Trash "
-                    + "took moved a DIFFERENT object — the Trash name it came "
-                    + "from (\(landed)) was re-used while the undo was "
-                    + "running. Whatever now stands at \(path) came out of "
-                    + "the Trash and was NOT put there by you, and the item "
-                    + "the Trash took is still in the Trash; nothing was "
-                    + "reported freed; refused, re-scan required"
-            case .destinationNotTheAdmittedContainer(let landed):
-                return "\(path): the folder at this path is no longer the one "
-                    + "that was inspected, and the folder that HOLDS it is no "
-                    + "longer the one the safety check admitted either — so "
-                    + "what the Trash took was NOT put back into it. It is in "
-                    + "the Trash at \(landed). Move it back once the folder "
-                    + "at \(path) is the one you expect; nothing was reported "
-                    + "freed; refused, re-scan required"
-            case .destinationUnknown:
-                return "\(path): the Trash did not report where it put the "
-                    + "item, so which folder it took cannot be established — "
-                    + "nothing was reported freed. Check the Trash, and use "
-                    + "permanent delete (turn off Move to Trash) for a "
-                    + "disposal that proves the folder it acts on"
+        /// ONE PROPOSITION A REFUSAL MESSAGE CAN CARRY — and the reason this
+        /// is a TYPE rather than a list of banned phrases (PR #460 codex r17,
+        /// M1).
+        ///
+        /// r15 fenced the OPENING clause of these messages; r16 found two
+        /// false TAILS behind that fence and widened it to the whole message
+        /// by adding a list of FORBIDDEN PHRASES. Measured at e6afc9f, that
+        /// widening catches only the sentences somebody had already written
+        /// down: restoring either retired tail reddens the guard, and saying
+        /// the SAME FALSE THING IN NEW WORDS passes — `"Check your Trash for
+        /// the item."` on `.lastSeenInTrash` was green on all 36 cells. A
+        /// blocklist of strings is phrasing-fencing, which is the failure
+        /// this branch has now repeated eight times.
+        ///
+        /// So the message is no longer a string literal per cause. It is a
+        /// sequence of `Claim`s, each of which names exactly ONE proposition
+        /// out of this closed vocabulary, and `established(for:)` says which
+        /// propositions each cause's own code path actually proved. A new
+        /// sentence cannot be added to a message without being tagged, and a
+        /// tag the cause does not establish fails — WITHOUT anyone having
+        /// predicted the sentence's wording.
+        ///
+        /// The last two cases are here precisely because NO arm establishes
+        /// them: they are the two propositions this file has shipped and
+        /// retired (r15's "the folder was replaced", r16/r17's net-effect
+        /// claims), kept nameable so the fence can assert that no cause
+        /// claims them.
+        enum Established: String, CaseIterable, Sendable {
+            /// The one proposition every row of the after-proof licenses:
+            /// the disposal could not be PROVED to have moved the inspected
+            /// item. Raised by every arm that reaches a comparison at all.
+            case theDisposalWasNotProvedToHaveMovedTheItem
+            /// `rollBack` completed its `renameatx_np` and IDENTIFIED the
+            /// arrival at the target under the held, admitted destination
+            /// descriptor. Only `.putBack` reaches that line.
+            case theItemIsBackAtTheTarget
+            /// An object WAS identified at `landed` — by the after-proof's
+            /// own read or by `rollBack`'s re-bind — and it was not moved
+            /// away afterwards, so it is still there.
+            case theItemIsAtTheLanding
+            /// The after-proof read the landing the disposal reported and
+            /// could NOT name the inspected object there (absent, replaced,
+            /// or unreadable). A negative fact about one name.
+            case theLandingDidNotYieldTheItem
+            /// The put-back's `renameatx_np` moved an object out of the
+            /// landing name and the arrival was NOT the object the re-bind
+            /// had identified there, so that NAME was re-pointed inside the
+            /// one-syscall window.
+            case theLandingNameWasRepointed
+            /// …and what the put-back moved is now standing at the target.
+            case aStrangerStandsAtTheTarget
+            /// The directory the put-back would restore INTO is not the
+            /// container the caller admitted — the identity comparison on
+            /// `DepthSafeRemoval.openAdmittedContainer` failed.
+            case theHoldingFolderIsNotTheAdmittedOne
+            /// The mover returned no landing URL at all, so which object it
+            /// took cannot be established.
+            case theLandingWasNotReported
+            /// NEVER ESTABLISHED BY ANY ARM, AND RETIRED IN THE ROUND AFTER
+            /// THE ONE THAT BLESSED IT (PR #460 codex r18, E2).
+            ///
+            /// It shipped on `.destinationUnknown`, justified like this: "the
+            /// mover is a TRASH disposal and it returned without throwing, so
+            /// whatever it took went to the Trash". That was the ONLY entry in
+            /// `established(for:)` derived from an assumption about an
+            /// INJECTABLE SEAM's contract rather than from something this code
+            /// READ — the identical inference an earlier round falsified for
+            /// `.lastSeenInTrash` — and "whatever it took" begs the question
+            /// when it took NOTHING.
+            ///
+            /// MEASURED at 9ca1129, all four Trash arms, 8/8 runs: a Mover
+            /// that proves and moves nothing and returns a nil landing raises
+            /// `.destinationUnknown`, and `lstat` before and after gives the
+            /// SAME `st_ino`. The message said "Check the Trash," for an item
+            /// that never left, and the fence positively ENDORSED it.
+            ///
+            /// REACHABILITY, STATED HONESTLY, because it is the reason this is
+            /// a retirement and not a bug report: the counterexample uses an
+            /// injected Mover. In the shipped composition `.destinationUnknown`
+            /// needs `FileManager.trashItem` to SUCCEED with a nil
+            /// `resultingItemURL`, and NOTHING IN THIS TREE MEASURES WHETHER
+            /// THAT HAPPENS. So the choice was between measuring Foundation's
+            /// behaviour and dropping the claim; the claim is dropped, which
+            /// is the answer that is right under both outcomes.
+            case theTrashHoldsWhatItTook
+            /// The disclosure, not a claim: where the item is now was NOT
+            /// established on this path.
+            case theItemsWhereaboutsAreNotEstablished
+            /// A fact about the REPORT this code writes — no entry, no
+            /// bytes. Every cause establishes it, because every cause is a
+            /// refusal.
+            case nothingWasReportedFreed
+            /// What the user can do next. Carries no proposition about the
+            /// file system and may name no place.
+            case theRemedyForThisRefusal
+            /// NEVER ESTABLISHED BY ANY ARM: a claim about the DISK. Nothing
+            /// after the mover returns counts bytes or re-reads the target's
+            /// contents. `.putBack` shipped it as "nothing was freed" until
+            /// r17's M4.
+            case nothingWasFreedOnDisk
+            /// NEVER ESTABLISHED BY ANY ARM: the target is never re-read
+            /// after the move. Five messages opened with it until r15's
+            /// D-P3.
+            case theTargetWasReplaced
+        }
+
+        /// One clause of a refusal message, and the single proposition it
+        /// asserts. `errorDescription` is the JOIN of these and contains no
+        /// free text of its own, which is what makes the tag mandatory.
+        struct Claim: Equatable, Sendable {
+            let establishes: Established
+            let text: String
+        }
+
+        /// DOES ASSERTING THIS PROPOSITION TELL THE USER WHERE THE INSPECTED
+        /// ITEM IS? — a property of the CLOSED VOCABULARY, decided once for
+        /// each of its fourteen members (PR #460 codex r18, E).
+        ///
+        /// It exists so that a fixture cell which has MEASURED where the item
+        /// actually is can fence the DERIVATION TABLE, which is the one
+        /// residual `established(for:)` has always carried and which E3 found
+        /// already broken. A cell that measures "same inode, still at the
+        /// target, nothing in the Trash" can assert that the cause it
+        /// produced establishes NO placing proposition — and that assertion
+        /// survives any rewording, because it is about the vocabulary and not
+        /// about a sentence.
+        ///
+        /// It is deliberately about the INSPECTED ITEM.
+        /// `.aStrangerStandsAtTheTarget` places the STRANGER and is therefore
+        /// `false`; `.theLandingNameWasRepointed` is a fact about a NAME.
+        static func placesTheItem(_ fact: Established) -> Bool {
+            switch fact {
+            case .theItemIsBackAtTheTarget, .theItemIsAtTheLanding,
+                 .theTrashHoldsWhatItTook:
+                return true
+            case .theDisposalWasNotProvedToHaveMovedTheItem,
+                 .theLandingDidNotYieldTheItem, .theLandingNameWasRepointed,
+                 .aStrangerStandsAtTheTarget,
+                 .theHoldingFolderIsNotTheAdmittedOne,
+                 .theLandingWasNotReported,
+                 .theItemsWhereaboutsAreNotEstablished,
+                 .nothingWasReportedFreed, .theRemedyForThisRefusal,
+                 .nothingWasFreedOnDisk, .theTargetWasReplaced:
+                return false
             }
         }
+
+        /// WHAT THE PATH THAT RAISES EACH CAUSE ACTUALLY ESTABLISHED —
+        /// derived from the code, cause by cause, and the reference every
+        /// message is checked against.
+        ///
+        /// This `switch` has no `default:`, so a seventh cause cannot be
+        /// added without answering this question for it.
+        static func established(for cause: Cause) -> Set<Established> {
+            // Every one of the six is a REFUSAL, so no entry and no bytes are
+            // written for it, and every one of the six may say what to do
+            // next.
+            let always: Set<Established> = [
+                .nothingWasReportedFreed, .theRemedyForThisRefusal,
+            ]
+            switch cause {
+            case .putBack:
+                // `rollBack` got past the Trash open, re-bound the landing,
+                // opened AND PROVED the destination against the admitted
+                // container, renamed, and identified the arrival there.
+                return always.union([
+                    .theDisposalWasNotProvedToHaveMovedTheItem,
+                    .theItemIsBackAtTheTarget,
+                ])
+            case .strandedInTrash:
+                // Reached from THREE places in `rollBack`, and all three have
+                // an object identified at the landing. The count was TWO in
+                // the commit that introduced this table, and the entry was
+                // written to be exhaustive (PR #460 codex r18, E3):
+                //
+                // 1. THE TRASH OPEN FAILED — `observed` is non-`nil` on that
+                //    line, so the caller identified the object at `landed` a
+                //    moment ago. Nothing was moved.
+                // 2. `openAdmittedContainer` THREW ANYTHING BUT
+                //    `.notTheAdmittedContainer` — the catch-all, reached after
+                //    the re-bind matched at the landing. Nothing was moved.
+                // 3. `renameatx_np` FAILED WITH A NON-`ENOENT` ERRNO — the
+                //    arm this entry did not enumerate. `EEXIST`/`ENOTEMPTY`
+                //    from `RENAME_EXCL`, `EACCES`, `EROFS`, `EXDEV`: every one
+                //    of them leaves the SOURCE where it was, which is why the
+                //    conclusion survived the omission and no user-facing
+                //    clause was ever false because of it.
+                //
+                // WHAT THE OMISSION DID COST is the `EEXIST` half of arm 3:
+                // that errno means something NOW STANDS AT THE TARGET, so
+                // "Move it back from there" collides with it. The clause says
+                // so; see `claims(path:cause:)`.
+                //
+                // AND THE CELL'S OWN RESIDUAL BIT ON DAY ONE. The fence's
+                // disclosure says "nothing here can check a derivation
+                // against the code" — and this is the entry that was written
+                // to be exhaustive and was not. Read that residual as load
+                // bearing, not as boilerplate.
+                return always.union([
+                    .theDisposalWasNotProvedToHaveMovedTheItem,
+                    .theItemIsAtTheLanding,
+                ])
+            case .lastSeenInTrash:
+                // The landing could not be named — absent, replaced,
+                // unreadable, or the rename answered ENOENT. Nothing was
+                // moved, and where the object is was NOT established: it may
+                // never have left the target, and it may be somewhere this
+                // process could not read.
+                return always.union([
+                    .theDisposalWasNotProvedToHaveMovedTheItem,
+                    .theLandingDidNotYieldTheItem,
+                    .theItemsWhereaboutsAreNotEstablished,
+                ])
+            case .putBackTookAnotherObject:
+                // The re-bind identified an object at the landing NAME and
+                // the rename then moved a DIFFERENT one out of it. That is a
+                // fact about the name and about what now stands at the
+                // target; it says nothing about where the first object went
+                // (r16, A-P1 — measured: it is not under the landing's
+                // container at all).
+                return always.union([
+                    .theDisposalWasNotProvedToHaveMovedTheItem,
+                    .theLandingNameWasRepointed, .aStrangerStandsAtTheTarget,
+                    .theItemsWhereaboutsAreNotEstablished,
+                ])
+            case .destinationNotTheAdmittedContainer:
+                // The destination open+prove failed on IDENTITY, after the
+                // re-bind had matched at the landing. So the object is still
+                // at the landing and the folder that holds the target is not
+                // the admitted one.
+                return always.union([
+                    .theDisposalWasNotProvedToHaveMovedTheItem,
+                    .theHoldingFolderIsNotTheAdmittedOne,
+                    .theItemIsAtTheLanding,
+                ])
+            case .destinationUnknown:
+                // Raised before anything about a landing is known — the
+                // mover returned `nil`. This arm READS NOTHING, so the only
+                // positive fact is that no landing was reported, and the only
+                // other true thing to say is that the item's whereabouts were
+                // not established.
+                //
+                // IT USED TO CLAIM `.theTrashHoldsWhatItTook` AS WELL, AND
+                // THAT WAS THE ONE ROW DERIVED FROM A SEAM'S CONTRACT RATHER
+                // THAN FROM A READ (PR #460 codex r18, E2). See that case's
+                // own doc for the measurement that falsified it — same inode,
+                // all four arms — and for why it is retired rather than
+                // re-derived.
+                //
+                // `.theDisposalWasNotProvedToHaveMovedTheItem` is NOT here:
+                // this message never carried the shared opening, and must not
+                // gain one (r15, D-P3).
+                return always.union([
+                    .theLandingWasNotReported,
+                    .theItemsWhereaboutsAreNotEstablished,
+                ])
+            }
+        }
+
+        /// THE TRASH NAME EACH CAUSE CARRIES, or `nil` for the two that
+        /// carry none. `default`-less, so a seventh cause must answer it.
+        static func landing(of cause: Cause) -> String? {
+            switch cause {
+            case .putBack, .destinationUnknown:
+                return nil
+            case .strandedInTrash(let landed),
+                 .lastSeenInTrash(let landed),
+                 .putBackTookAnotherObject(let landed),
+                 .destinationNotTheAdmittedContainer(let landed):
+                return landed
+            }
+        }
+
+        /// WHAT TO DO NEXT — A CLOSED SET (PR #460 codex r18, E).
+        ///
+        /// The remedy used to be the one clause with no constraint on it at
+        /// all: `contract(for: .theRemedyForThisRefusal)` had no `all` and no
+        /// `any`, so it was free text bounded by two word lists, and
+        /// `rescan`'s wording was shared by five of the six causes anyway.
+        /// It is an enumeration now, so "a remedy nobody wrote down" is not
+        /// a thing that can be said.
+        enum Remedy: String, CaseIterable, Sendable {
+            /// The disposal was refused; the state on disk may have moved, so
+            /// the only sound next step is to look again.
+            case rescan
+            /// …and for the one cause where the Trash itself is what could
+            /// not be pinned down, the disposal that does not need it.
+            case usePermanentDeleteInstead
+
+            var text: String {
+                switch self {
+                case .rescan:
+                    return "Refused; re-scan required."
+                case .usePermanentDeleteInstead:
+                    return "Use permanent delete (turn off Move to Trash) for "
+                        + "a disposal that proves the folder it acts on."
+                }
+            }
+        }
+
+        /// `default`-less, like every other per-cause table here.
+        static func remedy(for cause: Cause) -> Remedy {
+            switch cause {
+            case .putBack, .strandedInTrash, .lastSeenInTrash,
+                 .putBackTookAnotherObject, .destinationNotTheAdmittedContainer:
+                return .rescan
+            case .destinationUnknown:
+                return .usePermanentDeleteInstead
+            }
+        }
+
+        /// THE ORDER THE ESTABLISHED FACTS ARE SPOKEN IN. Every proposition
+        /// in the vocabulary appears here exactly once (asserted by the
+        /// fence), including the three no arm establishes — they simply never
+        /// pass the membership test in `claims(path:cause:)`.
+        static let messageOrder: [Established] = [
+            // The two OPENINGS. Exactly one of them starts every message, and
+            // they are the only two rendered in lower case, because they
+            // follow the `"<path>: "` prefix.
+            .theDisposalWasNotProvedToHaveMovedTheItem,
+            .theLandingWasNotReported,
+            // What happened to the object.
+            .theItemIsBackAtTheTarget,
+            .theLandingDidNotYieldTheItem,
+            .theLandingNameWasRepointed,
+            .aStrangerStandsAtTheTarget,
+            .theItemIsAtTheLanding,
+            .theHoldingFolderIsNotTheAdmittedOne,
+            .theItemsWhereaboutsAreNotEstablished,
+            // The report, then the remedy — always last, always both.
+            .nothingWasReportedFreed,
+            .theRemedyForThisRefusal,
+            // Never rendered: no cause establishes any of these.
+            .theTrashHoldsWhatItTook,
+            .nothingWasFreedOnDisk,
+            .theTargetWasReplaced,
+        ]
+
+        /// The two propositions a message may OPEN with. Both are rendered
+        /// lower case because the `"<path>: "` prefix precedes them.
+        static let openingFacts: Set<Established> = [
+            .theDisposalWasNotProvedToHaveMovedTheItem,
+            .theLandingWasNotReported,
+        ]
+
+        /// **THE ONE WORDING OF ONE PROPOSITION** — and the reason the
+        /// message is no longer written per cause (PR #460 codex r18, E).
+        ///
+        /// ## What was wrong with the shape this replaces
+        ///
+        /// r17 replaced a list of banned phrases with a `Claim` carrying a
+        /// tag and its own FREE TEXT, and a test fence that inspected that
+        /// text: word lists for "does this name a place", "does this claim a
+        /// net effect", "is this hedged", plus per-proposition `all`/`any`
+        /// marker strings. It asserted that "a NEW false sentence fails
+        /// without anyone having predicted its wording". MEASURED at 9ca1129,
+        /// **8 of 8 new false wordings passed it**, five of them saying the
+        /// same false thing r16 had spent a round retiring, and one passing
+        /// the FULL suite. Six distinct mechanisms, none of them a bug in the
+        /// word lists:
+        ///
+        /// (a) `isHedged` was a WHOLE-CLAUSE boolean, so one hedge word
+        ///     anywhere licensed an unhedged positive placement anywhere else
+        ///     in the same clause;
+        /// (b) a proposition marked whereabouts+positive licensed ARBITRARY
+        ///     extra whereabouts claims, about any object and any place;
+        /// (c) the `all`/`any` markers were a phrase list INVERTED — a
+        ///     brand-new clause tagged with an already-used proposition
+        ///     passed iff it contained that proposition's markers, so the
+        ///     marker was a PASSWORD, not a property;
+        /// (d) the remedy had no `all` and no `any` at all;
+        /// (e) the sentence-break rule tested `". "` only, so `"! "` and
+        ///     `"? "` let a new sentence into an existing clause untagged;
+        /// (f) the net-effect lexicon was six words.
+        ///
+        /// The lesson is not "widen the lists a tenth time". A fence that
+        /// inspects FREE TEXT will always be a blocklist, because "is this
+        /// clause entailed by what the proof established?" is a SEMANTIC
+        /// judgement and every approximation of it in strings is a password.
+        ///
+        /// ## What this is instead
+        ///
+        /// THERE IS NO FREE TEXT. The message is ASSEMBLED FROM THE FACT SET:
+        /// `claims(path:cause:)` walks `messageOrder`, keeps the facts
+        /// `established(for:)` says the cause proved, and asks THIS function
+        /// for each one's wording. A clause asserting a proposition the cause
+        /// did not establish is therefore UNREPRESENTABLE rather than
+        /// detected — there is no call site at which one could be written —
+        /// and the same proposition is worded IDENTICALLY under every cause
+        /// that establishes it, which is what kills (b) and (c) outright.
+        /// (a), (d), (e) and (f) go with the text inspection they belonged
+        /// to.
+        ///
+        /// ## THE RESIDUAL, WHICH IS REAL AND IS THE POINT OF THE SHAPE
+        ///
+        /// Someone can still write a sentence HERE that asserts more than the
+        /// proposition it is filed under — this table is where the semantic
+        /// judgement now lives, and no test can check it. What changed is its
+        /// SIZE and its SHAPE: it is one wording per proposition, fourteen of
+        /// them, in one `default`-less `switch`, reviewed once and shared by
+        /// every cause — rather than one wording per (cause × clause),
+        /// written afresh at each of six call sites, which is where all nine
+        /// of this branch's false sentences were written. It is a smaller
+        /// surface that a reviewer can read end to end, not a proof.
+        ///
+        /// The second residual is unchanged and equally real: an author can
+        /// edit `established(for:)` to admit a proposition the code path does
+        /// not prove. That table is the derivation, and E3 found it already
+        /// wrong about its own code in the commit that introduced it.
+        ///
+        /// `nil` means "this proposition is never spoken": the three no arm
+        /// establishes, and any fact whose payload this cause does not carry
+        /// (the fence asserts the latter never happens).
+        static func sentence(
+            for fact: Established, path: String, landed: String?,
+            remedy: Remedy
+        ) -> String? {
+            switch fact {
+            case .theDisposalWasNotProvedToHaveMovedTheItem:
+                return "the disposal could not be proved to have moved the "
+                    + "item that was inspected."
+            case .theLandingWasNotReported:
+                return "the Trash did not report where it put the item, so "
+                    + "which folder it took cannot be established."
+            case .theItemIsBackAtTheTarget:
+                // TWO NET-EFFECT CLAIMS HAVE BEEN RETIRED FROM THIS ONE, a
+                // round apart: "Nothing was moved to the Trash" (r16, A-P4b —
+                // an object WAS moved there and then retrieved) and "nothing
+                // was freed" (r17, M4 — a fact about the DISK, which no arm
+                // reads). What is left is what `rollBack` actually did.
+                return "What it did take has been PUT BACK: it was moved back "
+                    + "out of the Trash and identified at this path."
+            case .theLandingDidNotYieldTheItem:
+                guard let landed else { return nil }
+                return "Nothing could be put back: what the disposal reported "
+                    + "putting at \(landed) cannot be found there now, so "
+                    + "nothing was moved rather than moving whatever took its "
+                    + "place. The item may never have left \(path), and it "
+                    + "may be somewhere this could not read."
+            case .theLandingNameWasRepointed:
+                guard let landed else { return nil }
+                return "Putting back what it did take moved a DIFFERENT "
+                    + "object — the Trash name it came from (\(landed)) was "
+                    + "re-used while the undo was running."
+            case .aStrangerStandsAtTheTarget:
+                return "Whatever now stands at \(path) came out of the Trash "
+                    + "and was NOT put there by you."
+            case .theItemIsAtTheLanding:
+                guard let landed else { return nil }
+                // THE COLLISION HALF IS r18's E3: one of the three raise
+                // sites is `renameatx_np` answering EEXIST, which means
+                // something ALREADY stands at the target, and "move it back"
+                // walks straight into it. Hedged, so it is true on all three.
+                return "What it did take could not be put back automatically "
+                    + "— it is in the Trash at \(landed). Move it back from "
+                    + "there; and if something already stands at this path, "
+                    + "move that aside first, because the automatic put-back "
+                    + "refuses to overwrite."
+            case .theHoldingFolderIsNotTheAdmittedOne:
+                return "What the Trash took was NOT put back: the folder that "
+                    + "HOLDS this path is no longer the one the safety check "
+                    + "admitted. Move it back once the folder at this path is "
+                    + "the one you expect."
+            case .theItemsWhereaboutsAreNotEstablished:
+                return "Where the item is now was NOT established."
+            case .nothingWasReportedFreed:
+                // A fact about the REPORT, never about the disk. The
+                // qualifier is load-bearing and has been attacked twice.
+                return "No entry was written and nothing was reported freed."
+            case .theRemedyForThisRefusal:
+                return remedy.text
+            case .theTrashHoldsWhatItTook, .nothingWasFreedOnDisk,
+                 .theTargetWasReplaced:
+                // NO ARM ESTABLISHES THESE, so they are never spoken. Each
+                // shipped once and was retired on a measurement; see their
+                // cases in `Established`.
+                return nil
+            }
+        }
+
+        /// THE MESSAGE, ASSEMBLED FROM THE FACT SET — never written per
+        /// cause (PR #460 codex r18, E).
+        ///
+        /// This function chooses no words. It walks `messageOrder`, keeps
+        /// what `established(for:)` says this cause proved, and renders each
+        /// through `sentence(for:path:landed:remedy:)`. A clause asserting a
+        /// proposition this cause did not establish has no place to be
+        /// written; see `sentence`'s doc for what that does and does not buy.
+        ///
+        /// Pinned by `TrashDisposalHopProofTests`'
+        /// `…NoTrashFailureMessageAssertsAnythingItsOwnProofDidNotEstablish`
+        /// (the structural fence, off the type),
+        /// `…NoFailureMessageAssertsTheTargetWasReplacedWithoutReadingIt` and
+        /// `…EveryTrashFailureMessageOpensWithWhatWasActuallyProved` (r15's
+        /// opening guards, kept), and the three fixture cells that prove the
+        /// retired propositions FALSE on the events their causes are named
+        /// for —
+        /// `…TheLastSeenMessageDoesNotSendTheUserToTheTrashForAnItemStillOnDisk`,
+        /// `…APutBackThatTookAnotherObjectDoesNotClaimWhereTheTakenOneIs` and
+        /// `…TheUnknownDestinationMessageDoesNotSendTheUserToTheTrashForAnItemStillOnDisk`.
+        static func claims(path: String, cause: Cause) -> [Claim] {
+            let landed = landing(of: cause)
+            let facts = established(for: cause)
+            let remedy = remedy(for: cause)
+            return messageOrder.compactMap { fact in
+                guard facts.contains(fact) else { return nil }
+                guard let text = sentence(
+                    for: fact, path: path, landed: landed, remedy: remedy
+                ) else { return nil }
+                return Claim(establishes: fact, text: text)
+            }
+        }
+
+        /// The path, then the join, and NOTHING ELSE. The only text here that
+        /// is not a `Claim` is the subject — the path the refusal is about —
+        /// and the single space between sentences.
+        var errorDescription: String? {
+            "\(path): "
+                + Self.claims(path: path, cause: cause)
+                    .map(\.text).joined(separator: " ")
+        }
     }
+
+    // MARK: - The mover seam, and the proof that has to cross its hop
+
+    /// THE MOVER SEAM — and the SECOND argument is the whole reason this is a
+    /// named type rather than `(URL) async throws -> URL?` (PR #460 codex r6,
+    /// D1).
+    ///
+    /// `disposal(target, prove)` must call `prove()` **on the far side of
+    /// whatever hop it performs, immediately before the move**, and must not
+    /// move anything if it throws. The seam owner is the only code that knows
+    /// where its mover actually runs, so it is the only code that can put a
+    /// proof there.
+    ///
+    /// WHY. The production mover is `FileManager.trashItem`, which requires
+    /// the main actor, so `CacheCleaner` wraps it in a `MainActor.run`. Every
+    /// proof this file takes before calling the seam is therefore separated
+    /// from the move by the MAIN THREAD'S QUEUE DEPTH, which is not a syscall
+    /// and not a constant. MEASURED through the production composition
+    /// (`CacheCleaner` → `WorktreeReclaimPerformer` → this file, provider
+    /// instrumented so the last pre-move `probeChild` is timestamped, a
+    /// 120 ms work item held on the main thread):
+    ///
+    /// | shape | last proof → the mover is entered (n=5) |
+    /// |---|---|
+    /// | proof before the hop (through r5) | median **175.736 ms**, 160.352–184.937 |
+    /// | proof inside the hop (this) | median **0.004 ms**, 0.004–0.016 |
+    ///
+    /// The load is real in both rows and is asserted to be: the same run
+    /// measures the HOP itself (first leaf binding → last leaf binding) at
+    /// median 175.3 ms and 176.1 ms respectively.
+    ///
+    /// The full figures, the command and the load condition are in
+    /// `WorktreeReclaimPerformerTests`'
+    /// `testTheTrashProofAndTheMoveAreNotSeparatedByTheMainThreadQueue`.
+    ///
+    /// The after-proof still runs and still rolls back — this narrows the
+    /// window the after-proof exists to catch, it does not replace it.
+    typealias Mover = (URL, () throws -> Void) async throws -> URL?
 
     /// Move `target` to the Trash through `disposal`, proving on BOTH sides of
     /// it that the object disposed of is the one `inspected` is a verdict
@@ -326,50 +994,143 @@ enum TrashDisposal {
         expecting inspected: UserDataProbeResult.InspectedRoot,
         provider: FileSystemIdentityProvider,
         containedIn admittedParent: DepthSafeRemoval.AdmittedParent,
-        via disposal: (URL) async throws -> URL?
+        via disposal: Mover
     ) async throws {
-        // A NON-DIRECTORY leaf verdict cannot be proved by `look` — its kind
-        // gate is an `O_DIRECTORY` open, which can only ever IDENTIFY a
-        // directory (ENOTDIR/ELOOP name no inode). The carried identity is
-        // bound the way the no-leaf-verdict arm below binds: one `fstatat`
-        // under the PROVED container, on BOTH sides of the move, required
-        // equal to the identity the revalidator verified (PR #459 review r5
-        // — before this branch, ANY `.noDirectoryTree` sighting satisfied
-        // the file arm's verdict and a swapped-in file was trashed and KEPT
-        // with success reported).
-        if case .nonDirectoryLeaf(let expected) = inspected {
-            let bound = try boundLeaf(
-                of: target, containedIn: admittedParent, provider: provider
+        // WHICH ARM, AND WHY TWO OF THE FOUR VERDICTS LEAVE THIS FUNCTION
+        // IMMEDIATELY (PR #460 codex r13, A).
+        //
+        // `look` is the only proof `proveStanding` has, and `look`'s kind
+        // gate is an `O_DIRECTORY` open: it can IDENTIFY a directory and
+        // nothing else. So it answers a verdict ABOUT a directory
+        // (`.directory(identity)`) and cannot answer either verdict about a
+        // non-directory — `.nonDirectoryLeaf` because ENOTDIR/ELOOP name no
+        // inode, `.noDirectoryTree` because the verdict itself carries no
+        // identity to compare against and so reduces, on BOTH sides of the
+        // move, to "some non-directory answers to this name". ANY
+        // non-directory in ANY directory satisfies that, and until r13 this
+        // arm never opened `admittedParent` at all: the parameter was
+        // consulted only inside `.nonDirectoryLeaf`'s `boundLeaf` and inside
+        // `rollBack`.
+        //
+        // MEASURED AT 0139713, three ways, with the production provider and
+        // two real `rename(2)`s: at this level the stranger's file was moved
+        // to the landing and `dispose` RETURNED NORMALLY; through the
+        // production composition (real `CacheCleaner`, real
+        // `OrphanedCachesScanner.preDeleteRevalidator`, real PathGuard
+        // admission, `moveToTrash: true` — the GUI's shipped default) the
+        // report read `entries=[… exactBytes: 4096, disposal: .trash],
+        // errors=[]`; and with NOTHING injected at the seam — the shipped
+        // `FileManager.trashItem`, into the REAL `~/.Trash` — the stranger's
+        // file was left sitting in the user's Trash and its bytes reported
+        // freed. The PERMANENT arm refuses the identical event on the
+        // identical fixture, because `DepthSafeRemoval.remove` goes through
+        // `openAdmittedContainer` for EVERY verdict; so does the sibling
+        // overload below. This was the one destructive path in the product
+        // that did not bind its container.
+        //
+        // BINDING THE CONTAINER ALONE IS NOT ENOUGH, AND THAT WAS MEASURED
+        // TOO. A probe that only added `openAdmittedContainer` on both sides
+        // of the seam still trashed the stranger with `errors=[]` when the
+        // container was swapped INSIDE the mover — the window `trashItem`'s
+        // own resolution owns, the window the file header says the
+        // after-proof exists to catch — because the after-proof then reads
+        // `look(at: landed) == .noDirectoryTree` and
+        // `disagreement(.noDirectoryTree, .noDirectoryTree)` is `nil`. FOR
+        // THIS VERDICT THE AFTER-PROOF IS NOT LOAD-BEARING; THE BINDING IS.
+        //
+        // So both non-directory verdicts take the one shape that binds an
+        // OBJECT: `boundLeaf` under the PROVED container, on both sides of
+        // the move. `disposeBoundLeaf` is that shape, spelled once, and the
+        // container-bound overload below is the same call with the widest
+        // admission — three arms that cannot drift because they are one
+        // function.
+        switch inspected {
+        case .nonDirectoryLeaf(let expected):
+            // The revalidator held this leaf open and read its inode (PR
+            // #459 review r5 — before that, ANY `.noDirectoryTree` sighting
+            // satisfied the file arm's verdict and a swapped-in file was
+            // trashed and KEPT with success reported).
+            try await disposeBoundLeaf(
+                target, containedIn: admittedParent, provider: provider,
+                admitting: .exactly(expected), via: disposal
             )
-            guard bound.identity == expected else {
-                // Refused BEFORE the move: the Trash is untouched. The same
-                // cause the permanent arm throws for the same event, so the
-                // cleaner's log tags both `content-drift`.
-                throw DepthSafeRemoval.Failure(
-                    path: target.path, cause: .notTheInspectedObject, depth: 0
-                )
-            }
-            let landed = try await disposal(target)
-            guard let landed else {
-                throw Failure(path: target.path, cause: .destinationUnknown)
-            }
-            let observed = facts(at: landed, provider: provider)
-            guard observed == bound else {
-                throw Failure(
-                    path: target.path,
-                    cause: rollBack(
-                        observed, from: landed, to: target,
-                        containedIn: admittedParent, provider: provider
-                    )
-                )
-            }
             return
+        case .noDirectoryTree:
+            // NO IDENTITY EXISTS TO REQUIRE — the verdict's one producer is
+            // the probe whose root open FAILED (`OrphanedCachesScanner`), so
+            // it never held one. What CAN be required is the residual's own
+            // shape: a directory appearing at that name since voids the
+            // verdict (`PreDeleteInspectedObject.noDirectoryTree` says so),
+            // and it is a kind the permanent arm gets refused by the kernel
+            // — `unlinkat` without `AT_REMOVEDIR` cannot remove a directory,
+            // measured EPERM — while `trashItem` takes it happily. So the
+            // kind check is kept HERE, where it is the only thing keeping
+            // the two arms level, and the identity-free residual ("any
+            // non-directory at the name satisfies it") is now bounded to ONE
+            // directory: the admitted container, proved on both sides.
+            //
+            // GHOST TARGETS MOVE ONE CALL EARLIER, DELIBERATELY. Through r12
+            // an absent target satisfied `proveStanding`
+            // (`absenceProves: true`) and the disposal produced its own
+            // ENOENT; `boundLeaf` throws `.posix(ENOENT)` before the move
+            // instead. Both are item-keyed POSIX errors and neither is a
+            // silent skip, so the choice is between two spellings of one
+            // outcome — and this one keeps the user's Trash UNTOUCHED for an
+            // item that was never there, which the other cannot promise,
+            // because it hands the NAME to `trashItem` and whatever answers
+            // to it a moment later is what gets taken.
+            try await disposeBoundLeaf(
+                target, containedIn: admittedParent, provider: provider,
+                admitting: .anythingButADirectory, via: disposal
+            )
+            return
+        case .directory, .unestablished:
+            break
         }
 
-        // (1) The cheap refusal, and the one that keeps the Trash untouched.
-        try proveStanding(inspected, at: target, provider: provider)
+        // (0) WHOSE FOLDER IS THIS? (PR #460 codex r13, A2.) Asked before
+        // anything is read at the target's name, and asked the way every
+        // other destructive arm asks it — `DepthSafeRemoval`'s
+        // `openAdmittedContainer`, which opens the container and `fstat`s
+        // the descriptor against the identity the cleaner captured.
+        //
+        // The `.directory` arm SURVIVED a container swap without this, but
+        // only INCIDENTALLY: `Identity` is dev+inode, so a stranger's
+        // directory can never equal the inspected inode and the refusal came
+        // back as `.notTheInspectedObject` — logged `content-drift`, the tag
+        // for "the item changed", for an event in which the item did not
+        // change and its FOLDER did. The permanent arm and the
+        // container-bound overload both answer `.notTheAdmittedContainer` /
+        // `container-drift` for the identical event. A user told the wrong
+        // fact goes and looks at the wrong thing.
+        //
+        // `.unestablished` reaches here too and every arm below refuses it
+        // (`disagreement`'s `guard case`s each name a different case), which
+        // is the fail-closed default rather than a fourth shape.
+        //
+        // (1) …AND THE LEAF IS READ UNDER THAT SAME DESCRIPTOR — the cheap
+        // refusal, and the one that keeps the Trash untouched. The two used
+        // to be separate acts, and the second one re-opened the container by
+        // PATH with `O_NOFOLLOW` (see `proveStandingUnderAdmittedContainer`
+        // for what that cost).
+        try proveStandingUnderAdmittedContainer(
+            inspected, at: target, containedIn: admittedParent,
+            provider: provider
+        )
 
-        let landed = try await disposal(target)
+        // (1b) THE SAME PROOF, ON THE FAR SIDE OF THE SEAM'S HOP (D1). (0)
+        // and (1) are taken here; the move happens after a main-actor hop
+        // whose length is the main thread's queue depth, not a syscall. The
+        // container is opened and proved AGAIN here rather than carried
+        // across the hop on a descriptor: a descriptor held across it would
+        // still be the pre-hop container, and what this has to catch is a
+        // container swapped INSIDE it.
+        let landed = try await disposal(target) {
+            try proveStandingUnderAdmittedContainer(
+                inspected, at: target, containedIn: admittedParent,
+                provider: provider
+            )
+        }
 
         // (2) The disposal happened. From here on the question is not "may we
         // proceed" but "what did it actually take", and every unprovable
@@ -389,7 +1150,176 @@ enum TrashDisposal {
             throw Failure(
                 path: target.path,
                 cause: rollBack(
-                    identified(sighting), from: landed, to: target,
+                    identified(sighting, at: landed, provider: provider),
+                    from: landed, to: target,
+                    containedIn: admittedParent, provider: provider
+                )
+            )
+        }
+    }
+
+    /// WHAT THE PRE-MOVE BINDING MUST SHOW for a disposal to proceed — the
+    /// ONLY thing that differs between the three arms that bind a leaf under
+    /// a proved container.
+    ///
+    /// A value rather than a closure so nothing about an arm can be
+    /// captured, escape, or cross the mover's hop.
+    enum LeafAdmission: Equatable {
+        /// NO leaf verdict exists (all of contents mode, plus every item
+        /// whose scanner registers no revalidator): the binding under the
+        /// proved container IS the whole proposition, and the after-proof
+        /// carries the rest.
+        case whateverStandsThere
+        /// `.nonDirectoryLeaf(identity)` — the revalidator held the leaf open
+        /// and read its inode, so equality is available and required.
+        case exactly(FileSystemIdentityProvider.Identity)
+        /// `.noDirectoryTree` — identity-free by construction (its producer's
+        /// root open FAILED), so the only proposition the verdict carries is
+        /// that no directory TREE of ours stood at the name.
+        case anythingButADirectory
+
+        func admits(_ facts: FileSystemIdentityProvider.ChildFacts) -> Bool {
+            switch self {
+            case .whateverStandsThere: return true
+            case .exactly(let identity): return facts.identity == identity
+            case .anythingButADirectory: return facts.kind != .directory
+            }
+        }
+    }
+
+    /// THE CONTAINER IS PROVED AND THEN THE LEAF IS READ UNDER IT — the
+    /// `.directory` verdict's whole pre-move proof, as ONE act.
+    ///
+    /// It is `boundLeaf`'s shape with one difference, and the difference is
+    /// forced: this verdict's rollback depends on `look`'s `.unidentifiable`
+    /// arm, which only an OPENED inode can produce, so the leaf is opened
+    /// (`openat`, `O_NOFOLLOW`) rather than `fstatat`ed. The CONTAINER half is
+    /// identical — `DepthSafeRemoval.openAdmittedContainer`, the same call the
+    /// permanent arm and `boundLeaf` make, so the three cannot answer
+    /// differently about whose folder this is.
+    ///
+    /// ## AND THAT IS THE FIX (PR #460 codex r14, V1-D2)
+    ///
+    /// r13 proved the container, CLOSED the descriptor, and then read the leaf
+    /// with `look(at:)`, which re-opened the container BY PATH with
+    /// `O_NOFOLLOW`. `DepthSafeRemoval.openContainer` deliberately FOLLOWS,
+    /// and its header states the reason verbatim: "a no-follow open would
+    /// refuse it while `remove`'s open succeeded — a binding that refuses
+    /// every deletion under a symlinked cache root". So the two opens
+    /// disagreed by construction, and this one arm refused what the other four
+    /// destructive paths perform.
+    ///
+    /// MEASURED at 6866012 on `base/link -> base/real`, target
+    /// `base/link/victim`, production provider, one `AdmittedParent`:
+    /// permanent DELETED, `dispose(_:containedIn:)` TRASHED, the
+    /// `.noDirectoryTree` arm TRASHED, the `.nonDirectoryLeaf` arm TRASHED,
+    /// and this arm REFUSED `.posix(20)` — surfaced to the user as
+    /// "…/victim: Not a directory" about a directory that plainly is one. No
+    /// shipped scanner reached it (both `.directory` producers emit only
+    /// direct children of their admitted roots), so it was latent rather than
+    /// shipping. Evidenced by
+    /// `TrashDisposalHopProofTests.testEveryDestructivePathDisposesUnderASymlinkedContainer`
+    /// — the FORWARD half, all five paths. The undo half is r15's D-P1, and
+    /// until that round it was where the paths still disagreed:
+    /// `rollBack`'s destination open was left on `openDirectoryNoFollow`, so
+    /// this fix moved the arm from "refuses before the move" to "moves the
+    /// item to the Trash and then cannot put it back".
+    ///
+    /// The re-open also went away with it: the container was being resolved
+    /// twice per proof, and the second resolution was the unbound one.
+    ///
+    /// THE LANDING'S CONTAINER OPEN IS UNCHANGED AND MUST STAY SO. `look(at:)`
+    /// still opens ITS container `O_NOFOLLOW`, because the Trash's container
+    /// is proved against nothing — see `look`'s header and
+    /// `…RefusesASymlinkedLandingContainer`. Following there identified the
+    /// object on the other side of a link and reported a move that never
+    /// happened; following HERE is the only way to agree with the open that
+    /// the deletion itself uses.
+    private static func proveStandingUnderAdmittedContainer(
+        _ inspected: UserDataProbeResult.InspectedRoot,
+        at target: URL,
+        containedIn admittedParent: DepthSafeRemoval.AdmittedParent,
+        provider: FileSystemIdentityProvider
+    ) throws {
+        let fd = try DepthSafeRemoval.openAdmittedContainer(
+            at: target.deletingLastPathComponent(),
+            provenAgainst: admittedParent, displayPath: target.path,
+            provider: provider
+        )
+        defer { close(fd) }
+        // `absenceProves: true` — the frozen ghost-target behaviour, and the
+        // same value `proveStanding` passes. See `proveStanding`.
+        if let cause = disagreement(
+            inspected,
+            with: look(
+                named: target.lastPathComponent, inDirectory: fd,
+                logical: target, provider: provider
+            ),
+            absenceProves: true
+        ) {
+            throw DepthSafeRemoval.Failure(
+                path: target.path, cause: cause, depth: 0
+            )
+        }
+    }
+
+    /// THE ONE DISPOSAL SHAPE THAT BINDS AN OBJECT — used by every arm that
+    /// can have one, which since PR #460 codex r13 is every arm except the
+    /// `.directory` verdict's (whose proof must come off an OPENED inode,
+    /// because its rollback depends on `look`'s `.unidentifiable`).
+    ///
+    /// 1. BEFORE — the container is opened and `fstat`ed against
+    ///    `DepthSafeRemoval.admittedParent`'s identity, and the leaf is bound
+    ///    under THAT descriptor with one `fstatat` (`probeChild`: kind and
+    ///    identity from a single resolution no rename can re-point). What the
+    ///    binding must SHOW is `admission`'s business and nothing else's.
+    /// 2. AGAIN, IMMEDIATELY BEFORE THE MOVE, wherever the mover runs — the
+    ///    load-bearing one, because the production seam hops to the main
+    ///    actor and that hop is the main thread's queue depth (PR #460 codex
+    ///    r6, D1). Both readings are the SAME `boundLeaf` under the SAME
+    ///    proved container, so a difference is a swap inside the hop and
+    ///    nothing else.
+    /// 3. AFTER — what landed is read the same descriptor-relative way and
+    ///    required EQUAL to the bound facts. A mismatch is PUT BACK through
+    ///    `rollBack`, which proves its own destination against the same
+    ///    admitted container, and reported as a refusal: no entry, no bytes.
+    private static func disposeBoundLeaf(
+        _ target: URL,
+        containedIn admittedParent: DepthSafeRemoval.AdmittedParent,
+        provider: FileSystemIdentityProvider,
+        admitting admission: LeafAdmission,
+        via disposal: Mover
+    ) async throws {
+        let bound = try boundLeaf(
+            of: target, containedIn: admittedParent, provider: provider
+        )
+        guard admission.admits(bound) else {
+            // Refused BEFORE the move: the Trash is untouched. The same
+            // cause the permanent arm throws for the same event, so the
+            // cleaner's log tags both `content-drift`.
+            throw DepthSafeRemoval.Failure(
+                path: target.path, cause: .notTheInspectedObject, depth: 0
+            )
+        }
+        let landed = try await disposal(target) {
+            let atTheInstant = try boundLeaf(
+                of: target, containedIn: admittedParent, provider: provider
+            )
+            guard atTheInstant == bound else {
+                throw DepthSafeRemoval.Failure(
+                    path: target.path, cause: .notTheInspectedObject, depth: 0
+                )
+            }
+        }
+        guard let landed else {
+            throw Failure(path: target.path, cause: .destinationUnknown)
+        }
+        let observed = facts(at: landed, provider: provider)
+        guard observed == bound else {
+            throw Failure(
+                path: target.path,
+                cause: rollBack(
+                    observed, from: landed, to: target,
                     containedIn: admittedParent, provider: provider
                 )
             )
@@ -447,27 +1377,17 @@ enum TrashDisposal {
         _ target: URL,
         containedIn admittedParent: DepthSafeRemoval.AdmittedParent,
         provider: FileSystemIdentityProvider,
-        via disposal: (URL) async throws -> URL?
+        via disposal: Mover
     ) async throws {
-        let bound = try boundLeaf(
-            of: target, containedIn: admittedParent, provider: provider
+        // THE SAME SHAPE THE OTHER ENTRY POINT'S TWO NON-DIRECTORY ARMS TAKE,
+        // SPELLED ONCE (PR #460 codex r13, A). This arm has no verdict, so
+        // its admission is the widest one there is — but the binding, the
+        // proof across the hop, the after-proof and the rollback are
+        // literally the same code, which is what stops the arms drifting.
+        try await disposeBoundLeaf(
+            target, containedIn: admittedParent, provider: provider,
+            admitting: .whateverStandsThere, via: disposal
         )
-
-        let landed = try await disposal(target)
-
-        guard let landed else {
-            throw Failure(path: target.path, cause: .destinationUnknown)
-        }
-        let observed = facts(at: landed, provider: provider)
-        guard observed == bound else {
-            throw Failure(
-                path: target.path,
-                cause: rollBack(
-                    observed, from: landed, to: target,
-                    containedIn: admittedParent, provider: provider
-                )
-            )
-        }
     }
 
     /// WHAT STANDS AT `target`'s NAME INSIDE THE ADMITTED CONTAINER — the
@@ -488,10 +1408,23 @@ enum TrashDisposal {
         // multi-component one THROUGH the held directory, which is exactly the
         // no-follow guarantee this call exists to keep. No production URL
         // reaching here can violate it (`target` is an admitted item or an
-        // enumerated child), so deleting it — measured, both this and the copy
-        // in `facts` at once — leaves the FULL suite GREEN. It stays because
-        // the precondition is the primitive's, not this call's, and a future
-        // caller is what it is for.
+        // enumerated child), so no DISPOSAL fixture can kill it: measured at
+        // r13, deleting it alone leaves 361 tests across the six destructive
+        // suites GREEN, because `probeChild` carries the identical
+        // precondition and answers `EINVAL` itself.
+        //
+        // WHAT ITS REMOVAL DOES CHANGE IS THE CAUSE, AND THAT IS EVIDENCED
+        // RATHER THAN CONCEDED (PR #460 codex r13, E). This guard answers
+        // BEFORE anything is resolved; without it the malformed name is
+        // resolved first and the refusal reports whatever that resolution
+        // says — measured on the cell's fixture, `.notTheAdmittedContainer`,
+        // which tells the user the FOLDER changed about a target whose name
+        // was never valid. Pinned by
+        // `TrashDisposalHopProofTests.testALookAtAnUnsafeNameIsRefusedRatherThanResolvedAlongThePath`.
+        // The claim that stood here — that deleting this AND the copy in
+        // `facts` together leaves the full suite green — was true when it was
+        // written and is false now: `facts`' copy is load-bearing over its
+        // `probeLeaf` fallback, and both have cells.
         guard FileSystemIdentityProvider.isSafeComponent(leaf) else {
             throw DepthSafeRemoval.Failure(
                 path: target.path, cause: .invalidTarget, depth: 0
@@ -535,24 +1468,159 @@ enum TrashDisposal {
     }
 
     /// Kind AND identity of whatever answers to `url`'s NAME inside `url`'s
-    /// directory, read descriptor-relative.
+    /// directory, read descriptor-relative — and, WHEN THAT DIRECTORY CANNOT
+    /// BE OPENED AT ALL, from one no-follow `lstat` of the path instead.
     ///
     /// `nil` is "nothing could be identified here", which is never a match
     /// and never a licence: `nil == bound` is false for every `bound`, so the
     /// caller rolls back, and the rollback refuses to move an object it
-    /// cannot name. Its three `nil` arms are therefore not three guards —
-    /// they are one fail-closed default that the caller's comparison enforces.
+    /// cannot name. Its `nil` arms are therefore not guards — they are one
+    /// fail-closed default that the caller's comparison enforces.
+    ///
+    /// ## THE FALLBACK, AND THE DEFECT IT CLOSES (PR #460 codex r10, D1)
+    ///
+    /// `url` is where the DISPOSAL said it put the item: in production that
+    /// is `~/.Trash/<name>`, and **a process without Full Disk Access cannot
+    /// open `~/.Trash`**. Measured on this machine (Darwin 25.5), from an
+    /// ordinary CLI process: `open("/Users/<u>/.Trash",
+    /// O_RDONLY|O_DIRECTORY|O_NOFOLLOW)` returns -1 with errno 1 (EPERM),
+    /// while `lstat` and `open` of `~/.Trash/<name>` — the item this process
+    /// just moved there — both SUCCEED. TCC denies the directory and permits
+    /// traversal through it.
+    ///
+    /// So the descriptor-relative read failed for EVERY Trash disposal on
+    /// every machine without Full Disk Access, this returned `nil`, and the
+    /// caller read that as "the disposal took something nobody inspected" and
+    /// rolled back — a rollback that then could not open the Trash either, so
+    /// the user was told, of a checkout sitting in the Trash and recoverable
+    /// in one drag, that it "could not be put back — it is no longer at
+    /// `~/.Trash/<name>`, where the Trash reported putting it", with
+    /// `entries=0` and 0 bytes reported. REPRODUCED 3/3 through the real
+    /// production composition (`SpaceScannerRuntime.production` →
+    /// `CacheoutViewModel.clean()`, `moveToTrash` at its shipped default,
+    /// nothing injected at the seam) by
+    /// `GitWorktreeEndToEndTests.testTheTrashDefaultReportsTheCheckoutItReallyMovedToTheTrash`,
+    /// which is red without the fallback and green with it.
+    ///
+    /// A FAILURE TO VERIFY IS NOT EVIDENCE OF A WRONG DISPOSAL, and this is
+    /// not a decision to skip the verification: the fallback still IDENTIFIES
+    /// the landed object, by the one syscall the permission actually allows.
+    /// The comparison the caller makes is unchanged, so a genuinely swapped
+    /// object still mismatches and is still refused
+    /// (`testAnUnopenableLandingStillCatchesAnObjectThatIsNotOurs`).
+    ///
+    /// IT IS RESTRICTED TO THE PERMISSION ERRNOS, AND r10 SHIPPED IT
+    /// UNRESTRICTED (PR #460 codex r11, D1). r10's header argued that a
+    /// per-errno gate "would add an untestable branch and buy nothing"
+    /// because the fallback "cannot ADMIT anything the descriptor-relative
+    /// read would refuse". **That reasoning is wrong, and the counterexample
+    /// is the failure `O_NOFOLLOW` exists to produce.** The two reads do not
+    /// resolve the same path: `probeChild` reads a name inside a descriptor,
+    /// while `probeLeaf` `lstat`s a PATH, and `lstat`'s no-follow applies to
+    /// the FINAL component only. So when the CONTAINER is a symlink the
+    /// container open FAILS — and the fallback then resolves that link and
+    /// identifies whatever lies on the other side of it.
+    ///
+    /// MEASURED, in
+    /// `TrashDisposalHopProofTests.testASymlinkedLandingContainerIsRefusedRatherThanResolvedThroughIt`:
+    /// a mover that returns a landing whose parent is a symlink aimed back at
+    /// the item's OWN container makes `lstat` walk through the link, find the
+    /// ORIGINAL object still standing at its original path, and return the
+    /// identity bound before the move. `observed == bound` then holds and the
+    /// disposal reports SUCCESS HAVING MOVED NOTHING — a false success, which
+    /// is strictly worse than the false refusal r10 removed. With the gate
+    /// that errno is not in the permitted class, `facts` returns `nil`, and
+    /// the caller refuses exactly as it did before r10.
+    ///
+    /// (WHICH errno, measured on Darwin 25.5 rather than assumed: the r11
+    /// review named this the `ELOOP` case, and `ELOOP` (62) is indeed what
+    /// `open(link, O_RDONLY|O_NOFOLLOW)` returns. This open also carries
+    /// `O_DIRECTORY`, and with it the same call returns **`ENOTDIR` (20)** —
+    /// the directory check answers first, for a symlink to a directory and
+    /// for a self-referential one alike. Neither code is permitted, so the
+    /// gate is the same either way.)
+    ///
+    /// WHY `EPERM`/`EACCES` ARE THE WHOLE PERMITTED CLASS — and the argument
+    /// is about what reaching them PROVES, not about how many causes produce
+    /// them (corrected, PR #460 codex r12, D3). r11 wrote that they "are the
+    /// whole measured cause": TCC's `EPERM`, and `EACCES` as its mode-bit
+    /// spelling. THERE IS AT LEAST A THIRD, MEASURED — `open(dir, O_RDONLY)`
+    /// needs READ on the container while `lstat(container/name)` needs only
+    /// TRAVERSAL, so a container at mode `0111` answers `EACCES` here while
+    /// the fallback's path read succeeds
+    /// (`testTheErrnoCarryingOpenAnswersOneCodePerFailureAndAdmitsMode0111`).
+    ///
+    /// It is SOUND anyway, and the enumeration was never what made it sound.
+    /// Reaching either code AT ALL means the container's LAST COMPONENT is a
+    /// real directory that `O_NOFOLLOW` accepted — a symlink there answers
+    /// `ENOTDIR`/`ELOOP` first, before any permission check, measured in the
+    /// same cell — so no member of this class can license a resolution the
+    /// descriptor-relative read refused, whatever produced it. A missing
+    /// directory and a non-directory answer outside the class for the same
+    /// reason.
+    ///
+    /// All three directions are evidenced:
+    /// `testAnUnopenableLandingIsIdentifiedRatherThanRefused` (`EPERM` must
+    /// SUCCEED), `testAModeDeniedLandingIsIdentifiedRatherThanRefused`
+    /// (`EACCES` must SUCCEED) and the symlinked-container cell above (must
+    /// REFUSE).
+    ///
+    /// It is reached only when the container open has ALREADY failed; while
+    /// that open succeeds the descriptor-relative answer, including its
+    /// `.absent`, is the only one used.
+    ///
+    /// THE SIBLING ARM, AND THE PARITY THIS HEADER CLAIMED IT ALREADY HAD
+    /// (corrected, PR #460 codex r12, D1). r11 wrote here that
+    /// `dispose(_:expecting:…)`'s directory path "has always identified the
+    /// landing with `look`, which is a DIRECT `open` of `url` and therefore
+    /// never needed the Trash directory", and offered that as the reason it
+    /// needed no gate. **Never needing the permission is not the same fact as
+    /// being sound**: a direct open of the whole path was the SAME
+    /// resolution-through-a-symlinked-container this gate exists to refuse,
+    /// because `O_NOFOLLOW` guards only the FINAL component. The false
+    /// success was reproduced on that arm at 93d6198
+    /// (`testTheDirectoryVerdictArmRefusesASymlinkedLandingContainer`), and
+    /// `look` now resolves the name inside its container with the same
+    /// permission-class fallback this function carries. The two arms are at
+    /// parity because both were fixed, not because one never had the defect.
+    ///
+    /// What r10's D1 broke remains as stated: only the arms that read the
+    /// landing descriptor-relative — the container-bound overload (the GUI's
+    /// default worktree and contents-mode disposal) and the
+    /// `.nonDirectoryLeaf` arm — were unusable without Full Disk Access. The
+    /// directory arm reached the landing by path, which TCC permits, so its
+    /// fallback is what keeps it working rather than what restored it.
     static func facts(
         at url: URL, provider: FileSystemIdentityProvider
     ) -> FileSystemIdentityProvider.ChildFacts? {
         let name = url.lastPathComponent
+        // THE SAME GUARD OVER THE SAME HOLE AS `look`'s, and load-bearing for
+        // the same reason (PR #460 codex r13, E): this function's
+        // permission-class fallback is `probeLeaf`, an `lstat` of the PATH
+        // with no name check beneath it. Measured with the guard deleted:
+        // `facts` at a name of `..` under a permission-denied container
+        // returns `ChildFacts(kind: .directory, identity: <the container>)`
+        // where the guard returns `nil`. Same cell as `look`'s.
         guard FileSystemIdentityProvider.isSafeComponent(name) else {
             return nil
         }
-        let fd = provider.openDirectoryNoFollow(
+        let fd: Int32
+        switch provider.openDirectoryNoFollowCarryingErrno(
             at: url.deletingLastPathComponent()
-        )
-        guard fd >= 0 else { return nil }
+        ) {
+        case .opened(let descriptor):
+            fd = descriptor
+        case .failed(let code):
+            // THE PERMISSION CLASS ONLY. Every other cause — ENOTDIR on a
+            // symlinked container above all — is this open refusing to
+            // resolve something, and a path `lstat` must not be used to
+            // answer around it.
+            guard code == EPERM || code == EACCES else { return nil }
+            guard case .facts(let facts) = provider.probeLeaf(at: url) else {
+                return nil
+            }
+            return facts
+        }
         defer { close(fd) }
         guard case .facts(let facts) = provider.probeChild(
             inDirectory: fd, named: name, logical: url
@@ -560,16 +1628,58 @@ enum TrashDisposal {
         return facts
     }
 
-    /// The `Sighting` → `ChildFacts` narrowing, in ONE place: only a
-    /// `.directory` sighting names an object, and every other case is
-    /// "nothing identified".
+    /// The `Sighting` → `ChildFacts` narrowing, in ONE place: what the
+    /// landing IS, for the rollback that has to name the object it moves.
+    ///
+    /// ## THE NON-DIRECTORY LANDING WAS ABANDONED, AND THE USER WAS TOLD IT
+    /// ## WAS NOT THERE (PR #460 codex r14, V1-D1)
+    ///
+    /// Through r13 this was `guard case .directory` and nothing else, so
+    /// EVERY other sighting reached `rollBack` as `nil` — including a landing
+    /// that is a perfectly ordinary regular file, symlink or fifo, sitting
+    /// exactly where the Trash said it put it. `rollBack`'s first guard then
+    /// returned `.lastSeenInTrash`, whose message tells the user the object
+    /// "is no longer at <landing>, where the Trash reported putting it, so
+    /// nothing was moved".
+    ///
+    /// MEASURED through the production composition (real `CacheCleaner`, real
+    /// `OrphanedCachesScanner.preDeleteRevalidator`, real PathGuard, real
+    /// `ContainerSnapshot`, `moveToTrash: true` — the GUI's shipped default —
+    /// with only the seam injected, to put the swap in the window
+    /// `trashItem`'s own URL resolution owns): that message was reported with
+    /// the object STILL AT THE LANDING and the target NOT restored,
+    /// `entries=0`. The identical event through `dispose(_:containedIn:…)`
+    /// yields `.putBack`, because the `disposeBoundLeaf` arms read their
+    /// landing with `facts(at:)` — which identifies every KIND — instead of
+    /// this narrowing.
+    ///
+    /// WHY A SECOND READ RATHER THAN A RICHER `Sighting`: `look`'s kind gate
+    /// IS its `O_DIRECTORY` open, so a non-directory landing is classified by
+    /// ERRNO (`ENOTDIR`/`ELOOP`) and no inode is ever read. There is no
+    /// identity in the sighting to hand over — naming the object requires the
+    /// `fstatat` `facts` takes, and that is what this now does for exactly
+    /// that case.
+    ///
+    /// THE `.directory` CASE STILL COMES OFF THE OPENED INODE and is NOT
+    /// re-read: it is the stronger fact (an `fstat` of a descriptor `look`
+    /// held open, versus a name resolved a second time), and `rollBack`'s
+    /// re-bind is what turns either into a move. `.absent`, `.unreadable` and
+    /// `.unidentifiable` stay `nil` — nothing was identified, so nothing may
+    /// be moved.
     private static func identified(
-        _ sighting: Sighting
+        _ sighting: Sighting, at landed: URL,
+        provider: FileSystemIdentityProvider
     ) -> FileSystemIdentityProvider.ChildFacts? {
-        guard case .directory(let identity) = sighting else { return nil }
-        return FileSystemIdentityProvider.ChildFacts(
-            kind: .directory, identity: identity
-        )
+        switch sighting {
+        case .directory(let identity):
+            return FileSystemIdentityProvider.ChildFacts(
+                kind: .directory, identity: identity
+            )
+        case .noDirectoryTree:
+            return facts(at: landed, provider: provider)
+        case .absent, .unidentifiable, .unreadable:
+            return nil
+        }
     }
 
     // MARK: - The proofs
@@ -646,8 +1756,168 @@ enum TrashDisposal {
     /// INODE — the same shape `DepthSafeRemoval.remove` uses, for the same
     /// reason: a gate beside an open is a swap window by construction, and an
     /// `lstat` of a path is a second resolution of a name anyone can re-point.
+    ///
+    /// ## THE OPEN IS DESCRIPTOR-RELATIVE (PR #460 codex r12, D1)
+    ///
+    /// Through r11 this was ONE path-spelled
+    /// `open(url.path, O_RDONLY|O_DIRECTORY|O_NOFOLLOW)`, and r11's own
+    /// header called that the safe end of the trade it made in `facts`,
+    /// "a DIRECT `open` of `url` [which] therefore never needed the Trash
+    /// directory". **It is the same unsoundness one call away.**
+    /// `O_NOFOLLOW` guards only the FINAL component, so that open FOLLOWS a
+    /// symlinked landing CONTAINER exactly as `probeLeaf`'s `lstat` did — and
+    /// `dispose(_:expecting:…)`'s directory arm identified the landing with
+    /// it.
+    ///
+    /// MEASURED at 93d6198, production provider, real symlink, in
+    /// `TrashDisposalHopProofTests.testTheDirectoryVerdictArmRefusesASymlinkedLandingContainer`:
+    /// a mover that moves NOTHING and reports a landing whose parent is a
+    /// symlink aimed back at the item's own container made this open resolve
+    /// through the link onto the ORIGINAL object, hand back the identity the
+    /// verdict names, and `dispose` RETURNED NORMALLY with `victim` still on
+    /// disk — a disposal that reported success having moved nothing.
+    ///
+    /// So the name is now resolved INSIDE its container: one
+    /// `openDirectoryNoFollowCarryingErrno` of the container, one
+    /// `openChildDirectoryCarryingErrno` of the single component under the
+    /// held descriptor. Both carry `O_NOFOLLOW`, so a symlink at EITHER level
+    /// is a refusal rather than a resolution, and the identity still comes
+    /// off the opened inode — which is what the rollback's
+    /// `identity(ofDescriptor:)` seam and its `.unidentifiable` arm depend
+    /// on, and why this is not `facts`' `probeChild`.
+    ///
+    /// ## AND THE PERMISSION CLASS IS STILL ANSWERED
+    ///
+    /// `~/.Trash` is TCC-denied to every process without Full Disk Access
+    /// (measured in `facts`: `EPERM` on the directory, traversal THROUGH it
+    /// permitted). The path-spelled open never needed that permission, so
+    /// this arm was never broken the way r10's D1 broke the others — and a
+    /// descriptor-relative rewrite without a fallback would have broken it
+    /// for the first time. `EPERM`/`EACCES` on the CONTAINER open therefore
+    /// fall back to the path-spelled open, under the identical bound `facts`
+    /// carries — and stated there in full, including the THIRD cause that
+    /// reaches this class (a container at mode `0111`) and why the class is
+    /// sound regardless of how many causes produce it. In short: reaching
+    /// either code means the container's last component IS a real directory
+    /// that `O_NOFOLLOW` accepted, so the fallback resolves no link this open
+    /// refused, and its identity is only ever compared for EQUALITY against
+    /// one bound before the move. Every other failure refuses.
+    ///
+    /// ## AND THIS ENTRY POINT IS THE LANDING'S, NOT THE TARGET'S (r14, V1-D2)
+    ///
+    /// Everything above is about a container NOBODY PROVED — `~/.Trash`, whose
+    /// spelling comes from the mover. The TARGET's container is proved, so its
+    /// leaf is read through `proveStandingUnderAdmittedContainer` instead,
+    /// under the descriptor `DepthSafeRemoval.openAdmittedContainer` returns —
+    /// an open that deliberately FOLLOWS, because every other destructive path
+    /// follows and a no-follow open here refused what all four of them
+    /// performed. The two containers get two different opens because they are
+    /// two different questions; the leaf is `O_NOFOLLOW` in both.
+    ///
+    /// Both directions are evidenced, and each by its own cell:
+    /// `…IdentifiesAnUnopenableLanding` (`EPERM` must SUCCEED),
+    /// `…IdentifiesAModeDeniedLanding` (`EACCES` must SUCCEED),
+    /// `…RefusesASymlinkedLandingContainer` and
+    /// `…RefusesALandingThatIsNotADirectory` (must REFUSE).
     static func look(
         at url: URL, provider: FileSystemIdentityProvider
+    ) -> Sighting {
+        let name = url.lastPathComponent
+        // LOAD-BEARING ON THE FALLBACK, AND THE COMMENT THAT STOOD HERE SAID
+        // THE OPPOSITE (PR #460 codex r13, E). It called this a precondition
+        // "restated where it is called" and recorded that NO CELL FAILS when
+        // it is deleted — which r12's mutation M5 confirmed, red_count 0.
+        // Both readings were about the DESCRIPTOR-RELATIVE arm, where
+        // `openChildDirectory` carries the identical precondition and answers
+        // `EINVAL` itself, so nothing can tell the two apart.
+        //
+        // `lookAlongThePath` is the arm this holds. It is a path-spelled
+        // `open(url.path, …)` with NO name check anywhere beneath it, and
+        // `O_NOFOLLOW` does not object to `..` — measured, with the guard
+        // deleted: `look` at a name of `..` under a permission-denied
+        // container returns `.directory(<the container's identity>)`, an
+        // identity for a directory two levels above the name the caller
+        // asked about, where the guard returns `.unreadable(errno: EINVAL)`.
+        // The denial that routes it there is the ORDINARY production one:
+        // `~/.Trash` answers `EPERM` to every process without Full Disk
+        // Access. Evidenced by
+        // `TrashDisposalHopProofTests.testALookAtAnUnsafeNameIsRefusedRatherThanResolvedAlongThePath`.
+        guard FileSystemIdentityProvider.isSafeComponent(name) else {
+            return .unreadable(errno: EINVAL)
+        }
+        switch provider.openDirectoryNoFollowCarryingErrno(
+            at: url.deletingLastPathComponent()
+        ) {
+        case .opened(let container):
+            defer { close(container) }
+            return look(named: name, inDirectory: container,
+                        logical: url, provider: provider)
+        case .failed(let code):
+            // THE CONTAINER IS GONE. Nothing can stand inside a directory
+            // that is not there, and no name was resolved to establish it —
+            // so this is the same `.absent` the path-spelled open produced,
+            // and it is unspoofable for the same reason (an `ENOENT` cannot
+            // come from following anything).
+            if code == ENOENT { return .absent }
+            // THE PERMISSION CLASS ONLY — see the header. Every other cause,
+            // `ENOTDIR`/`ELOOP` on a symlinked container above all, is this
+            // open refusing to resolve something, and a path-spelled open
+            // must not be used to answer around it.
+            guard code == EPERM || code == EACCES else {
+                return .unreadable(errno: code)
+            }
+            return lookAlongThePath(url, provider: provider)
+        }
+    }
+
+    /// The single component `name`, opened under the HELD container.
+    ///
+    /// THE PRECONDITION IS CHECKED HERE, NOT ONLY AT THE PATH-SPELLED CALLER
+    /// (PR #460 codex r14, V1-D2). `look(at:)` guards before it reaches this,
+    /// because ITS fallback is a path open with no name check beneath it; this
+    /// function has a second caller now —
+    /// `proveStandingUnderAdmittedContainer`, which resolves the target's own
+    /// last component under the PROVED container — and `openat` would happily
+    /// walk a `..` out of the descriptor it was handed. Guarding the shared
+    /// spelling rather than each call site is what stops the next caller from
+    /// having to remember.
+    ///
+    /// WHAT IT BUYS IS THE CAUSE, MEASURED rather than assumed: with it
+    /// deleted the disposal is still REFUSED, because
+    /// `URL.deletingLastPathComponent()` does not cancel a `..` (it answers
+    /// `<child>/../`), so the container open and the `openat` under it land
+    /// one level apart and the identity comparison disagrees. The refusal that
+    /// comes back is then `.notTheInspectedObject` — the user is told the ITEM
+    /// changed about a target whose NAME was never valid, which is exactly the
+    /// wrong-fact-to-the-user class r13's A2 was about. Evidenced by
+    /// `TrashDisposalHopProofTests.testTheDirectoryVerdictArmRefusesATargetSpelledOutOfItsOwnContainer`
+    /// (full suite under the mutation: 1532 executed / 1 failure, that cell
+    /// alone).
+    private static func look(
+        named name: String, inDirectory container: Int32,
+        logical url: URL, provider: FileSystemIdentityProvider
+    ) -> Sighting {
+        guard FileSystemIdentityProvider.isSafeComponent(name) else {
+            return .unreadable(errno: EINVAL)
+        }
+        switch provider.openChildDirectoryCarryingErrno(
+            inDirectory: container, named: name, logical: url
+        ) {
+        case .opened(let fd):
+            defer { close(fd) }
+            guard let identity = provider.identity(ofDescriptor: fd) else {
+                return .unidentifiable
+            }
+            return .directory(identity)
+        case .failed(let code):
+            return sighting(forOpenFailure: code)
+        }
+    }
+
+    /// The path-spelled open — the WHOLE of `look` through r11, kept as the
+    /// permission-class fallback and reachable from nowhere else.
+    private static func lookAlongThePath(
+        _ url: URL, provider: FileSystemIdentityProvider
     ) -> Sighting {
         // The errno is READ INSIDE the closure, next to the call that set it
         // — the same discipline as
@@ -663,20 +1933,27 @@ enum TrashDisposal {
             if descriptor < 0 { code = errno }
             return descriptor
         }
-        guard fd >= 0 else {
-            switch code {
-            case ENOENT: return .absent
-            // ENOTDIR/ELOOP: something that is NOT a directory tree stands
-            // here. That is exactly what `.noDirectoryTree` is about.
-            case ENOTDIR, ELOOP: return .noDirectoryTree
-            default: return .unreadable(errno: code)
-            }
-        }
+        guard fd >= 0 else { return sighting(forOpenFailure: code) }
         defer { close(fd) }
         guard let identity = provider.identity(ofDescriptor: fd) else {
             return .unidentifiable
         }
         return .directory(identity)
+    }
+
+    /// The ONE errno taxonomy both opens above are read through, so the
+    /// descriptor-relative arm and its fallback can never classify the same
+    /// failure differently.
+    private static func sighting(forOpenFailure code: Int32) -> Sighting {
+        switch code {
+        case ENOENT: return .absent
+        // ENOTDIR/ELOOP: something that is NOT a directory tree stands here.
+        // That is exactly what `.noDirectoryTree` is about. (`O_DIRECTORY`
+        // makes a symlink answer ENOTDIR before O_NOFOLLOW's ELOOP on this
+        // OS — measured, and both are named so neither OS is a surprise.)
+        case ENOTDIR, ELOOP: return .noDirectoryTree
+        default: return .unreadable(errno: code)
+        }
     }
 
     /// Why `sighting` does NOT satisfy `inspected` — `nil` when it does.
@@ -720,9 +1997,66 @@ enum TrashDisposal {
             }
             return nil
         case .absent:
-            guard absenceProves, case .noDirectoryTree = inspected else {
+            // NOTHING IS AT THE NAME, AND "NOTHING" IS NOT "SOMETHING ELSE"
+            // (PR #460 codex r15, D-P2).
+            //
+            // The two positions are two different questions, so they get two
+            // different refusals rather than one.
+            guard absenceProves else {
+                // THE LANDING. The disposal CLAIMED to put an item at this
+                // URL; an empty name establishes nothing about what it took,
+                // and unestablished is refused. The clause is literally true
+                // here — nothing at the landing is the inspected object — and
+                // no production caller surfaces this value anyway: `dispose`
+                // reads only whether it is `nil` and reports `rollBack`'s own
+                // cause, and `proveTaken` has no production caller.
                 return .notTheInspectedObject
             }
+            guard case .noDirectoryTree = inspected else {
+                // THE TARGET, BEFORE THE MOVE — a plain race: the item
+                // vanishes between the revalidator's verdict and the
+                // disposal. MEASURED at 48073c9 on one absent-target fixture:
+                // `DepthSafeRemoval.remove`, `dispose(_:containedIn:)`, the
+                // `.noDirectoryTree` arm and the `.nonDirectoryLeaf` arm all
+                // answered `.posix(2)` — the other four reach `boundLeaf`'s
+                // `.absent` arm or the removal's own leaf open, both of which
+                // keep ENOENT — while THIS arm answered
+                // `.notTheInspectedObject`, surfaced as "it was replaced
+                // between the safety check and the deletion" and logged
+                // `content-drift`. Nothing was replaced; the name is empty,
+                // and a user told the wrong fact goes and looks at the wrong
+                // thing (the r13-A2 class, one arm over).
+                return .posix(ENOENT)
+            }
+            // THE FROZEN GHOST-TARGET BEHAVIOUR, and the one absence that
+            // PROVES its verdict: `.noDirectoryTree` is precisely a statement
+            // that no directory tree of ours stood at this name.
+            //
+            // AND IT IS NO LONGER ON A PRODUCTION PATH, WHICH IS WORTH
+            // SAYING RATHER THAN LEAVING TO BE INFERRED (PR #460 codex r16,
+            // A-P4c). `absenceProves: true` is reached in production only
+            // through `proveStandingUnderAdmittedContainer`, which
+            // `dispose(_:expecting:…)` calls for the `.directory` and
+            // `.unestablished` verdicts — never for `.noDirectoryTree`,
+            // which r13 routed to `disposeBoundLeaf`. That arm throws
+            // `.posix(ENOENT)` one call EARLIER, which is the deliberate
+            // choice recorded at the `case .noDirectoryTree` above: it keeps
+            // the user's Trash untouched for an item that was never there.
+            // So this line is held alive by a TEST-ONLY entry point:
+            // `TrashDisposal.proveStanding`, whose only callers are
+            // `TrashDisposalHopProofTests`'
+            // `…ALookInsideAContainerThatIsGoneIsStillAnAbsence` and
+            // `OrphanedCachesScannerTests`'
+            // `…AnAbsenceProvesTheVerdictBeforeTheDisposalOnly`.
+            //
+            // MEASURED at 073371c: replacing this `return nil` with
+            // `.posix(ENOENT)` and running the FULL SUITE reddens exactly
+            // those TWO cells and nothing else — 1558 executed / 2 skipped /
+            // 2 failures, exit 1, 205 s. Neither reaches production; both
+            // call `proveStanding` directly. It is kept because the asymmetry
+            // it encodes is the contract `absenceProves` exists to express,
+            // and because a deleted branch is a contract nobody can
+            // re-check.
             return nil
         case .unidentifiable:
             return .notTheInspectedObject
@@ -772,6 +2106,15 @@ enum TrashDisposal {
         // unidentifiable landing means the object the disposal took cannot be
         // named, and an undo that moves an unnamed object is the bug.
         //
+        // AND A LANDING THAT IS SIMPLY NOT A DIRECTORY IS NOT ONE OF THOSE
+        // (PR #460 codex r14, V1-D1). It used to arrive here as `nil` — the
+        // fourth case this comment did not enumerate, and the one that made
+        // the enumeration false — because the verdict-bound caller narrowed
+        // its sighting with a `guard case .directory`. It now arrives NAMED,
+        // through the same `facts` the bound arms read their landing with, so
+        // the three cases above are again the whole of what reaches this
+        // guard as `nil`.
+        //
         // NOT AN INDEPENDENTLY-EVIDENCED GUARD, AND SAID SO: it is the
         // extraction of the value everything below binds to, and it is
         // SUBSUMED by the re-bind — measured, by substituting an identity
@@ -782,11 +2125,10 @@ enum TrashDisposal {
         // fact.
         //
         // IT TAKES FACTS, NOT A `Sighting`, because both arms roll back
-        // through it and one of them binds NON-DIRECTORIES (see
-        // `dispose(_:containedIn:…)`). The verdict-bound arm narrows its own
-        // sighting at the call (`identified`), so a `.directory` landing is
-        // the only thing that ever reached this code before and the only
-        // thing it can produce now.
+        // through it and BOTH of them can bind non-directories: the bound
+        // arms by construction (see `dispose(_:containedIn:…)`), and the
+        // verdict-bound one since r14 — its `identified` reads a
+        // non-directory landing with `facts` rather than discarding it.
         guard let observed else {
             return .lastSeenInTrash(landed.path)
         }
@@ -795,25 +2137,107 @@ enum TrashDisposal {
         // A PRECONDITION, DISCLOSED AS ONE RATHER THAN DRESSED AS A GUARD.
         // `probeChild`/`renameatx_np` take a SINGLE component and resolve a
         // multi-component one through the held directory, which would let a
-        // symlinked middle component out of it. No production URL reaching
-        // here can violate that (`landed` comes from `trashItem`, `target`
-        // from an admitted item), so no test FAILS when this is deleted —
-        // it is the same precondition `FileSystemIdentityProvider` documents
-        // on both primitives, restated where they are called.
+        // symlinked middle component out of it.
+        //
+        // THIS IS THE ONE COPY THAT STAYS DISCLOSED RATHER THAN EVIDENCED,
+        // AND THE REASON IS STATED (PR #460 codex r13, E). Its SOURCE half is
+        // subsumed — `probeChild` answers `EINVAL`, the comparison below
+        // fails, and `.lastSeenInTrash` comes back either way, so there is
+        // no observable difference to assert. Its DESTINATION half is NOT
+        // subsumed: `renameatx_np` is a raw syscall and would resolve a
+        // multi-component `to` through `containerFD`. But that half is
+        // UNREACHABLE from either entry point, because `boundLeaf` refuses
+        // the same target with `.invalidTarget` before any disposal runs, so
+        // no cell can drive it. Unevidenceable is not the same as unexamined:
+        // `look`'s and `facts`' copies WERE reachable, and both now have
+        // cells (r13, E).
         guard FileSystemIdentityProvider.isSafeComponent(source),
               FileSystemIdentityProvider.isSafeComponent(destination)
         else { return .lastSeenInTrash(landed.path) }
 
+        // THE TRASH DIRECTORY CANNOT BE OPENED — which is the ORDINARY case,
+        // not an exotic one: without Full Disk Access this open is EPERM on
+        // every macOS machine (measured — see `facts`). What it means here is
+        // that the put-back cannot be PERFORMED, not that the item is not
+        // where the disposal said. `observed` is non-`nil` on this line — the
+        // caller identified an object at `landed` a moment ago, through
+        // whichever of the two reads was permitted — so the item IS in the
+        // Trash, and `.strandedInTrash` is the cause that says so and gives
+        // the user the path to drag it back from. Reporting
+        // `.lastSeenInTrash` here told them the opposite of what they can see
+        // in the Trash (PR #460 codex r10, D1).
+        //
+        // AND THIS GUARD IS WHERE THE DEFAULT USER'S UNDO ENDS — WHICH IS THE
+        // REACHABILITY EVERY NOTE BELOW WAS MISSING (PR #460 codex r16,
+        // A-P3). Three statements below this one, r15's D-P1 taught the
+        // DESTINATION open to follow a symlinked container, and its CHANGELOG
+        // entry said the undo "puts the item back under either spelling".
+        // Through the shipped seam it puts it back under NEITHER: this open
+        // is `~/.Trash`, and without Full Disk Access it is EPERM, so
+        // `rollBack` returns HERE and never reaches the line D-P1 changed.
+        //
+        // MEASURED at 3110d1e with NO `trashHandler` injected — the shipped
+        // `FileManager.trashItem` inside the production main-actor hop, into
+        // the real `~/.Trash` — all four verdict arms, 8/8 runs
+        // (`TrashDisposalHopProofTests`'
+        // `…WithoutFullDiskAccessEveryUndoStrandsTheItemInTheRealTrash`): the
+        // FORWARD disposal succeeds every time, and the undo answers
+        // `.strandedInTrash` every time, leaving the object in the user's real
+        // Trash and the target's name EMPTY.
+        //
+        // SO THE CAUSES SPLIT — BY VOLUME FIRST, AND ONLY THEN BY
+        // PERMISSION (PR #460 codex r17, M2). r16 wrote this list with the
+        // VOLUME axis missing and published "the default user never gets a
+        // put-back" off it. That is over-broad, and the axis it left out is
+        // the one that decides which directory this open is even about: the
+        // argument is `landed.deletingLastPathComponent()`, and the Trash
+        // `FileManager.trashItem` picks is PER VOLUME.
+        //
+        // * A HOME-VOLUME item lands in `~/.Trash`, which TCC gates. Without
+        //   Full Disk Access this open is EPERM, so the only causes reachable
+        //   are `.strandedInTrash` — from HERE, whatever the container
+        //   spelling — plus `.lastSeenInTrash` and `.destinationUnknown`,
+        //   both of which are decided before this line. WITH the permission
+        //   the other three become reachable.
+        // * AN ITEM ON ANY OTHER MOUNTED VOLUME lands in
+        //   `<volume>/.Trashes/<uid>`, which TCC does not gate AT ALL. This
+        //   open SUCCEEDS for a process with no Full Disk Access, so the undo
+        //   runs to completion and the last three causes are reachable for
+        //   the DEFAULT user.
+        //
+        // MEASURED at be445a0 with `~/.Trash` answering -1/EPERM throughout,
+        // no `trashHandler` injected — the shipped `FileManager.trashItem`
+        // inside the production main-actor hop — on a temporary APFS disk
+        // image attached under the test's own directory and detached in
+        // teardown (`TrashDisposalHopProofTests`'
+        // `…ANonHomeVolumeUndoPutsTheItemBackWithoutFullDiskAccess`, all four
+        // verdict arms, 8/8 runs):
+        //
+        //     other volume, ordinary swap       .putBack
+        //     other volume, container swapped   .destinationNotTheAdmittedContainer
+        //
+        // and the home-volume row it is the counterpart of —
+        // `…WithoutFullDiskAccessEveryUndoStrandsTheItemInTheRealTrash`, all
+        // four arms `.strandedInTrash` — is green in the same tree. Both
+        // cells assert AGAINST the permission they read, so each is a fact
+        // about the machine either way.
+        //
+        // What stays true from r16 is the FIXTURE warning: every cell that
+        // evidences the last three causes with an INJECTED landing proves
+        // only what a fixture directory proves, which is exactly the property
+        // this file's r11 D4 note records as having hidden a defect for eight
+        // rounds. The two cells above are the ones that use no fixture
+        // landing at all.
+        //
+        // D-P1's fix is not undone by that and is not being questioned: it is
+        // what makes the second row true, and it removed a real regression for
+        // the population that has the permission. What was wrong was
+        // publishing it as a change to what the DEFAULT user sees.
         let trashFD = provider.openDirectoryNoFollow(
             at: landed.deletingLastPathComponent()
         )
-        guard trashFD >= 0 else { return .lastSeenInTrash(landed.path) }
+        guard trashFD >= 0 else { return .strandedInTrash(landed.path) }
         defer { close(trashFD) }
-        let containerFD = provider.openDirectoryNoFollow(
-            at: target.deletingLastPathComponent()
-        )
-        guard containerFD >= 0 else { return .lastSeenInTrash(landed.path) }
-        defer { close(containerFD) }
 
         let bound = FileSystemIdentityProvider.ChildProbe.facts(observed)
         guard provider.probeChild(
@@ -822,29 +2246,80 @@ enum TrashDisposal {
             return .lastSeenInTrash(landed.path)
         }
 
-        // WHOSE FOLDER ARE WE RESTORING INTO? Asked of the HELD DESTINATION
-        // INODE, against a fact taken OUTSIDE it — the identity the cleaner
-        // captured before the disposal. `containerFD` was held across the
-        // whole disposal and never interrogated, so a container swap in that
-        // window aimed the undo at a stranger's directory; and the arrival
-        // proof below runs under THIS SAME descriptor, so it confirmed the
-        // move rather than catching it. A descriptor cannot be its own
-        // reference point.
+        // THE DESTINATION IS OPENED AND PROVED AS ONE ACT, THROUGH THE ONE
+        // SPELLING EVERY OTHER DESTRUCTIVE OPEN OF THIS CONTAINER USES (PR
+        // #460 codex r15, D-P1).
         //
-        // Taken AFTER the re-bind on purpose: by here the object is known to
+        // Until r15 this was `provider.openDirectoryNoFollow`, and the
+        // identity comparison was a separate guard below it. Both halves were
+        // wrong in the same way. `DepthSafeRemoval.openContainer` — which
+        // `remove`, `boundLeaf`, `admittedParent`'s capture and (since r14's
+        // V1-D2) `proveStandingUnderAdmittedContainer` all go through —
+        // deliberately FOLLOWS, and its header says why verbatim: "a
+        // no-follow open would refuse it while `remove`'s open succeeded — a
+        // binding that refuses every deletion under a symlinked cache root".
+        // So the undo refused exactly the spelling the forward path had just
+        // been taught to accept.
+        //
+        // MEASURED at 8f71459, identical event (the object replaced inside
+        // the mover and the replacement really moved), same fixture, ONLY the
+        // container spelling differing: PLAIN — all four Trash arms `.putBack`,
+        // landing emptied, object restored to the target's name. SYMLINKED —
+        // all four `.strandedInTrash`, the put-back NEVER ATTEMPTED, the
+        // target left ABSENT and the object left in the Trash. r14's V1-D2
+        // made this arm STRICTLY WORSE rather than fixing it: commit d6bdde2
+        // measured the `.directory` arm at 6866012 as refusing `.posix(20)`
+        // BEFORE the move on this exact fixture; after the fix it moved the
+        // item to the Trash and then could not put it back. Evidenced by
+        // `TrashDisposalHopProofTests`'
+        // `…UndoPutsBackUnderASymlinkedContainerWhatItPutsBackUnderAPlainOne`.
+        //
+        // AND EVERY FIGURE IN THAT PARAGRAPH WAS TAKEN THROUGH AN INJECTED
+        // LANDING, SO IT IS A FACT ABOUT A POPULATION AND NOT ABOUT THE
+        // DEFAULT (PR #460 codex r16, A-P3). This line is reached ONLY when
+        // the Trash-open guard above succeeded, i.e. only with Full Disk
+        // Access. Without it `rollBack` has already returned
+        // `.strandedInTrash` three statements up — measured at 3110d1e
+        // through the shipped `FileManager.trashItem` into the real
+        // `~/.Trash`, all four arms, 8/8 runs. Read the paragraph above as
+        // "what the undo does once it can open the Trash at all".
+        //
+        // THE TWO ERRORS THE PAIR THROWS ARE THE TWO CAUSES THIS FUNCTION
+        // ALREADY HAD, and they are kept apart for the reason
+        // `DepthSafeRemoval.Failure.Cause` keeps its own two apart:
+        //
+        // * THE OPEN FAILED — the SAME fact as the Trash-open guard above,
+        //   one directory over, and until r14 it answered the opposite cause
+        //   (PR #460 codex r14, V1-D1). `observed` is non-`nil` on this line,
+        //   so the item IS in the Trash; what failed is the put-back, not the
+        //   finding. `.lastSeenInTrash` told the user to go and look for an
+        //   item whose exact path we are holding.
+        // * THE IDENTITY DISAGREED — WHOSE FOLDER ARE WE RESTORING INTO?
+        //   Asked of the HELD DESTINATION INODE, against a fact taken OUTSIDE
+        //   it: the identity the cleaner captured before the disposal.
+        //   `containerFD` used to be held across the whole disposal and never
+        //   interrogated, so a container swap in that window aimed the undo at
+        //   a stranger's directory; and the arrival proof below runs under
+        //   THIS SAME descriptor, so it confirmed the move rather than
+        //   catching it. A descriptor cannot be its own reference point.
+        //
+        // TAKEN AFTER THE RE-BIND ON PURPOSE: by here the object is known to
         // still be at `landed`, which is exactly what the refusal tells the
-        // user to go and get. Comparing an `fstat` of this descriptor with an
-        // identity captured through `DepthSafeRemoval.admittedParent` is
-        // apples to apples — both are `fstat`s of a following open, and
-        // reaching this line at all means `openDirectoryNoFollow` succeeded,
-        // i.e. the container's last component is a real directory and not a
-        // link the two opens could disagree about.
-        if case .identity(let expected) = admittedParent {
-            guard provider.identity(ofDescriptor: containerFD) == expected
-            else {
-                return .destinationNotTheAdmittedContainer(landed.path)
-            }
+        // user to go and get.
+        let containerFD: Int32
+        do {
+            containerFD = try DepthSafeRemoval.openAdmittedContainer(
+                at: target.deletingLastPathComponent(),
+                provenAgainst: admittedParent, displayPath: target.path,
+                provider: provider
+            )
+        } catch let refusal as DepthSafeRemoval.Failure
+            where refusal.cause == .notTheAdmittedContainer {
+            return .destinationNotTheAdmittedContainer(landed.path)
+        } catch {
+            return .strandedInTrash(landed.path)
         }
+        defer { close(containerFD) }
 
         var failure: Int32 = 0
         let moved = source.withCString { from in

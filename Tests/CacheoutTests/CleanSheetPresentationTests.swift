@@ -14,6 +14,14 @@ import XCTest
 /// - `CacheoutViewModel.commandsTrashDisclosure(selectedItems:)` — nil
 ///   without command-backed selection; otherwise names ONLY the
 ///   command-backed items (their argv runs regardless of the Trash toggle).
+/// - `CacheoutViewModel.gitWorktreeTrashDisclosures(selectedItems:)` (fn-5.6,
+///   R11/F7) — the same honesty for `git_worktree_reclaim`: the CHECKOUT
+///   honours the toggle (PR #460 codex r5 — Cacheout performs the removal, so
+///   Move to Trash applies to it), while the `worktrees/<id>` registry
+///   directory and every repository prune are permanent whatever the toggle
+///   says, so a Trash-mode confirmation must not imply recoverability for
+///   them. Stale removals and repository prunes disclose
+///   SEPARATELY; the two derivations are disjoint by construction.
 /// - `CleanupReport.scannerSections` — per-scanner rollup grouping in
 ///   first-appearance order, pure sums.
 /// - `CleanupReport.errorLines` — failed items render from SELF-CONTAINED
@@ -141,7 +149,7 @@ final class CleanSheetPresentationTests: XCTestCase {
 
     // MARK: - Unified itemization with evidence (R1)
 
-    func testConfirmationRowsUnifyAggregateAndPerItemRowsWithEvidence() {
+    func testConfirmationRowsUnifyAggregateAndPerItemRowsWithEvidence() throws {
         let cacheAggregate = aggregate(
             name: "npm-cache",
             description: "npm package cache — restored on next install",
@@ -164,28 +172,28 @@ final class CleanSheetPresentationTests: XCTestCase {
 
         // Aggregate row: registered category icon + name; evidence is the
         // category description (description-grade — honest, not padded).
-        XCTAssertEqual(rows[0].icon, "shippingbox")
-        XCTAssertEqual(rows[0].label, "npm-cache")
+        XCTAssertEqual(try XCTUnwrapElement(rows, 0).icon, "shippingbox")
+        XCTAssertEqual(try XCTUnwrapElement(rows, 0).label, "npm-cache")
         XCTAssertEqual(
-            rows[0].evidence,
+            try XCTUnwrapElement(rows, 0).evidence,
             "npm package cache — restored on next install"
         )
 
         // Per-item row: "scanner: item" label (the pre-unification
         // "node_modules: <project>" rendering) + the item's evidence.
-        XCTAssertEqual(rows[1].icon, "shippingbox.fill")
-        XCTAssertEqual(rows[1].label, "node_modules: projectA")
+        XCTAssertEqual(try XCTUnwrapElement(rows, 1).icon, "shippingbox.fill")
+        XCTAssertEqual(try XCTUnwrapElement(rows, 1).label, "node_modules: projectA")
         XCTAssertEqual(
-            rows[1].evidence, "node_modules of projectA — ~/dev/projectA"
+            try XCTUnwrapElement(rows, 1).evidence, "node_modules of projectA — ~/dev/projectA"
         )
 
         // Sizes are the component-sum bytes through the shared formatter.
         XCTAssertEqual(
-            rows[0].formattedSize,
+            try XCTUnwrapElement(rows, 0).formattedSize,
             ByteCountFormatter.sharedFile.string(fromByteCount: 4096)
         )
         XCTAssertEqual(
-            rows[1].formattedSize,
+            try XCTUnwrapElement(rows, 1).formattedSize,
             ByteCountFormatter.sharedFile.string(fromByteCount: 8192)
         )
     }
@@ -334,7 +342,7 @@ final class CleanSheetPresentationTests: XCTestCase {
 
         let rows = CacheoutViewModel.confirmationRows(for: [partial, empty])
         XCTAssertEqual(rows.count, 2, "blocked rows STAY VISIBLE")
-        XCTAssertEqual(rows[0].valuables.map(\.name), ["Seen.dmg"],
+        XCTAssertEqual(try XCTUnwrapElement(rows, 0).valuables.map(\.name), ["Seen.dmg"],
                        "what the truncated probe DID see is still disclosed")
         for row in rows {
             XCTAssertTrue(row.isBlocked)
@@ -485,6 +493,164 @@ final class CleanSheetPresentationTests: XCTestCase {
         )
     }
 
+    // MARK: - git_worktree_reclaim Move-to-Trash disclosure (fn-5.6, R11/F7)
+
+    /// A composite plan of the given mode. Only `mode` and the structural
+    /// fields the derivation reads matter here; the plan's paths are inert.
+    private func reclaimAction(
+        _ mode: GitWorktreeReclaimPlan.Mode
+    ) -> ReclaimAction {
+        let parent = base.appendingPathComponent("repo")
+        let admin = parent.appendingPathComponent("admin")
+        switch mode {
+        case .removeStaleWorktree:
+            return .gitWorktreeReclaim(.removeStaleWorktree(
+                worktreePath: base.appendingPathComponent("wt"),
+                worktreeAdminEntry: admin.appendingPathComponent("wt"),
+                // Presentation-only fixture: nothing here reaches the
+                // delete path, where a nil identity is refused (r4/D6).
+                worktreeAdminEntryIdentity: nil,
+                parentRepoWorkingDir: parent,
+                adminContainer: admin
+            ))
+        case .pruneOrphanedAdmin:
+            return .gitWorktreeReclaim(.pruneOrphanedAdmin(
+                parentRepoWorkingDir: parent,
+                adminContainer: admin,
+                disclosedAdminDirectories: [admin.appendingPathComponent("gone")]
+            ))
+        }
+    }
+
+    /// THE trash-honesty case, CORRECTED AT r5 (PR #460 codex r5, D1/D7).
+    ///
+    /// Through r4 this cell asserted the sheet said "Move to Trash does not
+    /// apply … unlinked permanently", because `git worktree remove` unlinked
+    /// the checkout whatever the toggle said. The removal is Cacheout's own
+    /// now, so the CHECKOUT follows the toggle — and the sheet must say the
+    /// half that still does not: the `worktrees/<id>` registry entry goes
+    /// permanently either way. Before fn-5.6 a composite item matched NO
+    /// disclosure branch at all and fell to generic wording.
+    func testStaleReclaimDisclosesWhichHalfTheTrashToggleCovers()
+        throws
+    {
+        let stale = perItem(
+            scanner: GitWorktreeScanner.registeredID, id: "wt-1",
+            name: "feature-branch", action: reclaimAction(.removeStaleWorktree)
+        )
+        let deletionItem = perItem(id: "abc", name: "projectA")
+
+        let disclosures = CacheoutViewModel.gitWorktreeTrashDisclosures(
+            selectedItems: [deletionItem, stale, aggregate(name: "npm-cache")]
+        )
+
+        XCTAssertEqual(disclosures.count, 1, "\(disclosures)")
+        let text = try XCTUnwrap(disclosures.first)
+        XCTAssertTrue(text.contains("feature-branch"), text)
+        XCTAssertTrue(text.contains("CHECKOUT follows the Move to Trash setting"),
+                      text)
+        XCTAssertTrue(text.contains("removed permanently either way"), text)
+        XCTAssertTrue(text.contains("No branch is deleted"), text)
+        // The retired promise must not survive anywhere in the sentence.
+        XCTAssertFalse(text.contains("Move to Trash does not apply"), text)
+        XCTAssertFalse(text.contains("unlinked"), text)
+        XCTAssertFalse(text.contains("fallback"),
+                       "there is no second arm to name any more: \(text)")
+        XCTAssertFalse(text.contains("projectA"),
+                       "deletion-cleaned neighbors are NEVER named")
+        XCTAssertFalse(text.contains("npm-cache"),
+                       "aggregate deletion items are NEVER named")
+    }
+
+    func testPruneReclaimDisclosesAdminDataRemovalAndSurvivingRefs() throws {
+        let prune = perItem(
+            scanner: GitWorktreeScanner.registeredID, id: "prune-1",
+            name: "repo — orphaned worktree registry",
+            action: reclaimAction(.pruneOrphanedAdmin)
+        )
+
+        let disclosures = CacheoutViewModel.gitWorktreeTrashDisclosures(
+            selectedItems: [prune]
+        )
+
+        XCTAssertEqual(disclosures.count, 1, "\(disclosures)")
+        let text = try XCTUnwrap(disclosures.first)
+        XCTAssertTrue(text.contains("orphaned worktree registry"), text)
+        XCTAssertTrue(text.contains("repository admin data permanently"), text)
+        XCTAssertTrue(text.contains("Move to Trash does not apply"), text)
+        XCTAssertTrue(text.contains("Branch refs"), text)
+        XCTAssertFalse(text.contains("unlinked permanently"),
+                       "prune is NOT a worktree removal — one mode, one promise")
+    }
+
+    /// Both modes selected → TWO disclosures, stale first. Merging them into
+    /// one sentence would state a promise that is true of neither.
+    func testBothModesDiscloseSeparatelyAndInOrder() throws {
+        let stale = perItem(
+            scanner: GitWorktreeScanner.registeredID, id: "wt-1",
+            name: "feature-branch", action: reclaimAction(.removeStaleWorktree)
+        )
+        let prune = perItem(
+            scanner: GitWorktreeScanner.registeredID, id: "prune-1",
+            name: "repo — orphaned worktree registry",
+            action: reclaimAction(.pruneOrphanedAdmin)
+        )
+
+        let disclosures = CacheoutViewModel.gitWorktreeTrashDisclosures(
+            selectedItems: [prune, stale]
+        )
+
+        XCTAssertEqual(disclosures.count, 2, "\(disclosures)")
+        XCTAssertTrue(try XCTUnwrapElement(disclosures, 0).contains("feature-branch"))
+        XCTAssertTrue(try XCTUnwrapElement(disclosures, 1).contains("orphaned worktree registry"))
+    }
+
+    /// The two disclosures are DISJOINT: the `.commands` derivation never
+    /// names a worktree item, and the worktree derivation never names a
+    /// command-backed one. Overlap would print the same item twice under two
+    /// different promises.
+    func testTheTwoTrashDisclosuresNeverNameEachOthersItems() throws {
+        let commandItem = perItem(
+            scanner: "sims", id: "sim-devices", name: "Simulator Devices",
+            action: .commands([["true"]])
+        )
+        let stale = perItem(
+            scanner: GitWorktreeScanner.registeredID, id: "wt-1",
+            name: "feature-branch", action: reclaimAction(.removeStaleWorktree)
+        )
+        let selection = [commandItem, stale]
+
+        let commands = CacheoutViewModel.commandsTrashDisclosure(
+            selectedItems: selection
+        )
+        XCTAssertEqual(commands?.contains("feature-branch"), false, "\(commands ?? "")")
+        let worktrees = CacheoutViewModel.gitWorktreeTrashDisclosures(
+            selectedItems: selection
+        )
+        XCTAssertEqual(worktrees.count, 1)
+        let worktreeDisclosure = try XCTUnwrapElement(worktrees, 0)
+        XCTAssertFalse(
+            worktreeDisclosure.contains("Simulator Devices"),
+            worktreeDisclosure
+        )
+    }
+
+    func testNoWorktreeDisclosureWithoutACompositeSelection() {
+        XCTAssertTrue(
+            CacheoutViewModel.gitWorktreeTrashDisclosures(selectedItems: [
+                aggregate(name: "npm-cache"),
+                perItem(id: "abc", name: "projectA"),
+                perItem(scanner: "sims", id: "s", name: "Simulator Devices",
+                        action: .commands([["true"]])),
+            ]).isEmpty,
+            "no composite item selected → no disclosure"
+        )
+        XCTAssertTrue(
+            CacheoutViewModel.gitWorktreeTrashDisclosures(selectedItems: []).isEmpty,
+            "empty selection → no disclosure"
+        )
+    }
+
     // MARK: - Caution/partiallyDenied warnings from unified items (fn-1.4 parity)
 
     /// The caution warning arms from the UNIFIED selection surface — a
@@ -533,14 +699,14 @@ final class CleanSheetPresentationTests: XCTestCase {
         // selected per-item row renders with its evidence line.
         XCTAssertEqual(viewModel.confirmationRows.map(\.id), [cautionRow.key])
         XCTAssertEqual(
-            viewModel.confirmationRows[0].evidence,
+            try XCTUnwrapElement(viewModel.confirmationRows, 0).evidence,
             "node_modules/ beside package.json"
         )
     }
 
     // MARK: - Report sheet: per-scanner rollup sections (R1)
 
-    func testScannerSectionsGroupEntriesByScannerWithRollups() {
+    func testScannerSectionsGroupEntriesByScannerWithRollups() throws {
         // Interleaved on purpose: grouping is by scannerID in FIRST-
         // APPEARANCE order, entries keep report order within each section.
         let report = CleanupReport(
@@ -560,31 +726,31 @@ final class CleanSheetPresentationTests: XCTestCase {
         XCTAssertEqual(sections.map(\.scannerID), ["categories", "node_modules"],
                        "first-appearance order, one section per scanner")
 
-        XCTAssertEqual(sections[0].entries.map(\.displayName),
+        XCTAssertEqual(try XCTUnwrapElement(sections, 0).entries.map(\.displayName),
                        ["npm-cache", "pip-cache"],
                        "entries keep report order within their section")
-        XCTAssertEqual(sections[0].rollup.exactBytes, 1024 + 2048,
+        XCTAssertEqual(try XCTUnwrapElement(sections, 0).rollup.exactBytes, 1024 + 2048,
                        "rollup is the pure sum of the section's entries")
-        XCTAssertEqual(sections[0].rollup.estimatedUpToBytes, 0)
-        XCTAssertEqual(sections[0].rollup.entryCount, 2)
+        XCTAssertEqual(try XCTUnwrapElement(sections, 0).rollup.estimatedUpToBytes, 0)
+        XCTAssertEqual(try XCTUnwrapElement(sections, 0).rollup.entryCount, 2)
 
-        XCTAssertEqual(sections[1].entries.map(\.displayName), ["projectA"])
-        XCTAssertEqual(sections[1].rollup.exactBytes, 4096)
-        XCTAssertEqual(sections[1].rollup.estimatedUpToBytes, 512)
+        XCTAssertEqual(try XCTUnwrapElement(sections, 1).entries.map(\.displayName), ["projectA"])
+        XCTAssertEqual(try XCTUnwrapElement(sections, 1).rollup.exactBytes, 4096)
+        XCTAssertEqual(try XCTUnwrapElement(sections, 1).rollup.estimatedUpToBytes, 512)
 
         // The section header text is the same R16 component phrase the
         // entry rows use — estimates stay hedged, never laundered.
         XCTAssertEqual(
-            sections[0].rollup.componentSummary,
+            try XCTUnwrapElement(sections, 0).rollup.componentSummary,
             CleanupReport.componentPhrase(exact: 3072, estimatedUpTo: 0)
         )
         XCTAssertEqual(
-            sections[1].rollup.componentSummary,
+            try XCTUnwrapElement(sections, 1).rollup.componentSummary,
             CleanupReport.componentPhrase(exact: 4096, estimatedUpTo: 512)
         )
     }
 
-    func testReportTotalsAndRollupsSaturateInsteadOfTrapping() {
+    func testReportTotalsAndRollupsSaturateInsteadOfTrapping() throws {
         // Round 8: report entries cross scanners, and the runtime
         // validator bounds each scanner's outcome only individually —
         // every derived report sum must clamp at Int64.max, never trap
@@ -602,7 +768,7 @@ final class CleanSheetPresentationTests: XCTestCase {
         XCTAssertEqual(report.totalFreedExact, Int64.max,
                        "the report-wide exact total clamps")
         XCTAssertEqual(report.totalEstimatedUpTo, Int64.max)
-        XCTAssertEqual(report.entries[1].bytesFreed, Int64.max,
+        XCTAssertEqual(try XCTUnwrapElement(report.entries, 1).bytesFreed, Int64.max,
                        "the per-entry compatibility sum clamps too")
         XCTAssertEqual(report.scannerRollups.map(\.bytesFreed),
                        [Int64.max, Int64.max],

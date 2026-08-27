@@ -1048,8 +1048,8 @@ struct OrphanedCachesScanner: @unchecked Sendable {
     ///    decision is taken on this spelling.
     ///
     /// NO-CROSS rule (safety — PR #458 review, matching the sizer's own
-    /// root check at `DirectorySizer.swift:205` and its within-walk check at
-    /// `DirectorySizer.swift:289`): mount boundaries are never crossed, at
+    /// root check at `DirectorySizer.swift:261-272` and its within-walk check at
+    /// `DirectorySizer.swift:354-359`): mount boundaries are never crossed, at
     /// the root or anywhere beneath it, and an uncrossed boundary makes the
     /// probe INCOMPLETE. Both signals are now read from DESCRIPTORS —
     /// `f_fsid` plus `st_dev` (see `crossesMountBoundary`) — which is
@@ -1062,7 +1062,9 @@ struct OrphanedCachesScanner: @unchecked Sendable {
     /// What crossing costs is real and buys nothing: up to `entryLimit`
     /// reads on network/removable/FUSE storage the user never pointed this
     /// scanner at, on an item a boundary already makes uncleanable
-    /// (`CacheCleaner.swift:911`). UNCROSSED ⇒ INCOMPLETE, never "clean" —
+    /// (`CacheCleaner.deleteGuardedChild`:1151,
+    /// `CacheCleaner.removeGuardedItem`:1371). UNCROSSED ⇒ INCOMPLETE, never
+    /// "clean" —
     /// and unlike a depth cap it is CLEARABLE: unmount, and the next walk
     /// reads the tree whole.
     ///
@@ -1438,7 +1440,7 @@ struct OrphanedCachesScanner: @unchecked Sendable {
         }
 
         // MOUNT BOUNDARY AT THE ROOT, before anything below it is read —
-        // the same stance `DirectorySizer.swift:205` takes on its own root.
+        // the same stance `DirectorySizer.swift:261-272` takes on its own root.
         // An entry that IS a mount is not enumerated at all: not one entry
         // of the foreign filesystem is read, and the verdict is INCOMPLETE
         // precisely because we did not look.

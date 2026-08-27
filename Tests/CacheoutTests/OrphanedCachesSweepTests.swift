@@ -111,7 +111,9 @@ final class OrphanedCachesSweepTests: XCTestCase {
             XCTFail("expected .entries", file: file, line: line)
             return [:]
         }
-        return Dictionary(uniqueKeysWithValues: entries.map { ($0.name, $0) })
+        return XCTUniquelyKeyed(
+            entries.map { ($0.name, $0) }, file: file, line: line
+        )
     }
 
     // MARK: - First-level facts: enumeration + fixture math (R3/R7 support)

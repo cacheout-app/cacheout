@@ -169,9 +169,9 @@ create_bundle() {
          no current scan walks ~/Downloads, but the key ships so any future
          Downloads-reaching scanner prompts with an explanation. -->
     <key>NSDocumentsFolderUsageDescription</key>
-    <string>Cacheout looks for developer build-artifact folders (target/, node_modules/, .venv/ and similar) in Documents during scans you start. Nothing is deleted without your confirmation.</string>
+    <string>Cacheout looks for developer build-artifact folders (target/, node_modules/, .venv/ and similar) and stale git worktrees in Documents during scans you start. Nothing is deleted without your confirmation.</string>
     <key>NSDesktopFolderUsageDescription</key>
-    <string>Cacheout looks for developer build-artifact folders (target/, node_modules/, .venv/ and similar) on your Desktop during scans you start. Nothing is deleted without your confirmation.</string>
+    <string>Cacheout looks for developer build-artifact folders (target/, node_modules/, .venv/ and similar) and stale git worktrees on your Desktop during scans you start. Nothing is deleted without your confirmation.</string>
     <key>NSDownloadsFolderUsageDescription</key>
     <string>Cacheout reads Downloads only if a scan you start includes it, to find developer caches. Nothing is deleted without your confirmation.</string>
 </dict>
@@ -318,9 +318,54 @@ notarize_dmg() {
     echo "✅ Notarization complete! DMG is ready for distribution."
 }
 
+# RELEASE-BLOCKING cross-repo gates (fn-5.6)
+#
+# Some release preconditions live in ANOTHER repository — a coordinated
+# consumer that must adopt a contract before this build ships. Nothing in
+# this repo's own test suite can observe that, so the gate is RECORDED in
+# CHANGELOG.md's [Unreleased] section (named consumer, owner, verification,
+# and ONE status line) and enforced HERE, on every DISTRIBUTION-producing
+# mode. Merging with an open gate is fine and deliberate; shipping an
+# artifact with one is not — and `--direct` produces a signed, distributable
+# DMG just as `--release` does, so both arms run this. The default no-flag
+# mode builds an unsigned .app for local testing and produces no
+# distributable artifact, so it deliberately does not.
+#
+# RECORDED FORM, and it is CHECKED — not merely searched for. Each gate is a
+# `**RELEASE-BLOCKING` marker in [Unreleased] paired with exactly ONE status
+# line, and a status line has exactly two admissible forms:
+#
+#     Status: **NOT SATISFIED**            → blocks
+#     Status: **SATISFIED at <hex7-40>**   → passes
+#
+# The satisfied form is matched to its END, not by prefix. After the closing
+# `**` the line must either STOP or continue with WHITESPACE — the documented
+# one-line edit leaves the sentence's tail in place, so ` — adopted <date>`
+# is fine. Anything ATTACHED to the token (`**x`, `***`) means the token is
+# something else entirely and the status cannot be read as satisfied.
+#
+# EVERYTHING ELSE BLOCKS — a missing [Unreleased] section, a gate whose
+# status line was deleted, a duplicate or orphan status line, a typo, or
+# `Status: **SATISFIED**` with no commit to check. Searching only for the
+# open marker would FAIL OPEN on every one of those: deleting the status
+# line would "close" the gate. Enumerating the admissible states instead
+# means only a provably-satisfied gate lets a distribution build run.
+#
+# Keying on the status LINE (not on any occurrence of the phrase) is what
+# lets the paragraphs above explain the mechanism — and lets a future entry
+# quote it — without blocking every release.
+# RELEASE GATES — shared with every other distribution-producing script
+# (PR #460 codex r20). See scripts/release-gates.sh for why this is not
+# defined here any more.
+# shellcheck source=scripts/release-gates.sh
+. "$PROJECT_DIR/scripts/release-gates.sh"
+
 # Main
 case "${1:-}" in
     --direct)
+        # A signed, distributable DMG — the same shipping artifact the
+        # release arm produces, minus notarization. Gated identically.
+        check_release_gates
         if [ -z "$DEVID_CERT" ]; then
             echo "❌ Developer ID Application certificate required!"
             echo "   Found in Keychain? Check: security find-identity -v -p codesigning"
@@ -339,6 +384,10 @@ case "${1:-}" in
     --notarize|--release)
         # --notarize now performs the full pipeline (build + sign + DMG + notarize).
         # --release is kept as an alias for the same operation.
+        #
+        # Release gates FIRST: an open cross-repo gate must stop the pipeline
+        # before it builds, signs, or submits anything for notarization.
+        check_release_gates
         if [ -z "$DEVID_CERT" ]; then
             echo "❌ Developer ID Application certificate required!"
             echo "   Found in Keychain? Check: security find-identity -v -p codesigning"

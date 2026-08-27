@@ -445,7 +445,7 @@ final class RecommendationEngineTests: XCTestCase {
 
     // MARK: - CLI Golden JSON Test
 
-    func testCLIGoldenSnakeCaseFields() async {
+    func testCLIGoldenSnakeCaseFields() async throws {
         let processes = [
             makeProcess(pid: 100, name: "ollama", physFootprint: 2 * 1024 * 1024 * 1024),
         ]
@@ -465,8 +465,8 @@ final class RecommendationEngineTests: XCTestCase {
         // Encode to JSON and verify snake_case field names
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        let data = try! encoder.encode(result.recommendations)
-        let json = String(data: data, encoding: .utf8)!
+        let data = try encoder.encode(result.recommendations)
+        let json = try XCTUnwrap(String(data: data, encoding: .utf8))
 
         // Verify snake_case keys are present
         XCTAssertTrue(json.contains("\"impact_value\""), "Should have snake_case impact_value")
@@ -531,12 +531,12 @@ final class StatusSocketRecommendationsTests: XCTestCase {
         defer { socket.stop() }
 
         let response = try sendSocketCommand("{\"cmd\":\"recommendations\"}\n", to: socketPath)
-        let json = try JSONSerialization.jsonObject(with: response.data(using: .utf8)!) as! [String: Any]
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: response.data(using: .utf8)!) as? [String: Any])
         XCTAssertEqual(json["ok"] as? Bool, true)
 
-        let data = json["data"] as! [String: Any]
+        let data = try XCTUnwrap(json["data"] as? [String: Any])
         XCTAssertNotNil(data["recommendations"])
-        let meta = data["_meta"] as! [String: Any]
+        let meta = try XCTUnwrap(data["_meta"] as? [String: Any])
         XCTAssertNotNil(meta["count"])
         XCTAssertEqual(meta["source"] as? String, "daemon")
         XCTAssertNotNil(meta["scan_partial"])
@@ -553,7 +553,7 @@ final class StatusSocketRecommendationsTests: XCTestCase {
         defer { socket.stop() }
 
         let response = try sendSocketCommand("{\"cmd\":\"recommendations\"}\n", to: socketPath)
-        let json = try JSONSerialization.jsonObject(with: response.data(using: .utf8)!) as! [String: Any]
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: response.data(using: .utf8)!) as? [String: Any])
         XCTAssertEqual(json["ok"] as? Bool, false)
     }
 }
@@ -561,8 +561,8 @@ final class StatusSocketRecommendationsTests: XCTestCase {
 // MARK: - Test Helpers (socket)
 
 private func sendSocketCommand(_ command: String, to path: String) throws -> String {
-    let fd = socket(AF_UNIX, SOCK_STREAM, 0)
-    guard fd >= 0 else { throw NSError(domain: "socket", code: Int(errno)) }
+    // SO_NOSIGPIPE, set at creation (D5) — see `TestSocketClient`.
+    let fd = try TestSocketClient.makeStreamSocket()
     defer { close(fd) }
 
     var addr = sockaddr_un()
@@ -585,9 +585,9 @@ private func sendSocketCommand(_ command: String, to path: String) throws -> Str
     }
     guard connectResult == 0 else { throw NSError(domain: "connect", code: Int(errno)) }
 
-    let bytes = Array(command.utf8)
-    _ = bytes.withUnsafeBufferPointer { buf in
-        Darwin.write(fd, buf.baseAddress!, buf.count)
+    let sent = TestSocketClient.write(Array(command.utf8), to: fd)
+    guard sent.result >= 0 else {
+        throw NSError(domain: "write", code: Int(sent.errno))
     }
 
     var readBuf = [UInt8](repeating: 0, count: 65536)

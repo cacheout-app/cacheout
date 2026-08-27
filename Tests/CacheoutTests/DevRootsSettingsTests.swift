@@ -432,6 +432,52 @@ final class DevRootsSettingsTests: XCTestCase {
                        "a BSD-permission denial has no System Settings remedy")
     }
 
+    /// THE SESSION-BOUND ROW SAYS WHAT DID NOT HAPPEN, AND NAMES A REMEDY
+    /// THAT CAN ACTUALLY DIFFER (PR #460 codex r12, D2).
+    ///
+    /// `ScanIssuesBlock` renders `row.text` and relegates `issue.detail` to a
+    /// tooltip, so the KIND's label is the whole visible diagnosis. Reusing
+    /// `.malformedOutcome` here would have told the user their scanner
+    /// produced bad output — "rejected — malformed scanner output" — when
+    /// nothing was produced at all, and it would have named no remedy. This
+    /// row states the condition and offers the re-scan, which is honest
+    /// because the bound is WALL-CLOCK over real filesystem work: unlike a
+    /// deterministic cap, a retry genuinely can succeed.
+    func testTheSessionBoundRowNamesTheConditionAndARemedyThatCanDiffer()
+        throws
+    {
+        let timedOut = ScanIssueRowPresentation(
+            issue: ScanIssue(
+                url: nil, kind: .scanDidNotFinish,
+                detail: "the scan did not finish within 600 seconds; "
+                    + "nothing from this scanner was used"
+            ),
+            home: fixtureHome
+        )
+        XCTAssertEqual(timedOut.location, "Scanner output",
+                       "a NON-filesystem kind invents no path")
+        XCTAssertEqual(
+            timedOut.label,
+            "did not finish in time — nothing from it was used; re-scan to "
+                + "try again"
+        )
+        XCTAssertFalse(timedOut.showsSettingsLink,
+                       "no settings link that cannot help")
+        XCTAssertNotEqual(
+            timedOut.label,
+            ScanIssueRowPresentation(
+                issue: ScanIssue(
+                    url: nil, kind: .malformedOutcome, detail: "…"
+                ),
+                home: fixtureHome
+            ).label,
+            "nothing was REJECTED here — nothing arrived; the two kinds must "
+                + "not share a label"
+        )
+        XCTAssertEqual(ScanIssue.Kind.scanDidNotFinish.wireString,
+                       "scan_did_not_finish")
+    }
+
     /// AN OVER-MOUNTED ROOT SAYS SO, IN THE VISIBLE ROW (PR #459 codex r11,
     /// P2 DISCLOSURE).
     ///

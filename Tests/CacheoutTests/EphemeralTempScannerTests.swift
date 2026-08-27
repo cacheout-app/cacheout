@@ -48,7 +48,9 @@ final class EphemeralTempScannerTests: XCTestCase {
         sharedRootURL = base.appendingPathComponent("shared-temp")
         userRootURL = base.appendingPathComponent("user-temp")
         for url in [home, sharedRootURL, userRootURL] {
-            try fm.createDirectory(at: url!, withIntermediateDirectories: true)
+            try fm.createDirectory(
+                at: try XCTUnwrap(url), withIntermediateDirectories: true
+            )
         }
     }
 
@@ -200,9 +202,7 @@ final class EphemeralTempScannerTests: XCTestCase {
     private func itemsByName(
         _ outcome: ScanOutcome
     ) -> [String: ReclaimableItem] {
-        Dictionary(
-            uniqueKeysWithValues: outcome.items.map { ($0.displayName, $0) }
-        )
+        XCTUniquelyKeyed(outcome.items.map { ($0.displayName, $0) })
     }
 
     /// The outcome must pass fn-2's shared fail-closed validation THROUGH the
@@ -575,9 +575,13 @@ final class EphemeralTempScannerTests: XCTestCase {
     /// was already visible; this closes the asymmetry.
     ///
     /// Driven through the `readChildNames` seam because a real mid-`readdir`
-    /// failure cannot be staged deterministically. That production actually
-    /// produces `.readFailed` is pinned separately and without any seam by
-    /// `testProductionBoundedReadCarriesTheReaddirErrno`.
+    /// failure cannot be staged deterministically. There is NO seamless cell
+    /// behind that: this comment used to name one
+    /// (`testProductionBoundedReadCarriesTheReaddirErrno`), which has never
+    /// existed, and `testACleanReadIsNeverMisreadAsAFailedOne`'s own HONEST
+    /// SCOPE paragraph says the opposite in as many words — "`.readFailed`
+    /// itself has no cell", with the measurement behind that claim
+    /// (PR #460 codex r8, D3).
     func testWalkDisclosesAReadFailureAndStaysSilentOnAVanishedBranch() async throws {
         try makeStaleCandidate("old-scratch", under: sharedRootURL)
         // The walk composes children under the root's DECLARED (canonical)
@@ -2967,12 +2971,12 @@ final class EphemeralTempScannerTests: XCTestCase {
         // The tooltip still names WHICH object it is — that half was never
         // the defect and must not regress.
         XCTAssertTrue(
-            outcome.errors[0].detail.contains("(regular file)"),
-            "detail names the real kind: \(outcome.errors[0].detail)"
+            try XCTUnwrapElement(outcome.errors, 0).detail.contains("(regular file)"),
+            "detail names the real kind: \(outcome.errors.map(\.detail))"
         )
         XCTAssertTrue(
-            outcome.errors[1].detail.contains("(special file)"),
-            "detail names the real kind: \(outcome.errors[1].detail)"
+            try XCTUnwrapElement(outcome.errors, 1).detail.contains("(special file)"),
+            "detail names the real kind: \(outcome.errors.map(\.detail))"
         )
     }
 
@@ -3013,8 +3017,8 @@ final class EphemeralTempScannerTests: XCTestCase {
         )
         // The clause that fired stays in the tooltip, where it always was.
         XCTAssertTrue(
-            outcome.errors[0].detail.contains("home directory"),
-            "detail names the clause: \(outcome.errors[0].detail)"
+            try XCTUnwrapElement(outcome.errors, 0).detail.contains("home directory"),
+            "detail names the clause: \(outcome.errors.map(\.detail))"
         )
     }
 
@@ -3706,7 +3710,7 @@ final class EphemeralTempScannerTests: XCTestCase {
             tv_sec: Int(oldDate.timeIntervalSince1970), tv_nsec: 0
         )
         var times = [stamp, stamp]
-        guard utimensat(open[0], "payload.bin", &times, 0) == 0 else {
+        guard utimensat(try XCTUnwrapElement(open, 0), "payload.bin", &times, 0) == 0 else {
             throw XCTSkip("utimensat: \(errno)")
         }
         for fd in open.reversed() {

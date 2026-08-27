@@ -50,6 +50,14 @@ scenario for the corresponding epic.
   28 branch refs survived**, including one unmerged hotfix branch whose
   worktree lived elsewhere — demonstrating that worktree removal never
   deletes branches. E5's `evidence` string should state this to the user.
+- **SCOPE OF THAT OBSERVATION (PR #460 codex r1).** Every worktree in this
+  scenario was checked out ON A BRANCH, so "28/28 branch refs survived" says
+  nothing about a DETACHED worktree — which has no branch ref at all, and
+  whose removal therefore leaves whatever HEAD names reachable from no ref
+  (measured on git 2.50.1: the commit becomes a dangling object, surfaced
+  only by `git fsck`, and the worktree's `logs/HEAD` — the one reflog that
+  named it — is deleted alongside). The shipped `evidence` string carries the
+  branch sentence for ATTACHED worktrees only.
 
 ## Scenario 3 — /private/tmp scratchpads (E6)
 

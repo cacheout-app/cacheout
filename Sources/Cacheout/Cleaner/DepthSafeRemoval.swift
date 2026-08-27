@@ -147,12 +147,23 @@
 //     FAILED (`OrphanedCachesScanner.swift` — ENOENT/ENOTDIR, so it never
 //     had an identity to carry), plus this file's one-syscall
 //     `fstatat`→`unlinkat` window (no `funlinkat(2)` on macOS; residual 2's
-//     shape, one leaf, never a tree). None of it applies to
-//     `TrashDisposal.dispose(_:containedIn:…)`, which always bound by
-//     `fstatat` under a proved container. A future note here must not
+//     shape, one leaf, never a tree). A future note here must not
 //     generalise "the Trash arm binds the same way" in either direction:
 //     the arms bind differently, on purpose, because they have different
 //     facts available.
+//
+//     AND THE VERSION OF THAT SENTENCE WHICH STOOD HERE WAS EXACTLY THE
+//     GENERALISATION IT WARNS AGAINST (PR #460 codex r13). It said "none of
+//     it applies to `TrashDisposal.dispose(_:containedIn:…)`, which always
+//     bound by `fstatat` under a proved container" — true of that overload,
+//     and read as covering the Trash arm, while the OTHER entry point's
+//     `.noDirectoryTree` path opened no container and bound nothing at all:
+//     any non-directory in any directory satisfied it, measured through the
+//     shipped `FileManager.trashItem` into the real `~/.Trash`. Both Trash
+//     entry points now bind the leaf by `fstatat` under the proved container
+//     for this verdict, so what remains on the Trash side is the kind check
+//     plus the identity-free leaf — the same residual this file has, minus
+//     the `unlinkat` window and plus `trashItem`'s own resolution.
 //
 //  POSIX offers no primitive that closes 1, 2 or 3: there is no way to pin a
 //  directory to its parent for the duration of a read, no way to remove a
@@ -308,16 +319,46 @@ enum DepthSafeRemoval {
     /// is destroyed. `nil` says that no inspection ran and there is nothing to
     /// bind to; it is not a way to skip the check.
     ///
-    /// THE PARAMETER HAS NO DEFAULT, AND BOTH CALL SITES STATE THEIR `nil`
-    /// (PR #458 review — this sentence used to be true of only one of them).
-    /// `CacheCleaner.deleteGuardedChild` passes a literal `nil` under a
-    /// paragraph saying contents mode runs no probe;
-    /// `CacheCleaner.removeGuardedItem` used to let an implicitly-nil `var`
-    /// fall past its `if` and arrive here having said nothing, and now writes
-    /// the `else` arm out with the two populations it covers. A comment that
-    /// claims a property the code lacks is worse than no comment, so if a
-    /// third call site appears, either it states its `nil` or this paragraph
-    /// stops being true and must change with it.
+    /// THE PARAMETER HAS NO DEFAULT, AND EVERY CALL SITE STATES ITS `nil`
+    /// (PR #458 review; the enumeration RE-TAKEN at PR #460 codex r18).
+    ///
+    /// The r458 wording said "both call sites" and closed with "if a third
+    /// call site appears, either it states its `nil` or this paragraph stops
+    /// being true and must change with it". A third appeared at r7 — the
+    /// worktree performer's `removeTree` seam — and the paragraph did not
+    /// change with it, which is the shape it was written to prevent. The
+    /// standing enumeration, from `grep -rn "expecting:" Sources`:
+    ///
+    /// 1. `CacheCleaner.deleteGuardedChild` (contents mode) — a literal `nil`
+    ///    under a paragraph saying contents mode runs no probe. SOUND: the
+    ///    population is ENUMERATED CHILDREN of a folder this call opened and
+    ///    proved, so no per-child verdict exists anywhere to bind to, and the
+    ///    container binding (`containedIn`) is what covers the leaf. That is
+    ///    why the container parameter is not optional for this arm.
+    /// 2. `CacheCleaner.removeGuardedItem` (item mode) — `probedObject`,
+    ///    which is `nil` exactly when the item's scanner registers no
+    ///    revalidator or the seam answered `.unestablished`. SOUND for the
+    ///    same reason and under the same binding; when a verdict DOES exist
+    ///    it is passed and proved here.
+    /// 3. `CacheCleaner`'s `removeTree` seam for `WorktreeReclaimPerformer`
+    ///    — a literal `nil`, because `git_worktrees` registers no
+    ///    revalidator either. SOUND ONLY SINCE r18, AND IT WAS NOT BEFORE.
+    ///    What that seam destroys is a whole CHECKOUT or a whole ADMIN
+    ///    DIRECTORY, and no gate on either path was about that object: the
+    ///    stale arm's gates read the admin directory, the prune arm's read
+    ///    pathnames, and `containedIn` reads the folder. Measured on both
+    ///    arms at 9ca1129, a compatible directory renamed onto the checkout
+    ///    path after the clean check was destroyed with `errors == []` and a
+    ///    45056-byte success entry. It is sound now because the performer
+    ///    takes its OWN binding (`WorktreeReclaimPerformer.BoundObject`, read
+    ///    through `TrashDisposal.boundLeaf` under the SAME admitted container
+    ///    this call is handed) and re-proves it inside the `LastInstantProof`
+    ///    the seam runs on the far side of its hop.
+    ///    RESIDUAL, STATED: that proof runs immediately BEFORE this call
+    ///    rather than inside it, so what it leaves open is this function's
+    ///    own parent open — the identical residual the LOCKED and HEAD-MOVED
+    ///    propositions have carried since r7, for the identical reason: none
+    ///    of the three is expressible in this file's vocabulary.
     ///
     /// `provider` answers the mount question, and it is the same object the
     /// scanner's walk asks, so the two cannot classify a boundary

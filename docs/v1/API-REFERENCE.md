@@ -440,12 +440,23 @@ enum ReclaimAction: Equatable, Sendable {
     case removeContents        // delete children of every .measured root record
     case removeItem            // delete the item's own tree
     case commands([[String]])  // run argv arrays via /usr/bin/env
+    case gitWorktreeReclaim(GitWorktreeReclaimPlan)  // git-mediated removal / prune
 }
 ```
 
 | Member | Description |
 |--------|-------------|
-| `wireString` | FROZEN wire strings: `remove_contents` \| `remove_item` \| `commands`. `.commands` serializes ONLY its kind — argv arrays are NEVER exposed on any wire surface |
+| `wireString` | FROZEN wire strings: `remove_contents` \| `remove_item` \| `commands` \| `git_worktree_reclaim`. `.commands` and `.gitWorktreeReclaim` serialize ONLY their kind — argv arrays and the reclaim plan's paths are NEVER exposed on any wire surface |
+
+`.gitWorktreeReclaim` carries a PLAN of structured paths, never argv: the
+cleaner builds the argv from the plan's fields plus registry-controlled
+constants, so command argv stays trusted registry code exactly as it is for
+`.commands`. Two modes — `removeStaleWorktree` (one worktree) and `pruneOrphanedAdmin`
+(repository-level, over a provably-complete disclosed set). Every argv the
+cleaner builds is READ-ONLY: both removals are performed by Cacheout itself,
+the checkout under the depth-safe remover or the Trash disposal and the
+disclosed admin directories directly. There is no `git worktree remove` arm
+and no fallback behind one.
 
 ### `AdmissionDescriptor`
 
@@ -553,11 +564,15 @@ Two-surface rule: impediments attributable to an emitted item ride the item's
 `state`/`scanError`; only root/scanner-level problems with no recognized
 candidate land in `ScanOutcome.errors`. `Kind` is EXTENSIBLE — never write
 consumers that assume the case list is closed. Wire strings (frozen):
-`container_refused`, `mounted_volume_root`, `policy_refused_root`,
-`symlink_root`, `non_directory_root`, `tcc_denied`,
-`permission_denied`,
-`unreadable`, `enumeration_truncated`, `config_invalid`, `malformed_outcome`. `.malformedOutcome` is
+`container_refused`, `mounted_volume_root`,
+`mounted_volume_root_at_registration`, `policy_refused_root`,
+`symlink_root`, `non_directory_root`, `tcc_denied`, `permission_denied`,
+`unreadable`, `enumeration_truncated`, `config_invalid`, `tool_unavailable`,
+`malformed_outcome`. `.malformedOutcome` is
 synthesized ONLY by the runtime's validation, never by scanners.
+`.configInvalid`, `.toolUnavailable` and `.malformedOutcome` are the
+NON-FILESYSTEM kinds: their `url` is nil and the wire row therefore carries
+no `path`.
 `mounted_volume_root` is a registered root with another volume mounted at
 it — NOT a refusal of the root, and clearable by unmounting (added PR #459
 review r11; the GUI's visible row label is derived from the kind alone, so
@@ -601,7 +616,8 @@ Adding a scanner = implement this + register with the runtime — nothing else:
 the runtime derives delete-time admission from registration. Conformers:
 `CategoryScanner` (id `categories`), `BuildArtifactsScanner`
 (id `build_artifacts`), `OrphanedCachesScanner` (id `orphaned_caches`),
-`EphemeralTempScanner` (id `ephemeral_tmp`).
+`GitWorktreeScanner` (id `git_worktrees`), `EphemeralTempScanner`
+(id `ephemeral_tmp`).
 
 ### `ValidatedScannerEvent` / `SpaceScannerRegistrationError`
 
@@ -631,9 +647,11 @@ struct SpaceScannerRuntime {
     let scanners: [any SpaceScanner]
     let trustedContainerRoots: [URL]  // union of scanner declarations
 
-    init(scanners:categories:home:provider:) throws
+    init(scanners:categories:home:provider:gitRunner:) throws
     static func production(home:provider:orphanedCachesThresholds:devRoots:
-                           ephemeralTempThresholds:) -> SpaceScannerRuntime
+                           gitRunner:ephemeralTempRoots:
+                           ephemeralTempConfstrPath:ephemeralTempThresholds:)
+        -> SpaceScannerRuntime
     func makeCleaner(snapshot: ContainerSnapshot? = nil,
                      trashHandler:) -> CacheCleaner
     func scanValidated(scannerIDs: Set<String>? = nil,
@@ -647,7 +665,7 @@ struct SpaceScannerRuntime {
 | Member | Description |
 |--------|-------------|
 | `init` | Registration + FOLDED validation as one check: scanner-id slug syntax, scanner-id uniqueness, category-slug syntax, and the combined category-slug/scanner-slug namespace collision check (covers the frozen `categories` id). Injectable for tests — registering a fixture scanner requires zero production edits |
-| `production()` | The production registry — the single place scanners are registered (`CategoryScanner` + `BuildArtifactsScanner` + `OrphanedCachesScanner` + `EphemeralTempScanner`, in that order). `orphanedCachesThresholds` threads the sweep's invocation-scoped config, `devRoots` the build-artifact roots, and `ephemeralTempThresholds` the temp scanner's (nil resolves defaults → UserDefaults inside the factory). The temp scanner's ROOTS are not a parameter: `EphemeralTempRoots.resolve(provider:)` is the closed declaration |
+| `production()` | The production registry — the single place scanners are registered (`CategoryScanner` + `BuildArtifactsScanner` + `OrphanedCachesScanner` + `GitWorktreeScanner` + `EphemeralTempScanner`, in that order). `orphanedCachesThresholds` threads the sweep's invocation-scoped config; `devRoots` is resolved ONCE and shared by BOTH dev-root scanners (nil resolves defaults → UserDefaults); `gitRunner` substitutes the ONE shared git runner (nil builds it) — the same instance detects composite items and executes them, because the `git --version` availability cache is instance-scoped; `ephemeralTempThresholds` threads the temp scanner's (nil resolves defaults → UserDefaults inside the factory). The temp scanner's ROOTS are not a parameter: `EphemeralTempRoots.resolve(provider:)` is the closed declaration |
 | `makeCleaner(snapshot:trashHandler:)` | Builds the `CacheCleaner` whose PathGuard container roots are the runtime union — delete-time container admission covers exactly what registration declared, never anything an item claims. `snapshot` is the producing scan session's `ContainerSnapshot` (`ValidatedScanSession.snapshot`); nil FAIL-CLOSES every `.removeItem` deletion (`container-unavailable`) — items must be cleaned with the session that produced them |
 | `scanValidatedSession(scannerIDs:context:)` | The scan-and-validate entry point returning one SESSION: the progressive validated event stream, the producer handle (`untilProducerFinishes()`), and the session's `ContainerSnapshot` — every registered container root's no-follow (device, inode), captured BEFORE any scanner task launches (absent roots omitted). Delete-time `.removeItem` admission is identity-bound to this snapshot |
 | `scanValidated(scannerIDs:context:)` | Thin wrapper over `scanValidatedSession` returning just the event stream. The scan `TaskGroup` and ALL validation live inside; each event is one scanner's validated outcome or its synthesized `malformedOutcome` issue, yielded in completion order. `scannerIDs` scopes to a scanner subset (nil = all); the context's `categoryFilter` gives category-granular scoping inside `CategoryScanner`. Consumers pick scope and consumption style, never validation |

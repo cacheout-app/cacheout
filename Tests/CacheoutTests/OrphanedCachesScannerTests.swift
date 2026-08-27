@@ -924,7 +924,7 @@ final class OrphanedCachesScannerTests: XCTestCase {
             case .success(let parsed):
                 XCTFail("\(args) must be rejected, parsed \(parsed)")
             case .failure(let error):
-                XCTAssertTrue(error.message.contains(args[0]),
+                XCTAssertTrue(error.message.contains(try XCTUnwrapElement(args, 0)),
                               "the refusal names the flag: \(error.message)")
             }
         }
@@ -2761,7 +2761,11 @@ final class OrphanedCachesScannerTests: XCTestCase {
                        "an observer must see the walk's OWN spelling, "
                            + "composed root-first, one component per level")
         for (index, component) in components.enumerated() {
-            XCTAssertEqual(descended[component], expected[index],
+            // `expected` is the test's own array, but `index` runs over a
+            // DIFFERENT collection: the pairing is an invariant, not a
+            // guarantee, and a trap here would strand the run.
+            let parent = try XCTUnwrapElement(expected, index)
+            XCTAssertEqual(descended[component], parent,
                            "descent into \(component) was reported from the "
                                + "wrong parent spelling")
         }
@@ -3545,7 +3549,7 @@ final class OrphanedCachesScannerTests: XCTestCase {
         XCTAssertEqual(report.errors.count, 1)
         let message = try XCTUnwrap(report.errors.first?.message)
         XCTAssertTrue(message.contains("PUT BACK"), message)
-        XCTAssertTrue(message.contains("nothing was freed"), message)
+        XCTAssertTrue(message.contains("nothing was reported freed"), message)
         XCTAssertTrue(
             fm.fileExists(atPath: library.path),
             "the wrongly-taken tree was left in the Trash — a disposal that "
@@ -3933,14 +3937,23 @@ final class OrphanedCachesScannerTests: XCTestCase {
         )
         XCTAssertTrue(
             message.contains(
-                "the folder that HOLDS it is no longer the one the safety "
-                    + "check admitted"
+                "the folder that HOLDS this path is no longer the one the "
+                    + "safety check admitted"
             ),
             message
         )
         XCTAssertTrue(fm.fileExists(atPath: stash.path),
                       "the inspected tree is untouched")
-        try assertCleanupLogContains(tag: "content-drift")
+        // `container-drift` SINCE PR #460 codex r13, AND THE OLD TAG WAS THE
+        // DEFECT THIS CELL'S OWN MESSAGE ASSERTION NAMES. Two assertions up,
+        // this cell requires the sentence "the folder that HOLDS it is no
+        // longer the one the safety check admitted" — a fact about the
+        // FOLDER — and then pinned the log to `content-drift`, the tag for
+        // "the item changed". The permanent arm has answered `container-drift`
+        // for the identical event since PR #458; the Trash arm now does too
+        // (`CacheCleaner.trashRefusalTag`), so the cleanup log has ONE word
+        // for it whichever disposal the user chose.
+        try assertCleanupLogContains(tag: "container-drift")
     }
 
     /// Swaps the TRASH DIRECTORY ITSELF — not the entry in it — inside the
@@ -4121,7 +4134,14 @@ final class OrphanedCachesScannerTests: XCTestCase {
             "sent the user to a path nothing occupies: \(message)"
         )
         XCTAssertTrue(
-            message.contains("no longer at \(landed.path)"),
+            // r15 (D-P3) weakened this clause from "it is no longer at …" to
+            // "cannot be found there now" — the proposition the cell is about
+            // is unchanged, and the new wording is the one the r14 doc says
+            // is actually established (an unreadable landing may still hold
+            // the object).
+            message.contains(
+                "putting at \(landed.path) cannot be found there now"
+            ),
             "the refusal must say the item is not where the Trash put it: "
                 + message
         )
@@ -5767,7 +5787,7 @@ final class OrphanedCachesScannerTests: XCTestCase {
     /// guidance turns on — can a retry, unaided, change this? — instead of
     /// letting one benign case (the mid-walk race) justify a catch-all
     /// default that absorbs structural failures too.
-    func testErrnoRoutingSeparatesPermanentFromTransientFailures() {
+    func testErrnoRoutingSeparatesPermanentFromTransientFailures() throws {
         // Grantable.
         for code in [EACCES, EPERM] {
             XCTAssertEqual(OrphanedCachesScanner.obstruction(forErrno: code),
@@ -5811,7 +5831,7 @@ final class OrphanedCachesScannerTests: XCTestCase {
         under root: URL, segment: String, levels: Int
     ) throws -> [Int32] {
         var fds = [open(root.path, O_RDONLY | O_DIRECTORY)]
-        guard fds[0] >= 0 else {
+        guard try XCTUnwrapElement(fds, 0) >= 0 else {
             throw XCTSkip("cannot open fixture root: \(errno)")
         }
         for _ in 0..<levels {
@@ -6517,19 +6537,22 @@ private struct GatedFixtureScanner: SpaceScanner {
 }
 
 /// A hold-open gate for pinning mid-scan windows.
+///
+/// BOUNDED (PR #460 codex r11, D2) — see `BoundedRendezvous`: a park with no
+/// deadline strands the whole runner when the signal it waits for stops
+/// arriving, which is precisely what a production regression does.
 private actor ScanHoldGate {
-    private var opened = false
-    private var waiters: [CheckedContinuation<Void, Never>] = []
+    private let gate = BoundedRendezvous()
 
-    func open() {
-        opened = true
-        for waiter in waiters { waiter.resume() }
-        waiters = []
-    }
+    func open() { gate.open() }
 
-    func wait() async {
-        if opened { return }
-        await withCheckedContinuation { waiters.append($0) }
+    @discardableResult
+    func wait(
+        _ what: String = "a mid-scan hold gate",
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async -> Bool {
+        await gate.park(what, file: file, line: line)
     }
 }
 
@@ -6538,7 +6561,14 @@ private actor OutcomeSequenceBox {
     private var outcomes: [ScanOutcome]
     init(_ outcomes: [ScanOutcome]) { self.outcomes = outcomes }
     func next() -> ScanOutcome {
-        outcomes.count > 1 ? outcomes.removeFirst() : outcomes[0]
+        // FIXTURE-CONTROLLED (see the note on the twin in
+        // CacheoutViewModelTests): the literal list is the test's own. The
+        // subscript is gone anyway — the statement-position fence forbids the
+        // shape (PR #460 codex r6, D4); the `??` arm is unreachable.
+        precondition(!outcomes.isEmpty)
+        return outcomes.count > 1
+            ? outcomes.removeFirst()
+            : (outcomes.first ?? ScanOutcome(items: [], errors: []))
     }
 }
 

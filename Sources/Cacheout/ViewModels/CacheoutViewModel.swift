@@ -299,6 +299,26 @@ class CacheoutViewModel: ObservableObject {
 
     @Published var isCleaning = false
     @Published var diskInfo: DiskInfo?
+
+    /// HOW LONG THE HEADER'S VOLUME FIGURES MAY HOLD A CALLER (PR #460 codex
+    /// r14, V2-1). Two seconds, and the figure is not load-bearing: a healthy
+    /// `DiskInfo.current()` is one `statfs`-class call and returns in
+    /// microseconds, so anything at this scale means a starved cooperative
+    /// band or an unresponsive volume, neither of which gets better by
+    /// waiting. Deliberately far BELOW `ScanSessionBounds.production`'s ten
+    /// minutes: this fetch buys a display refresh, not a scan, and it is
+    /// spent before the session's own bound is even armed. On expiry the
+    /// figures are left as they were and the caller carries on — see
+    /// `BoundedDiskInfo` for what that costs and why a retry can differ.
+    static let diskInfoRefreshBudget: Duration = .seconds(2)
+
+    /// THIS view model's budget — the production default unless a caller
+    /// names one. Injectable for the same reason `ScanSessionBounds` is: the
+    /// starvation cells must saturate the band for a WALL-CLOCK interval, and
+    /// a two-second one costs the suite two seconds per cell to prove a
+    /// property that does not depend on the figure. Nothing in the app passes
+    /// it; `CacheoutApp` and every non-test construction take the default.
+    private let diskInfoBudget: Duration
     @Published var showCleanConfirmation = false
     @Published var showCleanupReport = false
     @Published var lastReport: CleanupReport?
@@ -489,10 +509,12 @@ class CacheoutViewModel: ObservableObject {
     ///   source.
     init(
         runtime: SpaceScannerRuntime = .production(),
-        reconstruction: RuntimeReconstruction? = nil
+        reconstruction: RuntimeReconstruction? = nil,
+        diskInfoBudget: Duration = CacheoutViewModel.diskInfoRefreshBudget
     ) {
         self.runtime = runtime
         self.reconstruction = reconstruction
+        self.diskInfoBudget = diskInfoBudget
 
         let storedInterval = UserDefaults.standard.double(forKey: "cacheout.scanIntervalMinutes")
         self.scanIntervalMinutes = storedInterval > 0 ? storedInterval : 30
@@ -1052,6 +1074,77 @@ class CacheoutViewModel: ObservableObject {
             + "commands — Move to Trash does not apply to them"
     }
 
+    /// The `git_worktree_reclaim` Move-to-Trash disclosures (fn-5.6, R11/F7).
+    ///
+    /// WHY THIS EXISTS AT ALL: the `.commands` disclosure above matches only
+    /// `.commands`, so a selected composite item would fall through to the
+    /// sheet's generic wording, which says nothing about the SECOND thing a
+    /// worktree reclaim removes.
+    ///
+    /// TWO MODES, TWO DIFFERENT TRUTHS — never one laundered sentence:
+    ///
+    /// - **stale removal** — the CHECKOUT honours the toggle and the admin
+    ///   entry does not. THIS CHANGED AT PR #460 codex r5 (D1/D7): while
+    ///   `git worktree remove` was the primary arm, the checkout was unlinked
+    ///   permanently whatever the toggle said, and this sentence said so.
+    ///   The removal is Cacheout's own now — under a descriptor-bound
+    ///   container and a last-instant re-proof — so Move to Trash applies to
+    ///   the checkout, which is the part a user would want back. The
+    ///   `worktrees/<id>` registry directory that follows it is removed
+    ///   permanently either way, and saying so is the whole point of this
+    ///   disclosure. Which disposal actually ran is reported per entry in the
+    ///   cleanup report (`disposal`).
+    /// - **prune-only** — repository ADMIN DATA (the orphaned worktree
+    ///   registry) and nothing else, permanently, whatever the toggle says.
+    ///   Branch refs and repository objects survive.
+    ///
+    /// Ordered stale-then-prune and returned as separate strings so a
+    /// selection containing both never merges two different promises. Empty
+    /// when no composite item is selected.
+    var gitWorktreeTrashDisclosures: [String] {
+        Self.gitWorktreeTrashDisclosures(selectedItems: selectedItems)
+    }
+
+    /// Pure derivation behind `gitWorktreeTrashDisclosures` — static so XCTest
+    /// asserts on it without a runtime.
+    nonisolated static func gitWorktreeTrashDisclosures(
+        selectedItems: [ReclaimableItem]
+    ) -> [String] {
+        var stale: [String] = []
+        var prune: [String] = []
+        for item in selectedItems {
+            // EXHAUSTIVE over the mode — a third reclaim shape must be a
+            // compile-time decision here, not a silent fall-through to
+            // wording that describes neither.
+            guard case .gitWorktreeReclaim(let plan) = item.action else { continue }
+            switch plan.mode {
+            case .removeStaleWorktree: stale.append(item.displayName)
+            case .pruneOrphanedAdmin: prune.append(item.displayName)
+            }
+        }
+        var disclosures: [String] = []
+        if !stale.isEmpty {
+            let verb = stale.count == 1 ? "its" : "their"
+            let noun = stale.count == 1 ? "entry is" : "entries are"
+            disclosures.append(
+                "\(stale.joined(separator: ", ")): the CHECKOUT follows the "
+                    + "Move to Trash setting, but \(verb) git registry "
+                    + "\(noun) removed permanently either way. No branch is "
+                    + "deleted and repository objects are untouched; the "
+                    + "cleanup report records which disposal ran."
+            )
+        }
+        if !prune.isEmpty {
+            let verb = prune.count == 1 ? "removes" : "remove"
+            disclosures.append(
+                "\(prune.joined(separator: ", ")) \(verb) repository admin "
+                    + "data permanently — Move to Trash does not apply. "
+                    + "Branch refs and repository objects are untouched."
+            )
+        }
+        return disclosures
+    }
+
     /// True when the current selection includes a caution-risk item (the
     /// confirmation sheet's warning banner).
     var hasCautionSelection: Bool {
@@ -1412,7 +1505,27 @@ class CacheoutViewModel: ObservableObject {
         sessionGeneration += 1
         let generation = sessionGeneration
         activeScanGeneration = generation
-        diskInfo = await Task.detached { DiskInfo.current() }.value
+        // THE HEADER REFRESH IS BOUNDED, AND IT HAD TO BE (PR #460 codex
+        // r14, V2-1). This await sits AFTER the in-progress guard above and
+        // BEFORE `scanValidatedSession` below creates the stream, the
+        // producer, the watchdog and the grace timer — so the session bound
+        // does not reach it and no `.scanDidNotFinish` is possible here. As a
+        // bare `await Task.detached { DiskInfo.current() }.value` it needed a
+        // free worker in the unspecified cooperative band just to START:
+        // measured with that band saturated, `scan()` returned at 2.619 s
+        // with the guard still raised at 1.2 s and no issue recorded, while
+        // a COMPLETE bounded session took 0.0065 s in the same cell.
+        //
+        // On `.timedOut` `diskInfo` KEEPS ITS PREVIOUS VALUE (nil before the
+        // first successful fetch — a state every renderer already handles)
+        // and the scan proceeds into the session, where the bound applies. A
+        // retry can differ: both causes are transient, so the next scan
+        // fetches again with nothing latched. See `BoundedDiskInfo`.
+        if case .fetched(let fetched) = await BoundedDiskInfo.current(
+            within: diskInfoBudget
+        ) {
+            diskInfo = fetched
+        }
 
         let session = sessionRuntime.scanValidatedSession(
             scannerIDs: participating,
@@ -1422,10 +1535,30 @@ class CacheoutViewModel: ObservableObject {
             handle(event, generation: generation)
         }
 
+        // DID THIS SESSION ACTUALLY FINISH — and there are TWO ways for the
+        // answer to be no, not one (PR #460 codex r13, D).
+        //
         // If the consuming task was cancelled the stream may have ended
         // early — some scanners never delivered. Pruning then would drop
         // selections for items whose scanner simply never reported.
-        let completed = !Task.isCancelled
+        //
+        // AND `Task.isCancelled` DOES NOT COVER THE BOUND. The session's
+        // watchdog cancels the PRODUCER, never this consumer, so a session
+        // cut off by its wall-clock deadline left this flag TRUE and the
+        // adoption block below ran — measured on a first-ever scan with one
+        // wedged scanner: `hasScanned` true, the healthy scanner's items
+        // selected and passing `isBlockedFromDestructivePaths`, i.e.
+        // deletable, while an orphaned read-only walk may still have been
+        // traversing the same trees. `untilProducerFinishes()` discloses a
+        // residual whose mitigation is that nothing a cut-off session saw
+        // becomes deletable; THIS LINE IS THE GUI HALF OF THAT, and the only
+        // half `adoptedGeneration` covers — the CLI's is a different
+        // mechanism entirely (target-scoped refusal, argued and pinned at
+        // `ValidatedScanSession.didExceedBounds`; PR #460 codex r14, V2-3).
+        // A bounded session is treated exactly as a cancelled one: rows
+        // already reconciled stay VISIBLE, and nothing this session saw is
+        // vouched for.
+        let completed = !Task.isCancelled && !session.didExceedBounds
 
         // Early termination only CANCELS the producer; its filesystem walks
         // wind down cooperatively rather than instantly (review P2).
@@ -1705,6 +1838,20 @@ class CacheoutViewModel: ObservableObject {
         ]
 
         do {
+            // RECORDED, NOT FIXED (PR #460 codex r13). This wait is
+            // UNBOUNDED, and it is the one primitive this repo replaced
+            // everywhere else: `Process.waitUntilExit()` can miss its
+            // termination wakeup under concurrent reaping (see
+            // `Process.waitForExit(within:)` in CacheCategory.swift, which
+            // exists for that and is used by CacheCleaner and the category
+            // subprocesses). Here it sits behind a `readToEnd()` on a
+            // cooperative worker, so a docker CLI that never exits holds the
+            // worker AND latches `isDockerPruning` true for the life of the
+            // app — the button never re-enables. Pre-existing on
+            // origin/main, unrelated to this PR's scanners, and left to its
+            // own change: the fix is `waitForExit(within:)` plus a
+            // termination policy, which is a product decision about how long
+            // a prune may take.
             let result = try await Task.detached { () -> (Int32, String) in
                 try process.run()
                 let data = try pipe.fileHandleForReading.readToEnd() ?? Data()
@@ -1736,8 +1883,20 @@ class CacheoutViewModel: ObservableObject {
             lastDockerPruneResult = "Docker not found"
         }
 
-        // Refresh disk info after prune
-        diskInfo = await Task.detached { DiskInfo.current() }.value
+        // Refresh disk info after prune — THE TWIN OF `scan`'s fetch, and
+        // bounded for the same reason (PR #460 codex r14, V2-1). Nothing
+        // bounds this one either: `isDockerPruning` is released by the
+        // `defer` at the top of this method, which does not run until this
+        // await returns, so an unstarted detached fetch latched the button
+        // disabled exactly the way the prune's own unbounded
+        // `waitUntilExit()` does. On `.timedOut` the header keeps the
+        // figures it had, `lastDockerPruneResult` (already set above) still
+        // reaches the user, and the next scan refreshes.
+        if case .fetched(let fetched) = await BoundedDiskInfo.current(
+            within: diskInfoBudget
+        ) {
+            diskInfo = fetched
+        }
     }
 
     // MARK: - Cleaning
@@ -1790,23 +1949,72 @@ class CacheoutViewModel: ObservableObject {
         // act on a half-built result set — and on items not yet paired
         // with an adopted session snapshot.
         guard !isCleaning && !isAnyScanInProgress else { return }
-        isCleaning = true
-        // The cleaner is built PER CLEAN from the adopted session's
-        // snapshot (R9): every caller derives `items` from `selectedItems`,
-        // which already excludes every scanner whose outcome that session
-        // did not produce, so items and snapshot are the atomic pair the
-        // session adoption established.
-        // No completed session (nil snapshot) fail-closes `.removeItem`.
-        // After a runtime rebuild the SAME gate empties `selectedItems`
-        // wholesale (fn-4.10, R8), so this current-runtime cleaner can
-        // never act on a snapshot the previous composition captured.
-        let cleaner = runtime.makeCleaner(snapshot: adoptedSnapshot)
-        let report = await cleaner.clean(
-            items: items, moveToTrash: moveToTrash,
-            authorization: authorization
-        )
+
+        // RECORDED, NOT BOUNDED (PR #460 codex r15, S-P4), and the sibling of
+        // the two waits disclosed at r13's e29ffb4.
+        //
+        // Nothing bounds the await below. `CacheCleaner.clean` walks the
+        // items sequentially and each one ends in `removefile(3)` or
+        // `FileManager.trashItem` — work whose duration is the tree's, not a
+        // budget's, and which can block indefinitely on an unresponsive
+        // volume or a wedged Finder. `isCleaning` is one of the TWO flags
+        // `scan`'s re-entrancy guard reads, and it has exactly two writers in
+        // the whole app (this method: the `true` above and the `defer`
+        // below — COUNTED, `grep -n 'isCleaning ='`). No watchdog, no
+        // timeout and no view ever clears it. So a clean that never returns
+        // latches BOTH the clean path and the scan path shut for the life of
+        // the app, exactly as `dockerPrune`'s unbounded `waitUntilExit()`
+        // latches its own button.
+        //
+        // NOT BOUNDED, deliberately, and this is the product decision: a
+        // deletion cannot be abandoned. `removefile`/`trashItem` keep running
+        // after any timeout this method could impose, so a bound would hand
+        // control back — and publish a report — while the filesystem work
+        // continued, and would re-open the door for a second clean to race
+        // the first over the same paths. Bounding it means making deletion
+        // itself cancellable, which is a change to the cleaner, not to this
+        // flag.
+        //
+        // The `defer` is scoped to this block ON PURPOSE: the trailing
+        // `scan(trigger:)` below is refused by its own guard while
+        // `isCleaning` is true, so a `defer` at METHOD scope would silently
+        // disable the post-cleanup rescan — no error, no report change, just
+        // a stale window. That scope IS evidenced: moving the `defer` out
+        // reddens `testACleanClearsItsFlagBeforeItsTrailingRescanRatherThan
+        // AtMethodExit` and SpaceScannerIntegrationTests' trailing-rescan
+        // assertion, 2/2 runs each.
+        //
+        // NEGATIVE RESULT, recorded so the next round does not re-derive it:
+        // the `defer` ITSELF is not evidenceable here. Replacing it with the
+        // plain assignment at the same site left the WHOLE suite green
+        // (1549 executed / 2 skipped / 0 failures, exit 0, 165 s — measured
+        // at r15's second fixer's head, d3d62b4, where the suite WAS 1549;
+        // a total is only ever a fact about the commit it was taken at).
+        // There is
+        // no reachable early exit from this block today — the awaited call
+        // does not throw, and cancelling the surrounding task does not unwind
+        // a non-throwing await — so it is scope hygiene against a future
+        // `try` or early `return`, not a guard covering a live path.
+        let report: CleanupReport
+        do {
+            isCleaning = true
+            defer { isCleaning = false }
+            // The cleaner is built PER CLEAN from the adopted session's
+            // snapshot (R9): every caller derives `items` from
+            // `selectedItems`, which already excludes every scanner whose
+            // outcome that session did not produce, so items and snapshot are
+            // the atomic pair the session adoption established.
+            // No completed session (nil snapshot) fail-closes `.removeItem`.
+            // After a runtime rebuild the SAME gate empties `selectedItems`
+            // wholesale (fn-4.10, R8), so this current-runtime cleaner can
+            // never act on a snapshot the previous composition captured.
+            let cleaner = runtime.makeCleaner(snapshot: adoptedSnapshot)
+            report = await cleaner.clean(
+                items: items, moveToTrash: moveToTrash,
+                authorization: authorization
+            )
+        }
         lastReport = report
-        isCleaning = false
         showCleanupReport = true
 
         // Rescan to update sizes. `.userInitiated`: a confirmed cleanup is

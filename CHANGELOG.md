@@ -7,14 +7,224 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 Scanner unification (`SpaceScanner` protocol) plus the project
-build-artifacts scanner. Breaking CLI release for JSON consumers:
-`schema_version` is now 4 and `--cli scan` emits an envelope instead of a
-top-level array. Coordinate MCP updates with `cacheout-mcp` (see PROTOCOL.md
-and docs/v1/CLI-REFERENCE.md) — the pre-release `node_modules` →
-`build_artifacts` slug rename below is part of that coordination.
+build-artifacts and stale-git-worktree scanners. Breaking CLI release for
+JSON consumers: `schema_version` is now 4 and `--cli scan` emits an envelope
+instead of a top-level array. Coordinate MCP updates with `cacheout-mcp` (see
+PROTOCOL.md and docs/v1/CLI-REFERENCE.md) — the pre-release `node_modules` →
+`build_artifacts` slug rename and the `git_worktrees` no-client-timeout rule
+below are both part of that coordination, and the latter BLOCKS this release.
 
 ### Added
 
+- **Stale git worktrees in the GUI and the CLI.** A `git_worktrees` per-item
+  scanner walks your configured dev roots for LINKED git worktrees whose work
+  is finished — the field case being 23 GB of merged worktrees under a hidden
+  `.claude/worktrees/` directory. A worktree is offered only when all four
+  gates pass: linked (not the main checkout, not bare), clean (`git status`
+  with submodules and untracked files forced on, so a repository cannot
+  configure its way to a false "clean"), merged into the repository's default
+  branch by local ancestry, and not locked. Every gate fails CLOSED — a
+  command that fails, times out or cannot be answered never passes — and each
+  row carries all four clauses as evidence, with the merge clause hedged
+  because `--is-ancestor` structurally misses squash and rebase merges. A
+  worktree that fails a gate is omitted rather than listed as an undeletable
+  row, and so is one whose git admin directory cannot be identified at scan
+  time — the check that later proves it is still the same checkout cannot be
+  armed without that, so the scan reports the problem instead of offering the
+  row. Separately, each repository whose registered checkouts no longer exist
+  on disk gets ONE item for its orphaned worktree registry, disclosing exactly
+  the set it will remove — unless one of those registrations was DETACHED at a
+  commit no branch, tag or other ref reaches. That registration's admin data
+  is the only name the commit has, so removing it would leave your work
+  unreachable and a later `git gc` could delete it; Cacheout then offers
+  nothing for that repository and tells you which commit to name. Naming it
+  (`git branch`, `git tag`, a merge or a push) clears the refusal on the next
+  scan, and the check runs again at clean time. `--cli scan` reports both as `scanner_items` rows
+  and `--cli clean` accepts `git_worktrees` or `git_worktrees:<item-id>` —
+  destructive runs still require `--confirm`. Nothing here is ever
+  auto-selected, Quick-Cleaned, or reached by `smart-clean`. The macOS
+  privacy prompts for Documents and Desktop now name worktree discovery
+  alongside build artifacts, in all three build paths — the prompt describes
+  every scanner that actually walks those roots.
+- **Worktree removal is Cacheout's own, and git is only asked questions.**
+  It used to be `git worktree remove`, and the entry that described it
+  measured the wrong thing: it called the moment git was LAUNCHED "the
+  destructive call". It is not. git then starts up, reads its registry, runs
+  its own status walk over the whole tree, and only then unlinks — and it
+  never re-reads the facts the checks just established. Measured on git
+  2.50.1: **14.9 ms** (median of ten) between launching git and the first
+  file being gone, on a worktree holding a single tracked file, and the gap
+  GROWS with the tree because git's status walk sits inside it. Cacheout
+  removes the checkout itself now, with the identity, lock and HEAD re-proof
+  immediately in front of it — **0.03 ms** (permanent) and **0.004 ms**
+  (Trash) before the destruction, both with the queue that runs it held busy —
+  and it does not grow. The cleanliness answer is not in that re-proof and
+  cannot be — it runs `git` — and its own distance from the destruction is
+  given, with its load condition, in the "permanent delete now does the same
+  across its own hop" entry below. Nothing became
+  removable that was not removable before — every case where git refused
+  already ended in this same delete. What is new is the refusals that gap
+  used to swallow.
+
+  Before the removal, the gates the scan used are re-established against the
+  live repository: which repository the parent path actually resolves to, and
+  whether the worktree is still registered, still linked, still unlocked and
+  still merged. Anything that changed since the scan refuses, names the
+  action that clears it ("run `git worktree unlock …`", "merge, rebase or
+  push that commit"), and deletes nothing. The tree is re-checked for
+  cleanliness LAST, immediately before deleting — so work you save while the
+  checks are running is found, not destroyed — and the delete is followed by
+  a narrowly gated removal of that worktree's own admin entry. A tree that
+  went dirty in that window is refused; commit, stash or stop writing,
+  re-scan, and it is offered again.
+
+  The re-establishment also proves WHICH worktree it is about, by identity
+  and not by path: the checkout at the assessed path must still back-link to
+  the admin directory the scan resolved AND that directory must be the same
+  object the scan saw. So a checkout you moved onto that path, and equally
+  one you removed and re-created there, is refused rather than removed — the
+  replacement is judged on its own merits by the next scan. That identity is
+  taken when the scan first WALKS onto the checkout, before it asks git for
+  the repository's list of worktrees, and it is taken a second time once
+  that list comes back and a third time before the row is armed. All three
+  must agree, so a checkout replaced at any point after the scan walked onto
+  it — including while git was producing the list itself — is refused with a
+  visible reason rather than offered, because the row's evidence would
+  describe a checkout that is already gone.
+
+  A worktree the walk never reaches is offered too, and its identity is read
+  straight out of the repository's own worktree registry immediately before
+  that list is asked for. For one release it was not: such a worktree was
+  refused by every scan, with a message saying the next scan would clear it.
+  Nothing could. The walk stops at a fixed depth below each of your dev
+  roots, no setting changes it, and a checkout registered deeper than that —
+  or under a directory the walk cannot read — was invisible to the walk on
+  every future scan just as it was on the first, while git listed it every
+  time. What can still refuse a row for want of an identity is a read that
+  FAILS on both paths — a permission blip, an entry that vanished — and that
+  one a re-scan genuinely can clear.
+  (Two earlier drafts of this entry were wrong about where that identity was
+  taken, each in the same direction. The first said it was taken before the
+  worktree was examined; the second said it was taken at the repository
+  listing. Both were still taken AFTER the read that produced the row's
+  evidence, so a checkout replaced the instant the listing returned was
+  offered anyway — silently, with no reason shown at all, armed with the
+  REPLACEMENT's identity, and destroyed by the clean that followed. Both
+  drafts also said the remaining gap was answered at delete time by this
+  same identity. IT WAS NOT, and that claim is withdrawn: the delete-time
+  check compares against the very identity that had been poisoned, so both
+  sides of it were the replacement and it agreed with itself. The window was
+  also larger than the second draft said — it grew with the number of
+  worktrees in the repository. All of this was measured, and is now
+  refused. A THIRD correction, to the entry that reported the second: it said
+  the identity was taken when the scan walks onto the checkout, and for one
+  release the code did not do that — it took it once the whole walk had
+  finished, for every checkout in the tree at once. So a checkout replaced
+  after the scan had walked onto it but before that pass reached it was
+  offered silently, armed with the replacement's identity, and destroyed by
+  the clean that followed; and the window grew with the size of your tree and
+  with the number of worktrees in the repository, rather than being the fixed
+  thing that entry described. The identity is now taken where the entry always
+  said — the moment the scan sees the checkout's `.git` — and what is left
+  uncovered is one step of the scan's own directory read, which does not grow
+  with anything. A related message correction rides with it: a checkout whose admin
+  directory could not be stat'd for a moment — a permission blip, an entry
+  that vanished and came back — used to be reported as one that "was replaced
+  while this scan was running". It now says the identity could not be read
+  and the gate could not be armed, which is what actually happened; either
+  way the row is not offered.) (This window is
+  the desktop app's, where one scan's results stay on screen across your
+  click. An earlier draft of this entry said `--cli clean` was protected
+  because its re-scan answers a replacement with "unknown item id — rescan
+  and retry"; that was WRONG and is corrected here. Item ids are derived from
+  the scanner and the path, so a replacement at the same path has the same
+  id, and candidacy has no age term — the CLI's re-scan re-judges whatever is
+  at the path, and removes it if all four gates pass on its own merits. It
+  does not detect the substitution.)
+
+  Immediately before the delete, three further facts are re-read straight
+  from the filesystem — that the checkout is still the assessed one, that
+  nobody has locked it, and that its HEAD has not moved — which costs
+  microseconds rather than further git commands. What that cannot cover is
+  stated rather than implied: cleanliness is git's answer and is the last
+  command run; and on a branch, a commit made while the checks run does not
+  move HEAD — that commit survives on the branch, which no removal here
+  touches. A DETACHED worktree whose HEAD cannot be re-read from disk is
+  refused outright rather than removed, because a commit lost there would be
+  reachable from nothing; put the work on a branch and re-scan.
+
+  A correction to the previous entry, which said repositories using the
+  `reftable` ref format "keep no per-worktree HEAD file". They keep one.
+  Measured on git 2.50.1, `git init --ref-format=reftable` followed by
+  `git worktree add --detach` leaves a `HEAD` file that reads
+  `ref: refs/heads/.invalid`, unchanged in bytes across a detached commit,
+  while git reports a real commit id. The file is there and readable; what it
+  cannot do is corroborate anything. Those repositories are now checked
+  through the worktree's own ref stack instead, which moves on every ref
+  write — and that catches a commit made on an ATTACHED branch too, which the
+  ordinary HEAD file cannot. Through the previous release an attached
+  worktree in such a repository had no HEAD check at all.
+
+  **Files your `.gitignore` hides are now accounted for honestly.** `git
+  status` reports nothing about an ignored path, so the previous entry's
+  promise that "work you save while the checks are running is found" was
+  false for anything ignored — measured, a `secret.env` written in that
+  window was destroyed with the tree and the report showed a plain success.
+  The ignored list is now read before the checks and again immediately before
+  the delete, and a path that APPEARED refuses the removal by name. Ignored
+  content that was ALREADY there is still destroyed with the worktree — that
+  is the point of the feature — and two limits are stated rather than
+  implied: a file created inside a directory that is itself ignored is not
+  detected, and a change to an ignored file that already existed is not
+  detected.
+
+  The repository-level item removes exactly the admin directories it
+  disclosed, one at a time — no repository-wide `git worktree prune` runs,
+  because git recomputes that command's set for itself after every check has
+  already answered, and a second checkout of the same repository that
+  vanished in between would be swept without ever having been listed.
+  **No branch is ever deleted and repository objects are never touched.**
+
+  **Move to Trash now applies to the checkout.** It did not before: git
+  unlinked the tree whatever the toggle said, and the app ships with Move to
+  Trash ON, so the most common worktree removal was unconditionally
+  unrecoverable. The `worktrees/<id>` registry directory that follows the
+  checkout is still removed permanently, as is a repository prune, and the
+  confirmation sheet discloses exactly that split per selected item. The
+  cleanup report records which disposal ran. A removal that succeeded but
+  left admin data behind reports a `warning` on its row (the bytes were still
+  freed) and the next scan offers the leftovers.
+
+  **And the last check before a Trash move now runs on the same thread the
+  move does.** Moving an item to the Trash has to happen on the app's main
+  thread — that is macOS's rule, not ours — while every safety check ran just
+  before hopping onto it. The gap between the two was therefore however long
+  the main thread was busy, not a fraction of a millisecond: measured through
+  the shipping code with the main thread held for 120 ms, **175.7 ms** passed
+  between the last check and the move. Both the checks and the move now happen
+  on the far side of that hop, with nothing in between: **0.004 ms** under the
+  identical load. This affects every Trash disposal in the app, not only
+  worktrees.
+- **And permanent delete now does the same across its own hop.** Permanent
+  delete runs on a background queue, so it never waited on the main thread —
+  but it waits on that queue, and the check it re-ran on the far side proved
+  only which FOLDER it was deleting in, never which checkout stood there,
+  whether it had been locked, or whether its HEAD had moved. With the
+  background pool held busy, **242.7 ms** passed between the last of those
+  three checks and the delete; they now run on the far side of that hop too,
+  leaving **0.03 ms**. What still does not cross either hop is the
+  cleanliness check: it runs `git`, and starting a program there would be a
+  worse trade than the gap it closes. Under a busy queue that gap is
+  185.9 ms (Trash) and 241.2 ms (permanent), and work saved into the worktree
+  inside it is still destroyed with the tree — re-scan and the item is judged
+  afresh.
+- **`tool_unavailable` scan errors.** When a scanner cannot run an external
+  tool it depends on — today `git` for `git_worktrees` — the scan publishes a
+  `tool_unavailable` row in `scanner_errors` and withdraws every item that
+  scan had built, instead of reporting an empty result that would be
+  indistinguishable from a machine with nothing to clean. Like
+  `malformed_outcome` and `config_invalid` it carries no `path`: the problem
+  is the toolchain, not a location.
 - **Project build artifacts in the GUI and the CLI.** A `build_artifacts`
   per-item scanner walks your configured dev roots for build output PROVEN by
   an ecosystem marker — `target/` beside `Cargo.toml`, `node_modules/` beside
@@ -250,8 +460,13 @@ and docs/v1/CLI-REFERENCE.md) — the pre-release `node_modules` →
   descriptors are bounded (the probe holds at most `clamp((RLIMIT_NOFILE −
   64)/4, 4, 64)` anchors plus two transients; the tree walker holds at most
   its depth budget), and exceeding that bound is never a refusal — anchors
-  are released and restored with an identity-verified `..` step, so no tree
-  depth can strand an item the way the retired depth cap did.
+  are released and restored with an identity-verified `..` step, so
+  exceeding it can never strand an item the way the retired depth cap did.
+  That is a claim about THIS bound — the anchors a walk holds open — and not
+  about every depth limit in the product; it has since been read wider than
+  it was written, so the scope is now explicit. The project tree walk still
+  carries a fixed per-root depth budget, and a directory beyond it is never
+  visited at all.
 - **The post-walk pass re-proves CONTAINMENT instead of re-resolving a
   path.** Anchoring the walks was not enough on its own: the scanner threw the
   walker's vetted descriptor away and kept a bare URL, then re-resolved that
@@ -367,9 +582,335 @@ and docs/v1/CLI-REFERENCE.md) — the pre-release `node_modules` →
   reachable. `-I` and `--exclude-dir` keep it scoped to source: a stale or
   freshly written `__pycache__/*.pyc` would otherwise let the gate report on
   build artifacts instead of on the code.
+- **BREAKING for MCP callers: NO client-side timeout on a confirmed
+  `git_worktrees` clean.** PROTOCOL.md's blanket 30-second subprocess timeout
+  now carries one exception, documented in full under "Subprocess Timeout".
+  Cleaning a worktree removes a tree that may be gigabytes, so ANY finite
+  client-side guess can kill a valid clean mid-removal and leave Cacheout in
+  partial state. (This entry originally said "runs `git worktree remove` … with
+  an unbounded guarded fallback behind it"; a later entry in this same
+  release replaced that architecture entirely. The rule is unchanged — what
+  is unbounded is the TREE.) Callers apply NO timeout when
+  a clean target token equals `git_worktrees`, starts with `git_worktrees:`,
+  or names an item whose preflight `scan` row carries
+  `"action": "git_worktree_reclaim"` — and, conservatively, when the target
+  is scanner-ambiguous (over-waiting is safe; a premature kill is not).
+  Everything else keeps 30 seconds. The CLI bounds itself: 300 s per git
+  invocation at delete time plus its own SIGTERM → SIGKILL escalation. If the
+  CLI is killed from outside anyway, an orphaned git child and a partially
+  removed tree are possible — the next scan recovers both (a partial tree
+  reads dirty or unassessable and is never a candidate; an orphaned admin
+  directory is offered by the prune tier).
+
+  **RELEASE-BLOCKING cross-repo gate.**
+  Status: **SATISFIED at 0b50b62** — cacheout-mcp adopted the rule.
+
+  **To close (ONE edit, one meaning):** run the verification below, then
+  replace that status line's `**NOT SATISFIED**` with
+  `**SATISFIED at <commit-hash>**` (7-40 hex characters — a commit anyone can
+  check out). Nothing else needs editing: the release script keys on the
+  `Status:` LINE alone, so this paragraph — and any future entry quoting the
+  phrase — never blocks a build. Those two spellings are the ONLY admissible
+  statuses: a deleted, duplicated, renamed or hash-less status line is an
+  unverifiable gate and blocks exactly like an open one.
+
+  **Deferred to the release path, deliberately — and ENFORCED there.**
+  Merging this work with the gate open is intentional: the scanner ships to
+  users only at release, and `[Unreleased]` is exactly where an unshipped
+  precondition belongs. It is not left to memory —
+  `scripts/bundle.sh` runs `check_release_gates` FIRST in EVERY
+  distribution-producing mode (`--release`/`--notarize` and `--direct`, which
+  also produces a signed DMG), before it builds, signs, packages or
+  notarizes anything. A missing or unreadable CHANGELOG aborts too: an
+  unverifiable gate is never a passed one. The default no-flag mode builds an
+  unsigned .app for local testing and ships nothing, so it is not gated.
+
+  - **Consumer:** `cacheout-mcp` (org `acebytes`), branch
+    `fn-1.3-memory-stats-mcp-tool`, PR #1.
+  - **Baseline verified at `63edbfc`:** `AppEngine._run`
+    (`src/cacheout_mcp/engine.py:465`) wraps EVERY CLI invocation in
+    `asyncio.wait_for(proc.communicate(), timeout=120)` (line 475) and raises
+    at line 480. A confirmed `git_worktrees` clean therefore gets SIGKILLed
+    at 120 s today — mid-removal on any tree that takes longer.
+  - **Required change:** derive the timeout per invocation and pass `None`
+    when the D18 trigger fires (target token `git_worktrees`, a
+    `git_worktrees:` prefix, a preflight row whose `action` is
+    `git_worktree_reclaim`, or a scanner-ambiguous target); every other
+    command keeps its existing bound.
+  - **Owner:** the fn-5.6 implementer, at release time.
+  - **Verification**, both parts source-scoped (`-I` and
+    `--exclude-dir=__pycache__` keep a stale `.pyc` from deciding the
+    verdict), run in the `cacheout-mcp` checkout:
+
+  ```
+  # (1) the trigger rule is implemented AND tested — must be NON-ZERO:
+  grep -rnI --exclude-dir=__pycache__ -E '"git_worktrees"|git_worktrees:' src tests
+
+  # (2) the blanket CLI timeout is gone — must be ZERO:
+  grep -rnI --exclude-dir=__pycache__ -E 'proc\.communicate\(\), timeout=120' src
+  ```
+
+  Zero in (2) is reachable and stable: the runner must DERIVE its timeout per
+  invocation (`None` for composite-capable cleans) instead of hardcoding one
+  for every command. The adopting commit hash going into the status line is
+  what closes this gate — and what lets any distribution build run.
 
 ### Fixed
 
+- **A scan could hang before it started, with the spinner up and no way to
+  stop it.** The first thing a scan does after marking itself in progress is
+  refresh the free-space figures in the header. That refresh was unbounded:
+  it ran on a background worker, and if no worker was free — or the boot
+  volume was slow to answer — the scan sat there. Every protection Cacheout
+  has for a scan that will not finish is armed by the NEXT step, so none of
+  them applied: no timeout fired, no "scan did not finish" row appeared, the
+  spinner stayed up, a second scan was refused as already running, and the
+  app looked healthy while nothing was happening. Reproduced with the
+  background workers held busy: the scan returned after 2.6 s with no problem
+  reported, while a complete scan under its own timeout took 0.007 s in the
+  same run. The refresh now gives up after two seconds and the scan carries
+  on immediately, keeping whatever free-space figures it already had (before
+  the first successful reading, the usage bar simply stays hidden, exactly as
+  it does when the volume cannot be read at all). Nothing is remembered about
+  the failure — the next scan reads the figures again from scratch, and a
+  busy moment or a briefly unresponsive volume clears itself. The identical
+  refresh after "Prune Docker" is bounded the same way, so a slow volume can
+  no longer leave that button disabled.
+- **"Move to Trash" could take a file that was never yours, and report your
+  folder's bytes as freed.** Before deleting anything Cacheout re-inspects the
+  item, and for one kind of answer — "there is no folder of ours at this name
+  any more", which is what it records when the thing at the path turns out to
+  be a plain file — the Trash disposal checked only that SOMETHING that is not
+  a folder answered to that name. It never checked WHICH FOLDER it was looking
+  in. So if the cache folder itself was replaced between the safety check and
+  the disposal — by a program, an installer, or a synced folder arriving — the
+  file that landed at the same name inside a stranger's folder was moved to
+  your Trash, and the report said the item had been cleaned and counted its
+  bytes as freed. Permanent delete refused the identical event, and said so.
+  The Trash disposal now holds the folder it was given, proves it is the same
+  folder the safety check admitted, and reads the item INSIDE it — before the
+  move and again at the last instant before it — so a swapped folder is
+  refused with nothing moved, and a swap that lands inside the Trash system's
+  own resolution is caught afterwards and reported honestly: the item is
+  refused, nothing is counted as freed, and the message names where the
+  wrongly-taken file is so you can put it back in one drag. A folder that
+  appeared at that name since the check is refused too, which is what the
+  answer meant in the first place.
+- **A refusal about your FOLDER no longer reads as a refusal about your item.**
+  When Cacheout stops because the folder holding an item was replaced, the
+  cleanup log says `container-drift`; when it stops because the item itself
+  changed, it says `content-drift`. Two Trash-side refusals about the folder
+  were being written down as the item having changed, which sends you to look
+  at the wrong thing. They now say what they mean.
+- **Cleaning up abandoned git-worktree records no longer counts space
+  something else freed.** When Cacheout removes the leftover bookkeeping
+  folders of git worktrees you have deleted, it re-checks the list immediately
+  before acting, and that list is allowed to SHRINK — an entry that was
+  locked, repaired or removed by something else in the meantime is dropped.
+  The freed-space total was then computed over the ORIGINAL list, counting any
+  entry that was simply no longer there. So a folder another program removed
+  while Cacheout was working was billed to Cacheout: measured on a test
+  fixture, 450,560 bytes reported where 24,576 were actually this operation's.
+  The total now follows the entries Cacheout itself removed.
+- **A scan can no longer hang the app forever.** The window showed each
+  scanner's progress and stopped when they all reported — and if one of them
+  never reported, nothing ever ended it: the spinner ran until the app was
+  quit, and while it ran no second scan and no cleanup could start. A scan
+  session now runs under a time limit. When it expires, every scanner that has
+  not reported is listed with "did not finish in time — nothing from it was
+  used; re-scan to try again", nothing that scanner might have found is
+  published, whatever it showed before is kept but cannot be cleaned, and
+  every scanner that DID finish keeps its results — a partial scan is
+  reported as partial, never as complete and never as empty. The limit is far
+  above any real scan, and re-scanning genuinely can succeed: it is a limit on
+  elapsed time, so a warmer cache, an answered privacy prompt or an unmounted
+  volume changes the outcome. `scan --format json` reports it as a
+  `scan_did_not_finish` row in `scanner_errors`.
+- **"Move to Trash" no longer tells you your folder could not be put back
+  while it is sitting in the Trash.** Move to Trash is the shipped default,
+  and after moving an item Cacheout re-identifies it where the Trash said it
+  put it — the check that catches a folder swapped out from under the
+  disposal. That check opened `~/.Trash` itself, and macOS refuses that to
+  every app without Full Disk Access, so on an ordinary Mac it could never be
+  taken: every trashed item was reported as a refusal with nothing freed, and
+  the message said what the Trash took "could not be put back — it is no
+  longer at `~/.Trash/<name>`, where the Trash reported putting it" — about a
+  folder that was at exactly that path, intact, one drag from recovery. When
+  — and ONLY when — macOS answers that open with a permission denial, the
+  check now identifies the item the way the permission actually allows, so a
+  real disposal is reported as one and a swapped folder is still caught and
+  refused. Any OTHER reason the folder cannot be opened is still a refusal:
+  in particular a landing folder that turns out to be a symbolic link is
+  refused rather than followed, because following it would identify the
+  object on the other side of the link and report a move that never
+  happened. When such a refusal happens without Full Disk Access the item
+  cannot be moved back automatically, and the message now says where it is
+  instead of denying it is there. **The same symbolic-link rule now covers
+  every kind of item.** Folders whose contents were checked before the move
+  were re-identified by their full path instead, which followed a symbolic
+  link standing in for the Trash folder just the same — and because such a
+  link can be aimed back at the item's own folder, the check could find the
+  original item exactly where it started, agree that it was the right one,
+  and report the folder as freed when nothing had moved at all. That path is
+  now read the same way as the others, so the link is refused rather than
+  followed and no disposal can report a move that did not happen.
+- **And it no longer abandons a FILE in your Trash while denying it is
+  there.** The same message had a second way of being wrong, on the same
+  shipped default. When the folder Cacheout was about to trash was swapped
+  for a plain file in the instant between the last check and the Trash's own
+  move — the window that check exists to catch — the Trash took the file, and
+  the undo that should have put it back refused to name it: the identification
+  step recognised folders and nothing else, so a file, a symbolic link or a
+  pipe sitting in your Trash came back as "nothing found". You were told the
+  item "is no longer at `~/.Trash/<name>`, where the Trash reported putting
+  it, so nothing was moved" while it was at exactly that path and the
+  original name was left empty. The undo now identifies every kind of object,
+  so what the Trash took is put back where it came from and the refusal says
+  so. When the put-back cannot be performed — the Trash or the destination
+  folder cannot be opened — the message gives you the path in the Trash to
+  drag it back from, rather than claiming it is not there. **Without Full
+  Disk Access that second case is not the exception, it is what happens every
+  time**; see the Full Disk Access note two entries below.
+- **One disposal path refused to work under a symlinked folder while the
+  other four worked.** Cacheout deliberately follows symlinks when it opens
+  the folder that HOLDS the item it is about to remove — a cache root reached
+  through a link is a real folder, and refusing it would refuse every deletion
+  under it. Permanent delete does that, and so do three of the four Move to
+  Trash paths. The fourth — the one used when the item's own folder was
+  checked before the move — re-opened that holding folder a second time, by
+  path, refusing to follow: on a fixture where the item's immediate folder is
+  a symbolic link, the other four removed or trashed the item and this one
+  refused with "Not a directory" about a directory that plainly is one. It now
+  reads the item under the same followed, identity-checked folder the other
+  paths use, so all five agree. No scanner Cacheout ships could reach the
+  refusal (the items with this kind of check are always direct children of a
+  root that is itself checked), so nothing you could clean was affected. The
+  Trash side of the same check still refuses to follow a link, because the
+  folder the Trash reports is not one anybody proved.
+- **And the UNDO under such a folder no longer strands your item in the
+  Trash.** Fixing the check above only fixed the way IN. When a Move to Trash
+  is undone — Cacheout puts the item straight back if it cannot prove the
+  Trash took the right thing — the folder it restores INTO was still opened
+  the refusing way. So under a folder reached through a symbolic link, all
+  four Move to Trash paths moved the item to the Trash and then could not put
+  it back: the put-back was never attempted, your item was left in the Trash
+  and the original name was left empty. Under an ordinary folder the identical
+  event put the item back every time. That made the fix above strictly worse
+  than the refusal it replaced, on that one path — before it, the item was
+  refused before the move and your Trash was never touched. The undo now opens
+  and identity-checks that folder exactly the way every other removal in the
+  app does, so it puts the item back under either spelling; and the refusal
+  that says "the folder that holds this item is not the one that was
+  admitted", which such a folder could never reach before, is now reached and
+  reported. **Both of those need Full Disk Access, and neither sentence
+  above said so.** Putting an item back means opening the Trash folder, and macOS
+  refuses that to any app without Full Disk Access — which Cacheout does not
+  ask for and does not have by default. So for an item on your STARTUP VOLUME
+  the undo stops one step earlier than either sentence above describes, under
+  EITHER spelling: nothing is put back, the item stays in the Trash, and the
+  message is the one that gives you its path so you can drag it back in one
+  move. Measured through the shipped Trash seam into the real Trash, on all
+  four Move to Trash paths, eight runs out of eight. What is fixed for
+  everyone is that the move itself still succeeds and the message names where
+  the item is; what is fixed only once you grant Full Disk Access is the
+  automatic put-back and the "folder that holds this item" refusal.
+  **And that is a fact about the STARTUP VOLUME, not about Cacheout: the
+  paragraph above once said it of every item, and for items on any other
+  disk it is false.** macOS gives each mounted volume its own Trash, and only
+  the one in your home folder is protected. An item cleaned from an external
+  drive, a disk image or any other mounted volume goes to that volume's own
+  Trash, which any app may open — so on those volumes the automatic put-back
+  and the "folder that holds this item" refusal both work with no Full Disk
+  Access at all. Measured on a temporary disk image, all four Move to Trash
+  paths, eight runs out of eight, with the home Trash still refused in the
+  same process.
+- **A folder that is simply GONE is no longer reported as one somebody
+  replaced.** If an item vanishes between the safety check and the deletion —
+  an ordinary race with an installer, an uninstaller or a synced folder —
+  permanent delete and three of the four Move to Trash paths say "No such file
+  or directory". The fourth said "the folder at this path is no longer the one
+  that was inspected — it was replaced between the safety check and the
+  deletion", and the cleanup log recorded it as the item having changed.
+  Nothing had been replaced: the name was empty. All five now report the
+  absence as an absence.
+- **Refusal messages no longer tell you your folder was replaced when nothing
+  looked at it.** Five of the six Move to Trash refusals opened by asserting
+  that the folder at the item's path was no longer the one that was inspected.
+  Nothing in the disposal re-reads that path: what it checks after the move is
+  what the Trash actually took. On a disposal that moved NOTHING and reported
+  a Trash location where nothing stands, the item was still on disk,
+  untouched — and you were told it had been replaced AND to go and look in the
+  Trash for it. The five now open with what was actually established: the
+  disposal could not be proved to have moved the item that was inspected. Each
+  one's remaining clauses are unchanged except where they were also stronger
+  than the evidence: the message no longer says the item "is no longer at" the
+  Trash path it names, only that it cannot be found there now.
+- **And two refusals no longer tell you where an item is when nothing
+  established it.** The entry above fixed the OPENING of five messages and
+  left the ends of two of them saying things no check on those paths
+  performs. The first is the same event the entry above describes — the
+  disposal moved nothing and your folder never left — and after being told
+  correctly that the move could not be proved, you were still told to "look
+  in the Trash for it", for an item sitting untouched exactly where it
+  started. The second happens when the undo puts something back and the
+  object it moved turns out not to be the one the Trash took: you were told
+  "the item the Trash took is still in the Trash". Nothing shows that. All
+  that was established is that the NAME in the Trash was re-used by something
+  else while the undo was running; the item itself may have been moved
+  anywhere, and was measured being moved out of the Trash entirely. Both
+  messages now say plainly that where the item is was not established, and
+  both still name every path they do know. The check that keeps false claims
+  out of these messages used to read only their first sentence; it now reads
+  the whole message.
+- **And the last refusal that claimed something about your disk no longer
+  does.** One of the six — the one you see when Cacheout takes something back
+  out of the Trash because it could not prove the Trash took the right thing
+  — ended "nothing was freed". The other five say "nothing was REPORTED
+  freed", which is what Cacheout actually knows: it wrote no entry and
+  counted no bytes. Whether anything on the disk was freed is not something
+  that check looks at, and on the very event that produces this message
+  something else HAD been moved. It now says "nothing was reported freed",
+  like its five siblings. The check behind all six changed shape too: it used
+  to be a list of sentences that had been caught being wrong, so a NEW way of
+  saying the same wrong thing passed it. Each message is now assembled from
+  clauses that each name the one thing they claim, and every clause is
+  checked against what that refusal's own code path proved.
+- **THE ENTRY ABOVE ENDED WITH A CLAIM THAT WAS MEASURED FALSE, and the
+  sixth refusal was still sending you to the Trash for an item that never
+  left.** That entry used to end "so a false sentence nobody has thought of
+  yet fails as well". It does not: eight new false wordings were written
+  against that check and all eight passed it, five of them saying the very
+  thing the two entries above had just been spent retiring. The check read
+  each clause's WORDS — does this name a place, does it claim bytes, is it
+  hedged — and every such test is a password rather than a property. The
+  messages are no longer WRITTEN at all: each refusal now states exactly the
+  set of things its own code path established, one fixed sentence per thing,
+  chosen from a closed list, with the next step chosen from a closed list of
+  two. A sentence asserting something the check did not establish has nowhere
+  to be written, rather than being caught after the fact. What that still
+  cannot catch is stated in the code and is worth saying here: someone can
+  word one of those fixed sentences to say more than the thing it stands
+  for.
+- **And the sixth refusal — "the Trash did not report where it put the item"
+  — no longer tells you to check your Trash.** It ended "Check the Trash, and
+  use permanent delete…", and the check positively endorsed that, on the
+  reasoning that a Trash disposal which returns without an error must have
+  put the item in the Trash. Measured on all four disposal paths: a disposal
+  that moves NOTHING and reports no location produces exactly this refusal,
+  and the item is still where it started, same folder, same inode. That was
+  the only thing any of these messages claimed on the strength of what a
+  component is supposed to do rather than something Cacheout read, and it is
+  the same mistake an earlier entry above fixed for a different refusal. The
+  message now says what this path does know: no location was reported,
+  nothing was reported freed, where the item is now was NOT established, and
+  permanent delete is the disposal that does not depend on the Trash naming
+  anything.
+- **A refusal that leaves your item in the Trash now warns you the put-back
+  can collide.** "Move it back from there" is what Cacheout says when it
+  could not restore the item itself. One of the three ways that refusal
+  arises is the restore failing because something ALREADY occupies the item's
+  old name — so the manual move you were told to make walks into the same
+  obstacle. The message now says to move whatever is there aside first.
 - **A background refresh no longer reads the folders it has already decided
   to skip.** The ephemeral-temp scanner runs only when you ask for a scan, but
   before each scan Cacheout records the identity of every folder it might
@@ -484,7 +1025,12 @@ and docs/v1/CLI-REFERENCE.md) — the pre-release `node_modules` →
   actually took afterwards; anything it cannot prove is PUT BACK and reported
   as a refusal, with nothing counted as freed. If the put-back cannot be
   performed the item stays in the Trash and the error names its path, so it is
-  recoverable in one drag.
+  recoverable in one drag. The stale-worktree removal added in this same
+  release — the disposal the GUI performs on a worktree — goes through the
+  identical check, so no Trash disposal in the app is handed a bare path.
+  (Originally written as "the stale-worktree fallback … when git refuses to
+  remove a worktree"; a later entry in this release made that removal the only
+  arm there is, reached unconditionally rather than on a refusal.)
 - **"Move to Trash" undo: a put-back will not restore into a folder it cannot
   prove.** When the Trash turns out to have taken the wrong folder, Cacheout
   puts it back. That undo held its destination folder open but never checked

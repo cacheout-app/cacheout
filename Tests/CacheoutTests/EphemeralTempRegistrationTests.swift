@@ -42,7 +42,9 @@ final class EphemeralTempRegistrationTests: XCTestCase {
         fixtureHome = base.appendingPathComponent("home")
         tempRoot = base.appendingPathComponent("shared-temp")
         for url in [base, fixtureHome, tempRoot] {
-            try fm.createDirectory(at: url!, withIntermediateDirectories: true)
+            try fm.createDirectory(
+                at: try XCTUnwrap(url), withIntermediateDirectories: true
+            )
         }
     }
 
@@ -164,8 +166,11 @@ final class EphemeralTempRegistrationTests: XCTestCase {
             CategoryScanner.registeredID,
             BuildArtifactsScanner.registeredID,
             OrphanedCachesScanner.registeredID,
+            GitWorktreeScanner.registeredID,
             EphemeralTempScanner.registeredID,
-        ], "the temp scanner is APPENDED — every existing slug keeps its place")
+        ], "the temp scanner is APPENDED — every existing slug keeps its "
+            + "place, including git_worktrees, which fn-5 registered ahead "
+            + "of it")
 
         let scanner = try XCTUnwrap(
             runtime.scanners.compactMap { $0 as? EphemeralTempScanner }.first
@@ -257,7 +262,7 @@ final class EphemeralTempRegistrationTests: XCTestCase {
     /// The cell above hands `production` a pre-built resolution through the
     /// `ephemeralTempRoots:` seam, which BYPASSES the `??` arm entirely.
     /// Neither shipped surface uses that seam: `CacheoutViewModel.production`
-    /// (`CacheoutViewModel.swift:483-499`) and
+    /// (`CacheoutViewModel.swift:555-574`) and
     /// `CLIHandler.CLIRuntimeDependencies.production`
     /// (`CLIHandler.swift:426-438`) both leave it `nil`, so both go through
     /// `EphemeralTempRoots.resolve(provider:confstrPath:)` inside the
@@ -699,7 +704,7 @@ final class EphemeralTempRegistrationTests: XCTestCase {
             case .success(let parsed):
                 XCTFail("\(args) must be rejected, parsed \(parsed)")
             case .failure(let error):
-                XCTAssertTrue(error.message.contains(args[0]),
+                XCTAssertTrue(error.message.contains(try XCTUnwrapElement(args, 0)),
                               "the refusal names the flag: \(error.message)")
             }
         }
@@ -1162,7 +1167,7 @@ final class EphemeralTempRegistrationTests: XCTestCase {
 
         XCTAssertEqual(report.entries.count, 1,
                        "one directory, one deletion", file: file, line: line)
-        XCTAssertEqual(report.entries.first?.scannerID, ordered[0].scannerID,
+        XCTAssertEqual(report.entries.first?.scannerID, try XCTUnwrapElement(ordered, 0).scannerID,
                        "the row that ran FIRST is the one that deleted",
                        file: file, line: line)
         XCTAssertEqual(report.totalFreedExact, build.exactBytes,
@@ -1172,7 +1177,7 @@ final class EphemeralTempRegistrationTests: XCTestCase {
                        "the second row is not a silent no-op — it surfaces as "
                         + "a per-item error", file: file, line: line)
         XCTAssertEqual(report.errors.first?.key.scannerID,
-                       ordered[1].scannerID, file: file, line: line)
+                       try XCTUnwrapElement(ordered, 1).scannerID, file: file, line: line)
         XCTAssertFalse(fm.fileExists(atPath: path),
                        "and the directory really is gone",
                        file: file, line: line)
@@ -1591,7 +1596,14 @@ final class EphemeralTempRegistrationTests: XCTestCase {
         )
 
         let session = Task { await viewModel.scan(trigger: .automatic) }
-        await rendezvous.waitUntilStarted()
+        // BOUNDED (D2): if production stops invoking the holder the cell
+        // fails HERE and unwinds, instead of parking the whole runner on a
+        // signal that is never coming.
+        guard await rendezvous.waitUntilStarted() else {
+            rendezvous.release()
+            await session.value
+            return
+        }
 
         // OBSERVED WHILE THE SESSION IS LIVE — the epilogue has not run.
         XCTAssertTrue(
@@ -1905,7 +1917,17 @@ private struct TriggerGatedFixtureScanner: SpaceScanner {
     }
 }
 
-/// A thread-safe invocation counter for the gated fixture scanner.
+/// A thread-safe invocation counter shared by the fixture doubles.
+///
+/// `bump()` returns the NEW value so a caller can act on "the Nth time" in
+/// ONE atomic step — reading `count` after a separate `bump()` is two
+/// operations and can interleave. `WorktreeReclaimPerformerTests` uses that
+/// to fire on the Nth invocation of a repeated argv — for example the FIRST
+/// `merge-base`, R2's last rung, which is the window between the ignored
+/// witness and the last gate. (Through r4 this note named "the fallback's
+/// `rev-parse --git-common-dir`, the SECOND one the performer runs"; there is
+/// one arm and one gate re-establishment now, and the second
+/// `--git-common-dir` belongs to the POST-removal prune recompute.)
 final class InvocationCounter: @unchecked Sendable {
     private let lock = NSLock()
     private var value = 0
@@ -1913,64 +1935,60 @@ final class InvocationCounter: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         return value
     }
-    func bump() {
+    @discardableResult
+    func bump() -> Int {
         lock.lock(); defer { lock.unlock() }
         value += 1
+        return value
     }
 }
 
 /// A two-phase rendezvous so a test can observe view-model state WHILE a scan
 /// session is live. No sleeping and no polling: the scanner signals that it
 /// has been entered, then parks until the test releases it.
+///
+/// BOTH PHASES ARE BOUNDED (PR #460 codex r11, D2), and the START phase is
+/// why. Its only resumer is a `signalStarted()` inside a fixture scanner that
+/// PRODUCTION invokes — `RendezvousFixtureScanner.scan` runs it only when
+/// `context.includeProtectedRoots == false` — so an ordinary production
+/// regression makes the signal never arrive. Measured with ONE mutated line
+/// (`ScanContext.includeProtectedRoots` → `{ true }`) the old unbounded
+/// `waitUntilStarted()` parked the runner for as long as anyone waited: the
+/// log ended at this cell's `started.` line, with no failure, no total line
+/// and no exit. See `BoundedRendezvous` in `TestElementAccess.swift`.
 final class ScanRendezvous: @unchecked Sendable {
-    private let lock = NSLock()
-    private var started = false
-    private var startWaiter: CheckedContinuation<Void, Never>?
-    private var released = false
-    private var releaseWaiter: CheckedContinuation<Void, Never>?
+    private let start = BoundedRendezvous()
+    private let releaseGate = BoundedRendezvous()
 
-    func signalStarted() {
-        lock.lock()
-        started = true
-        let waiter = startWaiter
-        startWaiter = nil
-        lock.unlock()
-        waiter?.resume()
+    func signalStarted() { start.open() }
+
+    /// `false` (and one failed cell) if nothing signalled within the bound.
+    @discardableResult
+    func waitUntilStarted(
+        within seconds: TimeInterval = 30,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async -> Bool {
+        await start.park(
+            "the fixture scanner was never entered, so it never signalled "
+                + "that the session had started",
+            within: seconds, file: file, line: line
+        )
     }
 
-    func waitUntilStarted() async {
-        await withCheckedContinuation { continuation in
-            lock.lock()
-            if started {
-                lock.unlock()
-                continuation.resume()
-            } else {
-                startWaiter = continuation
-                lock.unlock()
-            }
-        }
-    }
+    func release() { releaseGate.open() }
 
-    func release() {
-        lock.lock()
-        released = true
-        let waiter = releaseWaiter
-        releaseWaiter = nil
-        lock.unlock()
-        waiter?.resume()
-    }
-
-    func waitForRelease() async {
-        await withCheckedContinuation { continuation in
-            lock.lock()
-            if released {
-                lock.unlock()
-                continuation.resume()
-            } else {
-                releaseWaiter = continuation
-                lock.unlock()
-            }
-        }
+    /// `false` (and one failed cell) if the cell never released it.
+    @discardableResult
+    func waitForRelease(
+        within seconds: TimeInterval = 30,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async -> Bool {
+        await releaseGate.park(
+            "the cell never released the scanner it parked",
+            within: seconds, file: file, line: line
+        )
     }
 }
 

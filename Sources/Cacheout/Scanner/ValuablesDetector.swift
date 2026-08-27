@@ -108,8 +108,12 @@
 /// the surviving one is measured byte-identical in exposure to the derivation
 /// it replaced — strictly fewer, never more. It is fail-closed downstream: the
 /// rotated token does not match at delete time, so the clean is REFUSED rather
-/// than performed against the wrong tree (`testAdvScanTimeTokenAuthorizesThe`
-/// `ProductionRevalidator` pins the honest round trip; a rotated token refuses).
+/// than performed against the wrong tree — the honest round trip is pinned by
+/// `testUnacknowledgedConfirmRefusesWithTokenThenTheTokenDeletes` and the
+/// rotated-token refusal by
+/// `testInPlaceReplacementRotatesTheTokenAndRefusesTheStaleOne`, both in
+/// `CLIGateTests`. (This sentence used to name a cell that has never existed;
+/// PR #460 codex r8, D3.)
 /// Closing it entirely needs `F_GETPATH` on the held anchor, which would change
 /// the identity doctrine for every scanner — deliberately out of scope here.
 ///
@@ -136,7 +140,7 @@
 /// this machine, `st_dev` is identical for literally every path INCLUDING
 /// `/` and `/System/Volumes/Data`, so the device comparison is blind to
 /// exactly the APFS firmlink split it was partly meant to catch. The two
-/// path-based signals the sizer (`DirectorySizer.swift:202,287`) and the
+/// path-based signals the sizer (`DirectorySizer.swift:261-272,354-359`) and the
 /// project walker already use are retained beside it — they are the seam
 /// hermetic tests inject through, and they can only ever push the answer
 /// toward refusal. There is still exactly ONE notion of "mount boundary" in
@@ -158,7 +162,8 @@
 /// which means network round trips, spin-up, and privacy-sensitive access to
 /// a filesystem the user never pointed this scanner at. And it buys nothing:
 /// an artifact dir containing a boundary is `.denied` at scan time and
-/// refused whole by the cleaner (`CacheCleaner.swift:875,970`), so no
+/// refused whole by the cleaner (`CacheCleaner.deleteGuardedChild`:1151 and
+/// `CacheCleaner.removeGuardedItem`:1371), so no
 /// valuable found past the mount could ever change an outcome.
 ///
 /// UNCROSSED ⇒ INCOMPLETE, never "clean": the honest report is "we did not
@@ -499,7 +504,8 @@ struct ValuablesDisclosure: Equatable, Sendable {
     /// `ValuableIdentity` integer verbatim (decimal; `device`/`inode`
     /// unsigned). The leading pair is the canonical ItemKey serialization,
     /// matching the frozen `stableID` preimage convention
-    /// (`SpaceScanner.swift:262`): item ids are scanner-scoped, so only the
+    /// (`ReclaimableItem.stableID`, `SpaceScanner.swift:796`): item ids are
+    /// scanner-scoped, so only the
     /// FULL ItemKey makes a token item-bound — a token applied to another
     /// item, even the same item id under a different scanner id, can never
     /// match.
@@ -933,7 +939,7 @@ enum ValuablesDetector {
         descriptorWindow: Int? = nil
     ) -> ValuablesDisclosure {
         // MOUNT BOUNDARY AT THE ROOT. The sizer applies these signals to its
-        // OWN root (`DirectorySizer.swift:202`) and declines to enumerate; the
+        // OWN root (`DirectorySizer.swift:261-272`) and declines to enumerate; the
         // probe must decline identically, or the delete-time face — which has
         // no size report to consult — would read a whole mounted volume.
         // Nothing beneath is opened: not one entry of a foreign filesystem is

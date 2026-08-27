@@ -16,6 +16,14 @@
 ///   selected, `viewModel.commandsTrashDisclosure` names EXACTLY those
 ///   items — their cleanup commands run regardless of the toggle and place
 ///   nothing in the Trash
+/// - The `git_worktree_reclaim` disclosures (fn-5.6/R11):
+///   `viewModel.gitWorktreeTrashDisclosures` names the selected worktree
+///   items, stale removals apart from repository prunes. The CHECKOUT
+///   honours the toggle since PR #460 codex r5 (Cacheout removes it, not
+///   git); the `worktrees/<id>` registry directory that follows it, and every
+///   repository prune, are removed PERMANENTLY whatever the toggle says — so
+///   without this the generic wording would falsely promise recoverability
+///   for the part that has none
 /// - Warning banner when a `.partiallyDenied` category is selected (R18):
 ///   unreadable contents — measured bytes only
 /// - Per-row DISCLOSED release artifacts (fn-4.6, R3): each valuable's
@@ -157,6 +165,23 @@ struct CleanConfirmationSheet: View {
                     .foregroundStyle(.orange)
             }
 
+            // fn-5.6 (R11/F7): the SAME honesty for the composite reclaim.
+            // Without this branch a selected worktree item would fall to the
+            // sheet's generic wording, which covers only the CHECKOUT — and a
+            // worktree reclaim also removes a `worktrees/<id>` registry
+            // directory, permanently, whatever the toggle says (PR #460 codex
+            // r5 corrects the old reason, "git unlinks, it does not trash":
+            // no git removal runs here any more). Stale removals and
+            // repo-level prunes are disclosed SEPARATELY — they are different
+            // promises — so the enumeration is over the derived strings, not
+            // one merged sentence.
+            ForEach(Array(viewModel.gitWorktreeTrashDisclosures.enumerated()),
+                    id: \.offset) { _, disclosure in
+                Label(disclosure, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
+
             // R18: explicit selection of a partially denied category is
             // allowed, but the sheet must say what the number means.
             if viewModel.hasPartiallyDeniedSelection {
@@ -290,10 +315,19 @@ struct CleanupReportSheet: View {
                                         Text(entry.componentSummary)
                                             .foregroundStyle(.secondary)
                                     }
-                                    // P2 honesty marker: in a Trash run, a
-                                    // command-erased entry put nothing in
-                                    // the Trash.
-                                    if let note = report.rowAnnotation(for: entry) {
+                                    // Row annotations come from the PURE
+                                    // presentation helper (fn-5.4): the P2
+                                    // disposal honesty marker (in a Trash
+                                    // run, a command-erased entry put
+                                    // nothing in the Trash) and the D11
+                                    // warning an otherwise-successful entry
+                                    // carries. The body renders, it never
+                                    // derives — `rowAnnotations(for:)` is
+                                    // the tested surface.
+                                    ForEach(
+                                        report.rowAnnotations(for: entry),
+                                        id: \.self
+                                    ) { note in
                                         Text(note)
                                             .font(.caption2)
                                             .foregroundStyle(.orange)
@@ -320,9 +354,40 @@ struct CleanupReportSheet: View {
                     // Positional identity because one item may carry
                     // several error lines.
                     ForEach(Array(report.errorLines.enumerated()), id: \.offset) { _, line in
+                        // THE MESSAGE IS THE WHOLE POINT, AND IT WAS
+                        // UNREADABLE (field report on the 2.2.0 build).
+                        //
+                        // A bare `Text` inside this sheet's `.frame(width:
+                        // 400)` truncates to ONE line with an ellipsis, so a
+                        // refusal like "…: the folder that holds this item is
+                        // no longer the one the safety check admitted"
+                        // rendered as a cache name and three dots. Every
+                        // refusal this app writes explains what it refused
+                        // and what to do next, and the user could read none
+                        // of it — which makes the careful wording upstream
+                        // worthless at the one moment it matters.
+                        //
+                        // THREE MECHANISMS, DELIBERATELY, because the
+                        // failing case is an UNBREAKABLE TOKEN. The reported
+                        // line was `com.apple.SwiftUI.Drag-D21FA1F0-…` — a
+                        // cache name with no spaces, so there is no wrap
+                        // opportunity and plain `Text`, which wraps by
+                        // default, truncated instead. `fixedSize(vertical:)`
+                        // gives it the vertical room to break; `textSelection`
+                        // lets it be copied into a bug report even if a
+                        // future layout clips it again; `.help` puts the whole
+                        // string in a tooltip, which no width can shorten.
+                        //
+                        // The sheet grows with a long error list. That is the
+                        // right trade against hiding the text: this app does
+                        // not shorten a refusal it has decided to show.
                         Text(line)
                             .font(.caption)
                             .foregroundStyle(.red)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .textSelection(.enabled)
+                            .help(line)
                     }
                 }
                 .padding()

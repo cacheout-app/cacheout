@@ -415,6 +415,48 @@ class FileSystemIdentityProvider {
         open(url.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
     }
 
+    /// `openDirectoryNoFollow(at:)` with its `errno` CAPTURED AT THE CALL.
+    ///
+    /// WHY IT EXISTS (PR #460 codex r11, D1). One caller —
+    /// `TrashDisposal.facts` — must distinguish WHY the open failed, because
+    /// its `probeLeaf` fallback is sound for exactly one class of failure
+    /// (the TCC denial of `~/.Trash`, measured `EPERM`) and UNSOUND for the
+    /// class `O_NOFOLLOW` exists to produce: `ELOOP` says the last component
+    /// IS a symlink, and `probeLeaf`'s path `lstat` would then resolve the
+    /// very link the descriptor-relative read refused. "Failed" is not one
+    /// fact, so it is not returned as one.
+    ///
+    /// DELEGATES to `openDirectoryNoFollow(at:)` rather than re-spelling the
+    /// `open` on purpose: any subclass override of that method still governs
+    /// this call, so the two can never disagree about which directories are
+    /// refusable. (COUNTED, PR #460 codex r12, D3, rather than left as the
+    /// plural "the suite's TCC doubles among them": there is exactly ONE
+    /// override in the repo — `TrashDeniedProvider` in
+    /// `TrashDisposalHopProofTests`.)
+    ///
+    /// WHAT THE ERRNO READ ACTUALLY PROMISES, corrected in the same round.
+    /// This paragraph used to say the global `errno` "is read on the
+    /// statement immediately after, with no intervening call". It is not:
+    /// between the `open(2)` and the read sit the delegated call and its
+    /// return, `url.path`'s String construction and teardown, and this
+    /// function's own epilogue. None of them makes a syscall or touches
+    /// `errno` — which is a property of THIS delegation as compiled, not a
+    /// guarantee the language gives, so it is MEASURED and not asserted:
+    /// `TrashDisposalHopProofTests.testTheErrnoCarryingOpenAnswersOneCodePerFailureAndAdmitsMode0111`
+    /// runs 500 consecutive real failing opens and requires exactly one code
+    /// out of all of them.
+    ///
+    /// The spelling with genuinely NO intervening work is the `withCString`
+    /// closure form — the errno read INSIDE the closure, next to the call
+    /// that set it — which `openChildDirectoryCarryingErrno` and
+    /// `TrashDisposal.look`'s path fallback both use. This one buys the
+    /// override seam instead, and pays for it with an empirical claim rather
+    /// than a structural one.
+    func openDirectoryNoFollowCarryingErrno(at url: URL) -> DescriptorOpen {
+        let fd = openDirectoryNoFollow(at: url)
+        return fd >= 0 ? .opened(fd) : .failed(errno: errno)
+    }
+
     /// `fstatat(parent, name, AT_SYMLINK_NOFOLLOW)` — kind + metadata, one
     /// atomic call, no path resolution. `logical` is carried for tests only.
     func probeKind(
@@ -599,6 +641,49 @@ class FileSystemIdentityProvider {
     ) -> ChildProbe {
         var st = stat()
         guard fstatat(descriptor, name, &st, AT_SYMLINK_NOFOLLOW) == 0 else {
+            let code = errno
+            return (code == ENOENT || code == ENOTDIR)
+                ? .absent
+                : .failed(errno: code)
+        }
+        return .facts(ChildFacts(
+            kind: Self.fileKind(from: st),
+            identity: Identity(
+                device: UInt64(bitPattern: Int64(st.st_dev)),
+                inode: UInt64(st.st_ino)
+            )
+        ))
+    }
+
+    /// The SAME two facts about the object at `url`'s own path, from ONE
+    /// no-follow `lstat` — `probeChild`'s path-resolved twin.
+    ///
+    /// THIS IS NOT A REPLACEMENT FOR `probeChild` AND HAS EXACTLY ONE
+    /// SANCTIONED USE: reading an object inside a directory this process is
+    /// not permitted to OPEN. Measured on this machine (Darwin 25.5), from a
+    /// process without Full Disk Access:
+    ///
+    ///     open("/Users/<u>/.Trash", O_RDONLY|O_DIRECTORY|O_NOFOLLOW)
+    ///         → -1, errno 1 (EPERM)
+    ///     lstat("/Users/<u>/.Trash/<name>")              → 0
+    ///     open("/Users/<u>/.Trash/<name>", O_DIRECTORY)  → a descriptor
+    ///
+    /// TCC denies the DIRECTORY and permits traversal THROUGH it, so a
+    /// descriptor-relative read of a trashed item is impossible for every
+    /// user who has not granted Full Disk Access while a path read is not.
+    /// `TrashDisposal.facts` is the only caller and uses it only where the
+    /// container open has already failed.
+    ///
+    /// WHY THE WEAKER BINDING IS STILL SOUND THERE, STATED RATHER THAN
+    /// ASSUMED: its result is only ever compared for EQUALITY against an
+    /// identity bound before the move, and a difference refuses. A re-pointed
+    /// name resolves to some other inode, which cannot equal the bound one —
+    /// so this call can never ADMIT what the descriptor-relative form would
+    /// refuse. It can only supply the identity the descriptor-relative form
+    /// is not permitted to read.
+    func probeLeaf(at url: URL) -> ChildProbe {
+        var st = stat()
+        guard lstat(url.path, &st) == 0 else {
             let code = errno
             return (code == ENOENT || code == ENOTDIR)
                 ? .absent

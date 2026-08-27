@@ -30,7 +30,7 @@ Swift 5.9+ and SwiftUI.
 
 **At a glance:**
 - Built-in cache categories, defined in `Scanner/Categories.swift` and detailed in [CATEGORIES.md](CATEGORIES.md)
-- Per-item scanners (`build_artifacts`, `orphaned_caches`) unified with the categories under the `SpaceScanner` registry ([ARCHITECTURE.md](ARCHITECTURE.md))
+- Per-item scanners (`build_artifacts`, `orphaned_caches`, `git_worktrees`) unified with the categories under the `SpaceScanner` registry ([ARCHITECTURE.md](ARCHITECTURE.md))
 - 2 execution modes (GUI + CLI)
 - 3 app scenes (Main Window, Menubar, Settings)
 - 1 external dependency (Sparkle for updates)

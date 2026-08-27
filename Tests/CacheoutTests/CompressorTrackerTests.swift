@@ -73,7 +73,7 @@ final class CompressorTrackerTests: XCTestCase {
 
     // MARK: - Rate Tests
 
-    func testCompressionRateFromDeltas() async {
+    func testCompressionRateFromDeltas() async throws {
         let tracker = CompressorTracker()
         let base = Date()
 
@@ -90,10 +90,14 @@ final class CompressorTrackerTests: XCTestCase {
 
         let compRate = await tracker.compressionRate()
         let decompRate = await tracker.decompressionRate()
-        XCTAssertNotNil(compRate)
-        XCTAssertNotNil(decompRate)
-        XCTAssertEqual(compRate!, 200.0, accuracy: 0.01, "200 compressions over 1 second")
-        XCTAssertEqual(decompRate!, 100.0, accuracy: 0.01, "100 decompressions over 1 second")
+        XCTAssertEqual(
+            try XCTUnwrap(compRate), 200.0, accuracy: 0.01,
+            "200 compressions over 1 second"
+        )
+        XCTAssertEqual(
+            try XCTUnwrap(decompRate), 100.0, accuracy: 0.01,
+            "100 decompressions over 1 second"
+        )
     }
 
     func testRateWithZeroTimeDelta() async {

@@ -66,13 +66,15 @@ final class CacheoutViewModelTests: XCTestCase {
     private func makeRuntime(
         _ scanners: [any SpaceScanner],
         categories: [CacheCategory] = [],
-        provider: FileSystemIdentityProvider = FileSystemIdentityProvider()
+        provider: FileSystemIdentityProvider = FileSystemIdentityProvider(),
+        sessionBounds: ScanSessionBounds = .default
     ) throws -> SpaceScannerRuntime {
         try SpaceScannerRuntime(
             scanners: scanners,
             categories: categories,
             home: fixtureHome,
-            provider: provider
+            provider: provider,
+            sessionBounds: sessionBounds
         )
     }
 
@@ -101,15 +103,15 @@ final class CacheoutViewModelTests: XCTestCase {
     /// records every resolution it was handed. No production scanner could
     /// ever answer those ids, so "the rebuild silently swapped the injected
     /// composition for production defaults" is a single assertion away.
-    private func makeReconstruction()
+    private func makeReconstruction() throws
         -> (CacheoutViewModel.RuntimeReconstruction, ResolutionLog)
     {
         let base = self.base!
         let home = self.fixtureHome!
         // `let` on purpose: the factory below is `@Sendable`, and a captured
         // `var` is a Swift 6 error.
-        let outcomes = Dictionary(
-            uniqueKeysWithValues: Self.reconstructionRootNames.map { name in
+        let outcomes = XCTUniquelyKeyed(
+            Self.reconstructionRootNames.map { name in
                 (
                     "root_\(name)",
                     ScanOutcome(
@@ -122,6 +124,19 @@ final class CacheoutViewModelTests: XCTestCase {
             }
         )
         let log = ResolutionLog()
+        // THE FALLBACK EXISTS SO THE FACTORY BELOW CANNOT TRAP (PR #460 codex
+        // r6, D4). The factory is NON-throwing, so the composition inside it
+        // used to be a `try!` — and what decides that throw is PRODUCTION's
+        // registration validation, so a regression there turned this cell into
+        // a `SIGILL` that took every later class in the run with it (this class
+        // sorts near the front). Built HERE instead, in a throwing test
+        // context, where the same failure is one red cell; the factory falls
+        // back to it and the assertions about scanner ids then fail loudly
+        // rather than the process dying.
+        let fallback = try SpaceScannerRuntime(
+            scanners: [], categories: [], home: home,
+            provider: FileSystemIdentityProvider()
+        )
         let seam = CacheoutViewModel.RuntimeReconstruction(
             devRootsStore: makeDevRootsStore(),
             home: home
@@ -136,23 +151,33 @@ final class CacheoutViewModelTests: XCTestCase {
                 trustedContainerRoots: [base.appendingPathComponent(scannerID)],
                 provide: { outcome }
             )
-            // try!: a fixture composition with one valid slug and no
-            // categories cannot fail registration validation.
-            return try! SpaceScannerRuntime(
+            // A fixture composition with one valid slug and no categories
+            // cannot fail registration validation — but "cannot" is what a
+            // `try!` here would be asserting about PRODUCTION code, so the
+            // failure lands on `fallback` instead of on the run.
+            return (try? SpaceScannerRuntime(
                 scanners: [scanner],
                 categories: [],
                 home: home,
                 provider: FileSystemIdentityProvider()
-            )
+            )) ?? fallback
         }
         return (seam, log)
     }
 
     /// The production scanner ids a rebuilt runtime must NEVER acquire.
+    /// Every id `SpaceScannerRuntime.production` registers belongs here — a
+    /// missing one silently weakens the guard rather than failing it.
     private static let productionScannerIDs = [
         CategoryScanner.registeredID,
         BuildArtifactsScanner.registeredID,
         OrphanedCachesScanner.registeredID,
+        GitWorktreeScanner.registeredID,
+        // fn-6's scanner, added HERE as well as to the registry: the merge
+        // that brought it in left this list at four of five, which is the
+        // silent weakening the comment above warns about rather than a
+        // failure — the guard simply stopped covering `ephemeral_tmp`.
+        EphemeralTempScanner.registeredID,
     ]
 
     /// A `FixtureScanner` DECLARING the origin container `perItem(scanner:
@@ -1212,6 +1237,955 @@ final class CacheoutViewModelTests: XCTestCase {
         XCTAssertNil(issue.url)
     }
 
+    // ====================================================================
+    // MARK: - THE SESSION'S WALL-CLOCK BOUND (PR #460 codex r12, D2)
+    // ====================================================================
+    //
+    // THE MECHANISM, AND WHY IT NEEDED A DESIGN AND NOT A PATCH.
+    // `for await event in session.events` — one line of PRODUCTION, four
+    // lines below `scanValidatedSession` — consumes a stream whose ONLY
+    // terminator was `continuation.finish()`, reached only after the scan
+    // `TaskGroup` completes. A scanner that never returns therefore parked
+    // that loop forever: no failure, no total line, no exit status, and the
+    // 87 `await viewModel.scan(` call sites in this suite reach it without
+    // spelling a continuation of their own, so no fence over the TEST
+    // sources can see it.
+    //
+    // REPRODUCED at 46f9640 with ONE production line mutated —
+    // `SpaceScanner.swift`'s `continuation.finish()` deleted — run under a
+    // pty so nothing is lost to buffering:
+    //
+    //     Test Suite 'CacheoutViewModelTests' started at 18:49:31.850.
+    //     Test Case '…testACleanScanStillDisplaysASectionThatWasNeverInspected' started.
+    //     <nothing, 240 s, killed>
+    //
+    // `grep -c "Executed .* tests"` = 0.
+    //
+    // THE BOUND IS ON THE SESSION, not on the consumer: see
+    // `ScanSessionBounds`. These cells drive it through the SAME production
+    // path every other cell in this file uses — `await viewModel.scan(…)` —
+    // with the bound injected in milliseconds instead of minutes.
+
+    /// THE WHOLE MECHANISM, END TO END, THROUGH PRODUCTION.
+    ///
+    /// A wedged scanner must not park the scan; the bound must REPORT it
+    /// rather than swallow it; everything else in the session must still be
+    /// published; and the next scan must be able to succeed.
+    ///
+    /// THE CELL ITSELF IS THE STRAND ASSERTION: without the bound, the
+    /// `await viewModel.scan(…)` below never returns and this cell prints
+    /// its name and nothing else, forever.
+    ///
+    /// MUTATION: delete the watchdog `Task` in `scanValidatedSession` and
+    /// this cell hangs rather than fails — which is exactly the mechanism,
+    /// so the run must be given a wall-clock timeout.
+    @MainActor
+    func testAWedgedScannerIsReportedAndDoesNotParkTheScan() async throws {
+        let gate = StallGate()
+        let okOutcome = ScanOutcome(
+            items: [perItem(scanner: "ok", id: "o1", bytes: 5000)], errors: []
+        )
+        let wedgedOutcome = ScanOutcome(
+            items: [perItem(scanner: "wedged", id: "w1")], errors: []
+        )
+        let wedgedSequence = OutcomeSequence([wedgedOutcome, wedgedOutcome])
+        let runtime = try makeRuntime(
+            [
+                fixtureScanner("ok") { okOutcome },
+                FixtureScanner(
+                    id: "wedged",
+                    trustedContainerRoots: [
+                        base.appendingPathComponent("wedged"),
+                    ]
+                ) {
+                    await gate.hold()
+                    return await wedgedSequence.next()
+                },
+            ],
+            sessionBounds: ScanSessionBounds(
+                eventDeadline: .milliseconds(250),
+                producerWindDownGrace: .milliseconds(50)
+            )
+        )
+        let viewModel = CacheoutViewModel(runtime: runtime)
+
+        // (1) A HEALTHY session first, so the retention assertion below is
+        // about real previous results rather than about emptiness.
+        await viewModel.scan(trigger: .automatic)
+        XCTAssertEqual(viewModel.items(forScanner: "wedged").map(\.id), ["w1"])
+        viewModel.toggleSelection(for: key("wedged", "w1"))
+
+        // (2) THE WEDGE. `hold()` does not return until the test releases
+        // it, and the test does not release it until after the scan has
+        // come back — so the only thing that can end this scan is the bound.
+        await gate.wedge()
+        await viewModel.scan(trigger: .automatic)
+
+        // (3) REPORTED, not swallowed.
+        let issue = try XCTUnwrap(
+            viewModel.malformedIssuesByScannerID["wedged"],
+            "a scanner the bound cut off must be reported, not dropped"
+        )
+        XCTAssertEqual(issue.kind, .scanDidNotFinish)
+        XCTAssertNil(issue.url, "a NON-filesystem kind never invents a path")
+        XCTAssertTrue(
+            viewModel.perItemSections.first { $0.scannerID == "wedged" }?
+                .issues.contains(issue) ?? false,
+            "the row is surfaced on that scanner's own section"
+        )
+
+        // (4) FAIL-CLOSED, and the same fail-closed the malformed path
+        // already had: nothing published for it, previous rows and the
+        // user's ticks retained.
+        XCTAssertEqual(viewModel.items(forScanner: "wedged").map(\.id), ["w1"])
+        XCTAssertTrue(viewModel.selectedItemKeys.contains(key("wedged", "w1")))
+
+        // (5) A PARTIAL SCAN IS REPORTED AS PARTIAL. The scanner that DID
+        // report keeps its results — the bound is not a session-wide erase.
+        XCTAssertEqual(viewModel.items(forScanner: "ok").map(\.id), ["o1"])
+
+        // (6) THE GUARD IS RELEASED, which is what makes a retry possible at
+        // all: before the bound the spinner never stopped and no second scan
+        // and no cleanup could start.
+        XCTAssertFalse(viewModel.isAnyScanInProgress,
+                       "the scan guard must not survive the bound")
+
+        // (7) AND A RETRY CAN DIFFER — the property this branch demands of
+        // every incompleteness it reports. The wedge is a wall-clock
+        // condition, not a deterministic cap, so releasing it and re-scanning
+        // clears the row.
+        await gate.release()
+        await viewModel.scan(trigger: .automatic)
+        XCTAssertNil(viewModel.malformedIssuesByScannerID["wedged"],
+                     "a re-scan that finishes clears the row — the remedy the "
+                         + "label names is real")
+        XCTAssertEqual(viewModel.items(forScanner: "wedged").map(\.id), ["w1"])
+    }
+
+    /// THE SECOND BOUND, AND THE ONE THAT IS EASY TO FORGET: ending the
+    /// event stream alone would have moved the strand ONE LINE DOWN, to
+    /// `await session.untilProducerFinishes()`.
+    ///
+    /// A task group does not return until every child does, so a scanner
+    /// that ignores cancellation keeps the producer alive however firmly it
+    /// is cancelled. This scanner blocks its thread outright — the honest
+    /// simulation of a walk inside a syscall — for far longer than the
+    /// session's two bounds combined, and `scan` must still come back.
+    ///
+    /// MUTATION: restore `untilProducerFinishes()` to `await producer.value`
+    /// and this cell alone takes the full wedge (≈2 s) instead of the bound,
+    /// and the assertion on elapsed time fails.
+    @MainActor
+    func testTheWindDownGraceReleasesAWalkThatIgnoresCancellation()
+        async throws
+    {
+        let wedgeSeconds = 2.0
+        let runtime = try makeRuntime(
+            [
+                FixtureScanner(
+                    id: "uncancellable",
+                    trustedContainerRoots: [
+                        base.appendingPathComponent("uncancellable"),
+                    ]
+                ) {
+                    // NOT `Task.sleep`: this must ignore cancellation the
+                    // way a thread inside a syscall does.
+                    Thread.sleep(forTimeInterval: wedgeSeconds)
+                    return ScanOutcome(items: [], errors: [])
+                },
+            ],
+            sessionBounds: ScanSessionBounds(
+                eventDeadline: .milliseconds(200),
+                producerWindDownGrace: .milliseconds(100)
+            )
+        )
+        let viewModel = CacheoutViewModel(runtime: runtime)
+
+        let started = Date()
+        await viewModel.scan(trigger: .automatic)
+        let elapsed = Date().timeIntervalSince(started)
+
+        XCTAssertLessThan(
+            elapsed, wedgeSeconds,
+            "the scan must return on the session's bounds, not on the "
+                + "wedged walk: \(elapsed) s"
+        )
+        XCTAssertFalse(viewModel.isAnyScanInProgress,
+                       "…and the guard must be released with it")
+        let issue = try XCTUnwrap(
+            viewModel.malformedIssuesByScannerID["uncancellable"]
+        )
+        XCTAssertEqual(issue.kind, .scanDidNotFinish)
+    }
+
+    /// THE BOUND MUST FIRE WHEN THE COOPERATIVE POOL IS STARVED — i.e. in
+    /// exactly the wedge class it exists for (PR #460 codex r13, B).
+    ///
+    /// The cell above wedges ONE scanner. One blocked thread out of
+    /// `activeProcessorCount` leaves eleven workers free on this machine, so
+    /// an r12 watchdog built on `Task.sleep` still had somewhere to resume
+    /// and the cell passed — while the mechanism it was written to prove was
+    /// broken. THE THRESHOLD IS THE POOL WIDTH. Measured on a 12-core
+    /// machine at a 200 ms bound: 11 blocking scanners -> `scan` returned in
+    /// 0.335 s (the bound); 12 -> 25.03 s (the walk); 36 -> 75.04 s.
+    ///
+    /// So this cell blocks MORE THREADS THAN THE POOL HAS and asserts the
+    /// scan still returns on the bound. `Thread.sleep`, not `Task.sleep`:
+    /// the point is to occupy the worker, not to yield it. The blockers do
+    /// NOT observe cancellation, which is the honest simulation of a walk
+    /// inside a syscall AND what keeps the mutation below honest — a
+    /// cancellable blocker would let the mutated build off by exiting the
+    /// moment the watchdog cancelled the producer.
+    ///
+    /// MUTATION: restore `let task = Task {` (from `Task.detached(priority:
+    /// .utility)`) in `scanValidatedSession` and the producer is back in the
+    /// consumer's own band; measured 2.82 s against this 0.9 s assertion.
+    @MainActor
+    func testTheBoundFiresWithEveryCooperativeWorkerBlocked() async throws {
+        // MORE than the pool is wide: the pool is `activeProcessorCount`
+        // threads per band, and the bound must not need one of them.
+        let blockerCount = ProcessInfo.processInfo.activeProcessorCount + 2
+        let blockers = LeakFreeBlockers(count: blockerCount)
+        defer { blockers.join() }
+        let scanners: [any SpaceScanner] = (0..<blockerCount).map { index in
+            FixtureScanner(
+                id: "blocked_\(index)",
+                trustedContainerRoots: [
+                    base.appendingPathComponent("blocked_\(index)"),
+                ]
+            ) {
+                blockers.hold()
+                return ScanOutcome(items: [], errors: [])
+            }
+        }
+        let runtime = try makeRuntime(
+            scanners,
+            sessionBounds: ScanSessionBounds(
+                eventDeadline: .milliseconds(200),
+                producerWindDownGrace: .milliseconds(100)
+            )
+        )
+        let viewModel = CacheoutViewModel(runtime: runtime)
+
+        let started = Date()
+        await viewModel.scan(trigger: .automatic)
+        let elapsed = Date().timeIntervalSince(started)
+
+        XCTAssertLessThan(
+            elapsed, 0.9,
+            "with all \(blockerCount) workers blocked the session must still "
+                + "end on its 200 ms bound, not on the walk: \(elapsed) s"
+        )
+        XCTAssertFalse(viewModel.isAnyScanInProgress)
+        // EVERY starved scanner is reported, not silently dropped.
+        for index in 0..<blockerCount {
+            let issue = try XCTUnwrap(
+                viewModel.malformedIssuesByScannerID["blocked_\(index)"],
+                "blocked_\(index) was cut off and must say so"
+            )
+            XCTAssertEqual(issue.kind, .scanDidNotFinish)
+        }
+    }
+
+    /// AND PRODUCTION NEEDS NO TWELVE SCANNERS TO GET THERE — ONE IS ENOUGH.
+    ///
+    /// `CategoryScanner` runs `CacheScanner.scanAll`, which adds one child
+    /// task per category — 23 in `CacheCategory.allCategories` — each running
+    /// the SYNCHRONOUS `sizer.measure(…)`. A single internally parallel
+    /// scanner therefore fills every cooperative worker in its band on every
+    /// scan, so the starvation above is not an exotic composition: it is the
+    /// shipped one the moment those measurements block (a hung mount, an
+    /// unresponsive FUSE volume). This cell is that shape — ONE registered
+    /// scanner, 23 thread-blocking children. Measured at 20.13 s under a
+    /// 200 ms bound with the r12 producer.
+    ///
+    /// MUTATION: the same restoration as the cell above.
+    @MainActor
+    func testOneInternallyParallelScannerAloneCanStarveThePool() async throws {
+        let childCount = 23  // CacheCategory.allCategories.count
+        let blockers = LeakFreeBlockers(count: childCount)
+        defer { blockers.join() }
+        let runtime = try makeRuntime(
+            [
+                FixtureScanner(
+                    id: "categories_like",
+                    trustedContainerRoots: [
+                        base.appendingPathComponent("categories_like"),
+                    ]
+                ) {
+                    await withTaskGroup(of: Void.self) { group in
+                        for _ in 0..<childCount {
+                            group.addTask { blockers.hold() }
+                        }
+                        await group.waitForAll()
+                    }
+                    return ScanOutcome(items: [], errors: [])
+                },
+            ],
+            sessionBounds: ScanSessionBounds(
+                eventDeadline: .milliseconds(200),
+                producerWindDownGrace: .milliseconds(100)
+            )
+        )
+        let viewModel = CacheoutViewModel(runtime: runtime)
+
+        let started = Date()
+        await viewModel.scan(trigger: .automatic)
+        let elapsed = Date().timeIntervalSince(started)
+
+        XCTAssertLessThan(
+            elapsed, 0.9,
+            "one scanner with \(childCount) blocking children starves the "
+                + "pool exactly as \(childCount) scanners would; the bound "
+                + "must still fire: \(elapsed) s"
+        )
+        let issue = try XCTUnwrap(
+            viewModel.malformedIssuesByScannerID["categories_like"]
+        )
+        XCTAssertEqual(issue.kind, .scanDidNotFinish)
+    }
+
+    /// THE DEADLINE MUST NOT DEPEND ON THE CALLER'S OWN PRIORITY BAND —
+    /// the half of B that the band separation does NOT cover.
+    ///
+    /// The two cells above are satisfied by the producer moving to
+    /// `.utility`: the consumer keeps a clear band, so a `Task.sleep`
+    /// watchdog would find a worker there too and they would pass with the
+    /// deadline still on the pool. This cell takes that worker away. The
+    /// watchdog is created inside `scanValidatedSession`, which is called
+    /// synchronously from the caller — so an r12 `Task { try await
+    /// Task.sleep(…) }` watchdog inherits THE CALLER'S priority. Here the
+    /// caller IS `.utility`, the same band its own blocking scanners
+    /// saturate, so there is no free worker anywhere for a pool-borne
+    /// deadline to run on. Real shape: the headless/CLI consumer, which is
+    /// not on the MainActor and carries no priority guarantee.
+    ///
+    /// The assertion is NOT on when the scan returns — that consumer is
+    /// starved by construction and cannot be prompt. It is on when the
+    /// DEADLINE ITSELF ran, observed the one way a starved pool permits:
+    /// the blocking scanners poll `Task.isCancelled` on the threads they
+    /// already hold, needing no worker of their own, and record when the
+    /// watchdog's `task.cancel()` reached them.
+    ///
+    /// MUTATION: restore the watchdog to `Task { try await Task.sleep(for:
+    /// bounds.eventDeadline) }` and nothing cancels them; they run out their
+    /// \(pollCapSeconds) s cap instead — red on the assertion rather than a
+    /// hang, which is why the cap is there.
+    @MainActor
+    func testTheDeadlineDoesNotDependOnTheCallersOwnPriorityBand()
+        async throws
+    {
+        let blockerCount = ProcessInfo.processInfo.activeProcessorCount + 2
+        let observedCancellation = TimestampBox()
+        let started = Date()
+        let scanners: [any SpaceScanner] = (0..<blockerCount).map { index in
+            FixtureScanner(
+                id: "polling_\(index)",
+                trustedContainerRoots: [
+                    base.appendingPathComponent("polling_\(index)"),
+                ]
+            ) {
+                // Holds its thread like a walk in a syscall, but wakes often
+                // enough to notice cancellation WITHOUT needing a worker.
+                let deadline = Date().addingTimeInterval(Self.pollCapSeconds)
+                while !Task.isCancelled, Date() < deadline {
+                    Thread.sleep(forTimeInterval: 0.02)
+                }
+                if Task.isCancelled {
+                    observedCancellation.record(
+                        Date().timeIntervalSince(started)
+                    )
+                }
+                return ScanOutcome(items: [], errors: [])
+            }
+        }
+        let runtime = try makeRuntime(
+            scanners,
+            sessionBounds: ScanSessionBounds(
+                eventDeadline: .milliseconds(200),
+                producerWindDownGrace: .milliseconds(100)
+            )
+        )
+
+        // THE CALLER IS IN THE SCANNERS' OWN BAND. Detached so the band is
+        // `.utility` rather than this cell's, and so the starvation below
+        // cannot reach the MainActor the test itself runs on.
+        let consumer = Task.detached(priority: .utility) {
+            let session = runtime.scanValidatedSession(
+                context: ScanContext(trigger: .automatic)
+            )
+            for await _ in session.events {}
+            await session.untilProducerFinishes()
+        }
+        // Polled from the MainActor's own (clear) band, so this wait costs
+        // the starved band nothing.
+        let waitUntil = Date().addingTimeInterval(Self.pollCapSeconds + 2)
+        while observedCancellation.value == nil, Date() < waitUntil {
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+        let elapsed = try XCTUnwrap(
+            observedCancellation.value,
+            "the watchdog must have cancelled the producer at all"
+        )
+        XCTAssertLessThan(
+            elapsed, 0.9,
+            "the 200 ms deadline must fire off the cooperative pool, not in "
+                + "the caller's own saturated .utility band: \(elapsed) s"
+        )
+        _ = await consumer.value
+    }
+
+    /// AND THE WIND-DOWN GRACE IS THE SECOND TIMER, WITH THE SAME EXPOSURE.
+    ///
+    /// `untilProducerFinishes()` arms its own timer, and through r12 that was
+    /// a `Task.detached` running `Task.sleep`. Detachment fixed the OTHER
+    /// pool hazard — a plain `Task` inside an already-cancelled caller starts
+    /// cancelled and the grace collapses to zero — but a detached sleep still
+    /// resumes only on a cooperative worker, in the band an unspecified
+    /// priority lands in. This cell saturates THAT band while the producer is
+    /// wedged, so the gate can only be opened by a timer that needs no worker
+    /// at all.
+    ///
+    /// The consumer stays on the MainActor's own clear band, so the ONLY
+    /// starved participant is the grace timer itself.
+    ///
+    /// MUTATION: restore `let timer = Task.detached { try? await
+    /// Task.sleep(for: windDownGrace); gate.open() }` and the scan returns
+    /// when the saturated band frees instead of on the 100 ms grace.
+    @MainActor
+    func testTheWindDownGraceDoesNotDependOnTheCooperativePoolEither()
+        async throws
+    {
+        // The band an unspecified-priority detached task lands in.
+        let bandCount = ProcessInfo.processInfo.activeProcessorCount + 2
+        let bandBlockers = LeakFreeBlockers(count: bandCount)
+        defer { bandBlockers.join() }
+
+        // A producer that CANNOT wind down inside the grace, so the gate is
+        // opened by the timer rather than by the producer.
+        let wedge = LeakFreeBlockers(count: 1)
+        defer { wedge.join() }
+        let runtime = try makeRuntime(
+            [
+                FixtureScanner(
+                    id: "unwinding",
+                    trustedContainerRoots: [
+                        base.appendingPathComponent("unwinding"),
+                    ]
+                ) {
+                    // SATURATION STARTS HERE, not before the scan: `scan`'s
+                    // own preamble fetches the header's volume figures on a
+                    // detached task that lands in this very band, so
+                    // saturating it up front times THAT instead of the grace,
+                    // and did (1.83 s, all of it before the stream was even
+                    // created). That preamble is now bounded on its own clock
+                    // (`BoundedDiskInfo`, PR #460 codex r14, V2-1) — this
+                    // cell still starts the saturation from inside the
+                    // scanner because the two budgets would otherwise both be
+                    // in flight and the elapsed time would stop distinguishing
+                    // them. `testScanIsNotParkedByItsOwnDiskInfoPreamble
+                    // WhenTheBandIsSaturated` is the cell that times the
+                    // preamble on purpose.
+                    for _ in 0..<bandCount {
+                        Task.detached(priority: .medium) {
+                            bandBlockers.hold()
+                        }
+                    }
+                    wedge.hold()
+                    return ScanOutcome(items: [], errors: [])
+                },
+            ],
+            sessionBounds: ScanSessionBounds(
+                eventDeadline: .milliseconds(200),
+                producerWindDownGrace: .milliseconds(100)
+            )
+        )
+        let viewModel = CacheoutViewModel(runtime: runtime)
+
+        let started = Date()
+        await viewModel.scan(trigger: .automatic)
+        let elapsed = Date().timeIntervalSince(started)
+
+        XCTAssertLessThan(
+            elapsed, 0.9,
+            "the 100 ms wind-down grace must not wait for a cooperative "
+                + "worker in a saturated band: \(elapsed) s"
+        )
+        XCTAssertFalse(viewModel.isAnyScanInProgress)
+    }
+
+    // MARK: - The header refresh in FRONT of the bound (PR #460 codex r14, V2-1)
+
+    /// THE BOUND ITSELF, ON A FETCH THAT NEVER RETURNS.
+    ///
+    /// Deterministic — the fetch is a `Thread.sleep`, so the arithmetic does
+    /// not depend on how the pool happens to be scheduled. What it pins is
+    /// that `BoundedDiskInfo.current` returns AT the budget rather than at
+    /// the fetch, and that it says `.timedOut` rather than reporting a
+    /// completed read of nothing (a `.fetched(nil)` here would be a lie the
+    /// header would then render as a real "0 bytes free").
+    ///
+    /// MUTATION: delete the `ScanSessionClock.schedule` timer (leave the
+    /// detached settle) and this cell fails on the elapsed assertion — it
+    /// returns at the fetch's 3 s, not the 200 ms budget.
+    func testTheHeaderFetchReturnsOnItsBudgetNotOnAStuckVolume() async throws {
+        let released = DispatchSemaphore(value: 0)
+        let started = Date()
+        let outcome = await BoundedDiskInfo.current(
+            within: .milliseconds(200),
+            fetch: {
+                // Holds its thread the way `URL.resourceValues` on a hung
+                // mount does — uncancellable, because the real one is.
+                Thread.sleep(forTimeInterval: 3.0)
+                released.signal()
+                return DiskInfo(totalSpace: 1, freeSpace: 1, usedSpace: 0)
+            }
+        )
+        let elapsed = Date().timeIntervalSince(started)
+
+        XCTAssertTrue(
+            outcome.didTimeOut,
+            "a fetch still parked at the budget must be reported as timed "
+                + "out, never as a completed read"
+        )
+        XCTAssertLessThan(
+            elapsed, 1.5,
+            "the 200 ms budget must end the wait, not the 3 s fetch: "
+                + "\(elapsed) s"
+        )
+        // JOINED rather than leaked: a thread still sleeping when the next
+        // cell saturates the band is exactly what made r13's M-B3 look green.
+        released.wait()
+    }
+
+    /// AND A FETCH THAT DOES RETURN IS NOT REPORTED AS TIMED OUT — the other
+    /// direction, without which "always `.timedOut`" would pass the cell
+    /// above and silently freeze the header forever.
+    ///
+    /// It also pins that `DiskInfo.current()`'s OWN nil (an unreadable
+    /// volume) stays `.fetched(nil)`: that is a completed read, and the call
+    /// sites must be free to store it.
+    ///
+    /// MUTATION: settle the rendezvous with `.timedOut` from the detached
+    /// task and both assertions here go red.
+    func testACompletedFetchIsNeverReportedAsTimedOut() async throws {
+        let value = await BoundedDiskInfo.current(
+            within: .seconds(30),
+            fetch: { DiskInfo(totalSpace: 100, freeSpace: 40, usedSpace: 60) }
+        )
+        guard case .fetched(let disk) = value else {
+            return XCTFail("a prompt fetch must report .fetched, got \(value)")
+        }
+        XCTAssertEqual(disk?.freeSpace, 40)
+
+        let unreadable = await BoundedDiskInfo.current(
+            within: .seconds(30), fetch: { nil }
+        )
+        guard case .fetched(let none) = unreadable else {
+            return XCTFail(
+                "an unreadable volume is a COMPLETED read, not a timeout, "
+                    + "got \(unreadable)"
+            )
+        }
+        XCTAssertNil(none)
+    }
+
+    /// THE SITE, END TO END: `scan()` MUST NOT PARK IN ITS OWN PREAMBLE.
+    ///
+    /// This is the defect's measured shape. The fetch at the top of `scan`
+    /// runs AFTER the in-progress guard is raised and BEFORE
+    /// `scanValidatedSession` exists, so nothing bounds it and no
+    /// `.scanDidNotFinish` can be produced — and as a bare `Task.detached` it
+    /// needs a free worker in the unspecified cooperative band merely to
+    /// START. So the band is saturated BEFORE the scan (the opposite of
+    /// `testTheWindDownGraceDoesNotDependOnTheCooperativePoolEither`, which
+    /// saturates from inside the scanner precisely to avoid timing this
+    /// fetch — its comment records having measured 1.83 s here).
+    ///
+    /// The assertion is on `scan()`'s wall time against an injected 200 ms
+    /// budget, with the holders outliving it: with the bound, `scan` gives up
+    /// on the header and returns; without it, `scan` returns only when the
+    /// band frees.
+    ///
+    /// MUTATION: restore `diskInfo = await Task.detached { DiskInfo.current()
+    /// }.value` at `CacheoutViewModel.swift`'s scan preamble and this cell
+    /// goes red on the elapsed assertion.
+    @MainActor
+    func testScanIsNotParkedByItsOwnDiskInfoPreambleWhenTheBandIsSaturated()
+        async throws
+    {
+        // The band an unspecified-priority `Task.detached` lands in — the
+        // band the production fetch uses.
+        let bandCount = ProcessInfo.processInfo.activeProcessorCount + 2
+        let holders = LeakFreeBlockers(count: bandCount)
+        defer { holders.join() }
+        for _ in 0..<bandCount {
+            Task.detached(priority: .medium) { holders.hold() }
+        }
+        // Let them actually take the workers before the scan starts.
+        try await Task.sleep(for: .milliseconds(150))
+
+        let runtime = try makeRuntime(
+            [
+                FixtureScanner(
+                    id: "prompt",
+                    trustedContainerRoots: [
+                        base.appendingPathComponent("prompt"),
+                    ]
+                ) { ScanOutcome(items: [], errors: []) },
+            ],
+            sessionBounds: ScanSessionBounds(
+                eventDeadline: .milliseconds(200),
+                producerWindDownGrace: .milliseconds(100)
+            )
+        )
+        // The budget is INJECTED at 200 ms for the same reason the session
+        // bounds above are: the property under test is that the wait ENDS on
+        // a clock rather than on a worker, not what the production figure is.
+        let viewModel = CacheoutViewModel(
+            runtime: runtime, diskInfoBudget: .milliseconds(200)
+        )
+
+        let started = Date()
+        await viewModel.scan(trigger: .automatic)
+        let elapsed = Date().timeIntervalSince(started)
+
+        XCTAssertLessThan(
+            elapsed, 0.9,
+            "scan must not wait past its header budget for a cooperative "
+                + "worker in a saturated band — the guard is already raised "
+                + "and no bound covers this await: \(elapsed) s"
+        )
+        // The guard is RELEASED on the way out, which is the half of the
+        // signature the user sees as a spinner that never stops.
+        XCTAssertFalse(viewModel.isAnyScanInProgress)
+    }
+
+    /// AND THE HEADER IS STILL FILLED IN ON A HEALTHY SCAN — the direction
+    /// the two cells above cannot see.
+    ///
+    /// Bounding a fetch is only half a change: a budget of zero, a bound that
+    /// always wins, or an assignment dropped while rewriting the call site
+    /// would all satisfy "scan returns promptly" and leave the usage bar
+    /// permanently blank. Nothing in the suite asserted this before the
+    /// bound existed, so the regression would have been silent.
+    ///
+    /// Reads the REAL boot volume through the production default budget,
+    /// which is what the shipped call site does; `DiskInfo.current()` is
+    /// read-only.
+    ///
+    /// MUTATION: drop the `diskInfo = fetched` assignment in `scan`'s
+    /// preamble (or match `.timedOut` instead of `.fetched`) and this cell
+    /// goes red; the two starvation cells stay green.
+    @MainActor
+    func testAHealthyScanStillPublishesTheHeadersVolumeFigures() async throws {
+        let runtime = try makeRuntime(
+            [
+                FixtureScanner(
+                    id: "prompt",
+                    trustedContainerRoots: [
+                        base.appendingPathComponent("prompt"),
+                    ]
+                ) { ScanOutcome(items: [], errors: []) },
+            ]
+        )
+        let viewModel = CacheoutViewModel(runtime: runtime)
+        XCTAssertNil(viewModel.diskInfo, "nothing is fetched at construction")
+
+        await viewModel.scan(trigger: .automatic)
+
+        let disk = try XCTUnwrap(
+            viewModel.diskInfo,
+            "an unstarved scan must publish the volume figures — a bound that "
+                + "always fires would leave the header blank forever"
+        )
+        XCTAssertGreaterThan(disk.totalSpace, 0)
+    }
+
+    /// EXACTLY ONE EVENT PER SCANNER, EVER — the watchdog's report and the
+    /// real outcome must be exclusive in BOTH directions (PR #460 codex r13,
+    /// C).
+    ///
+    /// r12 read `missing(from:)`, yielded, and called `finish()` with no
+    /// atomicity against the producer's own yield loop. MEASURED with 12
+    /// blocked scanners at a 200 ms bound: of 19 events, SEVEN scanners were
+    /// reported as timed out AND published, `M:blocked_1:scan_did_not_finish`
+    /// before `O:blocked_1`. That order is the harmful one — `reconcile`
+    /// clears `malformedIssuesByScannerID[scannerID]`, so the timeout row the
+    /// user was supposed to see disappears and the scanner is republished as
+    /// healthy. The same run lost five completed scanners' outcomes when
+    /// `finish()` beat their yield.
+    ///
+    /// THE RACE NEEDS NO STARVATION — only a scanner finishing inside the
+    /// watchdog's window — so this cell aims scanners AT the window rather
+    /// than blocking anything, and repeats: each trial has every scanner
+    /// return at about the deadline, and the invariant is checked over the
+    /// raw event stream, which is where "both" and "neither" are both
+    /// visible.
+    ///
+    /// ## THE FIXTURE THIS SHIPPED WITH WAS A COIN FLIP, AND SAID IT WAS NOT
+    /// ## (PR #460 codex r14, V2-2)
+    ///
+    /// Through r13 it ran 12 trials x 6 scanners at a 40 ms deadline, and its
+    /// own doc asserted that "`.trials` is what makes it a gate rather than a
+    /// coin flip". MEASURED against a faithful reconstruction of the r12 race
+    /// (`ledger.record` + a bare `continuation.yield` in the producer, an
+    /// unsynchronized `ledger.missing(from:)` in the watchdog): EIGHT
+    /// consecutive runs of the old fixture gave exit 0,0,1,0,0,0,0,0 — **red 1
+    /// of 8** here, and 0,0,1,0,1,0,0,0 — 2 of 8 — for the round-13 verifier
+    /// who found it. Either way an edit reintroducing the race landed GREEN
+    /// most of the time. r13's commit message also claimed it was "red on
+    /// trial 0 ('racer_3 x2')"; at the shipped trial count that is not what it
+    /// does. Both claims are retired here: a repeat count is evidence only
+    /// when the RED RATE is measured, and this one's was not.
+    ///
+    /// The replacement is 40 trials x 8 scanners at a 30 ms deadline with the
+    /// per-scanner return jittered across the window, which is enough of the
+    /// race to be a gate. MEASURED, same mutant, eight consecutive runs:
+    /// **red 8 of 8**, 6 to 30 of the 320 scanner-trials doubly reported per
+    /// run, both harmful orders (`OT` and `TO`) seen in every run. Unmutated,
+    /// eight consecutive runs: **green 8 of 8**, 1.28-1.30 s each — so the
+    /// gate costs about 1.3 s and does not flake.
+    ///
+    /// MUTATION: replace the `ledger.publish(event, to: continuation)` call
+    /// with `ledger.record(event.scannerID); continuation.yield(event)` and
+    /// the watchdog's `conclude` with an unsynchronized `missing(from:)` read
+    /// — duplicates appear and this cell is red.
+    func testEveryScannerGetsExactlyOneEventEvenAtTheDeadline() async throws {
+        let trials = 40
+        let scannerCount = 8
+        let deadlineMilliseconds = 30
+        var sawBoth: [String] = []
+        var sawNeither: [String] = []
+        var doublyReported = 0
+        var kindsSeen: Set<String> = []
+
+        for trial in 0..<trials {
+            let scanners: [any SpaceScanner] = (0..<scannerCount).map { index in
+                let outcome = ScanOutcome(
+                    items: [perItem(scanner: "racer_\(index)",
+                                    id: "i\(index)", bytes: 100)],
+                    errors: []
+                )
+                // JITTERED PER SCANNER PER TRIAL, not laid out in a fixed
+                // fan: the window this races is scheduling, and a fixed
+                // offset table samples one point of it 40 times over.
+                let jitter = Int.random(in: -6...10)
+                return FixtureScanner(
+                    id: "racer_\(index)",
+                    trustedContainerRoots: [
+                        base.appendingPathComponent("racer_\(index)"),
+                    ]
+                ) {
+                    try? await Task.sleep(
+                        for: .milliseconds(
+                            max(0, deadlineMilliseconds + jitter)
+                        )
+                    )
+                    return outcome
+                }
+            }
+            let runtime = try makeRuntime(
+                scanners,
+                sessionBounds: ScanSessionBounds(
+                    eventDeadline: .milliseconds(deadlineMilliseconds),
+                    producerWindDownGrace: .milliseconds(50)
+                )
+            )
+            let session = runtime.scanValidatedSession(
+                context: ScanContext(trigger: .automatic)
+            )
+            // THE RAW STREAM, not the view model's reduction of it: this is
+            // the only place where "reported twice" and "reported never" are
+            // both still visible.
+            var seen: [String: [String]] = [:]
+            for await event in session.events {
+                switch event {
+                case .outcome(let id, _):
+                    seen[id, default: []].append("O")
+                case .malformed(let id, let issue):
+                    seen[id, default: []].append(
+                        issue.kind == .scanDidNotFinish ? "T" : "M"
+                    )
+                }
+            }
+            await session.untilProducerFinishes()
+
+            for index in 0..<scannerCount {
+                let id = "racer_\(index)"
+                let events = seen[id] ?? []
+                switch events.count {
+                case 1: continue
+                case 0: sawNeither.append("trial \(trial): \(id)")
+                default:
+                    doublyReported += 1
+                    kindsSeen.insert(events.joined())
+                    sawBoth.append(
+                        "trial \(trial): \(id) \(events.joined(separator: ","))"
+                    )
+                }
+            }
+        }
+
+        XCTAssertEqual(
+            sawBoth, [],
+            "a scanner reported as timed out must not ALSO publish an "
+                + "outcome — `reconcile` would clear the timeout row and "
+                + "republish it as healthy. \(doublyReported) of "
+                + "\(trials * scannerCount) doubly reported, orders "
+                + "\(kindsSeen.sorted())"
+        )
+        XCTAssertEqual(
+            sawNeither, [],
+            "and a scanner that finished must not lose its outcome to "
+                + "`finish()`: a partial scan is reported as partial"
+        )
+    }
+
+    /// A SESSION CUT OFF BY ITS BOUND VOUCHES FOR NOTHING — the mitigation
+    /// r12 wrote down and did not implement (PR #460 codex r13, D).
+    ///
+    /// `untilProducerFinishes()` discloses a real residual: when the grace
+    /// expires the caller releases its "scan in progress" guard while an
+    /// orphaned walk may still be reading the same trees. What made that
+    /// acceptable was the next sentence — "a session whose bound fired adopts
+    /// nothing, so `adoptedGeneration` never advances and every DESTRUCTIVE
+    /// path stays closed on that session's items". It was false. The watchdog
+    /// cancels the PRODUCER, never the consumer, so `let completed =
+    /// !Task.isCancelled` was TRUE and the adoption block ran: MEASURED on a
+    /// first-ever scan with one healthy and one wedged scanner at a 200 ms
+    /// bound, `hasScanned == true` and the healthy scanner's item selected
+    /// and CLEANABLE.
+    ///
+    /// This is a FIRST-EVER scan on purpose: it is the case with no earlier
+    /// adopted generation to fall back on, so nothing but this gate stands
+    /// between a cut-off session and a delete.
+    ///
+    /// MUTATION: restore `let completed = !Task.isCancelled` in
+    /// `CacheoutViewModel.scan` and every assertion below flips.
+    @MainActor
+    func testABoundedSessionAdoptsNothingAndCleansNothing() async throws {
+        let gate = StallGate()
+        let healthy = ScanOutcome(
+            items: [perItem(scanner: "ok", id: "o1", bytes: 5000,
+                            risk: .safe, defaultSelected: true,
+                            automaticCleanEligible: true)],
+            errors: []
+        )
+        let runtime = try makeRuntime(
+            [
+                fixtureScanner("ok") { healthy },
+                FixtureScanner(
+                    id: "wedged",
+                    trustedContainerRoots: [
+                        base.appendingPathComponent("wedged"),
+                    ]
+                ) {
+                    await gate.hold()
+                    return ScanOutcome(items: [], errors: [])
+                },
+            ],
+            sessionBounds: ScanSessionBounds(
+                eventDeadline: .milliseconds(200),
+                producerWindDownGrace: .milliseconds(100)
+            )
+        )
+        let viewModel = CacheoutViewModel(runtime: runtime)
+
+        // `hold()` does not return until the test releases it, so the only
+        // thing that can end this scan is the bound.
+        await gate.wedge()
+        await viewModel.scan(trigger: .automatic)
+
+        // The bound fired and said so.
+        XCTAssertEqual(
+            viewModel.malformedIssuesByScannerID["wedged"]?.kind,
+            .scanDidNotFinish
+        )
+        // The healthy scanner's row is still VISIBLE — a partial scan is
+        // reported as partial, which is the other half of the contract.
+        XCTAssertEqual(viewModel.items(forScanner: "ok").map(\.id), ["o1"])
+
+        // AND NOTHING IS VOUCHED FOR. This is the sentence made true. The
+        // item IS ticked — `defaultSelected` selected it on its first
+        // emission, exactly as the measurement found — so this is the gate
+        // refusing a live selection, not an empty one trivially passing.
+        XCTAssertTrue(viewModel.selectedItemKeys.contains(key("ok", "o1")))
+        XCTAssertEqual(
+            viewModel.selectedItems.map(\.id), [],
+            "the measurement found `selectedItems == [\"o1\"]` here: items "
+                + "from a cut-off session must not reach a destructive path"
+        )
+        XCTAssertFalse(
+            viewModel.hasCleanableSelection,
+            "a session cut off by its bound must not leave its items "
+                + "cleanable — an orphaned read-only walk may still be in "
+                + "the same trees"
+        )
+        XCTAssertEqual(viewModel.totalCleanableSelectedSize, 0)
+        XCTAssertEqual(viewModel.automaticCleanableSize, 0)
+        XCTAssertFalse(
+            viewModel.hasScanned,
+            "…and the session must not present itself as a completed scan"
+        )
+
+        // Bulk selection cannot re-open the door either.
+        viewModel.selectAllSafe()
+        XCTAssertFalse(viewModel.hasCleanableSelection,
+                       "Quick Clean must not stage an unadopted session")
+
+        // AND A RETRY CAN DIFFER: releasing the wedge and re-scanning adopts
+        // normally, so the fail-closed state is a state and not a trap.
+        await gate.release()
+        await viewModel.scan(trigger: .automatic)
+        XCTAssertNil(viewModel.malformedIssuesByScannerID["wedged"])
+        XCTAssertTrue(viewModel.hasScanned)
+        viewModel.selectAllSafe()
+        XCTAssertTrue(viewModel.hasCleanableSelection)
+        XCTAssertEqual(viewModel.totalCleanableSelectedSize, 5000)
+    }
+
+    /// How long this file's polling blockers hold a thread when nothing ever
+    /// cancels them — the cap that turns a regression into a RED cell
+    /// instead of a hung run.
+    private static let pollCapSeconds: TimeInterval = 2.0
+
+    /// THE HEALTHY PATH PAYS NOTHING, asserted rather than assumed: a
+    /// session whose scanners all report ends on the producer's own
+    /// terminator, immediately, and NO `scan_did_not_finish` row appears —
+    /// even with the bound set to a few milliseconds, which every other cell
+    /// in this file exercises at the 30 s default.
+    ///
+    /// Without this, the two cells above would pass against a session that
+    /// reported every scanner as timed out.
+    @MainActor
+    func testAHealthySessionEndsOnItsOwnTerminatorAndReportsNoBound()
+        async throws
+    {
+        let outcome = ScanOutcome(
+            items: [perItem(scanner: "ok", id: "o1", bytes: 5000)], errors: []
+        )
+        let runtime = try makeRuntime(
+            [fixtureScanner("ok") { outcome }],
+            sessionBounds: ScanSessionBounds(
+                eventDeadline: .milliseconds(250),
+                producerWindDownGrace: .milliseconds(50)
+            )
+        )
+        let viewModel = CacheoutViewModel(runtime: runtime)
+
+        let started = Date()
+        await viewModel.scan(trigger: .automatic)
+        let elapsed = Date().timeIntervalSince(started)
+
+        XCTAssertLessThan(elapsed, 0.25,
+                          "a healthy session must not wait out the deadline: "
+                              + "\(elapsed) s")
+        XCTAssertNil(viewModel.malformedIssuesByScannerID["ok"])
+        XCTAssertEqual(viewModel.items(forScanner: "ok").map(\.id), ["o1"])
+        XCTAssertTrue(viewModel.hasScanned)
+    }
+
     // MARK: - Malformed-BLOCKED scanners: retained records are display-only
     // (every destructive path excludes them until a valid outcome arrives)
 
@@ -1635,7 +2609,7 @@ final class CacheoutViewModelTests: XCTestCase {
         let runtime = try makeRuntime([
             fixtureScanner("old_alpha") { outcome },
         ])
-        let (seam, log) = makeReconstruction()
+        let (seam, log) = try makeReconstruction()
         let viewModel = CacheoutViewModel(
             runtime: runtime, reconstruction: seam
         )
@@ -1684,7 +2658,7 @@ final class CacheoutViewModelTests: XCTestCase {
         let runtime = try makeRuntime(
             [fixtureScanner("old_alpha") { outcome }], provider: spy
         )
-        let (seam, log) = makeReconstruction()
+        let (seam, log) = try makeReconstruction()
         let viewModel = CacheoutViewModel(
             runtime: runtime, reconstruction: seam
         )
@@ -1763,7 +2737,7 @@ final class CacheoutViewModelTests: XCTestCase {
                 return outcome
             },
         ])
-        let (seam, log) = makeReconstruction()
+        let (seam, log) = try makeReconstruction()
         let viewModel = CacheoutViewModel(
             runtime: runtime, reconstruction: seam
         )
@@ -1820,7 +2794,7 @@ final class CacheoutViewModelTests: XCTestCase {
         let runtime = try makeRuntime([
             DirectoryFixtureScanner(id: "fixture_items", container: container),
         ])
-        let (seam, log) = makeReconstruction()
+        let (seam, log) = try makeReconstruction()
         let viewModel = CacheoutViewModel(
             runtime: runtime, reconstruction: seam
         )
@@ -1875,7 +2849,7 @@ final class CacheoutViewModelTests: XCTestCase {
         let runtime = try makeRuntime([
             fixtureScanner("old_alpha") { outcome },
         ])
-        let (seam, _) = makeReconstruction()
+        let (seam, _) = try makeReconstruction()
         let viewModel = CacheoutViewModel(
             runtime: runtime, reconstruction: seam
         )
@@ -1916,7 +2890,7 @@ final class CacheoutViewModelTests: XCTestCase {
                 return outcome
             },
         ])
-        let (seam, log) = makeReconstruction()
+        let (seam, log) = try makeReconstruction()
         let viewModel = CacheoutViewModel(
             runtime: runtime, reconstruction: seam
         )
@@ -2025,21 +2999,58 @@ private actor CallCounter {
 }
 
 /// An openable/closable gate the staggered fixtures block on.
-private actor ScanGate {
-    private var opened = false
-    private var waiters: [CheckedContinuation<Void, Never>] = []
+///
+/// BOUNDED (PR #460 codex r11, D2). Both directions of this gate can be
+/// decided by production: a fixture scanner parks on it waiting for the CELL,
+/// and the cell parks on `entered` waiting for the SESSION to invoke that
+/// scanner. An unbounded park in the second direction turns a production
+/// regression into a runner that never finishes and never says why — measured
+/// on the twin in `EphemeralTempRegistrationTests`. See `BoundedRendezvous`.
+/// A gate a fixture scanner passes through instantly until the test WEDGES
+/// it, after which `hold()` does not return until `release()`.
+///
+/// Built on `BoundedRendezvous` — the r11 primitive — so a wedge the test
+/// forgets to release fails the cell after the rendezvous' own bound instead
+/// of parking the run. The session's wall-clock bound is what these cells
+/// are measuring; the rendezvous' is the backstop under it.
+private actor StallGate {
+    private let gate = BoundedRendezvous()
+    private var wedged = false
 
-    func open() {
-        opened = true
-        for waiter in waiters { waiter.resume() }
-        waiters = []
+    init() { gate.open() }
+
+    func wedge() {
+        wedged = true
+        gate.close()
     }
 
-    func close() { opened = false }
+    func release() {
+        wedged = false
+        gate.open()
+    }
 
-    func wait() async {
-        if opened { return }
-        await withCheckedContinuation { waiters.append($0) }
+    func hold(
+        file: StaticString = #filePath, line: UInt = #line
+    ) async {
+        guard wedged else { return }
+        await gate.park("a wedged fixture scanner", file: file, line: line)
+    }
+}
+
+private actor ScanGate {
+    private let gate = BoundedRendezvous()
+
+    func open() { gate.open() }
+
+    func close() { gate.close() }
+
+    @discardableResult
+    func wait(
+        _ what: String = "a staggered scan gate",
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async -> Bool {
+        await gate.park(what, file: file, line: line)
     }
 }
 
@@ -2106,6 +3117,74 @@ private actor OutcomeSequence {
     }
 
     func next() -> ScanOutcome {
-        outcomes.count > 1 ? outcomes.removeFirst() : outcomes[0]
+        // FIXTURE-CONTROLLED — `outcomes` is the literal list this test
+        // handed the box and no production code can shorten it — but the
+        // subscript is gone anyway (PR #460 codex r6, D4): the statement-
+        // position fence forbids the SHAPE, because "provably non-empty" is
+        // exactly what every stranding subscript in this suite's history also
+        // claimed. The `??` arm is unreachable; it is not a guard.
+        outcomes.count > 1
+            ? outcomes.removeFirst()
+            : (outcomes.first ?? ScanOutcome(items: [], errors: []))
+    }
+}
+
+/// N COOPERATIVE WORKERS HELD, AND THEN JOINED (PR #460 codex r13, B).
+///
+/// The starvation cells need threads blocked the way a walk inside a syscall
+/// blocks one: `Thread.sleep`, ignoring cancellation. A bare sleep does that
+/// but LEAKS — the blocked threads outlive the cell that made them and starve
+/// the NEXT one, which is not hypothetical: a four-cell run of these very
+/// cells failed a mutation check for that reason and passed when run alone.
+///
+/// So each blocker signals on its way out and the cell JOINS all of them
+/// before returning. The hold is uncancellable on purpose — a blocker that
+/// exited on cancellation would let a regressed build pass, because the
+/// watchdog cancels the producer whether or not the consumer can see it.
+private final class LeakFreeBlockers: @unchecked Sendable {
+    private let exited = DispatchSemaphore(value: 0)
+    private let count: Int
+    private let seconds: TimeInterval
+
+    init(count: Int, seconds: TimeInterval = 1.5) {
+        self.count = count
+        self.seconds = seconds
+    }
+
+    /// One blocker's body: holds its thread, cancellation or not.
+    func hold() {
+        Thread.sleep(forTimeInterval: seconds)
+        exited.signal()
+    }
+
+    /// Does not return until all `count` blockers have left `hold()`. Safe to
+    /// call from the MainActor because every caller puts its blockers BELOW
+    /// the MainActor's own band — `.utility` when they are session scanners,
+    /// `.medium` when they are detached — so none of them can be scheduled
+    /// onto the main thread and wait on the very actor that is joining them.
+    /// That is not hypothetical: an earlier draft used
+    /// `Task.detached(priority: .high)` and a blocker landed on the main
+    /// thread, deadlocking the cell (`sample` showed the main thread inside
+    /// `hold()`).
+    func join() {
+        for _ in 0..<count { exited.wait() }
+    }
+}
+
+/// A single elapsed-time reading, written from a blocked scanner thread and
+/// read from the test — lock-guarded because those are different threads and
+/// the writer must not suspend (PR #460 codex r13, B).
+private final class TimestampBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: TimeInterval?
+
+    var value: TimeInterval? {
+        lock.lock(); defer { lock.unlock() }
+        return stored
+    }
+
+    func record(_ seconds: TimeInterval) {
+        lock.lock(); defer { lock.unlock() }
+        if stored == nil { stored = seconds }
     }
 }

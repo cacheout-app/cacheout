@@ -297,17 +297,17 @@ final class CategoryScannerTests: XCTestCase {
         func count() -> Int { calls }
     }
 
+    /// BOUNDED (PR #460 codex r11, D2) — see `BoundedRendezvous`.
     private actor AsyncGate {
-        private var opened = false
-        private var waiters: [CheckedContinuation<Void, Never>] = []
-        func open() {
-            opened = true
-            for waiter in waiters { waiter.resume() }
-            waiters.removeAll()
-        }
-        func wait() async {
-            guard !opened else { return }
-            await withCheckedContinuation { waiters.append($0) }
+        private let gate = BoundedRendezvous()
+        func open() { gate.open() }
+        @discardableResult
+        func wait(
+            _ what: String = "a fixture scanner gate",
+            file: StaticString = #filePath,
+            line: UInt = #line
+        ) async -> Bool {
+            await gate.park(what, file: file, line: line)
         }
     }
 
@@ -425,13 +425,13 @@ final class CategoryScannerTests: XCTestCase {
         let second = await scanItems(categories: [category], home: home)
 
         XCTAssertEqual(first.items.count, 1)
-        XCTAssertEqual(first.items[0].id, "fixture_cache")
+        XCTAssertEqual(try XCTUnwrapElement(first.items, 0).id, "fixture_cache")
         XCTAssertEqual(
             first.items.map(\.id), second.items.map(\.id),
             "ids must be identical across two scans of the same fixture"
         )
         XCTAssertEqual(
-            first.items[0].key,
+            try XCTUnwrapElement(first.items, 0).key,
             ItemKey(scannerID: "categories", itemID: "fixture_cache")
         )
     }
@@ -453,9 +453,12 @@ final class CategoryScannerTests: XCTestCase {
         )
         // The records the item carries are the scan-time capture, not a
         // re-resolution.
-        XCTAssertEqual(outcome.items[0].rootRecords.count, 1)
-        XCTAssertEqual(outcome.items[0].rootRecords[0].status, .measured)
-        XCTAssertEqual(outcome.items[0].rootRecords[0].requestedURL.path, dir.path)
+        let records = try XCTUnwrapElement(outcome.items, 0).rootRecords
+        XCTAssertEqual(records.count, 1)
+        XCTAssertEqual(try XCTUnwrapElement(records, 0).status, .measured)
+        XCTAssertEqual(
+            try XCTUnwrapElement(records, 0).requestedURL.path, dir.path
+        )
     }
 
     // MARK: - RootScanRecord truth table (R1)
@@ -502,34 +505,34 @@ final class CategoryScannerTests: XCTestCase {
 
         // Refused at admission — never walked, never deletable; the record
         // still carries the honest canonical spelling.
-        XCTAssertEqual(result.rootRecords[0].status, .refusedAdmission)
-        XCTAssertEqual(result.rootRecords[0].requestedURL.path, documents.path)
+        XCTAssertEqual(try XCTUnwrapElement(result.rootRecords, 0).status, .refusedAdmission)
+        XCTAssertEqual(try XCTUnwrapElement(result.rootRecords, 0).requestedURL.path, documents.path)
         XCTAssertEqual(
-            result.rootRecords[0].resolvedURL?.path,
+            try XCTUnwrapElement(result.rootRecords, 0).resolvedURL?.path,
             provider.canonicalize(documents).path
         )
 
         // Admitted but denied before ANY measurement — not deletable.
-        XCTAssertEqual(result.rootRecords[1].status, .deniedUnmeasured)
-        XCTAssertEqual(result.rootRecords[1].requestedURL.path, denied.path)
+        XCTAssertEqual(try XCTUnwrapElement(result.rootRecords, 1).status, .deniedUnmeasured)
+        XCTAssertEqual(try XCTUnwrapElement(result.rootRecords, 1).requestedURL.path, denied.path)
 
         // Measured: requested keeps the UNRESOLVED symlink spelling (what
         // deletion uses), resolved is the canonical target (what containment
         // compares against).
-        XCTAssertEqual(result.rootRecords[2].status, .measured)
-        XCTAssertEqual(result.rootRecords[2].requestedURL.path, link.path)
+        XCTAssertEqual(try XCTUnwrapElement(result.rootRecords, 2).status, .measured)
+        XCTAssertEqual(try XCTUnwrapElement(result.rootRecords, 2).requestedURL.path, link.path)
         XCTAssertEqual(
-            result.rootRecords[2].resolvedURL?.path,
+            try XCTUnwrapElement(result.rootRecords, 2).resolvedURL?.path,
             provider.canonicalize(measuredTarget).path
         )
         XCTAssertNotEqual(
-            result.rootRecords[2].requestedURL.path,
-            result.rootRecords[2].resolvedURL?.path
+            try XCTUnwrapElement(result.rootRecords, 2).requestedURL.path,
+            try XCTUnwrapElement(result.rootRecords, 2).resolvedURL?.path
         )
 
         // A CLEAN-EMPTY walked root is `.measured` (deletable), NOT denied.
-        XCTAssertEqual(result.rootRecords[3].status, .measured)
-        XCTAssertEqual(result.rootRecords[3].requestedURL.path, empty.path)
+        XCTAssertEqual(try XCTUnwrapElement(result.rootRecords, 3).status, .measured)
+        XCTAssertEqual(try XCTUnwrapElement(result.rootRecords, 3).requestedURL.path, empty.path)
     }
 
     func testMissingCategoryHasEmptyCaptureAndDeclaredDisplayPath() async throws {
@@ -541,7 +544,7 @@ final class CategoryScannerTests: XCTestCase {
         let outcome = await scanItems(categories: [category], home: home)
 
         XCTAssertEqual(outcome.items.count, 1)
-        let item = outcome.items[0]
+        let item = try XCTUnwrapElement(outcome.items, 0)
         XCTAssertEqual(item.state, .missing)
         XCTAssertNil(item.url, "never a fake resolution for a missing category")
         XCTAssertTrue(item.rootRecords.isEmpty, "`.missing` → empty capture")
@@ -608,7 +611,7 @@ final class CategoryScannerTests: XCTestCase {
         let outcome = await scanItems(categories: [category], home: home)
 
         XCTAssertEqual(outcome.items.count, 1)
-        let item = outcome.items[0]
+        let item = try XCTUnwrapElement(outcome.items, 0)
         XCTAssertEqual(item.state, .denied, "never flattened to .empty (D6)")
         XCTAssertEqual(item.scanError?.kind, .permissionDenied)
         XCTAssertTrue(
@@ -619,7 +622,7 @@ final class CategoryScannerTests: XCTestCase {
         // honest display data.
         XCTAssertNotNil(item.url)
         XCTAssertEqual(item.rootRecords.count, 1)
-        XCTAssertEqual(item.rootRecords[0].status, .deniedUnmeasured)
+        XCTAssertEqual(try XCTUnwrapElement(item.rootRecords, 0).status, .deniedUnmeasured)
     }
 
     // MARK: - Policy + presentation fields (R1)
@@ -637,7 +640,7 @@ final class CategoryScannerTests: XCTestCase {
 
         let outcome = await scanItems(categories: categories, home: home)
 
-        let bySlug = Dictionary(uniqueKeysWithValues: outcome.items.map { ($0.id, $0) })
+        let bySlug = XCTUniquelyKeyed(outcome.items.map { ($0.id, $0) })
         XCTAssertEqual(bySlug["selected_cache"]?.defaultSelected, true)
         XCTAssertEqual(bySlug["unselected_cache"]?.defaultSelected, false)
         for item in outcome.items {
@@ -657,7 +660,7 @@ final class CategoryScannerTests: XCTestCase {
 
         let outcome = await scanItems(categories: [category], home: home)
 
-        let item = outcome.items[0]
+        let item = try XCTUnwrapElement(outcome.items, 0)
         XCTAssertEqual(item.scannerID, "categories", "the frozen aggregate id")
         XCTAssertEqual(item.scannerID, CategoryScanner.registeredID)
         XCTAssertEqual(item.displayName, "Owned Cache")
@@ -684,7 +687,7 @@ final class CategoryScannerTests: XCTestCase {
         let outcome = await scanItems(categories: [category], home: home)
 
         XCTAssertEqual(
-            outcome.items[0].action, .commands(argv),
+            try XCTUnwrapElement(outcome.items, 0).action, .commands(argv),
             "argv arrays pass through unmodified"
         )
     }
@@ -698,6 +701,13 @@ final class CategoryScannerTests: XCTestCase {
         // compile-time-visible change everywhere, never a silent fallthrough.
         let actions: [ReclaimAction] = [
             .removeContents, .removeItem, .commands([["true"]]),
+            .gitWorktreeReclaim(GitWorktreeReclaimPlan.pruneOrphanedAdmin(
+                parentRepoWorkingDir: URL(fileURLWithPath: "/dev/repo"),
+                adminContainer: URL(fileURLWithPath: "/dev/repo/.git/worktrees"),
+                disclosedAdminDirectories: [
+                    URL(fileURLWithPath: "/dev/repo/.git/worktrees/gone"),
+                ]
+            )),
         ]
         for action in actions {
             switch action {
@@ -707,6 +717,10 @@ final class CategoryScannerTests: XCTestCase {
                 XCTAssertEqual(action.wireString, "remove_item")
             case .commands:
                 XCTAssertEqual(action.wireString, "commands")
+            // fn-5.3 landed the composite case: this arm IS the
+            // compile-time-visible change the comment above predicted.
+            case .gitWorktreeReclaim:
+                XCTAssertEqual(action.wireString, "git_worktree_reclaim")
             }
         }
     }
@@ -728,6 +742,7 @@ final class CategoryScannerTests: XCTestCase {
         XCTAssertEqual(ScanIssue.Kind.permissionDenied.wireString, "permission_denied")
         XCTAssertEqual(ScanIssue.Kind.unreadable.wireString, "unreadable")
         XCTAssertEqual(ScanIssue.Kind.configInvalid.wireString, "config_invalid")
+        XCTAssertEqual(ScanIssue.Kind.toolUnavailable.wireString, "tool_unavailable")
         XCTAssertEqual(ScanIssue.Kind.malformedOutcome.wireString, "malformed_outcome")
     }
 
@@ -828,6 +843,9 @@ final class CategoryScannerTests: XCTestCase {
                 CategoryScanner.registeredID,
                 BuildArtifactsScanner.registeredID,
                 OrphanedCachesScanner.registeredID,
+                // fn-5.6: sharing the dev roots (and the one git runner) the
+                // composition already resolved.
+                GitWorktreeScanner.registeredID,
                 EphemeralTempScanner.registeredID,
             ]
         )
@@ -850,7 +868,9 @@ final class CategoryScannerTests: XCTestCase {
             "the union is the per-item scanners' declared sets in "
                 + "registration order (the kept dev roots, then the "
                 + "orphaned-caches sweep root, then the ephemeral temp "
-                + "roots) — CategoryScanner contributes no container roots"
+                + "roots) — CategoryScanner contributes no container roots, "
+                + "and git_worktrees declares the SAME dev roots, which the "
+                + "union deduplicates by path"
         )
         // The factory reaching here at all asserts the production
         // category-slug/scanner-slug namespace is collision-free (a
@@ -876,7 +896,7 @@ final class CategoryScannerTests: XCTestCase {
         ))
 
         XCTAssertEqual(events.count, 1)
-        XCTAssertEqual(outcome(of: events[0])?.items, [item])
+        XCTAssertEqual(outcome(of: try XCTUnwrapElement(events, 0))?.items, [item])
     }
 
     // MARK: - Shared outcome validation (R1, R8)
@@ -1662,11 +1682,11 @@ final class CategoryScannerTests: XCTestCase {
 
         XCTAssertEqual(events.count, 1)
         XCTAssertNil(
-            malformedIssue(of: events[0]),
+            malformedIssue(of: try XCTUnwrapElement(events, 0)),
             "no production emission may fail the coherence validator"
         )
-        let items = try XCTUnwrap(outcome(of: events[0])?.items)
-        let bySlug = Dictionary(uniqueKeysWithValues: items.map { ($0.id, $0) })
+        let items = try XCTUnwrap(outcome(of: try XCTUnwrapElement(events, 0))?.items)
+        let bySlug = XCTUniquelyKeyed(items.map { ($0.id, $0) })
         XCTAssertEqual(bySlug["partial_cache"]?.state, .partiallyDenied)
         XCTAssertEqual(
             Set(bySlug["partial_cache"]?.rootRecords.map(\.status) ?? []),
@@ -2000,7 +2020,7 @@ final class CategoryScannerTests: XCTestCase {
 
         XCTAssertEqual(events.count, 1)
         XCTAssertEqual(
-            malformedIssue(of: events[0])?.kind, .malformedOutcome,
+            malformedIssue(of: try XCTUnwrapElement(events, 0))?.kind, .malformedOutcome,
             "a fixture scanner must not be able to publish a category-backed "
                 + "action through the validated stream"
         )
@@ -2032,7 +2052,7 @@ final class CategoryScannerTests: XCTestCase {
         }
 
         XCTAssertEqual(events.count, 2)
-        XCTAssertEqual(scannerID(of: events[1]), "gated")
+        XCTAssertEqual(scannerID(of: try XCTUnwrapElement(events, 1)), "gated")
     }
 
     func testStreamSubsetScansOnlyTheNamedScanners() async throws {
@@ -2085,7 +2105,7 @@ final class CategoryScannerTests: XCTestCase {
         XCTAssertEqual(events.count, 2)
         let badEvents = events.filter { scannerID(of: $0) == "bad" }
         XCTAssertEqual(badEvents.count, 1)
-        let issue = malformedIssue(of: badEvents[0])
+        let issue = malformedIssue(of: try XCTUnwrapElement(badEvents, 0))
         XCTAssertEqual(
             issue?.kind, .malformedOutcome,
             "a malformed outcome yields its synthesized issue and NO item event"
@@ -2093,7 +2113,7 @@ final class CategoryScannerTests: XCTestCase {
         XCTAssertNil(issue?.url)
         // The valid scanner in the same subset still publishes.
         let goodEvents = events.filter { scannerID(of: $0) == "good" }
-        XCTAssertEqual(outcome(of: goodEvents[0])?.items.count, 1)
+        XCTAssertEqual(outcome(of: try XCTUnwrapElement(goodEvents, 0))?.items.count, 1)
     }
 
     // MARK: - Category filter (R1, R8)
@@ -2125,7 +2145,9 @@ final class CategoryScannerTests: XCTestCase {
         ))
 
         let categoryEvents = events.first { scannerID(of: $0) == "categories" }
-        XCTAssertEqual(outcome(of: categoryEvents!)?.items.map(\.id), ["a"])
+        XCTAssertEqual(
+            outcome(of: try XCTUnwrap(categoryEvents))?.items.map(\.id), ["a"]
+        )
         XCTAssertEqual(probeCount(slug: "a", home: home), 1)
         XCTAssertEqual(
             probeCount(slug: "b", home: home), 0,
@@ -2133,14 +2155,16 @@ final class CategoryScannerTests: XCTestCase {
         )
         // A per-item scanner ignores the filter entirely.
         let fixtureEvents = events.first { scannerID(of: $0) == "fixture_x" }
-        XCTAssertEqual(outcome(of: fixtureEvents!)?.items, [fixtureItem])
+        XCTAssertEqual(
+            outcome(of: try XCTUnwrap(fixtureEvents))?.items, [fixtureItem]
+        )
 
         // nil filter scans all.
         let allEvents = await collect(runtime.scanValidated(
             scannerIDs: ["categories"],
             context: ScanContext(trigger: .automatic)
         ))
-        let allItems = outcome(of: allEvents[0])?.items
+        let allItems = outcome(of: try XCTUnwrapElement(allEvents, 0))?.items
         XCTAssertEqual(Set(allItems?.map(\.id) ?? []), ["a", "b"])
         XCTAssertEqual(probeCount(slug: "b", home: home), 1)
     }

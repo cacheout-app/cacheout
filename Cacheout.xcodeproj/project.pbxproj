@@ -11,6 +11,7 @@
 		0278B4393D479EC036242074 /* CacheoutHelper in Embed Dependencies */ = {isa = PBXBuildFile; fileRef = F3746399EBD05A9B8148C269 /* CacheoutHelper */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		05DB419E77B0A635F9807007 /* JetsamSnapshotEntryDTO.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5C8F231FF24CC44DBE618C39 /* JetsamSnapshotEntryDTO.swift */; };
 		0647D21FFA0D1B4A24F10AE4 /* SaturatingArithmetic.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A736F34AD05200EDE9972AA /* SaturatingArithmetic.swift */; };
+		07C439BB8299EED3B6E1782F /* GitWorktreeInventory.swift in Sources */ = {isa = PBXBuildFile; fileRef = E9BFFD7E10C4A7542DB9FC2E /* GitWorktreeInventory.swift */; };
 		088E861862E309BF9EDE036A /* SystemMonitorViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4F95CF8D96666F9C369AA112 /* SystemMonitorViewModel.swift */; };
 		0DEF981806847D459872BBD5 /* PredictiveEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9CA2CF3212EDFDB834A10546 /* PredictiveEngine.swift */; };
 		130F94E2F25EC1A4689DFDD6 /* MemorySnapshot.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8735DAAAE2A574287605F48B /* MemorySnapshot.swift */; };
@@ -38,6 +39,7 @@
 		50AEC599709438B015AC81BB /* PathGuard.swift in Sources */ = {isa = PBXBuildFile; fileRef = B415391F406F0415AE007308 /* PathGuard.swift */; };
 		5134AD93B1D55612B74BDFD1 /* Categories.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6E4F0D56D0D9FFBD5157574E /* Categories.swift */; };
 		5194782EBC470C5E5765E5FC /* DaemonSnapshot.swift in Sources */ = {isa = PBXBuildFile; fileRef = 76C8538BE4D7AD7ACDECC254 /* DaemonSnapshot.swift */; };
+		527DC90002648CDE1543783F /* WorktreeStalenessAssessor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6BAD54210BDEE35F2FB38595 /* WorktreeStalenessAssessor.swift */; };
 		53FDF117C05781F8D27938BA /* AutopilotPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 82ABA28C5E88782DD93E42A1 /* AutopilotPolicy.swift */; };
 		5416ABC78819DF413373498E /* StatusSocket.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2BD6365309839A8FF2A6A271 /* StatusSocket.swift */; };
 		572BD228B36DEA32CEBB9585 /* Sparkle in Frameworks */ = {isa = PBXBuildFile; productRef = F14689CFA3D53EC0E6D1A853 /* Sparkle */; };
@@ -70,6 +72,8 @@
 		9891100B0B90E4B88DBE923E /* CacheCleaner.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1230916736A41CCED07F35CA /* CacheCleaner.swift */; };
 		99FDCC1360ACB7298594FFB1 /* EphemeralTempRoots.swift in Sources */ = {isa = PBXBuildFile; fileRef = 528D3A07085FFADB1D465CF5 /* EphemeralTempRoots.swift */; };
 		9AEB2C0D8F19C4470F26CF15 /* CacheoutViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = D564143E7CC34F104D9274A0 /* CacheoutViewModel.swift */; };
+		A0358BB924BC7F234052EC60 /* WorktreeReclaimPerformer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 379987CF5B79ABDF997B7DC1 /* WorktreeReclaimPerformer.swift */; };
+		A2F30550AAFBE3C54CB029CA /* GitWorktreeScanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = E76EC93CDCAC20AF891B84DD /* GitWorktreeScanner.swift */; };
 		A33E0DD02A3A4774BB09DFE7 /* ScanResult.swift in Sources */ = {isa = PBXBuildFile; fileRef = BC4E35BBC87E2364C890D8EB /* ScanResult.swift */; };
 		A43CF960F06EEC4A6F9C4C1D /* MenuBarIconTemplate.png in Resources */ = {isa = PBXBuildFile; fileRef = B878A98009FCF82EC164CFFD /* MenuBarIconTemplate.png */; };
 		A4E06C2EC0CFD54C2BDA25FE /* MemoryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 478B5454F1D3E7D6047E1E6C /* MemoryView.swift */; };
@@ -95,6 +99,7 @@
 		D50904DE9D410EC6C0E70588 /* XPCDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = DF94BB5AFCDB5762405130C7 /* XPCDelegate.swift */; };
 		D6A6853C267993B9FB084206 /* DiskInfo.swift in Sources */ = {isa = PBXBuildFile; fileRef = BF1FDC6594E076F20AACD291 /* DiskInfo.swift */; };
 		D950B656A6294774C4FCFDED /* ScannerItemSection.swift in Sources */ = {isa = PBXBuildFile; fileRef = B09E2754C65635360AFBAE8E /* ScannerItemSection.swift */; };
+		DB3D6FA8B8C895D201EAA115 /* GitCommandRunner.swift in Sources */ = {isa = PBXBuildFile; fileRef = 14FAD15AA744620E0BEFE581 /* GitCommandRunner.swift */; };
 		DEC54E50C77616EA4C656C73 /* CacheoutApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 690B4B40C11E6BCBB23D5E81 /* CacheoutApp.swift */; };
 		E1EA90E64BFB61E4586B7EDA /* InterventionEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 53733E66E19D1D326B7702E9 /* InterventionEngine.swift */; };
 		E7B97E3C741CBCCA949C0B61 /* shim.c in Sources */ = {isa = PBXBuildFile; fileRef = 62CF83129C7140C556661459 /* shim.c */; };
@@ -201,6 +206,7 @@
 		08069DE63A5D0EDBBD1E9C4F /* OnboardingView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OnboardingView.swift; sourceTree = "<group>"; };
 		10C54ACA50BA3F2B5FB5F2B7 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		1230916736A41CCED07F35CA /* CacheCleaner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CacheCleaner.swift; sourceTree = "<group>"; };
+		14FAD15AA744620E0BEFE581 /* GitCommandRunner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GitCommandRunner.swift; sourceTree = "<group>"; };
 		17099F0406144C6E7D4167F6 /* SettingsContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsContentView.swift; sourceTree = "<group>"; };
 		1CEB51D47544270EEF3C44C7 /* Cacheout.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Cacheout.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		1D7651B0D35566F5CE769DE0 /* CacheScanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CacheScanner.swift; sourceTree = "<group>"; };
@@ -214,6 +220,7 @@
 		3453E554A2EF5BB26F884A37 /* CacheCategory.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CacheCategory.swift; sourceTree = "<group>"; };
 		3484E5F5A3B45839B0F1C493 /* MemlimitWorkaround.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MemlimitWorkaround.swift; sourceTree = "<group>"; };
 		36C9423892BDE0AC771BD2FB /* MenuBarIcon.tiff */ = {isa = PBXFileReference; lastKnownFileType = image.tiff; path = MenuBarIcon.tiff; sourceTree = "<group>"; };
+		379987CF5B79ABDF997B7DC1 /* WorktreeReclaimPerformer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorktreeReclaimPerformer.swift; sourceTree = "<group>"; };
 		3D8D2747B5292A1718AEAA39 /* memorystatus_private.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = memorystatus_private.h; sourceTree = "<group>"; };
 		406A840A809552F909991D62 /* OrphanedCachesScanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OrphanedCachesScanner.swift; sourceTree = "<group>"; };
 		4498672B01BC7DADFF0A5D0E /* OrphanedCacheClassifier.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OrphanedCacheClassifier.swift; sourceTree = "<group>"; };
@@ -236,6 +243,7 @@
 		6761E1D9337C546411448F05 /* ZoneHealthDTO.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ZoneHealthDTO.swift; sourceTree = "<group>"; };
 		690B4B40C11E6BCBB23D5E81 /* CacheoutApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CacheoutApp.swift; sourceTree = "<group>"; };
 		694FD02594543926D322D60A /* libCKernelPrivate.a */ = {isa = PBXFileReference; explicitFileType = archive.ar; includeInIndex = 0; path = libCKernelPrivate.a; sourceTree = BUILT_PRODUCTS_DIR; };
+		6BAD54210BDEE35F2FB38595 /* WorktreeStalenessAssessor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorktreeStalenessAssessor.swift; sourceTree = "<group>"; };
 		6E4F0D56D0D9FFBD5157574E /* Categories.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Categories.swift; sourceTree = "<group>"; };
 		7004867F08F19EC37A2D7D1B /* RecommendationEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecommendationEngine.swift; sourceTree = "<group>"; };
 		73710519BBA38A1BB272D0E8 /* HelperInstaller.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HelperInstaller.swift; sourceTree = "<group>"; };
@@ -283,7 +291,9 @@
 		E638A9E7E14DFE181F014833 /* HealthScore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HealthScore.swift; sourceTree = "<group>"; };
 		E67941938A2005282222342F /* JetsamPriorityEntryDTO.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JetsamPriorityEntryDTO.swift; sourceTree = "<group>"; };
 		E6EE7823FD0C101186B28314 /* main.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = main.swift; sourceTree = "<group>"; };
+		E76EC93CDCAC20AF891B84DD /* GitWorktreeScanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GitWorktreeScanner.swift; sourceTree = "<group>"; };
 		E88E2595E9EE04EB9B26FFC0 /* MenuBarView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MenuBarView.swift; sourceTree = "<group>"; };
+		E9BFFD7E10C4A7542DB9FC2E /* GitWorktreeInventory.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GitWorktreeInventory.swift; sourceTree = "<group>"; };
 		EF1F365F6A2B91448060F8D6 /* AgentDetector.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentDetector.swift; sourceTree = "<group>"; };
 		EFF2C42D456B268FFEB2B2A2 /* Tier2Interventions.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Tier2Interventions.swift; sourceTree = "<group>"; };
 		F3746399EBD05A9B8148C269 /* CacheoutHelper */ = {isa = PBXFileReference; includeInIndex = 0; path = CacheoutHelper; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -346,6 +356,9 @@
 				7A7C712109CDC8595E0BB9A1 /* DirectorySizer.swift */,
 				528D3A07085FFADB1D465CF5 /* EphemeralTempRoots.swift */,
 				89FA2F192993DAFC4F865A81 /* EphemeralTempScanner.swift */,
+				14FAD15AA744620E0BEFE581 /* GitCommandRunner.swift */,
+				E9BFFD7E10C4A7542DB9FC2E /* GitWorktreeInventory.swift */,
+				E76EC93CDCAC20AF891B84DD /* GitWorktreeScanner.swift */,
 				B69D25090E909C3A91ED47CB /* InstalledAppResolver.swift */,
 				4498672B01BC7DADFF0A5D0E /* OrphanedCacheClassifier.swift */,
 				406A840A809552F909991D62 /* OrphanedCachesScanner.swift */,
@@ -353,6 +366,7 @@
 				AA0D6F28962ECA37ED73C427 /* ProjectTreeWalker.swift */,
 				673D975672C5697FDBBDCAF6 /* SpaceScanner.swift */,
 				845EFE64C2165765BE1829EB /* ValuablesDetector.swift */,
+				6BAD54210BDEE35F2FB38595 /* WorktreeStalenessAssessor.swift */,
 			);
 			path = Scanner;
 			sourceTree = "<group>";
@@ -399,6 +413,7 @@
 				1230916736A41CCED07F35CA /* CacheCleaner.swift */,
 				00ED87E5A2D4D49E6C748016 /* FileSystemIdentityProvider.swift */,
 				B415391F406F0415AE007308 /* PathGuard.swift */,
+				379987CF5B79ABDF997B7DC1 /* WorktreeReclaimPerformer.swift */,
 			);
 			path = Cleaner;
 			sourceTree = "<group>";
@@ -801,6 +816,9 @@
 				987BF1F1F29312B8F2CA516C /* EphemeralTempScanner.swift in Sources */,
 				8C9412CAD5C695C33BD45D30 /* FileSystemIdentityProvider.swift in Sources */,
 				249C9634CFBAD37F324B7B43 /* Formatters.swift in Sources */,
+				DB3D6FA8B8C895D201EAA115 /* GitCommandRunner.swift in Sources */,
+				07C439BB8299EED3B6E1782F /* GitWorktreeInventory.swift in Sources */,
+				A2F30550AAFBE3C54CB029CA /* GitWorktreeScanner.swift in Sources */,
 				C048F0DFA7681A952CA103A5 /* HealthScore.swift in Sources */,
 				A62B3A2B794E7B29FCBCED8D /* HelperInstaller.swift in Sources */,
 				BAD850782EDBBC4BEC43C12E /* InstalledAppResolver.swift in Sources */,
@@ -839,6 +857,8 @@
 				AF9392A8DFC710E864BE6466 /* Tier3Interventions.swift in Sources */,
 				C277F5DC011FC0CC51B6B6E3 /* ValuablesDetector.swift in Sources */,
 				F7C935653D7E8085572FF2E2 /* WebhookAlerter.swift in Sources */,
+				A0358BB924BC7F234052EC60 /* WorktreeReclaimPerformer.swift in Sources */,
+				527DC90002648CDE1543783F /* WorktreeStalenessAssessor.swift in Sources */,
 				443CA4EDAF50F7BCCB152940 /* main.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -989,8 +1009,8 @@
 				INFOPLIST_FILE = Sources/Cacheout/Info.plist;
 				INFOPLIST_KEY_CFBundleIconFile = Cacheout;
 				INFOPLIST_KEY_LSUIElement = NO;
-				INFOPLIST_KEY_NSDesktopFolderUsageDescription = "Cacheout looks for developer build-artifact folders (target/, node_modules/, .venv/ and similar) on your Desktop during scans you start. Nothing is deleted without your confirmation.";
-				INFOPLIST_KEY_NSDocumentsFolderUsageDescription = "Cacheout looks for developer build-artifact folders (target/, node_modules/, .venv/ and similar) in Documents during scans you start. Nothing is deleted without your confirmation.";
+				INFOPLIST_KEY_NSDesktopFolderUsageDescription = "Cacheout looks for developer build-artifact folders (target/, node_modules/, .venv/ and similar) and stale git worktrees on your Desktop during scans you start. Nothing is deleted without your confirmation.";
+				INFOPLIST_KEY_NSDocumentsFolderUsageDescription = "Cacheout looks for developer build-artifact folders (target/, node_modules/, .venv/ and similar) and stale git worktrees in Documents during scans you start. Nothing is deleted without your confirmation.";
 				INFOPLIST_KEY_NSDownloadsFolderUsageDescription = "Cacheout reads Downloads only if a scan you start includes it, to find developer caches. Nothing is deleted without your confirmation.";
 				INFOPLIST_KEY_NSHighResolutionCapable = YES;
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -1097,8 +1117,8 @@
 				INFOPLIST_FILE = Sources/Cacheout/Info.plist;
 				INFOPLIST_KEY_CFBundleIconFile = Cacheout;
 				INFOPLIST_KEY_LSUIElement = NO;
-				INFOPLIST_KEY_NSDesktopFolderUsageDescription = "Cacheout looks for developer build-artifact folders (target/, node_modules/, .venv/ and similar) on your Desktop during scans you start. Nothing is deleted without your confirmation.";
-				INFOPLIST_KEY_NSDocumentsFolderUsageDescription = "Cacheout looks for developer build-artifact folders (target/, node_modules/, .venv/ and similar) in Documents during scans you start. Nothing is deleted without your confirmation.";
+				INFOPLIST_KEY_NSDesktopFolderUsageDescription = "Cacheout looks for developer build-artifact folders (target/, node_modules/, .venv/ and similar) and stale git worktrees on your Desktop during scans you start. Nothing is deleted without your confirmation.";
+				INFOPLIST_KEY_NSDocumentsFolderUsageDescription = "Cacheout looks for developer build-artifact folders (target/, node_modules/, .venv/ and similar) and stale git worktrees in Documents during scans you start. Nothing is deleted without your confirmation.";
 				INFOPLIST_KEY_NSDownloadsFolderUsageDescription = "Cacheout reads Downloads only if a scan you start includes it, to find developer caches. Nothing is deleted without your confirmation.";
 				INFOPLIST_KEY_NSHighResolutionCapable = YES;
 				LD_RUNPATH_SEARCH_PATHS = (

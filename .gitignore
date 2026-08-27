@@ -37,3 +37,7 @@ dist/
 
 # Claude Code agent worktrees (session-local)
 .claude/worktrees/
+
+# The measurement harness binary, built on demand by
+# scripts/measure/worktree-removal-window.sh (PR #460 codex r7, D7).
+scripts/measure/worktree-removal-window

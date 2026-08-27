@@ -1102,6 +1102,173 @@ final class PathGuardTests: XCTestCase {
         }
     }
 
+    // MARK: - Subprocess-traversal validation (fn-5.4, D13)
+
+    /// An admitted container plus its guard, for the traversal cells.
+    private func admittedContainer(
+        provider: FileSystemIdentityProvider = FileSystemIdentityProvider()
+    ) throws -> (guard: PathGuard, container: AdmittedContainer, root: URL) {
+        let root = base.appendingPathComponent("dev")
+        try mkdir(root)
+        let pathGuard = makeGuard(containers: [root], provider: provider)
+        let container = try pathGuard.admitContainer(
+            root, snapshot: snapshot(of: [root], provider: provider)
+        )
+        return (pathGuard, container, root)
+    }
+
+    func testTraversalGuardRefusesASymlinkLeafEvenWhenItPointsInside() throws {
+        // THE reason this operation exists: `validateRemovableItem` leaves the
+        // leaf unresolved (correct for deletion — a symlink deletes as a
+        // link), but a subprocess FOLLOWS what it is handed. A symlink leaf is
+        // therefore refused OUTRIGHT here, even when its target is a perfectly
+        // legal directory inside the same container.
+        let (pathGuard, container, root) = try admittedContainer()
+        let real = root.appendingPathComponent("real")
+        try mkdir(real)
+        let link = root.appendingPathComponent("link")
+        try fm.createSymbolicLink(at: link, withDestinationURL: real)
+
+        // The deletion-target validator accepts the link (by design).
+        XCTAssertNoThrow(try pathGuard.validateRemovableItem(link, inside: container))
+        // The traversal guard does not.
+        XCTAssertThrowsError(
+            try pathGuard.validateSubprocessTraversalDirectory(link, inside: container)
+        ) { error in
+            XCTAssertEqual(
+                error as? PathGuardError,
+                .notATraversableDirectory(path: link.path)
+            )
+        }
+        XCTAssertNoThrow(
+            try pathGuard.validateSubprocessTraversalDirectory(real, inside: container)
+        )
+    }
+
+    func testTraversalGuardRefusesNonDirectoriesAndAbsentLeaves() throws {
+        let (pathGuard, container, root) = try admittedContainer()
+        let file = root.appendingPathComponent("file.txt")
+        try Data("x".utf8).write(to: file)
+        let absent = root.appendingPathComponent("nothing-here")
+
+        for candidate in [file, absent] {
+            XCTAssertThrowsError(
+                try pathGuard.validateSubprocessTraversalDirectory(
+                    candidate, inside: container
+                ),
+                candidate.lastPathComponent
+            ) { error in
+                XCTAssertEqual(
+                    error as? PathGuardError,
+                    .notATraversableDirectory(path: candidate.path)
+                )
+            }
+        }
+    }
+
+    func testTraversalGuardCanonicalizesTheWholePathBeforeDecidingContainment()
+        throws
+    {
+        // A symlinked ANCESTOR that escapes the container is caught because
+        // the whole path canonicalizes first.
+        let (pathGuard, container, root) = try admittedContainer()
+        let outside = base.appendingPathComponent("outside")
+        try mkdir(outside.appendingPathComponent("repo"))
+        let escape = root.appendingPathComponent("escape")
+        try fm.createSymbolicLink(at: escape, withDestinationURL: outside)
+
+        XCTAssertThrowsError(
+            try pathGuard.validateSubprocessTraversalDirectory(
+                escape.appendingPathComponent("repo"), inside: container
+            )
+        ) { error in
+            guard case .notADescendant = error as? PathGuardError else {
+                return XCTFail("expected a containment refusal, got \(error)")
+            }
+        }
+    }
+
+    func testTraversalContainmentIsStrictByDefaultAndEqualOnlyWhenAsked()
+        throws
+    {
+        // Round 4: `parentRepoWorkingDir` ALONE may equal the container (a
+        // dev root that IS a repository); every mutated path stays strict.
+        let (pathGuard, container, root) = try admittedContainer()
+        XCTAssertThrowsError(
+            try pathGuard.validateSubprocessTraversalDirectory(root, inside: container)
+        ) { error in
+            guard case .isRootItself = error as? PathGuardError else {
+                return XCTFail("expected isRootItself, got \(error)")
+            }
+        }
+        XCTAssertNoThrow(
+            try pathGuard.validateSubprocessTraversalDirectory(
+                root, inside: container, containment: .descendantOrEqual
+            )
+        )
+        // Descendant-or-equal is not a licence to leave the container.
+        let outside = base.appendingPathComponent("outside")
+        try mkdir(outside)
+        XCTAssertThrowsError(
+            try pathGuard.validateSubprocessTraversalDirectory(
+                outside, inside: container, containment: .descendantOrEqual
+            )
+        )
+    }
+
+    func testTraversalGuardFailsClosedOnDeviceMismatchAndOnUnreadableDevices()
+        throws
+    {
+        // Cross-device parity with `validateRemovableItem` — and STRICTER by
+        // design: a path whose device id cannot be read at all is refused
+        // too, because a subprocess must never be pointed at a location this
+        // guard could not prove sits on the container's volume.
+        let injecting = DeviceInjectingProvider()
+        let (pathGuard, container, root) = try admittedContainer(provider: injecting)
+        let foreign = root.appendingPathComponent("foreign")
+        try mkdir(foreign)
+        injecting.overrides = [(pathGuard_canonicalPath(foreign), 4242)]
+
+        XCTAssertThrowsError(
+            try pathGuard.validateSubprocessTraversalDirectory(
+                foreign, inside: container
+            )
+        ) { error in
+            guard case .crossDevice = error as? PathGuardError else {
+                return XCTFail("expected crossDevice, got \(error)")
+            }
+        }
+
+        let unreadable = root.appendingPathComponent("unreadable")
+        try mkdir(unreadable)
+        let blind = UnreadableDeviceProvider()
+        blind.blindPaths = [pathGuard_canonicalPath(unreadable)]
+        let blindGuard = makeGuard(containers: [root], provider: blind)
+        let blindContainer = try blindGuard.admitContainer(
+            root, snapshot: snapshot(of: [root], provider: blind)
+        )
+        XCTAssertThrowsError(
+            try blindGuard.validateSubprocessTraversalDirectory(
+                unreadable, inside: blindContainer
+            )
+        ) { error in
+            guard case .crossDevice = error as? PathGuardError else {
+                return XCTFail("expected a fail-closed crossDevice, got \(error)")
+            }
+        }
+    }
+
+    /// Reports NO identity (and therefore no device id) for the named
+    /// canonical paths — the "cannot prove it is on this volume" case.
+    private final class UnreadableDeviceProvider: FileSystemIdentityProvider {
+        var blindPaths: Set<String> = []
+        override func identity(of url: URL) -> Identity? {
+            blindPaths.contains(canonicalize(url).path)
+                ? nil
+                : super.identity(of: url)
+        }
+    }
+
     // MARK: - Ownership probe (fn-6.2, epic D12)
 
     /// The probe feeds the ephemeral-temp scanner's sticky-root gate, and its

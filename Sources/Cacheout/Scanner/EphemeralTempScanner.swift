@@ -1679,7 +1679,7 @@ struct EphemeralTempScanner: @unchecked Sendable {
         /// them made an EIO/EINVAL mid-walk indistinguishable from a benign
         /// cap hit, and the candidate was dropped with no item and no issue.
         /// Both sibling implementations of this primitive already keep the
-        /// two apart (`ValuablesDetector.swift:1752` vs `:1767`;
+        /// two apart (`ValuablesDetector.swift:1754-1756` vs `:1772-1773`;
         /// `OrphanedCachesScanner.swift:2397-2403`).
         enum Truncation: Equatable {
             /// The entry budget ended the read. Nothing was denied — and
@@ -2736,7 +2736,7 @@ struct EphemeralTempScanner: @unchecked Sendable {
     /// project already has a lesson for, and this walk was the last instance.
     ///
     /// THE SHAPE IS `DepthSafeRemoval.removeTree`'s
-    /// (`DepthSafeRemoval.swift:641-878`): descend by `openat`, CLOSE the
+    /// (`DepthSafeRemoval.swift:671-908`): descend by `openat`, CLOSE the
     /// parent, and climb back with `openat(current, "..")`, proving at every
     /// step that `..` landed on the identity the walk recorded when it left.
     /// Peak descriptors: the caller's root, the level the walk stands on, and

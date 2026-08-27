@@ -25,10 +25,13 @@
 /// ## Frozen wire values (epic contract — fn-2.6 asserts, fn-3..fn-6 inherit)
 ///
 /// - CategoryScanner's scanner id: `categories`.
-/// - `ReclaimAction`: `remove_contents` | `remove_item` | `commands` —
-///   `.commands` serializes ONLY its kind; argv arrays never reach any wire.
+/// - `ReclaimAction`: `remove_contents` | `remove_item` | `commands` |
+///   `git_worktree_reclaim` — `.commands` and `.gitWorktreeReclaim`
+///   serialize ONLY their kind; argv arrays and plan paths never reach any
+///   wire.
 /// - `ScanIssue.Kind`: `container_refused` | `symlink_root` | `tcc_denied` |
-///   `permission_denied` | `unreadable` | `malformed_outcome`.
+///   `permission_denied` | `unreadable` | `config_invalid` |
+///   `tool_unavailable` | `malformed_outcome`.
 /// - Item ids: full 64-char lowercase-hex SHA-256 over the UTF-8 bytes of
 ///   `scannerID + "\0" + canonicalPath` (`ReclaimableItem.stableID`).
 
@@ -123,12 +126,417 @@ struct ItemKey: Hashable, Sendable {
     }
 }
 
+// MARK: - Git worktree reclaim plan (fn-5.3, D1/D13/D14)
+
+/// The PLAN the composite `ReclaimAction` carries: what git is to be pointed
+/// at, expressed as structured paths and a mode — never as argv.
+///
+/// ARGV PROVENANCE (the whole reason this is a plan and not a
+/// `.commands([[String]])` payload): command argv is trusted registry code,
+/// never item input (fn-2.3). NEITHER MODE ASSEMBLES A MUTATING ARGV AT ALL
+/// (PR #460 codex r5/r6): the cleaner assembles only READ-ONLY commands from
+/// these fields plus its own constants at execution time — `rev-parse
+/// --git-common-dir`, `worktree list --porcelain`, `status --porcelain
+/// --ignored`, the ancestry ladder — and performs both removals itself, the
+/// checkout under `DepthSafeRemoval`/`TrashDisposal` and the disclosed admin
+/// directories directly. Through r4 stale mode assembled
+/// `["git", "-C", <parentRepoWorkingDir>, "worktree", "remove", <path>]`;
+/// that argv builder is gone (see `WorktreeReclaimPerformer`'s "WHO REMOVES
+/// THE TREE"), as is any repo-wide `git worktree prune` whose set git would
+/// recompute for itself. So a forged item can only mis-POINT a fixed
+/// READ-ONLY command — and every path it could point at is bound to the
+/// item's own admitted container by
+/// `GitWorktreeReclaimPlan.violation(...)`. `.commands` is not an option at
+/// all here: validator checks (f)/(g) require every `.commands` item to carry
+/// a REGISTERED `CacheCategory` whose `cleanCommands` equal the argv, and
+/// fn-5 has no category — one such item would malform the whole outcome.
+///
+/// WHY THE MODE-SPECIFIC FIELDS ARE OPTIONAL rather than associated values on
+/// `Mode`: the shapes this type must REFUSE (a stale plan carrying a
+/// disclosed set, a prune plan carrying a worktree path) have to be
+/// REPRESENTABLE for the two independent checkers — the cleaner's
+/// `structuralRefusal` and the runtime validator — to refuse them. A
+/// mode-parameterized enum would make the forgeries unrepresentable in Swift
+/// and thereby unTESTABLE, which is the wrong trade for a payload whose
+/// entire job is to survive a hostile item: the cleaner explicitly never
+/// assumes the validator ran (fn-2.7's headless path reaches it directly).
+struct GitWorktreeReclaimPlan: Equatable, Sendable {
+
+    /// The two reclaim shapes. They are NOT interchangeable: stale removal
+    /// deletes ONE worktree tree, prune removes the DISCLOSED,
+    /// delete-time-recomputed prunable set of ONE repository — a
+    /// repository-SCOPED effect, removed directory by directory, never a
+    /// `git worktree prune` whose set git re-enumerates for itself (D14).
+    enum Mode: Equatable, Sendable {
+        /// Remove ONE linked worktree's checkout — the scan's four gates
+        /// re-established, the filesystem re-proved at the last instant, then
+        /// THIS process removes the tree under `DepthSafeRemoval` (or moves
+        /// it to the Trash), then a GATED removal of that worktree's own
+        /// admin entry. No `git worktree remove` and no second arm: git is
+        /// read-only on this path (PR #460 codex r5).
+        case removeStaleWorktree
+        /// Repository-level, one item per repo, disclosing the COMPLETE set
+        /// it will remove — and removing exactly that set, directory by
+        /// directory, never through a repo-wide `git worktree prune`.
+        case pruneOrphanedAdmin
+    }
+
+    let mode: Mode
+
+    /// STALE MODE ONLY (nil in prune mode): the linked worktree to remove,
+    /// verbatim as the scan spelled it. Must equal the admission
+    /// descriptor's `requestedTargetURL`.
+    let worktreePath: URL?
+
+    /// STALE MODE ONLY (nil in prune mode): that worktree's own admin
+    /// directory, `<parentAdminContainer>/<id>`, as the fn-5.1 resolver
+    /// derived it. fn-5.4's post-removal prune gate compares the RECOMPUTED
+    /// prunable set against exactly this entry and removes it only when they
+    /// are the same one directory (epic round 8) — without the carried entry the
+    /// gate could not name what it is allowed to sweep.
+    let worktreeAdminEntry: URL?
+
+    /// STALE MODE ONLY: the INODE IDENTITY of `worktreeAdminEntry` as the
+    /// scan saw it (PR #460 codex r3, closing D3).
+    ///
+    /// `worktreeAdminEntry` above is a PATH, and a path is not an identity.
+    /// MEASURED on git 2.50.1 — the measurement predates r5's replacement of
+    /// the removal arm and is unaffected by it, because what it establishes is
+    /// git's NAME REUSE, not who does the unlinking: `git worktree remove <p>`
+    /// frees
+    /// `worktrees/<basename>` and a later `git worktree add <same path>`
+    /// TAKES THAT NAME BACK — same spelling, different inode. R1b re-resolved
+    /// both sides from paths, so that one re-creation was indistinguishable
+    /// from the original checkout and the delete path destroyed a brand-new
+    /// working tree — together with files `status --porcelain` never reports,
+    /// because a committed `.gitignore` makes such a tree read CLEAN to both
+    /// git and this app.
+    ///
+    /// The admin directory is the right object to bind: it is created once
+    /// per checkout and SURVIVES every operation a user legitimately performs
+    /// on one. `git worktree move` rewrites its `gitdir` file and leaves the
+    /// directory itself alone; `git worktree repair` likewise. Only `remove`
+    /// destroys it — which is exactly the event that must refuse.
+    ///
+    /// NIL IS REFUSED AT DELETE TIME (PR #460 codex r4, D6). r3 said "the
+    /// plan was not built by a scan that could stat that directory.
+    /// `GitWorktreeScanner` always can", and that universal was unevidenced
+    /// and false: the capture is a bare `provider.identity(of:)` with no
+    /// `guard let`, and `lstat` CAN fail — EPERM under a protected root, or
+    /// the directory vanishing in the resolve→plan-build window. In that
+    /// state the whole gate silently did nothing. Now the scanner emits NO
+    /// item when it cannot stat the directory (it records a visible issue
+    /// instead), R1b REFUSES a plan that carries no identity, and the
+    /// initializers below no longer default the field — so a future
+    /// construction path that forgets it fails to compile rather than
+    /// shipping a disabled guard.
+    ///
+    /// It stays Optional in the TYPE because prune-mode plans are not about
+    /// one worktree and carry nil by construction.
+    let worktreeAdminEntryIdentity: FileSystemIdentityProvider.Identity?
+
+    /// BOTH MODES: git's `-C` target — the porcelain FIRST record's path
+    /// (`WorktreeMembership.parentRepoWorkingDir`), which is the main working
+    /// tree or the bare repository directory. NEVER derived from the git
+    /// directory's parent: under `--separate-git-dir` that is not the working
+    /// tree (fn-5.1's authority split).
+    let parentRepoWorkingDir: URL
+
+    /// BOTH MODES: the RESOLVER-carried `<parentGitDir>/worktrees`
+    /// (`WorktreeMembership.parentAdminContainer`) — the admin data every
+    /// mode mutates. NEVER reconstructed as `<parentRepoWorkingDir>/.git/
+    /// worktrees`: a bare parent's git directory does not live at
+    /// `<wd>/.git`, and a linked worktree of a bare main is not itself
+    /// `bare`, so no gate would catch the mis-pathing (D13 revised).
+    let parentAdminContainer: URL
+
+    /// PRUNE MODE ONLY (empty in stale mode): the PROVABLY-COMPLETE set of
+    /// admin directories the repository-level prune will remove, as
+    /// disclosed to the user at scan time. fn-5.4 recomputes the set at
+    /// delete time and refuses fail-closed on anything outside this
+    /// disclosure (D14).
+    let disclosedAdminDirectories: [URL]
+
+    /// Spelled out rather than synthesized so every field is NAMED at every
+    /// construction site. `worktreeAdminEntryIdentity` deliberately carries
+    /// NO default (PR #460 codex r4, D6): a default let the field be omitted
+    /// silently, and omitting it disabled the only gate that can tell a
+    /// re-created checkout from the assessed one.
+    init(
+        mode: Mode,
+        worktreePath: URL?,
+        worktreeAdminEntry: URL?,
+        worktreeAdminEntryIdentity: FileSystemIdentityProvider.Identity?,
+        parentRepoWorkingDir: URL,
+        parentAdminContainer: URL,
+        disclosedAdminDirectories: [URL]
+    ) {
+        self.mode = mode
+        self.worktreePath = worktreePath
+        self.worktreeAdminEntry = worktreeAdminEntry
+        self.worktreeAdminEntryIdentity = worktreeAdminEntryIdentity
+        self.parentRepoWorkingDir = parentRepoWorkingDir
+        self.parentAdminContainer = parentAdminContainer
+        self.disclosedAdminDirectories = disclosedAdminDirectories
+    }
+
+    /// Stale-removal plan. The disclosed set is empty BY CONSTRUCTION here —
+    /// a stale item discloses no repository-level removal set.
+    static func removeStaleWorktree(
+        worktreePath: URL,
+        worktreeAdminEntry: URL,
+        worktreeAdminEntryIdentity: FileSystemIdentityProvider.Identity?,
+        parentRepoWorkingDir: URL,
+        adminContainer: URL
+    ) -> GitWorktreeReclaimPlan {
+        GitWorktreeReclaimPlan(
+            mode: .removeStaleWorktree,
+            worktreePath: worktreePath,
+            worktreeAdminEntry: worktreeAdminEntry,
+            worktreeAdminEntryIdentity: worktreeAdminEntryIdentity,
+            parentRepoWorkingDir: parentRepoWorkingDir,
+            parentAdminContainer: adminContainer,
+            disclosedAdminDirectories: []
+        )
+    }
+
+    /// Repository-level prune plan. No worktree path and no admin entry by
+    /// construction — the operation is not about one worktree.
+    static func pruneOrphanedAdmin(
+        parentRepoWorkingDir: URL,
+        adminContainer: URL,
+        disclosedAdminDirectories: [URL]
+    ) -> GitWorktreeReclaimPlan {
+        GitWorktreeReclaimPlan(
+            mode: .pruneOrphanedAdmin,
+            worktreePath: nil,
+            worktreeAdminEntry: nil,
+            // No worktree, so no worktree identity — stated, not defaulted.
+            worktreeAdminEntryIdentity: nil,
+            parentRepoWorkingDir: parentRepoWorkingDir,
+            parentAdminContainer: adminContainer,
+            disclosedAdminDirectories: disclosedAdminDirectories
+        )
+    }
+
+    // MARK: Structural rules (ONE rule set, two enforcing sites)
+
+    /// Every path the plan can point git at, each with the name the refusal
+    /// wording uses. The `..` screen below walks THIS list, so a field added
+    /// later is screened by construction rather than by remembering to.
+    private var labelledPaths: [(label: String, url: URL)] {
+        var paths: [(String, URL)] = [
+            ("parentRepoWorkingDir", parentRepoWorkingDir),
+            ("parentAdminContainer", parentAdminContainer),
+        ]
+        if let worktreePath { paths.append(("worktreePath", worktreePath)) }
+        if let worktreeAdminEntry {
+            paths.append(("worktreeAdminEntry", worktreeAdminEntry))
+        }
+        paths += disclosedAdminDirectories.map { ("disclosed admin directory", $0) }
+        return paths
+    }
+
+    /// The ONE structural rule set for a composite item — shared VERBATIM by
+    /// `CacheCleaner.structuralRefusal` and
+    /// `SpaceScannerRuntime.structuralViolation` (the
+    /// `missingRevalidatorRefusal` precedent: one helper, two call sites, so
+    /// the two enforcers can never diverge in wording OR in condition).
+    /// Returns the bare reason; the cleaner prefixes it with `refused: `.
+    ///
+    /// What it defends: this plan is a CLAIM riding an item, and the item is
+    /// the only thing `clean(items:)` receives. Every field is therefore
+    /// bound to the item's OWN admitted container so a forged or regressed
+    /// plan cannot point `git -C` at another repository on disk (D13).
+    ///
+    /// NOT its job: filesystem truth. Every check here is lexical, on the
+    /// VERBATIM spellings — the root-capture doctrine forbids a second
+    /// resolution at validation time (it would race the filesystem), and the
+    /// delete-time subprocess-traversal guard (fn-5.4, D13) is what proves a
+    /// leaf is a real directory canonically inside the container.
+    static func violation(
+        for item: ReclaimableItem, plan: GitWorktreeReclaimPlan
+    ) -> String? {
+        // The composite mutates ONE container's worth of git data, so it
+        // needs the per-item container admission — a category descriptor
+        // would admit by policy roots that have nothing to do with it.
+        guard case .containerItem(let originContainer, let requestedTargetURL)
+                = item.admission else {
+            return "a git_worktree_reclaim item must carry the "
+                + "container-item admission descriptor"
+        }
+
+        // (1) `..` SCREEN — FIRST, before any standardization (epic round
+        // 9). Standardization ERASES `..` (`/a/../b` becomes `/b`), so a
+        // containment check run on standardized spellings would accept a
+        // traversal spelling as if it had been written plainly — and the
+        // path that reaches git at execution time is the VERBATIM one.
+        // Order here is the whole defense: screen raw components, then
+        // standardize only for the containment comparison below.
+        for (label, url) in plan.labelledPaths
+        where url.pathComponents.contains("..") {
+            return "the plan's \(label) '\(url.path)' contains a '..' "
+                + "component — a traversal spelling is malformed, never "
+                + "standardized away"
+        }
+
+        // (2) MODE SHAPE. Each mode's fields are exactly the ones its git
+        // invocation consumes; carrying the OTHER mode's fields is a forged
+        // or regressed plan, never a harmless extra.
+        switch plan.mode {
+        case .removeStaleWorktree:
+            guard let worktreePath = plan.worktreePath else {
+                return "a stale-removal plan must carry the worktree path it "
+                    + "removes"
+            }
+            guard let adminEntry = plan.worktreeAdminEntry else {
+                return "a stale-removal plan must carry the worktree's admin "
+                    + "entry — the post-removal prune gate identifies the "
+                    + "one entry it may sweep by that path"
+            }
+            if !plan.disclosedAdminDirectories.isEmpty {
+                return "a stale-removal plan must disclose no prune set — a "
+                    + "repository-level removal set belongs to the prune-only "
+                    + "mode, and undisclosed sweeping is what D14 forbids"
+            }
+            // The deletion target is the descriptor's, never the plan's: if
+            // they disagree, the item was admitted for one path and would
+            // execute against another.
+            if worktreePath.path != requestedTargetURL.path {
+                return "the plan's worktree path '\(worktreePath.path)' is "
+                    + "not the admitted requestedTargetURL "
+                    + "'\(requestedTargetURL.path)' — the path admitted and "
+                    + "the path removed must be the same one"
+            }
+            if !isStrictDescendant(adminEntry, of: plan.parentAdminContainer) {
+                return "the worktree's admin entry '\(adminEntry.path)' is "
+                    + "not inside the carried admin container "
+                    + "'\(plan.parentAdminContainer.path)'"
+            }
+        case .pruneOrphanedAdmin:
+            if let worktreePath = plan.worktreePath {
+                return "a prune-only plan must carry no worktree path "
+                    + "(carried '\(worktreePath.path)') — the operation is "
+                    + "repository-level and removes no checkout"
+            }
+            if let adminEntry = plan.worktreeAdminEntry {
+                return "a prune-only plan must carry no worktree admin entry "
+                    + "(carried '\(adminEntry.path)') — its removal set is "
+                    + "the disclosed set, not one worktree's entry"
+            }
+            if plan.disclosedAdminDirectories.isEmpty {
+                return "a prune-only plan must disclose the non-empty set of "
+                    + "admin directories the repository-level prune removes"
+            }
+            // The item's admitted target IS the container being mutated —
+            // compared against the CARRIED field, never against a
+            // `<wd>/.git/worktrees` reconstruction (D13: a bare parent's git
+            // directory does not live there).
+            if requestedTargetURL.path != plan.parentAdminContainer.path {
+                return "the prune-only plan's admitted requestedTargetURL "
+                    + "'\(requestedTargetURL.path)' is not the carried admin "
+                    + "container '\(plan.parentAdminContainer.path)'"
+            }
+            for directory in plan.disclosedAdminDirectories
+            where !isStrictDescendant(directory, of: plan.parentAdminContainer) {
+                return "disclosed admin directory '\(directory.path)' is not "
+                    + "inside the carried admin container "
+                    + "'\(plan.parentAdminContainer.path)'"
+            }
+        }
+
+        // (3) MUTATION SCOPE, both modes (D13). The admin container holds
+        // the data git rewrites, so it must sit STRICTLY inside the item's
+        // own admitted container — a plan whose admin container IS the
+        // container would put every sibling of the repository in scope.
+        if !isStrictDescendant(plan.parentAdminContainer, of: originContainer) {
+            return "the plan's admin container "
+                + "'\(plan.parentAdminContainer.path)' is not strictly "
+                + "inside the admitted originContainer "
+                + "'\(originContainer.path)' — a plan may only mutate git "
+                + "data inside its own admitted container"
+        }
+        // The `-C` target may EQUAL the container: a dev root that IS a
+        // repository is a legal, common shape (epic round 4) — only its
+        // strictly-contained admin data is mutated. Anything OUTSIDE is a
+        // forged mutation scope.
+        if !isDescendantOrEqual(plan.parentRepoWorkingDir, of: originContainer) {
+            return "the plan's parent repository "
+                + "'\(plan.parentRepoWorkingDir.path)' is outside the "
+                + "admitted originContainer '\(originContainer.path)' — git "
+                + "would be pointed at a repository this item never admitted"
+        }
+
+        // (4) MEASURED-RECORD / DISPLAY BINDING, mirrored from the
+        // `.removeItem` arm. In the states the cleaner dispatches, the
+        // admitted target must be one of the scan's OWN `.measured`
+        // captures, and the item's display identity must be that same
+        // record's resolution — otherwise a forged item could measure and
+        // show one capture while executing against another admitted path.
+        // Exhaustive over `ScanState` so a future state decides at compile
+        // time; the non-deletable states never reach execution.
+        switch item.state {
+        case .measured, .partiallyDenied:
+            let bound = item.rootRecords.filter { record in
+                record.status == .measured
+                    && record.requestedURL.path == requestedTargetURL.path
+            }
+            if bound.isEmpty {
+                return "a deletable git_worktree_reclaim item must carry a "
+                    + "measured root record capturing its "
+                    + "requestedTargetURL — the measured path and the "
+                    + "reclaim target must be the same capture"
+            }
+            let displayBound = bound.contains { record in
+                record.resolvedURL?.path == item.url?.path
+            }
+            if !displayBound {
+                return "a deletable git_worktree_reclaim item's display url "
+                    + "must be the resolved identity of the record binding "
+                    + "its target — the path shown and the path reclaimed "
+                    + "must be the same capture"
+            }
+        case .missing, .empty, .denied:
+            break
+        }
+
+        return nil
+    }
+
+    /// STRICT lexical containment on STANDARDIZED spellings, compared as
+    /// `pathComponents` arrays — never `hasPrefix` (`/a/bc` is not inside
+    /// `/a/b`), the PathGuard doctrine (PathGuard.swift:45). Standardization
+    /// runs only AFTER the `..` screen above; it collapses `.`, `//` and
+    /// trailing slashes so two spellings of one path compare equal, and it
+    /// resolves NO symlinks (that is delete-time's job).
+    private static func isStrictDescendant(_ candidate: URL, of ancestor: URL) -> Bool {
+        let candidateComponents = candidate.standardizedFileURL.pathComponents
+        let ancestorComponents = ancestor.standardizedFileURL.pathComponents
+        guard candidateComponents.count > ancestorComponents.count else {
+            return false
+        }
+        return Array(candidateComponents.prefix(ancestorComponents.count))
+            == ancestorComponents
+    }
+
+    /// Descendant OR EQUAL — used for `parentRepoWorkingDir` alone.
+    private static func isDescendantOrEqual(_ candidate: URL, of ancestor: URL) -> Bool {
+        let candidateComponents = candidate.standardizedFileURL.pathComponents
+        let ancestorComponents = ancestor.standardizedFileURL.pathComponents
+        guard candidateComponents.count >= ancestorComponents.count else {
+            return false
+        }
+        return Array(candidateComponents.prefix(ancestorComponents.count))
+            == ancestorComponents
+    }
+}
+
 // MARK: - Reclaim action
 
 /// How an item's bytes are reclaimed. Dispatch with EXHAUSTIVE switches (no
-/// `default:`) — fn-5 adds a composite case (git worktree remove → fallback
-/// removeItem + prune) and that addition must be a compile-time-visible
-/// change. Do not encode "there are exactly three actions" anywhere.
+/// `default:`) — fn-5 adds a composite case (read-only git gates, then this
+/// process's own removal of the checkout, then a scoped admin-entry removal)
+/// and that addition must be a compile-time-visible change. Do not encode "there are exactly four actions" anywhere.
 enum ReclaimAction: Equatable, Sendable {
     /// Delete the children of every `.measured` root record, keeping the
     /// root directory itself (today's category clean).
@@ -139,16 +547,27 @@ enum ReclaimAction: Equatable, Sendable {
     /// At delete time EVERY root record's `requestedURL` is re-admitted and
     /// ANY refusal blocks the ENTIRE command set (fn-1.3 R17 parity).
     case commands([[String]])
+    /// The fn-5 COMPOSITE reclaim: a git-mediated worktree removal, or a
+    /// repository-level prune of orphaned worktree admin directories. The
+    /// payload is a PLAN of structured paths — never argv. The cleaner
+    /// builds the argv from the plan's fields plus registry-controlled
+    /// constants, so command argv stays trusted registry code exactly as it
+    /// is for `.commands` (fn-2.3's argv-provenance rule).
+    case gitWorktreeReclaim(GitWorktreeReclaimPlan)
 
     /// FROZEN wire strings (epic contract; `ScanError.Kind.wireString`
-    /// precedent). `.commands` serializes ONLY its kind — the argv arrays
-    /// are NEVER exposed on any wire surface (deliberate non-exposure: the
-    /// CLI JSON is a reporting surface, not an execution contract).
+    /// precedent). `.commands` and `.gitWorktreeReclaim` serialize ONLY
+    /// their kind — argv arrays and plan paths are NEVER exposed on any wire
+    /// surface (deliberate non-exposure: the CLI JSON is a reporting
+    /// surface, not an execution contract).
     var wireString: String {
         switch self {
         case .removeContents: return "remove_contents"
         case .removeItem: return "remove_item"
         case .commands: return "commands"
+        // SITE 5 of 8 (fn-5.3): FROZEN at merge, snake_case like its three
+        // siblings and the PROTOCOL.md action rows.
+        case .gitWorktreeReclaim: return "git_worktree_reclaim"
         }
     }
 }
@@ -510,6 +929,17 @@ struct ScanIssue: Equatable, Sendable {
         /// configured roots are NOT this kind — they carry their offending
         /// path honestly under the frozen `.containerRefused`.)
         case configInvalid
+        /// An EXTERNAL TOOL a scanner depends on is unavailable (fn-5, D12
+        /// revised — e.g. `git` missing from the runner's fixed PATH, or its
+        /// availability probe failing). The affected scan produced no
+        /// results BECAUSE the tool could not run, and that must be VISIBLE:
+        /// a tool-less scan reporting zero findings is indistinguishable
+        /// from a clean machine. Another NON-filesystem kind: the problem is
+        /// the toolchain, not a path, so `url` is nil and a fake path is
+        /// never invented (the round-3 rejection of reusing `.unreadable`
+        /// with a nil url — `url` is required BY CONTRACT for the
+        /// filesystem kinds). `detail` names the tool and the context.
+        case toolUnavailable
         /// Synthesized ONLY by `SpaceScannerRuntime.validatedOutcome` when a
         /// scanner's outcome fails ownership/structural validation — never
         /// produced by scanners themselves. RESERVED and enforced (check
@@ -519,6 +949,28 @@ struct ScanIssue: Equatable, Sendable {
         /// and its items excluded, so a scanner must not be able to publish
         /// items BESIDE a `malformed_outcome` row.
         case malformedOutcome
+        /// The session's WALL-CLOCK BOUND fired before this scanner reported
+        /// (PR #460 codex r12, D2). Synthesized ONLY by
+        /// `SpaceScannerRuntime.scanValidatedSession`'s watchdog, for each
+        /// scanner that had not delivered an event when the bound expired.
+        ///
+        /// ITS OWN KIND, and specifically NOT `.malformedOutcome`, because
+        /// the two differ in the one thing a kind-derived label must get
+        /// right — what happened and what the user can do. Nothing was
+        /// REJECTED here: nothing ARRIVED. And the remedy is real, which is
+        /// the property this branch demands of every incompleteness it
+        /// reports: the bound is over WALL-CLOCK time spent on real
+        /// filesystem work, so a re-scan on a warmer cache, an answered
+        /// privacy prompt, an unmounted volume or a less loaded machine can
+        /// genuinely differ — unlike a deterministic cap, which the "re-scan
+        /// and retry" a label prints can never clear.
+        ///
+        /// A NON-filesystem kind: no single path is the cause, so `url` is
+        /// nil and a fake path is never invented. `detail` names the bound
+        /// that fired. It is FAIL-CLOSED downstream by construction — it
+        /// travels as a `.malformed` event, which every consumer already
+        /// treats as "this scanner published nothing this session".
+        case scanDidNotFinish
 
         /// FROZEN wire strings, case-by-case (epic contract).
         var wireString: String {
@@ -535,14 +987,17 @@ struct ScanIssue: Equatable, Sendable {
             case .unreadable: return "unreadable"
             case .enumerationTruncated: return "enumeration_truncated"
             case .configInvalid: return "config_invalid"
+            case .toolUnavailable: return "tool_unavailable"
             case .malformedOutcome: return "malformed_outcome"
+            case .scanDidNotFinish: return "scan_did_not_finish"
             }
         }
     }
 
     /// Required BY CONVENTION for the filesystem kinds; nil for the
-    /// NON-filesystem kinds (`.malformedOutcome`, `.configInvalid`) — no
-    /// filesystem location exists, and a fake path must never be invented.
+    /// NON-filesystem kinds (`.malformedOutcome`, `.configInvalid`,
+    /// `.toolUnavailable`, `.scanDidNotFinish`) — no filesystem location
+    /// exists, and a fake path must never be invented.
     /// The wire `path` key is conditional on the same rule.
     let url: URL?
     let kind: Kind
@@ -578,11 +1033,22 @@ struct ScanOutcome: Sendable {
 /// UNBOUND DELETION. The cleaner additionally binds the folder that HOLDS the
 /// target (`DepthSafeRemoval.admittedParent`) and proves it on BOTH disposal
 /// arms — the permanent one at its parent open, the Trash one through
-/// `TrashDisposal.dispose(_:containedIn:…)`, which also binds the leaf under
-/// that proved container. That pair is what covers the `.unestablished`
-/// population the third case below describes, and it is worth naming here
-/// because "no verdict" was read as "nothing to bind" at two Trash call sites
-/// for three review rounds.
+/// `TrashDisposal`. That pair is what covers the `.unestablished` population
+/// the third case below describes, and it is worth naming here because "no
+/// verdict" was read as "nothing to bind" at two Trash call sites for three
+/// review rounds.
+///
+/// "BOTH DISPOSAL ARMS" WAS TRUE OF THE PERMANENT ONE AND OF ONE OF THE
+/// TRASH ENTRY POINTS (corrected, PR #460 codex r13). This sentence named
+/// `TrashDisposal.dispose(_:containedIn:…)` and stopped there, which is the
+/// arm for items with NO verdict; the arm for items WITH one
+/// (`dispose(_:expecting:…)`) consulted `admittedParent` only inside its
+/// `.nonDirectoryLeaf` branch and inside its rollback. On a
+/// `.noDirectoryTree` verdict it opened no container at all, and since that
+/// verdict carries no identity either, the disposal bound NOTHING — measured
+/// through the shipped `FileManager.trashItem` into the real `~/.Trash`, a
+/// stranger's file was trashed and its bytes reported freed. Every arm of
+/// both entry points proves the container now.
 enum PreDeleteInspectedObject: Equatable, Sendable {
     /// A real directory was opened and walked; this is the `fstat` identity
     /// of the descriptor the whole walk was anchored to.
@@ -606,6 +1072,18 @@ enum PreDeleteInspectedObject: Equatable, Sendable {
     /// probe whose root open FAILED and therefore never had an identity to
     /// carry (`OrphanedCachesScanner`), and it keeps that probe's disclosed
     /// residual: any non-directory at the name satisfies it.
+    ///
+    /// THAT RESIDUAL IS ABOUT THE LEAF, AND FOR ONE DISPOSAL ARM IT USED TO
+    /// BE ABOUT THE CONTAINER TOO (PR #460 codex r13, A3). "Any
+    /// non-directory at the name" was read as bounded to the folder the
+    /// cleaner admitted, and on `TrashDisposal.dispose(_:expecting:…)` it was
+    /// not: that arm never opened `admittedParent`, so any non-directory in
+    /// ANY directory satisfied it and a stranger's file was trashed with its
+    /// bytes reported freed (measured through the shipped
+    /// `FileManager.trashItem` into the real `~/.Trash`). Both disposals now
+    /// resolve the leaf INSIDE the proved container — the permanent arm
+    /// always did — so the residual is what it always said it was: one
+    /// unidentified non-directory, inside one proved folder.
     case noDirectoryTree
     /// Nothing was established: either the inspection refused before it could
     /// bind anything, or this revalidator has no object binding to offer at
@@ -782,6 +1260,316 @@ extension SpaceScanner {
 enum ValidatedScannerEvent: Sendable {
     case outcome(scannerID: String, ScanOutcome)
     case malformed(scannerID: String, ScanIssue)
+
+    /// WHO this event is about — both cases carry it, and the session's
+    /// watchdog needs it to tell a scanner that reported from one that did
+    /// not (PR #460 codex r12, D2).
+    var scannerID: String {
+        switch self {
+        case .outcome(let id, _), .malformed(let id, _): return id
+        }
+    }
+}
+
+/// THE TWO WALL-CLOCK BOUNDS A SCAN SESSION RUNS UNDER (PR #460 codex r12,
+/// D2), and why a session has any.
+///
+/// ## The mechanism
+///
+/// `ValidatedScanSession.events` is an `AsyncStream` whose ONLY terminator
+/// was `continuation.finish()`, reached only after the scan `TaskGroup`
+/// completes — so a scanner that never returns parks EVERY consumer of that
+/// stream forever. That is not a test problem with a test remedy: the park is
+/// in PRODUCTION (`CacheoutViewModel.scan`'s `for await event in
+/// session.events`, and `CLIHandler.collectValidatedScan`'s), it is reached
+/// from 101 sites in the suite that spell no continuation of their own, and
+/// what the user sees is a spinner that never stops, no second scan and no
+/// cleanup — for as long as anybody is willing to wait.
+///
+/// ## Why the bound is HERE and not on the producer
+///
+/// The producer is `await withTaskGroup { … }`, and a task group does not
+/// return until every child returns. A scanner wedged in a call that does not
+/// observe cancellation cannot be made to return by cancelling it. So the
+/// producer's completion is precisely the thing that CANNOT be bounded, and
+/// any design that waits on it inherits the park — which is why
+/// `untilProducerFinishes()` is bounded too, and not only the stream.
+///
+/// One bound in the session covers every consumer, present and future, GUI
+/// and CLI, without any of them knowing: the alternative is one deadline per
+/// `for await`, fourteen of them today, that nothing can hold in step.
+///
+/// ## Why the timers are not `Task.sleep` (PR #460 codex r13, B)
+///
+/// Through r12 both timers were `Task.sleep` — the deadline inside an
+/// unstructured `Task`, the wind-down grace inside a `Task.detached`. A sleep
+/// can only resume on a Swift cooperative worker, and the wedge class this
+/// bound exists for is precisely the one that OCCUPIES those workers: a
+/// scanner parked in a blocking syscall holds its thread, and the pool is
+/// `activeProcessorCount` threads wide. At that many blocked walks there is
+/// no worker left to resume the deadline and IT NEVER RUNS — measured on a
+/// 12-core machine with a 200 ms bound: 12 blocking scanners returned in
+/// 25.03 s on the walk rather than the bound, 36 in 75.04 s, while a CONTROL
+/// at 11 (one worker free) returned in 0.335 s. The threshold was exactly
+/// the pool width, and production needs no twelve scanners to cross it:
+/// `CategoryScanner` → `CacheScanner.scanAll` adds one child task per
+/// category — 23 of them — each running the SYNCHRONOUS `sizer.measure`, so
+/// ONE scanner fills every worker on every scan. Modelled that way the
+/// 200 ms bound took 20.13 s; with the children blocked 900 s (a hung mount)
+/// the run reproduced the pre-bound signature verbatim: the cell started,
+/// nothing followed, KILLED, exit -9, zero `Executed` lines.
+///
+/// So both timers run on `ScanSessionClock` — a Dispatch queue, off the
+/// cooperative pool entirely, the same move `GitCommandRunner.run` and
+/// `StatusSocket` already make for the same reason.
+///
+/// THAT IS ONLY HALF OF IT, AND THE HALF THAT WAS EASY TO MISTAKE. Firing the
+/// deadline is not the same as the consumer SEEING it fire, and the first
+/// draft of this comment claimed a MainActor consumer could not be delayed
+/// because it resumes on the main thread. Measurement says otherwise: with
+/// the deadline moved off the pool and nothing else changed, the watchdog ran
+/// at 206 ms and `CacheoutViewModel.scan` still did not return until 1.51 s,
+/// the moment the walks released. The main thread was never blocked — a
+/// 50 ms heartbeat on it ran unbroken through the whole gap. `for await`
+/// resumes `AsyncStream.Iterator.next()` on the GENERIC executor before
+/// hopping back to the actor, so the consumer's wake needs a cooperative
+/// worker of its own, in its own priority band — and the producer's blocking
+/// scanners were in that band, because an unstructured `Task {}` inherits the
+/// creating task's priority.
+///
+/// So the bound needs BOTH moves, and they close different halves:
+///   - `ScanSessionClock` (here) makes the deadline FIRE at all, whatever the
+///     pool is doing, including when the caller's own band is saturated.
+///   - the producer's `.utility` band (`scanValidatedSession`) keeps the scan's
+///     blocking work OUT of the band its consumer wakes in.
+/// Each is evidenced by a cell the other does not cover; see the mutation
+/// notes on `testTheDeadlineDoesNotDependOnTheCallersOwnPriorityBand` and
+/// `testTheBoundFiresWithEveryCooperativeWorkerBlocked`.
+///
+/// WHAT IS STILL NOT CLOSED, stated rather than glossed: a consumer that
+/// itself runs at `.utility` or below shares the band with the scanners and
+/// can still wake late. Both consumers in this repo sit above it
+/// (`CacheoutViewModel.scan` on the MainActor, `CLIHandler
+/// .collectValidatedScan` at the default `.medium`), and the DEADLINE fires
+/// regardless — but "the session ended" reaching such a consumer is bounded
+/// by a free worker in its band, not by wall-clock. That residual belongs to
+/// a scanner that blocks its thread, which is the thing this bound reports
+/// rather than the thing it can cure.
+///
+/// ## What happens when one fires
+///
+/// NOT a silent truncation — that is its own defect. The watchdog first
+/// yields one `.malformed` event carrying `ScanIssue.Kind.scanDidNotFinish`
+/// for EACH scanner that has not reported, so the timeout reaches the user
+/// through the same fail-closed path a rejected outcome already takes:
+/// nothing is published for that scanner, its previous rows are retained but
+/// excluded from every destructive path, and its section carries a row saying
+/// what did not happen. Scanners that DID report keep their results — a
+/// partial scan is reported as partial, never as complete and never as empty.
+struct ScanSessionBounds: Sendable {
+    /// How long the whole session may take before the event stream is ended
+    /// on its behalf. Deliberately FAR above any measured scan: it exists to
+    /// convert "never" into "reported", not to hurry a slow machine.
+    let eventDeadline: Duration
+    /// After the deadline fires, how long the cancelled producer is given to
+    /// wind down before `untilProducerFinishes()` stops waiting for it. See
+    /// that method for what is given up when this one expires.
+    let producerWindDownGrace: Duration
+
+    /// What the SHIPPED composition runs under — `production(…)` is the
+    /// only construction in the repo that names it. Ten minutes is far above
+    /// any measured scan of a real machine; it exists to convert "never"
+    /// into "reported", and a scan that legitimately needs longer than this
+    /// has a different problem.
+    static let production = ScanSessionBounds(
+        eventDeadline: .seconds(600), producerWindDownGrace: .seconds(30)
+    )
+
+    /// WHAT A COMPOSITION THAT DID NOT NAME A BOUND GETS, and why it is not
+    /// `.production`.
+    ///
+    /// Every construction of `SpaceScannerRuntime` in this repo other than
+    /// `production(…)` is a composition of FIXTURE scanners — closures that
+    /// return in microseconds, or ones a test releases by hand a few
+    /// MainActor steps later. Thirty seconds is three orders of magnitude of
+    /// headroom for that, and it is the same figure `BoundedRendezvous`
+    /// chose for the same reason (PR #460 codex r11, D2): it never fails
+    /// anything for being SLOW, only for being ABANDONED.
+    ///
+    /// It matters that the two differ. With `.production` here, ONE wedged
+    /// fixture would cost the suite ten minutes per scan and the run would
+    /// look, to anyone watching, exactly like the strand this bound exists
+    /// to end. A default that is short enough to READ is the whole point of
+    /// having a default at all.
+    ///
+    /// A future SHIPPING composition that forgets to name `.production` gets
+    /// this one, and fails VISIBLY (a `scan_did_not_finish` row per scanner
+    /// that ran long, nothing published, a re-scan offered) rather than
+    /// dangerously — which is the direction to be wrong in.
+    static let `default` = ScanSessionBounds(
+        eventDeadline: .seconds(30), producerWindDownGrace: .seconds(5)
+    )
+}
+
+/// WHERE A SCAN SESSION'S BOUNDS ARE TIMED — off the Swift cooperative pool,
+/// on purpose (PR #460 codex r13, B). See `ScanSessionBounds` for the
+/// measurement that forced it: a `Task.sleep` deadline cannot resume while
+/// the pool's every worker is held by a scanner blocked in a syscall, which
+/// is the exact wedge the bound exists to convert into a report.
+///
+/// The queue is DEDICATED and SERIAL, and nothing blocking may ever be
+/// scheduled on it. Every body it runs is non-suspending and microseconds
+/// long — yield into an unbounded `AsyncStream`, `finish()`, `Task.cancel()`,
+/// `OneShotGate.open()` (which resumes continuations by ENQUEUEING them, it
+/// does not run them inline). That is what makes one serial queue safe for
+/// every concurrent session on the machine; put a blocking call in one of
+/// these bodies and you would stall every other session's deadline behind it.
+enum ScanSessionClock {
+    static let queue = DispatchQueue(
+        label: "app.cacheout.scan-session-bounds"
+    )
+
+    /// Runs `body` once, `delay` from now, unless the returned handle is
+    /// cancelled first. `DispatchWorkItem.cancel()` before execution
+    /// guarantees the body never runs; a handle cancelled after the body has
+    /// STARTED does not stop it, which is why the bodies themselves latch
+    /// (see `ScanSessionLedger`) rather than trusting the cancel to win.
+    static func schedule(
+        after delay: Duration, _ body: @escaping @Sendable () -> Void
+    ) -> DispatchWorkItem {
+        let item = DispatchWorkItem(block: body)
+        queue.asyncAfter(deadline: .now() + seconds(delay), execute: item)
+        return item
+    }
+
+    /// `Duration` in seconds, for Dispatch's `TimeInterval` deadlines.
+    /// `components` is (whole seconds, attoseconds).
+    static func seconds(_ duration: Duration) -> TimeInterval {
+        let parts = duration.components
+        return TimeInterval(parts.seconds)
+            + TimeInterval(parts.attoseconds) / 1e18
+    }
+}
+
+/// A one-shot gate: opened at most once, by whichever party gets there
+/// first, and waited on WITHOUT observing cancellation.
+///
+/// Lock-guarded rather than an actor because `open()` is called from
+/// `ScanSessionClock` timer bodies and must not suspend, and because the wait must
+/// be a plain `withCheckedContinuation` — the ONE spelling that ignores the
+/// caller's cancellation, which is the property `untilProducerFinishes()`
+/// documents and depends on.
+final class OneShotGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var isOpen = false
+    private var waiting: [CheckedContinuation<Void, Never>] = []
+
+    func open() {
+        lock.lock()
+        guard !isOpen else { lock.unlock(); return }
+        isOpen = true
+        let resuming = waiting
+        waiting = []
+        lock.unlock()
+        for continuation in resuming { continuation.resume() }
+    }
+
+    func wait() async {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if isOpen {
+                lock.unlock()
+                continuation.resume()
+                return
+            }
+            waiting.append(continuation)
+            lock.unlock()
+        }
+    }
+}
+
+/// WHO HAS BEEN PUBLISHED, AND WHETHER THE SESSION IS OVER — one lock over
+/// BOTH, which is the whole point (PR #460 codex r13, C).
+///
+/// Through r12 these were two unsynchronized steps. The watchdog read
+/// `missing(from:)`, yielded a `.scanDidNotFinish` for each, and called
+/// `finish()`, while the producer's loop was independently recording and
+/// yielding real outcomes. Nothing ordered the two, and MEASURED with 12
+/// blocked scanners at a 200 ms bound the overlap was not theoretical: of 19
+/// events, SEVEN scanners were reported as timed out AND published, with
+/// `M:blocked_1:scan_did_not_finish` printed before `O:blocked_1`. That
+/// ordering is the dangerous one — `CacheoutViewModel.handle` runs
+/// `reconcile` for the later `.outcome`, and `reconcile` ends with
+/// `malformedIssuesByScannerID[scannerID] = nil`, so the timeout row the user
+/// was supposed to see disappears and the scanner is republished as healthy.
+/// The same run showed the converse: five scanners that HAD completed lost
+/// their outcomes when `finish()` beat their yield, which the shipped
+/// doc-comment on `ScanSessionBounds` promises cannot happen ("a partial scan
+/// is reported as partial"). The race needs no starvation — only a scanner
+/// finishing inside the watchdog's own window.
+///
+/// So publishing and concluding are mutually exclusive in BOTH directions:
+/// `publish` records the id and yields the event under the SAME lock
+/// `conclude` takes to latch the session closed. Every selected scanner
+/// therefore gets EXACTLY ONE event — its real outcome if it beat the
+/// conclusion, `.scanDidNotFinish` if it did not, never both and never
+/// neither.
+///
+/// Yielding under the lock is safe and deliberate: `AsyncStream` is unbounded
+/// here, so `yield` appends and at most ENQUEUES a waiting consumer (it never
+/// runs consumer code inline), and it does not invoke `onTermination`.
+/// `finish()`, which does, is deliberately called OUTSIDE the lock.
+final class ScanSessionLedger: @unchecked Sendable {
+    /// Why the session stopped accepting events — and the answer to "may
+    /// this session's items be adopted" (see `ValidatedScanSession
+    /// .didExceedBounds`).
+    enum Conclusion {
+        /// The producer drained its group: every scanner reported.
+        case producerFinished
+        /// The wall-clock deadline ended the session early.
+        case boundFired
+    }
+
+    private let lock = NSLock()
+    private var ids = Set<String>()
+    private var conclusion: Conclusion?
+
+    /// Publishes one scanner's event unless the session has already been
+    /// concluded, recording it as reported in the same atomic step.
+    /// Returns whether the event was published.
+    @discardableResult
+    func publish(
+        _ event: ValidatedScannerEvent,
+        to continuation: AsyncStream<ValidatedScannerEvent>.Continuation
+    ) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard conclusion == nil else { return false }
+        ids.insert(event.scannerID)
+        continuation.yield(event)
+        return true
+    }
+
+    /// Latches the session closed and returns the selected scanners that
+    /// never published — or nil if somebody else concluded it first, in
+    /// which case the caller must do nothing.
+    func conclude(
+        _ reason: Conclusion, selected: [String]
+    ) -> [String]? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard conclusion == nil else { return nil }
+        conclusion = reason
+        return selected.filter { !ids.contains($0) }
+    }
+
+    /// Whether the session was ended by its wall-clock bound rather than by
+    /// the producer finishing. False while the session is still running.
+    var boundDidFire: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return conclusion == .boundFired
+    }
 }
 
 /// One RUNNING validated scan (review P2): the progressive event stream
@@ -803,17 +1591,181 @@ struct ValidatedScanSession {
     /// `scanValidated` returns (that API is now a thin wrapper over this).
     let events: AsyncStream<ValidatedScannerEvent>
     fileprivate let producer: Task<Void, Never>
+    /// The session's publish/conclude ledger — also the authority on WHY it
+    /// ended (see `didExceedBounds`).
+    fileprivate let ledger: ScanSessionLedger
+    /// Opened when the producer returns, and — if it does not — by the
+    /// watchdog once the wind-down grace expires. See
+    /// `untilProducerFinishes()`.
+    fileprivate let woundDown: OneShotGate
+    /// How long `untilProducerFinishes()` waits for a cancelled producer
+    /// that is not winding down.
+    fileprivate let windDownGrace: Duration
+
+    /// TRUE when this session was ended by its wall-clock bound rather than
+    /// by the producer finishing — i.e. at least one scanner was cut off and
+    /// reported `.scanDidNotFinish` (PR #460 codex r13, D).
+    ///
+    /// A CONSUMER MUST TREAT THIS EXACTLY AS IT TREATS ITS OWN CANCELLATION,
+    /// and that is not a style note. The watchdog cancels the PRODUCER; it
+    /// cannot cancel the consumer, so `Task.isCancelled` is FALSE in a
+    /// consumer whose session was cut off, and every "did this scan finish"
+    /// test written against it silently answered yes. `CacheoutViewModel
+    /// .scan` read exactly that, ran its adoption block, and MEASURED: a
+    /// first-ever scan with one healthy and one wedged scanner at a 200 ms
+    /// bound left `hasScanned == true` and the healthy scanner's items
+    /// SELECTED and cleanable — while, by this bound's own admission, an
+    /// orphaned read-only walk may still be traversing the same trees. Read
+    /// this after the event stream ends; it is false while the session runs.
+    ///
+    /// ONE OF THE TWO CONSUMERS READS IT TODAY, and saying which is the point
+    /// of writing this down. `CacheoutViewModel.scan` does, and that is where
+    /// the measured defect was. `CLIHandler.collectValidatedScan` does NOT —
+    /// it never reads this flag at all — AND THE CLI IS CLOSED ANYWAY, by a
+    /// different mechanism, which is the sentence that matters here.
+    ///
+    /// r13 wrote the opposite: that items belonging to scanners which DID
+    /// report in the same cut-off invocation "remain cleanable" and that the
+    /// residual "is NOT closed". THAT IS FALSE, AND IT IS THE MORE EXPENSIVE
+    /// KIND OF FALSE — a residual that does not exist sends a future round to
+    /// fix a non-bug (PR #460 codex r14, V2-3). What actually closes it is
+    /// TARGET-SCOPED REFUSAL, and it closes it completely:
+    ///
+    ///   - `cleanCLIOutcome` builds its session with `scannerIDs:
+    ///     scannerSubset`, and that subset is derived EXCLUSIVELY from the
+    ///     parsed targets (`CLIHandler.swift`, "Target-scoped scan (R2)").
+    ///     So EVERY scanner that can be cut off in a destructive CLI session
+    ///     is named by some target — a scanner no target names never runs.
+    ///   - `resolveCleanTargets` then refuses the WHOLE invocation for any
+    ///     target whose scanner is in `malformed`, on all three target kinds
+    ///     (`.category`, `.allScannerItems`, `.scannerItem`), and every
+    ///     cut-off scanner IS in `malformed`: the watchdog yields one
+    ///     `.scanDidNotFinish` per scanner in `conclude`'s missing set before
+    ///     `finish()`. The three arms are not equally load-bearing — only
+    ///     `.allScannerItems` would otherwise PROCEED (a cut-off scanner
+    ///     reads there as the documented "zero items is a legitimate no-op");
+    ///     the other two fail anyway for want of an outcome to resolve
+    ///     against, and their check buys the accurate reason. Mutation
+    ///     figures are on the cell.
+    ///
+    /// DRIVEN END TO END rather than reasoned: `clean <category> <wedged>
+    /// --confirm` against a 250 ms-bounded session returns
+    /// `INVALID_ARGUMENTS` — "Target '<wedged>' cannot be resolved … Nothing
+    /// was cleaned." — and the real fixture file survives. See
+    /// `testABoundedOutCLICleanRefusesTheWholeInvocation`, which pins BOTH
+    /// halves so this cannot silently regress into the residual r13 imagined.
+    ///
+    /// SAY WHAT IS AND IS NOT GUARANTEED. The CLI's closure is NOT this
+    /// bound's: `didExceedBounds` and `adoptedGeneration` have nothing to do
+    /// with it, and a future change that widened the session beyond the
+    /// targets — a preflight scanner, an "always scan X" rule — would reopen
+    /// it without touching a line of this file. NOT A WORRY, A MEASUREMENT:
+    /// with `scannerIDs: scannerSubset` mutated to the full set, a
+    /// `clean <category> --confirm` whose session was cut off by the wedged
+    /// scanner it never addressed went through and freed the healthy
+    /// category's real 4096 bytes — r13's imagined residual, made real by
+    /// exactly that change. That is why this is written down here, next to
+    /// the flag a reader would otherwise assume was doing the work.
+    ///
+    /// THE OTHER THREE `collectValidatedScan` CALLERS, so the enumeration is
+    /// complete rather than gestured at. `smartCleanCLIOutcome` scans
+    /// `CategoryScanner` alone and returns `MALFORMED_SCANNER_OUTPUT` before
+    /// the gate switch on its `.scanDidNotFinish`, so all three of its
+    /// surfaces (unconfirmed plan, `--dry-run`, confirmed run) refuse
+    /// identically. `spotlightOutcome` also scans that scanner alone and
+    /// fails closed the same way — worth stating rather than filing under
+    /// "read-only", because it is not: it writes Finder comments and marker
+    /// files. It deletes nothing. `scanEnvelope` is the only genuinely
+    /// read-only one, and it reports the cut-off scanners as
+    /// `scan_did_not_finish` rows in `scanner_errors`.
+    ///
+    /// FINALLY, THE FLAG IS NOT A CLAIM THAT ANY SCANNER WAS LOST. `conclude`
+    /// latches on whoever gets there first, so a bound that fires in the
+    /// instant after the last scanner published leaves this TRUE with an
+    /// EMPTY missing set and no `.scanDidNotFinish` anywhere. The GUI then
+    /// declines to adopt a session that in fact completed (conservative, and
+    /// the direction to be wrong in); the CLI cleans it, correctly, because
+    /// every scanner it addressed reported a real outcome.
+    var didExceedBounds: Bool { ledger.boundDidFire }
 
     /// Suspends until the producer task has ACTUALLY returned — scanners
     /// finished or wound down, the group drained. Deliberately
-    /// NON-cancellable: `Task<_, Never>.value` cannot throw, so awaiting it
-    /// from an already-cancelled task still waits out the wind-down — the
-    /// entire point is to hold a "scan in progress" guard honestly PAST the
-    /// consumer's own cancellation. In the normal completion path the
-    /// producer has already finished by the time `events` ends, so the
-    /// await returns immediately.
+    /// NON-cancellable: the wait is a plain `withCheckedContinuation`, so
+    /// awaiting it from an already-cancelled task still waits out the
+    /// wind-down — the entire point is to hold a "scan in progress" guard
+    /// honestly PAST the consumer's own cancellation. In the normal
+    /// completion path the producer has already finished by the time
+    /// `events` ends, so the await returns immediately.
+    ///
+    /// AND IT IS BOUNDED (PR #460 codex r12, D2). Through r11 this was
+    /// `await producer.value`, which is unbounded by construction: a task
+    /// group does not return until every child does, so one wedged scanner
+    /// parked this await forever — and bounding only the event stream would
+    /// have moved the strand one line down in the ONE consumer that matters,
+    /// `CacheoutViewModel.scan`, which awaits both.
+    ///
+    /// WHAT IS GIVEN UP WHEN THE GRACE EXPIRES, DISCLOSED RATHER THAN
+    /// GLOSSED: the caller releases its "scan in progress" guard while a
+    /// cancelled walk may still be reading — exactly what this method
+    /// existed to prevent. That is the price of not being stuck forever, and
+    /// it is bounded in the way that matters: the orphaned walk is
+    /// READ-ONLY, and nothing this session saw becomes deletable on the
+    /// strength of having seen it.
+    ///
+    /// THAT MITIGATION IS WHAT MAKES THE RESIDUAL ACCEPTABLE, so it is stated
+    /// as two mechanisms rather than one, because that is what it is (PR #460
+    /// codex r14, V2-3 — the single-mechanism wording over-claimed):
+    ///
+    ///   - THE GUI, by adoption. `CacheoutViewModel.scan` reads
+    ///     `didExceedBounds` and treats a cut-off session exactly as a
+    ///     cancelled one, so `adoptedGeneration` never advances and
+    ///     `isBlockedFromDestructivePaths` holds every destructive path shut
+    ///     on that session's items.
+    ///   - THE CLI, by TARGET-SCOPED REFUSAL, which this bound neither owns
+    ///     nor guarantees. `collectValidatedScan` never reads
+    ///     `didExceedBounds`; the invocation is refused wholesale because
+    ///     every scanner in a destructive CLI session is named by a target
+    ///     and any cut-off one is `malformed`. The argument, the measurement
+    ///     and the cell that pins it are on `didExceedBounds` above.
+    ///
+    /// THE FIRST OF THE TWO WAS FALSE WHEN r12 WROTE IT (PR #460 codex r13,
+    /// D), which is why it is spelled out rather than asserted. The watchdog
+    /// cancels the PRODUCER (`task.cancel()`), never the consumer, so `let
+    /// completed = !Task.isCancelled` in `CacheoutViewModel.scan` was TRUE on
+    /// a cut-off session and the adoption block ran. MEASURED at a 200 ms
+    /// bound with one healthy and one wedged scanner: the wedged one
+    /// correctly carried `.scanDidNotFinish`, and then `hasScanned == true`
+    /// with the healthy scanner's items selected and passing
+    /// `isBlockedFromDestructivePaths` — deletable. `ValidatedScanSession
+    /// .didExceedBounds` is what closes it: the session now says out loud
+    /// that it was cut off, and the GUI adopts nothing when it was.
+    ///
+    /// The wedged producer task itself is leaked — one per wedged session,
+    /// which is already a session that cannot finish.
     func untilProducerFinishes() async {
-        await producer.value
+        // THE GRACE TIMER IS ARMED ONLY WHEN SOMEBODY IS ACTUALLY WAITING,
+        // and it runs OFF THE COOPERATIVE POOL. Both matter. Armed here, a
+        // healthy session — where the producer opened the gate before
+        // `events` even ended — pays for no timer at all: `wait()` returns on
+        // the spot and the item is cancelled before it runs.
+        //
+        // Off the pool (PR #460 codex r13, B) because this timer had BOTH
+        // pool-borne failures at once. Through r12 it was a `Task.detached`
+        // running `Task.sleep`: detached to dodge the first one (a plain
+        // `Task` created inside a CANCELLED caller starts cancelled, so
+        // `Task.sleep` throws immediately and the grace collapses to zero in
+        // exactly the case this method exists for), but detachment does
+        // nothing about the second — a sleep still resumes only on a
+        // cooperative worker, and the wedged scanner this grace is waiting
+        // out is the very thing holding those workers. `ScanSessionClock`'s
+        // Dispatch timer has neither problem: it does not inherit
+        // cancellation and it does not need the pool.
+        let gate = woundDown
+        let timer = ScanSessionClock.schedule(after: windDownGrace) {
+            gate.open()
+        }
+        await gate.wait()
+        timer.cancel()
     }
 }
 
@@ -883,6 +1835,26 @@ struct SpaceScannerRuntime {
     private let home: URL
     private let provider: FileSystemIdentityProvider
 
+    /// The SHARED git runner (fn-5.1), held at the composition layer and
+    /// handed to every cleaner this runtime builds (fn-5.4). ONE instance per
+    /// runtime by design: fn-5.1 made the `git --version` availability cache
+    /// INSTANCE-scoped, so a second runner built elsewhere would probe (and
+    /// cache) independently — and detection and execution must agree about
+    /// whether git exists at all. `nil` stays the fail-closed default for
+    /// runtimes composed without one (every test runtime today), which makes
+    /// their cleaners refuse composite items per item.
+    ///
+    /// `production(...)` builds ONE instance and hands it to BOTH the
+    /// registered `GitWorktreeScanner` and this property (fn-5.6) — never a
+    /// fresh one per consumer.
+    let gitRunner: (any GitCommandRunning)?
+
+    /// The session's two wall-clock bounds (PR #460 codex r12, D2) — see
+    /// `ScanSessionBounds`. Injectable so a test can put the deadline in
+    /// milliseconds; every existing composition gets `.production`, whose
+    /// values no healthy scan reaches.
+    let sessionBounds: ScanSessionBounds
+
     /// Registration + FOLDED validation as one check (epic rounds 6-7):
     /// scanner-id slug syntax, scanner-id uniqueness, and the combined
     /// category-slug/scanner-slug namespace collision check. Injectable for
@@ -892,11 +1864,17 @@ struct SpaceScannerRuntime {
     /// - Parameter categories: the category registry the `CategoryScanner`
     ///   adapter scans — registered HERE so scan-time validation has an
     ///   authoritative source to check category provenance against.
+    /// - Parameter gitRunner: the SHARED fn-5.1 runner (see the stored
+    ///   property). TRAILING and DEFAULTED so every existing composition
+    ///   compiles unchanged; the default `nil` keeps those runtimes'
+    ///   cleaners fail-closed for composite items.
     init(
         scanners: [any SpaceScanner],
         categories: [CacheCategory],
         home: URL,
-        provider: FileSystemIdentityProvider
+        provider: FileSystemIdentityProvider,
+        gitRunner: (any GitCommandRunning)? = nil,
+        sessionBounds: ScanSessionBounds = .default
     ) throws {
         var namespace = Set<String>()
         for scanner in scanners {
@@ -952,6 +1930,8 @@ struct SpaceScannerRuntime {
         self.preDeleteRevalidators = revalidators
         self.home = home
         self.provider = provider
+        self.gitRunner = gitRunner
+        self.sessionBounds = sessionBounds
     }
 
     /// CROSS-SCANNER alias suppression over the FINAL union (fn-4.5 review,
@@ -1086,7 +2066,19 @@ struct SpaceScannerRuntime {
     ///   persisted. `keptRoots` become the scanner's declared container
     ///   roots (and the walker's roots); `issues` ride EVERY scan outcome,
     ///   so a policy-rejected persisted root stays visible while never
-    ///   registering or walking (R16).
+    ///   registering or walking (R16). Resolved ONCE here and handed to BOTH
+    ///   dev-root scanners (`build_artifacts`, `git_worktrees`): resolving
+    ///   twice would read the store twice and could hand the two scanners
+    ///   different roots.
+    /// - Parameter gitRunner: the SHARED fn-5.1 runner. `nil` — the GUI and
+    ///   CLI composition — builds exactly ONE `GitCommandRunner`; tests
+    ///   inject a hermetic instance (`GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM`
+    ///   pinned) so no scan or clean can read the developer's real git
+    ///   config. EITHER WAY the composition holds ONE runner and hands the
+    ///   SAME instance to the scanner and to every cleaner it makes — fn-5.1's
+    ///   `git --version` availability cache is INSTANCE-scoped, so a second
+    ///   runner would probe independently and let detection and execution
+    ///   disagree about whether git exists at all.
     /// - Parameter ephemeralTempThresholds: the ephemeral temp scanner's size
     ///   floor + stale age (fn-6, R7). `nil` — the GUI's composition —
     ///   resolves defaults → UserDefaults HERE, exactly like
@@ -1108,7 +2100,7 @@ struct SpaceScannerRuntime {
     ///   parameter and its pass-through as if they were callers, and omitted
     ///   the GUI entirely). First: `devRoots` is passed NON-NIL by both
     ///   shipped surfaces — the GUI unconditionally
-    ///   (`CacheoutViewModel.swift:489`, a non-optional `DevRootsResolution`)
+    ///   (`CacheoutViewModel.swift:563`, a non-optional `DevRootsResolution`)
     ///   and the CLI whenever `--dev-root` is given
     ///   (`CLIHandler.swift:206` and `:220`, through the forwarder whose own
     ///   parameter is declared at `:427` and passed through at `:433`) —
@@ -1123,7 +2115,7 @@ struct SpaceScannerRuntime {
     ///
     ///   It exists because of D4 (PR #459 codex r10): the `nil` arm is the
     ///   one BOTH shipped compositions take — neither
-    ///   `CacheoutViewModel.production` (`CacheoutViewModel.swift:483-499`)
+    ///   `CacheoutViewModel.production` (`CacheoutViewModel.swift:555-574`)
     ///   nor `CLIHandler.CLIRuntimeDependencies.production`
     ///   (`CLIHandler.swift:426-438`) passes `ephemeralTempRoots:` — and its
     ///   `issues` half was UNEVIDENCED: replacing this site with a version
@@ -1139,6 +2131,7 @@ struct SpaceScannerRuntime {
         provider: FileSystemIdentityProvider = FileSystemIdentityProvider(),
         orphanedCachesThresholds: OrphanedCacheClassifier.Thresholds? = nil,
         devRoots: DevRootsResolution? = nil,
+        gitRunner: (any GitCommandRunning)? = nil,
         ephemeralTempRoots: EphemeralTempRootsResolution? = nil,
         ephemeralTempConfstrPath: EphemeralTempRoots.ConfstrResolver =
             EphemeralTempRoots.confstrPath(_:),
@@ -1149,11 +2142,14 @@ struct SpaceScannerRuntime {
             categories: categories,
             scanner: CacheScanner(home: home, provider: provider)
         )
+        // ONE resolution, TWO consumers (fn-5.6): the build-artifacts scanner
+        // and the git-worktree scanner walk the SAME effective roots, and both
+        // republish the SAME classified config issues on every outcome.
+        let resolvedDevRoots = devRoots
+            ?? DevRootsStore(provider: provider).effectiveRoots(home: home)
         let buildArtifactsScanner = BuildArtifactsScanner(
             home: home,
-            devRoots: devRoots
-                ?? DevRootsStore(provider: provider)
-                    .effectiveRoots(home: home),
+            devRoots: resolvedDevRoots,
             provider: provider
         )
         // fn-3.3's production resolver, wired in as the classifier's
@@ -1166,6 +2162,28 @@ struct SpaceScannerRuntime {
             thresholds: orphanedCachesThresholds
                 ?? OrphanedCachesSweepConfig.resolvedThresholds(),
             installedAppStatus: { installedAppResolver.status(ofBundleID: $0) }
+        )
+        // The SHARED git runner (fn-5.1/fn-5.4/fn-5.6): built ONCE here, in a
+        // local, and handed to BOTH the scanner that DETECTS composite items
+        // and the runtime whose cleaners EXECUTE them. Inert until work
+        // exists — nothing constructs a subprocess and nothing probes for git
+        // until a repository is actually discovered or a composite item is
+        // actually cleaned.
+        //
+        // A second runner anywhere would fork fn-5.1's deliberately
+        // instance-scoped availability cache, letting the scan and the clean
+        // disagree about whether git exists at all.
+        let sharedGitRunner: any GitCommandRunning =
+            gitRunner ?? GitCommandRunner(home: home)
+        // fn-5.6: registration is the ONLY step. It puts the scanner's
+        // declared roots (the same effective dev roots) into the runtime's
+        // container-root union, which is what extends DELETE-TIME admission
+        // for `git_worktree_reclaim` items — items never widen it themselves.
+        let gitWorktreeScanner = GitWorktreeScanner(
+            home: home,
+            devRoots: resolvedDevRoots,
+            runner: sharedGitRunner,
+            provider: provider
         )
         // fn-6: registration is the ONLY admission-widening lever — declaring
         // the resolved temp roots here is what puts them in the session
@@ -1189,11 +2207,18 @@ struct SpaceScannerRuntime {
         return try! SpaceScannerRuntime(
             scanners: [
                 categoryScanner, buildArtifactsScanner, orphanedCachesScanner,
+                gitWorktreeScanner,
                 ephemeralTempScanner,
             ],
             categories: categories,
             home: home,
-            provider: provider
+            provider: provider,
+            gitRunner: sharedGitRunner,
+            // THE ONLY CONSTRUCTION IN THE REPO THAT NAMES `.production`
+            // (PR #460 codex r12, D2) — and the only one that scans a real
+            // machine. See `ScanSessionBounds.default` for why the two
+            // differ.
+            sessionBounds: .production
         )
     }
 
@@ -1211,6 +2236,13 @@ struct SpaceScannerRuntime {
     /// snapshot (fn-4.8): a cleaner built THROUGH the runtime can always
     /// honour a `requiresPreDeleteRevalidation` marker, and a cleaner built
     /// without one fails closed on marked items.
+    ///
+    /// The runtime's SHARED git runner rides along the same way (fn-5.4): a
+    /// cleaner built THROUGH a runtime that holds one can EXECUTE
+    /// `git_worktree_reclaim`, and a cleaner built through a runtime without
+    /// one (or constructed directly) refuses those items per item —
+    /// fail-closed, never a silent no-op. `production(...)` always supplies
+    /// it, so the GUI and CLI paths are wired end to end.
     func makeCleaner(
         snapshot: ContainerSnapshot? = nil,
         trashHandler: CacheCleaner.TrashHandler? = nil
@@ -1221,7 +2253,8 @@ struct SpaceScannerRuntime {
             containerSnapshot: snapshot,
             preDeleteRevalidators: preDeleteRevalidators,
             provider: provider,
-            trashHandler: trashHandler
+            trashHandler: trashHandler,
+            gitRunner: gitRunner
         )
     }
 
@@ -1829,6 +2862,46 @@ struct SpaceScannerRuntime {
                 return "a .removeItem item must carry the .containerItem "
                     + "admission descriptor"
             }
+        // SITE 6 of 8 (fn-5.3). The composite gets its OWN top-level arm:
+        // a forged plan/admission divergence must malform the outcome at
+        // VALIDATION time, not only at the cleaner — the two enforcers are
+        // deliberately independent, and only this one holds the registration
+        // facts (declared roots, the producing scanner id).
+        case .gitWorktreeReclaim(let plan):
+            // CONVERSE ownership, mirrored from `.removeItem`: the aggregate
+            // adapter constructs only category-backed items, so a composite
+            // item bearing its id is a mapping regression, and downstream
+            // treats every `categories` item as an aggregate.
+            if scannerID == CategoryScanner.registeredID {
+                return "the aggregate category adapter may emit only "
+                    + "category-backed actions — git_worktree_reclaim is "
+                    + "reserved for per-item scanners"
+            }
+            switch item.admission {
+            case .containerItem(let originContainer, _):
+                // ORIGIN BINDING (round 6 doctrine, same reason as
+                // `.removeItem`): delete-time admission checks the
+                // runtime-wide UNION, so an undeclared origin could ride
+                // another scanner's registration. Path equality against the
+                // declaration — never a second resolution.
+                if !declaredContainerRoots.contains(where: {
+                    $0.path == originContainer.path
+                }) {
+                    return "originContainer '\(originContainer.path)' is "
+                        + "not one of the producing scanner's declared "
+                        + "trustedContainerRoots — delete-time admission "
+                        + "checks the runtime-wide union, so an undeclared "
+                        + "origin could ride another scanner's registration"
+                }
+            case .category:
+                // Refused by the shared rule set below, in its ONE wording.
+                break
+            }
+            // The plan/admission rules themselves: ONE implementation, also
+            // called by `CacheCleaner.structuralRefusal`, so validation and
+            // the chokepoint can never disagree about what a well-formed
+            // composite item is.
+            return GitWorktreeReclaimPlan.violation(for: item, plan: plan)
         case .removeContents, .commands:
             switch item.admission {
             case .category(let carried):
@@ -1907,6 +2980,15 @@ struct SpaceScannerRuntime {
                     }
                 case .removeItem:
                     break // unreachable — the outer switch splits it out
+                // SITE 7 of 8 (fn-5.3). This nested switch is exhaustive
+                // over `ReclaimAction` in its OWN right, so the composite
+                // case must decide here even though the outer switch splits
+                // it out too — the `.removeItem` precedent immediately
+                // above. Nothing to check: the composite carries no argv and
+                // no category, and its coherence rules live in its own
+                // outer-switch arm.
+                case .gitWorktreeReclaim:
+                    break // unreachable — the outer switch splits it out
                 }
             case .containerItem:
                 return "a \(item.action.wireString) item must carry category "
@@ -1941,10 +3023,10 @@ struct SpaceScannerRuntime {
     ///
     /// - the ViewModel gates every destructive path on the scanner's
     ///   outcome generation equalling the ADOPTED one
-    ///   (`isBlockedFromDestructivePaths`, CacheoutViewModel.swift:588-592).
+    ///   (`isBlockedFromDestructivePaths`, CacheoutViewModel.swift:610-614).
     ///   A non-participating scanner delivers no event, so its retained rows
     ///   keep the older generation while adoption moves on
-    ///   (CacheoutViewModel.swift:1465-1466) — they are already
+    ///   (CacheoutViewModel.swift:1487-1488) — they are already
     ///   visible-but-non-cleanable before this filter sees them;
     /// - the CLI resolves the items it cleans FROM the same collected
     ///   session (CLIHandler.swift:2123 and :2442 pass that session's
@@ -2048,6 +3130,38 @@ struct SpaceScannerRuntime {
         // the kernel table names as a mount point is skipped WITHOUT the
         // lstat (PR #459 review r6 codex C2 — that lstat is first contact
         // with the mounted filesystem).
+        //
+        // RECORDED, NOT FIXED, AND NOT COVERED BY THE BOUND BELOW (PR #460
+        // codex r13). This capture is SYNCHRONOUS — `ContainerSnapshot
+        // .capture` reads the mount table and then runs `provider
+        // .identity(of:)`, an `lstat`, for every remaining session container
+        // root — and `CacheoutViewModel.scan` calls this method without an
+        // `await`, on the MainActor. So it runs ON THE MAIN THREAD, and it
+        // runs BEFORE the stream, the producer, the watchdog and the grace
+        // timer exist: a hung network mount or unresponsive FUSE volume
+        // freezes the app here, unbounded and unreported, with no
+        // `.scanDidNotFinish` possible because nothing is armed yet. r12's
+        // verifier measured a 6.03 s `scan` with `isMainThread == true` from
+        // a 6 s blocking `identity(of:)`; verified here as a code path
+        // rather than re-measured — the loop is straight-line synchronous
+        // and this call site has no suspension point before it. The
+        // `mountPointPaths()` preflight does NOT close it: it skips roots
+        // that ARE mount points, and a root INSIDE a hung mount is still
+        // lstat'ed. Pre-existing on origin/main; its own task.
+        //
+        // IT IS NOT THE ONLY PRE-SESSION WAIT, and reading it as "the one
+        // place the bound cannot reach" is what let a second one sit
+        // undisclosed for two rounds (PR #460 codex r14, V2-1).
+        // `CacheoutViewModel.scan`'s header refresh also runs after the
+        // in-progress guard and before this method is called; it is now
+        // bounded on its own clock (`BoundedDiskInfo`), which is the shape a
+        // fix for THIS site would take too — a wall-clock budget of its own,
+        // since the session's cannot be armed yet. What stops that here and
+        // not there is the disposition: an abandoned header fetch costs a
+        // stale figure, while an abandoned container snapshot would leave the
+        // session with no identity baseline to admit deletes against, so
+        // giving up on it needs a product decision about what the scan then
+        // reports.
         let snapshot = ContainerSnapshot.capture(
             roots: sessionContainerRoots(for: selected), provider: provider
         )
@@ -2056,7 +3170,50 @@ struct SpaceScannerRuntime {
         let preDeleteRevalidators = self.preDeleteRevalidators
         let (events, continuation) =
             AsyncStream<ValidatedScannerEvent>.makeStream()
-        let task = Task {
+        // THE SESSION'S WALL-CLOCK BOUNDS (PR #460 codex r12, D2) — see
+        // `ScanSessionBounds` for the mechanism and the decision. Everything
+        // the watchdog needs is captured HERE, before any task starts.
+        let bounds = sessionBounds
+        let selectedIDs = selected.map(\.id)
+        let ledger = ScanSessionLedger()
+        let woundDown = OneShotGate()
+        // THE PRODUCER RUNS IN A LOWER PRIORITY BAND THAN ITS CONSUMER, and
+        // that is the OTHER half of making the bound observable (PR #460
+        // codex r13, B). Through r12 this was a plain `Task {}`, which
+        // inherits the creating task's priority — so a scan started from the
+        // MainActor put every scanner, and every child task a scanner spawns,
+        // in the SAME cooperative-pool band as the consumer that has to
+        // observe the session ending. `for await event in session.events`
+        // resumes `AsyncStream.Iterator.next()` on the GENERIC executor, not
+        // on the consumer's actor, so that wake needs a worker in that band —
+        // and a thread-blocking scanner has taken them all.
+        //
+        // MEASURED, one scanner with 23 blocking children at a 200 ms bound.
+        // Watchdog fires on time in every arm (it is off the pool entirely);
+        // what changes is when the MainActor consumer SEES it:
+        //   `Task {}`                              → 1.51 s / 3.02 s (the walk)
+        //   `Task.detached(priority: .utility)`    → 0.204 s (the bound)
+        //   `Task.detached(priority: .background)` → 0.210 s (the bound)
+        // Cooperative-pool width is per-band, so scan work at `.utility`
+        // cannot occupy the workers a `.userInitiated` or `.medium` consumer
+        // needs to wake.
+        //
+        // SAY WHAT THIS DOES NOT GUARANTEE. It is a band separation, not a
+        // reservation: a consumer that itself runs at `.utility` or below
+        // shares the band and can still queue behind a blocking scanner. The
+        // two consumers in this repo are above it — `CacheoutViewModel.scan`
+        // on the MainActor and `CLIHandler.collectValidatedScan` at the
+        // default `.medium`. The DEADLINE's own firing does not rest on this
+        // at all (see `ScanSessionClock`); only the consumer's promptness in
+        // observing it does.
+        //
+        // `.utility` and not lower: `.background` is I/O-throttled by the
+        // kernel, which would slow every real scan to buy nothing the band
+        // separation has not already bought. Detaching is otherwise a no-op
+        // here — this method is nonisolated, so `Task {}` inherited no actor
+        // isolation, an unstructured task inherits no cancellation either
+        // way, and the repo defines no task-local values.
+        let task = Task.detached(priority: .utility) {
             // Parallelism must not regress: scanners run concurrently
             // across the group (and internally parallel as today);
             // events yield in COMPLETION order — that is the
@@ -2083,14 +3240,66 @@ struct SpaceScannerRuntime {
                     }
                 }
                 for await event in group {
-                    continuation.yield(event)
+                    // Recorded and yielded ATOMICALLY against the watchdog's
+                    // conclusion (C): after the bound has fired this drops the
+                    // event rather than publishing an outcome for a scanner
+                    // already reported as timed out.
+                    ledger.publish(event, to: continuation)
                 }
             }
+            // The producer's own conclusion, latched for the same reason: a
+            // watchdog that wakes after this must not yield a
+            // `.scanDidNotFinish` for a scanner that finished.
+            _ = ledger.conclude(.producerFinished, selected: [])
             continuation.finish()
+            woundDown.open()
         }
-        continuation.onTermination = { _ in task.cancel() }
+        // THE WATCHDOG. On the healthy path it is cancelled by
+        // `onTermination` the instant the stream ends and never runs a line
+        // of its body; `continuation.finish()` is idempotent, so the two can
+        // race without either being wrong.
+        //
+        // IT IS A DISPATCH TIMER, NOT A `Task` (PR #460 codex r13, B). An
+        // unstructured `Task`'s `Task.sleep` can only resume on a cooperative
+        // worker, and at `activeProcessorCount` thread-blocking scanners
+        // there is none — the deadline never ran in precisely the wedge class
+        // it exists for. `ScanSessionClock` is off that pool; see
+        // `ScanSessionBounds` for the measurement and the residual.
+        let watchdog = ScanSessionClock.schedule(after: bounds.eventDeadline) {
+            // REPORTED, NOT SWALLOWED. Every scanner still outstanding gets
+            // the event that says so, BEFORE the stream ends, so the
+            // consumer's fail-closed path runs for it exactly as it would
+            // for a rejected outcome.
+            //
+            // The missing set is read in the SAME atomic step that closes the
+            // session (C), so a scanner cannot be both reported here and
+            // published by the producer a moment later. `nil` means the
+            // producer concluded first and there is nothing to report.
+            guard let missing = ledger.conclude(
+                .boundFired, selected: selectedIDs
+            ) else { return }
+            for id in missing {
+                continuation.yield(.malformed(
+                    scannerID: id,
+                    ScanIssue(
+                        url: nil, kind: .scanDidNotFinish,
+                        detail: "the scan did not finish within "
+                            + "\(bounds.eventDeadline); nothing from this "
+                            + "scanner was used"
+                    )
+                ))
+            }
+            continuation.finish()
+            task.cancel()
+        }
+        continuation.onTermination = { _ in
+            task.cancel()
+            watchdog.cancel()
+        }
         return ValidatedScanSession(
-            snapshot: snapshot, events: events, producer: task
+            snapshot: snapshot, events: events, producer: task,
+            ledger: ledger, woundDown: woundDown,
+            windDownGrace: bounds.producerWindDownGrace
         )
     }
 

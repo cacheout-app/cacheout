@@ -100,6 +100,16 @@ subsystem (`Intervention/`, `Memory/`, `Helper/`, `CacheoutHelper*`,
 | D7 | Two divergent `directorySize` implementations (regular-file filter vs none) | see above |
 | D8 | APFS clones/hardlinks counted at full size per link → cross-category double count (pnpm store ↔ project node_modules); headline total overstates | `CacheoutViewModel.swift:117-119` |
 
+> **Reading the "Where" column.** Those line numbers are `d747412`'s, per the
+> header rule — `git show d747412:<path>` reads them, HEAD does not.
+> `NodeModulesScanner.swift` (rows D3 and D6) has since been RETIRED along
+> with the `node_modules` scanner slug (see CHANGELOG.md, `[Unreleased]`,
+> PRE-RELEASE RENAME); per-project `node_modules` is now scanned by
+> `BuildArtifactsScanner`. `SourceAnchorIntegrityTests` enforces both halves
+> of this paragraph: a Markdown file that cites a Swift line must declare the
+> commit it was verified at, and every file it cites must exist or be
+> accounted for.
+
 Size math is otherwise **correct**: `totalFileAllocatedSize` (on-disk blocks)
 is the right key. Field evidence: a Rust target dir was 57.1G logical but 31G
 allocated (sparse incremental files). Any new scanner must use allocated size;
@@ -222,6 +232,40 @@ Enumerate-and-explain, the counterpart to the curated allowlist:
   `git worktree prune` in the parent repo. Branch refs live in the main
   repo's `.git` and **survive removal by construction**; say so in
   `evidence`.
+  - **CORRECTED AS BUILT (PR #460 codex r1).** Two claims in the bullet above
+    are wrong as written, and both had shipped. (a) "Branch refs survive by
+    construction" holds only for a worktree checked out ON A BRANCH: a
+    DETACHED worktree has no branch ref, so removal leaves whatever HEAD
+    names reachable from nothing — the evidence now says that instead for
+    that shape. (b) `git worktree prune` accepts no path and no set; it
+    re-enumerates the admin container itself, after every gate has already
+    answered. The shipped code therefore removes exactly the admin
+    directories it disclosed and runs no repository-wide prune.
+  - **CORRECTED AS BUILT AGAIN (PR #460 codex r5/r6).** The bullet's whole
+    "try `git worktree remove` first, fall back to deleting the tree" shape is
+    retired. There is no first arm and no fallback: git is READ-ONLY on the
+    delete path (`rev-parse --git-common-dir`, `worktree list --porcelain`,
+    `status --porcelain --ignored`, the ancestry ladder), and Cacheout removes
+    the checkout itself under `DepthSafeRemoval` — or moves it to the Trash
+    under `TrashDisposal`, which the git arm could never do — with the
+    filesystem re-proved at the last instant. MEASURED (git 2.50.1, macOS 15,
+    APFS), and each figure with its own endpoint and load condition — r5's
+    whole correction was that these differ: `git worktree remove` takes
+    14.87 ms (1 tracked file) / 156.8 ms (2001) between its SPAWN and its
+    first destruction, NOT between the last gate and it. The corresponding
+    interval for the shipped removal is the last identity/lock/HEAD proof →
+    the destruction, which since r6/r7 runs on the far side of each arm's
+    hop: 0.032 ms (permanent, global pool saturated) / 0.004 ms (Trash,
+    120 ms main-thread work items). The cleanliness answer cannot cross that
+    hop, and its own window under those same loads is 241.2 ms / 185.9 ms
+    (0.373 ms / 0.674 ms on an idle main thread) — that is the figure this
+    bullet used to print as "0.373 ms constant". The tables and their
+    caveats are in `WorktreeReclaimPerformer`'s header, including that its
+    0.417 ms `removefile` row is a PROXY harness rather than this code.
+    The `Directory not empty` field class the bullet was written around is now
+    REFUSED rather than routed: the last gate runs `status --porcelain
+    --ignored`, so an ignored tree that appeared since the scan aborts the
+    removal.
 - Risk: review; `defaultSelected: false`. Never touch a worktree that fails
   any gate; never run `git branch -d`.
 - Run git binary via argv (`/usr/bin/env git …`), no shell, bounded timeout —

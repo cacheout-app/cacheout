@@ -761,6 +761,27 @@ final class OrphanedCachesScannerTests: XCTestCase {
         XCTAssertEqual(outcome.errors.first?.url?.path, cachesRoot.path)
     }
 
+    func testRegularFileSweepRootYieldsNonDirectoryRootIssue() async throws {
+        try fm.removeItem(at: cachesRoot)
+        _ = try writeFile(cachesRoot)
+
+        let scanner = makeScanner()
+        let outcome = await scanner.scan(
+            context: ScanContext(trigger: .userInitiated)
+        )
+        XCTAssertTrue(outcome.items.isEmpty)
+        XCTAssertEqual(outcome.errors.count, 1)
+        // `.nonDirectoryRoot`, NOT `.symlinkRoot` (fn-4.12): the
+        // kind-derived GUI label under `.symlinkRoot` read "symlinked —
+        // not searched" for a regular file standing at the sweep root.
+        XCTAssertEqual(outcome.errors.first?.kind, .nonDirectoryRoot)
+        XCTAssertEqual(outcome.errors.first?.url?.path, cachesRoot.path)
+        XCTAssertTrue(
+            outcome.errors.first?.detail.contains("regular file") == true,
+            "the detail names the real kind: \(outcome.errors)"
+        )
+    }
+
     func testUnreadableSweepRootYieldsClassifiedIssueNotEmptySuccess() async throws {
         try XCTSkipIf(geteuid() == 0, "root ignores permission bits")
         try writeFile(cachesRoot.appendingPathComponent("f.bin"))

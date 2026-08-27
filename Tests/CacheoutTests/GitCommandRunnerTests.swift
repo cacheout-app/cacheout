@@ -551,6 +551,78 @@ final class GitCommandRunnerTests: XCTestCase {
         )
     }
 
+    /// **THE GROUP SURVIVES ITS LEADER** (fn-4.27). r18 discovered the
+    /// child's process group with `getpgid` AFTER launch, so the group fact
+    /// was contingent on observing a LIVE leader — a git that spawned a
+    /// helper and exited left `group == nil`, and the termination protocol
+    /// then signalled only the corpse's pid while the descendant ran on.
+    /// `SpawnedProcess.launch` establishes the group at CREATION
+    /// (`POSIX_SPAWN_SETPGROUP`): the group id IS the pid, leader dead or
+    /// alive, and nothing about signalling is conditional on liveness.
+    ///
+    /// The fixture is the defect's exact shape: the leader records its pid,
+    /// spawns a TERM-immune descendant that holds the inherited stdout, and
+    /// exits 0 — so by the time any signal is sent, the leader is LONG dead
+    /// (asserted below, not assumed). The runner's join arm answers
+    /// `.timeout` and the descendant must die BY PID anyway, which only the
+    /// group — established at spawn — can reach.
+    ///
+    /// MUTATION (fn-4.27 acceptance): restoring post-launch discovery —
+    /// `signalTree` consulting `getpgid(pid)` and requiring `== pid` before
+    /// group-signalling, r18's semantics — turns THIS cell red 8/8 (the
+    /// leader is provably reaped before `terminate`, so discovery always
+    /// fails and the descendant survives), while the unmutated cell is
+    /// green 8/8. Recorded in the fn-4.27 commit.
+    func testALeaderThatExitsImmediatelyStillHasItsDescendantReapedByPid()
+        async throws
+    {
+        let stubs = base.appendingPathComponent("stubs-exited-leader")
+        let leaderPidFile = base.appendingPathComponent("leader.pid")
+        let descendantPidFile = base.appendingPathComponent("exited-leader-descendant.pid")
+        _ = try GitFixture.makeStubGit(in: stubs, body: """
+        export PATH=/bin:/usr/bin
+        echo $$ > "\(leaderPidFile.path)"
+        ( trap '' TERM; exec sleep 300 ) &
+        echo $! > "\(descendantPidFile.path)"
+        exit 0
+        """)
+        // HYGIENE: whatever this test spawns dies with it, mutation or not.
+        defer {
+            if let pid = recordedPid(at: descendantPidFile), pid > 0 {
+                kill(pid, SIGKILL)
+            }
+        }
+        let runner = GitCommandRunner(
+            environment: stubEnvironment(pathDirectories: [stubs]),
+            defaultTimeout: 30,
+            terminationGrace: 0.5,
+            drainJoinBudget: 0.5
+        )
+        let invocation = await runner.run(["status", "--porcelain"], timeout: 20)
+
+        // WHICH arm fired: the leader exited normally, so this is the
+        // unfinished-drain refusal — never the expiry arm, never `.success`.
+        XCTAssertEqual(invocation.outcome, .timeout)
+
+        let leader = try XCTUnwrap(recordedPid(at: leaderPidFile))
+        let descendant = try XCTUnwrap(recordedPid(at: descendantPidFile))
+        XCTAssertNotEqual(leader, descendant)
+        // The PRECONDITION the cell exists for, asserted rather than
+        // assumed: the leader was already unsignallable when the runner
+        // answered — a group fact discovered from a live leader could not
+        // have existed here.
+        XCTAssertNotEqual(
+            kill(leader, 0), 0,
+            "the leader must already be gone — this cell is about signalling "
+                + "AFTER the leader's death"
+        )
+        XCTAssertTrue(
+            waitUntil(5) { kill(descendant, 0) != 0 },
+            "the descendant must be reaped BY PID after .timeout — only the "
+                + "spawn-established group can reach it once the leader is dead"
+        )
+    }
+
     // MARK: - A hard read error is not EOF (fn-4.24)
 
     /// Serial call counter for the drain factory seam. `execute` builds its

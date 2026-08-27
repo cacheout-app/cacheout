@@ -6,9 +6,13 @@
 /// `private` and nulls both output streams, which is useless for porcelain
 /// parsing. What IS cloned is its process discipline — `/usr/bin/env`,
 /// argv-only (never a shell), a fixed PATH, an injected `HOME`, and a
-/// BOUNDED wait via `Process.waitForExit(within:)` (a bare
-/// `waitUntilExit()` misses its termination wakeup under concurrent
-/// spawning/reaping — house doctrine, see `CacheCategory.swift`).
+/// BOUNDED wait (a bare `waitUntilExit()` misses its termination wakeup
+/// under concurrent spawning/reaping — house doctrine, see
+/// `CacheCategory.swift`; since fn-4.27 the runner spawns through its own
+/// `SpawnedProcess` — `posix_spawn` with `POSIX_SPAWN_SETPGROUP`, so the
+/// child's isolated process group is established AT CREATION rather than
+/// discovered after launch — and its bounded wait polls a pid-targeted
+/// `waitpid(WNOHANG)` in the same deadline/backoff shape).
 ///
 /// ## What this runner adds over the cleaner's
 ///
@@ -459,21 +463,31 @@ final class GitCommandRunner: GitCommandRunning, @unchecked Sendable {
         let argv = Self.argv(for: arguments)
         let environment = environment(for: profile)
 
-        let process = Process()
-        process.executableURL = executableURL
-        process.arguments = argv
-        process.environment = environment
-        // git must never be able to prompt: an inherited terminal would let
-        // a credential helper block the whole scan. /dev/null reads EOF.
-        process.standardInput = FileHandle.nullDevice
-
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
-        process.standardOutput = stdoutPipe
-        process.standardError = stderrPipe
 
+        // THE ISOLATED PROCESS GROUP IS ESTABLISHED BY THE SPAWN ITSELF
+        // (fn-4.27): `SpawnedProcess.launch` passes `POSIX_SPAWN_SETPGROUP`
+        // with pgroup 0, so the kernel makes the child the leader of a new
+        // group whose id IS its pid, atomically, at creation. There is no
+        // post-launch `getpgid` discovery any more — r18's shape read the
+        // group AFTER `run()`, so a leader exiting inside that window left
+        // `group == nil` and its descendants unsignalled, which was exactly
+        // the case the group existed for. `process.pid` is the group id for
+        // the process's whole life, leader dead or alive.
+        //
+        // stdin is `/dev/null` inside the spawn's file actions: git must
+        // never be able to prompt — an inherited terminal would let a
+        // credential helper block the whole scan; /dev/null reads EOF.
+        let process: SpawnedProcess
         do {
-            try process.run()
+            process = try SpawnedProcess.launch(
+                executablePath: executableURL.path,
+                arguments: argv,
+                environment: environment,
+                stdout: stdoutPipe,
+                stderr: stderrPipe
+            )
         } catch {
             // `env` itself is missing/unrunnable — the same class of answer
             // as "git is not on PATH", never a silent zero.
@@ -482,12 +496,6 @@ final class GitCommandRunner: GitCommandRunning, @unchecked Sendable {
                 outcome: .gitUnavailable
             )
         }
-
-        // THE CHILD'S PROCESS GROUP, READ WHILE THE CHILD IS PROVABLY ALIVE
-        // (PR #460 codex r18, C8). Everything the runner may later have to
-        // signal is decided here, once, before any wait — see
-        // `ownProcessGroup(of:)`.
-        let group = Self.ownProcessGroup(of: process)
 
         // Both drains start BEFORE the wait: either stream filling the
         // 64 KiB pipe buffer would otherwise block the child forever while
@@ -498,7 +506,7 @@ final class GitCommandRunner: GitCommandRunning, @unchecked Sendable {
         stderrDrain.start()
 
         guard process.waitForExit(within: timeout) else {
-            terminate(process, group: group)
+            terminate(process)
             // PINNED ORDER: close the pipe handles FIRST, then join. An open
             // FD is exactly what wedges a reader when the child (or a
             // grandchild that inherited the write end) is still holding it.
@@ -559,7 +567,7 @@ final class GitCommandRunner: GitCommandRunning, @unchecked Sendable {
         let stdoutJoined = stdoutDrain.join(within: drainJoinBudget)
         let stderrJoined = stderrDrain.join(within: drainJoinBudget)
         guard stdoutJoined, stderrJoined else {
-            terminate(process, group: group)
+            terminate(process)
             // The same pinned order as the expiry arm: close FIRST (an open
             // FD is what wedges a reader), then join.
             stdoutDrain.close()
@@ -644,73 +652,213 @@ final class GitCommandRunner: GitCommandRunning, @unchecked Sendable {
         )
     }
 
-    /// The child's process group ID — but ONLY when the child is that
-    /// group's own LEADER, and read ONCE, immediately after `run()`, while
-    /// the pid is provably still allocated to this child.
-    ///
-    /// MEASURED on this machine (Darwin 25.5, 2026-08-23) with a 15-line
-    /// Foundation program: `Process` places every child in a NEW process
-    /// group whose id IS the child's pid — parent `pid 47862 pgrp 47770`,
-    /// child `pid 47866 pgid 47866`. So `kill(-pid, …)` reaches the child
-    /// AND every descendant that has not deliberately left the group, which
-    /// is the whole of what a git command spawns (helpers, submodule
-    /// recursions, the odd `sh`).
-    ///
-    /// THE `group == pid` TEST IS THE SAFETY, NOT DECORATION. If a future
-    /// Foundation left the child in the CALLER's group, `-group` would
-    /// signal this whole process — the app, or the test bundle. `nil` then
-    /// means "signal the pid alone", which is exactly what the runner did
-    /// before r18 and is never worse than it.
-    private static func ownProcessGroup(of process: Process) -> pid_t? {
-        let pid = process.processIdentifier
-        guard pid > 0 else { return nil }
-        let group = getpgid(pid)
-        guard group == pid else { return nil }
-        return group
-    }
-
     /// SIGTERM the TREE → bounded grace → SIGKILL the TREE if anything in it
     /// is still there → bounded reap wait. Every step bounded; a
     /// SIGTERM-ignoring child cannot survive it, and neither can a
     /// descendant that outlives it.
     ///
     /// **THE TREE, NOT THE PID** (PR #460 codex r18, C8). Both steps used to
-    /// target `process.processIdentifier` alone. Killing the parent of a
-    /// timed-out `git` leaves whatever it spawned — a helper invoked while
-    /// inspecting a submodule, say — orphaned and running, still holding the
-    /// inherited pipe write end and still traversing repositories after the
-    /// runner has returned `.timeout`. The old timeout cell could not see it:
-    /// its fixture launches `sleep`, and it checked only the shell's pid.
+    /// target the child's pid alone. Killing the parent of a timed-out `git`
+    /// leaves whatever it spawned — a helper invoked while inspecting a
+    /// submodule, say — orphaned and running, still holding the inherited
+    /// pipe write end and still traversing repositories after the runner has
+    /// returned `.timeout`. The old timeout cell could not see it: its
+    /// fixture launches `sleep`, and it checked only the shell's pid.
+    ///
+    /// **THE GROUP IS A SPAWN-TIME FACT, NOT A DISCOVERY** (fn-4.27).
+    /// r18 read the group with `getpgid` after `run()`, "while the pid is
+    /// provably still allocated" — and a leader that exited inside that
+    /// window failed the read, leaving `group == nil` and this protocol
+    /// aimed at a pid that was already a corpse while the descendants — the
+    /// very case the group protocol exists for — ran on unsignalled. The
+    /// r18 comment called nil "never worse than before"; for that exited-
+    /// leader case it was exactly as bad as before, which was the defect.
+    /// `SpawnedProcess.launch` establishes the group with
+    /// `POSIX_SPAWN_SETPGROUP` at creation, so `process.pid` IS the group
+    /// id, leader dead or alive, and nothing here is conditional on
+    /// observing a live leader.
     ///
     /// AND THE ESCALATION IS DECIDED ON THE GROUP, NOT ON THE PARENT. A
     /// parent that exits inside the grace window says nothing about a
     /// descendant that ignored the same SIGTERM, so after the grace the
     /// group is probed (`kill(-group, 0)`) and SIGKILLed if anything answers.
     ///
-    /// DISCLOSED RESIDUAL — a pid-recycle window. `group` equals the child's
-    /// pid, and once the kernel reaps that child the pid may be reissued; a
-    /// process that then became a group leader with the same id would receive
-    /// the SIGKILL below. macOS pids are issued sequentially and wrap near
-    /// 99999, so hitting it needs ~100k spawns inside one `terminationGrace`.
-    /// The pre-r18 code had the same class of window on its bare
-    /// `kill(pid, SIGKILL)`; what is new is that the post-exit probe can fire
-    /// after the parent has already been reaped.
-    private func terminate(_ process: Process, group: pid_t?) {
-        signal(SIGTERM, to: process, group: group)
+    /// DISCLOSED RESIDUAL — a pid-recycle window, unchanged in class from
+    /// r18: the group id equals the child's pid, and once the kernel reaps
+    /// that child the pid may be reissued; a process that then became a
+    /// group leader with the same id would receive the SIGKILL below. macOS
+    /// pids are issued sequentially and wrap near 99999, so hitting it needs
+    /// ~100k spawns inside one `terminationGrace`.
+    private func terminate(_ process: SpawnedProcess) {
+        process.signalTree(SIGTERM)
         let parentExited = process.waitForExit(within: terminationGrace)
-        let treeStillThere = group.map { kill(-$0, 0) == 0 } ?? false
+        let treeStillThere = kill(-process.pid, 0) == 0
         guard !parentExited || treeStillThere else { return }
-        signal(SIGKILL, to: process, group: group)
+        process.signalTree(SIGKILL)
         _ = process.waitForExit(within: terminationGrace)
     }
+}
 
-    /// The group if there is one and it accepted the signal, the pid
-    /// otherwise. Never both: a group signal already reached the child.
-    private func signal(_ code: Int32, to process: Process, group: pid_t?) {
-        if let group, kill(-group, code) == 0 { return }
-        let pid = process.processIdentifier
-        guard pid > 0 else { return }
+// MARK: - The spawn seam (fn-4.27)
+
+/// The runner's own subprocess handle: `posix_spawn(2)` with
+/// `POSIX_SPAWN_SETPGROUP` (pgroup 0), so the child is made the LEADER of a
+/// new process group — id == its pid — by the kernel, atomically, as part
+/// of creation.
+///
+/// WHY NOT `Foundation.Process` (the shape this replaces): Foundation does
+/// not expose spawn attributes, so the group could only be DISCOVERED after
+/// launch (`getpgid`), and that read required the leader to still be alive
+/// — the fn-4.27 defect. WHY NOT the other in-repo option, a setpgid
+/// trampoline executable: it would be a second `exec` layer to ship, and
+/// `scripts/bundle.sh` copies nothing it is not told to (the v2.1.0
+/// lesson), while a shell trampoline is banned outright by this seam's own
+/// fence (`testTheNewGitFilesNeverConstructAShellString`). `posix_spawn`
+/// keeps the argv EXACTLY as `Process` passed it — `/usr/bin/env` +
+/// ["git", …], argv-only, never a shell — and adds no shipped binary.
+///
+/// PARITY WITH WHAT `Process` DID, stated because each is load-bearing:
+/// - stdin is `/dev/null` (file action `open`), stdout/stderr are the two
+///   pipes' write ends (file action `dup2`);
+/// - every OTHER descriptor is closed in the child
+///   (`POSIX_SPAWN_CLOEXEC_DEFAULT` — the same hygiene `Process` applies),
+///   so a git descendant can inherit at most the two pipe ends the drains
+///   are watching;
+/// - the parent's copies of the write ends are closed by `launch` the
+///   moment the spawn returns — with `Process` the framework did this; a
+///   forgotten close here would mean the drains NEVER see EOF (the parent
+///   itself would hold the pipe open);
+/// - the bounded wait polls `waitpid(WNOHANG)` under the same monotonic
+///   deadline/backoff shape as `Process.waitForExit(within:)` (a bare
+///   `waitUntilExit` misses wakeups under concurrent reaping — house
+///   doctrine, `CacheCategory.swift`). `waitpid` is targeted at THIS pid,
+///   so concurrent `Process` users elsewhere in the app are untouched.
+///
+/// Single-threaded by contract: `execute` calls every member from the one
+/// thread that ran `launch` (the same discipline the `Process` shape had),
+/// so the reaped status needs no lock.
+private final class SpawnedProcess {
+
+    /// The child's pid AND — by the spawn attribute — its process group id.
+    let pid: pid_t
+
+    /// The raw `wait(2)` status once the child has been reaped.
+    private var reapedStatus: Int32?
+
+    private init(pid: pid_t) { self.pid = pid }
+
+    struct SpawnFailure: Error { let code: Int32 }
+
+    /// Spawn `executablePath` with `[executablePath] + arguments` as argv —
+    /// exactly the vector `Process` builds — in a NEW process group.
+    static func launch(
+        executablePath: String,
+        arguments: [String],
+        environment: [String: String],
+        stdout: Pipe,
+        stderr: Pipe
+    ) throws -> SpawnedProcess {
+        var fileActions: posix_spawn_file_actions_t?
+        posix_spawn_file_actions_init(&fileActions)
+        defer { posix_spawn_file_actions_destroy(&fileActions) }
+        posix_spawn_file_actions_addopen(
+            &fileActions, 0, "/dev/null", O_RDONLY, 0
+        )
+        posix_spawn_file_actions_adddup2(
+            &fileActions, stdout.fileHandleForWriting.fileDescriptor, 1
+        )
+        posix_spawn_file_actions_adddup2(
+            &fileActions, stderr.fileHandleForWriting.fileDescriptor, 2
+        )
+
+        var attributes: posix_spawnattr_t?
+        posix_spawnattr_init(&attributes)
+        defer { posix_spawnattr_destroy(&attributes) }
+        // THE fn-4.27 LINE: the child leads a new group (id == pid) from
+        // birth. CLOEXEC_DEFAULT closes everything the file actions above
+        // did not explicitly wire.
+        posix_spawnattr_setflags(
+            &attributes,
+            Int16(POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_CLOEXEC_DEFAULT)
+        )
+        posix_spawnattr_setpgroup(&attributes, 0)
+
+        var argv: [UnsafeMutablePointer<CChar>?] =
+            ([executablePath] + arguments).map { strdup($0) }
+        argv.append(nil)
+        defer { argv.forEach { free($0) } }
+        var envp: [UnsafeMutablePointer<CChar>?] =
+            environment.map { strdup("\($0.key)=\($0.value)") }
+        envp.append(nil)
+        defer { envp.forEach { free($0) } }
+
+        var pid: pid_t = 0
+        let rc = posix_spawn(
+            &pid, executablePath, &fileActions, &attributes, argv, envp
+        )
+        // The parent's write-end copies close on BOTH arms: on success the
+        // child holds its dup2'd copies and the drains must be able to see
+        // EOF; on failure nothing holds the pipe at all.
+        try? stdout.fileHandleForWriting.close()
+        try? stderr.fileHandleForWriting.close()
+        guard rc == 0 else { throw SpawnFailure(code: rc) }
+        return SpawnedProcess(pid: pid)
+    }
+
+    /// `true` once the child has exited — `terminationStatus` is then safe
+    /// to read — or `false` if it is still running when `timeout` elapses.
+    /// Same deadline/backoff shape as `Process.waitForExit(within:)`.
+    func waitForExit(within timeout: TimeInterval) -> Bool {
+        let deadline = DispatchTime.now() + timeout
+        var pollInterval: UInt32 = 1_000 // µs; backs off to 16ms
+        while !reapIfExited() {
+            if DispatchTime.now() >= deadline { return false }
+            usleep(pollInterval)
+            pollInterval = min(pollInterval * 2, 16_000)
+        }
+        return true
+    }
+
+    /// Exit code for a normal exit; `-(signal)` for a signal death —
+    /// negative so no real exit code (0…255) can be impersonated. The two
+    /// call sites test `== 0` and `== 127` only. `-1` before the child has
+    /// been proven exited (callers gate on `waitForExit` first).
+    var terminationStatus: Int32 {
+        guard let status = reapedStatus else { return -1 }
+        if status & 0x7f == 0 { return (status >> 8) & 0xff }
+        return -(status & 0x7f)
+    }
+
+    /// Signal the GROUP; fall back to the pid alone only if the group
+    /// signal is refused (then the pid-direct kill fails the same way for
+    /// the same reason — the fallback is a belt, kept because it costs one
+    /// syscall and can never signal anything the group signal would not).
+    func signalTree(_ code: Int32) {
+        if kill(-pid, code) == 0 { return }
         kill(pid, code)
+    }
+
+    /// One targeted, non-blocking reap attempt. `waitpid` names THIS pid,
+    /// so nothing here can steal another subsystem's child.
+    private func reapIfExited() -> Bool {
+        if reapedStatus != nil { return true }
+        var status: Int32 = 0
+        let reaped = waitpid(pid, &status, WNOHANG)
+        if reaped == pid {
+            // Exited or killed. (WUNTRACED is not passed, so stop/continue
+            // states never come back from this call.)
+            reapedStatus = status
+            return true
+        }
+        if reaped == -1 && errno == ECHILD {
+            // Not our child any more — nothing left to wait for. Recorded
+            // as a signal-less zero so `terminationStatus` stays readable;
+            // unreachable in practice (the reap is pid-targeted and only
+            // this instance ever waits on it).
+            reapedStatus = 0
+            return true
+        }
+        return false
     }
 }
 

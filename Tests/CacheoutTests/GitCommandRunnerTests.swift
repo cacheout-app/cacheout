@@ -1241,6 +1241,88 @@ final class GitCommandRunnerTests: XCTestCase {
         XCTAssertFalse(firstVerdictAgain)
     }
 
+    /// A TRANSIENT failure must not be remembered as "git is not installed"
+    /// (PR #460 codex r21).
+    ///
+    /// `availability()` converted every non-success probe outcome to `false`
+    /// and cached it for the runner's lifetime. So one `Process.run()` hitting
+    /// EMFILE/EBADF under momentary pressure, or one probe timing out, left
+    /// every later scan and clean answering `gitUnavailable` until the app was
+    /// restarted — telling the user to install software they already have.
+    /// Ask the standing question this branch asks of every refusal: can a
+    /// retry differ? For exit 127 it cannot; for a launch failure it can.
+    ///
+    /// The transient failure is staged the way it really happens — the
+    /// executable is momentarily not runnable (mode 000), then it is. No
+    /// injected outcome; `Process.run()` genuinely throws on the first call.
+    ///
+    /// MUTATION: restore the unconditional `cachedAvailability = available`
+    /// and the recovery assertion goes red — the runner keeps answering
+    /// `.gitUnavailable` after the host recovers.
+    func testATransientLaunchFailureIsNotCachedAsGitBeingAbsent()
+        async throws
+    {
+        let stubs = base.appendingPathComponent("stubs-transient")
+        try fm.createDirectory(at: stubs, withIntermediateDirectories: true)
+        let stub = stubs.appendingPathComponent("git")
+        try """
+        #!/bin/bash
+        echo "git version 2.99.0-stub"
+        exit 0
+        """.write(to: stub, atomically: true, encoding: .utf8)
+        // NOT RUNNABLE YET — `Process.run()` throws, which is the transient
+        // class (EMFILE/EBADF/EACCES), not "the tool is missing".
+        try fm.setAttributes([.posixPermissions: 0o000], ofItemAtPath: stub.path)
+
+        let runner = GitCommandRunner(
+            environment: try emptyPathEnvironment(), executableURL: stub
+        )
+        let duringPressure = await runner.run(["--version"])
+        XCTAssertEqual(
+            duringPressure.outcome, .gitUnavailable,
+            "an unrunnable executable is still gitUnavailable"
+        )
+        XCTAssertFalse(
+            duringPressure.unavailabilityIsDefinitive,
+            "a throwing launch is NOT a definitive not-found — only exit 127 is"
+        )
+
+        // The host recovers.
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: stub.path)
+
+        let afterRecovery = await runner.run(["--version"])
+        guard case .success = afterRecovery.outcome else {
+            return XCTFail(
+                "the runner remembered a transient failure and never retried — "
+                    + "stale-worktree work stays disabled until the app is "
+                    + "restarted. Got \(afterRecovery.outcome)"
+            )
+        }
+    }
+
+    /// The other half: exit 127 IS definitive, and IS remembered
+    /// (PR #460 codex r21). Without this, "cache only definitive" could be
+    /// satisfied by caching nothing, which would re-probe forever on a host
+    /// with no git.
+    func testADefinitiveNotFoundIsRememberedAndNotReProbed() async throws {
+        let stub = base.appendingPathComponent("stubs/exit127-definitive")
+        try GitFixture.makeUnavailableStub(at: stub)
+        let runner = GitCommandRunner(
+            environment: try emptyPathEnvironment(), executableURL: stub
+        )
+        let first = await runner.run(["--version"])
+        XCTAssertEqual(first.outcome, .gitUnavailable)
+        XCTAssertTrue(
+            first.unavailabilityIsDefinitive,
+            "exit 127 from the launcher is the one answer a retry cannot change"
+        )
+        let second = await runner.run(["worktree", "list"])
+        XCTAssertEqual(
+            second.outcome, .gitUnavailable,
+            "a definitive absence stays remembered"
+        )
+    }
+
     func testAvailabilityIsProbedOnceAndThenCached() async throws {
         let stubs = base.appendingPathComponent("stubs-counting")
         let counter = base.appendingPathComponent("probe-count")

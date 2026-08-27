@@ -813,6 +813,55 @@ final class GitWorktreeInventoryTests: XCTestCase {
         XCTAssertTrue(reason.contains(ghost.path), "the reason NAMES the entry: \(reason)")
     }
 
+    /// TWO ADMIN ENTRIES, ONE BACK-LINK: ambiguous, therefore refused
+    /// (PR #460 codex r21).
+    ///
+    /// The `!matches.isEmpty` guard refused ZERO matches and said nothing
+    /// about several. Git can list one duplicate `locked` and the other
+    /// `prunable`; `removalTargets` drops the locked RECORD, but this mapper
+    /// works from the back-link, so the locked entry's DIRECTORY was mapped in
+    /// on the strength of the other record — its lock never consulted, and
+    /// detached-HEAD preservation applied only to the record that was seen.
+    ///
+    /// MUTATION: restore `guard !matches.isEmpty` alone (drop the
+    /// `matches.count == 1` guard) and this cell goes red with BOTH
+    /// directories returned for one record.
+    func testDuplicateAdminBackLinksAreRefusedRatherThanBothMapped()
+        async throws
+    {
+        let fixture = try await makeOrphanFixture(named: "map-ambiguous")
+        let orphan = try XCTUnwrap(fixture.orphans.first)
+
+        // A SECOND admin entry carrying the SAME `gitdir` back-link as the
+        // first. This is the on-disk shape; nothing here forges a record.
+        let original = try XCTUnwrap(
+            try fm.contentsOfDirectory(
+                at: fixture.container, includingPropertiesForKeys: nil
+            ).first { (try? String(
+                contentsOf: $0.appendingPathComponent("gitdir"), encoding: .utf8
+            ))?.contains(orphan.lastPathComponent) == true }
+        )
+        let twin = fixture.container.appendingPathComponent("\(original.lastPathComponent)-twin")
+        try fm.copyItem(at: original, to: twin)
+
+        let verdict = GitWorktreeAdminMapper()
+            .map(prunableRecordsIn: fixture.inventory.entries,
+                 adminContainer: fixture.container)
+
+        guard case .incomplete(let reason) = verdict else {
+            return XCTFail(
+                "two admin entries share one back-link, so which describes the "
+                    + "record is unproven — the mapper must refuse, got \(verdict)"
+            )
+        }
+        XCTAssertTrue(
+            reason.contains(original.lastPathComponent)
+                && reason.contains(twin.lastPathComponent),
+            "the reason must NAME the colliding directories so the user can "
+                + "look: \(reason)"
+        )
+    }
+
     func testLockedPrunableRecordsAreExcludedWithoutSuppressingTheVerdict() async throws {
         let fixture = try await makeOrphanFixture(named: "map-locked")
         var entries = fixture.inventory.entries

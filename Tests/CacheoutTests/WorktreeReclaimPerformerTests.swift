@@ -5997,6 +5997,78 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         XCTAssertEqual(refusals.tags, ["prune-admin-lock-unreadable"])
     }
 
+    /// A `.git` that is PRESENT but not a readable pointer is ambiguous, and
+    /// ambiguity refuses (PR #460 codex r21).
+    ///
+    /// `revivedCheckoutRefusal` was one compound `guard` whose every failure
+    /// meant "not revived, carry on" — folding FIVE states into one answer
+    /// when only the first, genuine absence, was the one it meant. A `.git`
+    /// that is a directory, a symlink, unreadable or half-written is not
+    /// evidence of an orphan; it is evidence of a checkout being RESTORED
+    /// while this ran, which is the event the guard exists to catch. The
+    /// final mapper already proved that back-link readable, so a newly
+    /// ambiguous state is a change since then, and a retryable one.
+    ///
+    /// This is the reading the lock arms one function away already take
+    /// (`worktree-lock-unreadable`, `prune-admin-lock-unreadable` refuse
+    /// rather than assume unlocked). This one assumed.
+    ///
+    /// MUTATION: restore the single compound `guard … else { return nil }`
+    /// and this cell goes red with the restored checkout's admin directory
+    /// pruned.
+    func testTheDirectPruneRefusesAnAmbiguousGitEntryAtTheRevivedCheckout()
+        async throws
+    {
+        let fixture = try makePruneFixture(orphans: ["gone"])
+        let orphan = try XCTUnwrapElement(fixture.admin, 0)
+        let plan = prunePlan(membership: fixture.membership, disclosed: [orphan])
+        let staged = InvocationCounter()
+        let removed = TrashRecorder()
+        let fileManager = fm
+
+        let outcome = await perform(
+            item(plan, id: "prune"), plan: plan,
+            with: makePerformer(
+                runner: InterceptingGitRunner(wrapping: realRunner()),
+                removeTree: { url, _, prove in
+                    // Restore the checkout directory, but leave `.git` in a
+                    // state no reader can call a pointer: a DIRECTORY at that
+                    // name. Present, unambiguous on disk, unreadable as a
+                    // back-link.
+                    if let backlink = try? String(
+                        contentsOf: url.appendingPathComponent("gitdir"),
+                        encoding: .utf8
+                    ) {
+                        let dotGit = URL(
+                            fileURLWithPath: backlink
+                                .trimmingCharacters(in: .whitespacesAndNewlines)
+                        )
+                        if (try? fileManager.createDirectory(
+                            at: dotGit, withIntermediateDirectories: true
+                        )) != nil { staged.bump() }
+                    }
+                    try prove()
+                    removed.record(url)
+                    try fileManager.removeItem(at: url)
+                }
+            )
+        )
+
+        XCTAssertEqual(staged.count, 1, "the fixture never staged the ambiguity")
+        XCTAssertEqual(
+            removed.urls, [],
+            "a `.git` that could not be read as a pointer was treated as "
+                + "ABSENT, so the admin directory of a checkout being restored "
+                + "was pruned"
+        )
+        XCTAssertTrue(fm.fileExists(atPath: orphan.path))
+        XCTAssertNil(outcome.entry, "a refused removal accepts nothing")
+        let message = try XCTUnwrapElement(outcome.errors, 0).message
+        XCTAssertTrue(
+            message.contains("could not be read as a worktree pointer"), message
+        )
+    }
+
     /// The FAR-SIDE `prune-checkout-revived`, inside `LastInstantProof`
     /// (PR #460 codex r19, R3c).
     ///

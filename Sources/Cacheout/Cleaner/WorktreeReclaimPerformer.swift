@@ -1672,14 +1672,40 @@ struct WorktreeReclaimPerformer {
         guard let dotGit = Self.gitdirTarget(
             backlinkText, relativeTo: adminDirectory, prefixed: false
         ) else { return nil }
-        guard provider.probeKind(of: dotGit) == .kind(.regularFile),
+        // ONLY DEFINITE ABSENCE PROCEEDS (PR #460 codex r21).
+        //
+        // This was one compound `guard` whose every failure meant "not
+        // revived, carry on". That folded FIVE states into one answer, and
+        // only the first of them is the one it meant: `.git` genuinely
+        // absent. A `.git` that is PRESENT but a directory, a symlink,
+        // unreadable, or partially written is not evidence of an orphan — it
+        // is evidence of a checkout being restored WHILE this ran, which is
+        // precisely the event this guard exists to catch.
+        //
+        // The final mapper already proved this back-link readable, so a
+        // newly-ambiguous state is a CHANGE since then, and a retryable one.
+        // Fail closed and let the next scan see a settled filesystem. This is
+        // the same reading the lock arms take one function away
+        // (`worktree-lock-unreadable`, `prune-admin-lock-unreadable`), which
+        // refuse rather than assume unlocked; this one assumed.
+        let kind = provider.probeKind(of: dotGit)
+        if kind == .absent { return nil }
+        let ambiguous = "refused: the checkout at "
+            + "\(dotGit.deletingLastPathComponent().path) has a `.git` entry "
+            + "that could not be read as a worktree pointer at the last "
+            + "instant, so whether it is registered again could not be "
+            + "established — nothing was pruned. Re-scan once that path is "
+            + "settled."
+        guard kind == .kind(.regularFile),
               let pointerText = try? String(contentsOf: dotGit, encoding: .utf8),
               let named = Self.gitdirTarget(
                   pointerText, relativeTo: dotGit.deletingLastPathComponent(),
                   prefixed: true
-              ),
-              provider.sameLocation(named, adminDirectory)
-        else { return nil }
+              )
+        else { return ambiguous }
+        // It names a DIFFERENT admin directory: this checkout is not the one
+        // whose entry is being pruned, so it is not a revival of it.
+        guard provider.sameLocation(named, adminDirectory) else { return nil }
         return "refused: the checkout at "
             + "\(dotGit.deletingLastPathComponent().path) is registered again "
             + "and points back at \(adminDirectory.path) — it is no longer "
@@ -2309,11 +2335,21 @@ struct WorktreeReclaimPerformer {
     /// message match and nothing is a bare spelling comparison —
     /// `sameLocation` is inode identity when both sides exist.
     ///
-    /// UNLIKE `revivedCheckoutRefusal` THIS ONE FAILS CLOSED on every
-    /// ambiguity, and the asymmetry is deliberate: there the oracle had
+    /// BOTH FAIL CLOSED ON AMBIGUITY, and the asymmetry this paragraph used
+    /// to describe is gone (PR #460 codex r21).
+    ///
+    /// It read: "UNLIKE `revivedCheckoutRefusal` THIS ONE FAILS CLOSED on
+    /// every ambiguity, and the asymmetry is deliberate: there the oracle had
     /// already proved the entry prunable and an unreadable back-link could
-    /// only ADD a refusal, whereas here an unreadable back-link means the
-    /// authorisation cannot be tied to an object at all.
+    /// only ADD a refusal." Both halves were wrong. `revivedCheckoutRefusal`
+    /// returned nil — PROCEED — for every failure of its compound guard, so
+    /// an unreadable back-link there did not add a refusal, it REMOVED one:
+    /// a checkout being restored while the prune ran read as an orphan and
+    /// its admin directory went. It now proceeds only on definite absence.
+    ///
+    /// The paragraph is kept rather than deleted because a documented
+    /// asymmetry is exactly what would license someone restoring the
+    /// fail-open reading as intentional.
     ///
     /// That sentence was FALSE FOR ONE ARM until PR #460 codex r4 (D6).
     /// `sameLocation` is inode identity only when BOTH sides can be stat'd;

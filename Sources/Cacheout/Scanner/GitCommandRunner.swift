@@ -216,6 +216,12 @@ struct GitCommandInvocation: Equatable, Sendable {
     let argv: [String]
     let environment: [String: String]
     let outcome: GitCommandOutcome
+    /// `.gitUnavailable` has two very different causes and only one of them
+    /// is permanent (PR #460 codex r21): `/usr/bin/env` answering 127 means
+    /// the tool is genuinely not on PATH, while a throwing `Process.run()`
+    /// can be EMFILE/EBADF/EAGAIN under momentary pressure. Only the former
+    /// may be remembered; see `availability()`.
+    var unavailabilityIsDefinitive = false
 }
 
 // MARK: - Injection seam
@@ -344,7 +350,7 @@ final class GitCommandRunner: GitCommandRunning, @unchecked Sendable {
     func isGitAvailable() async -> Bool {
         await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
-                continuation.resume(returning: self.availability())
+                continuation.resume(returning: self.availability().available)
             }
         }
     }
@@ -354,12 +360,21 @@ final class GitCommandRunner: GitCommandRunning, @unchecked Sendable {
     /// use it without a hop.
     func runSynchronously(_ arguments: [String], timeout: TimeInterval) -> GitCommandInvocation {
         let profile = GitSafetyProfile.classify(arguments)
-        guard availability() else {
+        let availability = availability()
+        guard availability.available else {
+            // CARRY THE REAL ANSWER (PR #460 codex r21). A first draft marked
+            // this arm definitive unconditionally, reasoning that only a
+            // definitive absence is ever cached. That was false and a new cell
+            // caught it: this arm is reached whenever the probe says no,
+            // INCLUDING the transient case in the very call that probed, which
+            // is never cached. Asserting a property the code does not have is
+            // the class this branch has spent its whole review retiring.
             return GitCommandInvocation(
                 profile: profile,
                 argv: Self.argv(for: arguments),
                 environment: environment(for: profile),
-                outcome: .gitUnavailable
+                outcome: .gitUnavailable,
+                unavailabilityIsDefinitive: availability.definitive
             )
         }
         return execute(arguments, profile: profile, timeout: timeout)
@@ -377,15 +392,34 @@ final class GitCommandRunner: GitCommandRunning, @unchecked Sendable {
     /// + SIGKILL reap + both drain joins, all of them injected — and it is
     /// paid at most once per instance. It is not the shape r14's N2 was
     /// about; there is no second unbounded hold here.
-    private func availability() -> Bool {
+    /// `available`, and — when it is not — whether that answer is one a retry
+    /// could change (PR #460 codex r21). The caller needs both: it must not
+    /// tell a user "git is not installed" on the strength of an EMFILE.
+    private func availability() -> (available: Bool, definitive: Bool) {
         lock.lock()
         defer { lock.unlock() }
-        if let cachedAvailability { return cachedAvailability }
+        // Only two things are ever written to the cache: a success, and a
+        // DEFINITIVE absence. So a cache hit is definitive by construction —
+        // which is a property of the writes below, not an assumption.
+        if let cachedAvailability { return (cachedAvailability, true) }
         let probe = execute(["--version"], profile: .readOnly, timeout: defaultTimeout)
-        let available: Bool
-        if case .success = probe.outcome { available = true } else { available = false }
-        cachedAvailability = available
-        return available
+        if case .success = probe.outcome {
+            cachedAvailability = true
+            return (true, true)
+        }
+        // A TRANSIENT FAILURE IS NOT AN ANSWER TO REMEMBER (PR #460 codex
+        // r21). Every non-success outcome used to be cached as "git is not
+        // installed" for the lifetime of this runner — so one `Process.run()`
+        // hitting EMFILE, or one probe timing out under momentary pressure,
+        // disabled every stale-worktree scan and clean until the app was
+        // restarted, while telling the user to install software they already
+        // have. Ask the standing question: can a retry differ? For 127 it
+        // cannot; for everything else it can, so nothing is written down.
+        if probe.unavailabilityIsDefinitive {
+            cachedAvailability = false
+            return (false, true)
+        }
+        return (false, false)
     }
 
     // MARK: Argv & environment assembly
@@ -536,10 +570,13 @@ final class GitCommandRunner: GitCommandRunning, @unchecked Sendable {
             )
         }
         if status == 127 {
-            // `/usr/bin/env` could not find the tool.
+            // `/usr/bin/env` could not find the tool. THE ONE DEFINITIVE
+            // ANSWER (PR #460 codex r21) — it is the only unavailability a
+            // retry cannot change, so it is the only one `availability()` is
+            // allowed to remember.
             return GitCommandInvocation(
                 profile: profile, argv: argv, environment: environment,
-                outcome: .gitUnavailable
+                outcome: .gitUnavailable, unavailabilityIsDefinitive: true
             )
         }
         return GitCommandInvocation(

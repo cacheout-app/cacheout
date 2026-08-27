@@ -669,6 +669,33 @@ struct GitWorktreeAdminMapper {
                         + "mapped to an admin directory in \(adminContainer.path)"
                 )
             }
+            // EXACTLY ONE, OR THE REGISTRY IS AMBIGUOUS (PR #460 codex r21).
+            //
+            // The guard above refused ZERO matches and said nothing about
+            // several. Two admin entries can carry the SAME `gitdir`
+            // back-link, and git may then list one of them `locked` and the
+            // other `prunable`. `removalTargets` excludes the locked RECORD —
+            // but this mapper works from the back-link, so the locked entry's
+            // DIRECTORY was mapped in anyway, on the strength of the other
+            // record. Its lock is then never consulted (the last-instant
+            // check re-reads the lock of the directory it is given, and the
+            // caller was given both), and detached-HEAD preservation examined
+            // only the prunable record — so the locked entry's unique commit
+            // could be orphaned by a removal nothing about it authorized.
+            //
+            // A registry in that state is not something to resolve by picking
+            // one; it is a shape this code has no proof about. Refuse it, and
+            // say which directories collided so the user can look.
+            guard matches.count == 1 else {
+                let names = matches.map(\.lastPathComponent).sorted()
+                return .incomplete(
+                    reason: "prunable worktree \(record.path.path) maps to "
+                        + "\(matches.count) admin directories "
+                        + "(\(names.joined(separator: ", "))) in "
+                        + "\(adminContainer.path) — the registry is ambiguous "
+                        + "about which entry describes it, so none is pruned"
+                )
+            }
             mapped.append(contentsOf: matches)
         }
 

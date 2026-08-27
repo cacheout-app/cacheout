@@ -320,26 +320,50 @@ enum DepthSafeRemoval {
     /// bind to; it is not a way to skip the check.
     ///
     /// THE PARAMETER HAS NO DEFAULT, AND EVERY CALL SITE STATES ITS `nil`
-    /// (PR #458 review; the enumeration RE-TAKEN at PR #460 codex r18).
+    /// (PR #458 review; the enumeration RE-TAKEN at PR #460 codex r18, and
+    /// AGAIN at fn-4.21, which found the r18 take listing three sites of
+    /// five).
     ///
     /// The r458 wording said "both call sites" and closed with "if a third
     /// call site appears, either it states its `nil` or this paragraph stops
     /// being true and must change with it". A third appeared at r7 — the
     /// worktree performer's `removeTree` seam — and the paragraph did not
     /// change with it, which is the shape it was written to prevent. The
-    /// standing enumeration, from `grep -rn "expecting:" Sources`:
+    /// standing enumeration, from `grep -rn "expecting:" Sources` (five call
+    /// sites; `TrashDisposal.dispose(_:expecting:…)` is the disposal's own
+    /// spelling of this parameter and binds its leaf itself, on both sides
+    /// of its own hop):
     ///
-    /// 1. `CacheCleaner.deleteGuardedChild` (contents mode) — a literal `nil`
-    ///    under a paragraph saying contents mode runs no probe. SOUND: the
-    ///    population is ENUMERATED CHILDREN of a folder this call opened and
-    ///    proved, so no per-child verdict exists anywhere to bind to, and the
-    ///    container binding (`containedIn`) is what covers the leaf. That is
-    ///    why the container parameter is not optional for this arm.
-    /// 2. `CacheCleaner.removeGuardedItem` (item mode) — `probedObject`,
-    ///    which is `nil` exactly when the item's scanner registers no
-    ///    revalidator or the seam answered `.unestablished`. SOUND for the
-    ///    same reason and under the same binding; when a verdict DOES exist
-    ///    it is passed and proved here.
+    /// 1. `CacheCleaner.deleteGuardedChild` (contents mode) — a literal
+    ///    `nil`: contents mode runs no probe, so no VERDICT exists for any
+    ///    enumerated child. The claim that stood here — SOUND, because "the
+    ///    container binding (`containedIn`) is what covers the leaf" — was
+    ///    the same reasoning r18 measured FALSE for the worktree seam, and
+    ///    fn-4.21 measured it false here the same way: a child renamed aside
+    ///    at its own path inside the window, container untouched, left a
+    ///    stranger that this removal destroyed with `expecting: nil` while
+    ///    the measured tree's bytes were reported freed
+    ///    (`testContentsModeChildSwappedInsideTheWindowIsRefused`, red
+    ///    before the binding). No verdict exists, but an OBJECT does: the
+    ///    caller now binds what stands at the name at its FIRST READ of the
+    ///    child (`TrashDisposal.boundLeaf` under this same admitted
+    ///    container) and re-proves it via `provingImmediatelyBefore` on the
+    ///    far side of the hop (`CacheCleaner.provedStillTheBoundLeaf` — the
+    ///    r18 `BoundObject` shape through the same function, so two readings
+    ///    cannot disagree).
+    /// 2. `CacheCleaner.removeGuardedItem` (item mode, permanent arm) —
+    ///    `probedObject`, which is `nil` exactly when the item's scanner
+    ///    registers no revalidator or the seam answered `.unestablished`.
+    ///    When a verdict exists it is passed and proved here; when it is
+    ///    nil the caller takes the same fn-4.21 binding as contents mode —
+    ///    captured with `admittedParent`, before the delete-time rechecks —
+    ///    and re-proves it past the hop
+    ///    (`testItemModeNilProbeTargetSwappedInsideTheWindowIsRefused`, red
+    ///    before the binding). The item-mode TRASH arm's no-verdict case
+    ///    does not pass through this parameter at all: it takes
+    ///    `TrashDisposal.dispose(_:containedIn:…)`, whose leaf binding is
+    ///    taken at the disposal's own entry and after-proved (a swap in the
+    ///    window before that entry lands in the reversible Trash, not here).
     /// 3. `CacheCleaner`'s `removeTree` seam for `WorktreeReclaimPerformer`
     ///    — a literal `nil`, because `git_worktrees` registers no
     ///    revalidator either. SOUND ONLY SINCE r18, AND IT WAS NOT BEFORE.
@@ -358,7 +382,23 @@ enum DepthSafeRemoval {
     ///    rather than inside it, so what it leaves open is this function's
     ///    own parent open — the identical residual the LOCKED and HEAD-MOVED
     ///    propositions have carried since r7, for the identical reason: none
-    ///    of the three is expressible in this file's vocabulary.
+    ///    of the three is expressible in this file's vocabulary. Since
+    ///    fn-4.21 the two `CacheCleaner` bindings above run in the same
+    ///    place and carry the identical residual.
+    /// 4. `CacheCleaner.removeItemConcurrently` — the forwarder sites 1–3
+    ///    reach this file through. It states nothing of its own: it carries
+    ///    its caller's `expecting:` and `provingImmediatelyBefore:` across
+    ///    the queue hop unchanged, which is exactly why the no-verdict
+    ///    bindings ride in the proof closure rather than in a second
+    ///    parameter.
+    /// 5. `CacheCleaner.removeGuardedItem`'s Trash arm —
+    ///    `TrashDisposal.dispose(_:expecting: probedObject, …)`, reached
+    ///    only inside `if let probedObject`, so `expecting:` is never nil
+    ///    there at runtime; the disposal proves the verdict on both sides of
+    ///    its hop (the fn-4.21 spec's claim that this site passes nil "when
+    ///    no revalidator applies" was retired against the source: the
+    ///    no-revalidator case takes the `containedIn:` overload in the
+    ///    `else` arm).
     ///
     /// `provider` answers the mount question, and it is the same object the
     /// scanner's walk asks, so the two cannot classify a boundary
@@ -648,8 +688,15 @@ enum DepthSafeRemoval {
         provider: FileSystemIdentityProvider,
         displayPath: String
     ) throws {
-        // No inspection ran (contents mode): nothing to bind to. The caller
-        // states this explicitly.
+        // No inspection ran: no VERDICT to bind to, and the caller states
+        // that explicitly. It is not a proof holiday — each of the three
+        // nil-stating production callers carries its own leaf binding
+        // (fn-4.21's `boundLeaf` re-read for contents mode and the
+        // no-revalidator item arm; the worktree performer's `BoundObject`)
+        // in its `provingImmediatelyBefore` closure, run on this side of
+        // the hop immediately before `remove` — it cannot run HERE because
+        // what it binds is not expressible in this file's vocabulary (see
+        // the standing enumeration above).
         guard let inspected else { return }
         // Only a `.directory` verdict about THIS inode admits an opened
         // directory: `.noDirectoryTree`, `.nonDirectoryLeaf` and

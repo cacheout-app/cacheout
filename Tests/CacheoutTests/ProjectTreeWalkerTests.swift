@@ -57,6 +57,103 @@ final class ProjectTreeWalkerTests: XCTestCase {
         permsToRestore.append(url)
     }
 
+    /// EXPLORATORY (fn-4.13 measurement): drive the real recursive `visit`
+    /// at an env-provided depth on the cooperative executor to find where
+    /// the pool's small stack breaks it. Skipped unless WALKER_DEPTH is set.
+    func testExploratoryDeepWalkAtEnvDepth() async throws {
+        guard let raw = ProcessInfo.processInfo.environment["WALKER_DEPTH"],
+              let depth = Int(raw) else {
+            throw XCTSkip("exploratory: set WALKER_DEPTH to run")
+        }
+        let root = base.appendingPathComponent("deep-root")
+        try mkdir(root)
+        var fds: [Int32] = []
+        defer { for fd in fds { close(fd) } }
+        let current = open(root.path, O_RDONLY | O_DIRECTORY)
+        guard current >= 0 else { throw XCTSkip("open: \(errno)") }
+        fds.append(current)
+        var cursor = current
+        for _ in 0..<depth {
+            guard mkdirat(cursor, "d", 0o755) == 0 else {
+                throw XCTSkip("mkdirat: \(errno)")
+            }
+            let next = openat(cursor, "d", O_RDONLY | O_DIRECTORY)
+            guard next >= 0 else { throw XCTSkip("openat: \(errno)") }
+            fds.append(next)
+            cursor = next
+        }
+        let walker = makeWalker(roots: [root])
+        let sink = DepthSink()
+        let issues = await Task.detached {
+            walker.walk(roots: [root], maxDepth: depth,
+                        consumers: [{ event in
+                            sink.observe(event.depth)
+                            return []
+                        }])
+        }.value
+        print("WALKER_DEPTH=\(depth): survived; deepest event "
+              + "\(sink.deepest); issues=\(issues.count)")
+    }
+
+    /// fn-4.13 REGRESSION PIN: a walk asked for a depth inside the measured
+    /// crash band must SURVIVE the cooperative pool. `visit` recurses once
+    /// per level; measured through this exact path (`Task.detached`, chain
+    /// fixture): depth 256 survived, depth 288 died with signal 10 — a
+    /// guard-page hit on the pool's small stack, ~270 recursion levels, no
+    /// refusal anyone could act on. The clamp
+    /// (`ProjectTreeWalker.stackSafeMaxDepthCeiling` = 128) bounds the
+    /// recursion instead; the walk returns and the deepest emitted event
+    /// sits exactly at the ceiling.
+    ///
+    /// MUTATION: revert the clamp in `walk` — this cell dies with signal 10
+    /// (the r14 precedent: a signal death on revert is a legitimate red).
+    func testAWalkAskedForACrashBandDepthSurvivesTheCooperativePool() async throws {
+        let depth = 320  // past the measured 288-crash point
+        let root = base.appendingPathComponent("crash-band-root")
+        try mkdir(root)
+        var fds: [Int32] = []
+        defer { for fd in fds { close(fd) } }
+        let first = open(root.path, O_RDONLY | O_DIRECTORY)
+        guard first >= 0 else { throw XCTSkip("open: \(errno)") }
+        fds.append(first)
+        var cursor = first
+        for _ in 0..<depth {
+            guard mkdirat(cursor, "d", 0o755) == 0 else {
+                throw XCTSkip("mkdirat: \(errno)")
+            }
+            let next = openat(cursor, "d", O_RDONLY | O_DIRECTORY)
+            guard next >= 0 else { throw XCTSkip("openat: \(errno)") }
+            fds.append(next)
+            cursor = next
+        }
+        let walker = makeWalker(roots: [root])
+        let sink = DepthSink()
+        let issues = await Task.detached {
+            walker.walk(roots: [root], maxDepth: depth,
+                        consumers: [{ event in
+                            sink.observe(event.depth)
+                            return []
+                        }])
+        }.value
+
+        XCTAssertTrue(issues.isEmpty, "\(issues.map(\.detail))")
+        XCTAssertEqual(
+            sink.deepest, ProjectTreeWalker.stackSafeMaxDepthCeiling,
+            "the walk descends exactly to the clamp and no further — deep "
+                + "enough to prove the budget, shallow enough to keep the "
+                + "recursion off the guard page"
+        )
+    }
+
+    final class DepthSink: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value = -1
+        var deepest: Int { lock.lock(); defer { lock.unlock() }; return value }
+        func observe(_ depth: Int) {
+            lock.lock(); value = max(value, depth); lock.unlock()
+        }
+    }
+
     /// Walker whose guard's containerRoots == `roots` (the epic model: each
     /// scanner constructs its OWN PathGuard from its declared roots).
     private func makeWalker(

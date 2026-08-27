@@ -116,6 +116,22 @@ struct ProjectTreeWalker {
     /// none are descended).
     static let defaultMaxDepth = 8
 
+    /// The HARD ceiling `walk` clamps any caller-supplied `maxDepth` to
+    /// (fn-4.13). `visit` recurses once per level, and the cooperative
+    /// pool's small thread stack breaks that recursion long before any
+    /// filesystem limit does — MEASURED through the real `visit` on the
+    /// real executor (`Task.detached`, mkdirat-chain fixture): a walk at
+    /// depth 256 survives; depth 288 kills the process with signal 10, a
+    /// guard-page hit, no refusal anyone can act on. 128 leaves a 2x margin
+    /// under the measured floor of the crash band (257..288) while sitting
+    /// 16x above `defaultMaxDepth` — every production caller passes the
+    /// default, so this clamp changes no shipped behavior; it exists so a
+    /// test seam or a future caller cannot turn a parameter into a crash.
+    /// DETERMINISTIC by design and disclosed here rather than at runtime:
+    /// levels past the clamp are simply outside the walk's budget, exactly
+    /// as levels past `maxDepth` always were.
+    static let stackSafeMaxDepthCeiling = 128
+
     /// Home-relative first-level ancestors macOS gates behind a TCC consent
     /// prompt. Protection of an ARBITRARY configured root is decided by
     /// canonical-path PREFIX under one of these (see `isProtectedRoot`),
@@ -257,6 +273,8 @@ struct ProjectTreeWalker {
         didAnchorRoot: ((URL, SecureDirectory) -> Void)? = nil
     ) -> [ScanIssue] {
         var issues: [ScanIssue] = []
+        // The stack-safe clamp (fn-4.13) — see `stackSafeMaxDepthCeiling`.
+        let maxDepth = min(maxDepth, Self.stackSafeMaxDepthCeiling)
 
         for root in roots {
             if Task.isCancelled { break }

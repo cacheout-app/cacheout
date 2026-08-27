@@ -734,6 +734,54 @@ final class DirectorySizerTests: XCTestCase {
         }
     }
 
+    // MARK: - fn-4.13: the sizer's walk is NOT a stack recursion — measured
+
+    /// NEGATIVE RESULT, pinned (fn-4.13): `enumerateTree` iterates
+    /// `FileManager.enumerator`'s deep enumeration — heap-backed, not one
+    /// Swift stack frame per level — so a chain deeper than the cooperative
+    /// pool's measured recursion ceiling (~250-290 frames kills the process
+    /// through a per-level recursion; `ProjectTreeWalker`'s crash band and
+    /// PR #459 r14's `freshContentBelow` both measured it) measures to
+    /// completion on the same executor. Depth 350 sits past that band while
+    /// keeping every composed absolute path under `PATH_MAX`.
+    func testADeepChainMeasuresOnTheCooperativePoolWithoutAStackCrash() async throws {
+        let depth = 350
+        let root = base.appendingPathComponent("deep-chain")
+        try mkdir(root)
+        var fds: [Int32] = []
+        defer { for fd in fds { close(fd) } }
+        let first = open(root.path, O_RDONLY | O_DIRECTORY)
+        guard first >= 0 else { throw XCTSkip("open: \(errno)") }
+        fds.append(first)
+        var cursor = first
+        for _ in 0..<depth {
+            guard mkdirat(cursor, "d", 0o755) == 0 else {
+                throw XCTSkip("mkdirat: \(errno)")
+            }
+            let next = openat(cursor, "d", O_RDONLY | O_DIRECTORY)
+            guard next >= 0 else { throw XCTSkip("openat: \(errno)") }
+            fds.append(next)
+            cursor = next
+        }
+        // One real file at the bottom so the walk proves it REACHED depth.
+        let leaf = openat(cursor, "payload.bin",
+                          O_CREAT | O_WRONLY | O_TRUNC, 0o644)
+        guard leaf >= 0 else { throw XCTSkip("openat leaf: \(errno)") }
+        _ = "payload".withCString { write(leaf, $0, 7) }
+        close(leaf)
+
+        let sizer = makeSizer()
+        let report = await Task.detached {
+            sizer.measure(at: root, mode: .scanRoot)
+        }.value
+
+        XCTAssertEqual(report.enumeratedEntries, depth + 1,
+                       "every level plus the leaf file, walked to completion")
+        XCTAssertEqual(report.itemCount, 1, "the bottom payload was reached")
+        XCTAssertTrue(report.denials.isEmpty, "\(report.denials)")
+        XCTAssertFalse(report.cancelled)
+    }
+
     // MARK: - fn-4.15: cancellation is a first-class stop, never a silent
     // completion
 

@@ -354,9 +354,40 @@ struct CleanupReportSheet: View {
                     // Positional identity because one item may carry
                     // several error lines.
                     ForEach(Array(report.errorLines.enumerated()), id: \.offset) { _, line in
+                        // THE MESSAGE IS THE WHOLE POINT, AND IT WAS
+                        // UNREADABLE (field report on the 2.2.0 build).
+                        //
+                        // A bare `Text` inside this sheet's `.frame(width:
+                        // 400)` truncates to ONE line with an ellipsis, so a
+                        // refusal like "…: the folder that holds this item is
+                        // no longer the one the safety check admitted"
+                        // rendered as a cache name and three dots. Every
+                        // refusal this app writes explains what it refused
+                        // and what to do next, and the user could read none
+                        // of it — which makes the careful wording upstream
+                        // worthless at the one moment it matters.
+                        //
+                        // THREE MECHANISMS, DELIBERATELY, because the
+                        // failing case is an UNBREAKABLE TOKEN. The reported
+                        // line was `com.apple.SwiftUI.Drag-D21FA1F0-…` — a
+                        // cache name with no spaces, so there is no wrap
+                        // opportunity and plain `Text`, which wraps by
+                        // default, truncated instead. `fixedSize(vertical:)`
+                        // gives it the vertical room to break; `textSelection`
+                        // lets it be copied into a bug report even if a
+                        // future layout clips it again; `.help` puts the whole
+                        // string in a tooltip, which no width can shorten.
+                        //
+                        // The sheet grows with a long error list. That is the
+                        // right trade against hiding the text: this app does
+                        // not shorten a refusal it has decided to show.
                         Text(line)
                             .font(.caption)
                             .foregroundStyle(.red)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .textSelection(.enabled)
+                            .help(line)
                     }
                 }
                 .padding()

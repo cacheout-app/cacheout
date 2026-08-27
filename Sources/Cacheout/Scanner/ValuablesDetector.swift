@@ -162,8 +162,8 @@
 /// which means network round trips, spin-up, and privacy-sensitive access to
 /// a filesystem the user never pointed this scanner at. And it buys nothing:
 /// an artifact dir containing a boundary is `.denied` at scan time and
-/// refused whole by the cleaner (`CacheCleaner.deleteGuardedChild`:1151 and
-/// `CacheCleaner.removeGuardedItem`:1371), so no
+/// refused whole by the cleaner (`deleteGuardedChild`, `CacheCleaner.swift:1210`,
+/// and `removeGuardedItem`, `CacheCleaner.swift:1496`), so no
 /// valuable found past the mount could ever change an outcome.
 ///
 /// UNCROSSED ⇒ INCOMPLETE, never "clean": the honest report is "we did not

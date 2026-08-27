@@ -102,7 +102,18 @@ final class SourceAnchorIntegrityTests: XCTestCase {
     /// Every anchor in the tree, with a fragment of the text it cites.
     /// Sorted; one entry per DISTINCT anchor however many places cite it.
     static let anchorExpectations: [(anchor: String, excerpt: String)] = [
-        ("BuildArtifactsScanner.swift:1405-1406",
+        // The two CacheCleaner mount-refusal arms, cited from THREE files —
+        // this pair went stale twice in two rounds (r1 gate, r2 gate) because
+        // the citations were spelled `function`:line, which the anchor
+        // pattern cannot see. Canonically spelled and pinned so the third
+        // drift is a red cell, not a gate finding (fn-4 r2 gate).
+        ("CacheCleaner.swift:1210",
+         "child.path): mount boundary at"),
+        ("CacheCleaner.swift:1496",
+         "target.path): mount boundary at"),
+        ("OrphanedCachesScanner.swift:816",
+         "static func preDeleteUserDataProbe("),
+        ("BuildArtifactsScanner.swift:1407-1408",
          "deletable && report.logicalBytes > report.measur"),
         ("BuildArtifactsScanner.swift:378-382",
          "this walk's per-root classified issues. Candidat"),

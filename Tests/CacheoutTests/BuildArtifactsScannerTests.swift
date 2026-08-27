@@ -1004,7 +1004,7 @@ final class BuildArtifactsScannerTests: XCTestCase {
     }
 
     func testLogicalBytesPredicateMatchesTheAsBuiltBoundaryCells() {
-        // The as-built predicate VERBATIM (BuildArtifactsScanner.swift:1405-1406)
+        // The as-built predicate VERBATIM (BuildArtifactsScanner.swift:1407-1408)
         // — boundary cells on BOTH sides, which no filesystem fixture can
         // place precisely.
         var equal = SizeReport()

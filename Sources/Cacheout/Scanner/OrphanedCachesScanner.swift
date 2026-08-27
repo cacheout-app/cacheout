@@ -1062,8 +1062,8 @@ struct OrphanedCachesScanner: @unchecked Sendable {
     /// What crossing costs is real and buys nothing: up to `entryLimit`
     /// reads on network/removable/FUSE storage the user never pointed this
     /// scanner at, on an item a boundary already makes uncleanable
-    /// (`CacheCleaner.deleteGuardedChild`:1151,
-    /// `CacheCleaner.removeGuardedItem`:1371). UNCROSSED ⇒ INCOMPLETE, never
+    /// (`deleteGuardedChild`, `CacheCleaner.swift:1210`;
+    /// `removeGuardedItem`, `CacheCleaner.swift:1496`). UNCROSSED ⇒ INCOMPLETE, never
     /// "clean" —
     /// and unlike a depth cap it is CLEARABLE: unmount, and the next walk
     /// reads the tree whole.

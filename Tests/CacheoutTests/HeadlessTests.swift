@@ -1070,6 +1070,67 @@ final class StatusSocketIntegrationTests: XCTestCase {
         }
     }
 
+    // MARK: - fn-4.14: the reply-framing evidence
+
+    /// The reply is newline-FRAMED, and the client must read to the frame,
+    /// not to the first `read(2)` return. This server writes its reply in two
+    /// segments 60 ms apart: a single unframed read hands back the first
+    /// segment — truncated JSON, the exact garble that fed the trapping
+    /// `as! [String: Any]` this task retired — while the framed loop hands
+    /// back the whole line. Measured with the pre-fn-4.14 single-read helper:
+    /// truncated 10 of 10 runs.
+    func testSegmentedReplyIsReadWholeNotFirstSegment() throws {
+        let tmpDir = try makeShortTmpDir()
+        defer { try? FileManager.default.removeItem(at: tmpDir) }
+        let socketPath = tmpDir.appendingPathComponent("seg.sock").path
+
+        let server = socket(AF_UNIX, SOCK_STREAM, 0)
+        XCTAssertGreaterThanOrEqual(server, 0, "socket() errno \(errno)")
+        defer { close(server) }
+
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        addr.sun_len = UInt8(MemoryLayout<sockaddr_un>.size)
+        let pathCString = socketPath.utf8CString
+        withUnsafeMutableBytes(of: &addr.sun_path) { pathPtr in
+            pathCString.withUnsafeBufferPointer { cBuf in
+                let copyLen = min(cBuf.count, pathPtr.count)
+                for i in 0..<copyLen {
+                    pathPtr[i] = UInt8(bitPattern: cBuf[i])
+                }
+            }
+        }
+        let bound = withUnsafePointer(to: &addr) { addrPtr in
+            addrPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockPtr in
+                Darwin.bind(server, sockPtr, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+        XCTAssertEqual(bound, 0, "bind() errno \(errno)")
+        XCTAssertEqual(listen(server, 1), 0, "listen() errno \(errno)")
+
+        let firstSegment = "{\"ok\":true,\"data\":{\"answer\""
+        let secondSegment = ":42}}\n"
+        let served = expectation(description: "server wrote both segments")
+        DispatchQueue.global().async {
+            let client = accept(server, nil, nil)
+            defer { served.fulfill() }
+            guard client >= 0 else { return }
+            defer { close(client) }
+            // A broken pipe must fail THIS cell, never the process (D5).
+            TestSocketClient.disarmSIGPIPE(on: client)
+            var command = [UInt8](repeating: 0, count: 64)
+            _ = read(client, &command, command.count)
+            _ = TestSocketClient.write(Array(firstSegment.utf8), to: client)
+            usleep(60_000)   // let the client's first read(2) return alone
+            _ = TestSocketClient.write(Array(secondSegment.utf8), to: client)
+        }
+
+        let response = try sendSocketCommand("ping\n", to: socketPath)
+        wait(for: [served], timeout: 5)
+        XCTAssertEqual(response, firstSegment + secondSegment,
+                       "the framed read must hand back the whole line")
+    }
+
     // MARK: - Helper: Send command to Unix socket
 
     private func sendSocketCommand(_ command: String, to path: String) throws -> String {
@@ -1112,13 +1173,10 @@ final class StatusSocketIntegrationTests: XCTestCase {
             )
         }
 
-        // Read response
-        var buffer = [UInt8](repeating: 0, count: 65536)
-        let n = read(fd, &buffer, buffer.count)
-        guard n > 0 else {
-            throw NSError(domain: "test", code: -1, userInfo: [NSLocalizedDescriptionKey: "No response"])
-        }
-        return String(bytes: buffer[0..<n], encoding: .utf8) ?? ""
+        // Read the WHOLE newline-terminated reply — a single `read(2)` on a
+        // stream socket can return the first segment only, and truncated JSON
+        // is what fed the fn-4.14 trapping cast (see `TestSocketClient`).
+        return try TestSocketClient.readNewlineTerminatedReply(from: fd)
     }
 }
 

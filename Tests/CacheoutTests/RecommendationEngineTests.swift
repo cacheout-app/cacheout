@@ -590,11 +590,9 @@ private func sendSocketCommand(_ command: String, to path: String) throws -> Str
         throw NSError(domain: "write", code: Int(sent.errno))
     }
 
-    var readBuf = [UInt8](repeating: 0, count: 65536)
-    let n = read(fd, &readBuf, readBuf.count)
-    guard n > 0 else { throw NSError(domain: "read", code: Int(errno)) }
-
-    return String(bytes: readBuf[0..<n], encoding: .utf8) ?? ""
+    // The WHOLE newline-terminated reply, never a first segment (fn-4.14) —
+    // see `TestSocketClient.readNewlineTerminatedReply`.
+    return try TestSocketClient.readNewlineTerminatedReply(from: fd)
 }
 
 // Mock that returns recommendations

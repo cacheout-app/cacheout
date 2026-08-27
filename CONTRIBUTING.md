@@ -45,6 +45,15 @@ CacheCategory(
    `--confirm` — preview safely with `--cli clean <slug> --dry-run`)
 5. Submit a PR with a clear description
 
+> **A green tally is not a green run.** A trapping construct (`as!`, `try!`,
+> a force-unwrap, an out-of-range subscript) kills the whole test process,
+> and every `Executed N tests … 0 failures` line printed BEFORE the kill
+> stays in the log — one truncated run showed a passing tally while ~26
+> later suites never executed (fn-4.14). When reading a `swift test` log,
+> trust only the process EXIT CODE and the final executed COUNT compared
+> against the expected baseline, never a greppable `0 failures` line.
+> `StrandFenceTests` fences the trapping shapes out of test sources.
+
 ## Documentation
 
 Full technical documentation is in [docs/v1/](docs/v1/):

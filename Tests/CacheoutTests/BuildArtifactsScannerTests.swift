@@ -1361,8 +1361,11 @@ final class BuildArtifactsScannerTests: XCTestCase {
                        "candidate-level denials are never dropped")
     }
 
-    func testInjectedEPERMClassifiesAsTccDenied() async throws {
+    func testInjectedEPERMClassifiesNeutrallyNeverAsTcc() async throws {
         // EPERM cannot be fixtured from an unentitled process — inject it.
+        // NEUTRAL since fn-4.12: the failing probe is a raw lstat, and a
+        // bare errno carries no provenance, so `.tccDenied` — and the GUI's
+        // "Grant access…" link that rides it — may not be asserted.
         let target = try makeProject(
             at: dev.appendingPathComponent("proj"),
             marker: "Cargo.toml", artifact: "target", payloadBytes: nil
@@ -1384,8 +1387,13 @@ final class BuildArtifactsScannerTests: XCTestCase {
         XCTAssertEqual(found.state, .denied,
                        "nothing measurable behind the denial")
         XCTAssertEqual(found.rootRecords.map(\.status), [.deniedUnmeasured])
-        XCTAssertEqual(found.scanError?.kind, .tccDenied,
-                       "EPERM → TCC (the frozen taxonomy)")
+        XCTAssertEqual(found.scanError?.kind, .other,
+                       "bare EPERM is neutral — never TCC (fn-4.12)")
+        XCTAssertTrue(
+            found.scanError?.message.contains("could not be established")
+                == true,
+            "the neutral detail says why: \(String(describing: found.scanError))"
+        )
     }
 
     // MARK: - R16 data path + per-root issue surfacing
@@ -1409,8 +1417,10 @@ final class BuildArtifactsScannerTests: XCTestCase {
         )
 
         XCTAssertEqual(itemPaths(outcome), [identityPath(of: target)])
-        XCTAssertEqual(outcome.errors.map(\.kind), [.containerRefused],
-                       "the config issue rides the outcome: \(outcome.errors)")
+        XCTAssertEqual(outcome.errors.map(\.kind), [.policyRefusedRoot],
+                       "the config issue rides the outcome — the root IS "
+                           + "configured, so `.containerRefused` was the "
+                           + "false kind (fn-4.12): \(outcome.errors)")
         XCTAssertEqual(outcome.errors.first?.url?.path, "/")
     }
 
@@ -3770,7 +3780,7 @@ final class BuildArtifactsScannerTests: XCTestCase {
         async throws
     {
         // The ROOT cell. The sizer declines to enumerate its own root when
-        // that root is a mount (`DirectorySizer.swift:317-332`); the probe must
+        // that root is a mount (`DirectorySizer.swift:322-337`); the probe must
         // decline identically, or it reads a whole foreign volume that the
         // caller has already denied.
         let artifact = try makeProject(
@@ -5825,9 +5835,10 @@ final class BuildArtifactsScannerTests: XCTestCase {
     }
 
     /// R16 data path: a POLICY-REJECTED PERSISTED root is never registered
-    /// and never walked, while its classified `.containerRefused` issue
-    /// rides EVERY scan outcome — asserted across two consecutive scans, and
-    /// the stored value is never rewritten.
+    /// and never walked, while its classified `.policyRefusedRoot` issue
+    /// (fn-4.12; `.containerRefused` before that, whose label contradicted
+    /// the detail) rides EVERY scan outcome — asserted across two
+    /// consecutive scans, and the stored value is never rewritten.
     func testPolicyRejectedPersistedRootRidesEveryScanAndNeverRegisters()
         async throws
     {
@@ -5848,7 +5859,7 @@ final class BuildArtifactsScannerTests: XCTestCase {
 
         for pass in 1...2 {
             let outcome = try await runScan(scanner)
-            let refusals = outcome.errors.filter { $0.kind == .containerRefused }
+            let refusals = outcome.errors.filter { $0.kind == .policyRefusedRoot }
             XCTAssertEqual(refusals.count, 1, "pass \(pass)")
             XCTAssertEqual(refusals.first?.url?.path, "/", "pass \(pass)")
             XCTAssertTrue(
@@ -5913,7 +5924,8 @@ final class BuildArtifactsScannerTests: XCTestCase {
         let fileIssue = try XCTUnwrap(
             outcome.errors.first { $0.url?.path == fileRoot.path }
         )
-        XCTAssertEqual(fileIssue.kind, .symlinkRoot)
+        XCTAssertEqual(fileIssue.kind, .nonDirectoryRoot,
+                       "a regular-file root is NOT 'symlinked' (fn-4.12)")
         // Nested roots walked independently, overlap collapsed to ONE item
         // per canonical identity (D7).
         XCTAssertEqual(

@@ -722,8 +722,8 @@ struct BuildArtifactsScanner: @unchecked Sendable {
     ///   descendant (review r3). The house rule VERBATIM, no third notion
     ///   invented: device-id change against the ANCESTOR, plus the `statfs`
     ///   mount-root check that catches the same-`st_dev` firmlink mounts a
-    ///   device comparison is blind to (`DirectorySizer.swift:443-448`,
-    ///   `ProjectTreeWalker.swift:578-581`, `ValuablesDetector.swift`). The sizer
+    ///   device comparison is blind to (`DirectorySizer.swift:448-453`,
+    ///   `ProjectTreeWalker.swift:629-632`, `ValuablesDetector.swift`). The sizer
     ///   records the boundary and skips its subtree uncounted; the cleaner
     ///   refuses any tree containing one whole
     ///   (`deleteGuardedChild`, `CacheCleaner.swift:1210`, and

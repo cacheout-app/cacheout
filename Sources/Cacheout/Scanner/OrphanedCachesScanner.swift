@@ -1048,8 +1048,8 @@ struct OrphanedCachesScanner: @unchecked Sendable {
     ///    decision is taken on this spelling.
     ///
     /// NO-CROSS rule (safety — PR #458 review, matching the sizer's own
-    /// root check at `DirectorySizer.swift:317-332` and its within-walk check at
-    /// `DirectorySizer.swift:443-448`): mount boundaries are never crossed, at
+    /// root check at `DirectorySizer.swift:322-337` and its within-walk check at
+    /// `DirectorySizer.swift:448-453`): mount boundaries are never crossed, at
     /// the root or anywhere beneath it, and an uncrossed boundary makes the
     /// probe INCOMPLETE. Both signals are now read from DESCRIPTORS —
     /// `f_fsid` plus `st_dev` (see `crossesMountBoundary`) — which is
@@ -1440,7 +1440,7 @@ struct OrphanedCachesScanner: @unchecked Sendable {
         }
 
         // MOUNT BOUNDARY AT THE ROOT, before anything below it is read —
-        // the same stance `DirectorySizer.swift:317-332` takes on its own root.
+        // the same stance `DirectorySizer.swift:322-337` takes on its own root.
         // An entry that IS a mount is not enumerated at all: not one entry
         // of the foreign filesystem is read, and the verdict is INCOMPLETE
         // precisely because we did not look.
@@ -2728,9 +2728,15 @@ extension OrphanedCachesScanner: SpaceScanner {
         case .rootNotADirectory(let kind):
             // A symlinked/non-directory sweep root is NEVER traversed —
             // the scanner-level issue fn-2 defined for exactly this.
+            // TWO kinds by what actually stands there (fn-4.12, the PR #459
+            // codex r13 split): `.symlinkRoot`'s single GUI label is the
+            // fixed sentence "symlinked — not searched", so a regular file
+            // or special file standing at the sweep root must carry
+            // `.nonDirectoryRoot` — the detail always named the real kind,
+            // but only in the hover tooltip.
             return ScanOutcome(items: [], errors: [ScanIssue(
                 url: cachesRoot,
-                kind: .symlinkRoot,
+                kind: kind == .symlink ? .symlinkRoot : .nonDirectoryRoot,
                 detail: "sweep root is not a real directory "
                     + "(\(Self.describe(kind))) — never traversed"
             )])

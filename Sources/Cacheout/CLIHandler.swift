@@ -1140,8 +1140,10 @@ struct CLIHandler {
         // The policy's own verdict, surfaced as a usage error (the CLI
         // attack case: `--dev-root /`). `.configInvalid` cannot occur on the
         // replacement path — nothing was parsed out of the defaults suite.
+        // `.policyRefusedRoot` since fn-4.12 — the resolution pipeline's
+        // refusal kind for a CONFIGURED (here: flag-declared) root.
         if let refused = resolution.issues.first(
-            where: { $0.kind == .containerRefused }
+            where: { $0.kind == .policyRefusedRoot }
         ) {
             return .failure(CLIAddressError(message:
                 "\(devRootFlag) \(refused.url?.path ?? "") is not a usable "

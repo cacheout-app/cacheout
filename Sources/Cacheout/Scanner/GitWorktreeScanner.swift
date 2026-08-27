@@ -96,10 +96,12 @@
 /// the resolver-carried admin container all lie inside the SAME declared dev
 /// root — the parent alone may EQUAL the root (a
 /// dev root that IS a repository is legal), everything else is a STRICT
-/// descendant. A worktree outside every root, or a parent/admin container
-/// outside the worktree's root, becomes a `.containerRefused` issue and NEVER
-/// an item (D3: no display-only admission exists, and emitting one malforms
-/// the whole outcome).
+/// descendant. A worktree outside every root becomes a `.containerRefused`
+/// issue; a parent/admin container outside the worktree's root becomes a
+/// `.mutationScopeRefused` one (fn-4.12 — that worktree IS inside a
+/// configured root, so the old kind's label was false for it). NEVER an item
+/// either way (D3: no display-only admission exists, and emitting one
+/// malforms the whole outcome).
 ///
 /// Because `GitWorktreeReclaimPlan.violation` checks containment LEXICALLY on
 /// the verbatim spellings (a second resolution at validation time would race
@@ -1002,6 +1004,12 @@ struct GitWorktreeScanner: @unchecked Sendable {
         // path outside every root is exactly what the secondary gate exists to
         // limit, and no assessment of it could change the answer.
         guard !rootsStrictlyContaining(worktreeIdentity, in: bindings).isEmpty else {
+            // `.containerRefused` is TRUE here and stays (fn-4.12 producer
+            // audit): its fixed GUI label — "not a configured search root"
+            // — is exactly this worktree's condition, sitting outside every
+            // configured root. The containment arms below are the ones that
+            // moved (`.mutationScopeRefused`): their candidates ARE inside
+            // a configured root, so that same sentence was false there.
             issues.append(ScanIssue(
                 url: record.path, kind: .containerRefused,
                 detail: "registered worktree '\(record.path.path)' is outside "
@@ -1103,8 +1111,12 @@ struct GitWorktreeScanner: @unchecked Sendable {
         )
         guard case .bound(let root, let parent, let strict) = scope else {
             if case .unbound(let reason) = scope {
+                // `.mutationScopeRefused`, NOT `.containerRefused`
+                // (fn-4.12): this worktree IS inside a configured dev root
+                // — the detail's first clause has always said so — while
+                // the old kind's fixed GUI label said the opposite.
                 issues.append(ScanIssue(
-                    url: record.path, kind: .containerRefused,
+                    url: record.path, kind: .mutationScopeRefused,
                     detail: "worktree '\(record.path.path)' is inside a "
                         + "configured dev root but \(reason) — git mutates the "
                         + "parent repository's admin data, so the whole "
@@ -1462,8 +1474,13 @@ struct GitWorktreeScanner: @unchecked Sendable {
         )
         guard case .bound(let root, let parent, let strict) = scope else {
             if case .unbound(let reason) = scope {
+                // `.mutationScopeRefused` (fn-4.12): the withheld candidate
+                // is the repository's admin data, not a search root, and
+                // `.containerRefused`'s fixed GUI label ("not a configured
+                // search root") diagnosed the wrong thing — the refusal is
+                // the prune's mutation scope, which `reason` names.
                 issues.append(ScanIssue(
-                    url: parentRepoWorkingDir, kind: .containerRefused,
+                    url: parentRepoWorkingDir, kind: .mutationScopeRefused,
                     detail: "orphaned worktree admin data in this repository "
                         + "cannot be offered for pruning because \(reason) — "
                         + "the whole mutation scope must share one declared "

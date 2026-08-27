@@ -509,7 +509,30 @@ final class ProjectTreeWalkerTests: XCTestCase {
         let (events, issues) = recordedWalk(roots: [fileRoot])
 
         XCTAssertTrue(events.isEmpty)
-        XCTAssertEqual(issues.map(\.kind), [.symlinkRoot])
+        // `.nonDirectoryRoot`, NOT `.symlinkRoot` (fn-4.12, the PR #459
+        // codex r13 split): the kind-derived GUI label under `.symlinkRoot`
+        // read "symlinked — not searched" for a regular file.
+        XCTAssertEqual(issues.map(\.kind), [.nonDirectoryRoot])
+        XCTAssertTrue(
+            issues.first?.detail.contains("regular file") == true,
+            "the detail names the object's real kind: \(issues)"
+        )
+    }
+
+    func testFifoRootRefusedAsNonDirectoryNeverSymlink() throws {
+        let fifoRoot = base.appendingPathComponent("actually-a-fifo")
+        guard mkfifo(fifoRoot.path, 0o644) == 0 else {
+            throw XCTSkip("mkfifo unavailable in this environment")
+        }
+
+        let (events, issues) = recordedWalk(roots: [fifoRoot])
+
+        XCTAssertTrue(events.isEmpty)
+        XCTAssertEqual(issues.map(\.kind), [.nonDirectoryRoot])
+        XCTAssertTrue(
+            issues.first?.detail.contains("special file") == true,
+            "the detail names the object's real kind: \(issues)"
+        )
     }
 
     func testAbsentRootIsQuietOmissionWhileWalkContinues() throws {
@@ -543,8 +566,84 @@ final class ProjectTreeWalkerTests: XCTestCase {
         )
 
         XCTAssertTrue(events.isEmpty, "refused root: zero traversal")
+        // `.containerRefused` is the TRUE kind for exactly this producer
+        // (fn-4.12 audit): the walked root is NOT among the guard's
+        // configured roots, which is the kind's fixed GUI label verbatim.
+        // A CONFIGURED root the policy refuses is the sibling cell below.
         XCTAssertEqual(issues.map(\.kind), [.containerRefused])
         XCTAssertEqual(issues.first?.url?.path, unconfigured.path)
+    }
+
+    func testConfiguredRootRefusedByPolicyClassifiesAsPolicyRefusedRoot() throws {
+        // $HOME as its own dev root: configured in the guard, iterated by
+        // the walk, refused by the search-root safety policy. Under
+        // `.containerRefused` the visible row said "not a configured search
+        // root" while the root sat in `containerRoots` (fn-4.12).
+        let walker = ProjectTreeWalker(
+            home: home,
+            pathGuard: PathGuard(home: home, containerRoots: [home])
+        )
+        var events: [ProjectTreeEvent] = []
+        let issues = walker.walk(
+            roots: [home],
+            consumers: [{ events.append($0); return [] }]
+        )
+
+        XCTAssertTrue(events.isEmpty, "refused root: zero traversal")
+        XCTAssertEqual(issues.map(\.kind), [.policyRefusedRoot])
+        XCTAssertEqual(issues.first?.url?.path, home.path)
+        XCTAssertTrue(
+            issues.first?.detail.contains("home directory") == true,
+            "the detail names WHICH policy clause fired: \(issues)"
+        )
+    }
+
+    private final class MountTableInjectingWalkProvider:
+        FileSystemIdentityProvider
+    {
+        var injectedMountPoints: Set<String> = []
+        override func mountPointPaths() -> [String] {
+            Array(injectedMountPoints) + super.mountPointPaths()
+        }
+        override func isMountPoint(_ url: URL) -> Bool {
+            if injectedMountPoints.contains(url.path) { return true }
+            return super.isMountPoint(url)
+        }
+    }
+
+    func testMountedConfiguredRootClassifiesAsMountedVolumeRootNotPolicy() throws {
+        // A volume mounted exactly at a configured dev root (fn-4.12): the
+        // condition is the machine's, not the configuration's, and it is
+        // the one refusal here a re-scan can clear — the walk re-reads the
+        // kernel table every time — so the kind must be the one whose label
+        // says "eject or unmount it, then re-scan".
+        let volume = base.appendingPathComponent("MountedDevRoot")
+        try mkdir(volume)
+        let provider = MountTableInjectingWalkProvider()
+        provider.injectedMountPoints = [volume.path]
+
+        let walker = ProjectTreeWalker(
+            home: home,
+            pathGuard: PathGuard(
+                home: home, containerRoots: [volume], provider: provider
+            ),
+            provider: provider
+        )
+        var events: [ProjectTreeEvent] = []
+        let issues = walker.walk(
+            roots: [volume],
+            consumers: [{ events.append($0); return [] }]
+        )
+
+        XCTAssertTrue(events.isEmpty, "an over-mounted root is never walked")
+        XCTAssertEqual(issues.map(\.kind), [.mountedVolumeRoot],
+                       "mount is decided BEFORE admission — never flattened "
+                           + "into the policy kind")
+        XCTAssertEqual(issues.first?.url?.path, volume.path)
+        XCTAssertTrue(
+            issues.first?.detail.contains("mounted volume") == true,
+            "\(issues)"
+        )
     }
 
     // MARK: - R2/R9: single-consumer prune is decisive
@@ -1098,8 +1197,8 @@ final class ProjectTreeWalkerTests: XCTestCase {
                        "the issue names the ROOT — never a silent zero (R12)")
     }
 
-    // MARK: - R12: EPERM → TCC classification (injected — EPERM cannot be
-    // fixtured from an unentitled process)
+    // MARK: - R12/fn-4.12: bare-EPERM neutrality (injected — EPERM cannot
+    // be fixtured from an unentitled process)
 
     private final class FailingKindProbeProvider: FileSystemIdentityProvider {
         var failingNames: [String: Int32] = [:]
@@ -1123,7 +1222,7 @@ final class ProjectTreeWalkerTests: XCTestCase {
         }
     }
 
-    func testInjectedEPERMProbeClassifiesAsTCCDenied() throws {
+    func testInjectedEPERMProbeClassifiesNeutrallyAsUnreadable() throws {
         let root = base.appendingPathComponent("dev")
         try mkdir(root.appendingPathComponent("tcc-locked"))
         try mkdir(root.appendingPathComponent("fine"))
@@ -1133,8 +1232,16 @@ final class ProjectTreeWalkerTests: XCTestCase {
 
         let (events, issues) = recordedWalk(roots: [root], provider: provider)
 
-        XCTAssertEqual(issues.map(\.kind), [.tccDenied],
-                       "EPERM → .tccDenied, distinct from EACCES")
+        // NEUTRAL since fn-4.12: a raw probe's bare EPERM carries no
+        // provenance, so `.tccDenied` — and the "Grant access…" link the
+        // GUI hangs on that kind — may not be asserted from it. The denial
+        // stays VISIBLE, with the detail saying why no cause is named.
+        XCTAssertEqual(issues.map(\.kind), [.unreadable],
+                       "bare EPERM is neutral — never .tccDenied (fn-4.12)")
+        XCTAssertTrue(
+            issues.first?.detail.contains("could not be established") == true,
+            "\(issues)"
+        )
         XCTAssertEqual(issues.first?.url?.lastPathComponent, "tcc-locked")
         let rootEvent = try XCTUnwrap(event(events, at: root))
         XCTAssertEqual(rootEvent.entries, [.init(name: "fine", kind: .directory)],

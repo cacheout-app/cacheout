@@ -140,7 +140,7 @@
 /// this machine, `st_dev` is identical for literally every path INCLUDING
 /// `/` and `/System/Volumes/Data`, so the device comparison is blind to
 /// exactly the APFS firmlink split it was partly meant to catch. The two
-/// path-based signals the sizer (`DirectorySizer.swift:317-332,443-448`) and the
+/// path-based signals the sizer (`DirectorySizer.swift:322-337,448-453`) and the
 /// project walker already use are retained beside it — they are the seam
 /// hermetic tests inject through, and they can only ever push the answer
 /// toward refusal. There is still exactly ONE notion of "mount boundary" in
@@ -939,7 +939,7 @@ enum ValuablesDetector {
         descriptorWindow: Int? = nil
     ) -> ValuablesDisclosure {
         // MOUNT BOUNDARY AT THE ROOT. The sizer applies these signals to its
-        // OWN root (`DirectorySizer.swift:317-332`) and declines to enumerate; the
+        // OWN root (`DirectorySizer.swift:322-337`) and declines to enumerate; the
         // probe must decline identically, or the delete-time face — which has
         // no size report to consult — would read a whole mounted volume.
         // Nothing beneath is opened: not one entry of a foreign filesystem is

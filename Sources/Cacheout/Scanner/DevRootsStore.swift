@@ -31,8 +31,8 @@ struct DevRootsResolution: Equatable, Sendable {
     /// walker's `originRoot` carry these verbatim; validator origin binding
     /// needs them).
     let keptRoots: [URL]
-    /// Classified config issues: policy-rejected roots as the frozen
-    /// `.containerRefused` (with the offending declared path), whole-value
+    /// Classified config issues: policy-rejected roots as
+    /// `.policyRefusedRoot` (offending declared path; fn-4.12), whole-value
     /// parse failures as `.configInvalid` (url nil — no honest filesystem
     /// path exists).
     let issues: [ScanIssue]
@@ -263,8 +263,8 @@ struct DevRootsStore {
     ///    since fn-4.11 it answers from the as-spelled probe, the kernel
     ///    mount table, and — for a symlink leaf — the link's own content,
     ///    never the destination). Rejected roots are EXCLUDED from the
-    ///    kept set and carried as frozen `.containerRefused` issues with
-    ///    their offending declared path.
+    ///    kept set and carried as `.policyRefusedRoot` issues with their
+    ///    offending declared path (fn-4.12 — these roots ARE configured).
     /// 2. **Exact-canonical-duplicate dedupe ONLY** (no keep-ancestor drop,
     ///    D7 — nested real roots remain independent walks). TWO values per
     ///    root: a normalized comparison KEY (canonical path — the leaf a
@@ -310,9 +310,15 @@ struct DevRootsStore {
             } catch {
                 let reason = (error as? LocalizedError)?.errorDescription
                     ?? String(describing: error)
+                // `.policyRefusedRoot`, NOT `.containerRefused` (fn-4.12):
+                // this root IS configured — the detail below has always
+                // said so — and the GUI derives the visible row label from
+                // the kind alone, so the old kind rendered "not a
+                // configured search root" against a tooltip saying the
+                // opposite. WHICH policy clause refused rides the reason.
                 issues.append(ScanIssue(
                     url: declared,
-                    kind: .containerRefused,
+                    kind: .policyRefusedRoot,
                     detail: "configured dev root refused: \(reason)"
                 ))
             }

@@ -1329,15 +1329,16 @@ class CacheoutViewModel: ObservableObject {
     }
 
     /// Pure row derivation (XCTest asserts on this directly): one row per
-    /// DECLARED path, carrying the refusal detail of the `.containerRefused`
-    /// issue that names it — a policy-rejected persisted root is visible in
-    /// the editor exactly as it is visible in the scan results (R16).
+    /// DECLARED path, carrying the refusal detail of the `.policyRefusedRoot`
+    /// issue that names it (fn-4.12; `.containerRefused` before that) — a
+    /// policy-rejected persisted root is visible in the editor exactly as it
+    /// is visible in the scan results (R16).
     nonisolated static func devRootRows(
         declaredPaths: [String], issues: [ScanIssue], home: URL
     ) -> [DevRootRowModel] {
         let refusalsByPath = Dictionary(
             issues
-                .filter { $0.kind == .containerRefused }
+                .filter { $0.kind == .policyRefusedRoot }
                 .compactMap { issue -> (String, String)? in
                     guard let url = issue.url else { return nil }
                     return (url.standardizedFileURL.path, issue.detail)

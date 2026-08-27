@@ -118,7 +118,7 @@ final class DevRootsStoreTests: XCTestCase {
 
     // MARK: - R16: store-layer attack fixtures
 
-    func testPersistedFilesystemRootExcludedWithFrozenContainerRefused() throws {
+    func testPersistedFilesystemRootExcludedWithPolicyRefusedRoot() throws {
         let original: Any = ["/"]
         persist(original)
 
@@ -128,9 +128,11 @@ final class DevRootsStoreTests: XCTestCase {
                        "a persisted `/` must never be registered or walked")
         XCTAssertEqual(resolution.issues.count, 1)
         let issue = try XCTUnwrap(resolution.issues.first)
-        XCTAssertEqual(issue.kind, .containerRefused,
-                       "policy-rejected roots keep the FROZEN kind")
-        XCTAssertEqual(issue.kind.wireString, "container_refused")
+        XCTAssertEqual(issue.kind, .policyRefusedRoot,
+                       "a policy-rejected root IS configured (fn-4.12): the "
+                       + "kind-derived GUI label under `.containerRefused` "
+                       + "said the opposite of the detail")
+        XCTAssertEqual(issue.kind.wireString, "policy_refused_root")
         XCTAssertEqual(issue.url?.path, "/",
                        "a policy rejection carries its offending path honestly")
         assertStoredUnchanged(original)
@@ -148,7 +150,7 @@ final class DevRootsStoreTests: XCTestCase {
         XCTAssertEqual(resolution.keptRoots, [],
                        "an alias of / names / — read from the link's own "
                        + "content since fn-4.11, never by resolving it")
-        XCTAssertEqual(resolution.issues.map(\.kind), [.containerRefused])
+        XCTAssertEqual(resolution.issues.map(\.kind), [.policyRefusedRoot])
         XCTAssertEqual(resolution.issues.first?.url?.path, alias.path,
                        "the issue names the DECLARED offending spelling")
     }
@@ -164,7 +166,7 @@ final class DevRootsStoreTests: XCTestCase {
             .effectiveRoots(home: fixtureHome)
 
         XCTAssertEqual(resolution.keptRoots, [])
-        XCTAssertEqual(resolution.issues.map(\.kind), [.containerRefused])
+        XCTAssertEqual(resolution.issues.map(\.kind), [.policyRefusedRoot])
     }
 
     func testPersistedHomeExcludedInDirectAndAliasSpellings() throws {
@@ -179,7 +181,7 @@ final class DevRootsStoreTests: XCTestCase {
                        + "identity when spelled directly, by the link's own "
                        + "content when aliased (fn-4.11)")
         XCTAssertEqual(resolution.issues.map(\.kind),
-                       [.containerRefused, .containerRefused])
+                       [.policyRefusedRoot, .policyRefusedRoot])
         XCTAssertEqual(resolution.issues.map { $0.url?.path },
                        [fixtureHome.path, alias.path])
     }
@@ -209,7 +211,7 @@ final class DevRootsStoreTests: XCTestCase {
         XCTAssertEqual(resolution.keptRoots.map(\.path), [good.path],
                        "a dangerous string in a VALID array is rejected "
                        + "individually; the rest of the list survives")
-        XCTAssertEqual(resolution.issues.map(\.kind), [.containerRefused])
+        XCTAssertEqual(resolution.issues.map(\.kind), [.policyRefusedRoot])
     }
 
     // MARK: - R8/R16: guarded parsing + mixed-corrupt semantics
@@ -247,7 +249,7 @@ final class DevRootsStoreTests: XCTestCase {
         // THE pinned attack cell: [true, "/"]. The array shape is invalid,
         // so the WHOLE value is a parse failure — seeds in effect, ONE
         // config_invalid issue, and the embedded "/" never reaches the kept
-        // set (the visible parse issue covers it; no containerRefused row
+        // set (the visible parse issue covers it; no per-root refusal row
         // is fabricated for a value that was never accepted as config).
         let original: Any = [true, "/"]
         persist(original)
@@ -645,7 +647,7 @@ final class DevRootsStoreTests: XCTestCase {
 
         XCTAssertEqual(resolution.keptRoots.map(\.path), [good.path],
                        "the CLI replacement path runs the SAME policy")
-        XCTAssertEqual(resolution.issues.map(\.kind), [.containerRefused])
+        XCTAssertEqual(resolution.issues.map(\.kind), [.policyRefusedRoot])
         XCTAssertNil(storedValue,
                      "a per-invocation replacement is NEVER persisted")
     }

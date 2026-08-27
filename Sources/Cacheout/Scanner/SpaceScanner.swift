@@ -29,9 +29,9 @@
 ///   `git_worktree_reclaim` — `.commands` and `.gitWorktreeReclaim`
 ///   serialize ONLY their kind; argv arrays and plan paths never reach any
 ///   wire.
-/// - `ScanIssue.Kind`: `container_refused` | `symlink_root` | `tcc_denied` |
-///   `permission_denied` | `unreadable` | `config_invalid` |
-///   `tool_unavailable` | `malformed_outcome`.
+/// - `ScanIssue.Kind`: FROZEN wire strings, case-by-case, on the enum's own
+///   `wireString` and in PROTOCOL.md's `kind` row — EXTENSIBLE, consumers
+///   tolerate unknown kinds (the list that stood here rotted; fn-4.12).
 /// - Item ids: full 64-char lowercase-hex SHA-256 over the UTF-8 bytes of
 ///   `scannerID + "\0" + canonicalPath` (`ReclaimableItem.stableID`).
 
@@ -836,7 +836,17 @@ struct ScanIssue: Equatable, Sendable {
     /// consumers that assume the case list is closed. Generalizes the
     /// retired `NodeModulesScanIssue.Kind` scanner-agnostically.
     enum Kind: Equatable, Sendable {
-        /// `PathGuard.admitContainer` refused the search root.
+        /// A path that is genuinely NOT a configured search root — which is
+        /// the fixed sentence the GUI derives from this kind, so that is the
+        /// ONE condition allowed to carry it (fn-4.12 producer audit). Its
+        /// live producer is `GitWorktreeScanner`'s discovered-worktree arm
+        /// (a registered worktree sitting outside EVERY configured dev
+        /// root). The refusals that used to ride this kind while their own
+        /// `detail` said "configured … refused" moved to
+        /// `.policyRefusedRoot`/`.mountedVolumeRoot` (`DevRootsStore`,
+        /// `ProjectTreeWalker`) and `.mutationScopeRefused`
+        /// (`GitWorktreeScanner`'s containment arms). The WIRE string is
+        /// frozen; only the producer set narrowed.
         case containerRefused
         /// A REGISTERED search root that the kernel's mount table names as a
         /// mount point: another volume stands at that path, so what is there
@@ -881,6 +891,20 @@ struct ScanIssue: Equatable, Sendable {
         /// remedy is claimed in the label because the causes do not share
         /// one. A FILESYSTEM kind: `url` names the refused root.
         case policyRefusedRoot
+        /// A DISCOVERED deletable candidate withheld because the destructive
+        /// git operation's whole MUTATION SCOPE — the paths git itself would
+        /// modify (the worktree, the admin directories) PLUS the parent
+        /// repository whose records name them — is not contained in ONE
+        /// configured dev root (`GitWorktreeScanner.mutationScope`, D13).
+        /// The candidate itself is often INSIDE a configured root — which is
+        /// exactly why `.containerRefused` ("not a configured search root")
+        /// was a false diagnosis for these producers and this is its own
+        /// kind (fn-4.12): the GUI's visible row label derives from the kind
+        /// alone. The label claims no remedy — where the out-of-scope data
+        /// sits is the user's layout — and `detail` names which path broke
+        /// the containment. A FILESYSTEM kind: `url` names the candidate
+        /// whose removal was withheld.
+        case mutationScopeRefused
         /// The search root is a SYMLINK — and only a symlink. Its target may
         /// sit anywhere, so the no-follow root gate never traverses it.
         ///
@@ -927,7 +951,7 @@ struct ScanIssue: Equatable, Sendable {
         /// kind: a config parse failure has no honest filesystem path, so
         /// `url` is nil and a fake path is never invented. (Policy-REJECTED
         /// configured roots are NOT this kind — they carry their offending
-        /// path honestly under the frozen `.containerRefused`.)
+        /// path honestly under `.policyRefusedRoot`, fn-4.12.)
         case configInvalid
         /// An EXTERNAL TOOL a scanner depends on is unavailable (fn-5, D12
         /// revised — e.g. `git` missing from the runner's fixed PATH, or its
@@ -980,6 +1004,7 @@ struct ScanIssue: Equatable, Sendable {
             case .mountedVolumeRootAtRegistration:
                 return "mounted_volume_root_at_registration"
             case .policyRefusedRoot: return "policy_refused_root"
+            case .mutationScopeRefused: return "mutation_scope_refused"
             case .symlinkRoot: return "symlink_root"
             case .nonDirectoryRoot: return "non_directory_root"
             case .tccDenied: return "tcc_denied"
@@ -3125,10 +3150,10 @@ struct SpaceScannerRuntime {
     ///   (`isBlockedFromDestructivePaths`, CacheoutViewModel.swift:610-614).
     ///   A non-participating scanner delivers no event, so its retained rows
     ///   keep the older generation while adoption moves on
-    ///   (CacheoutViewModel.swift:1487-1488) — they are already
+    ///   (CacheoutViewModel.swift:1488-1489) — they are already
     ///   visible-but-non-cleanable before this filter sees them;
     /// - the CLI resolves the items it cleans FROM the same collected
-    ///   session (CLIHandler.swift:2123 and :2442 pass that session's
+    ///   session (CLIHandler.swift:2125 and :2444 pass that session's
     ///   snapshot), so it can only ever hold items a participating scanner
     ///   produced.
     ///

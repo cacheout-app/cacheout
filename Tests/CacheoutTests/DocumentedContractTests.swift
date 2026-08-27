@@ -460,6 +460,7 @@ final class DocumentedContractTests: XCTestCase {
         let allKinds: [ScanIssue.Kind] = [
             .containerRefused, .mountedVolumeRoot,
             .mountedVolumeRootAtRegistration, .policyRefusedRoot,
+            .mutationScopeRefused,
             .symlinkRoot, .nonDirectoryRoot, .tccDenied,
             .permissionDenied,
             .unreadable, .enumerationTruncated, .configInvalid,

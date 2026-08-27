@@ -12,7 +12,9 @@
 /// 3. **Containment (D13)** — the worktree, its parent repository and the
 ///    resolver-carried admin container inside ONE declared root, with the
 ///    parent alone allowed to EQUAL it; everything else is a
-///    `.containerRefused` issue and never an item.
+///    `.containerRefused` issue (outside EVERY root) or a
+///    `.mutationScopeRefused` one (inside a root, scope unbound — fn-4.12)
+///    and never an item.
 /// 4. **The two TCC gates** — protected roots and protected SECONDARY paths
 ///    are skipped SILENTLY on automatic scans and walked when the user asks,
 ///    while genuine denials stay visible in both.
@@ -2615,7 +2617,10 @@ final class GitWorktreeScannerTests: XCTestCase {
         let outcome = await scanner.scan(context: ScanContext(trigger: .userInitiated))
 
         XCTAssertTrue(outcome.items.isEmpty, "D13 forbids the deletable item")
-        let issue = try XCTUnwrap(outcome.errors.first { $0.kind == .containerRefused })
+        // `.mutationScopeRefused` since fn-4.12: this worktree IS inside a
+        // configured dev root — `.containerRefused`'s label ("not a
+        // configured search root") was a false diagnosis for it.
+        let issue = try XCTUnwrap(outcome.errors.first { $0.kind == .mutationScopeRefused })
         XCTAssertTrue(
             issue.detail.contains("parent repository"),
             "the refusal must name the parent-outside cause; got: \(issue.detail)"
@@ -2861,8 +2866,11 @@ final class GitWorktreeScannerTests: XCTestCase {
             provider.failingPaths = [denied.path]
             let scanner = makeScanner(provider: provider)
             let outcome = await scanner.scan(context: ScanContext(trigger: trigger))
+            // `.unreadable` since fn-4.12: the injected failure is a raw
+            // lstat EPERM, and a bare errno cannot establish TCC — the
+            // point of THIS cell is that the denial stays VISIBLE.
             XCTAssertTrue(
-                outcome.errors.contains { $0.kind == .tccDenied && $0.url?.path == denied.path },
+                outcome.errors.contains { $0.kind == .unreadable && $0.url?.path == denied.path },
                 "a genuine denial must stay visible under \(trigger): \(outcome.errors)"
             )
         }
@@ -3091,7 +3099,9 @@ final class GitWorktreeScannerTests: XCTestCase {
             "a user-initiated scan follows the pointer"
         )
         XCTAssertTrue(user.items.isEmpty, "the admin container is outside every root")
-        XCTAssertTrue(user.errors.contains { $0.kind == .containerRefused })
+        XCTAssertTrue(user.errors.contains { $0.kind == .mutationScopeRefused },
+                      "fn-4.12: the worktree is inside a root; the SCOPE is "
+                          + "what fails — \(user.errors)")
         try assertNonMalformed(user, from: userScanner)
     }
 
@@ -3155,7 +3165,8 @@ final class GitWorktreeScannerTests: XCTestCase {
             protectedRealpaths(userProvider).isEmpty,
             "a user-initiated scan resolves the pointer — the counting seam is live"
         )
-        XCTAssertTrue(user.errors.contains { $0.kind == .containerRefused })
+        XCTAssertTrue(user.errors.contains { $0.kind == .mutationScopeRefused },
+                      "fn-4.12: the scope refusal, as in the probe cell above")
     }
 
     func testFirstRecordAuthorityWinsWhenTheGitDirsParentIsNotTheWorkingTree()

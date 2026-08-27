@@ -202,8 +202,13 @@ final class DirectorySizerTests: XCTestCase {
 
     func testEnumeratedItemProbeFailureKeepsErrnoClassification() throws {
         // A walk item whose lstat fails must keep its errno classification
-        // (EACCES → permission, EPERM → TCC), never collapse to a generic
-        // metadata failure (D6/R6).
+        // (EACCES → permission — unambiguous BSD), never be silently
+        // dropped (D6/R6). A BARE EPERM is NEUTRAL since fn-4.12: a raw
+        // errno carries no provenance, so `.tcc` — and the "Grant access…"
+        // remedy every `.tcc` consumer prints — may not be asserted from
+        // it; the denial stays VISIBLE as `.metadata` with a detail saying
+        // the cause could not be established. Chain-proven TCC is the
+        // sibling cell `testDenialClassificationEPERMIsTCCAndEACCESIsPermission`.
         let root = base.appendingPathComponent("classified-walk")
         try mkdir(root)
         let visible = try writeFile(root.appendingPathComponent("visible.bin"), bytes: 4_096)
@@ -221,7 +226,14 @@ final class DirectorySizerTests: XCTestCase {
 
         provider.failErrno = EPERM
         let epermReport = makeSizer(provider: provider).measure(at: root, mode: .scanRoot)
-        XCTAssertEqual(epermReport.denials.map(\.kind), [.tcc])
+        XCTAssertEqual(epermReport.denials.map(\.kind), [.metadata],
+                       "bare EPERM is neutral — never `.tcc` (fn-4.12)")
+        XCTAssertTrue(
+            epermReport.denials.first?.detail
+                .contains("could not be established") == true,
+            "the neutral detail says WHY no cause is asserted: "
+                + "\(epermReport.denials)"
+        )
         XCTAssertEqual(epermReport.exactAllocatedBytes, allocated(visible))
     }
 
@@ -366,7 +378,9 @@ final class DirectorySizerTests: XCTestCase {
             )]
         )
         XCTAssertEqual(DirectorySizer.classifyDenial(eperm, at: url).kind, .tcc,
-                       "EPERM under Cocoa 257 is a TCC denial")
+                       "EPERM under Cocoa 257 is a TCC denial — the "
+                       + "CHAIN-PROVEN arm, the one place `.tcc` is "
+                       + "assertable (fn-4.12)")
 
         let eacces = NSError(
             domain: NSCocoaErrorDomain,

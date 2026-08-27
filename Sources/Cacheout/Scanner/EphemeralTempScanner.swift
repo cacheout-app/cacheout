@@ -156,17 +156,17 @@
 ///   establishable from a bare errno, so neither `.tccDenied` nor
 ///   `.permissionDenied` may be asserted; anything else ⇒ `.unreadable`.
 /// - **(c) post-sizing `SizeDenial`s**: `.permission` ⇒ permission-denied;
-///   `.tcc` ⇒ NEUTRAL `.other`-kind `ScanError` with the detail preserved,
-///   because `SizeDenial.Kind.tcc` CONFLATES chain-proven denials
-///   (`classifyDenial`'s `case .some(Int(EPERM))` arm,
-///   `DirectorySizer.swift:570`) with raw-probe guesses
-///   (`denial(forFailedProbe:errno:)`'s `case EPERM`, :545); the only
-///   surviving discriminator is a detail STRING, and classification derived
-///   from message text is forbidden house doctrine (`CacheCleaner.refusalTag`
-///   :1402 switches the TYPED error). Anchors re-verified r10 — the three
-///   that stood here pointed at a sparse-accounting comment, a hardlink
-///   comment and an unrelated line (R3-V5); re-grep before trusting these
-///   too (SCANNERS-ROADMAP doctrine).
+///   `.tcc` ⇒ NEUTRAL `.other`-kind `ScanError` with the detail preserved.
+///   The conflation that MANDATED this neutrality is retired (fn-4.12):
+///   `denial(forFailedProbe:errno:)` no longer answers `.tcc` for a bare
+///   EPERM — this file's rule (b) became the shared taxonomy's — so `.tcc`
+///   now arrives chain-proven only (`classifyDenial`'s
+///   `case .some(Int(EPERM))` arm, `DirectorySizer.swift:575`). Preserving
+///   the grant hint here is therefore now POSSIBLE; it is deliberately NOT
+///   done in fn-4.12, whose boundary excludes this scanner's pinned #459
+///   matrix — recorded residual: a sizing-path chain-proven TCC denial in
+///   ephemeral_tmp still renders neutrally, understating a real remedy but
+///   asserting nothing false.
 ///
 /// ENOENT on a child is a purely OBSERVABLE race contract: silently skipped —
 /// no item, no denial, no issue. There is no race counter.

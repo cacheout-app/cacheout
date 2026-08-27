@@ -110,7 +110,7 @@
 /// thread while building its `@StateObject`
 /// (`CacheoutApp.swift:58` → `CacheoutViewModel.production()` →
 /// `CacheoutViewModel.swift:563` → `SpaceScannerRuntime.production`,
-/// `SpaceScanner.swift:2228`), long
+/// `SpaceScanner.swift:2253`), long
 /// before any trigger or `participates(in:)` gate exists to consult. The main
 /// thread is not an inference: `CacheoutViewModel` is `@MainActor`
 /// (`CacheoutViewModel.swift:264`), so its `production()` factory cannot be
@@ -139,8 +139,8 @@
 /// key with `provider.canonicalize`, on every root including non-directory
 /// ones, at the same construction time; fn-4.11 converged them onto this
 /// file's rule — `DevRootsStore.resolve`'s probe pass
-/// (`DevRootsStore.swift:336-346`), `suppressingAliasShadows`' probe
-/// (`SpaceScanner.swift:2063-2081`), and the container-root policy
+/// (`DevRootsStore.swift:342-352`), `suppressingAliasShadows`' probe
+/// (`SpaceScanner.swift:2088-2106`), and the container-root policy
 /// (`PathGuard.validateContainerRoot`) all now probe as spelled and read a
 /// symlink leaf's own content, and the fold itself was hoisted to
 /// `FileSystemIdentityProvider.lexicalTargetPath` (this file's
@@ -158,7 +158,7 @@
 /// `SpaceScanner.swift`'s alias-suppression key). fn-4.11 closed it by
 /// changing that key's derivation, not by weakening the suppression: the
 /// union now compares a symlink root's folded link content by NAME
-/// (`suppressingAliasShadows`, `SpaceScanner.swift:2050`), pinned by
+/// (`suppressingAliasShadows`, `SpaceScanner.swift:2075`), pinned by
 /// `testProductionNeverContactsASymlinkDevRootsDestination` with an
 /// instrumented provider that fails on any call naming the destination.
 ///
@@ -189,7 +189,7 @@
 /// fix and a relocation: the 2 of those 5 that `resolve` never made were
 /// `suppressingAliasShadows` canonicalizing and probing the same root in the
 /// cross-scanner union — measured against the union as it then stood; since
-/// fn-4.11 its probe (`SpaceScanner.swift:2063-2081`) runs its own
+/// fn-4.11 its probe (`SpaceScanner.swift:2088-2106`) runs its own
 /// kernel-table preflight first, so even a kept mounted root is no longer
 /// contacted there.
 ///
@@ -220,8 +220,8 @@
 /// One value is probed per declared root: whether the DECLARED spelling is
 /// itself a real directory (`lstat` leaf, no follow) — since fn-4.11 the
 /// same as-spelled-first probe the dev-root resolution
-/// (`DevRootsStore.swift:336-346`) and `suppressingAliasShadows`
-/// (`SpaceScanner.swift:2063-2081`) run: none of the three resolves a
+/// (`DevRootsStore.swift:342-352`) and `suppressingAliasShadows`
+/// (`SpaceScanner.swift:2088-2106`) run: none of the three resolves a
 /// non-directory leaf. The two halves that consume the probe have
 /// different precedents — do not read this as one pattern copied whole from
 /// either:
@@ -231,7 +231,7 @@
 ///   alone (:396-398, `seenCanonicalKeys.insert`).
 ///   `SpaceScannerRuntime.suppressingAliasShadows` does NOT do this half — it
 ///   deliberately DECLINES it, and `suppressingAliasShadows`
-///   (`SpaceScanner.swift:2091-2094`) says so:
+///   (`SpaceScanner.swift:2116-2119`) says so:
 ///   "Two real-directory spellings of one location are NOT touched: both pass
 ///   the reality gate, so neither shadows the other, and dropping either would
 ///   change which declared spelling the identity binding keys off for no
@@ -240,7 +240,7 @@
 ///
 ///   The comparison here is INODE identity (`sameLocation`) of the declared
 ///   spellings, where that precedent compares canonical paths as STRINGS
-///   (`DevRootsStore.swift:340` builds `.path` — real directories only,
+///   (`DevRootsStore.swift:346` builds `.path` — real directories only,
 ///   fn-4.11). Comparing the declared
 ///   spellings is sound only because both sides are real DIRECTORIES, whose
 ///   parent chain resolution already made them canonical: measured on this
@@ -267,23 +267,23 @@
 ///   real root is worse than useless — `PathGuard.matchConfiguredRoot`
 ///   returns the FIRST configured root that matches and `admitContainer`
 ///   refuses THAT spelling without trying the real one behind it.
-///   `DevRootsStore.swift:347-355` names that shape "ACTIVELY HARMFUL";
-///   `suppressingAliasShadows`' doc (`SpaceScanner.swift:1971-1982`)
+///   `DevRootsStore.swift:353-361` names that shape "ACTIVELY HARMFUL";
+///   `suppressingAliasShadows`' doc (`SpaceScanner.swift:1996-2007`)
 ///   records the breakage it caused when the
 ///   shadowed root came from another scanner.
 ///
-///   BOTH files do this half — `DevRootsStore.swift:360-369` + :373-395 and
-///   `suppressingAliasShadows` (`SpaceScanner.swift:2050-2126`) — since
+///   BOTH files do this half — `DevRootsStore.swift:366-375` + :379-401 and
+///   `suppressingAliasShadows` (`SpaceScanner.swift:2075-2151`) — since
 ///   fn-4.11 by THIS file's name-compare rule in all three — but only
 ///   `DevRootsStore` classifies the
 ///   drop. `suppressingAliasShadows` returns roots plus their comparison keys
-///   and NO issue channel of its own (`SpaceScanner.swift:2050-2052`; the
+///   and NO issue channel of its own (`SpaceScanner.swift:2075-2077`; the
 ///   "bare `[URL]`" this sentence used to say stopped being true when the
 ///   keys were carried out of the same probe, PR #460 codex r4);
-///   `suppressingAliasShadows`' doc (`SpaceScanner.swift:2044-2049`)
+///   `suppressingAliasShadows`' doc (`SpaceScanner.swift:2069-2074`)
 ///   records what
 ///   reports its drops instead. The `.symlinkRoot` issue raised here follows
-///   `DevRootsStore.swift:384-390`, not that function.
+///   `DevRootsStore.swift:390-396`, not that function.
 ///
 /// A non-directory spelling that NOTHING else covers passes through verbatim:
 /// scan time is where absence and denial are told apart, and the no-follow
@@ -577,7 +577,7 @@ enum EphemeralTempRoots {
         // syscall blocks. And this is CONSTRUCTION, not scan time:
         // `EphemeralTempRoots.resolve` runs inside
         // `SpaceScannerRuntime.production`
-        // (`SpaceScannerRuntime.production` (`SpaceScanner.swift:2228`)), which
+        // (`SpaceScannerRuntime.production` (`SpaceScanner.swift:2253`)), which
         // the GUI calls from `CacheoutViewModel.production`
         // (`CacheoutViewModel.swift:555-574`) at the `@MainActor` view
         // model's construction (`CacheoutApp.swift:58`), so the block lands
@@ -590,7 +590,7 @@ enum EphemeralTempRoots {
         //
         // The root is DROPPED, not kept-and-skipped, and that difference is
         // the fix: a kept root reaches the runtime's cross-scanner union,
-        // whose probe (`SpaceScanner.swift:2063-2081`) — at the time of
+        // whose probe (`SpaceScanner.swift:2088-2106`) — at the time of
         // this fix — canonicalized and probed it, the remaining 2 of those
         // 5, still during construction (since fn-4.11 the union preflights
         // the same kernel table itself, a second line this drop no longer

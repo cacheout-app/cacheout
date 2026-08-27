@@ -89,7 +89,12 @@ import Foundation
 /// otherwise (a real `du` on `~/Pictures` returned 8.0K for a multi-GB tree).
 struct SizeDenial: Equatable {
     enum Kind: Equatable {
-        /// EPERM(1) under the Cocoa error — macOS TCC (privacy) denial.
+        /// macOS TCC (privacy) denial — CHAIN-PROVEN ONLY (fn-4.12):
+        /// EPERM(1) recovered from a Cocoa error's `NSUnderlyingErrorKey`
+        /// chain (`classifyDenial`). The raw-errno classifier
+        /// (`denial(forFailedProbe:errno:)`) never produces this kind — a
+        /// bare errno carries no provenance, so a consumer mapping `.tcc`
+        /// to a "Grant access…" remedy is no longer amplifying a guess.
         case tcc
         /// EACCES(13) — classic BSD permission denial.
         case permission
@@ -422,8 +427,8 @@ struct DirectorySizer {
                 // race, not a denial.
                 continue
             case .failed(let code):
-                // Classified by errno (EPERM → TCC, EACCES → permission) —
-                // never collapsed into a generic metadata failure (D6).
+                // Classified by errno (EACCES → permission; bare EPERM is
+                // NEUTRAL, fn-4.12) — never collapsed silently (D6).
                 report.denials.append(Self.denial(forFailedProbe: itemURL, errno: code))
                 continue
             }
@@ -624,18 +629,36 @@ struct DirectorySizer {
         return SizeDenial(url: url, kind: kind, detail: nsError.localizedDescription)
     }
 
-    /// Classify a raw failed `lstat` probe by errno: EPERM is TCC, EACCES is
-    /// BSD permissions, anything else a metadata failure.
+    /// Classify a raw failed `lstat` probe by errno.
+    ///
+    /// THE BARE-ERRNO RULE, decided ONCE for every producer on this
+    /// taxonomy (fn-4.12; the `EphemeralTempScanner` denial-classification
+    /// header measured and recorded the rationale): EACCES is unambiguous
+    /// BSD permissions; a BARE EPERM is NEUTRAL — a raw errno carries no
+    /// provenance, so neither a privacy (TCC) denial nor a filesystem
+    /// refusal (SIP, sticky semantics, an immutable flag) may be asserted
+    /// from it, and the `.tcc` this arm used to answer flowed into
+    /// `.tccDenied` rows and the GUI's "Grant access…" link — a remedy
+    /// claimed on a guess. Only the Cocoa `NSUnderlyingErrorKey` chain
+    /// (`classifyDenial` above) can prove TCC. `ProjectTreeWalker`,
+    /// `OrphanedCachesScanner` and this sizer's own walk all classify raw
+    /// probes through here; `EphemeralTempScanner.classify`'s raw-errno arm
+    /// states the same rule in its own switch.
     static func denial(forFailedProbe url: URL, errno code: Int32) -> SizeDenial {
         let kind: SizeDenial.Kind
+        var caveat = ""
         switch code {
-        case EPERM: kind = .tcc
+        case EPERM:
+            kind = .metadata
+            caveat = " — the cause could not be established (a privacy "
+                + "denial and a filesystem refusal are indistinguishable "
+                + "in a bare errno)"
         case EACCES: kind = .permission
         default: kind = .metadata
         }
         return SizeDenial(
             url: url, kind: kind,
-            detail: "lstat failed: \(String(cString: strerror(code)))"
+            detail: "lstat failed: \(String(cString: strerror(code)))" + caveat
         )
     }
 }

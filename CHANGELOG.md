@@ -657,6 +657,43 @@ below are both part of that coordination, and the latter BLOCKS this release.
 
 ### Fixed
 
+- **Every scan-issue row now states a condition that is true for the
+  producer that emitted it** (fn-4.12 — the PR #459 codex r13 sweep, run
+  over every OTHER scanner's producers; the app's visible row label is
+  derived from `scanner_errors[].kind` alone, so a kind shared with a
+  different condition prints a false diagnosis). All ADDITIONS to the same
+  extensible enumeration (`schema_version` stays 4); no wire STRING is
+  renamed, but the kind a given condition reports under moves, so consumers
+  keying kinds to conditions must re-key: **(1)** a configured dev root
+  refused by the search-root safety policy — persisted, or via `--dev-root`
+  — is now `"policy_refused_root"` ("refused by the search-root safety
+  policy"); it was `"container_refused"`, whose label "not a configured
+  search root" contradicted the row's own detail ("configured dev root
+  refused: …"). **(2)** a configured dev root with a volume mounted exactly
+  at it is now `"mounted_volume_root"`, whose label names the one remedy a
+  re-scan honors (the walk re-reads the kernel mount table every scan).
+  **(3)** a dev root or `~/Library/Caches` sweep root standing as a regular
+  file, FIFO, socket or device is now `"non_directory_root"`; it was
+  `"symlink_root"`, which sent the user hunting for a link that was not
+  there — `"symlink_root"` now means a symlink and nothing else, in every
+  scanner. **(4)** a git worktree or repository admin directory withheld
+  because git's cleanup would modify paths not all inside ONE configured
+  dev root is the NEW `"mutation_scope_refused"` ("git cleanup is not
+  contained in one dev root — not offered"); it was `"container_refused"`
+  while the worktree in question IS inside a configured root. A worktree
+  outside EVERY configured root keeps `"container_refused"` — there the
+  label is exactly the condition. **(5)** a BARE-errno EPERM (raw
+  `lstat`/`open` probes) is now neutral `"unreadable"` everywhere, with the
+  detail saying the cause could not be established; it was `"tcc_denied"`
+  in the dev-root walk and the orphaned-caches sweep — printing the "Grant
+  access…" (Full Disk Access) remedy on a guess — while the temp scanner
+  already classified the same errno as unknowable (a bare errno carries no
+  provenance; TCC, SIP and other filesystem refusals are indistinguishable
+  in it). A chain-proven EPERM — recovered from a Cocoa error's
+  `NSUnderlyingErrorKey` chain — still reports `"tcc_denied"` with the
+  grant hint, which is the one place the claim is establishable. The two
+  scanners that disagreed on bare EPERM now share one recorded rule
+  (`DirectorySizer.denial(forFailedProbe:)`).
 - **A scan could hang before it started, with the spinner up and no way to
   stop it.** The first thing a scan does after marking itself in progress is
   refresh the free-space figures in the header. That refresh was unbounded:

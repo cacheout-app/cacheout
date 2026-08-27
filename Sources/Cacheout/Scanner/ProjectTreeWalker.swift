@@ -76,10 +76,14 @@
 ///   NodeModulesScanner anti-pattern R2 bans — it made monorepo
 ///   `packages/build/...` invisible).
 ///
-/// ## Failure classification (epic R12)
+/// ## Failure classification (epic R12; fn-4.12 bare-errno alignment)
 /// Per-root enumeration/probe failures use the FROZEN `ScanIssue.Kind`
-/// taxonomy: EPERM → `.tccDenied`, EACCES → `.permissionDenied` (the
-/// `DirectorySizer.classifyDenial` precedent), anything else `.unreadable`.
+/// taxonomy: EACCES → `.permissionDenied`; a BARE EPERM is NEUTRAL
+/// `.unreadable` — this walk is raw-syscall throughout, and a raw errno
+/// carries no provenance, so `.tccDenied` is never assertable from here
+/// (`DirectorySizer.denial(forFailedProbe:errno:)` is the shared rule; the
+/// chain-proven Cocoa arm in `classifyDenial` is what CAN assert TCC).
+/// Anything else `.unreadable`.
 /// `.malformedOutcome` is NEVER authored here (reserved to the validator).
 /// TCC PROTECTION of a configured root is prefix-under-protected-ancestor on
 /// the CANONICAL root path (a user-added `~/Documents/GitHub` is protected
@@ -275,6 +279,10 @@ struct ProjectTreeWalker {
         var issues: [ScanIssue] = []
         // The stack-safe clamp (fn-4.13) — see `stackSafeMaxDepthCeiling`.
         let maxDepth = min(maxDepth, Self.stackSafeMaxDepthCeiling)
+        // ONE kernel mount-table read per walk (fn-4.12) — the per-root
+        // mount gate below answers from this harvest, so every root of one
+        // walk is judged against the same table.
+        let mountTable = Set(provider.mountPointPaths())
 
         for root in roots {
             if Task.isCancelled { break }
@@ -293,14 +301,50 @@ struct ProjectTreeWalker {
             let rootProbe = provider.probeKind(of: root)
             if rootProbe == .absent { continue }
 
+            // MOUNT FIRST (fn-4.12, the `EphemeralTempScanner` shape): a
+            // kernel-table mount standing at a configured root is a
+            // CONDITION of the machine, not a refusal of the root, and it
+            // is the one condition here whose remedy a re-scan can honor —
+            // this gate re-reads the table every walk, so "unmount, then
+            // re-scan" is true. Decided from the kernel's own spelling,
+            // before admission, so the guard's `.deniedVolumeRoot` clause
+            // never converts it into a generic policy sentence. A mount the
+            // table names under a DIFFERENT spelling of this root falls
+            // through to the guard and is refused there — as policy, which
+            // is also true.
+            if mountTable.contains(root.path) {
+                issues.append(ScanIssue(
+                    url: root, kind: .mountedVolumeRoot,
+                    detail: "configured dev root is a mounted volume — not "
+                        + "scanned; its contents belong to that volume. "
+                        + "Eject or unmount it, then re-scan"
+                ))
+                continue
+            }
+
             // Container admission BEFORE any traversal — the SCAN-TIME
             // read-only mode (fn-3.4 round 9): no snapshot, and this token
             // cannot delete. Refusal → classified issue, root never walked.
+            // TWO kinds by WHICH clause refused (fn-4.12): production
+            // callers walk the very roots their guard was built from, so a
+            // refusal there is a POLICY verdict on a configured root —
+            // `.policyRefusedRoot`, because `.containerRefused`'s fixed GUI
+            // label ("not a configured search root") was false for it. But
+            // `roots:` is a parameter: a root the guard does NOT know
+            // (`.notAConfiguredContainer`) keeps `.containerRefused`, whose
+            // label is exactly that condition — one kind per truth, decided
+            // by the typed error, never by message text.
             do {
                 _ = try pathGuard.admitSearchRoot(root)
             } catch {
+                let kind: ScanIssue.Kind
+                if case PathGuardError.notAConfiguredContainer = error {
+                    kind = .containerRefused
+                } else {
+                    kind = .policyRefusedRoot
+                }
                 issues.append(ScanIssue(
-                    url: root, kind: .containerRefused,
+                    url: root, kind: kind,
                     detail: error.localizedDescription
                 ))
                 continue
@@ -310,17 +354,32 @@ struct ProjectTreeWalker {
             // real target may sit anywhere — but symlinked ANCESTORS already
             // resolved through the lstat, so `/var`-style alias roots pass).
             // A root we cannot even lstat is a classified, visible failure.
+            // TWO kinds by what actually stands there (fn-4.12, the PR #459
+            // codex r13 split): `.symlinkRoot`'s single GUI label is the
+            // fixed sentence "symlinked — not searched", so a regular file,
+            // FIFO, socket or device must carry `.nonDirectoryRoot` instead
+            // of sending the user hunting for a link that is not there.
             switch rootProbe {
             case .kind(.directory):
                 break
             case .failed(let code):
                 issues.append(Self.issue(forFailedProbe: root, errno: code))
                 continue
-            case .kind, .absent:
+            case .kind(.symlink):
                 issues.append(ScanIssue(
                     url: root, kind: .symlinkRoot,
-                    detail: "dev root is not a real directory"
+                    detail: "dev root is a symlink — never traversed"
                 ))
+                continue
+            case .kind(let kind):
+                issues.append(ScanIssue(
+                    url: root, kind: .nonDirectoryRoot,
+                    detail: "dev root is not a real directory "
+                        + "(\(Self.describe(kind))) — never traversed"
+                ))
+                continue
+            case .absent:
+                // Unreachable belt: absence already continued above.
                 continue
             }
 
@@ -682,31 +741,55 @@ struct ProjectTreeWalker {
         return ScanIssue(url: denial.url, kind: kind, detail: denial.detail)
     }
 
-    /// Classify a failed lstat probe by errno (EPERM → TCC, EACCES → BSD
-    /// permissions) — same taxonomy as the sizer's denial classification.
+    /// Classify a failed lstat probe by errno — the shared raw-errno rule
+    /// (`DirectorySizer.denial(forFailedProbe:errno:)`): EACCES → BSD
+    /// permissions; a BARE EPERM is NEUTRAL (see the sizer's rule doc).
     private static func issue(
         forFailedProbe url: URL, errno code: Int32
     ) -> ScanIssue {
         issue(from: DirectorySizer.denial(forFailedProbe: url, errno: code))
     }
 
-    /// Classify a failed directory OPEN by errno, on the SAME frozen
-    /// taxonomy: EPERM → `.tccDenied`, EACCES → `.permissionDenied`,
-    /// everything else (notably ENOTDIR — a name that is no longer a
-    /// directory) → `.unreadable`.
+    /// Classify a failed directory OPEN by errno, on the SAME rule as the
+    /// probe classifier above: EACCES → `.permissionDenied`; a BARE EPERM
+    /// is NEUTRAL `.unreadable` (fn-4.12 — an `openat`/`open` errno carries
+    /// no provenance, so neither a privacy denial nor a filesystem refusal
+    /// may be asserted; the EPERM arm here claimed `.tccDenied` and, with
+    /// it, the GUI's "Grant access…" remedy link, on a guess); everything
+    /// else (notably ENOTDIR — a name that is no longer a directory) →
+    /// `.unreadable`.
     private static func issue(
         forFailedOpen url: URL, errno code: Int32
     ) -> ScanIssue {
         let kind: ScanIssue.Kind
+        var caveat = ""
         switch code {
-        case EPERM: kind = .tccDenied
+        case EPERM:
+            kind = .unreadable
+            caveat = " — the cause could not be established (a privacy "
+                + "denial and a filesystem refusal are indistinguishable "
+                + "in a bare errno)"
         case EACCES: kind = .permissionDenied
         default: kind = .unreadable
         }
         return ScanIssue(
             url: url, kind: kind,
             detail: "directory open failed: "
-                + String(cString: strerror(code))
+                + String(cString: strerror(code)) + caveat
         )
+    }
+
+    /// The house spelling for a non-directory root's real kind — the same
+    /// wording `EphemeralTempScanner`/`OrphanedCachesScanner.describe` use,
+    /// so one condition reads identically across scanners.
+    private static func describe(
+        _ kind: FileSystemIdentityProvider.FileKind
+    ) -> String {
+        switch kind {
+        case .regularFile: return "regular file"
+        case .directory: return "directory"
+        case .symlink: return "symlink"
+        case .other: return "special file"
+        }
     }
 }

@@ -807,6 +807,63 @@ class FileSystemIdentityProvider {
         return String(cString: buffer)
     }
 
+    /// `content` as an absolute path, folded LEXICALLY — no syscall of any
+    /// kind. A relative target is joined to `link`'s own directory (which the
+    /// caller must hand over parent-canonical); `.` is dropped and `..` pops
+    /// a component in the STRING, because popping it against the filesystem
+    /// is precisely the resolution this avoids.
+    ///
+    /// Born as `EphemeralTempRoots.lexicalTargetPath` (fn-6.1, PR #459 codex
+    /// r12); hoisted here in fn-4.11 so the dev-root resolution, the
+    /// cross-scanner union, and the container-root policy share the ONE
+    /// folding rule with the temp-root resolution (that symbol now delegates
+    /// here).
+    ///
+    /// `nil` for anything that is not a usable comparison subject: empty
+    /// content, a `..` that walks off the root, and a target of `/` itself —
+    /// note the latter two both NAME the filesystem root, and a caller that
+    /// must refuse such a target (the container-root policy) treats `nil`
+    /// from non-empty content as exactly that.
+    static func lexicalTargetPath(ofLink link: URL, content: String) -> String? {
+        guard !content.isEmpty else { return nil }
+        let joined = content.hasPrefix("/")
+            ? content
+            : link.deletingLastPathComponent().path + "/" + content
+        var components: [String] = []
+        for component in joined.split(separator: "/") {
+            switch component {
+            case ".":
+                continue
+            case "..":
+                guard !components.isEmpty else { return nil }
+                components.removeLast()
+            default:
+                components.append(String(component))
+            }
+        }
+        guard !components.isEmpty else { return nil }
+        return "/" + components.joined(separator: "/")
+    }
+
+    /// The absolute path a symlink's content NAMES, or `nil` when `url` is
+    /// not a readable symlink or the content is not a usable comparison
+    /// subject (see `lexicalTargetPath`). One `readlink(2)` of the link
+    /// itself plus the lexical fold above, positioned at the link's
+    /// PARENT-canonical spelling so a relative target and a canonically
+    /// declared sibling compare equal. The parent-chain `realpath(3)` never
+    /// names the destination — only the link's own ancestors.
+    ///
+    /// The result is a NAME, never a resolved location: callers compare it,
+    /// and must never register, walk, or open it (fn-4.11 — the whole point
+    /// is that `realpath(3)` on a symlink leaf is first contact with
+    /// whatever answers for the destination).
+    final func lexicalAliasTarget(of url: URL) -> String? {
+        guard let content = symlinkTarget(of: url) else { return nil }
+        let position = canonicalize(url.deletingLastPathComponent())
+            .appendingPathComponent(url.lastPathComponent)
+        return Self.lexicalTargetPath(ofLink: position, content: content)
+    }
+
     // MARK: - Location comparison
 
     /// Same filesystem object? Inode identity when both sides exist (immune to

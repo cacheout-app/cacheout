@@ -717,14 +717,16 @@ final class EphemeralTempRootsTests: XCTestCase {
     }
 
     /// THE FIX AT `production()` SCOPE — the half a drop-vs-keep decision
-    /// turns on. A root KEPT here would reach the runtime's cross-scanner
-    /// union, where `SpaceScannerRuntime.suppressingAliasShadows`
-    /// (`suppressingAliasShadows`' probe pair,
-    /// `SpaceScanner.swift:2021-2025`) canonicalizes and probes every root
-    /// it is given, still during construction — so the block would simply
-    /// move one function along. Measured against this fixture before the
-    /// preflight existed: `production()` made 5 calls naming the mounted
-    /// root, 3 from `resolve` and 2 from that pair.
+    /// turns on. A root KEPT here reaches the runtime's cross-scanner
+    /// union, whose probe (`SpaceScannerRuntime.suppressingAliasShadows`,
+    /// `SpaceScanner.swift:2063-2081`) — as it stood when this cell landed —
+    /// canonicalized and probed every root it was given, still during
+    /// construction, so the block would simply have moved one function
+    /// along. Measured against this fixture before the preflight existed:
+    /// `production()` made 5 calls naming the mounted root, 3 from `resolve`
+    /// and 2 from that probe. (Since fn-4.11 the union preflights the same
+    /// kernel table itself — a second line this drop no longer relies on,
+    /// pinned by `testAnOverMountedRegisteredRootIsNeverProbedByTheUnion`.)
     ///
     /// Driven through the SHIPPED `??` arm (no `ephemeralTempRoots:`), which
     /// is the arm both the GUI and the CLI take.

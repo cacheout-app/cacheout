@@ -707,9 +707,31 @@ final class PathGuard {
     /// The ONE shared container-root admission policy: may `url` serve as a
     /// configured CONTAINER root (a dev root) at all? Rejects the dangerous
     /// containers — the filesystem root `/`, any volume root / mount point,
-    /// and `$HOME` itself — each in canonical AND alias spellings (the URL
-    /// is canonicalized BEFORE the check, so a symlink alias of `/` or of
-    /// home is caught; the `$HOME` check is inode identity).
+    /// and `$HOME` itself — each in canonical AND alias spellings.
+    ///
+    /// THE GATE ANSWERS BEFORE `realpath` (fn-4.11 — the fn-4.26 order at
+    /// this policy's scope). This runs synchronously inside runtime
+    /// construction, on the main thread, on paths the app does not control:
+    /// a same-UID process can point a persisted dev root at an unresponsive
+    /// mounted volume, and the previous canonicalize-first shape made
+    /// `realpath(3)` — a traversal of everything it resolves, destination
+    /// included — the app's first contact with that volume, freezing launch
+    /// before any window existed. So:
+    ///
+    /// 1. KERNEL-TABLE PREFLIGHT (`mountPointPaths` — `getfsstat(MNT_NOWAIT)`,
+    ///    no filesystem contact): a `url` that IS an over-mounted path is
+    ///    refused with the same `.deniedVolumeRoot` the canonical check
+    ///    reaches for a healthy mount, and with ZERO calls naming it —
+    ///    `lstat` or `realpath` OF a mount point is served by the mounted
+    ///    filesystem (the r15 finding's mechanism). `/` is exempt: always in
+    ///    the table, not foreign, and it keeps `.deniedFilesystemRoot`.
+    /// 2. PROBE AS SPELLED (`lstat`, no follow). Only a SYMLINK leaf can
+    ///    make `realpath(3)` name a destination the spelling never wrote;
+    ///    every other kind resolves over objects the probe or the parent
+    ///    chain already touched, so those take the canonical check below
+    ///    unchanged — same verdicts, same error paths.
+    /// 3. A symlink leaf takes `symlinkContainerRootDenyCheck` — the deny
+    ///    core re-stated over the link's own CONTENT, never its destination.
     ///
     /// This is `denyCheck`'s core MINUS the protected-first-level-children
     /// clause: `~/Documents` and `~/Documents/dev` are LEGAL dev roots (the
@@ -722,11 +744,69 @@ final class PathGuard {
     static func validateContainerRoot(
         _ url: URL, home: URL, provider: FileSystemIdentityProvider
     ) throws {
-        try coreDenyCheck(
-            provider.canonicalize(url),
-            resolvedHome: provider.canonicalize(home),
-            provider: provider
+        let mounted = Set(provider.mountPointPaths())
+        if url.path != "/", mounted.contains(url.path) {
+            throw PathGuardError.deniedVolumeRoot(path: url.path)
+        }
+        guard provider.probeKind(of: url) == .kind(.symlink) else {
+            try coreDenyCheck(
+                provider.canonicalize(url),
+                resolvedHome: provider.canonicalize(home),
+                provider: provider
+            )
+            return
+        }
+        try symlinkContainerRootDenyCheck(
+            url, home: home, provider: provider, mountTable: mounted
         )
+    }
+
+    /// The container-root deny core for a SYMLINK-LEAF spelling, decided
+    /// WITHOUT naming the destination (fn-4.11): one `readlink(2)` of the
+    /// link itself plus lexical folding at the link's parent-canonical
+    /// position (the fn-6 `EphemeralTempRoots` technique —
+    /// `FileSystemIdentityProvider.lexicalTargetPath` is the shared fold),
+    /// compared against `/`, the kernel mount table, and both spellings of
+    /// `$HOME`.
+    ///
+    /// What ACCEPTANCE means here is unchanged in effect: a symlink leaf can
+    /// never be walked (the walker's no-follow root gate refuses it), never
+    /// admits at delete time (`admitContainer`'s no-follow reality gate),
+    /// and is visibly classified at scan time — acceptance only defers its
+    /// classification to gates that already hold it inadmissible.
+    ///
+    /// RESIDUALS at measured scope, each fail-CLOSED for deletion by those
+    /// same gates: (a) content that names `/`, `$HOME` or a mount through a
+    /// spelling this fold cannot equate — a second symlink hop, a case or
+    /// normalization variant, an unresolved `/var`-style alias — is ACCEPTED
+    /// here where the old full resolution refused it; (b) a volume root
+    /// visible only to the device-id signal is not refused (never a real
+    /// mount — the table names every real mount; the signal exists for
+    /// injected test devices and the firmlink case, whose mounts the table
+    /// also names); (c) unreadable or empty link content classifies as
+    /// naming nothing — the old `canonicalize` ENOENT-fallback accepted
+    /// exactly the same way.
+    private static func symlinkContainerRootDenyCheck(
+        _ url: URL, home: URL, provider: FileSystemIdentityProvider,
+        mountTable: Set<String>
+    ) throws {
+        guard let content = provider.symlinkTarget(of: url) else { return }
+        let position = provider.canonicalize(url.deletingLastPathComponent())
+            .appendingPathComponent(url.lastPathComponent)
+        guard let target = FileSystemIdentityProvider.lexicalTargetPath(
+            ofLink: position, content: content
+        ) else {
+            // Non-empty content with no foldable target: `/` itself, or
+            // `..`s that walk off the root — both NAME the filesystem root,
+            // and this is the same refusal the resolved spelling carried.
+            throw PathGuardError.deniedFilesystemRoot(path: "/")
+        }
+        if mountTable.contains(target) {
+            throw PathGuardError.deniedVolumeRoot(path: target)
+        }
+        if target == home.path || target == provider.canonicalize(home).path {
+            throw PathGuardError.deniedHomeDirectory(path: target)
+        }
     }
 
     // MARK: - Deny list

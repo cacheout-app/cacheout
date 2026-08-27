@@ -777,8 +777,10 @@ final class PathGuardTests: XCTestCase {
     }
 
     func testContainerRootPolicyRejectsSymlinkAliasOfFilesystemRoot() throws {
-        // Canonicalize-then-check, proven: the alias spelling is nowhere
-        // near "/" lexically, yet resolves to it.
+        // The alias spelling is nowhere near "/" in its own path, yet its
+        // CONTENT names it — since fn-4.11 the policy reads that content
+        // (`readlink`, fold) instead of resolving the leaf, and the refusal
+        // is unchanged.
         let alias = base.appendingPathComponent("rootlink")
         try fm.createSymbolicLink(
             at: alias, withDestinationURL: URL(fileURLWithPath: "/")
@@ -846,7 +848,8 @@ final class PathGuardTests: XCTestCase {
             }
         }
 
-        // Symlink alias — inode identity collapses the spellings.
+        // Symlink alias — refused from the link's own content (fn-4.11:
+        // the policy never resolves a symlink leaf's destination).
         let alias = base.appendingPathComponent("homelink")
         try fm.createSymbolicLink(at: alias, withDestinationURL: fixtureHome)
         XCTAssertThrowsError(
@@ -857,6 +860,175 @@ final class PathGuardTests: XCTestCase {
             guard case .deniedHomeDirectory? = $0 as? PathGuardError else {
                 return XCTFail("expected deniedHomeDirectory, got \($0)")
             }
+        }
+    }
+
+    // MARK: - fn-4.11: the policy never names a symlink root's destination
+
+    /// FAILS THE TEST on (a) any call naming the forbidden DESTINATION or
+    /// anything below it, and (b) any LEAF-FOLLOWING operation on a listed
+    /// alias spelling (`canonicalize`/`realPath`/`isMountPoint` of the alias
+    /// — `realpath(3)` resolves the link and `statfs(2)` follows it, so a
+    /// call whose ARGUMENT names only the alias is still first contact with
+    /// whatever answers for the destination). `lstat`/`readlink`-class calls
+    /// on the alias itself stay legal: they read the link's own entry and
+    /// content, never the destination.
+    private final class DestinationForbiddingProvider:
+        FileSystemIdentityProvider, @unchecked Sendable
+    {
+        var forbiddenDestination = ""
+        var aliasSpellings: Set<String> = []
+        /// When non-nil, replaces the kernel mount table wholesale.
+        var injectedMountPoints: [String]?
+        private let fail: (String) -> Void
+
+        init(fail: @escaping (String) -> Void) {
+            self.fail = fail
+            super.init()
+        }
+
+        override func mountPointPaths() -> [String] {
+            injectedMountPoints ?? super.mountPointPaths()
+        }
+
+        private func forbid(_ method: String, _ path: String) {
+            guard !forbiddenDestination.isEmpty,
+                  path == forbiddenDestination
+                    || path.hasPrefix(forbiddenDestination + "/")
+            else { return }
+            fail("\(method) made first contact with the destination: \(path)")
+        }
+        private func forbidFollow(_ method: String, _ path: String) {
+            forbid(method, path)
+            if aliasSpellings.contains(path) {
+                fail("\(method) is a leaf-following resolution of the alias "
+                    + "spelling itself: \(path)")
+            }
+        }
+
+        override func realPath(of path: String) -> String? {
+            forbidFollow("realPath", path)
+            let out = super.realPath(of: path)
+            if let out { forbid("realPath output", out) }
+            return out
+        }
+        override func canonicalize(_ url: URL) -> URL {
+            forbidFollow("canonicalize", url.path)
+            return super.canonicalize(url)
+        }
+        override func isMountPoint(_ url: URL) -> Bool {
+            forbidFollow("isMountPoint", url.path)
+            return super.isMountPoint(url)
+        }
+        override func probeKind(of url: URL) -> KindProbe {
+            forbid("probeKind", url.path)
+            return super.probeKind(of: url)
+        }
+        override func identity(of url: URL) -> Identity? {
+            forbid("identity", url.path)
+            return super.identity(of: url)
+        }
+        override func symlinkTarget(of url: URL) -> String? {
+            forbid("symlinkTarget", url.path)
+            return super.symlinkTarget(of: url)
+        }
+        override func canEnumerateDirectory(_ url: URL) -> Bool {
+            forbidFollow("canEnumerateDirectory", url.path)
+            return super.canEnumerateDirectory(url)
+        }
+        override func ownerProbe(of url: URL) -> OwnerProbe {
+            forbid("ownerProbe", url.path)
+            return super.ownerProbe(of: url)
+        }
+        override func leafMetadata(of url: URL) -> LeafMetadata? {
+            forbid("leafMetadata", url.path)
+            return super.leafMetadata(of: url)
+        }
+        override func linkCount(of url: URL) -> UInt64? {
+            forbid("linkCount", url.path)
+            return super.linkCount(of: url)
+        }
+    }
+
+    /// fn-4.11: the policy runs at runtime CONSTRUCTION on the main thread,
+    /// on paths the app does not control — a same-UID process can point a
+    /// persisted dev root at an unresponsive mounted volume, and the old
+    /// canonicalize-first shape made `realpath(3)` name that destination
+    /// before any window existed. A symlink leaf pointing at an ordinary
+    /// directory is ACCEPTED with zero destination contact: acceptance only
+    /// defers it to gates that already hold it inadmissible (the walker's
+    /// no-follow root gate, `admitContainer`'s reality gate).
+    func testContainerRootPolicyNeverResolvesASymlinkLeafsDestination() throws {
+        let destination = base.appendingPathComponent("policy-dest")
+        try mkdir(destination)
+        let alias = base.appendingPathComponent("policy-alias")
+        try fm.createSymbolicLink(at: alias, withDestinationURL: destination)
+        let provider = DestinationForbiddingProvider(fail: { XCTFail($0) })
+        provider.forbiddenDestination = destination.path
+        provider.aliasSpellings = [alias.path]
+
+        XCTAssertNoThrow(try PathGuard.validateContainerRoot(
+            alias, home: fixtureHome, provider: provider
+        ))
+    }
+
+    /// …and a DANGLING alias (destination absent) is the same acceptance
+    /// with the same zero contact — the old shape's `realpath(3)` fallback
+    /// walked the destination's parent chain looking for its deepest
+    /// existing ancestor.
+    func testContainerRootPolicyNeverResolvesADanglingAliasesDestination() throws {
+        let destination = base.appendingPathComponent("policy-dest-gone")
+        // NOT created — the point is nothing may go looking for it.
+        let alias = base.appendingPathComponent("policy-dangling-alias")
+        try fm.createSymbolicLink(at: alias, withDestinationURL: destination)
+        let provider = DestinationForbiddingProvider(fail: { XCTFail($0) })
+        provider.forbiddenDestination = destination.path
+        provider.aliasSpellings = [alias.path]
+
+        XCTAssertNoThrow(try PathGuard.validateContainerRoot(
+            alias, home: fixtureHome, provider: provider
+        ))
+    }
+
+    /// The alias-of-a-volume-root refusal survives the destination-free
+    /// rewrite: the link's CONTENT is compared against the kernel mount
+    /// table (`getfsstat`, no filesystem contact), so the mount is refused
+    /// without any call naming it.
+    func testContainerRootPolicyRejectsSymlinkAliasOfAMountFromTheKernelTable() throws {
+        let volume = base.appendingPathComponent("DeadVol")
+        // NOT created — an unresponsive mount cannot be staged, so the cell
+        // asserts the sharper property: refusal with zero calls naming it.
+        let alias = base.appendingPathComponent("vollink")
+        try fm.createSymbolicLink(at: alias, withDestinationURL: volume)
+        let provider = DestinationForbiddingProvider(fail: { XCTFail($0) })
+        provider.forbiddenDestination = volume.path
+        provider.aliasSpellings = [alias.path]
+        provider.injectedMountPoints = [volume.path]
+
+        XCTAssertThrowsError(try PathGuard.validateContainerRoot(
+            alias, home: fixtureHome, provider: provider
+        )) { error in
+            XCTAssertEqual(error as? PathGuardError,
+                           .deniedVolumeRoot(path: volume.path))
+        }
+    }
+
+    /// The r15 shape at THIS policy's scope: a declared root that IS an
+    /// over-mounted path is refused from the kernel table before anything
+    /// probes it — `lstat` or `realpath` OF a mount point is served by the
+    /// mounted (possibly unresponsive) filesystem.
+    func testContainerRootPolicyRefusesAnOverMountedRootFromTheTableWithoutContact() throws {
+        let mountRoot = base.appendingPathComponent("MountedRoot")
+        // NOT created — nothing may touch it, not even the kind probe.
+        let provider = DestinationForbiddingProvider(fail: { XCTFail($0) })
+        provider.forbiddenDestination = mountRoot.path
+        provider.injectedMountPoints = [mountRoot.path]
+
+        XCTAssertThrowsError(try PathGuard.validateContainerRoot(
+            mountRoot, home: fixtureHome, provider: provider
+        )) { error in
+            XCTAssertEqual(error as? PathGuardError,
+                           .deniedVolumeRoot(path: mountRoot.path))
         }
     }
 

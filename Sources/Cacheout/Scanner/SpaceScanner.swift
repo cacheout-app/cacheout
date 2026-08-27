@@ -1823,10 +1823,12 @@ struct SpaceScannerRuntime {
     let scanners: [any SpaceScanner]
     /// UNION of every scanner's declared `trustedContainerRoots`, in
     /// registration order, deduplicated by path — and with SHADOWING
-    /// ALIASES suppressed (`suppressingAliasShadows`): at most one spelling
-    /// per canonical location survives whenever any of them is a real
-    /// directory, so first-match root matching can never return an unusable
-    /// spelling of a location another scanner registered usably.
+    /// ALIASES suppressed (`suppressingAliasShadows`): an unusable spelling
+    /// whose own link content names a surviving real-directory spelling is
+    /// dropped, so first-match root matching can never return such an
+    /// unusable spelling of a location another scanner registered usably
+    /// (comparison is by NAME since fn-4.11 — the residual is recorded on
+    /// that function).
     let trustedContainerRoots: [URL]
 
     /// PER-SCANNER declared container roots, captured at registration
@@ -1838,11 +1840,14 @@ struct SpaceScannerRuntime {
     /// union.
     private let declaredContainerRoots: [String: [URL]]
 
-    /// DECLARED path -> canonical path, for every root any scanner declared
+    /// DECLARED path -> comparison key, for every root any scanner declared
     /// (union survivors and alias-suppressed drops alike), captured at
-    /// registration from `suppressingAliasShadows`' single probe pass.
-    /// Read ONLY by `sessionContainerRoots`, which uses it to decide the
-    /// snapshot's capture set without a session-time realpath.
+    /// registration from `suppressingAliasShadows`' single probe pass: the
+    /// canonical path for a proven real directory, the folded link content
+    /// or parent-canonical leaf-kept spelling otherwise (fn-4.11 — nothing
+    /// here follows a symlink leaf). Read ONLY by `sessionContainerRoots`,
+    /// which uses it to decide the snapshot's capture set without a
+    /// session-time realpath.
     private let containerRootCanonicalKeys: [String: String]
 
     /// The AUTHORITATIVE category registry, keyed by slug — registered at
@@ -1995,17 +2000,46 @@ struct SpaceScannerRuntime {
     ///
     /// - a dropped spelling is never a real directory, so `admitContainer`'s
     ///   gate (2) refused it, and the walker refuses it as a root;
-    /// - it is dropped ONLY when a real-directory spelling of the SAME
-    ///   canonical location survives — and root matching is by canonical
-    ///   identity, so every claim the alias could have matched still matches
-    ///   the covering root, which additionally passes the gate;
+    /// - it is dropped ONLY when its own link content NAMES a surviving
+    ///   real-directory spelling (by that root's canonical key or declared
+    ///   path) — and delete-time root matching is by canonical identity, so
+    ///   every claim the alias could have matched still matches the covering
+    ///   root, which additionally passes the gate;
     /// - a claim spelled AS the alias stays refused: gate (2) checks the
     ///   caller's own spelling too.
     ///
+    /// PROBED AS SPELLED FIRST (fn-4.11 — the fn-4.26 order at the union's
+    /// scope). This probe runs at CONSTRUCTION, on the main thread, and the
+    /// old shape canonicalized EVERY root — leaf included — so a symlink
+    /// root here (a dev root a same-UID process re-aimed, or fn-6's
+    /// symlinked temp root when its own resolution could not place it) made
+    /// `realpath(3)` name the DESTINATION, and an unresponsive volume there
+    /// froze launch. Now only a spelling PROVEN a real directory by the
+    /// no-follow lstat is canonicalized (the resolved leaf then IS the
+    /// object the lstat touched); a symlink leaf contributes what its own
+    /// CONTENT names (`FileSystemIdentityProvider.lexicalAliasTarget` — one
+    /// `readlink(2)` + string folding, the fn-6 technique), compared by
+    /// NAME against the real-directory spellings this union holds. A root
+    /// the kernel mount table names is not probed at all (the r15 shape —
+    /// `lstat` OF a mount point is served by the mounted filesystem): kept
+    /// verbatim, and still fail-closed, because delete-time root matching
+    /// skips over-mounted configured roots from the same table.
+    ///
+    /// RESIDUAL at measured scope: the name compare misses a target written
+    /// through a THIRD spelling (a second link hop, a case variant, an
+    /// unresolved `/var`-style alias of the covering root's declared
+    /// spelling) — such an alias is KEPT, where the old full resolution
+    /// dropped it, and it can then sit ahead of the root it shadows for
+    /// first-match root matching (the fn-4.5 breakage, at that narrowed
+    /// scope). The same trade fn-6.1 records for its own resolution
+    /// (`testAliasWrittenThroughAThirdSpellingKeepsBothRootsRatherThanGuessing`):
+    /// closing it requires resolving the destination, which is the exact
+    /// contact this function must not make.
+    ///
     /// The `resolveTargetKeepingLeaf` doctrine is preserved exactly as
-    /// `DevRootsStore` preserves it: the leaf-resolving canonical path is a
-    /// comparison KEY only and never reaches the returned union — every
-    /// surviving entry is the verbatim spelling its scanner declared.
+    /// `DevRootsStore` preserves it: every comparison value is a KEY only
+    /// and never reaches the returned union — every surviving entry is the
+    /// verbatim spelling its scanner declared.
     ///
     /// Nothing is silently lost: a dropped root is unusable in its own right,
     /// and the scanner that declared it still declares it
@@ -2016,43 +2050,79 @@ struct SpaceScannerRuntime {
     private static func suppressingAliasShadows(
         in roots: [URL], provider: FileSystemIdentityProvider
     ) -> (roots: [URL], canonicalKeys: [String: String]) {
-        // Probed ONCE per root: the canonical comparison KEY, and whether the
-        // DECLARED spelling is itself a real directory (leaf lstat no-follow)
-        // — the same probe pair, with the same meaning, as fn-4.1's dev-root
-        // resolution.
-        let probed = roots.map { root in
-            (declared: root,
-             key: provider.canonicalize(root).path,
-             isDirectory: provider.probeKind(of: root) == .kind(.directory))
+        let mounted = Set(provider.mountPointPaths())
+        // Probed ONCE per root, as spelled first (see the doc above): the
+        // canonical KEY for proven real directories, the folded link
+        // content for symlink leaves, nothing for a root the mount table
+        // names. `mapKey` is what `canonicalKeys` carries when neither a
+        // canonical key nor a covering root applies: the folded content
+        // when the link has one, else the parent-canonical leaf-kept
+        // spelling (`resolveTargetKeepingLeaf` — ancestors only), so two
+        // scanners' spellings of one location still land on one key
+        // without any leaf-following resolution.
+        let probed = roots.map {
+            root -> (declared: URL, key: String?, aliasTarget: String?,
+                     mapKey: String) in
+            if mounted.contains(root.path) {
+                return (root, nil, nil, root.path)
+            }
+            switch provider.probeKind(of: root) {
+            case .kind(.directory):
+                let key = provider.canonicalize(root).path
+                return (root, key, nil, key)
+            case .kind(.symlink):
+                let target = provider.lexicalAliasTarget(of: root)
+                return (root, nil, target,
+                        target ?? provider.resolveTargetKeepingLeaf(root).path)
+            case .kind(.regularFile), .kind(.other), .absent, .failed:
+                return (root, nil, nil,
+                        provider.resolveTargetKeepingLeaf(root).path)
+            }
         }
-        let coveredByRealDirectory = Set(
-            probed.lazy.filter(\.isDirectory).map(\.key)
-        )
+        // The spellings a REAL-DIRECTORY root already covers — its
+        // canonical key and its declared path. An alias's folded link
+        // content is compared against THESE STRINGS, never resolved.
+        var coveredByRealDirectory = Set<String>()
+        for root in probed {
+            guard let key = root.key else { continue }
+            coveredByRealDirectory.insert(key)
+            coveredByRealDirectory.insert(root.declared.path)
+        }
         // Two real-directory spellings of one location are NOT touched: both
         // pass the reality gate, so neither shadows the other, and dropping
         // either would change which declared spelling the identity binding
         // keys off for no safety gain.
-        return (
-            roots: probed
-                .filter { $0.isDirectory || !coveredByRealDirectory.contains($0.key) }
-                .map(\.declared),
-            // THE SAME PROBE'S KEYS, carried out rather than recomputed (PR
-            // #459 codex r16). `sessionContainerRoots` needs to know which
-            // union entries a participating scanner's declared root can
-            // MATCH, and matching is by canonical identity
-            // (`PathGuard.matchConfiguredRoot`, PathGuard.swift:536-543), not
-            // by spelling. Re-canonicalizing at session time would pay this
-            // construction's realpath bill again — per session, per trigger,
-            // on exactly the roots the participation gate exists to leave
-            // alone. Keyed by DECLARED path and kept for every declared root
-            // including the ones dropped above: a participating scanner whose
-            // own spelling was suppressed still reaches the covering entry
-            // through this map.
-            canonicalKeys: Dictionary(
-                probed.map { ($0.declared.path, $0.key) },
-                uniquingKeysWith: { first, _ in first }
-            )
-        )
+        var union: [URL] = []
+        // THE SAME PROBE'S KEYS, carried out rather than recomputed (PR
+        // #459 codex r16). `sessionContainerRoots` needs to know which
+        // union entries a participating scanner's declared root can MATCH,
+        // and matching is by canonical identity
+        // (`PathGuard.matchConfiguredRoot`, PathGuard.swift:536-543), not
+        // by spelling. Re-deriving them at session time would pay this
+        // construction's probe bill again — per session, per trigger, on
+        // exactly the roots the participation gate exists to leave alone.
+        // Keyed by DECLARED path and kept for every declared root including
+        // the ones dropped below. A DROPPED spelling's entry is the NAME its
+        // content folded to, not the covering root's canonical key — fn-4.11
+        // retired that link on measured evidence (deleting it left every
+        // cell green): a scanner can produce no admissible claim through a
+        // spelling the reality gates refuse (the walker's root gate never
+        // walks it, scan-time origin binding is to the scanner's own
+        // declaration, and `admitContainer`'s gate (2) refuses the alias
+        // spelling itself), so pulling the covering entry into the capture
+        // set for such a participant was exactly the over-capture the r16
+        // narrowing exists to avoid.
+        var canonicalKeys: [String: String] = [:]
+        for root in probed {
+            canonicalKeys[root.declared.path] = root.key ?? root.mapKey
+            if root.key == nil,
+               let target = root.aliasTarget,
+               coveredByRealDirectory.contains(target) {
+                continue // the shadowing alias — dropped from the union
+            }
+            union.append(root.declared)
+        }
+        return (roots: union, canonicalKeys: canonicalKeys)
     }
 
     /// The production registry — the single place scanners are registered.
@@ -3072,12 +3142,16 @@ struct SpaceScannerRuntime {
     /// (PathGuard.swift:536-543), and the snapshot is keyed by THAT root's
     /// declared spelling. So a participating scanner's claim can legitimately
     /// key off a union entry only a NON-participating scanner declared — an
-    /// alias spelling of the same location, including the case where the
-    /// participating scanner's own spelling was dropped by
-    /// `suppressingAliasShadows`. Filtering by declared path alone would have
-    /// turned those admissions into `containerUnavailable`; the registration
-    /// -captured `containerRootCanonicalKeys` pull the covering entry in
-    /// without a session-time realpath.
+    /// alias spelling of the same location, both spellings real directories
+    /// (the ancestor-symlink case
+    /// `testAParticipatingScannersAliasedRootIsStillCaptured` stages).
+    /// Filtering by declared path alone would have turned those admissions
+    /// into `containerUnavailable`; the registration-captured
+    /// `containerRootCanonicalKeys` pull the covering entry in without a
+    /// session-time realpath. (This paragraph once also claimed the link
+    /// held for a spelling `suppressingAliasShadows` DROPPED — retired in
+    /// fn-4.11: a dropped spelling supports no admissible claim, so its map
+    /// entry deliberately links nothing; see that function.)
     private func sessionContainerRoots(
         for selected: [any SpaceScanner]
     ) -> [URL] {

@@ -2821,6 +2821,27 @@ final class TrashDisposalHopProofTests: XCTestCase {
     /// semantic judgement stays with the reviewer reading it, and with the
     /// measured fixture cells for the placing propositions. See the
     /// residual-by-mechanism disclosure at `TrashDisposal.Failure.sentence`.
+    ///
+    /// ## MEASURED — the fn-4.22 attack round (11 fresh false wordings,
+    /// ## each applied to production alone, `--filter` suite run, reverted)
+    ///
+    /// | attack | result |
+    /// |---|---|
+    /// | `.rescan` remedy + "The item the Trash took is safe in the Trash." (the task's measured passer) | RED (6) |
+    /// | `.usePermanentDeleteInstead` + "Whatever the Trash took is safe there." | RED (2) |
+    /// | graft into the whereabouts wording, "…though it was there a second ago." (r18's GREEN row) | RED (2) |
+    /// | report clause reworded to the disk claim "nothing was freed" | RED (2) |
+    /// | NEW case `theItemIsSafeInTheTrash`, sentence written, `messageOrder` placed, `placesTheItem` false, claimed by `.destinationUnknown` | RED (3) |
+    /// | NEW case claimed by NO cause, false sentence in wait, not retired | RED (7) |
+    /// | NEW case smuggled through `retired` WITH a sentence | RED (5) |
+    /// | hedge stripped from the landing wording ("the path is clear for it.") | RED (2) |
+    /// | non-placing proposition reworded to "The item is in the Trash." | RED (11) |
+    /// | `.rescan` remedy + "Check the Trash for the item." | RED (6) |
+    /// | `established(for: .lastSeenInTrash)` gains `.theItemIsAtTheLanding` (through the derivation) | RED (4) |
+    ///
+    /// **0 of 11 passed.** Deterministic table/type mutations, one run
+    /// each; the baseline between attacks re-ran green (40/0), which is the
+    /// control that each RED is the mutation's.
     func testTheVocabularyAndEveryWordingArePinnedSoExtensionFailsClosed() throws {
         typealias Failure = TrashDisposal.Failure
 

@@ -382,24 +382,40 @@ final class SourceAnchorIntegrityTests: XCTestCase {
              + "`git show d747412:Sources/Cacheout/Scanner/NodeModulesScanner.swift`"),
     ]
 
-    /// Every Markdown file in the repository, excluding build products.
+    /// Every TRACKED Markdown file in the repository (post-#460 scope
+    /// correction).
+    ///
+    /// This used to be a filesystem walk, which swept UNTRACKED Markdown too
+    /// — and the first checkout carrying a populated, gitignored `.flow/`
+    /// task tracker turned the suite red with sixty findings about documents
+    /// the repository does not ship and a fresh clone does not have. A test
+    /// whose verdict depends on gitignored local state is the state-pinned
+    /// gate defect this project has already catalogued: it does not measure
+    /// the repository, it measures the machine.
+    ///
+    /// The demand itself is unchanged and still binds every document that
+    /// can reach a reader — `git ls-files` is the definition of that set.
+    /// Untracked working notes are outside the repository's contract;
+    /// their known hazard is recorded where their consumers are told to
+    /// re-grep before trusting anchors (CLAUDE.md, roadmap note).
+    ///
+    /// THE SCOPE CHANGE CANNOT SILENTLY EMPTY THE SCAN: the caller asserts
+    /// the set is non-empty and still contains a known line-anchor-bearing
+    /// document, so a future `ls-files` failure reads as a red cell, not a
+    /// vacuous pass.
     private func markdownDocuments() throws -> [URL] {
-        var files: [URL] = []
-        let walker = try XCTUnwrap(
-            FileManager.default.enumerator(
-                at: repositoryRoot, includingPropertiesForKeys: nil
-            ),
-            "the repository root could not be enumerated"
-        )
-        for case let url as URL in walker {
-            let name = url.lastPathComponent
-            if name == ".build" || name == ".git" {
-                walker.skipDescendants()
-                continue
-            }
-            if url.pathExtension == "md" { files.append(url) }
-        }
-        return files.sorted { $0.path < $1.path }
+        let list = Process()
+        list.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        list.arguments = ["git", "-C", repositoryRoot.path, "ls-files", "-z", "--", "*.md"]
+        let out = Pipe()
+        list.standardOutput = out
+        try list.run()
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        list.waitUntilExit()
+        XCTAssertEqual(list.terminationStatus, 0, "git ls-files failed")
+        return String(decoding: data, as: UTF8.self)
+            .split(separator: "\0").map(String.init).sorted()
+            .map { repositoryRoot.appendingPathComponent($0) }
     }
 
     func testMarkdownLineAnchorsAreDatedAndTheirFilesAccountedFor() throws {
@@ -413,11 +429,18 @@ final class SourceAnchorIntegrityTests: XCTestCase {
         let pin = #"commit `[0-9a-f]{7,40}`"#
         let retired = Set(Self.retiredMarkdownAnchorTargets.map(\.file))
         let live = Set(try swiftSources().map(\.lastPathComponent))
+        let documents = try markdownDocuments()
+        XCTAssertFalse(documents.isEmpty, "the tracked-markdown scan is empty")
+        XCTAssertTrue(
+            documents.contains { $0.lastPathComponent == "SCANNERS-ROADMAP.md" },
+            "the scan no longer sees a known line-anchor-bearing document — "
+                + "the scope change went vacuous"
+        )
 
         var scanned = 0
         var citing = 0
         var offenders: [String] = []
-        for document in try markdownDocuments() {
+        for document in documents {
             scanned += 1
             let text = try String(contentsOf: document, encoding: .utf8)
             let lines = text.split(

@@ -191,14 +191,16 @@ enum GitCommandOutcome: Equatable, Sendable {
     /// Non-zero exit, with git's own stderr (lossily decoded — stderr is a
     /// human message, never a path used as a deletion target).
     case failure(exitCode: Int32, stderr: String)
-    /// The invocation could not be COMPLETED within its bounds, and the full
-    /// termination protocol ran. Two ways in, and they are one answer on
-    /// purpose (PR #460 codex r18, C7): the per-invocation budget expired
-    /// before git exited, OR git exited but its output could not be read to
-    /// completion within the drain budget — which means something git spawned
-    /// still holds the inherited pipe, so the captured bytes may be short.
-    /// Both are retryable and neither may be reported as a `.success` whose
-    /// `stdout` a porcelain parser will count.
+    /// The invocation could not be COMPLETED within its bounds. Three ways
+    /// in, and they are one answer on purpose (PR #460 codex r18 C7;
+    /// fn-4.24): the per-invocation budget expired before git exited (the
+    /// full termination protocol ran), OR git exited but its output could
+    /// not be read to completion within the drain budget — something git
+    /// spawned still holds the inherited pipe, so the captured bytes may be
+    /// short — OR a drain DIED on a hard `read(2)` error, which also leaves
+    /// the captured bytes short. All three are retryable (a fresh invocation
+    /// opens fresh pipes and descriptors) and none may be reported as a
+    /// `.success` whose `stdout` a porcelain parser will count.
     case timeout
     /// `env` could not find git (exit 127), the launch itself failed, or the
     /// instance's cached availability probe already said no.
@@ -299,6 +301,14 @@ final class GitCommandRunner: GitCommandRunning, @unchecked Sendable {
     let defaultTimeout: TimeInterval
     private let terminationGrace: TimeInterval
     private let drainJoinBudget: TimeInterval
+    /// How `execute` builds the drain over each pipe. TESTING SEAM
+    /// (fn-4.24): production always uses the default — a `PipeDrain` over
+    /// the pipe's own read end — and nothing in this file reassigns it. The
+    /// seam exists because a pipe cannot be made to fail `read(2)` HARD on
+    /// demand, and the died-on-error drain classes (EISDIR through a
+    /// directory descriptor) are only reachable through
+    /// `PipeDrain(readingFrom:)`.
+    private let drainFactory: (Pipe) -> PipeDrain
 
     // MARK: Mutable state (lock-guarded)
 
@@ -317,13 +327,15 @@ final class GitCommandRunner: GitCommandRunning, @unchecked Sendable {
         executableURL: URL = GitCommandRunner.defaultExecutable,
         defaultTimeout: TimeInterval = GitCommandRunner.scanTimeout,
         terminationGrace: TimeInterval = GitCommandRunner.defaultTerminationGrace,
-        drainJoinBudget: TimeInterval = GitCommandRunner.defaultDrainJoinBudget
+        drainJoinBudget: TimeInterval = GitCommandRunner.defaultDrainJoinBudget,
+        drainFactory: @escaping (Pipe) -> PipeDrain = { PipeDrain(pipe: $0) }
     ) {
         self.baseEnvironment = environment
         self.executableURL = executableURL
         self.defaultTimeout = defaultTimeout
         self.terminationGrace = terminationGrace
         self.drainJoinBudget = drainJoinBudget
+        self.drainFactory = drainFactory
     }
 
     /// Production initializer — the cleaner-cloned environment.
@@ -480,8 +492,8 @@ final class GitCommandRunner: GitCommandRunning, @unchecked Sendable {
         // Both drains start BEFORE the wait: either stream filling the
         // 64 KiB pipe buffer would otherwise block the child forever while
         // the parent waits for an exit that can never come.
-        let stdoutDrain = PipeDrain(pipe: stdoutPipe)
-        let stderrDrain = PipeDrain(pipe: stderrPipe)
+        let stdoutDrain = drainFactory(stdoutPipe)
+        let stderrDrain = drainFactory(stderrPipe)
         stdoutDrain.start()
         stderrDrain.start()
 
@@ -554,6 +566,50 @@ final class GitCommandRunner: GitCommandRunning, @unchecked Sendable {
             stderrDrain.close()
             stdoutDrain.join(within: drainJoinBudget)
             stderrDrain.join(within: drainJoinBudget)
+            return GitCommandInvocation(
+                profile: profile, argv: argv, environment: environment,
+                outcome: .timeout
+            )
+        }
+        // AND A DRAIN CAN FINISH BECAUSE `read(2)` DIED, NOT BECAUSE THE
+        // STREAM ENDED (fn-4.24, PR #460 round 18). A hard read error is
+        // terminal for the worker — it signals `finished` like EOF does, so
+        // the joins above answer true — and until the drain RECORDED that
+        // ending, this boundary had no way to tell the two apart: the
+        // partial buffer shipped as `.success`. This is the first read of
+        // that fact, on the one path that can still turn into a success.
+        //
+        // The answer is `.timeout` — the same class as the unjoined-drain
+        // arm above, for the same reason: the output could not be read to
+        // completion, and a porcelain parser must never count a short
+        // stdout. Ask the standing question: can a retry differ? Yes — a
+        // fresh invocation opens fresh pipes and fresh descriptors, so
+        // nothing deterministic pins the error, and every caller's `.timeout`
+        // handling (re-scan or refuse) is the right disposition.
+        //
+        // NO `terminate` in this arm, deliberately: the child has already
+        // exited (`waitForExit` succeeded) and both drains have returned, so
+        // unlike the arm above there is no evidence of a surviving holder —
+        // a kill whose removal no cell could redden would be an unevidenced
+        // guard by this repo's own rule.
+        //
+        // WOULD A DOWNSTREAM PARSER HAVE CAUGHT THE TRUNCATION? (asked by
+        // the task spec, answered from the parsers' source): only partially,
+        // so this gate is load-bearing. `GitWorktreePorcelainParser.parse`
+        // fails closed on a cut that lands mid-field or mid-record (its
+        // final `start == endIndex && current.isEmpty` guard), but a cut on
+        // a RECORD BOUNDARY — right after a record's closing empty field —
+        // parses cleanly as a repository with fewer worktrees.
+        // `WorktreeStalenessAssessor.verdict(for:)` catches nothing: a
+        // truncated `status --porcelain` has fewer entries and an empty one
+        // is `.clean` by definition. The first-line readers (`rev-parse`,
+        // `symbolic-ref`) accept whatever line survives. None of them can
+        // refuse what this boundary fails to mark.
+        if stdoutDrain.terminalReadFailure != nil
+            || stderrDrain.terminalReadFailure != nil
+        {
+            stdoutDrain.close()
+            stderrDrain.close()
             return GitCommandInvocation(
                 profile: profile, argv: argv, environment: environment,
                 outcome: .timeout
@@ -741,6 +797,10 @@ final class PipeDrain: @unchecked Sendable {
     private var buffer = Data()
     private var isClosed = false
     private var closeRequested = false
+    /// The errno of a HARD `read(2)` failure that ended the drain — `nil`
+    /// when the drain ended at EOF or on a requested close (fn-4.24).
+    /// Guarded by `lock`, like the buffer it qualifies.
+    private var terminalReadErrno: Int32?
 
     init(pipe: Pipe) {
         handle = pipe.fileHandleForReading
@@ -783,6 +843,24 @@ final class PipeDrain: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return buffer
+    }
+
+    /// How the drain DIED, when it died on a hard `read(2)` error rather
+    /// than reaching EOF: the errno, or `nil` for a clean ending (EOF or a
+    /// requested close). fn-4.24 — before this existed, a died-on-error
+    /// drain signalled `finished` exactly like EOF, `join(within:)` answered
+    /// true, and `execute` shipped the partial buffer as `.success`; a
+    /// truncated porcelain listing does not look malformed, it looks like a
+    /// repository with fewer worktrees.
+    ///
+    /// Takes `lock` without announcing itself — the same shape `captured`'s
+    /// doc warns about — so production reads it ONLY after a successful
+    /// `join(within:)`, when the worker has provably returned and cannot
+    /// contend.
+    var terminalReadFailure: Int32? {
+        lock.lock()
+        defer { lock.unlock() }
+        return terminalReadErrno
     }
 
     /// END the drain and take everything it read — the one bounded spelling
@@ -917,6 +995,12 @@ final class PipeDrain: @unchecked Sendable {
                 }
                 // A hard read error is terminal: polling a broken
                 // descriptor would spin, and there is nothing left to read.
+                // RECORDED, never equated with EOF (fn-4.24): until it was,
+                // this arm signalled `finished` exactly like end-of-stream,
+                // and `execute` shipped the partial buffer as `.success` —
+                // a truncated porcelain listing that reads as a repository
+                // with fewer worktrees. `lock` is held here.
+                terminalReadErrno = code
                 isDone = true
                 break readAvailable
             }

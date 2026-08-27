@@ -551,6 +551,196 @@ final class GitCommandRunnerTests: XCTestCase {
         )
     }
 
+    // MARK: - A hard read error is not EOF (fn-4.24)
+
+    /// Serial call counter for the drain factory seam. `execute` builds its
+    /// drains on ONE thread in a pinned source order, and a runner's first
+    /// `run` makes exactly four: the availability probe's stdout (1) and
+    /// stderr (2), then the command's stdout (3) and stderr (4). Locked
+    /// anyway so the cell asserts the count without a data-race caveat.
+    private final class DrainBuildCounter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value = 0
+        func next() -> Int {
+            lock.lock()
+            defer { lock.unlock() }
+            value += 1
+            return value
+        }
+        var count: Int {
+            lock.lock()
+            defer { lock.unlock() }
+            return value
+        }
+    }
+
+    /// A `PipeDrain` whose `read(2)` fails HARD on the first call: a
+    /// directory descriptor, `EISDIR` (errno 21) — the reproduction the task
+    /// spec measured (PR #460 round 18, runner scope).
+    private func drainOverADirectoryDescriptor(named name: String) throws -> PipeDrain {
+        let directory = base.appendingPathComponent(name)
+        try fm.createDirectory(at: directory, withIntermediateDirectories: true)
+        let descriptor = open(directory.path, O_RDONLY)
+        XCTAssertGreaterThanOrEqual(
+            descriptor, 0, "opening a directory read-only cannot fail here"
+        )
+        return PipeDrain(
+            readingFrom: FileHandle(fileDescriptor: descriptor, closeOnDealloc: false)
+        )
+    }
+
+    /// The drain-level half of fn-4.24, with its EOF control.
+    ///
+    /// DEFECT (measured before the fix): a drain whose `read(2)` died hard
+    /// ended EXACTLY like EOF — `finished` signalled, `join(within:)` true,
+    /// nothing recorded — so `execute` had no fact to read and shipped the
+    /// partial buffer as `.success`. The cell asserts WHICH failure ended
+    /// the drain (EISDIR, not merely "some refusal"), and the control shows
+    /// a genuine EOF records nothing, so the two endings are distinguishable.
+    func testADrainThatDiedOnAHardReadErrorRecordsTheErrnoInsteadOfPosingAsEOF() throws {
+        let drain = try drainOverADirectoryDescriptor(named: "read-error-target")
+        drain.start()
+        XCTAssertTrue(
+            drain.join(within: 5),
+            "a hard read error must still END the drain — polling a broken "
+                + "descriptor would spin forever"
+        )
+        XCTAssertEqual(
+            drain.terminalReadFailure, EISDIR,
+            "the drain died on EISDIR; a died-on-error ending that records "
+                + "nothing is indistinguishable from EOF, which is what let "
+                + "a partial buffer ship as `.success` (fn-4.24)"
+        )
+        XCTAssertEqual(
+            drain.closeAndCapture(), Data(),
+            "no byte was ever readable from a directory descriptor"
+        )
+
+        // CONTROL: a drain that reaches genuine EOF records NO failure —
+        // otherwise the execute gate would refuse every healthy invocation
+        // and the cell above could be passing for the wrong reason.
+        let pipe = Pipe()
+        let eofDrain = PipeDrain(pipe: pipe)
+        eofDrain.start()
+        try pipe.fileHandleForWriting.write(contentsOf: Data("complete\n".utf8))
+        try pipe.fileHandleForWriting.close()
+        XCTAssertTrue(eofDrain.join(within: 5), "EOF must end the control drain")
+        XCTAssertNil(
+            eofDrain.terminalReadFailure,
+            "a clean EOF is not a read failure; recording one here would "
+                + "turn every healthy run into a refusal"
+        )
+        XCTAssertEqual(eofDrain.closeAndCapture(), Data("complete\n".utf8))
+    }
+
+    /// The execute-boundary half of fn-4.24, stdout arm: git exits 0, the
+    /// STDOUT drain dies on a hard read error (a real EISDIR descriptor via
+    /// the factory seam), and the invocation must be `.timeout` — never a
+    /// `.success` whose short stdout a porcelain parser will count as a
+    /// repository with fewer worktrees.
+    ///
+    /// CONTROL FIRST: the same stub through default drains is a plain
+    /// `.success` carrying the expected bytes, so the refusal below cannot
+    /// be the fixture refusing for reasons of its own. And the refusal is
+    /// pinned to the read-failure GATE, not the join guard: a died-on-error
+    /// drain joins within milliseconds, and the mutation run that deletes
+    /// the gate turns exactly this cell green-to-red via `.success`.
+    func testAHardStdoutReadErrorAfterANormalExitIsRefusedNotShippedAsSuccess() async throws {
+        let stubs = base.appendingPathComponent("stubs-stdout-read-error")
+        _ = try GitFixture.makeStubGit(in: stubs, body: """
+        echo "worktree /tmp/x"
+        exit 0
+        """)
+
+        let control = GitCommandRunner(
+            environment: stubEnvironment(pathDirectories: [stubs]),
+            defaultTimeout: 30
+        )
+        let controlRun = await control.run(["worktree", "list"], timeout: 20)
+        guard case .success(let stdout) = controlRun.outcome else {
+            return XCTFail(
+                "CONTROL: the stub itself must succeed through default "
+                    + "drains, got \(controlRun.outcome)"
+            )
+        }
+        XCTAssertTrue(
+            String(decoding: stdout, as: UTF8.self).contains("worktree /tmp/x"),
+            "CONTROL: the stub's stdout must arrive intact"
+        )
+
+        let calls = DrainBuildCounter()
+        // Built OUTSIDE the factory closure: the closure cannot throw, and
+        // the strand fence rightly forbids `try!` in a test source.
+        let broken = try drainOverADirectoryDescriptor(named: "broken-stdout-fd")
+        let runner = GitCommandRunner(
+            environment: stubEnvironment(pathDirectories: [stubs]),
+            defaultTimeout: 30,
+            drainFactory: { pipe in
+                // Call 3 is the COMMAND'S stdout drain; the probe (1, 2) and
+                // the command's stderr (4) stay healthy.
+                if calls.next() == 3 { return broken }
+                return PipeDrain(pipe: pipe)
+            }
+        )
+        let invocation = await runner.run(["worktree", "list"], timeout: 20)
+        XCTAssertEqual(
+            calls.count, 4,
+            "the factory must have built the probe's two drains and the "
+                + "command's two — a different count means the broken drain "
+                + "was not the command's stdout"
+        )
+        XCTAssertEqual(
+            invocation.outcome, .timeout,
+            "a stdout drain that died on a hard read error must be refused "
+                + "at the execute boundary; before fn-4.24 it ended like EOF "
+                + "and the truncated buffer shipped as `.success` — a "
+                + "porcelain listing with fewer worktrees"
+        )
+    }
+
+    /// The stderr arm of the same gate: a truncated stderr is a truncated
+    /// answer too (on the failure path it is THE answer), so either drain
+    /// dying on a hard read error refuses the invocation.
+    func testAHardStderrReadErrorAfterANormalExitIsRefusedNotShippedAsSuccess() async throws {
+        let stubs = base.appendingPathComponent("stubs-stderr-read-error")
+        _ = try GitFixture.makeStubGit(in: stubs, body: """
+        echo "worktree /tmp/x"
+        exit 0
+        """)
+
+        let control = GitCommandRunner(
+            environment: stubEnvironment(pathDirectories: [stubs]),
+            defaultTimeout: 30
+        )
+        let controlRun = await control.run(["worktree", "list"], timeout: 20)
+        guard case .success = controlRun.outcome else {
+            return XCTFail(
+                "CONTROL: the stub itself must succeed through default "
+                    + "drains, got \(controlRun.outcome)"
+            )
+        }
+
+        let calls = DrainBuildCounter()
+        let broken = try drainOverADirectoryDescriptor(named: "broken-stderr-fd")
+        let runner = GitCommandRunner(
+            environment: stubEnvironment(pathDirectories: [stubs]),
+            defaultTimeout: 30,
+            drainFactory: { pipe in
+                // Call 4 is the COMMAND'S stderr drain.
+                if calls.next() == 4 { return broken }
+                return PipeDrain(pipe: pipe)
+            }
+        )
+        let invocation = await runner.run(["worktree", "list"], timeout: 20)
+        XCTAssertEqual(calls.count, 4, "probe (2) + command (2) drains")
+        XCTAssertEqual(
+            invocation.outcome, .timeout,
+            "a stderr drain that died on a hard read error must refuse the "
+                + "invocation exactly like the stdout arm — fail closed on "
+                + "either stream"
+        )
+    }
+
     // MARK: - The drain's lock: bounded turns, and a closer nobody barges past
 
     /// A shell that starts `count` writers on the pipe's write end and then

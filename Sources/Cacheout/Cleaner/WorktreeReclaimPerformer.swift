@@ -3314,6 +3314,34 @@ struct WorktreeReclaimPerformer {
         // has already been bitten by. Holding a repository lock is git's to
         // give and it does not give one for this.
         //
+        // RATIFIED, 2026-08-27, BY THE PRODUCT OWNER — A CLEANUP DOES NOT
+        // WRITE REFS. This is a settled decision, not an open residual to
+        // re-fix; a future round proposing a preservation ref is reopening a
+        // decision, not closing an oversight (fn-4.29 records the closure).
+        // The ledger that decided it:
+        //
+        //   The residual harm here is OMISSION — failing to stop a THIRD
+        //   PARTY deleting the last ref inside a microsecond app-code window,
+        //   on an item the user asked us to delete — and even then we remove
+        //   a NAME, not the object: the commit stays recoverable via
+        //   `git fsck --unreachable` until gc expiry (~2 weeks by default).
+        //   Writing a ref is COMMISSION, on every prune, and its harms are
+        //   worse in kind: a preservation ref pins the commit, its tree and
+        //   every ancestor against gc — a cleanup tool that PINS storage —
+        //   and it is durable state other tools observe: `git for-each-ref`,
+        //   backup tooling, and `git push --mirror`, which would PUBLISH our
+        //   private ref to the user's remote. Ref writes also fail (lock
+        //   contention, reftable compaction), adding partial states a
+        //   read-only cleanup never had, and the ref needs a lifecycle
+        //   nobody owns. And the race would not even fully close: no git
+        //   transaction spans our unlink.
+        //
+        //   The zero-ref refusal above is already STRICTER than git itself —
+        //   `git worktree prune` deletes a prunable admin directory with no
+        //   reachability check at all — and it puts the preservation
+        //   decision in the user's hands, in git's own vocabulary (put the
+        //   commit on a branch), instead of inventing a parallel one.
+        //
         // It traverses nothing new: the queries are `git -C
         // <parentRepoWorkingDir>`, the target the guard above already covers
         // for the listing.

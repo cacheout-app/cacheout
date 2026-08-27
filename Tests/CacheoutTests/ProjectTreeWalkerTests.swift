@@ -1200,6 +1200,52 @@ final class ProjectTreeWalkerTests: XCTestCase {
     // MARK: - R12/fn-4.12: bare-EPERM neutrality (injected — EPERM cannot
     // be fixtured from an unentitled process)
 
+    /// Fails the descriptor OPEN itself (`openDirectoryNoFollow`) with a
+    /// chosen errno — the seam behind `issue(forFailedOpen:)`, which the
+    /// probe-failure double above never reaches.
+    private final class FailingOpenProvider: FileSystemIdentityProvider {
+        var failingPaths: Set<String> = []
+        var openErrno: Int32 = EPERM
+
+        override func openDirectoryNoFollow(at url: URL) -> Int32 {
+            if failingPaths.contains(url.path) {
+                errno = openErrno
+                return -1
+            }
+            return super.openDirectoryNoFollow(at: url)
+        }
+    }
+
+    func testRootOpenEPERMClassifiesNeutrallyAsUnreadable() throws {
+        let root = base.appendingPathComponent("open-denied")
+        try mkdir(root)
+
+        let provider = FailingOpenProvider()
+        provider.failingPaths = [root.path]
+        provider.openErrno = EPERM
+        let (events, issues) = recordedWalk(roots: [root], provider: provider)
+
+        XCTAssertTrue(events.isEmpty, "a root that cannot open is never walked")
+        // NEUTRAL since fn-4.12 — same rule as the probe classifier: a bare
+        // open(2) EPERM carries no provenance, so `.tccDenied` (and its
+        // GUI "Grant access…" link) may not be asserted from it.
+        XCTAssertEqual(issues.map(\.kind), [.unreadable],
+                       "bare open-EPERM is neutral — never .tccDenied (fn-4.12)")
+        XCTAssertTrue(
+            issues.first?.detail.contains("could not be established") == true,
+            "\(issues)"
+        )
+
+        // CONTROL: the same seam with EACCES asserts WHICH refusal fired —
+        // unambiguous BSD permissions keep their specific kind, proving the
+        // neutral cell above is not a collapse of the whole switch.
+        let eacces = FailingOpenProvider()
+        eacces.failingPaths = [root.path]
+        eacces.openErrno = EACCES
+        let (_, controlIssues) = recordedWalk(roots: [root], provider: eacces)
+        XCTAssertEqual(controlIssues.map(\.kind), [.permissionDenied])
+    }
+
     private final class FailingKindProbeProvider: FileSystemIdentityProvider {
         var failingNames: [String: Int32] = [:]
 

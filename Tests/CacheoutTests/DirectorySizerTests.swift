@@ -78,9 +78,23 @@ final class DirectorySizerTests: XCTestCase {
     }
 
     private func makeSizer(
-        provider: FileSystemIdentityProvider = FileSystemIdentityProvider()
+        provider: FileSystemIdentityProvider = FileSystemIdentityProvider(),
+        entryCap: Int? = DirectorySizer.defaultEntryCap
     ) -> DirectorySizer {
-        DirectorySizer(provider: provider)
+        DirectorySizer(provider: provider, entryCap: entryCap)
+    }
+
+    /// `count` EMPTY files under `root` — creation speed matters more than
+    /// bytes for the cancellation/cap fixtures (the walk stats each entry
+    /// either way).
+    private func makeManyEmptyFiles(_ root: URL, count: Int) throws {
+        try mkdir(root)
+        for index in 0..<count {
+            guard fm.createFile(
+                atPath: root.appendingPathComponent("e\(index)").path,
+                contents: nil
+            ) else { throw XCTSkip("createFile failed at \(index)") }
+        }
     }
 
     // MARK: - R2: bundles + hidden files + plain files, exact allocated total
@@ -718,6 +732,274 @@ final class DirectorySizerTests: XCTestCase {
                     + "\(provider.mountCheckedPaths)"
             )
         }
+    }
+
+    // MARK: - fn-4.15: cancellation is a first-class stop, never a silent
+    // completion
+
+    /// Runs `body` inside a task that is PROVABLY cancelled before `body`
+    /// starts: the task spins on `Task.isCancelled` (bounded, yielding) until
+    /// the cancel below it lands, so cancellation's stickiness guarantees
+    /// every `Task.isCancelled` read inside `body` answers true from the
+    /// first entry on. Deterministic — no mid-walk race to lose.
+    private func inPreCancelledTask<T: Sendable>(
+        _ body: @escaping @Sendable () -> T
+    ) async -> T? {
+        let task = Task.detached { () -> T? in
+            var spins = 0
+            while !Task.isCancelled {
+                spins += 1
+                if spins > 1_000_000 { return nil }  // bounded, never a park
+                await Task.yield()
+            }
+            return body()
+        }
+        task.cancel()
+        return await task.value
+    }
+
+    func testAPreCancelledMeasureStopsBeforeTheFirstEntry() async throws {
+        // 12 real entries: a walk that ignores cancellation enumerates all
+        // of them; a walk that honours it never counts one. Deterministic
+        // red/green — no timing window.
+        let root = base.appendingPathComponent("cancel-target")
+        try mkdir(root)
+        for index in 0..<12 {
+            try writeFile(root.appendingPathComponent("f\(index).bin"),
+                          bytes: 4_096)
+        }
+        let sizer = makeSizer()
+
+        let measured = await inPreCancelledTask {
+            sizer.measure(at: root, mode: .scanRoot)
+        }
+        let report = try XCTUnwrap(measured)
+
+        XCTAssertLessThan(
+            report.enumeratedEntries, 12,
+            "a measure running in an already-cancelled task must stop at its "
+                + "first between-entries check, not walk the whole tree"
+        )
+        XCTAssertTrue(
+            report.cancelled,
+            "a cancelled measure returns what it has MARKED PARTIAL — never "
+                + "silently complete"
+        )
+        // WHICH refusal fired (and the control against the fixture refusing
+        // for its own reasons): a cancelled stop is NOT a denial — the
+        // fixture is fully readable, so any recorded denial here means
+        // something else refused and the cell is lying about cancellation.
+        XCTAssertTrue(
+            report.denials.isEmpty,
+            "cancellation must not be dressed as a denial; unexpected: "
+                + "\(report.denials)"
+        )
+    }
+
+    func testTheSameFixtureUncancelledMeasuresCompletely() throws {
+        // CONTROL for the cell above: same shape, no cancellation — the walk
+        // must complete, so the cancelled cell's short count is attributable
+        // to cancellation and nothing else.
+        let root = base.appendingPathComponent("cancel-control")
+        try mkdir(root)
+        var files: [URL] = []
+        for index in 0..<12 {
+            files.append(try writeFile(
+                root.appendingPathComponent("f\(index).bin"), bytes: 4_096
+            ))
+        }
+
+        let report = makeSizer().measure(at: root, mode: .scanRoot)
+
+        XCTAssertEqual(report.enumeratedEntries, 12)
+        XCTAssertEqual(report.itemCount, 12)
+        XCTAssertEqual(report.exactAllocatedBytes, allocated(files))
+        XCTAssertTrue(report.denials.isEmpty)
+        XCTAssertFalse(report.cancelled,
+                       "an uncancelled complete walk is never marked partial")
+    }
+
+    /// The LATENCY evidence for the between-entries check (the figure to
+    /// beat, from PR #459 r16, was 46.3 ms of unabortable work): a cancel
+    /// landing mid-walk returns within one entry's processing, not at the
+    /// end of the tree. Timing-dependent by nature, so the cell retries the
+    /// race a bounded number of times and FAILS (never skips) if no attempt
+    /// observes a mid-walk stop — under a reverted cancellation check no
+    /// attempt ever can, which is what makes this cell mutation-killable.
+    func testAMidWalkCancelReturnsPromptly() async throws {
+        let root = base.appendingPathComponent("midwalk")
+        try makeManyEmptyFiles(root, count: 20_000)
+        let sizer = makeSizer()
+
+        // CONTROL, and the rate measurement backing `defaultEntryCap`'s doc.
+        let controlStart = Date()
+        let control = sizer.measure(at: root, mode: .scanRoot)
+        let fullDuration = Date().timeIntervalSince(controlStart)
+        XCTAssertEqual(control.enumeratedEntries, 20_000)
+        XCTAssertFalse(control.cancelled)
+        print("DirectorySizer rate: "
+              + "\(Int(Double(20_000) / max(fullDuration, 0.000_1))) entries/s "
+              + "(full walk \(fullDuration)s)")
+
+        for _ in 0..<5 {
+            let task = Task.detached { sizer.measure(at: root, mode: .scanRoot) }
+            // A quarter of the measured full-walk time: far enough in to
+            // start, far enough out to land before the end even if the warm
+            // cache halves the second walk's duration.
+            try await Task.sleep(
+                nanoseconds: UInt64(max(fullDuration * 0.25, 0.001) * 1e9)
+            )
+            let cancelledAt = Date()
+            task.cancel()
+            let report = await task.value
+            let latency = Date().timeIntervalSince(cancelledAt)
+            guard report.cancelled else { continue }  // walk won the race
+            XCTAssertLessThan(
+                report.enumeratedEntries, 20_000,
+                "a cancelled walk stopped early by definition"
+            )
+            XCTAssertLessThan(
+                latency, 1.0,
+                "return within a bounded time of the cancel — measured "
+                    + "granularity is one entry's processing; observed "
+                    + "\(latency)s"
+            )
+            print("cancel-to-return latency: \(latency)s after "
+                  + "\(report.enumeratedEntries) entries")
+            return
+        }
+        XCTFail(
+            "no attempt observed a mid-walk cancellation — either this "
+                + "machine walks 20k entries inside the sleep every time, or "
+                + "the between-entries check is gone"
+        )
+    }
+
+    // MARK: - fn-4.15: the entry cap — a DETERMINISTIC bound, disclosed as
+    // permanent
+
+    func testTheEntryCapStopsTheWalkAndDisclosesAPermanentFloor() throws {
+        let root = base.appendingPathComponent("capped")
+        try mkdir(root)
+        for index in 0..<10 {
+            try writeFile(root.appendingPathComponent("f\(index).bin"),
+                          bytes: 4_096)
+        }
+
+        let report = makeSizer(entryCap: 4).measure(at: root, mode: .scanRoot)
+
+        XCTAssertEqual(report.enumeratedEntries, 4,
+                       "the walk reads exactly the cap, then stops")
+        let capDenials = report.denials.filter { $0.kind == .enumerationCapped }
+        XCTAssertEqual(capDenials.count, 1,
+                       "ONE disclosure per capped walk, at the root; got "
+                           + "\(report.denials)")
+        // Path comparison, canonicalized: `.scanRoot` resolves the root, so
+        // the denial's URL is the /private/var spelling of the fixture.
+        XCTAssertEqual(capDenials.first?.url.standardizedFileURL.path,
+                       root.resolvingSymlinksInPath().standardizedFileURL.path)
+        XCTAssertFalse(report.cancelled,
+                       "the cap is not cancellation and must not claim it")
+        // The figures are a floor over the first 4 entries — strictly less
+        // than the tree's full 40 KiB.
+        XCTAssertGreaterThan(report.exactAllocatedBytes, 0)
+        XCTAssertLessThan(report.exactAllocatedBytes, allocated(
+            (0..<10).map { root.appendingPathComponent("f\($0).bin") }
+        ))
+    }
+
+    func testTheCapDisclosureNamesAPermanentConditionNeverARetry() throws {
+        // The deterministic-bound doctrine: this project once shipped a
+        // deterministic refusal whose printed remedy was "re-scan", which
+        // could never clear it. The cap's sentence must state permanence and
+        // must not offer a retry in any wording.
+        let root = base.appendingPathComponent("cap-wording")
+        try mkdir(root)
+        for index in 0..<6 {
+            try writeFile(root.appendingPathComponent("f\(index).bin"))
+        }
+
+        let report = makeSizer(entryCap: 2).measure(at: root, mode: .scanRoot)
+        let denial = try XCTUnwrap(
+            report.denials.first { $0.kind == .enumerationCapped }
+        )
+        let detail = denial.detail.lowercased()
+        for forbidden in ["re-scan", "rescan", "scan again", "try again",
+                          "retry", "later scan"] {
+            XCTAssertFalse(detail.contains(forbidden),
+                           "a deterministic cap may not promise '\(forbidden)'"
+                               + " — detail: \(denial.detail)")
+        }
+        XCTAssertTrue(detail.contains("cannot"),
+                      "permanence must be stated, not implied: \(denial.detail)")
+    }
+
+    func testAnExactFitTreeMakesNoTruncationClaim() throws {
+        // The `wasCutShort` rule: a walk whose LAST entitled entry happens to
+        // be the tree's last makes no claim of incompleteness — the cap
+        // discloses only when a further entry actually existed.
+        let root = base.appendingPathComponent("exact-fit")
+        try mkdir(root)
+        var files: [URL] = []
+        for index in 0..<4 {
+            files.append(try writeFile(
+                root.appendingPathComponent("f\(index).bin"), bytes: 4_096
+            ))
+        }
+
+        let report = makeSizer(entryCap: 4).measure(at: root, mode: .scanRoot)
+
+        XCTAssertEqual(report.enumeratedEntries, 4)
+        XCTAssertTrue(report.denials.isEmpty,
+                      "an exact fit is COMPLETE — no truncation claim; got "
+                          + "\(report.denials)")
+        XCTAssertEqual(report.exactAllocatedBytes, allocated(files))
+    }
+
+    func testAnUncappedSizerWalksPastACappedOnesStopPoint() throws {
+        // `entryCap: nil` is the delete-time configuration: the same fixture
+        // a capped sizer truncates must measure completely.
+        let root = base.appendingPathComponent("uncapped")
+        try mkdir(root)
+        var files: [URL] = []
+        for index in 0..<10 {
+            files.append(try writeFile(
+                root.appendingPathComponent("f\(index).bin"), bytes: 4_096
+            ))
+        }
+
+        let capped = makeSizer(entryCap: 4).measure(at: root, mode: .scanRoot)
+        let uncapped = makeSizer(entryCap: nil).measure(at: root, mode: .scanRoot)
+
+        XCTAssertEqual(capped.enumeratedEntries, 4)
+        XCTAssertEqual(uncapped.enumeratedEntries, 10)
+        XCTAssertTrue(uncapped.denials.isEmpty)
+        XCTAssertEqual(uncapped.exactAllocatedBytes, allocated(files))
+    }
+
+    func testAPreCancelledWalkIsNotDressedAsTheCap() async throws {
+        // ARM SEPARATION (the round-16 lesson: a neighbouring check can
+        // answer a cell meant for another): under cancellation AND a tight
+        // cap, the stop is attributed to cancellation — partial flag set, no
+        // cap denial fabricated for entries the walk never read.
+        let root = base.appendingPathComponent("cancel-vs-cap")
+        try mkdir(root)
+        for index in 0..<10 {
+            try writeFile(root.appendingPathComponent("f\(index).bin"))
+        }
+        let sizer = makeSizer(entryCap: 4)
+
+        let measured = await inPreCancelledTask {
+            sizer.measure(at: root, mode: .scanRoot)
+        }
+        let report = try XCTUnwrap(measured)
+
+        XCTAssertTrue(report.cancelled, "the stop was cancellation")
+        XCTAssertTrue(
+            report.denials.isEmpty,
+            "no cap disclosure for a walk the cap never bounded: "
+                + "\(report.denials)"
+        )
     }
 }
 

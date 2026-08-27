@@ -116,6 +116,13 @@ struct SizeDenial: Equatable {
         /// distinguished. What it is NOT any more is a reason the item
         /// cannot be DELETED: `DepthSafeRemoval` addresses this tree.
         case unaddressablePath
+        /// The walk hit this sizer's entry cap with entries still unread
+        /// (fn-4.15). DETERMINISTIC: the same tree re-measures to the same
+        /// cap, so no re-scan can ever clear this — the denial's `detail`
+        /// must state permanence (the only clearing act is shrinking the
+        /// tree) and must never promise a retry. Every byte/count figure in
+        /// a capped report is a FLOOR over the first `entryCap` entries.
+        case enumerationCapped
         /// Anything else — recorded, never swallowed.
         case other
     }
@@ -185,6 +192,17 @@ struct SizeReport {
     /// child churn and lie about content age. `nil` when no regular file's
     /// date could be read.
     var newestContentDate: Date?
+    /// The walk observed task cancellation and STOPPED with entries still
+    /// unread (fn-4.15). Every figure in the report is then a floor over
+    /// whatever was measured before the stop — a caller may not consume a
+    /// cancelled report as a complete measurement (the delete-time mount
+    /// doctrine reads `mountBoundaries` as "the whole tree was swept", which
+    /// a cancelled walk cannot claim). Deliberately NOT a denial: nothing
+    /// refused the read, and a retry CAN differ — cancellation is a caller
+    /// act, not a property of the tree. Never set by a walk that ran out of
+    /// entries before it observed the cancellation: such a report IS
+    /// complete.
+    var cancelled: Bool = false
 
     /// The two byte components summed — what a scan row displays today.
     var measuredBytes: Int64 { exactAllocatedBytes + estimatedUpToBytes }
@@ -200,11 +218,50 @@ struct DirectorySizer {
         case deletionTarget
     }
 
+    /// The default entry cap a sizing walk spends before it stops and
+    /// records `.enumerationCapped` (fn-4.15). THE VALUE IS A DESIGN
+    /// DECISION, sized against measurement, not folklore: this walk runs at
+    /// ~111k entries/s on a warm APFS volume (measured over a 20k-entry
+    /// fixture; the figure is printed by
+    /// `DirectorySizerTests.testAMidWalkCancelReturnsPromptly` on every
+    /// run), and the largest real trees this project has evidence for are
+    /// far below the cap — a full `.build` here holds 5,917 entries for
+    /// 481 MB, which extrapolates the 23G field-evidence worktrees tree
+    /// (`FIELD-EVIDENCE-2026-08-06.md`, scenario 2) to roughly 300k
+    /// entries. So 2,000,000 clears every evidenced real tree by better
+    /// than 6x while bounding a pathological one at ~18 s of walk, and
+    /// cancellation (checked every entry, 25 µs cancel-to-return measured)
+    /// covers the user who will not wait even that long.
+    ///
+    /// COMPOSITION (the product rule): this cap is PER MEASURE CALL. A
+    /// scanner that sizes N candidates spends at most N × cap entries per
+    /// scan — bounded per scan because every scanner's candidate list is
+    /// itself bounded (categories: fixed root list; orphaned-caches sweep:
+    /// one directory's children; build artifacts / worktrees: the walker's
+    /// own entry budget) — and the per-entry cancellation check is what
+    /// bounds the wait a user actually experiences.
+    static let defaultEntryCap = 2_000_000
+
     private let provider: FileSystemIdentityProvider
+    /// Entries one `enumerateTree` walk may read before stopping with
+    /// `.enumerationCapped`; `nil` = uncapped. `nil` is reserved for the
+    /// DELETE-TIME verification sizer (`CacheCleaner`'s): the mount doctrine
+    /// consumes `mountBoundaries` as proof the WHOLE tree was swept, so a
+    /// capped delete-time walk would have to fail closed — and a
+    /// deterministic cap that blocks deletion is a permanent strand (the
+    /// tree can never measure differently). Delete-time work stays bounded
+    /// anyway: the sizing pass is at most proportional to the deletion the
+    /// caller is about to perform over the same tree, and it is cancellable
+    /// per entry.
+    private let entryCap: Int?
     private let fileManager = FileManager.default
 
-    init(provider: FileSystemIdentityProvider = FileSystemIdentityProvider()) {
+    init(
+        provider: FileSystemIdentityProvider = FileSystemIdentityProvider(),
+        entryCap: Int? = DirectorySizer.defaultEntryCap
+    ) {
         self.provider = provider
+        self.entryCap = entryCap
     }
 
     /// Measure the tree (or leaf) at `url`. Pure function: never mutates
@@ -321,7 +378,37 @@ struct DirectorySizer {
         let rootDevice = provider.deviceID(of: root)
 
         while let next = enumerator.nextObject() {
+            // CANCELLATION, between entries (fn-4.15) — the walk was
+            // unabortable before this: a scanner cancelled mid-measure kept
+            // walking to the end of the tree. Checked BEFORE the pulled
+            // entry is processed, so a cancelled walk never half-counts an
+            // entry; the granularity is one entry's processing (measured in
+            // `DirectorySizerTests.testAMidWalkCancelReturnsPromptly`).
+            // Reached only when the enumerator HANDED BACK another entry, so
+            // an exhausted walk that never observed the flag stays complete
+            // (`cancelled == false`) — see `SizeReport.cancelled`.
+            if Task.isCancelled {
+                report.cancelled = true
+                break
+            }
             guard let itemURL = next as? URL else { continue }
+            // THE ENTRY CAP (fn-4.15), spent only when a FURTHER entry
+            // actually exists: an exact-fit tree ends the loop above with no
+            // truncation claim (the `PrefilterBudget.wasCutShort` rule). The
+            // cap is deterministic over a static tree, so the disclosure
+            // states permanence and offers no retry — the
+            // deterministic-bound doctrine's one honest wording.
+            if let cap = entryCap, report.enumeratedEntries >= cap {
+                report.denials.append(SizeDenial(
+                    url: root, kind: .enumerationCapped,
+                    detail: "this folder holds more than \(cap) entries — "
+                        + "more than a sizing walk will ever read, so every "
+                        + "figure shown for it is a floor over the first "
+                        + "\(cap); measuring again cannot reach further "
+                        + "(only removing entries from the folder can)"
+                ))
+                break
+            }
             // The CENSUS, counted before any classification: every entry the
             // enumerator yielded, whatever it turns out to be and whether or
             // not it survives to contribute bytes.
@@ -561,7 +648,11 @@ extension SizeDenial.Kind {
         switch self {
         case .tcc: return .tccDenied
         case .permission: return .permissionDenied
-        case .metadata, .other, .unaddressablePath: return .other
+        // The cap is neither a TCC nor a BSD denial and no grant lifts it;
+        // `.other` here, and the truncation-specific `ScanIssue` kind where
+        // an issue surface exists (`OrphanedCachesScanner.rootIssueKind`).
+        case .metadata, .other, .unaddressablePath, .enumerationCapped:
+            return .other
         }
     }
 }

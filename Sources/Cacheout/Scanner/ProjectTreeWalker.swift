@@ -656,6 +656,10 @@ struct ProjectTreeWalker {
         // `overlongDescendantPathBytes` now feeds the row's SIZE CAVEAT only
         // — the refusal it used to drive was retired with its premise.
         case .metadata, .other, .unaddressablePath: kind = .unreadable
+        // The sizer's entry cap (fn-4.15). This walker never runs the sizer's
+        // enumeration, so the arm is unreachable today; it maps to the
+        // taxonomy's truncation kind so a future sizer-fed path stays honest.
+        case .enumerationCapped: kind = .enumerationTruncated
         }
         return ScanIssue(url: denial.url, kind: kind, detail: denial.detail)
     }

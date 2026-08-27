@@ -553,6 +553,106 @@ final class CacheCleanerTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: goodB.path))
     }
 
+    // MARK: - fn-4.15: a CANCELLED (partial) measurement fails closed
+
+    /// Runs `body` inside a task that is PROVABLY cancelled before `body`
+    /// starts (bounded spin on `Task.isCancelled`, then the already-cancelled
+    /// task runs `body`); cancellation's stickiness makes every
+    /// `Task.isCancelled` read inside answer true — deterministic, no race.
+    private func inPreCancelledTask<T: Sendable>(
+        _ body: @escaping @Sendable () async -> T
+    ) async -> T? {
+        let task = Task.detached { () -> T? in
+            var spins = 0
+            while !Task.isCancelled {
+                spins += 1
+                if spins > 1_000_000 { return nil }  // bounded, never a park
+                await Task.yield()
+            }
+            return await body()
+        }
+        task.cancel()
+        return await task.value
+    }
+
+    /// The CATEGORY-CHILD arm: the delete-time sizer is uncapped but
+    /// cancellable, and a walk that stopped on cancellation swept only part
+    /// of the tree — its mount check and its claims are both partial, so the
+    /// child is refused, not deleted. REAL path end to end: the production
+    /// sizer marks the report inside an already-cancelled task.
+    ///
+    /// MUTATION: delete the `report.cancelled` guard in the category-child
+    /// arm — RED here (the child is deleted despite the partial sweep).
+    func testACancelledMeasurementRefusesTheCategoryChildNotDeletes() async throws {
+        let root = try makeTempDir("cancelled-category-root")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let child = root.appendingPathComponent("payload-dir")
+        try FileManager.default.createDirectory(at: child, withIntermediateDirectories: true)
+        try writeFile(child.appendingPathComponent("payload.bin"))
+
+        let category = makeCategory(at: root, name: "cancelled-cat")
+        let cleaner = CacheCleaner(containerRoots: [])
+        let items = categoryItems([makeScanResult(category: category)])
+
+        let cleaned = await inPreCancelledTask {
+            await cleaner.clean(items: items, moveToTrash: false)
+        }
+        let report = try XCTUnwrap(cleaned)
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: child.path),
+                      "a partially-measured child must not be deleted")
+        XCTAssertEqual(report.errors.count, 1)
+        let message = try XCTUnwrap(report.errors.first?.message)
+        // WHICH refusal fired: cancellation, not the mount arm and not a
+        // denial — and honestly retryable (a new clean re-measures).
+        XCTAssertTrue(message.contains("cancelled"), message)
+        XCTAssertTrue(message.contains("not permanent"), message)
+
+        // CONTROL: the identical fixture, uncancelled, deletes cleanly — so
+        // the refusal above is attributable to cancellation alone.
+        let control = await cleaner.clean(items: items, moveToTrash: false)
+        XCTAssertTrue(control.errors.isEmpty,
+                      "\(control.errors.map(\.message))")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: child.path))
+    }
+
+    /// The ITEM-TARGET arm: same rule through `clean(items:)`'s removeItem
+    /// pipeline.
+    ///
+    /// MUTATION: delete the `report.cancelled` guard in the item arm — RED
+    /// here (the target is deleted despite the partial sweep).
+    func testACancelledMeasurementRefusesTheItemTargetNotDeletes() async throws {
+        let root = try makeTempDir("cancelled-item-root")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let target = root.appendingPathComponent("proj/artifacts")
+        try FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
+        try writeFile(target.appendingPathComponent("a.json"))
+
+        let items = [removableItem(at: target, originContainer: root)]
+        let cleaner = CacheCleaner(
+            containerRoots: [root], containerSnapshot: sessionSnapshot(of: [root])
+        )
+
+        let cleaned = await inPreCancelledTask {
+            await cleaner.clean(items: items, moveToTrash: false)
+        }
+        let report = try XCTUnwrap(cleaned)
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: target.path),
+                      "a partially-measured item must not be deleted")
+        XCTAssertEqual(report.errors.count, 1)
+        XCTAssertTrue(report.entries.isEmpty, "nothing was freed")
+        let message = try XCTUnwrap(report.errors.first?.message)
+        XCTAssertTrue(message.contains("cancelled"), message)
+        XCTAssertTrue(message.contains("not permanent"), message)
+
+        // CONTROL: uncancelled, the same item deletes.
+        let control = await cleaner.clean(items: items, moveToTrash: false)
+        XCTAssertTrue(control.errors.isEmpty,
+                      "\(control.errors.map(\.message))")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: target.path))
+    }
+
     // MARK: - Honest freed bytes (R1/R16)
 
     func testCategoryFreedEqualsMeasuredDeletedBytesAcrossTwoPaths() async throws {

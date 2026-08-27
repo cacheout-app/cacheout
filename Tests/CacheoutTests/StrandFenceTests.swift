@@ -104,7 +104,7 @@ import XCTest
 ///    puts a second one.
 ///
 ///    MEASURED AT THIS COMMIT'S PARENT, by mutating ONE production line —
-///    `Sources/Cacheout/Cleaner/CacheCleaner.swift:514`, `if let entry =
+///    `Sources/Cacheout/Cleaner/CacheCleaner.swift:523`, `if let entry =
 ///    outcome.entry { entries.append(entry) }`, appended twice, which is the
 ///    shape of SCANNERS-ROADMAP defect D1. With the old constructor at
 ///    `CacheCleanerTests:1385` the run died with `Fatal error: Duplicate

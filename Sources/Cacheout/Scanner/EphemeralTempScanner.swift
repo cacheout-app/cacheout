@@ -159,7 +159,7 @@
 ///   `.tcc` ⇒ NEUTRAL `.other`-kind `ScanError` with the detail preserved,
 ///   because `SizeDenial.Kind.tcc` CONFLATES chain-proven denials
 ///   (`classifyDenial`'s `case .some(Int(EPERM))` arm,
-///   `DirectorySizer.swift:483`) with raw-probe guesses
+///   `DirectorySizer.swift:570`) with raw-probe guesses
 ///   (`denial(forFailedProbe:errno:)`'s `case EPERM`, :545); the only
 ///   surviving discriminator is a detail STRING, and classification derived
 ///   from message text is forbidden house doctrine (`CacheCleaner.refusalTag`
@@ -1876,6 +1876,11 @@ struct EphemeralTempScanner: @unchecked Sendable {
             // descriptor-relative and handles such trees whole.
             case .metadata, .other, .unaddressablePath:
                 return (.unreadable, "\(url.path): \(denial.detail)")
+            // Unreachable from `classifyDenial` (errno classification never
+            // yields the cap); mapped rather than defaulted so the switch
+            // stays a reviewer's inventory (fn-4.15).
+            case .enumerationCapped:
+                return (.enumerationTruncated, "\(url.path): \(denial.detail)")
             }
         case .metadataUnavailable:
             return (.unreadable, "\(url.path): metadata unavailable")
@@ -1890,6 +1895,13 @@ struct EphemeralTempScanner: @unchecked Sendable {
                         "\(denial.url.path): \(denial.detail)")
             case .tcc, .metadata, .other, .unaddressablePath:
                 return (.unreadable, "\(denial.url.path): \(denial.detail)")
+            // The sizer's entry cap (fn-4.15): the taxonomy's truncation
+            // kind, whose GUI label ("too many entries — partially
+            // inspected") is exactly true; the detail carries the sizer's
+            // own no-retry sentence verbatim.
+            case .enumerationCapped:
+                return (.enumerationTruncated,
+                        "\(denial.url.path): \(denial.detail)")
             }
         }
     }

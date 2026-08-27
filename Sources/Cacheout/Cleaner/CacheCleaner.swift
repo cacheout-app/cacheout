@@ -343,7 +343,16 @@ actor CacheCleaner {
     ) {
         self.home = home
         self.provider = provider
-        self.sizer = DirectorySizer(provider: provider)
+        // UNCAPPED on purpose (fn-4.15): this is the DELETE-TIME verification
+        // sizer, and the mount-doctrine consumers below read the report's
+        // `mountBoundaries` as "the whole tree was swept" — a capped walk
+        // could not claim that, so a cap here would have to fail closed, and
+        // a deterministic cap that blocks deletion is a permanent strand
+        // (the same tree re-measures to the same cap forever). The pass
+        // stays bounded by the tree the caller is about to delete over the
+        // same entries anyway, and it is cancellable per entry; a CANCELLED
+        // (partial) report is refused by every consumer, not consumed.
+        self.sizer = DirectorySizer(provider: provider, entryCap: nil)
         self.pathGuard = PathGuard(
             home: home, containerRoots: containerRoots, provider: provider
         )
@@ -1176,6 +1185,20 @@ actor CacheCleaner {
             knownInodes: await registry.knownIdentities
         )
 
+        // A CANCELLED measurement is a PARTIAL one (fn-4.15): the mount
+        // check below is only sound over a report that swept the whole tree,
+        // and a partial claims registration would under-account. Fail closed
+        // — and say honestly that a retry CAN differ (cancellation is a
+        // caller act, never a property of this tree). Bound where the fact
+        // is first read: this is the first consumer of `report`.
+        if report.cancelled {
+            let detail = "\(child.path): measurement was cancelled before "
+                + "the tree was fully inspected — refused, not deleted "
+                + "(cleaning again re-measures; this refusal is not permanent)"
+            logRefusal(label: label, tag: "measurement_cancelled", detail: detail)
+            return .failed(detail)
+        }
+
         // ANY mount boundary in the measured tree — the child itself, or a
         // mounted subtree nested anywhere beneath it — refuses the deletion.
         // The sizer records-and-skips boundaries for SIZING, but `removeItem`
@@ -1451,6 +1474,19 @@ actor CacheCleaner {
             at: target, mode: .deletionTarget,
             knownInodes: await registry.knownIdentities
         )
+
+        // A CANCELLED measurement is a PARTIAL one (fn-4.15) — same
+        // fail-closed rule as the category-child arm above, for the same two
+        // reasons (an unswept mount check, an under-registered claim set),
+        // and the same honest retryability: a new clean re-measures.
+        if report.cancelled {
+            let detail = "\(target.path): measurement was cancelled before "
+                + "the tree was fully inspected — refused, not deleted "
+                + "(cleaning again re-measures; this refusal is not permanent)"
+            logRefusal(label: item.displayName, tag: "measurement_cancelled",
+                       detail: detail)
+            return (nil, [Self.itemError(item, detail)])
+        }
 
         // Same mount doctrine as category children (R15): a boundary
         // anywhere in the measured tree refuses the deletion —

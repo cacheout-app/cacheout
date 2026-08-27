@@ -3770,7 +3770,7 @@ final class BuildArtifactsScannerTests: XCTestCase {
         async throws
     {
         // The ROOT cell. The sizer declines to enumerate its own root when
-        // that root is a mount (`DirectorySizer.swift:261-272`); the probe must
+        // that root is a mount (`DirectorySizer.swift:317-332`); the probe must
         // decline identically, or it reads a whole foreign volume that the
         // caller has already denied.
         let artifact = try makeProject(

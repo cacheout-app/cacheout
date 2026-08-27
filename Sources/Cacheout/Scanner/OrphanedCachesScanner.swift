@@ -1048,8 +1048,8 @@ struct OrphanedCachesScanner: @unchecked Sendable {
     ///    decision is taken on this spelling.
     ///
     /// NO-CROSS rule (safety — PR #458 review, matching the sizer's own
-    /// root check at `DirectorySizer.swift:261-272` and its within-walk check at
-    /// `DirectorySizer.swift:354-359`): mount boundaries are never crossed, at
+    /// root check at `DirectorySizer.swift:317-332` and its within-walk check at
+    /// `DirectorySizer.swift:443-448`): mount boundaries are never crossed, at
     /// the root or anywhere beneath it, and an uncrossed boundary makes the
     /// probe INCOMPLETE. Both signals are now read from DESCRIPTORS —
     /// `f_fsid` plus `st_dev` (see `crossesMountBoundary`) — which is
@@ -1440,7 +1440,7 @@ struct OrphanedCachesScanner: @unchecked Sendable {
         }
 
         // MOUNT BOUNDARY AT THE ROOT, before anything below it is read —
-        // the same stance `DirectorySizer.swift:261-272` takes on its own root.
+        // the same stance `DirectorySizer.swift:317-332` takes on its own root.
         // An entry that IS a mount is not enumerated at all: not one entry
         // of the foreign filesystem is read, and the verdict is INCOMPLETE
         // precisely because we did not look.
@@ -2948,6 +2948,11 @@ extension OrphanedCachesScanner: SpaceScanner {
         case .tcc: return .tccDenied
         case .permission: return .permissionDenied
         case .metadata, .other, .unaddressablePath: return .unreadable
+        // The sizer's entry cap (fn-4.15) is the condition the GUI already
+        // words for this issue kind ("too many entries — partially
+        // inspected") — deterministic, so the denial's own detail carries
+        // the no-retry wording.
+        case .enumerationCapped: return .enumerationTruncated
         }
     }
 

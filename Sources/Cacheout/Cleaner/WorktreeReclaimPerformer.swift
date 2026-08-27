@@ -695,6 +695,18 @@ struct WorktreeReclaimPerformer {
         let report = measure(
             worktreePath, .deletionTarget, await registry.knownIdentities
         )
+        // (3b) A CANCELLED measurement is a PARTIAL one (fn-4.15): the
+        // mount doctrine below is only sound over a report that swept the
+        // whole tree. Fail closed, first consumer of the report — and the
+        // refusal is honestly retryable (a new clean re-measures).
+        if report.cancelled {
+            let detail = "\(worktreePath.path): measurement was cancelled "
+                + "before the tree was fully inspected — refused, not "
+                + "deleted (cleaning again re-measures; this refusal is not "
+                + "permanent)"
+            logRefusal("measurement_cancelled", detail)
+            return failure(item, detail, tag: nil)
+        }
         // (4) Mount doctrine (`removeGuardedItem` parity): a boundary at the
         // target or nested anywhere beneath it refuses the deletion — the
         // removal would recurse straight through an inner mount.
@@ -1198,6 +1210,18 @@ struct WorktreeReclaimPerformer {
             let report = measure(
                 directory, .deletionTarget, await registry.knownIdentities
             )
+            // (4b) A CANCELLED measurement is a PARTIAL one (fn-4.15) —
+            // same fail-closed rule as the worktree arm, before any claim
+            // is registered; honestly retryable.
+            if report.cancelled {
+                let detail = "refused: measurement of affected admin "
+                    + "directory \(directory.path) was cancelled before the "
+                    + "tree was fully inspected — nothing was pruned "
+                    + "(cleaning again re-measures; this refusal is not "
+                    + "permanent)"
+                logRefusal("measurement_cancelled", detail)
+                return failure(item, detail, tag: nil)
+            }
             // (5) MOUNT DOCTRINE (epic round 9): the removal is a
             // RECURSIVE filesystem mutation over these directories, so the
             // boundary-bearing-recursive-delete rule applies exactly as it

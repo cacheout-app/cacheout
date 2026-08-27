@@ -5239,6 +5239,90 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
                      "the refusal precedes the prune")
     }
 
+    // MARK: - fn-4.15: a CANCELLED (partial) measurement fails closed
+
+    /// The worktree arm: a measure that stopped on cancellation swept only
+    /// part of the tree, so the mount doctrine downstream would be judging
+    /// an unswept remainder — the performer must refuse, not proceed.
+    /// Simulated at the sizer seam (like the mount cell above) because the
+    /// report's `cancelled` flag IS the production sizer's marking; the
+    /// sizer-side cells in `DirectorySizerTests` prove the real walk sets it.
+    ///
+    /// MUTATION: delete the `report.cancelled` arm in the worktree path —
+    /// RED here (the removal proceeds and the worktree is gone).
+    func testACancelledMeasurementRefusesTheWorktreeRemoval() async throws {
+        let repository = try makeRepository(named: "repo-cancel")
+        let worktree = try addWorktree(
+            named: "wt-cancel", branch: "feature", in: repository
+        )
+        let membership = try membership(of: worktree, in: repository)
+        let plan = staleplan(worktree: worktree, membership: membership)
+
+        let runner = InterceptingGitRunner(wrapping: realRunner())
+        let refusals = RefusalLog()
+        let performer = makePerformer(
+            runner: runner,
+            measure: { url, _, _ in
+                var report = SizeReport()
+                if url.path == worktree.path { report.cancelled = true }
+                return report
+            },
+            refusals: refusals
+        )
+        let outcome = await perform(item(plan), plan: plan, with: performer)
+
+        XCTAssertNil(outcome.entry, "a partial measurement credits nothing")
+        let message = try XCTUnwrap(outcome.errors.first?.message)
+        XCTAssertTrue(message.contains("cancelled"), message)
+        // WHICH refusal fired — the tag separates this arm from the mount
+        // arm and from a seam refusal collapsing into the generic catch.
+        XCTAssertEqual(refusals.tags, ["measurement_cancelled"])
+        // Honest retryability: cancellation is a caller act, so the message
+        // must SAY a retry can differ — never read as permanent.
+        XCTAssertTrue(message.contains("not permanent"), message)
+        XCTAssertTrue(fm.fileExists(atPath: worktree.path),
+                      "refused, not deleted")
+        XCTAssertNil(runner.argvs.first { $0.contains("remove") },
+                     "the refusal precedes any destructive git")
+    }
+
+    /// The admin-prune arm: same rule, before any claim registration and
+    /// before the prune.
+    ///
+    /// MUTATION: delete the `report.cancelled` arm in the prune path — RED
+    /// here (the directory is removed and a row emitted).
+    func testACancelledMeasurementRefusesTheAdminPruneBeforeClaims()
+        async throws
+    {
+        let fixture = try makePruneFixture(orphans: ["gone"])
+        let orphan = try XCTUnwrapElement(fixture.admin, 0)
+        let plan = prunePlan(membership: fixture.membership, disclosed: [orphan])
+        let runner = InterceptingGitRunner(wrapping: realRunner())
+        let refusals = RefusalLog()
+        let performer = makePerformer(
+            runner: runner,
+            measure: { url, _, _ in
+                var report = SizeReport()
+                if url.path == orphan.path { report.cancelled = true }
+                return report
+            },
+            refusals: refusals
+        )
+        let outcome = await perform(
+            item(plan, id: "prune"), plan: plan, with: performer
+        )
+
+        XCTAssertNil(outcome.entry)
+        let message = try XCTUnwrap(outcome.errors.first?.message)
+        XCTAssertTrue(message.contains("cancelled"), message)
+        XCTAssertTrue(message.contains("nothing was pruned"), message)
+        XCTAssertTrue(message.contains("not permanent"), message)
+        XCTAssertEqual(refusals.tags, ["measurement_cancelled"])
+        XCTAssertTrue(fm.fileExists(atPath: orphan.path),
+                      "refused, not pruned")
+        XCTAssertNil(runner.argvs.first { $0.contains("prune") },
+                     "the refusal precedes the prune")
+    }
 
     /// A DELETE-TIME MEASUREMENT THAT COULD NOT READ THROUGH THE DIRECTORY
     /// REFUSES THE WHOLE PRUNE (PR #460 codex r18, C6).

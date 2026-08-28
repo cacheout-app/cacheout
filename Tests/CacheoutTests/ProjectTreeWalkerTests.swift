@@ -611,6 +611,69 @@ final class ProjectTreeWalkerTests: XCTestCase {
         }
     }
 
+    /// The mount table is consulted BEFORE the root is probed — the
+    /// contract the paragraph has claimed since fn-4.12 while the code did
+    /// the opposite (PR #461 codex r1).
+    ///
+    /// The order is the whole guard: on an UNRESPONSIVE mounted volume the
+    /// `lstat` never returns, so probing first means the walk hangs, the
+    /// `.mountedVolumeRoot` issue this cell asserts is never emitted, and the
+    /// session reaches its watchdog leaving a blocked worker behind. A
+    /// hanging provider cannot be used to prove that (it would hang the
+    /// suite, which is the defect, not a test) — so this counts instead: a
+    /// provider that RECORDS every probe must record NONE for the mounted
+    /// root, which is exactly what makes the hang unreachable.
+    ///
+    /// MUTATION: move `let rootProbe = provider.probeKind(of: root)` back
+    /// above the mount-table block and this cell reds on the recorded probe.
+    func testAMountedRootIsNeverProbedBecauseTheTableAnswersFirst() throws {
+        let volume = base.appendingPathComponent("UnresponsiveMount")
+        try mkdir(volume)
+        let provider = ProbeRecordingMountProvider()
+        provider.injectedMountPoints = [volume.path]
+
+        let walker = ProjectTreeWalker(
+            home: home,
+            pathGuard: PathGuard(
+                home: home, containerRoots: [volume], provider: provider
+            ),
+            provider: provider
+        )
+        let issues = walker.walk(
+            roots: [volume],
+            consumers: [{ (_: ProjectTreeEvent) -> Set<String> in [] }]
+        )
+
+        XCTAssertEqual(
+            provider.probedPaths.filter { $0 == volume.path }, [],
+            "the mounted root was probed — on an unresponsive volume that "
+                + "lstat is the hang the table check exists to avoid, and it "
+                + "happens before the guard can classify it: \(provider.probedPaths)"
+        )
+        XCTAssertEqual(
+            issues.map(\.kind), [ScanIssue.Kind.mountedVolumeRoot],
+            "the table answer must still be the emitted verdict: \(issues)"
+        )
+    }
+
+    private final class ProbeRecordingMountProvider:
+        FileSystemIdentityProvider
+    {
+        var injectedMountPoints: Set<String> = []
+        private(set) var probedPaths: [String] = []
+        override func mountPointPaths() -> [String] {
+            Array(injectedMountPoints) + super.mountPointPaths()
+        }
+        override func isMountPoint(_ url: URL) -> Bool {
+            if injectedMountPoints.contains(url.path) { return true }
+            return super.isMountPoint(url)
+        }
+        override func probeKind(of url: URL) -> KindProbe {
+            probedPaths.append(url.path)
+            return super.probeKind(of: url)
+        }
+    }
+
     func testMountedConfiguredRootClassifiesAsMountedVolumeRootNotPolicy() throws {
         // A volume mounted exactly at a configured dev root (fn-4.12): the
         // condition is the machine's, not the configuration's, and it is

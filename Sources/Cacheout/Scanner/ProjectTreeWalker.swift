@@ -295,12 +295,16 @@ struct ProjectTreeWalker {
                 continue
             }
 
-            // ABSENT root: honest no-item omission — machines differ, and
-            // the seeds routinely include roots that do not exist. No issue,
-            // no events (epic registration-time story).
-            let rootProbe = provider.probeKind(of: root)
-            if rootProbe == .absent { continue }
-
+            // MOUNT FIRST, AND NOW ACTUALLY FIRST (PR #461 codex r1). The
+            // paragraph below has said MOUNT FIRST since fn-4.12 while the
+            // root probe ran above it, so an unresponsive mounted volume was
+            // `lstat`ed before the guard that exists to avoid touching it:
+            // the walk hung, the `.mountedVolumeRoot` issue was never
+            // emitted, and the session reached its watchdog leaving a blocked
+            // worker behind. The comment described the contract; the order
+            // did not honour it. The kernel table is memory — it costs no
+            // filesystem call — so asking it first is free.
+            //
             // MOUNT FIRST (fn-4.12, the `EphemeralTempScanner` shape): a
             // kernel-table mount standing at a configured root is a
             // CONDITION of the machine, not a refusal of the root, and it
@@ -321,6 +325,13 @@ struct ProjectTreeWalker {
                 ))
                 continue
             }
+
+            // ABSENT root: honest no-item omission — machines differ, and
+            // the seeds routinely include roots that do not exist. No issue,
+            // no events (epic registration-time story). Asked AFTER the
+            // mount table, which is what makes the hang impossible.
+            let rootProbe = provider.probeKind(of: root)
+            if rootProbe == .absent { continue }
 
             // Container admission BEFORE any traversal — the SCAN-TIME
             // read-only mode (fn-3.4 round 9): no snapshot, and this token

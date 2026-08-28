@@ -801,14 +801,40 @@ private final class SpawnedProcess {
         ))
         try require(posix_spawnattr_setpgroup(&attributes, 0))
 
-        var argv: [UnsafeMutablePointer<CChar>?] =
-            ([executablePath] + arguments).map { strdup($0) }
-        argv.append(nil)
+        // NIL IS THE TERMINATOR, SO A FAILED COPY IS NOT A LOST ARGUMENT —
+        // IT IS A DIFFERENT COMMAND (PR #461 codex r2). `strdup` allocates,
+        // so under the same pressure the setup checks above exist for it
+        // answers nil, and `map { strdup($0) }` wrote that nil straight into
+        // the vector where `posix_spawn` reads it as end-of-arguments. A
+        // failed copy of "git" leaves argv `[/usr/bin/env, nil]`: env runs
+        // with no utility, PRINTS ITS ENVIRONMENT, and exits 0 — so the
+        // runner accepts unrelated output as a completed git command. Same
+        // silently-different-child class as a dropped `adddup2`, and quieter,
+        // because this one succeeds.
+        //
+        // Each `defer` is registered BEFORE its vector is filled, so a throw
+        // part-way through frees what was already copied.
+        func duplicate(_ text: String) throws -> UnsafeMutablePointer<CChar> {
+            guard let copy = strdup(text) else {
+                throw SpawnFailure(code: ENOMEM)
+            }
+            return copy
+        }
+
+        var argv: [UnsafeMutablePointer<CChar>?] = []
         defer { argv.forEach { free($0) } }
-        var envp: [UnsafeMutablePointer<CChar>?] =
-            environment.map { strdup("\($0.key)=\($0.value)") }
-        envp.append(nil)
+        for argument in [executablePath] + arguments {
+            argv.append(try duplicate(argument))
+        }
+        argv.append(nil)
+        var envp: [UnsafeMutablePointer<CChar>?] = []
         defer { envp.forEach { free($0) } }
+        for variable in environment {
+            envp.append(
+                try duplicate("\(variable.key)=\(variable.value)")
+            )
+        }
+        envp.append(nil)
 
         var pid: pid_t = 0
         let rc = posix_spawn(

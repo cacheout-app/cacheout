@@ -679,6 +679,45 @@ final class GitCommandRunnerTests: XCTestCase {
         return nil
     }
 
+    /// THE SPAWN'S OWN GUARD, EVIDENCED (PR #461 merge gate r3, P4).
+    ///
+    /// The fence below exempts `posix_spawn` by name, on the stated ground
+    /// that it "is checked by its own `guard`". Nothing tested that guard,
+    /// and no cell in the suite could: `executableURL` defaults to
+    /// `/usr/bin/env`, which always exists, and no test had ever passed
+    /// `executableURL:`. An exemption justified by a sentence is a hole with
+    /// a note attached — and this is the one call whose unchecked failure is
+    /// catastrophic rather than merely wrong, because `var pid: pid_t = 0`
+    /// means a swallowed failure hands back pid 0, and `signalTree` would
+    /// then run `kill(-0, SIGTERM)`: every process in the CALLER'S OWN
+    /// process group.
+    ///
+    /// A nonexistent executable makes `posix_spawn` answer ENOENT on Darwin
+    /// without any test needing to stage memory pressure, so the throw path
+    /// — the sole producer of `.gitUnavailable` at this site — is reachable
+    /// after all.
+    ///
+    /// MUTATION: deleting `guard rc == 0 else { throw SpawnFailure(code: rc) }`
+    /// reds this cell. Measured with `signalTree`'s body neutered in the same
+    /// mutation, deliberately: without that second edit the mutant signals
+    /// the test harness's own process group, which is a way to destroy the
+    /// run rather than measure it.
+    func testASpawnThatCannotStartIsReportedRatherThanHandedBackAsPidZero()
+        async throws
+    {
+        let missing = URL(fileURLWithPath: "/nonexistent-\(UUID().uuidString)/env")
+        let runner = GitCommandRunner(
+            environment: GitFixture.environment(home: home),
+            executableURL: missing
+        )
+        let invocation = await runner.run(["--version"], timeout: 5)
+        XCTAssertEqual(
+            invocation.outcome, .gitUnavailable,
+            "a spawn that could not start must be reported, never handed "
+                + "back as a running child: \(invocation.outcome)"
+        )
+    }
+
     /// EVERY SPAWN-SETUP SYMBOL IS CHECKED — asserted over the source,
     /// because the failure cannot be staged from outside (PR #461 codex r1
     /// P2, rebuilt twice by the merge gate).

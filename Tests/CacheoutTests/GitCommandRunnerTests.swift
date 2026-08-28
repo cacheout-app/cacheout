@@ -551,8 +551,137 @@ final class GitCommandRunnerTests: XCTestCase {
         )
     }
 
-    /// EVERY SPAWN-SETUP CALL IS CHECKED — asserted over the source, because
-    /// the failure cannot be staged from outside (PR #461 codex r1, P2).
+    /// Repo root from this file's own path — the idiom
+    /// `SourceAnchorIntegrityTests` uses, so a moved test file cannot make
+    /// the fence below silently scan nothing.
+    private var repositoryRoot: URL {
+        URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+    }
+
+    /// Swift source with every comment blanked, newlines and therefore line
+    /// numbering preserved. Line comments are blanked because a trailing
+    /// `// try require(` laundered a bare call as checked in the first
+    /// version of the fence below; block comments because one sitting between
+    /// a wrapper and its operand would otherwise read as a missing wrapper.
+    /// String literals are skipped, so a `//` inside one is not a comment.
+    private func commentsBlanked(_ source: String) -> String {
+        var out = ""
+        out.reserveCapacity(source.count)
+        var index = source.startIndex
+        var inString = false
+        var escaped = false
+        while index < source.endIndex {
+            let character = source[index]
+            let after = source.index(after: index)
+            let next: Character? = after < source.endIndex ? source[after] : nil
+            if inString {
+                out.append(character)
+                if escaped { escaped = false }
+                else if character == "\\" { escaped = true }
+                else if character == "\"" { inString = false }
+                index = after
+                continue
+            }
+            if character == "\"" {
+                inString = true
+                out.append(character)
+                index = after
+                continue
+            }
+            if character == "/", next == "/" {
+                while index < source.endIndex, source[index] != "\n" {
+                    out.append(" ")
+                    index = source.index(after: index)
+                }
+                continue
+            }
+            if character == "/", next == "*" {
+                var depth = 1
+                out.append("  ")
+                index = source.index(index, offsetBy: 2)
+                while index < source.endIndex, depth > 0 {
+                    let inner = source[index]
+                    let ahead = source.index(after: index)
+                    let peek: Character? =
+                        ahead < source.endIndex ? source[ahead] : nil
+                    if inner == "/", peek == "*" {
+                        depth += 1
+                        out.append("  ")
+                        index = source.index(index, offsetBy: 2)
+                        continue
+                    }
+                    if inner == "*", peek == "/" {
+                        depth -= 1
+                        out.append("  ")
+                        index = source.index(index, offsetBy: 2)
+                        continue
+                    }
+                    out.append(inner == "\n" ? "\n" : " ")
+                    index = source.index(after: index)
+                }
+                continue
+            }
+            out.append(character)
+            index = after
+        }
+        return out
+    }
+
+    /// The balanced-brace extent of the body of the function whose
+    /// declaration begins with `signature`.
+    ///
+    /// The first version bounded the region with `range(of: "\n    }\n")`,
+    /// which is not a function's end but the first four-space-indented `}`
+    /// INSIDE it. Everything past such a brace escaped the fence in silence
+    /// while the vacuity floor still passed on the checked calls above the
+    /// cut. Braces are counted from the body's `{` — the first one outside
+    /// the parameter list — with string literals skipped.
+    private func functionBody(
+        startingWith signature: String, in source: String
+    ) -> Range<String.Index>? {
+        guard let declaration = source.range(of: signature) else { return nil }
+        var parenDepth = 0
+        var braceDepth = 0
+        var bodyStart: String.Index?
+        var inString = false
+        var escaped = false
+        var index = declaration.lowerBound
+        while index < source.endIndex {
+            let character = source[index]
+            if inString {
+                if escaped { escaped = false }
+                else if character == "\\" { escaped = true }
+                else if character == "\"" { inString = false }
+                index = source.index(after: index)
+                continue
+            }
+            switch character {
+            case "\"": inString = true
+            case "(": parenDepth += 1
+            case ")": parenDepth -= 1
+            case "{":
+                if bodyStart == nil, parenDepth == 0 { bodyStart = index }
+                if bodyStart != nil { braceDepth += 1 }
+            case "}":
+                if let begin = bodyStart {
+                    braceDepth -= 1
+                    if braceDepth == 0 {
+                        return begin..<source.index(after: index)
+                    }
+                }
+            default: break
+            }
+            index = source.index(after: index)
+        }
+        return nil
+    }
+
+    /// EVERY SPAWN-SETUP SYMBOL IS CHECKED — asserted over the source,
+    /// because the failure cannot be staged from outside (PR #461 codex r1
+    /// P2, rebuilt twice by the merge gate).
     ///
     /// The defect: `posix_spawn_file_actions_*` and `posix_spawnattr_*`
     /// allocate, so under transient pressure they answer ENOMEM — and
@@ -574,105 +703,90 @@ final class GitCommandRunnerTests: XCTestCase {
     /// purely to make the failure reachable would widen production API for
     /// evidence, which this project declines.
     ///
-    /// So the property is asserted where it lives: every setup call in the
-    /// spawn path is wrapped. This is the same shape as the
-    /// `waitUntilExit` gate (fn-4.20) and the refusal-tag census (fn-4.23) —
-    /// a source fence for a proposition no runtime path can exercise.
+    /// THE PROPERTY IS ON THE SYMBOL, NOT THE CALL. Two rebuilds ago this
+    /// fence enumerated six names; one rebuild ago it matched
+    /// `posix_spawn…\s*\(` and required the wrapper immediately in front.
+    /// Both were keyed on a CALL, and the gate walked through the gap that
+    /// leaves: `let addclose = posix_spawn_file_actions_addclose` followed by
+    /// `_ = addclose(&fileActions, 5)` names the symbol with no paren after
+    /// it and calls it under a name the fence has never heard of — compiled
+    /// and run to confirm it is working Swift. So the assertion is now: every
+    /// appearance of a `posix_spawn*` identifier in the spawn path is the
+    /// direct operand of `try require(`. A function value cannot be taken
+    /// without naming the symbol, so aliasing is caught at the alias.
+    ///
+    /// Exemptions are by property or by name, never by pattern: identifiers
+    /// ending `_t` are types, the two `destroy` calls run in `defer` with
+    /// nothing to report to, and `posix_spawn` itself is checked by its own
+    /// `guard`. ACKNOWLEDGED LIMIT: a symbol reached through `dlsym` by
+    /// string is outside what any source fence can see.
     ///
     /// MUTATION: drop any `try require(` back to a bare call and this reds,
-    /// naming the line.
-    /// Repo root from this file's own path — the idiom
-    /// `SourceAnchorIntegrityTests` uses, so a moved test file cannot make
-    /// the fence silently scan nothing.
-    private var repositoryRoot: URL {
-        URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-    }
-
+    /// naming `GitCommandRunner.swift:<line>` and the offending line — as do
+    /// the alias, `_ =`, comment-laundering and `setsigmask` escapes.
+    /// Reformats stay green: a wrapper split across lines, `try require (`
+    /// with a space, a comment between wrapper and operand.
     func testEverySpawnSetupCallIsChecked() throws {
-        let source = try String(
-            contentsOf: repositoryRoot.appendingPathComponent(
-                "Sources/Cacheout/Scanner/GitCommandRunner.swift"
-            ),
-            encoding: .utf8
-        )
-        // THE SPAWN PATH ONLY — bounded to the function, so a `posix_spawn`
-        // symbol elsewhere in the file cannot silently widen or narrow this.
-        guard let bodyStart = source.range(of: "static func launch("),
-              let bodyEnd = source.range(
-                of: "\n    }\n", range: bodyStart.upperBound..<source.endIndex
-              )
-        else { return XCTFail("the spawn path could not be located") }
-        var body = String(source[bodyStart.lowerBound..<bodyEnd.upperBound])
-
-        // Comments are stripped BEFORE matching: the previous version tested
-        // `line.contains("try require(")`, so a bare call whose trailing
-        // comment merely mentioned the wrapper laundered itself as checked.
-        body = body.replacingOccurrences(
-            of: #"//[^\n]*"#, with: "", options: .regularExpression
-        )
-        // Statements, not lines: the previous version anchored per line, so a
-        // correctly-checked call re-wrapped across three lines was flagged
-        // (a reformat reddened correct code) while any token before the
-        // symbol — an assignment, `_ =`, an alias — made an UNCHECKED call
-        // invisible rather than loud. Both directions were wrong.
-        let statements = body
-            .replacingOccurrences(of: "\n", with: " ")
-            .replacingOccurrences(
-                of: #"\s+"#, with: " ", options: .regularExpression
+        let source = commentsBlanked(
+            try String(
+                contentsOf: repositoryRoot.appendingPathComponent(
+                    "Sources/Cacheout/Scanner/GitCommandRunner.swift"
+                ),
+                encoding: .utf8
             )
-            .components(separatedBy: ";")
-            .flatMap { $0.components(separatedBy: "  ") }
-
-        // BY PREFIX, not by an enumerated list of six names: the old
-        // alternation missed `posix_spawn_file_actions_addclose`,
-        // `..._addchdir_np` and `posix_spawnattr_setsigmask` — genuine setup
-        // calls whose only defect was being absent from the list. A fence
-        // that must be told each spelling is a blocklist.
-        let symbol = try NSRegularExpression(
-            pattern: #"(posix_spawn(?:attr|_file_actions)?_[a-z0-9_]+)\s*\("#
         )
-        // Teardown runs in `defer` with nothing to report to, and the spawn
-        // itself is checked by its own `guard` — named, not pattern-excused.
-        let exempt: Set<String> = [
+        guard let bodyRange = functionBody(
+            startingWith: "static func launch(", in: source
+        ) else { return XCTFail("the spawn path could not be located") }
+        let body = String(source[bodyRange])
+        XCTAssertTrue(
+            body.contains("posix_spawn("),
+            "the scanned region does not reach the spawn itself, so it was "
+                + "truncated and anything past the cut escapes in silence"
+        )
+
+        let symbol = try NSRegularExpression(
+            pattern: #"\bposix_spawn[A-Za-z0-9_]*\b"#
+        )
+        // The wrapper, by structure and not by spelling: any whitespace
+        // between `try`, `require` and `(` and before the operand. A
+        // correctly-wrapped call re-flowed across three lines was flagged by
+        // the line-anchored version — a reformat reddening correct code.
+        let wrapper = #"try\s+require\s*\(\s*$"#
+        let exemptNames: Set<String> = [
             "posix_spawn_file_actions_destroy", "posix_spawnattr_destroy",
             "posix_spawn",
         ]
 
+        let firstLine = source[source.startIndex..<bodyRange.lowerBound]
+            .reduce(1) { $1 == "\n" ? $0 + 1 : $0 }
         var unchecked: [String] = []
         var checked = 0
-        for statement in statements {
-            let range = NSRange(
-                statement.startIndex..<statement.endIndex, in: statement
-            )
-            for match in symbol.matches(in: statement, range: range) {
-                guard let nameRange = Range(match.range(at: 1), in: statement)
-                else { continue }
-                let name = String(statement[nameRange])
-                guard !exempt.contains(name) else { continue }
-                // The property: this symbol's call is the direct operand of
-                // `try require(`. Checked by STRUCTURE — the wrapper
-                // immediately precedes the symbol — so whitespace, wrapping
-                // and comments cannot launder it, and an assignment or alias
-                // in front of it fails loudly instead of vanishing.
-                let prefix = statement[statement.startIndex..<nameRange.lowerBound]
-                let wrapped = prefix.hasSuffix("try require(")
-                    || prefix.hasSuffix("try require( ")
-                if wrapped { checked += 1 } else {
-                    unchecked.append(
-                        name + "  in: "
-                            + statement.trimmingCharacters(in: .whitespaces)
-                                .prefix(90)
-                    )
-                }
+        let whole = NSRange(body.startIndex..<body.endIndex, in: body)
+        for match in symbol.matches(in: body, range: whole) {
+            guard let range = Range(match.range, in: body) else { continue }
+            let name = String(body[range])
+            guard !name.hasSuffix("_t"), !exemptNames.contains(name)
+            else { continue }
+            let prefix = body[body.startIndex..<range.lowerBound]
+            if prefix.range(of: wrapper, options: .regularExpression) != nil {
+                checked += 1
+                continue
             }
+            let line = prefix.reduce(firstLine) { $1 == "\n" ? $0 + 1 : $0 }
+            let lineStart = prefix.lastIndex(of: "\n")
+                .map(body.index(after:)) ?? body.startIndex
+            let text = body[lineStart...].prefix { $0 != "\n" }
+                .trimmingCharacters(in: .whitespaces)
+            unchecked.append(
+                "GitCommandRunner.swift:\(line)  \(name)  —  "
+                    + text.prefix(90)
+            )
         }
         XCTAssertGreaterThanOrEqual(
-            checked, 6,
-            "found \(checked) checked setup calls — fewer than the six the "
-                + "spawn path makes, so this fence has gone vacuous"
+            checked, 7,
+            "found \(checked) wrapped setup symbols — fewer than the seven "
+                + "the spawn path names, so this fence has gone vacuous"
         )
         XCTAssertEqual(
             unchecked, [],

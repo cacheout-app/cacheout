@@ -598,30 +598,87 @@ final class GitCommandRunnerTests: XCTestCase {
             ),
             encoding: .utf8
         )
-        let setupCall = #"(?m)^\s*(?:try require\()?\s*(posix_spawn_file_actions_(?:init|addopen|adddup2)|posix_spawnattr_(?:init|setflags|setpgroup))\("#
-        let regex = try NSRegularExpression(pattern: setupCall)
-        let lines = source.components(separatedBy: "\n")
+        // THE SPAWN PATH ONLY — bounded to the function, so a `posix_spawn`
+        // symbol elsewhere in the file cannot silently widen or narrow this.
+        guard let bodyStart = source.range(of: "static func launch("),
+              let bodyEnd = source.range(
+                of: "\n    }\n", range: bodyStart.upperBound..<source.endIndex
+              )
+        else { return XCTFail("the spawn path could not be located") }
+        var body = String(source[bodyStart.lowerBound..<bodyEnd.upperBound])
+
+        // Comments are stripped BEFORE matching: the previous version tested
+        // `line.contains("try require(")`, so a bare call whose trailing
+        // comment merely mentioned the wrapper laundered itself as checked.
+        body = body.replacingOccurrences(
+            of: #"//[^\n]*"#, with: "", options: .regularExpression
+        )
+        // Statements, not lines: the previous version anchored per line, so a
+        // correctly-checked call re-wrapped across three lines was flagged
+        // (a reformat reddened correct code) while any token before the
+        // symbol — an assignment, `_ =`, an alias — made an UNCHECKED call
+        // invisible rather than loud. Both directions were wrong.
+        let statements = body
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(
+                of: #"\s+"#, with: " ", options: .regularExpression
+            )
+            .components(separatedBy: ";")
+            .flatMap { $0.components(separatedBy: "  ") }
+
+        // BY PREFIX, not by an enumerated list of six names: the old
+        // alternation missed `posix_spawn_file_actions_addclose`,
+        // `..._addchdir_np` and `posix_spawnattr_setsigmask` — genuine setup
+        // calls whose only defect was being absent from the list. A fence
+        // that must be told each spelling is a blocklist.
+        let symbol = try NSRegularExpression(
+            pattern: #"(posix_spawn(?:attr|_file_actions)?_[a-z0-9_]+)\s*\("#
+        )
+        // Teardown runs in `defer` with nothing to report to, and the spawn
+        // itself is checked by its own `guard` — named, not pattern-excused.
+        let exempt: Set<String> = [
+            "posix_spawn_file_actions_destroy", "posix_spawnattr_destroy",
+            "posix_spawn",
+        ]
+
         var unchecked: [String] = []
-        var found = 0
-        for (index, line) in lines.enumerated() {
-            let range = NSRange(line.startIndex..<line.endIndex, in: line)
-            guard regex.firstMatch(in: line, range: range) != nil else { continue }
-            found += 1
-            // `destroy` is deliberately unchecked (it runs in `defer`, and a
-            // failed teardown has nothing to report to); it is excluded by
-            // the pattern rather than allow-listed here.
-            if !line.contains("try require(") {
-                unchecked.append("GitCommandRunner.swift:\(index + 1): \(line.trimmingCharacters(in: .whitespaces))")
+        var checked = 0
+        for statement in statements {
+            let range = NSRange(
+                statement.startIndex..<statement.endIndex, in: statement
+            )
+            for match in symbol.matches(in: statement, range: range) {
+                guard let nameRange = Range(match.range(at: 1), in: statement)
+                else { continue }
+                let name = String(statement[nameRange])
+                guard !exempt.contains(name) else { continue }
+                // The property: this symbol's call is the direct operand of
+                // `try require(`. Checked by STRUCTURE — the wrapper
+                // immediately precedes the symbol — so whitespace, wrapping
+                // and comments cannot launder it, and an assignment or alias
+                // in front of it fails loudly instead of vanishing.
+                let prefix = statement[statement.startIndex..<nameRange.lowerBound]
+                let wrapped = prefix.hasSuffix("try require(")
+                    || prefix.hasSuffix("try require( ")
+                if wrapped { checked += 1 } else {
+                    unchecked.append(
+                        name + "  in: "
+                            + statement.trimmingCharacters(in: .whitespaces)
+                                .prefix(90)
+                    )
+                }
             }
         }
         XCTAssertGreaterThanOrEqual(
-            found, 6,
-            "the scan found \(found) setup calls — fewer than the six the "
+            checked, 6,
+            "found \(checked) checked setup calls — fewer than the six the "
                 + "spawn path makes, so this fence has gone vacuous"
         )
         XCTAssertEqual(
             unchecked, [],
-            "an unchecked spawn-setup call spawns a silently different child"
+            "an unchecked spawn-setup call spawns a silently different child: "
+                + "a dropped adddup2 leaves git's stdout elsewhere, git exits "
+                + "0, and the empty buffer is accepted as a complete answer"
         )
     }
 

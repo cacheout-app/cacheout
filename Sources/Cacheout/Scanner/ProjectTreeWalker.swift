@@ -343,8 +343,29 @@ struct ProjectTreeWalker {
             // TCC policy gate (R9/R12): a background rescan must never be
             // the thing that fires a macOS privacy prompt. Prefix-under-
             // protected-ancestor on the CANONICAL root — never basename.
-            // Asked AFTER the table, which is the only ordering in which its
-            // own canonicalize cannot be the call that hangs.
+            //
+            // Asked AFTER the table, which removes the one ordering in which
+            // this gate's own `canonicalize` was the first contact with a
+            // root that IS a mount point. It does NOT make the hang
+            // impossible, and the note that stood here saying so was wrong
+            // (merge gate r3, P7): `mountTable.contains(root.path)` is exact
+            // membership against mount POINTS, so a root INSIDE a mounted
+            // volume — `<volume>/dev` — never matches, and stage 2's
+            // `realpath(3)` below is then first contact with a path on that
+            // volume. Measured order for such a root, background arm:
+            // canonicalize -> realPath -> probeKind, issues [].
+            //
+            // WHERE THAT CASE IS ACTUALLY COVERED, and it is not here: by the
+            // session's wall-clock bound, the same answer `captureBounded`
+            // gives for a container root inside a hung mount (SpaceScanner's
+            // note at the capture says the table preflight never covered it
+            // either). Both walker callers are `SpaceScanner` conformers, so
+            // a blocked `realpath` is converted into `.scanDidNotFinish` with
+            // the ledger concluded `.boundFired`. The same residual applies
+            // verbatim: the bound converts the hang into a REPORT, it does
+            // not cure it — `realpath` takes no deadline, so its thread stays
+            // parked until the volume answers. CAN A RETRY DIFFER? Yes: the
+            // volume answers, or it is unmounted.
             if !includeProtectedRoots,
                Self.isProtectedRoot(root, home: home, provider: provider) {
                 continue
@@ -353,7 +374,10 @@ struct ProjectTreeWalker {
             // ABSENT root: honest no-item omission — machines differ, and
             // the seeds routinely include roots that do not exist. No issue,
             // no events (epic registration-time story). Asked AFTER the
-            // mount table, which is what makes the hang impossible.
+            // mount table, so a root that IS a mount point is never probed —
+            // NOT, as this note used to claim, because that makes the hang
+            // impossible; see the TCC gate above for the root-inside-a-volume
+            // case and where it is really bounded.
             let rootProbe = provider.probeKind(of: root)
             if rootProbe == .absent { continue }
 

@@ -661,6 +661,64 @@ final class ProjectTreeWalkerTests: XCTestCase {
         )
     }
 
+    /// THE CASE THE TABLE GATE DOES NOT COVER, pinned so it cannot be read
+    /// as covered (PR #461 merge gate r3, P7).
+    ///
+    /// `mountTable.contains(root.path)` is EXACT membership against mount
+    /// POINTS. A dev root INSIDE a mounted volume never matches it, so the
+    /// sibling cell above — which tests `root == mount point` — proves
+    /// nothing about this shape, while the comments it guarded used to claim
+    /// the ordering made the hang impossible outright.
+    ///
+    /// What is true, and what this cell records: the root IS contacted, the
+    /// first contact being `isProtectedRoot`'s canonicalize/realPath, and no
+    /// `.mountedVolumeRoot` issue is emitted. On an unresponsive volume that
+    /// `realpath(3)` blocks uninterruptibly. It is bounded — by the SESSION's
+    /// wall-clock bound, since both walker callers are `SpaceScanner`
+    /// conformers, exactly as `captureBounded` bounds a container root inside
+    /// a hung mount — not by anything in this loop.
+    ///
+    /// This cell reds if the table gate is ever widened from membership to
+    /// CONTAINMENT. That would be a deliberate policy change (every root
+    /// under `/System/Volumes/Data` is inside a mount), so it should have to
+    /// come here and say so.
+    func testARootInsideAMountedVolumeIsNotCaughtByTheTableAndIsProbed()
+        throws
+    {
+        let volume = base.appendingPathComponent("HungMount")
+        let root = volume.appendingPathComponent("dev")
+        try mkdir(volume)
+        try mkdir(root)
+        let provider = ProbeRecordingMountProvider()
+        // The VOLUME is the mount point; the configured root is inside it.
+        provider.injectedMountPoints = [volume.path]
+
+        let walker = ProjectTreeWalker(
+            home: home,
+            pathGuard: PathGuard(
+                home: home, containerRoots: [root], provider: provider
+            ),
+            provider: provider
+        )
+        let issues = walker.walk(
+            roots: [root],
+            includeProtectedRoots: false,
+            consumers: [{ (_: ProjectTreeEvent) -> Set<String> in [] }]
+        )
+
+        XCTAssertFalse(
+            provider.contacts.filter { $0.contains(root.path) }.isEmpty,
+            "if this root is no longer touched, the table gate has been "
+                + "widened to containment — a deliberate policy change that "
+                + "must update this cell and the notes it pins"
+        )
+        XCTAssertFalse(
+            issues.map(\.kind).contains(.mountedVolumeRoot),
+            "membership does not match a root inside the volume, so no "
+                + "mounted-volume verdict is available here: \(issues)"
+        )
+    }
+
     private final class ProbeRecordingMountProvider:
         FileSystemIdentityProvider
     {

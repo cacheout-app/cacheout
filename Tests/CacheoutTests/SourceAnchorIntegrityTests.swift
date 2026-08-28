@@ -193,7 +193,7 @@ final class SourceAnchorIntegrityTests: XCTestCase {
          "compared as `pathComponents` arrays (never `hasP"),
         ("PathGuard.swift:536-543",
          "The filesystem root `/` is exempt from both: it"),
-        ("ProjectTreeWalker.swift:661-664",
+        ("ProjectTreeWalker.swift:671-674",
          "|| provider.isMountPoint(provider.canonicalize(c"),
         ("SpaceScanner.swift:1996-2007",
          "no-follow reality gate to THAT spelling and refu"),

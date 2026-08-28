@@ -320,6 +320,16 @@ struct ProjectTreeWalker {
             // table names under a DIFFERENT spelling of this root falls
             // through to the guard and is refused there — as policy, which
             // is also true.
+            //
+            // RESIDUAL, disclosed rather than smoothed over (merge gate r2):
+            // this order CHANGES what a root that is both TCC-protected and
+            // mounted reports on a background scan. It used to be skipped in
+            // silence by the gate below; it now says `.mountedVolumeRoot`.
+            // That is the honest answer — the volume, not privacy, is why its
+            // contents are not ours to walk — but it is a user-visible change,
+            // and its printed remedy is only half true for such a root: eject
+            // it and the NEXT scan reaches the TCC gate and skips it silently
+            // again, with no second issue to explain the disappearance.
             if mountTable.contains(root.path) {
                 issues.append(ScanIssue(
                     url: root, kind: .mountedVolumeRoot,

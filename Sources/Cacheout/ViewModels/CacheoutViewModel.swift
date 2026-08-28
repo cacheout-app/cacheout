@@ -1900,6 +1900,17 @@ class CacheoutViewModel: ObservableObject {
         // nothing is running, re-enable the button — and the task would then
         // launch an unowned destructive prune, free to overlap the retry the
         // user was just invited to make. Both sides decide through one lock.
+        //
+        // RESIDUAL, disclosed (merge gate r2): `begin` performs the launch
+        // UNDER the claim's lock — that is the whole mechanism — so the timer
+        // body below blocks on that lock for the duration of the spawn, and
+        // it runs on `ScanSessionClock`'s single shared serial queue. No
+        // deadlock cycle exists (nothing `process.run()` waits on is
+        // dispatched to that queue), but for a fork/exec's worth of time —
+        // milliseconds, more under load — every other bound scheduled there
+        // is delayed, and a `.timedOut` settle overshoots its budget by the
+        // same amount. Not fixable by releasing the lock earlier: releasing
+        // it is exactly the window this type exists to close.
         let launch = LaunchClaim()
         let timer = ScanSessionClock.schedule(after: budget) {
             launch.abandon()
@@ -1968,6 +1979,16 @@ class CacheoutViewModel: ObservableObject {
             // this is, and because `begin` performs the launch under the same
             // lock, `didStart` is now a fact rather than a guess about a
             // statement that may not have run yet.
+            //
+            // RESIDUAL, disclosed (merge gate r2): WHICH arm is taken is
+            // pinned — `LaunchClaimTests` proves `didStart` is a fact about
+            // the past, not a guess — but the two WORDINGS below have no
+            // cell. `dockerPrune` builds them inline and the branch is only
+            // reachable through a real timed-out spawn, so pinning them would
+            // mean hoisting the strings into production API for a test to
+            // read, which this project declines. A source fence over the
+            // spellings would be a blocklist wearing a fence's name, which
+            // this branch has already retired eleven times.
             if launch.didStart {
                 if process.isRunning { process.terminate() }
                 lastDockerPruneResult = "Docker prune did not finish within "

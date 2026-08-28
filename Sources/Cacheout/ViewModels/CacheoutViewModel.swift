@@ -1892,10 +1892,21 @@ class CacheoutViewModel: ObservableObject {
         let waitSeconds = Double(budget.components.seconds)
             + Double(budget.components.attoseconds) / 1e18
         let rendezvous = FirstWinsRendezvous<DockerPruneOutcome>()
+        // THE LAUNCH IS CLAIMED, NOT ASSUMED (PR #461 codex r1, P1). The
+        // timer settling `.timedOut` does not stop a detached task that has
+        // not been scheduled yet, and the starvation this off-pool timer
+        // exists to survive is precisely what keeps it queued: the timeout
+        // branch would see `isRunning == false`, report truthfully that
+        // nothing is running, re-enable the button — and the task would then
+        // launch an unowned destructive prune, free to overlap the retry the
+        // user was just invited to make. Both sides decide through one lock.
+        let launch = LaunchClaim()
         let timer = ScanSessionClock.schedule(after: budget) {
+            launch.abandon()
             rendezvous.settle(.timedOut)
         }
         Task.detached {
+            guard launch.begin() else { return }
             do {
                 try process.run()
             } catch {
@@ -1951,7 +1962,11 @@ class CacheoutViewModel: ObservableObject {
             // delete, a wedged Docker Desktop — are all transient, so
             // "check Docker and retry" is a real remedy, not a strand
             // dressed as one.
-            if process.isRunning { process.terminate() }
+            // `didStart` distinguishes the two timeouts: a child that
+            // never launched has nothing to terminate, and asking
+            // `isRunning` of an unlaunched `Process` answers false anyway —
+            // this states which case happened rather than inferring it.
+            if launch.didStart, process.isRunning { process.terminate() }
             lastDockerPruneResult = "Docker prune did not finish within "
                 + "\(budget) — asked it to stop; check Docker and retry"
         }

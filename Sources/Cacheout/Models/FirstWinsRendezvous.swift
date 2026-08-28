@@ -53,3 +53,52 @@ final class FirstWinsRendezvous<Outcome: Sendable>: @unchecked Sendable {
         }
     }
 }
+
+/// ONE-SHOT AUTHORITY TO START SOMETHING DESTRUCTIVE (PR #461 codex r1, P1).
+///
+/// `FirstWinsRendezvous` decides which OUTCOME is reported. It cannot decide
+/// whether the work ever STARTED, and for a destructive child those are
+/// different questions: a detached task still queued when the off-pool timer
+/// wins observes nothing, the timeout branch sees `process.isRunning == false`
+/// and truthfully reports that nothing is running — and then the task is
+/// scheduled and calls `run()`, launching an unowned `docker system prune -f`
+/// after the operation was reported timed out, free to overlap a user retry.
+///
+/// The starvation this timer exists to survive is exactly the condition that
+/// keeps the task queued, so the window is widest when it matters most.
+///
+/// Both sides claim through one lock, so the pair is decided once: whoever
+/// arrives first wins and the loser is told. `begin()` false means DO NOT
+/// START. `abandon()` false means it already started — the caller owns
+/// stopping it.
+final class LaunchClaim: @unchecked Sendable {
+    private let lock = NSLock()
+    private var decided = false
+    private var started = false
+
+    /// `true` if the caller may start the work. Never true twice.
+    func begin() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard !decided else { return false }
+        decided = true
+        started = true
+        return true
+    }
+
+    /// `true` if the work was stopped before it began. `false` means it is
+    /// already running and the caller must stop it by other means.
+    @discardableResult
+    func abandon() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard !decided else { return false }
+        decided = true
+        return true
+    }
+
+    /// Whether the work was actually started — for a caller deciding whether
+    /// it has anything to terminate.
+    var didStart: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return started
+    }
+}

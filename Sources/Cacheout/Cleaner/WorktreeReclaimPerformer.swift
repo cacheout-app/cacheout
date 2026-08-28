@@ -1691,8 +1691,10 @@ struct WorktreeReclaimPerformer {
     /// prunable, so the next scan simply stops offering it.
     private func revivedCheckoutRefusal(for adminDirectory: URL) -> String? {
         let backlink = adminDirectory.appendingPathComponent("gitdir")
-        guard let backlinkText = try? String(contentsOf: backlink, encoding: .utf8)
-        else { return nil }
+        guard let backlinkText = provider.smallRegularFileText(
+            at: backlink,
+            limit: FileSystemIdentityProvider.gitPointerByteLimit
+        ) else { return nil }
         guard let dotGit = Self.gitdirTarget(
             backlinkText, relativeTo: adminDirectory, prefixed: false
         ) else { return nil }
@@ -1721,7 +1723,10 @@ struct WorktreeReclaimPerformer {
             + "established — nothing was pruned. Re-scan once that path is "
             + "settled."
         guard kind == .kind(.regularFile),
-              let pointerText = try? String(contentsOf: dotGit, encoding: .utf8),
+              let pointerText = provider.smallRegularFileText(
+                  at: dotGit,
+                  limit: FileSystemIdentityProvider.gitPointerByteLimit
+              ),
               let named = Self.gitdirTarget(
                   pointerText, relativeTo: dotGit.deletingLastPathComponent(),
                   prefixed: true
@@ -3014,10 +3019,15 @@ struct WorktreeReclaimPerformer {
         adminEntry: URL, substrate: HeadWitness.Substrate
     ) -> HeadWitness? {
         let file = adminEntry.appendingPathComponent(substrate.relativePath)
-        guard provider.probeKind(of: file) == .kind(.regularFile),
-              let identity = provider.identity(of: file),
-              let bytes = try? Data(contentsOf: file)
-        else { return nil }
+        // ONE DESCRIPTOR for kind, identity AND bytes (PR #461 codex r2).
+        // The three path reads this replaces resolved `file` three times, so
+        // the witness could pair one object's inode with another's bytes —
+        // and this witness is what the reclaim proves the far side against.
+        guard let found = provider.smallRegularFile(
+            at: file, limit: FileSystemIdentityProvider.gitPointerByteLimit
+        ) else { return nil }
+        let identity = found.identity
+        let bytes = found.bytes
         return HeadWitness(
             substrate: substrate, identity: identity, bytes: bytes
         )

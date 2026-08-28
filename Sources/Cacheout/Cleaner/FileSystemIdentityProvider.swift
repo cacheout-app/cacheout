@@ -533,6 +533,93 @@ class FileSystemIdentityProvider {
     /// overrides `identity(of:)` for a directory the walk actually OPENS
     /// must override this in step, or the re-proof sees a divergence
     /// production cannot produce and refuses.
+    /// The bytes and identity of a SMALL REGULAR file, read through ONE
+    /// no-follow descriptor (PR #461 codex r2).
+    ///
+    /// Three defects, all of them the same one: the call sites this replaces
+    /// asked `probeKind` about a PATH, then handed that PATH to
+    /// `String(contentsOf:)`/`Data(contentsOf:)`, which resolves it again and
+    /// FOLLOWS symlinks. A `HEAD` or `config` replaced by a symlink between
+    /// the two reads is then opened through the replacement, so a scan of a
+    /// dev root can be steered into a TCC-protected or unresponsive target
+    /// despite a check that just said "regular file". A path is not an
+    /// identity, and asking twice is asking about two objects.
+    ///
+    /// Second, the read was UNBOUNDED. Any directory under a dev root with
+    /// the cheap bare-repository shape but a multi-gigabyte `HEAD` was loaded
+    /// and UTF-8 decoded in full before anything decided it was not a
+    /// repository — a memory spike no scan deadline can cancel, because the
+    /// read is synchronous. `limit` is checked against the DESCRIPTOR's size
+    /// and the file is REFUSED rather than truncated: truncating would let a
+    /// huge file whose first bytes read `ref: refs/…` pass as a valid HEAD.
+    ///
+    /// Third, kind and identity now come from the same descriptor as the
+    /// bytes, so a caller that needs "these bytes belong to THAT object" gets
+    /// it without a second resolution.
+    ///
+    /// `O_NONBLOCK` because `O_NOFOLLOW` alone does not save an open of a
+    /// FIFO: a named pipe left at one of these names would park the opening
+    /// thread until a writer appeared. Non-regular kinds are refused by the
+    /// `fstat` below, but only if the open returns to run it.
+    /// The two sizes these readers use. A git pointer file — `HEAD`,
+    /// `gitdir`, `commondir`, a `.git` pointer — is tens of bytes; a repo
+    /// `config` can legitimately reach a few kilobytes. Both are generous by
+    /// orders of magnitude, and anything past them is refused, not truncated.
+    /// A real repository whose config exceeds this stays UNDISCOVERED, which
+    /// is the same silence every bare repository had before fn-4.28 — never a
+    /// refusal dressed as retryable.
+    static let gitPointerByteLimit = 64 * 1024
+    static let gitConfigByteLimit = 1024 * 1024
+
+    func smallRegularFile(
+        at url: URL, limit: Int
+    ) -> (bytes: Data, identity: Identity)? {
+        url.withUnsafeFileSystemRepresentation { pathPointer in
+            guard let pathPointer else { return nil }
+            let descriptor = open(
+                pathPointer, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK
+            )
+            guard descriptor >= 0 else { return nil }
+            defer { close(descriptor) }
+            var info = stat()
+            guard fstat(descriptor, &info) == 0,
+                  (info.st_mode & S_IFMT) == S_IFREG,
+                  info.st_size >= 0, info.st_size <= limit
+            else { return nil }
+            let identity = Identity(
+                device: UInt64(bitPattern: Int64(info.st_dev)),
+                inode: UInt64(info.st_ino)
+            )
+            var bytes = Data()
+            var buffer = [UInt8](repeating: 0, count: 64 * 1024)
+            while bytes.count <= limit {
+                let got = buffer.withUnsafeMutableBytes {
+                    read(descriptor, $0.baseAddress, $0.count)
+                }
+                if got < 0 {
+                    if errno == EINTR { continue }
+                    return nil
+                }
+                if got == 0 { break }
+                bytes.append(contentsOf: buffer[0..<got])
+            }
+            // A file that GREW past the limit between the fstat and the last
+            // read is refused too, for the same reason the size check exists.
+            guard bytes.count <= limit else { return nil }
+            return (bytes, identity)
+        }
+    }
+
+    /// `smallRegularFile` decoded as UTF-8 — the text form the git metadata
+    /// readers want. Invalid UTF-8 is `nil`, exactly as
+    /// `String(contentsOf:encoding:.utf8)` threw.
+    func smallRegularFileText(at url: URL, limit: Int) -> String? {
+        guard let found = smallRegularFile(at: url, limit: limit) else {
+            return nil
+        }
+        return String(data: found.bytes, encoding: .utf8)
+    }
+
     func identity(ofDescriptor fd: Int32) -> Identity? {
         var st = stat()
         guard fstat(fd, &st) == 0 else { return nil }

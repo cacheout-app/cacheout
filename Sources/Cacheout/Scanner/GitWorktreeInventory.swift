@@ -400,7 +400,9 @@ struct GitWorktreeGitdirResolver {
     func bareRepositoryGitDirectory(at directory: URL) -> URL? {
         let head = directory.appendingPathComponent("HEAD")
         guard identity.probeKind(of: head) == .kind(.regularFile),
-              let headContents = try? String(contentsOf: head, encoding: .utf8),
+              let headContents = identity.smallRegularFileText(
+                  at: head, limit: FileSystemIdentityProvider.gitPointerByteLimit
+              ),
               Self.isAcceptableHeadContent(headContents)
         else { return nil }
         guard identity.probeKind(of: directory.appendingPathComponent("objects"))
@@ -413,7 +415,9 @@ struct GitWorktreeGitdirResolver {
         guard hasRefs || hasReftable else { return nil }
         let config = directory.appendingPathComponent("config")
         guard identity.probeKind(of: config) == .kind(.regularFile),
-              let configContents = try? String(contentsOf: config, encoding: .utf8),
+              let configContents = identity.smallRegularFileText(
+                  at: config, limit: FileSystemIdentityProvider.gitConfigByteLimit
+              ),
               Self.declaresBare(configContents)
         else { return nil }
         return directory
@@ -608,7 +612,9 @@ struct GitWorktreeGitdirResolver {
     /// Read a `gitdir: <path>` pointer file. Relative targets resolve
     /// against `base`.
     private func pointerPath(inFileAt url: URL, relativeTo base: URL) -> URL? {
-        guard let contents = try? String(contentsOf: url, encoding: .utf8) else { return nil }
+        guard let contents = identity.smallRegularFileText(
+            at: url, limit: FileSystemIdentityProvider.gitPointerByteLimit
+        ) else { return nil }
         let trimmed = contents.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.hasPrefix(Self.gitdirPrefix) else { return nil }
         let target = String(trimmed.dropFirst(Self.gitdirPrefix.count))
@@ -620,7 +626,9 @@ struct GitWorktreeGitdirResolver {
     /// Read a bare path file (`gitdir`, `commondir`). Relative targets
     /// resolve against `base`.
     private func pathContents(of url: URL, relativeTo base: URL) -> URL? {
-        guard let contents = try? String(contentsOf: url, encoding: .utf8) else { return nil }
+        guard let contents = identity.smallRegularFileText(
+            at: url, limit: FileSystemIdentityProvider.gitPointerByteLimit
+        ) else { return nil }
         let trimmed = contents.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
         return resolve(trimmed, relativeTo: base)
@@ -842,7 +850,10 @@ struct GitWorktreeAdminMapper {
         worktreePaths.reserveCapacity(gated.count)
         for entry in gated {
             let backlink = entry.appendingPathComponent("gitdir")
-            guard let contents = try? String(contentsOf: backlink, encoding: .utf8) else {
+            guard let contents = identity.smallRegularFileText(
+                at: backlink,
+                limit: FileSystemIdentityProvider.gitPointerByteLimit
+            ) else {
                 return .incomplete(
                     reason: "admin entry \(entry.path) gitdir file is unreadable"
                 )

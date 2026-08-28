@@ -758,30 +758,48 @@ private final class SpawnedProcess {
         stdout: Pipe,
         stderr: Pipe
     ) throws -> SpawnedProcess {
+        // EVERY SETUP RESULT IS CHECKED (PR #461 codex r1, P2). These calls
+        // allocate, so under transient pressure they answer ENOMEM — and
+        // discarding that answer is not a lost error, it is a SILENTLY
+        // DIFFERENT CHILD. A dropped `adddup2` leaves git's stdout attached
+        // to whatever descriptor 1 already was: git exits 0, its output never
+        // reaches the drain, and the empty buffer is accepted as a complete
+        // answer — the exact class fn-4.24 closed at the execute boundary,
+        // re-entering through the spawn. A dropped attribute call defeats the
+        // process-group isolation fn-4.27 established, silently.
+        //
+        // `throws` is the honest answer: the caller maps it to
+        // `.gitUnavailable`, which is retried rather than cached (fn-4.25's
+        // definitive-only rule), and ENOMEM is transient — so a retry can
+        // genuinely differ.
+        func require(_ result: Int32) throws {
+            guard result == 0 else { throw SpawnFailure(code: result) }
+        }
+
         var fileActions: posix_spawn_file_actions_t?
-        posix_spawn_file_actions_init(&fileActions)
+        try require(posix_spawn_file_actions_init(&fileActions))
         defer { posix_spawn_file_actions_destroy(&fileActions) }
-        posix_spawn_file_actions_addopen(
+        try require(posix_spawn_file_actions_addopen(
             &fileActions, 0, "/dev/null", O_RDONLY, 0
-        )
-        posix_spawn_file_actions_adddup2(
+        ))
+        try require(posix_spawn_file_actions_adddup2(
             &fileActions, stdout.fileHandleForWriting.fileDescriptor, 1
-        )
-        posix_spawn_file_actions_adddup2(
+        ))
+        try require(posix_spawn_file_actions_adddup2(
             &fileActions, stderr.fileHandleForWriting.fileDescriptor, 2
-        )
+        ))
 
         var attributes: posix_spawnattr_t?
-        posix_spawnattr_init(&attributes)
+        try require(posix_spawnattr_init(&attributes))
         defer { posix_spawnattr_destroy(&attributes) }
         // THE fn-4.27 LINE: the child leads a new group (id == pid) from
         // birth. CLOEXEC_DEFAULT closes everything the file actions above
         // did not explicitly wire.
-        posix_spawnattr_setflags(
+        try require(posix_spawnattr_setflags(
             &attributes,
             Int16(POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_CLOEXEC_DEFAULT)
-        )
-        posix_spawnattr_setpgroup(&attributes, 0)
+        ))
+        try require(posix_spawnattr_setpgroup(&attributes, 0))
 
         var argv: [UnsafeMutablePointer<CChar>?] =
             ([executablePath] + arguments).map { strdup($0) }

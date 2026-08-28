@@ -551,7 +551,80 @@ final class GitCommandRunnerTests: XCTestCase {
         )
     }
 
-    /// **THE GROUP SURVIVES ITS LEADER** (fn-4.27). r18 discovered the
+    /// EVERY SPAWN-SETUP CALL IS CHECKED — asserted over the source, because
+    /// the failure cannot be staged from outside (PR #461 codex r1, P2).
+    ///
+    /// The defect: `posix_spawn_file_actions_*` and `posix_spawnattr_*`
+    /// allocate, so under transient pressure they answer ENOMEM — and
+    /// discarding that answer is not a lost message, it is a SILENTLY
+    /// DIFFERENT CHILD. A dropped `adddup2` leaves git's stdout attached to
+    /// whatever descriptor 1 already was: git exits 0, the drain sees an
+    /// immediate EOF, and the EMPTY buffer is accepted as a complete answer —
+    /// the exact class fn-4.24 closed at the execute boundary, re-entering
+    /// through the spawn. A dropped attribute call defeats fn-4.27's group
+    /// isolation just as quietly.
+    ///
+    /// NEGATIVE RESULT, recorded rather than worked around: no behavioural
+    /// cell can stage this. `launch` takes `Pipe`s and builds its own
+    /// descriptors, and `adddup2` does not validate that a descriptor is
+    /// OPEN at setup time (only that it is non-negative), so a closed pipe
+    /// does not reach the guard — it throws an ObjC exception from
+    /// `fileDescriptor` first, one layer earlier. Staging real ENOMEM is not
+    /// available to a test. Reshaping `launch` to accept raw descriptors
+    /// purely to make the failure reachable would widen production API for
+    /// evidence, which this project declines.
+    ///
+    /// So the property is asserted where it lives: every setup call in the
+    /// spawn path is wrapped. This is the same shape as the
+    /// `waitUntilExit` gate (fn-4.20) and the refusal-tag census (fn-4.23) —
+    /// a source fence for a proposition no runtime path can exercise.
+    ///
+    /// MUTATION: drop any `try require(` back to a bare call and this reds,
+    /// naming the line.
+    /// Repo root from this file's own path — the idiom
+    /// `SourceAnchorIntegrityTests` uses, so a moved test file cannot make
+    /// the fence silently scan nothing.
+    private var repositoryRoot: URL {
+        URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+    }
+
+    func testEverySpawnSetupCallIsChecked() throws {
+        let source = try String(
+            contentsOf: repositoryRoot.appendingPathComponent(
+                "Sources/Cacheout/Scanner/GitCommandRunner.swift"
+            ),
+            encoding: .utf8
+        )
+        let setupCall = #"(?m)^\s*(?:try require\()?\s*(posix_spawn_file_actions_(?:init|addopen|adddup2)|posix_spawnattr_(?:init|setflags|setpgroup))\("#
+        let regex = try NSRegularExpression(pattern: setupCall)
+        let lines = source.components(separatedBy: "\n")
+        var unchecked: [String] = []
+        var found = 0
+        for (index, line) in lines.enumerated() {
+            let range = NSRange(line.startIndex..<line.endIndex, in: line)
+            guard regex.firstMatch(in: line, range: range) != nil else { continue }
+            found += 1
+            // `destroy` is deliberately unchecked (it runs in `defer`, and a
+            // failed teardown has nothing to report to); it is excluded by
+            // the pattern rather than allow-listed here.
+            if !line.contains("try require(") {
+                unchecked.append("GitCommandRunner.swift:\(index + 1): \(line.trimmingCharacters(in: .whitespaces))")
+            }
+        }
+        XCTAssertGreaterThanOrEqual(
+            found, 6,
+            "the scan found \(found) setup calls — fewer than the six the "
+                + "spawn path makes, so this fence has gone vacuous"
+        )
+        XCTAssertEqual(
+            unchecked, [],
+            "an unchecked spawn-setup call spawns a silently different child"
+        )
+    }
+
     /// child's process group with `getpgid` AFTER launch, so the group fact
     /// was contingent on observing a LIVE leader — a git that spawned a
     /// helper and exited left `group == nil`, and the termination protocol

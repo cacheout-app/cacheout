@@ -1465,15 +1465,62 @@ actor CacheCleaner {
             return (nil, [Self.itemError(item, error.localizedDescription)])
         }
 
-        // Deliberately NO already-gone skip here (the frozen ENOENT
-        // asymmetry): a missing ("ghost") target surfaces as an ITEM-KEYED
-        // error — its absent leaf measures as an empty report and the
-        // deletion below reports the ENOENT. The ENOENT skip exists ONLY
-        // for category children in contents mode.
-        let report = sizer.measure(
-            at: target, mode: .deletionTarget,
-            knownInodes: await registry.knownIdentities
-        )
+        do {
+            // BOUND BEFORE MEASURED — the order contents mode has always
+            // used, and item mode had backwards (PR #461 codex r2).
+            //
+            // The leaf binding used to be taken AFTER `sizer.measure`. For a
+            // permanently deleted item whose scanner registers no
+            // revalidator — every shipped scanner without one — that left a
+            // window the whole measurement wide: rename the target away and
+            // install a stranger at the same name, and the binding recorded
+            // the STRANGER. The far-side proof then succeeded (it proved the
+            // stranger against itself), the stranger was destroyed, and the
+            // report credited the ORIGINAL tree's bytes. Measuring one object
+            // and binding another is exactly the "a path is not an identity"
+            // class, arrived at through ordering rather than through a path
+            // check.
+            //
+            // `admittedParent` moves up with it, because the leaf is read
+            // under that descriptor. Taken here it covers strictly MORE than
+            // it did — everything after the capture is what the binding
+            // covers, and the measurement is now inside that.
+            //
+            // Taken UNCONDITIONALLY, unlike the verdict-shaped binding below.
+            // `probedObject` cannot be hoisted with it: the revalidation seam
+            // must run AFTER the mount-boundary check, so it is not known
+            // yet. The cost is one extra descriptor open for items that DO
+            // carry a verdict, and one behaviour change for them, stated
+            // rather than glossed: a ghost target now raises its ENOENT here
+            // instead of at the removal. That is the same frozen-ENOENT
+            // reasoning this arm already recorded — the removal's own leaf
+            // open would have raised the identical
+            // `Failure(.posix(ENOENT))` a moment later — now applying to
+            // both arms instead of one.
+            let admittedParent = try DepthSafeRemoval.admittedParent(
+                directory: target.deletingLastPathComponent(),
+                displayPath: target.path, provider: provider
+            )
+            // `try?`, and the fallback below is why. A leaf that cannot be
+            // bound HERE — the ghost target, an unreadable one — must keep
+            // raising its failure at the ORIGINAL point, with the original
+            // error identity: the absent-target arms pin their refusal
+            // MESSAGE precisely so a fixture "cannot silently degrade into
+            // testing the other arm", and a hard `try` here re-tagged them.
+            // This binding therefore only ever ADDS a refusal; it never moves
+            // one.
+            let preMeasureLeaf = try? TrashDisposal.boundLeaf(
+                of: target, containedIn: admittedParent, provider: provider
+            )
+
+            // Deliberately NO already-gone skip here (the frozen ENOENT
+            // asymmetry): a missing ("ghost") target surfaces as an
+            // ITEM-KEYED error. The ENOENT skip exists ONLY for category
+            // children in contents mode.
+            let report = sizer.measure(
+                at: target, mode: .deletionTarget,
+                knownInodes: await registry.knownIdentities
+            )
 
         // A CANCELLED measurement is a PARTIAL one (fn-4.15) — same
         // fail-closed rule as the category-child arm above, for the same two
@@ -1543,9 +1590,8 @@ actor CacheCleaner {
             probedObject = inspected == .unestablished ? nil : inspected
         }
 
-        let token = await registry.registerObservations(report.claims)
+            let token = await registry.registerObservations(report.claims)
 
-        do {
             // WHICH FOLDER HOLDS THIS ITEM — READ FROM A DESCRIPTOR, HERE,
             // ON THIS SIDE OF THE QUEUE HOP (PR #458 review — the P1).
             //
@@ -1559,15 +1605,10 @@ actor CacheCleaner {
             // `<dev-root>/proj/node_modules` shape the directory the deletion
             // actually opens (`proj`) is bound by nothing at all.
             //
-            // Taken FIRST, before the rechecks below, because everything
-            // after the capture is what the binding covers; taken last it
-            // would cover only the hop. It fails closed and costs nothing to
-            // do so — the removal performs the identical open a moment later,
-            // so an open that fails here would have failed there.
-            let admittedParent = try DepthSafeRemoval.admittedParent(
-                directory: target.deletingLastPathComponent(),
-                displayPath: target.path, provider: provider
-            )
+            // Taken FIRST — and since the codex r2 fix above, taken before
+            // the MEASUREMENT too, which is where it now lives. This note
+            // stays here because this is where a reader looks for it.
+            //
             // WITH NO LEAF VERDICT, BIND WHAT STANDS AT THE NAME (fn-4.21).
             // When `probedObject` is nil no inspection ran, and until this
             // binding existed the permanent arm's leaf open was proved
@@ -1591,12 +1632,16 @@ actor CacheCleaner {
             // When a verdict DOES exist, the verdict is the leaf binding —
             // it travels in `expecting:` and is proved against the opened
             // inode by the removal itself, so no second binding is taken.
+            // The binding taken BEFORE the measurement, so the object whose
+            // bytes were counted is the object the removal must prove. If the
+            // leaf could not be bound then, the original read stands exactly
+            // where it always did — same call, same point, same failure.
             let boundTarget: FileSystemIdentityProvider.ChildFacts? =
                 probedObject == nil
-                ? try TrashDisposal.boundLeaf(
+                ? try (preMeasureLeaf ?? TrashDisposal.boundLeaf(
                     of: target, containedIn: admittedParent,
                     provider: provider
-                )
+                ))
                 : nil
             // TOCTOU narrowing, immediately pre-delete: the SAME no-follow
             // + snapshot-identity admission re-runs (a container swapped
@@ -1722,6 +1767,26 @@ actor CacheCleaner {
                     } ?? LastInstantProof.nothingFurther.run
                 )
             }
+            // ACCEPTED ONLY HERE, inside the same `do` as everything it
+            // accounts for: the token moved in with the block when the leaf
+            // binding was hoisted above the measurement (PR #461 codex r2),
+            // and a failure on any path above still reaches the catch with
+            // the token abandoned.
+            let accepted = await registry.acceptSuccessful(token)
+            logCleanup(
+                label: "\(item.scannerID)/\(item.displayName)",
+                bytesFreed: accepted.exactBytes + accepted.estimatedUpToBytes
+            )
+            return (
+                CleanupReport.Entry(
+                    itemID: item.id, scannerID: item.scannerID,
+                    displayName: item.displayName,
+                    exactBytes: accepted.exactBytes,
+                    estimatedUpToBytes: accepted.estimatedUpToBytes,
+                    disposal: moveToTrash ? .trash : .permanent
+                ),
+                []
+            )
         } catch {
             if error is PathGuardError {
                 logRefusal(
@@ -1771,22 +1836,6 @@ actor CacheCleaner {
             // is produced, and no bytes are reported.
             return (nil, [Self.itemError(item, error.localizedDescription)])
         }
-
-        let accepted = await registry.acceptSuccessful(token)
-        logCleanup(
-            label: "\(item.scannerID)/\(item.displayName)",
-            bytesFreed: accepted.exactBytes + accepted.estimatedUpToBytes
-        )
-        return (
-            CleanupReport.Entry(
-                itemID: item.id, scannerID: item.scannerID,
-                displayName: item.displayName,
-                exactBytes: accepted.exactBytes,
-                estimatedUpToBytes: accepted.estimatedUpToBytes,
-                disposal: moveToTrash ? .trash : .permanent
-            ),
-            []
-        )
     }
 
     // MARK: - Composite item mode (.gitWorktreeReclaim, fn-5.4)

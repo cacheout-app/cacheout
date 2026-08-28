@@ -4045,9 +4045,19 @@ final class CacheCleanerTests: XCTestCase {
 
         func arm() { armed = true }
 
-        override func identity(ofDescriptor descriptor: Int32) -> Identity? {
+        /// The revalidator's ownership gate — the ONLY production caller of
+        /// this accessor — is what marks "the revalidation has run". It used
+        /// to be `identity(ofDescriptor:)`, which was equivalent while the
+        /// cleaner's first descriptor question came after the verdict; since
+        /// the leaf binding was hoisted above the measurement (PR #461 codex
+        /// r2) two descriptor questions happen BEFORE the revalidation, so
+        /// that gate opened too early and the swap landed ahead of the
+        /// revalidator's own path check — which then caught it, making this
+        /// cell prove a different guard than the one it is named for.
+        override func ownerUID(ofDescriptor fd: Int32) -> UInt32? {
+            let real = super.ownerUID(ofDescriptor: fd)
             inspected = true
-            return super.identity(ofDescriptor: descriptor)
+            return real
         }
 
         override func identity(of url: URL) -> Identity? {
@@ -5227,19 +5237,25 @@ extension CacheCleanerTests {
             return real
         }
 
-        /// Descriptor-identity question #1 after the verdict returns is the
-        /// cleaner's admitted-parent capture; #2 is the DISPOSAL's own
-        /// container proof (`openAdmittedContainer`, reached through
-        /// `DepthSafeRemoval.remove` on the permanent arm and
-        /// `TrashDisposal.boundLeaf` on the Trash arm) — after the final
-        /// path check. The swap lands there, for real; every answer is
-        /// `super`'s real answer (the parent directory's identity is
-        /// unchanged by a leaf swap, so the container proof rightly passes
-        /// and the LEAF binding is the one guard left standing).
+        /// The FIRST descriptor-identity question after the verdict returns
+        /// is the DISPOSAL's own container proof (`openAdmittedContainer`,
+        /// reached through `DepthSafeRemoval.remove` on the permanent arm and
+        /// `TrashDisposal.boundLeaf` on the Trash arm) — after the final path
+        /// check. The swap lands there, for real; every answer is `super`'s
+        /// real answer (the parent directory's identity is unchanged by a
+        /// leaf swap, so the container proof rightly passes and the LEAF
+        /// binding is the one guard left standing).
+        ///
+        /// It used to be the SECOND, with the cleaner's admitted-parent
+        /// capture ahead of it. That capture moved above the measurement when
+        /// the leaf binding was hoisted there (PR #461 codex r2), so it now
+        /// happens BEFORE the revalidator gates and is no longer counted
+        /// here. The count changed because production's order changed; what
+        /// the swap targets did not.
         override func identity(ofDescriptor descriptor: Int32) -> Identity? {
             if armed, revalidatorGatesRan {
                 descriptorIdentityCallsAfterGates += 1
-                if descriptorIdentityCallsAfterGates == 2, !swapped {
+                if descriptorIdentityCallsAfterGates == 1, !swapped {
                     swapped = true
                     try? FileManager.default.moveItem(at: target, to: stash)
                     plantReplacement()
@@ -5870,6 +5886,95 @@ extension CacheCleanerTests {
             logContents(home: base).contains("REFUSED [content-drift]"),
             logContents(home: base)
         )
+    }
+
+    /// Swaps the target while the MEASUREMENT is walking it — strictly after
+    /// any pre-measure binding and strictly before a post-measure one.
+    private final class MeasureWindowSwapProvider: FileSystemIdentityProvider {
+        var target: URL!
+        var stash: URL!
+        private var armed = false
+        private(set) var swapped = false
+
+        func arm() { armed = true }
+
+        /// Fires when the SIZER reaches the payload inside the target — its
+        /// per-entry `probeKind` during enumeration. Matched by basename, not
+        /// by path prefix: the sizer canonicalizes, so a `/var` fixture path
+        /// never prefix-matches its own `/private/var` spelling (the same
+        /// reason the sibling fixtures match on `lastPathComponent`).
+        override func probeKind(of url: URL) -> KindProbe {
+            if armed, !swapped, url.lastPathComponent == "payload.bin" {
+                swapped = true
+                let answer = super.probeKind(of: url)
+                try? FileManager.default.moveItem(at: target, to: stash)
+                try? FileManager.default.createDirectory(
+                    at: target, withIntermediateDirectories: true
+                )
+                try? Data("stranger".utf8).write(
+                    to: target.appendingPathComponent("stranger.bin")
+                )
+                return answer
+            }
+            return super.probeKind(of: url)
+        }
+    }
+
+    /// **BOUND BEFORE MEASURED** (PR #461 codex r2).
+    ///
+    /// Item mode measured the target and only then bound its leaf, so for
+    /// every item whose scanner registers no revalidator there was a window
+    /// the whole measurement wide: rename the target away, install a stranger
+    /// at the same name, and the binding recorded the STRANGER. The far-side
+    /// proof then succeeded — it proved the stranger against itself — the
+    /// stranger was destroyed, and the report credited the ORIGINAL tree's
+    /// bytes. Contents mode has always bound first; only this arm was
+    /// backwards.
+    ///
+    /// MUTATION: move the binding back below `sizer.measure` and this reds.
+    func testItemModeTargetSwappedDuringTheMeasurementIsRefused()
+        async throws
+    {
+        let base = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: base) }
+        let container = base.appendingPathComponent("fixture-container")
+        let project = container.appendingPathComponent("proj")
+        let target = project.appendingPathComponent("victim-item")
+        try FileManager.default.createDirectory(
+            at: target, withIntermediateDirectories: true
+        )
+        try writeFile(target.appendingPathComponent("payload.bin"), bytes: 4096)
+
+        let provider = MeasureWindowSwapProvider()
+        provider.target = target
+        provider.stash = base.appendingPathComponent("stash")
+
+        let cleaner = CacheCleaner(
+            home: base, containerRoots: [container],
+            containerSnapshot: sessionSnapshot(
+                of: [container], provider: provider
+            ),
+            provider: provider
+        )
+        provider.arm()
+        let report = await cleaner.clean(
+            items: [makeRemoveItem(origin: container, target: target)],
+            moveToTrash: false
+        )
+
+        XCTAssertTrue(provider.swapped, "the fixture never fired the swap")
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: target.appendingPathComponent("stranger.bin").path
+            ),
+            "the stranger installed during the measurement was DELETED — the "
+                + "binding was taken after the measure and recorded it"
+        )
+        XCTAssertTrue(
+            report.entries.isEmpty,
+            "reported bytes for a tree it never deleted: \(report.entries)"
+        )
+        XCTAssertEqual(report.errors.count, 1, "\(report.errors)")
     }
 
     /// CONTROL for the item-mode cell: identical fixture and provider,

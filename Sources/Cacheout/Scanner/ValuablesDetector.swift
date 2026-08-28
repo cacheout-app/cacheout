@@ -163,7 +163,7 @@
 /// a filesystem the user never pointed this scanner at. And it buys nothing:
 /// an artifact dir containing a boundary is `.denied` at scan time and
 /// refused whole by the cleaner (`deleteGuardedChild`, `CacheCleaner.swift:1210`,
-/// and `removeGuardedItem`, `CacheCleaner.swift:1496`), so no
+/// and `removeGuardedItem`, `CacheCleaner.swift:1543`), so no
 /// valuable found past the mount could ever change an outcome.
 ///
 /// UNCROSSED ⇒ INCOMPLETE, never "clean": the honest report is "we did not

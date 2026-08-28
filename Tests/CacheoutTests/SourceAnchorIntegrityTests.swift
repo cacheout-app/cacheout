@@ -109,7 +109,7 @@ final class SourceAnchorIntegrityTests: XCTestCase {
         // drift is a red cell, not a gate finding (fn-4 r2 gate).
         ("CacheCleaner.swift:1210",
          "child.path): mount boundary at"),
-        ("CacheCleaner.swift:1496",
+        ("CacheCleaner.swift:1543",
          "target.path): mount boundary at"),
         ("OrphanedCachesScanner.swift:816",
          "static func preDeleteUserDataProbe("),

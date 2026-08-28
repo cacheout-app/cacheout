@@ -1633,16 +1633,42 @@ actor CacheCleaner {
             // it travels in `expecting:` and is proved against the opened
             // inode by the removal itself, so no second binding is taken.
             // The binding taken BEFORE the measurement, so the object whose
-            // bytes were counted is the object the removal must prove. If the
-            // leaf could not be bound then, the original read stands exactly
-            // where it always did — same call, same point, same failure.
-            let boundTarget: FileSystemIdentityProvider.ChildFacts? =
-                probedObject == nil
-                ? try (preMeasureLeaf ?? TrashDisposal.boundLeaf(
+            // bytes were counted is the object the removal must prove.
+            //
+            // AND WHEN NOTHING COULD BE BOUND THEN, NOTHING MAY BE DELETED
+            // NOW (PR #461 merge gate r4, P4). The `??` that stood here read
+            // the leaf again at the original point and used whatever it
+            // found, and its comment claimed that read was "same call, same
+            // point, same failure". The third clause was false: the re-read
+            // can SUCCEED, on an object that arrived AFTER the measurement.
+            // Nothing inspected it, nothing measured it, and binding it
+            // proved it against itself — so it was destroyed and the item
+            // reported SUCCESS with no error at all. Measured live, on a
+            // ghost target with a no-revalidator scanner, before this fix.
+            //
+            // The re-read still happens, because a still-absent leaf must
+            // raise its ENOENT at the original point with the original
+            // identity — the absent-target arms pin that message so a
+            // fixture "cannot silently degrade into testing the other arm".
+            // What changes is what a SUCCESSFUL re-read means: it is a drift
+            // event, not a target.
+            let boundTarget: FileSystemIdentityProvider.ChildFacts?
+            if probedObject != nil {
+                boundTarget = nil
+            } else if let bound = preMeasureLeaf {
+                boundTarget = bound
+            } else {
+                // Throws the original failure when the leaf is still absent
+                // or still unbindable; returns only when something now
+                // stands where nothing stood.
+                _ = try TrashDisposal.boundLeaf(
                     of: target, containedIn: admittedParent,
                     provider: provider
-                ))
-                : nil
+                )
+                throw DepthSafeRemoval.Failure(
+                    path: target.path, cause: .notTheInspectedObject, depth: 0
+                )
+            }
             // TOCTOU narrowing, immediately pre-delete: the SAME no-follow
             // + snapshot-identity admission re-runs (a container swapped
             // between the checks above and here is refused), then the

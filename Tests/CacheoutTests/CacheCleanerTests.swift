@@ -5977,6 +5977,107 @@ extension CacheCleanerTests {
         XCTAssertEqual(report.errors.count, 1, "\(report.errors)")
     }
 
+    /// Plants a stranger at a GHOST target's name the moment the pre-measure
+    /// bind has answered "absent" — the window the `??` fallback reopens.
+    private final class GhostThenStrangerProvider: FileSystemIdentityProvider {
+        var target: URL!
+        private var armed = false
+        private(set) var sawAbsent = false
+        private(set) var planted = false
+
+        func arm() { armed = true }
+
+        override func probeChild(
+            inDirectory descriptor: Int32, named name: String,
+            logical: @autoclosure () -> URL
+        ) -> ChildProbe {
+            let answer = super.probeChild(
+                inDirectory: descriptor, named: name, logical: logical()
+            )
+            guard armed, name == target.lastPathComponent else { return answer }
+            if case .absent = answer {
+                sawAbsent = true
+            } else if sawAbsent, !planted {
+                // The fallback's own read — already too late in the shipped
+                // shape, which is the point.
+            }
+            if sawAbsent, !planted {
+                planted = true
+                try? FileManager.default.createDirectory(
+                    at: target, withIntermediateDirectories: true
+                )
+                try? Data("stranger".utf8).write(
+                    to: target.appendingPathComponent("stranger.bin")
+                )
+            }
+            return answer
+        }
+    }
+
+    /// **A GHOST LEAF LEAVES THE MEASURE→BIND WINDOW WIDE OPEN**
+    /// (PR #461 merge gate r4, P4).
+    ///
+    /// The r2 hoist binds the leaf before the measurement — but only when the
+    /// leaf BINDS. When the target is absent at that moment (a ghost), the
+    /// `??` fallback re-reads at the original point, and if an object has
+    /// appeared in between it binds THAT one: the far-side proof then
+    /// succeeds against the newcomer and destroys it, reporting success. The
+    /// comment at the fallback claimed the original read "stands exactly
+    /// where it always did — same call, same point, same failure"; the third
+    /// clause was false, because that read can now SUCCEED on a different
+    /// object.
+    ///
+    /// Nothing was measured — the ghost measures empty — so the report does
+    /// not even have bytes to be wrong about. It simply deletes a stranger
+    /// and calls it a success. Pre-existing rather than introduced by the
+    /// hoist, and disclosed nowhere.
+    func testAStrangerArrivingAtAGhostTargetIsNeverDeleted() async throws {
+        let base = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: base) }
+        let container = base.appendingPathComponent("fixture-container")
+        let project = container.appendingPathComponent("proj")
+        let target = project.appendingPathComponent("victim-item")
+        try FileManager.default.createDirectory(
+            at: target, withIntermediateDirectories: true
+        )
+        try writeFile(target.appendingPathComponent("payload.bin"), bytes: 4096)
+
+        let provider = GhostThenStrangerProvider()
+        provider.target = target
+
+        let cleaner = CacheCleaner(
+            home: base, containerRoots: [container],
+            containerSnapshot: sessionSnapshot(
+                of: [container], provider: provider
+            ),
+            provider: provider
+        )
+        // The target is gone by the time cleaning starts: scanned, then
+        // removed by someone else. This is the ghost the arm is written for.
+        try FileManager.default.removeItem(at: target)
+        provider.arm()
+
+        let report = await cleaner.clean(
+            items: [makeRemoveItem(origin: container, target: target)],
+            moveToTrash: false
+        )
+
+        XCTAssertTrue(provider.planted, "the fixture never planted a stranger")
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: target.appendingPathComponent("stranger.bin").path
+            ),
+            "a stranger that arrived at a GHOST target's name was DELETED — "
+                + "nothing ever inspected it, and nothing measured it"
+        )
+        XCTAssertTrue(
+            report.entries.isEmpty,
+            "reported SUCCESS for an object that arrived after the "
+                + "measurement: \(report.entries)"
+        )
+        XCTAssertEqual(report.errors.count, 1, "\(report.errors)")
+    }
+
     /// CONTROL for the item-mode cell: identical fixture and provider,
     /// never armed — success, so the refusal above is the swap's and only
     /// the swap's.

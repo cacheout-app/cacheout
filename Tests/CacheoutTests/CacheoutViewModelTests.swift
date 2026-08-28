@@ -2120,6 +2120,54 @@ final class CacheoutViewModelTests: XCTestCase {
         XCTAssertTrue(result.contains("did not finish"), result)
     }
 
+    /// THE OTHER TIMEOUT ARM, PINNED (PR #461 merge gate r3, P5).
+    ///
+    /// The r2 disclosure at this branch's site claimed both wordings were
+    /// uncoverable and that pinning them would need production API hoisted
+    /// for a test to read. Both halves were false: the sibling cell above
+    /// already pins the `didStart` arm by reading `lastDockerPruneResult`,
+    /// published state three cells in this file read. This one pins the
+    /// other arm the same way, so the two messages cannot be swapped, and
+    /// the false disclosure is retired.
+    ///
+    /// The arm requires the timer to win before the detached task is even
+    /// scheduled, which a zero budget makes the ordinary case.
+    @MainActor
+    func testAPruneThatNeverStartedSaysSoAndClaimsNothingWasStopped()
+        async throws
+    {
+        var startedReports = 0
+        var neverStartedReports = 0
+        for _ in 0..<12 {
+            let runtime = try makeRuntime([])
+            let viewModel = CacheoutViewModel(runtime: runtime)
+            viewModel.dockerPruneBudget = .zero
+            viewModel.dockerPruneCommand = ["sh", "-c", "sleep 30"]
+            await viewModel.dockerPrune()
+            let result = viewModel.lastDockerPruneResult ?? ""
+            if result.contains("did not start") {
+                neverStartedReports += 1
+                XCTAssertTrue(
+                    result.contains("nothing was run"),
+                    "an unstarted prune must not claim anything was stopped: "
+                        + result
+                )
+                XCTAssertFalse(
+                    result.contains("asked it to stop"),
+                    "the two arms must not share vocabulary: \(result)"
+                )
+            } else if result.contains("did not finish") {
+                startedReports += 1
+                XCTAssertTrue(result.contains("asked it to stop"), result)
+            }
+        }
+        XCTAssertGreaterThan(
+            neverStartedReports, 0,
+            "the never-started arm was not reached in 12 zero-budget rounds "
+                + "(\(startedReports) rounds started) — this cell pins nothing"
+        )
+    }
+
     /// CONTROL for the cell above, and the success path's parser: a child
     /// that prints docker's reclaimed line and exits must be read to EOF
     /// and reported through the same seams — so the expiry cell's refusal

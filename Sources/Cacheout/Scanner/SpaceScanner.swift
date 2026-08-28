@@ -1471,13 +1471,27 @@ struct ScanSessionBounds: Sendable {
 /// the pool's every worker is held by a scanner blocked in a syscall, which
 /// is the exact wedge the bound exists to convert into a report.
 ///
-/// The queue is DEDICATED and SERIAL, and nothing blocking may ever be
-/// scheduled on it. Every body it runs is non-suspending and microseconds
-/// long — yield into an unbounded `AsyncStream`, `finish()`, `Task.cancel()`,
+/// The queue is DEDICATED and SERIAL, and nothing blocking may be scheduled
+/// on it. Every body it runs is non-suspending and microseconds long — yield
+/// into an unbounded `AsyncStream`, `finish()`, `Task.cancel()`,
 /// `OneShotGate.open()` (which resumes continuations by ENQUEUEING them, it
 /// does not run them inline). That is what makes one serial queue safe for
 /// every concurrent session on the machine; put a blocking call in one of
-/// these bodies and you would stall every other session's deadline behind it.
+/// these bodies and you stall every other session's deadline behind it.
+///
+/// ONE BODY BREAKS THIS, KNOWINGLY (PR #461 merge gate r3, P6 — recorded
+/// HERE because this is the site a future round reads to answer "may I block
+/// in this body?", and until r3 the answer here was an unqualified no while
+/// the exception lived a thousand lines away). `CacheoutViewModel.dockerPrune`
+/// schedules `LaunchClaim.abandon()` on this queue, and `abandon()` blocks on
+/// the claim's lock, which `begin` holds across a `Process.run()` — a
+/// fork/exec, milliseconds, more under load. It is deliberate: releasing that
+/// lock earlier is precisely the window `LaunchClaim` exists to close. No
+/// deadlock cycle exists, but for that interval every other bound scheduled
+/// here — `DiskInfo`, `PathGuard`, the wind-down grace, the event-deadline
+/// watchdog — is delayed, and that prune's own `.timedOut` settle overshoots
+/// its budget by the same amount. A SECOND such body would not be acceptable
+/// on this reasoning; this one is the exception, not a precedent.
 enum ScanSessionClock {
     static let queue = DispatchQueue(
         label: "app.cacheout.scan-session-bounds"

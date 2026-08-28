@@ -1980,15 +1980,19 @@ class CacheoutViewModel: ObservableObject {
             // lock, `didStart` is now a fact rather than a guess about a
             // statement that may not have run yet.
             //
-            // RESIDUAL, disclosed (merge gate r2): WHICH arm is taken is
-            // pinned — `LaunchClaimTests` proves `didStart` is a fact about
-            // the past, not a guess — but the two WORDINGS below have no
-            // cell. `dockerPrune` builds them inline and the branch is only
-            // reachable through a real timed-out spawn, so pinning them would
-            // mean hoisting the strings into production API for a test to
-            // read, which this project declines. A source fence over the
-            // spellings would be a blocklist wearing a fence's name, which
-            // this branch has already retired eleven times.
+            // BOTH ARMS ARE PINNED, and the r2 note that stood here claiming
+            // otherwise was false in both halves (merge gate r3, P5). It said
+            // the wordings had no cell and that pinning them would need the
+            // strings hoisted into production API; in fact
+            // `testDockerPruneExpiresReportsAndReleasesTheButton` already
+            // pinned this arm, and
+            // `testAPruneThatNeverStartedSaysSoAndClaimsNothingWasStopped`
+            // now pins the other — both by reading `lastDockerPruneResult`,
+            // published state those cells already consume, with nothing
+            // hoisted. A residual is recorded so a future round need not
+            // rediscover it; that one would have sent a future round hunting
+            // for a cell thirty lines away in a file it already reads, and
+            // licensed a swap of these two messages as "uncovered".
             if launch.didStart {
                 if process.isRunning { process.terminate() }
                 lastDockerPruneResult = "Docker prune did not finish within "

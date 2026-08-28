@@ -287,14 +287,18 @@ struct ProjectTreeWalker {
         for root in roots {
             if Task.isCancelled { break }
 
-            // TCC policy gate (R9/R12): a background rescan must never be
-            // the thing that fires a macOS privacy prompt. Prefix-under-
-            // protected-ancestor on the CANONICAL root — never basename.
-            if !includeProtectedRoots,
-               Self.isProtectedRoot(root, home: home, provider: provider) {
-                continue
-            }
-
+            // THE TCC GATE MOVED BELOW THE TABLE (PR #461 merge gate).
+            // `isProtectedRoot`'s stage 2 canonicalizes, and `realpath(3)` on
+            // a hung hard mount blocks uninterruptibly in the kernel — so on
+            // an automatic scan (`includeProtectedRoots` false for every
+            // non-userInitiated trigger) the protected check was the FIRST
+            // contact with the root, and the walk hung there before the table
+            // could answer. The previous round moved the `probeKind` below
+            // the table and asserted the hang was unreachable; it was not,
+            // because `probeKind` was never the only way the root gets
+            // touched. The table is memory, so it answers before any code
+            // that can touch the filesystem at all.
+            //
             // MOUNT FIRST, AND NOW ACTUALLY FIRST (PR #461 codex r1). The
             // paragraph below has said MOUNT FIRST since fn-4.12 while the
             // root probe ran above it, so an unresponsive mounted volume was
@@ -323,6 +327,16 @@ struct ProjectTreeWalker {
                         + "scanned; its contents belong to that volume. "
                         + "Eject or unmount it, then re-scan"
                 ))
+                continue
+            }
+
+            // TCC policy gate (R9/R12): a background rescan must never be
+            // the thing that fires a macOS privacy prompt. Prefix-under-
+            // protected-ancestor on the CANONICAL root — never basename.
+            // Asked AFTER the table, which is the only ordering in which its
+            // own canonicalize cannot be the call that hangs.
+            if !includeProtectedRoots,
+               Self.isProtectedRoot(root, home: home, provider: provider) {
                 continue
             }
 

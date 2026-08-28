@@ -639,16 +639,21 @@ final class ProjectTreeWalkerTests: XCTestCase {
             ),
             provider: provider
         )
+        // `includeProtectedRoots: false` IS the broken path: it is what
+        // every non-userInitiated trigger passes, and it is the arm on which
+        // the protected check ran first.
         let issues = walker.walk(
             roots: [volume],
+            includeProtectedRoots: false,
             consumers: [{ (_: ProjectTreeEvent) -> Set<String> in [] }]
         )
 
         XCTAssertEqual(
-            provider.probedPaths.filter { $0 == volume.path }, [],
-            "the mounted root was probed — on an unresponsive volume that "
-                + "lstat is the hang the table check exists to avoid, and it "
-                + "happens before the guard can classify it: \(provider.probedPaths)"
+            provider.contacts.filter { $0.contains(volume.path) }, [],
+            "the mounted root was TOUCHED before the table answered — on an "
+                + "unresponsive volume any of these blocks uninterruptibly in "
+                + "the kernel, which is the hang the table check exists to "
+                + "avoid: \(provider.contacts)"
         )
         XCTAssertEqual(
             issues.map(\.kind), [ScanIssue.Kind.mountedVolumeRoot],
@@ -660,7 +665,7 @@ final class ProjectTreeWalkerTests: XCTestCase {
         FileSystemIdentityProvider
     {
         var injectedMountPoints: Set<String> = []
-        private(set) var probedPaths: [String] = []
+        private(set) var contacts: [String] = []
         override func mountPointPaths() -> [String] {
             Array(injectedMountPoints) + super.mountPointPaths()
         }
@@ -668,9 +673,27 @@ final class ProjectTreeWalkerTests: XCTestCase {
             if injectedMountPoints.contains(url.path) { return true }
             return super.isMountPoint(url)
         }
+        // EVERY filesystem contact, not just `probeKind` (PR #461 merge
+        // gate). The first version of this double recorded `probeKind` alone
+        // and passed while `isProtectedRoot`'s stage-2 `realpath` touched the
+        // mounted root first — the cell was blind to the very call that
+        // hangs. A guard that names one syscall can only ever prove something
+        // about that syscall.
         override func probeKind(of url: URL) -> KindProbe {
-            probedPaths.append(url.path)
+            contacts.append("probeKind(\(url.path))")
             return super.probeKind(of: url)
+        }
+        override func canonicalize(_ url: URL) -> URL {
+            contacts.append("canonicalize(\(url.path))")
+            return super.canonicalize(url)
+        }
+        override func realPath(of path: String) -> String? {
+            contacts.append("realPath(\(path))")
+            return super.realPath(of: path)
+        }
+        override func identity(of url: URL) -> Identity? {
+            contacts.append("identity(\(url.path))")
+            return super.identity(of: url)
         }
     }
 

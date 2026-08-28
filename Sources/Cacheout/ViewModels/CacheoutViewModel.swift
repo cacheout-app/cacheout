@@ -1906,9 +1906,10 @@ class CacheoutViewModel: ObservableObject {
             rendezvous.settle(.timedOut)
         }
         Task.detached {
-            guard launch.begin() else { return }
+            // ONE ACT: the claim performs the launch, so the timer cannot
+            // interleave between deciding and starting (PR #461 merge gate).
             do {
-                try process.run()
+                guard try launch.begin({ try process.run() }) else { return }
             } catch {
                 rendezvous.settle(.launchFailed)
                 return
@@ -1962,13 +1963,23 @@ class CacheoutViewModel: ObservableObject {
             // delete, a wedged Docker Desktop — are all transient, so
             // "check Docker and retry" is a real remedy, not a strand
             // dressed as one.
-            // `didStart` distinguishes the two timeouts: a child that
-            // never launched has nothing to terminate, and asking
-            // `isRunning` of an unlaunched `Process` answers false anyway —
-            // this states which case happened rather than inferring it.
-            if launch.didStart, process.isRunning { process.terminate() }
-            lastDockerPruneResult = "Docker prune did not finish within "
-                + "\(budget) — asked it to stop; check Docker and retry"
+            // TWO TIMEOUTS, AND THE MESSAGE MUST NOT CLAIM THE OTHER ONE
+            // (PR #461 merge gate). `abandon()` above already decided which
+            // this is, and because `begin` performs the launch under the same
+            // lock, `didStart` is now a fact rather than a guess about a
+            // statement that may not have run yet.
+            if launch.didStart {
+                if process.isRunning { process.terminate() }
+                lastDockerPruneResult = "Docker prune did not finish within "
+                    + "\(budget) — asked it to stop; check Docker and retry"
+            } else {
+                // Nothing was launched, so nothing was asked to stop. Saying
+                // otherwise is the false-message class this project retires
+                // everywhere else; the remedy is still real, because the
+                // cause (a starved pool, a busy daemon) is transient.
+                lastDockerPruneResult = "Docker prune did not start within "
+                    + "\(budget) — nothing was run; check Docker and retry"
+            }
         }
 
         // Refresh disk info after prune — THE TWIN OF `scan`'s fetch, and

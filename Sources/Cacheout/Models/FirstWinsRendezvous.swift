@@ -76,17 +76,36 @@ final class LaunchClaim: @unchecked Sendable {
     private var decided = false
     private var started = false
 
-    /// `true` if the caller may start the work. Never true twice.
-    func begin() -> Bool {
+    /// Decide AND perform in one act: `body` runs while the lock is held, so
+    /// `abandon()` cannot interleave between the decision and the start.
+    ///
+    /// A first version of this type offered a bare `begin()` and left the
+    /// caller to start the work on the next statement. That MOVED the window
+    /// rather than closing it: with the timer firing between the two,
+    /// `abandon()` answered false ("already started"), the caller's timeout
+    /// branch read `didStart == true` with `isRunning == false` — because the
+    /// start had not run yet — terminated nothing, reported the work stopped,
+    /// and the work then began, unowned. Deciding and starting must be the
+    /// same act, so this type performs it.
+    ///
+    /// Returns `false` without running `body` if the work was already
+    /// abandoned. A throwing `body` leaves the claim DECIDED but not started:
+    /// the attempt is spent (never retried under the same claim) while
+    /// `didStart` stays false, because nothing is running to terminate.
+    @discardableResult
+    func begin(_ body: () throws -> Void) rethrows -> Bool {
         lock.lock(); defer { lock.unlock() }
         guard !decided else { return false }
         decided = true
+        try body()
         started = true
         return true
     }
 
-    /// `true` if the work was stopped before it began. `false` means it is
-    /// already running and the caller must stop it by other means.
+    /// `true` if the work was stopped before it began. `false` means the
+    /// decision was already taken — and because `begin` performs the work
+    /// under this same lock, a false answer means the work has provably
+    /// STARTED (or its start threw), never that it is about to.
     @discardableResult
     func abandon() -> Bool {
         lock.lock(); defer { lock.unlock() }

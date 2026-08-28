@@ -432,17 +432,92 @@ struct GitWorktreeGitdirResolver {
         return trimmed.allSatisfy { $0.isHexDigit && ($0.isNumber || $0.isLowercase) }
     }
 
-    /// Does this config text carry a `bare = true` line, as git's own
-    /// config writer spells it (case-insensitive, whitespace-tolerant)?
+    /// The EFFECTIVE `core.bare`, resolved the way git resolves it: section
+    /// context is honoured and the LAST value wins.
+    ///
+    /// The first version matched any line whose key was `bare`, anywhere in
+    /// the file (PR #461 codex r2). Two shapes broke it, and git reads both
+    /// the other way: a healthy `--separate-git-dir` repository carrying
+    /// `core.bare = false` PLUS an unrelated section with its own `bare` key
+    /// was admitted as bare, and an early `core.bare = true` later overridden
+    /// by `false` stayed admitted. Admitting one is not a harmless
+    /// over-discovery — the scanner then runs `worktree list` against a
+    /// healthy non-bare admin directory and publishes a cross-validation
+    /// `unreadable` issue on every scan, for a repository shape this scanner
+    /// deliberately does not cover.
+    ///
+    /// RESIDUAL, unchanged and still disclosed: only git's own writer
+    /// spelling of the VALUE counts. `bare = yes`, a valueless `bare` key
+    /// (which git reads as true) and an `include.path` indirection all leave
+    /// the repository undiscovered — the same silence every bare repository
+    /// had before fn-4.28, never a refusal dressed as retryable.
     static func declaresBare(_ configContents: String) -> Bool {
-        configContents.split(whereSeparator: \.isNewline).contains { line in
-            let trimmed = line.trimmingCharacters(in: .whitespaces).lowercased()
-            guard let equals = trimmed.firstIndex(of: "=") else { return false }
-            let key = trimmed[..<equals].trimmingCharacters(in: .whitespaces)
-            let value = trimmed[trimmed.index(after: equals)...]
-                .trimmingCharacters(in: .whitespaces)
-            return key == "bare" && value == "true"
+        var section = ""
+        var subsection: String?
+        var effective: String?
+        for rawLine in configContents.split(
+            whereSeparator: \.isNewline
+        ) {
+            var line = Substring(Self.withoutComment(rawLine))
+                .drop(while: { $0 == " " || $0 == "\t" })
+            if line.first == "[" {
+                guard let close = line.firstIndex(of: "]") else { continue }
+                (section, subsection) = Self.sectionName(
+                    line[line.index(after: line.startIndex)..<close]
+                )
+                // git allows a variable on the section header's own line.
+                line = line[line.index(after: close)...]
+                    .drop(while: { $0 == " " || $0 == "\t" })
+            }
+            guard !line.isEmpty, let equals = line.firstIndex(of: "=")
+            else { continue }
+            let key = line[..<equals]
+                .trimmingCharacters(in: .whitespaces).lowercased()
+            guard section == "core", subsection == nil, key == "bare"
+            else { continue }
+            var value = line[line.index(after: equals)...]
+                .trimmingCharacters(in: .whitespaces).lowercased()
+            if value.count >= 2, value.hasPrefix("\""), value.hasSuffix("\"") {
+                value = String(value.dropFirst().dropLast())
+            }
+            // LAST WINS, which is the whole point: an override must be able
+            // to turn bareness OFF, not merely fail to turn it on.
+            effective = value
         }
+        return effective == "true"
+    }
+
+    /// The line with any unquoted `#`/`;` comment removed. Quoted because a
+    /// git config VALUE may legitimately contain either character.
+    private static func withoutComment(_ line: Substring) -> String {
+        var out = ""
+        var quoted = false
+        var escaped = false
+        for character in line {
+            if escaped { out.append(character); escaped = false; continue }
+            if character == "\\" { out.append(character); escaped = true; continue }
+            if character == "\"" { quoted.toggle(); out.append(character); continue }
+            if !quoted, character == "#" || character == ";" { break }
+            out.append(character)
+        }
+        return out
+    }
+
+    /// `[core]` -> ("core", nil); `[core "sub"]` -> ("core", "sub"). Section
+    /// names are case-insensitive in git, subsection names are not — and a
+    /// subsection makes the key `core.sub.bare`, which is NOT `core.bare`.
+    private static func sectionName(
+        _ header: Substring
+    ) -> (String, String?) {
+        guard let quote = header.firstIndex(of: "\"") else {
+            return (
+                header.trimmingCharacters(in: .whitespaces).lowercased(), nil
+            )
+        }
+        let name = header[..<quote]
+            .trimmingCharacters(in: .whitespaces).lowercased()
+        let rest = header[header.index(after: quote)...]
+        return (name, String(rest.prefix(while: { $0 != "\"" })))
     }
 
     /// The repository's COMMON git directory, via the admin directory's

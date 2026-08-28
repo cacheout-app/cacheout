@@ -1851,20 +1851,28 @@ class CacheoutViewModel: ObservableObject {
         // docker CLI that never exits.
         defer { isDockerPruning = false }
 
-        let process = Process()
+        // A `ClaimedProcess`, not a `Process`: it owns the child and never
+        // hands it out, so nothing below this line can start the prune except
+        // through the claim (PR #461 merge gate r3, P1 — the gate restored
+        // the two-statement launch here and all 1667 cells stayed green,
+        // because the claim's window was closed in the TYPE and unlatched at
+        // this, its only call site). There is no `process` in scope now, so
+        // that shape does not compile.
         let pipe = Pipe()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        process.arguments = dockerPruneCommand
-        process.standardOutput = pipe
-        process.standardError = pipe
         // Real home is correct here: the view model has no injected-home
         // seam — docker prune is a production-only action on the real
         // account (unlike CacheCleaner/CacheCategory subprocesses, which
         // pin HOME to their injected home).
-        process.environment = [
-            "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin",
-            "HOME": FileManager.default.homeDirectoryForCurrentUser.path
-        ]
+        let child = ClaimedProcess(
+            executableURL: URL(fileURLWithPath: "/usr/bin/env"),
+            arguments: dockerPruneCommand,
+            environment: [
+                "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin",
+                "HOME": FileManager.default.homeDirectoryForCurrentUser.path
+            ],
+            standardOutput: pipe,
+            standardError: pipe
+        )
 
         // BOUNDED, AND BOUNDED AS A WHOLE (fn-4.20; through fn-4 round 1
         // this was RECORDED, NOT FIXED at PR #460 codex r13). The old body
@@ -1905,22 +1913,22 @@ class CacheoutViewModel: ObservableObject {
         // UNDER the claim's lock — that is the whole mechanism — so the timer
         // body below blocks on that lock for the duration of the spawn, and
         // it runs on `ScanSessionClock`'s single shared serial queue. No
-        // deadlock cycle exists (nothing `process.run()` waits on is
+        // deadlock cycle exists (nothing the child's launch waits on is
         // dispatched to that queue), but for a fork/exec's worth of time —
         // milliseconds, more under load — every other bound scheduled there
         // is delayed, and a `.timedOut` settle overshoots its budget by the
         // same amount. Not fixable by releasing the lock earlier: releasing
         // it is exactly the window this type exists to close.
-        let launch = LaunchClaim()
         let timer = ScanSessionClock.schedule(after: budget) {
-            launch.abandon()
+            child.abandon()
             rendezvous.settle(.timedOut)
         }
         Task.detached {
-            // ONE ACT: the claim performs the launch, so the timer cannot
-            // interleave between deciding and starting (PR #461 merge gate).
+            // ONE ACT, and the only act available: `start()` decides and
+            // launches under one lock, and the child is not reachable any
+            // other way (PR #461 merge gate r3, P1).
             do {
-                guard try launch.begin({ try process.run() }) else { return }
+                guard try child.start() else { return }
             } catch {
                 rendezvous.settle(.launchFailed)
                 return
@@ -1931,12 +1939,12 @@ class CacheoutViewModel: ObservableObject {
             // the SAME figure: the outer timer started first, so on a
             // wedged child it is the timer that settles, and this poll can
             // never outlive the budget by more than its own scheduling.
-            guard process.waitForExit(within: waitSeconds) else {
+            guard child.waitForExit(within: waitSeconds) else {
                 rendezvous.settle(.timedOut)
                 return
             }
             rendezvous.settle(.finished(
-                status: process.terminationStatus,
+                status: child.terminationStatus,
                 output: String(data: data, encoding: .utf8) ?? ""
             ))
         }
@@ -1993,8 +2001,8 @@ class CacheoutViewModel: ObservableObject {
             // rediscover it; that one would have sent a future round hunting
             // for a cell thirty lines away in a file it already reads, and
             // licensed a swap of these two messages as "uncovered".
-            if launch.didStart {
-                if process.isRunning { process.terminate() }
+            if child.didStart {
+                if child.isRunning { child.terminate() }
                 lastDockerPruneResult = "Docker prune did not finish within "
                     + "\(budget) — asked it to stop; check Docker and retry"
             } else {

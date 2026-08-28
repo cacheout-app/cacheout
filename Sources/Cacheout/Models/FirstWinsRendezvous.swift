@@ -121,3 +121,72 @@ final class LaunchClaim: @unchecked Sendable {
         return started
     }
 }
+
+
+/// A `Process` that CANNOT be started except through its own launch claim.
+///
+/// `LaunchClaim` closes the decide-then-start window inside the type, and
+/// `LaunchClaimTests` proves it does. What nothing held was the CALLER: the
+/// claim takes a closure, so `begin({})` is writable and the launch is free
+/// to drift back out to the next statement — which is the original defect,
+/// not a variant of it. The merge gate demonstrated exactly that (PR #461
+/// r3, P1): it restored the two-statement shape at `dockerPrune` and the
+/// full 1667-cell suite stayed green, because every cell builds its own
+/// claim and calls `begin` itself.
+///
+/// A test cannot hold that boundary — the damage needs the timer to land in
+/// a fork/exec-wide window, so any cell for it samples rather than proves.
+/// The type can: this one OWNS the `Process`, builds it from its parts and
+/// never hands it out, so there is no `process` in scope at the call site to
+/// call `run()` on. The two-statement shape stops COMPILING — verified by
+/// applying the gate's mutation verbatim, which now fails with
+/// `cannot find 'process' in scope` rather than passing 1667 green cells.
+///
+/// WHAT THIS DOES NOT PREVENT, stated rather than implied: a caller can still
+/// construct its OWN `Process` and run it (measured — that compiles). But
+/// that launches a DIFFERENT child than the one the claim guards, which is a
+/// visible act rather than the silent drift of a launch out of the claim's
+/// body, and `didStart` would then contradict it. The boundary this type
+/// holds is "the claimed child cannot start unclaimed", not "no process may
+/// ever be started here".
+final class ClaimedProcess: @unchecked Sendable {
+    private let process = Process()
+    private let claim = LaunchClaim()
+
+    init(
+        executableURL: URL,
+        arguments: [String],
+        environment: [String: String],
+        standardOutput: Pipe,
+        standardError: Pipe
+    ) {
+        process.executableURL = executableURL
+        process.arguments = arguments
+        process.environment = environment
+        process.standardOutput = standardOutput
+        process.standardError = standardError
+    }
+
+    /// Decide and launch as ONE act. `false` means the launch was abandoned
+    /// before it began; the process is never started twice.
+    @discardableResult
+    func start() throws -> Bool {
+        try claim.begin { try self.process.run() }
+    }
+
+    /// `true` if the launch was stopped before it began. `false` means the
+    /// work has provably started — see `LaunchClaim.abandon()`.
+    @discardableResult
+    func abandon() -> Bool { claim.abandon() }
+
+    /// Whether anything was started, so a caller knows whether it has
+    /// something to terminate.
+    var didStart: Bool { claim.didStart }
+
+    var isRunning: Bool { process.isRunning }
+    var terminationStatus: Int32 { process.terminationStatus }
+    func terminate() { process.terminate() }
+    func waitForExit(within seconds: TimeInterval) -> Bool {
+        process.waitForExit(within: seconds)
+    }
+}

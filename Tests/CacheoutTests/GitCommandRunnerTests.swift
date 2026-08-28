@@ -561,13 +561,25 @@ final class GitCommandRunnerTests: XCTestCase {
             .deletingLastPathComponent()
     }
 
-    /// Swift source with every comment blanked, newlines and therefore line
-    /// numbering preserved. Line comments are blanked because a trailing
-    /// `// try require(` laundered a bare call as checked in the first
-    /// version of the fence below; block comments because one sitting between
-    /// a wrapper and its operand would otherwise read as a missing wrapper.
-    /// String literals are skipped, so a `//` inside one is not a comment.
-    private func commentsBlanked(_ source: String) -> String {
+    /// Swift source with every comment AND every string literal's CONTENTS
+    /// blanked, newlines and therefore line numbering preserved.
+    ///
+    /// Comments, because a trailing `// try require(` laundered a bare call
+    /// as checked in the first version of the fence below, and a block
+    /// comment between a wrapper and its operand reads as a missing wrapper.
+    /// String CONTENTS too (the quotes are kept, so the scan stays balanced),
+    /// because `let note = "try require("` in front of a bare call laundered
+    /// it the same way.
+    ///
+    /// ONLY plain `"…"` literals with backslash escapes are modelled. Raw
+    /// (`#"…"#`) and multiline (`"""`) literals are NOT, and the caller must
+    /// refuse a file containing them — see the fence's own precondition. In
+    /// `#"\"#` the backslash sets `escaped`, the closing quote is swallowed
+    /// as an escaped character and `inString` stays true for the whole rest
+    /// of the file, so nothing after it is ever blanked. The merge gate
+    /// walked a comment-laundered call straight past this (r3 P2) by adding
+    /// one such literal earlier in the file.
+    private func commentsAndStringsBlanked(_ source: String) -> String {
         var out = ""
         out.reserveCapacity(source.count)
         var index = source.startIndex
@@ -578,10 +590,18 @@ final class GitCommandRunnerTests: XCTestCase {
             let after = source.index(after: index)
             let next: Character? = after < source.endIndex ? source[after] : nil
             if inString {
-                out.append(character)
-                if escaped { escaped = false }
-                else if character == "\\" { escaped = true }
-                else if character == "\"" { inString = false }
+                if escaped {
+                    escaped = false
+                    out.append(" ")
+                } else if character == "\\" {
+                    escaped = true
+                    out.append(" ")
+                } else if character == "\"" {
+                    inString = false
+                    out.append(character)
+                } else {
+                    out.append(character == "\n" ? "\n" : " ")
+                }
                 index = after
                 continue
             }
@@ -630,55 +650,6 @@ final class GitCommandRunnerTests: XCTestCase {
         return out
     }
 
-    /// The balanced-brace extent of the body of the function whose
-    /// declaration begins with `signature`.
-    ///
-    /// The first version bounded the region with `range(of: "\n    }\n")`,
-    /// which is not a function's end but the first four-space-indented `}`
-    /// INSIDE it. Everything past such a brace escaped the fence in silence
-    /// while the vacuity floor still passed on the checked calls above the
-    /// cut. Braces are counted from the body's `{` — the first one outside
-    /// the parameter list — with string literals skipped.
-    private func functionBody(
-        startingWith signature: String, in source: String
-    ) -> Range<String.Index>? {
-        guard let declaration = source.range(of: signature) else { return nil }
-        var parenDepth = 0
-        var braceDepth = 0
-        var bodyStart: String.Index?
-        var inString = false
-        var escaped = false
-        var index = declaration.lowerBound
-        while index < source.endIndex {
-            let character = source[index]
-            if inString {
-                if escaped { escaped = false }
-                else if character == "\\" { escaped = true }
-                else if character == "\"" { inString = false }
-                index = source.index(after: index)
-                continue
-            }
-            switch character {
-            case "\"": inString = true
-            case "(": parenDepth += 1
-            case ")": parenDepth -= 1
-            case "{":
-                if bodyStart == nil, parenDepth == 0 { bodyStart = index }
-                if bodyStart != nil { braceDepth += 1 }
-            case "}":
-                if let begin = bodyStart {
-                    braceDepth -= 1
-                    if braceDepth == 0 {
-                        return begin..<source.index(after: index)
-                    }
-                }
-            default: break
-            }
-            index = source.index(after: index)
-        }
-        return nil
-    }
-
     /// THE SPAWN'S OWN GUARD, EVIDENCED (PR #461 merge gate r3, P4).
     ///
     /// The fence below exempts `posix_spawn` by name, on the stated ground
@@ -718,120 +689,150 @@ final class GitCommandRunnerTests: XCTestCase {
         )
     }
 
-    /// EVERY SPAWN-SETUP SYMBOL IS CHECKED — asserted over the source,
-    /// because the failure cannot be staged from outside (PR #461 codex r1
-    /// P2, rebuilt twice by the merge gate).
+    /// EVERY ALLOCATION IN THE SPAWN PATH IS CHECKED — asserted over the
+    /// source, because the failure cannot be staged from outside (PR #461
+    /// codex r1 P2 and r2, rebuilt three times by the merge gate).
     ///
-    /// The defect: `posix_spawn_file_actions_*` and `posix_spawnattr_*`
-    /// allocate, so under transient pressure they answer ENOMEM — and
-    /// discarding that answer is not a lost message, it is a SILENTLY
-    /// DIFFERENT CHILD. A dropped `adddup2` leaves git's stdout attached to
-    /// whatever descriptor 1 already was: git exits 0, the drain sees an
-    /// immediate EOF, and the EMPTY buffer is accepted as a complete answer —
-    /// the exact class fn-4.24 closed at the execute boundary, re-entering
-    /// through the spawn. A dropped attribute call defeats fn-4.27's group
-    /// isolation just as quietly.
+    /// The defect: `posix_spawn_file_actions_*`, `posix_spawnattr_*` and
+    /// `strdup` all ALLOCATE, so under transient pressure they answer ENOMEM
+    /// or nil — and discarding that answer is not a lost message, it is a
+    /// SILENTLY DIFFERENT CHILD. A dropped `adddup2` leaves git's stdout
+    /// attached to whatever descriptor 1 already was: git exits 0, the drain
+    /// sees an immediate EOF, and the EMPTY buffer is accepted as a complete
+    /// answer. A dropped `strdup` is worse, because nil is argv's TERMINATOR:
+    /// `/usr/bin/env` then runs with no utility, prints its environment and
+    /// exits 0, and unrelated output is accepted as a completed git command.
     ///
     /// NEGATIVE RESULT, recorded rather than worked around: no behavioural
-    /// cell can stage this. `launch` takes `Pipe`s and builds its own
+    /// cell can stage either. `launch` takes `Pipe`s and builds its own
     /// descriptors, and `adddup2` does not validate that a descriptor is
-    /// OPEN at setup time (only that it is non-negative), so a closed pipe
-    /// does not reach the guard — it throws an ObjC exception from
-    /// `fileDescriptor` first, one layer earlier. Staging real ENOMEM is not
-    /// available to a test. Reshaping `launch` to accept raw descriptors
+    /// OPEN at setup time, so a closed pipe throws from `fileDescriptor` one
+    /// layer earlier instead of reaching the guard. Staging real ENOMEM is
+    /// not available to a test. Reshaping `launch` to accept raw descriptors
     /// purely to make the failure reachable would widen production API for
-    /// evidence, which this project declines.
+    /// evidence, which this project declines. (The spawn's OWN guard IS
+    /// reachable — see the cell above; only these allocations are not.)
     ///
-    /// THE PROPERTY IS ON THE SYMBOL, NOT THE CALL. Two rebuilds ago this
-    /// fence enumerated six names; one rebuild ago it matched
-    /// `posix_spawn…\s*\(` and required the wrapper immediately in front.
-    /// Both were keyed on a CALL, and the gate walked through the gap that
-    /// leaves: `let addclose = posix_spawn_file_actions_addclose` followed by
-    /// `_ = addclose(&fileActions, 5)` names the symbol with no paren after
-    /// it and calls it under a name the fence has never heard of — compiled
-    /// and run to confirm it is working Swift. So the assertion is now: every
-    /// appearance of a `posix_spawn*` identifier in the spawn path is the
-    /// direct operand of `try require(`. A function value cannot be taken
-    /// without naming the symbol, so aliasing is caught at the alias.
+    /// THE PROPERTY IS ON THE SYMBOL, NOT THE CALL, AND OVER THE WHOLE FILE,
+    /// NOT ONE FUNCTION. Rebuild 2 enumerated six names; rebuild 3 matched
+    /// `posix_spawn…\s*\(` and required the wrapper immediately in front —
+    /// keyed on a CALL, so `let addclose = posix_spawn_file_actions_addclose`
+    /// walked past it. Rebuild 4 fixed that but scanned only `launch`'s BODY,
+    /// so the gate hoisted the same alias to type scope
+    /// (`private static let addclose = …` plus `Self.addclose(&fileActions, 5)`)
+    /// and walked past again. Both escapes compiled and ran. So: every
+    /// appearance of a guarded symbol ANYWHERE in this file must be the
+    /// direct operand of its wrapper. A function value cannot be taken
+    /// without naming the symbol, and there is no scope left to hoist it to.
     ///
     /// Exemptions are by property or by name, never by pattern: identifiers
     /// ending `_t` are types, the two `destroy` calls run in `defer` with
     /// nothing to report to, and `posix_spawn` itself is checked by its own
-    /// `guard`. ACKNOWLEDGED LIMIT: a symbol reached through `dlsym` by
-    /// string is outside what any source fence can see.
+    /// `guard` — which, unlike every previous rebuild, now has a cell.
     ///
-    /// MUTATION: drop any `try require(` back to a bare call and this reds,
-    /// naming `GitCommandRunner.swift:<line>` and the offending line — as do
-    /// the alias, `_ =`, comment-laundering and `setsigmask` escapes.
-    /// Reformats stay green: a wrapper split across lines, `try require (`
-    /// with a space, a comment between wrapper and operand.
+    /// RESIDUAL on the destroy exemption, disclosed (merge gate r3): it is by
+    /// NAME, everywhere in the file, and the fence never checks that those
+    /// calls are actually in a `defer`. A `posix_spawnattr_destroy(&attributes)`
+    /// inserted BEFORE the spawn — destroying the attributes the spawn is
+    /// about to read — is green here. Kept because the alternative is
+    /// matching on `defer` proximity, which is a spelling test of exactly the
+    /// kind this fence exists not to be; the exposure is a deliberate misuse
+    /// of a teardown call, not a dropped check.
+    ///
+    /// ACKNOWLEDGED LIMITS, and they fail closed rather than silently: a
+    /// symbol reached through `dlsym` by string is outside what any source
+    /// fence can see; a raw or multiline string literal anywhere in the file
+    /// is REFUSED here rather than mis-scanned; and renaming a wrapper
+    /// (`require`, `duplicate`) reds this cell, which is correct — the fence
+    /// cannot know a new name is a checker.
+    ///
+    /// MUTATION: drop any wrapper back to a bare call and this reds, naming
+    /// `GitCommandRunner.swift:<line>` and the offending line.
     func testEverySpawnSetupCallIsChecked() throws {
-        let source = commentsBlanked(
-            try String(
-                contentsOf: repositoryRoot.appendingPathComponent(
-                    "Sources/Cacheout/Scanner/GitCommandRunner.swift"
-                ),
-                encoding: .utf8
-            )
+        let raw = try String(
+            contentsOf: repositoryRoot.appendingPathComponent(
+                "Sources/Cacheout/Scanner/GitCommandRunner.swift"
+            ),
+            encoding: .utf8
         )
-        guard let bodyRange = functionBody(
-            startingWith: "static func launch(", in: source
-        ) else { return XCTFail("the spawn path could not be located") }
-        let body = String(source[bodyRange])
+        // FAIL CLOSED on the literal shapes the scanner does not model
+        // (merge gate r3, P2). One `#"\"#` anywhere earlier in the file left
+        // `inString` true for the remainder and re-enabled comment
+        // laundering, with the fence still green.
+        XCTAssertFalse(
+            raw.contains("#\"") || raw.contains("\"\"\""),
+            "this fence's scanner models only plain string literals; a raw "
+                + "or multiline literal in the spawn path desynchronises it, "
+                + "so the file is refused rather than mis-scanned"
+        )
+        let source = commentsAndStringsBlanked(raw)
         XCTAssertTrue(
-            body.contains("posix_spawn("),
-            "the scanned region does not reach the spawn itself, so it was "
-                + "truncated and anything past the cut escapes in silence"
+            source.contains("posix_spawn("),
+            "the spawn itself is not in the scanned text — the file was not "
+                + "read, or the scanner blanked it"
         )
 
-        let symbol = try NSRegularExpression(
-            pattern: #"\bposix_spawn[A-Za-z0-9_]*\b"#
-        )
-        // The wrapper, by structure and not by spelling: any whitespace
-        // between `try`, `require` and `(` and before the operand. A
-        // correctly-wrapped call re-flowed across three lines was flagged by
-        // the line-anchored version — a reformat reddening correct code.
-        let wrapper = #"try\s+require\s*\(\s*$"#
+        // Each rule: the symbols it guards, and the wrapper each must be the
+        // direct operand of. The wrapper patterns tolerate any whitespace and
+        // an optional module qualifier (`Darwin.posix_spawnattr_setpgroup` is
+        // correct code that rebuild 4 flagged as unchecked — merge gate r3,
+        // P8), and are anchored so only the token immediately in front counts.
+        let qualifier = #"(?:[A-Za-z_][A-Za-z0-9_]*\s*\.\s*)?"#
+        let rules: [(name: String, symbol: String, wrapper: String, floor: Int)] = [
+            (
+                "spawn setup", #"\bposix_spawn[A-Za-z0-9_]*\b"#,
+                #"try\s+require\s*\(\s*"# + qualifier + "$", 7
+            ),
+            (
+                "C-string copy", #"\bstrdup\b"#,
+                #"guard\s+let\s+[A-Za-z_][A-Za-z0-9_]*\s*=\s*"# + qualifier + "$", 1
+            ),
+        ]
         let exemptNames: Set<String> = [
             "posix_spawn_file_actions_destroy", "posix_spawnattr_destroy",
             "posix_spawn",
         ]
 
-        let firstLine = source[source.startIndex..<bodyRange.lowerBound]
-            .reduce(1) { $1 == "\n" ? $0 + 1 : $0 }
         var unchecked: [String] = []
-        var checked = 0
-        let whole = NSRange(body.startIndex..<body.endIndex, in: body)
-        for match in symbol.matches(in: body, range: whole) {
-            guard let range = Range(match.range, in: body) else { continue }
-            let name = String(body[range])
-            guard !name.hasSuffix("_t"), !exemptNames.contains(name)
-            else { continue }
-            let prefix = body[body.startIndex..<range.lowerBound]
-            if prefix.range(of: wrapper, options: .regularExpression) != nil {
-                checked += 1
-                continue
+        let whole = NSRange(source.startIndex..<source.endIndex, in: source)
+        for rule in rules {
+            let symbol = try NSRegularExpression(pattern: rule.symbol)
+            var checked = 0
+            for match in symbol.matches(in: source, range: whole) {
+                guard let range = Range(match.range, in: source) else { continue }
+                let name = String(source[range])
+                guard !name.hasSuffix("_t"), !exemptNames.contains(name)
+                else { continue }
+                let prefix = source[source.startIndex..<range.lowerBound]
+                if prefix.range(of: rule.wrapper, options: .regularExpression)
+                    != nil
+                {
+                    checked += 1
+                    continue
+                }
+                let line = prefix.reduce(1) { $1 == "\n" ? $0 + 1 : $0 }
+                let lineStart = prefix.lastIndex(of: "\n")
+                    .map(source.index(after:)) ?? source.startIndex
+                let text = source[lineStart...].prefix { $0 != "\n" }
+                    .trimmingCharacters(in: .whitespaces)
+                unchecked.append(
+                    "GitCommandRunner.swift:\(line)  \(name)  —  "
+                        + text.prefix(90)
+                )
             }
-            let line = prefix.reduce(firstLine) { $1 == "\n" ? $0 + 1 : $0 }
-            let lineStart = prefix.lastIndex(of: "\n")
-                .map(body.index(after:)) ?? body.startIndex
-            let text = body[lineStart...].prefix { $0 != "\n" }
-                .trimmingCharacters(in: .whitespaces)
-            unchecked.append(
-                "GitCommandRunner.swift:\(line)  \(name)  —  "
-                    + text.prefix(90)
+            XCTAssertGreaterThanOrEqual(
+                checked, rule.floor,
+                "found \(checked) wrapped \(rule.name) symbols — fewer than "
+                    + "the \(rule.floor) the spawn path names, so this rule "
+                    + "has gone vacuous"
             )
         }
-        XCTAssertGreaterThanOrEqual(
-            checked, 7,
-            "found \(checked) wrapped setup symbols — fewer than the seven "
-                + "the spawn path names, so this fence has gone vacuous"
-        )
         XCTAssertEqual(
             unchecked, [],
-            "an unchecked spawn-setup call spawns a silently different child: "
-                + "a dropped adddup2 leaves git's stdout elsewhere, git exits "
-                + "0, and the empty buffer is accepted as a complete answer"
+            "an unchecked allocation in the spawn path spawns a silently "
+                + "different child: a dropped adddup2 leaves git's stdout "
+                + "elsewhere and a dropped strdup truncates argv, and in both "
+                + "cases the child exits 0 and its output is accepted"
         )
     }
 

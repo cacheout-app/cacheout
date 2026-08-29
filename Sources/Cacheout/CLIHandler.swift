@@ -2898,8 +2898,33 @@ struct CLIHandler {
 
         // Replace the process image; argv[0] becomes the resolved path so the
         // re-exec'd process' Bundle.main is the real app bundle.
-        var argv: [UnsafeMutablePointer<CChar>?] = CommandLine.arguments.map { strdup($0) }
-        argv[0] = strdup(resolved)
+        //
+        // NIL IS argv's TERMINATOR, SO A FAILED COPY IS NOT A LOST ARGUMENT —
+        // IT IS A DIFFERENT COMMAND (PR #461 merge gate r4, P1). This is the
+        // same defect the spawn path carried, in the sibling exec path, and
+        // the fence that now guards `GitCommandRunner` could not see it
+        // because that fence reads one file. `map { strdup($0) }` wrote a
+        // failed allocation's nil straight into the vector: a failed copy of
+        // element k truncates the command there, so `cacheout install-helper`
+        // invoked through the documented Homebrew symlink re-execs into a
+        // no-subcommand `cacheout` — and because the process image is already
+        // replaced by then, nothing can report it.
+        //
+        // The `defer` is registered BEFORE the vector is filled, so a failure
+        // part-way frees what was already copied; on a successful `execv` it
+        // never runs, because there is no longer a process to run it in.
+        var argv: [UnsafeMutablePointer<CChar>?] = []
+        defer { argv.forEach { free($0) } }
+        for text in [resolved] + CommandLine.arguments.dropFirst() {
+            guard let copy = strdup(text) else {
+                printError(
+                    "Warning: could not re-exec bundled binary at \(resolved): "
+                        + "out of memory copying arguments — not re-exec'd"
+                )
+                return
+            }
+            argv.append(copy)
+        }
         argv.append(nil)
         execv(resolved, argv)
         // execv only returns on failure — continue and let SMAppService report.

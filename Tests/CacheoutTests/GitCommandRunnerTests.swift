@@ -561,93 +561,138 @@ final class GitCommandRunnerTests: XCTestCase {
             .deletingLastPathComponent()
     }
 
-    /// Swift source with every comment AND every string literal's CONTENTS
-    /// blanked, newlines and therefore line numbering preserved.
+    /// Swift source with every comment blanked and every string literal's
+    /// CONTENTS blanked — but INTERPOLATED EXPRESSIONS kept verbatim —
+    /// newlines and therefore line numbering preserved.
     ///
-    /// Comments, because a trailing `// try require(` laundered a bare call
-    /// as checked in the first version of the fence below, and a block
-    /// comment between a wrapper and its operand reads as a missing wrapper.
-    /// String CONTENTS too (the quotes are kept, so the scan stays balanced),
-    /// because `let note = "try require("` in front of a bare call laundered
-    /// it the same way.
+    /// Three rebuilds of this fence were defeated through its scanner, so it
+    /// is now a real lexer rather than a pair of flags, and it has its own
+    /// cells (`ScannableSourceTests`).
     ///
-    /// ONLY plain `"…"` literals with backslash escapes are modelled. Raw
-    /// (`#"…"#`) and multiline (`"""`) literals are NOT, and the caller must
-    /// refuse a file containing them — see the fence's own precondition. In
-    /// `#"\"#` the backslash sets `escaped`, the closing quote is swallowed
-    /// as an escaped character and `inString` stays true for the whole rest
-    /// of the file, so nothing after it is ever blanked. The merge gate
-    /// walked a comment-laundered call straight past this (r3 P2) by adding
-    /// one such literal earlier in the file.
-    private func commentsAndStringsBlanked(_ source: String) -> String {
-        var out = ""
-        out.reserveCapacity(source.count)
-        var index = source.startIndex
-        var inString = false
-        var escaped = false
-        while index < source.endIndex {
-            let character = source[index]
-            let after = source.index(after: index)
-            let next: Character? = after < source.endIndex ? source[after] : nil
-            if inString {
-                if escaped {
-                    escaped = false
-                    out.append(" ")
-                } else if character == "\\" {
-                    escaped = true
-                    out.append(" ")
-                } else if character == "\"" {
-                    inString = false
-                    out.append(character)
-                } else {
-                    out.append(character == "\n" ? "\n" : " ")
-                }
-                index = after
-                continue
-            }
-            if character == "\"" {
-                inString = true
-                out.append(character)
-                index = after
-                continue
-            }
-            if character == "/", next == "/" {
-                while index < source.endIndex, source[index] != "\n" {
-                    out.append(" ")
-                    index = source.index(after: index)
-                }
-                continue
-            }
-            if character == "/", next == "*" {
-                var depth = 1
-                out.append("  ")
-                index = source.index(index, offsetBy: 2)
-                while index < source.endIndex, depth > 0 {
-                    let inner = source[index]
-                    let ahead = source.index(after: index)
-                    let peek: Character? =
-                        ahead < source.endIndex ? source[ahead] : nil
-                    if inner == "/", peek == "*" {
-                        depth += 1
-                        out.append("  ")
-                        index = source.index(index, offsetBy: 2)
-                        continue
-                    }
-                    if inner == "*", peek == "/" {
-                        depth -= 1
-                        out.append("  ")
-                        index = source.index(index, offsetBy: 2)
-                        continue
-                    }
-                    out.append(inner == "\n" ? "\n" : " ")
-                    index = source.index(after: index)
-                }
-                continue
-            }
-            out.append(character)
-            index = after
+    /// - Comments, because a trailing `// try require(` laundered a bare call
+    ///   as checked, and a block comment between a wrapper and its operand
+    ///   reads as a missing wrapper.
+    /// - String contents, because `let note = "try require("` in front of a
+    ///   bare call laundered it the same way.
+    /// - But NOT interpolations: blanking those was itself an escape (merge
+    ///   gate r4, P2). `_ = "\(posix_spawn_file_actions_addclose(&a, 5))"`
+    ///   compiles, runs, and was invisible to every rule.
+    /// - Raw (`#"…"#`, `##"…"##`) and multiline (`"""`) literals are modelled,
+    ///   because refusing files that contain them is not available: the fence
+    ///   must cover `CLIHandler.swift`, which has both. In `#"\"#` the
+    ///   backslash is NOT an escape, and a scanner that assumes it is stays
+    ///   "inside a string" for the rest of the file (merge gate r3, P2).
+    func scannableSource(_ source: String) -> String {
+        enum Frame {
+            case code(interpolation: Bool, depth: Int)
+            case string(hashes: Int, multiline: Bool)
         }
-        return out
+        let characters = Array(source)
+        var out: [Character] = []
+        out.reserveCapacity(characters.count)
+        var stack: [Frame] = [.code(interpolation: false, depth: 0)]
+        var index = 0
+
+        func matches(_ text: [Character], at start: Int) -> Bool {
+            guard start + text.count <= characters.count else { return false }
+            for offset in 0..<text.count
+            where characters[start + offset] != text[offset] { return false }
+            return true
+        }
+        func blank(_ count: Int) {
+            for offset in 0..<count {
+                out.append(characters[index + offset] == "\n" ? "\n" : " ")
+            }
+            index += count
+        }
+        func emit(_ count: Int) {
+            for offset in 0..<count { out.append(characters[index + offset]) }
+            index += count
+        }
+        /// A run of `#` immediately before a quote, and the quote's length.
+        func openingDelimiter(at start: Int) -> (hashes: Int, multiline: Bool)? {
+            var hashes = 0
+            while start + hashes < characters.count,
+                  characters[start + hashes] == "#" { hashes += 1 }
+            let quote = start + hashes
+            guard quote < characters.count, characters[quote] == "\"" else {
+                return nil
+            }
+            let triple = matches(["\"", "\"", "\""], at: quote)
+            return (hashes, triple)
+        }
+
+        while index < characters.count {
+            switch stack[stack.count - 1] {
+            case .code(let interpolation, let depth):
+                if matches(["/", "/"], at: index) {
+                    while index < characters.count, characters[index] != "\n" {
+                        blank(1)
+                    }
+                    continue
+                }
+                if matches(["/", "*"], at: index) {
+                    var nesting = 1
+                    blank(2)
+                    while index < characters.count, nesting > 0 {
+                        if matches(["/", "*"], at: index) {
+                            nesting += 1; blank(2); continue
+                        }
+                        if matches(["*", "/"], at: index) {
+                            nesting -= 1; blank(2); continue
+                        }
+                        blank(1)
+                    }
+                    continue
+                }
+                if let opening = openingDelimiter(at: index) {
+                    emit(opening.hashes + (opening.multiline ? 3 : 1))
+                    stack.append(
+                        .string(
+                            hashes: opening.hashes, multiline: opening.multiline
+                        )
+                    )
+                    continue
+                }
+                if interpolation, characters[index] == "(" {
+                    stack[stack.count - 1] =
+                        .code(interpolation: true, depth: depth + 1)
+                    emit(1)
+                    continue
+                }
+                if interpolation, characters[index] == ")" {
+                    if depth == 0 { stack.removeLast(); emit(1); continue }
+                    stack[stack.count - 1] =
+                        .code(interpolation: true, depth: depth - 1)
+                    emit(1)
+                    continue
+                }
+                emit(1)
+
+            case .string(let hashes, let multiline):
+                let closing: [Character] =
+                    (multiline ? ["\"", "\"", "\""] : ["\""])
+                    + Array(repeating: "#", count: hashes)
+                if matches(closing, at: index) {
+                    emit(closing.count)
+                    stack.removeLast()
+                    continue
+                }
+                let escape: [Character] =
+                    ["\\"] + Array(repeating: "#", count: hashes)
+                if matches(escape, at: index) {
+                    if matches(escape + ["("], at: index) {
+                        emit(escape.count + 1)
+                        stack.append(.code(interpolation: true, depth: 0))
+                        continue
+                    }
+                    blank(min(escape.count + 1, characters.count - index))
+                    continue
+                }
+                blank(1)
+            }
+        }
+        return String(out)
     }
 
     /// THE SPAWN'S OWN GUARD, EVIDENCED (PR #461 merge gate r3, P4).
@@ -689,103 +734,220 @@ final class GitCommandRunnerTests: XCTestCase {
         )
     }
 
-    /// EVERY ALLOCATION IN THE SPAWN PATH IS CHECKED — asserted over the
-    /// source, because the failure cannot be staged from outside (PR #461
-    /// codex r1 P2 and r2, rebuilt three times by the merge gate).
+    // MARK: - The fence's scanner, evidenced on its own
+
+    /// `scannableSource` is load-bearing: three of the five fence rebuilds
+    /// were defeated THROUGH it, not around it. So it has cells.
     ///
-    /// The defect: `posix_spawn_file_actions_*`, `posix_spawnattr_*` and
-    /// `strdup` all ALLOCATE, so under transient pressure they answer ENOMEM
-    /// or nil — and discarding that answer is not a lost message, it is a
-    /// SILENTLY DIFFERENT CHILD. A dropped `adddup2` leaves git's stdout
-    /// attached to whatever descriptor 1 already was: git exits 0, the drain
-    /// sees an immediate EOF, and the EMPTY buffer is accepted as a complete
+    /// Newline count is asserted everywhere because the fence reports line
+    /// numbers from it; a scanner that eats a newline sends a reader to the
+    /// wrong line, which is the anchor-rot failure in another costume.
+    func testTheScannerBlanksCommentsAndKeepsLineNumbering() {
+        let source = "let a = 1 // try require(\nlet b = 2\n"
+        let scanned = scannableSource(source)
+        XCTAssertFalse(scanned.contains("try require("))
+        XCTAssertTrue(scanned.contains("let a = 1"))
+        XCTAssertTrue(scanned.contains("let b = 2"))
+        XCTAssertEqual(
+            scanned.filter { $0 == "\n" }.count,
+            source.filter { $0 == "\n" }.count
+        )
+    }
+
+    func testTheScannerBlanksNestedBlockComments() {
+        let source = "a /* outer /* inner try require( */ still */ b\n"
+        let scanned = scannableSource(source)
+        XCTAssertFalse(scanned.contains("try require("))
+        XCTAssertFalse(scanned.contains("still"))
+        XCTAssertTrue(scanned.contains("a "))
+        XCTAssertTrue(scanned.contains(" b"))
+    }
+
+    func testTheScannerBlanksStringContentsButKeepsTheDelimiters() {
+        let scanned = scannableSource("let n = \"try require(\"\n")
+        XCTAssertFalse(scanned.contains("try require("))
+        XCTAssertTrue(scanned.contains("let n = \"") )
+    }
+
+    /// THE r4 P2 ESCAPE. Blanking string CONTENTS also blanked interpolated
+    /// EXPRESSIONS, so a real call written inside `"\( … )"` was invisible to
+    /// every rule — it compiled, it ran, and the fence stayed green.
+    func testTheScannerKeepsInterpolatedExpressionsVerbatim() {
+        let scanned = scannableSource(
+            "_ = \"\\(posix_spawn_file_actions_addclose(&a, 5))\"\n"
+        )
+        XCTAssertTrue(
+            scanned.contains("posix_spawn_file_actions_addclose"),
+            "an interpolated call is CODE and must reach the rules: \(scanned)"
+        )
+    }
+
+    func testTheScannerHandlesNestedInterpolationParens() {
+        let scanned = scannableSource(
+            "_ = \"\\(f(g(1), h(2)))\" + \"tail\"\n"
+        )
+        XCTAssertTrue(scanned.contains("f(g(1), h(2))"))
+        XCTAssertFalse(
+            scanned.contains("tail"),
+            "the scanner lost the string frame after the interpolation closed"
+        )
+    }
+
+    /// THE r3 P2 ESCAPE. In `#"\"#` the backslash is NOT an escape. A scanner
+    /// that assumes it is swallows the closing quote and stays "inside a
+    /// string" for the rest of the file — after which no comment is ever
+    /// blanked and comment-laundering works again.
+    func testARawLiteralWithATrailingBackslashDoesNotDesyncTheScanner() {
+        let source = ##"""
+        let marker = #""#
+        let after = 1 // try require(
+        posix_spawnattr_setpgroup(&a, 0)
+        """##
+        let scanned = scannableSource(source)
+        XCTAssertFalse(
+            scanned.contains("try require("),
+            "the comment after a raw literal was not blanked — the scanner "
+                + "is still inside the string: \(scanned)"
+        )
+        XCTAssertTrue(
+            scanned.contains("posix_spawnattr_setpgroup"),
+            "and the code after it must still be visible to the rules"
+        )
+    }
+
+    func testAMultilineLiteralHidesItsContentsAndItsSlashes() {
+        let source = ##"""
+        let text = """
+        // try require(
+        posix_spawnattr_setpgroup
+        """
+        let after = 2
+        """##
+        let scanned = scannableSource(source)
+        XCTAssertFalse(scanned.contains("try require("))
+        XCTAssertFalse(
+            scanned.contains("posix_spawnattr_setpgroup"),
+            "a symbol NAMED inside a multiline string is not a call"
+        )
+        XCTAssertTrue(scanned.contains("let after = 2"))
+        XCTAssertEqual(
+            scanned.filter { $0 == "\n" }.count,
+            source.filter { $0 == "\n" }.count
+        )
+    }
+
+    func testAnEscapedQuoteDoesNotEndAPlainString() {
+        let scanned = scannableSource(
+            "let s = \"a\\\"b\" ; posix_spawnattr_setpgroup(&a, 0)\n"
+        )
+        XCTAssertTrue(
+            scanned.contains("posix_spawnattr_setpgroup"),
+            "the string frame did not close at the real delimiter: \(scanned)"
+        )
+    }
+
+    /// EVERY ALLOCATION ON A PROCESS-LAUNCH PATH IS CHECKED — asserted over
+    /// the source, REPO-WIDE, because the failure cannot be staged from
+    /// outside (PR #461 codex r1/r2, rebuilt five times by the merge gate).
+    ///
+    /// The defect: `posix_spawn_file_actions_*`, `posix_spawnattr_*` and the
+    /// C-string duplicators all ALLOCATE, so under transient pressure they
+    /// answer ENOMEM or nil — and discarding that answer is not a lost
+    /// message, it is a SILENTLY DIFFERENT CHILD. A dropped `adddup2` leaves
+    /// git's stdout attached to whatever descriptor 1 already was: git exits
+    /// 0, the drain sees EOF, and the EMPTY buffer is accepted as a complete
     /// answer. A dropped `strdup` is worse, because nil is argv's TERMINATOR:
-    /// `/usr/bin/env` then runs with no utility, prints its environment and
-    /// exits 0, and unrelated output is accepted as a completed git command.
+    /// the command is truncated at that element and a DIFFERENT program runs.
+    ///
+    /// WHY REPO-WIDE, and this is the fifth rebuild's whole point. Rebuild 3
+    /// keyed on a CALL, so a local alias walked past. Rebuild 4 keyed on the
+    /// SYMBOL but scanned one function's BODY, so the alias hoisted to type
+    /// scope. Rebuild 5 scanned one FILE — and the merge gate found the
+    /// identical unchecked `map { strdup($0) }` alive in `CLIHandler`'s
+    /// `execv` re-exec path, one file out (r4, P1), on the shipped Homebrew
+    /// install route. Each widening was met by moving one scope out, so the
+    /// scope is now every Swift file the repository tracks. There is nowhere
+    /// left to move.
     ///
     /// NEGATIVE RESULT, recorded rather than worked around: no behavioural
-    /// cell can stage either. `launch` takes `Pipe`s and builds its own
-    /// descriptors, and `adddup2` does not validate that a descriptor is
-    /// OPEN at setup time, so a closed pipe throws from `fileDescriptor` one
-    /// layer earlier instead of reaching the guard. Staging real ENOMEM is
-    /// not available to a test. Reshaping `launch` to accept raw descriptors
-    /// purely to make the failure reachable would widen production API for
-    /// evidence, which this project declines. (The spawn's OWN guard IS
-    /// reachable — see the cell above; only these allocations are not.)
-    ///
-    /// THE PROPERTY IS ON THE SYMBOL, NOT THE CALL, AND OVER THE WHOLE FILE,
-    /// NOT ONE FUNCTION. Rebuild 2 enumerated six names; rebuild 3 matched
-    /// `posix_spawn…\s*\(` and required the wrapper immediately in front —
-    /// keyed on a CALL, so `let addclose = posix_spawn_file_actions_addclose`
-    /// walked past it. Rebuild 4 fixed that but scanned only `launch`'s BODY,
-    /// so the gate hoisted the same alias to type scope
-    /// (`private static let addclose = …` plus `Self.addclose(&fileActions, 5)`)
-    /// and walked past again. Both escapes compiled and ran. So: every
-    /// appearance of a guarded symbol ANYWHERE in this file must be the
-    /// direct operand of its wrapper. A function value cannot be taken
-    /// without naming the symbol, and there is no scope left to hoist it to.
+    /// cell can stage these. `launch` builds its own descriptors, and
+    /// `adddup2` does not validate that a descriptor is OPEN at setup time,
+    /// so a closed pipe throws from `fileDescriptor` one layer earlier
+    /// instead of reaching the guard. Staging real ENOMEM is not available to
+    /// a test. (The spawn's OWN guard IS reachable — see the cell above.)
     ///
     /// Exemptions are by property or by name, never by pattern: identifiers
     /// ending `_t` are types, the two `destroy` calls run in `defer` with
     /// nothing to report to, and `posix_spawn` itself is checked by its own
-    /// `guard` — which, unlike every previous rebuild, now has a cell.
+    /// `guard`, which now has a cell.
     ///
-    /// RESIDUAL on the destroy exemption, disclosed (merge gate r3): it is by
-    /// NAME, everywhere in the file, and the fence never checks that those
-    /// calls are actually in a `defer`. A `posix_spawnattr_destroy(&attributes)`
-    /// inserted BEFORE the spawn — destroying the attributes the spawn is
-    /// about to read — is green here. Kept because the alternative is
-    /// matching on `defer` proximity, which is a spelling test of exactly the
-    /// kind this fence exists not to be; the exposure is a deliberate misuse
-    /// of a teardown call, not a dropped check.
+    /// RESIDUAL on the destroy exemption, disclosed: it is by NAME and the
+    /// fence never checks the call is in a `defer`, so a destroy placed
+    /// before the spawn is green. Kept, because the alternative is a
+    /// `defer`-proximity spelling test — the thing this fence exists not to
+    /// be.
     ///
-    /// ACKNOWLEDGED LIMITS, and they fail closed rather than silently: a
-    /// symbol reached through `dlsym` by string is outside what any source
-    /// fence can see; a raw or multiline string literal anywhere in the file
-    /// is REFUSED here rather than mis-scanned; and renaming a wrapper
-    /// (`require`, `duplicate`) reds this cell, which is correct — the fence
-    /// cannot know a new name is a checker.
+    /// ACKNOWLEDGED LIMITS, all failing closed: a symbol reached through
+    /// `dlsym` or `@_silgen_name` by STRING is outside what any source fence
+    /// can see; and renaming a wrapper (`require`, `duplicate`) reds this
+    /// cell, which is correct — the fence cannot know a new name is a checker.
     ///
     /// MUTATION: drop any wrapper back to a bare call and this reds, naming
-    /// `GitCommandRunner.swift:<line>` and the offending line.
+    /// `<file>:<line>` and the offending line.
     func testEverySpawnSetupCallIsChecked() throws {
-        let raw = try String(
-            contentsOf: repositoryRoot.appendingPathComponent(
-                "Sources/Cacheout/Scanner/GitCommandRunner.swift"
-            ),
-            encoding: .utf8
+        // The repository's OWN file list, not the machine's: a `find` here
+        // would make the verdict a property of whatever is lying around
+        // untracked (the lesson of 8a38e3f's markdown gate).
+        let list = Process()
+        list.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        list.arguments = [
+            "git", "-C", repositoryRoot.path, "ls-files", "-z", "--",
+            "Sources/*.swift",
+        ]
+        let out = Pipe()
+        list.standardOutput = out
+        try list.run()
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        list.waitUntilExit()
+        XCTAssertEqual(list.terminationStatus, 0, "git ls-files failed")
+        let paths = String(decoding: data, as: UTF8.self)
+            .split(separator: "\0").map(String.init).sorted()
+        XCTAssertGreaterThan(
+            paths.count, 50,
+            "the file listing came back with \(paths.count) entries — the "
+                + "fence is scanning almost nothing"
         )
-        // FAIL CLOSED on the literal shapes the scanner does not model
-        // (merge gate r3, P2). One `#"\"#` anywhere earlier in the file left
-        // `inString` true for the remainder and re-enabled comment
-        // laundering, with the fence still green.
-        XCTAssertFalse(
-            raw.contains("#\"") || raw.contains("\"\"\""),
-            "this fence's scanner models only plain string literals; a raw "
-                + "or multiline literal in the spawn path desynchronises it, "
-                + "so the file is refused rather than mis-scanned"
-        )
-        let source = commentsAndStringsBlanked(raw)
-        XCTAssertTrue(
-            source.contains("posix_spawn("),
-            "the spawn itself is not in the scanned text — the file was not "
-                + "read, or the scanner blanked it"
-        )
+        for required in [
+            "Sources/Cacheout/Scanner/GitCommandRunner.swift",
+            "Sources/Cacheout/CLIHandler.swift",
+        ] {
+            XCTAssertTrue(
+                paths.contains(required),
+                "\(required) is not in the scanned set, and it is one of the "
+                    + "two files that actually holds a guarded allocation"
+            )
+        }
 
-        // Each rule: the symbols it guards, and the wrapper each must be the
-        // direct operand of. The wrapper patterns tolerate any whitespace and
-        // an optional module qualifier (`Darwin.posix_spawnattr_setpgroup` is
-        // correct code that rebuild 4 flagged as unchecked — merge gate r3,
-        // P8), and are anchored so only the token immediately in front counts.
+        // Each rule: the symbols it guards, the wrapper each must be the
+        // direct operand of, and how many the repository must contain. The
+        // wrapper patterns tolerate any whitespace and an optional module
+        // qualifier (`Darwin.posix_spawnattr_setpgroup` is correct code that
+        // rebuild 4 flagged as unchecked — merge gate r3, P8).
         let qualifier = #"(?:[A-Za-z_][A-Za-z0-9_]*\s*\.\s*)?"#
+        // A FAMILY, not a name. Rebuild 5's rule matched `strdup` alone under
+        // a heading that said "every allocation", so `strndup`, `malloc` and
+        // `calloc` all walked past it (merge gate r4, P3).
+        let allocators =
+            #"\b(?:strdup|strndup|malloc|calloc|realloc|reallocf|valloc|aligned_alloc)\b"#
         let rules: [(name: String, symbol: String, wrapper: String, floor: Int)] = [
             (
                 "spawn setup", #"\bposix_spawn[A-Za-z0-9_]*\b"#,
                 #"try\s+require\s*\(\s*"# + qualifier + "$", 7
             ),
             (
-                "C-string copy", #"\bstrdup\b"#,
-                #"guard\s+let\s+[A-Za-z_][A-Za-z0-9_]*\s*=\s*"# + qualifier + "$", 1
+                "C allocation", allocators,
+                #"(?:guard|if)\s+let\s+[A-Za-z_][A-Za-z0-9_]*\s*=\s*"#
+                    + qualifier + "$", 2
             ),
         ]
         let exemptNames: Set<String> = [
@@ -794,45 +956,55 @@ final class GitCommandRunnerTests: XCTestCase {
         ]
 
         var unchecked: [String] = []
-        let whole = NSRange(source.startIndex..<source.endIndex, in: source)
-        for rule in rules {
-            let symbol = try NSRegularExpression(pattern: rule.symbol)
-            var checked = 0
-            for match in symbol.matches(in: source, range: whole) {
-                guard let range = Range(match.range, in: source) else { continue }
-                let name = String(source[range])
-                guard !name.hasSuffix("_t"), !exemptNames.contains(name)
-                else { continue }
-                let prefix = source[source.startIndex..<range.lowerBound]
-                if prefix.range(of: rule.wrapper, options: .regularExpression)
-                    != nil
-                {
-                    checked += 1
-                    continue
-                }
-                let line = prefix.reduce(1) { $1 == "\n" ? $0 + 1 : $0 }
-                let lineStart = prefix.lastIndex(of: "\n")
-                    .map(source.index(after:)) ?? source.startIndex
-                let text = source[lineStart...].prefix { $0 != "\n" }
-                    .trimmingCharacters(in: .whitespaces)
-                unchecked.append(
-                    "GitCommandRunner.swift:\(line)  \(name)  —  "
-                        + text.prefix(90)
+        var checkedPerRule = [Int](repeating: 0, count: rules.count)
+        for path in paths {
+            let source = scannableSource(
+                try String(
+                    contentsOf: repositoryRoot.appendingPathComponent(path),
+                    encoding: .utf8
                 )
+            )
+            let whole = NSRange(source.startIndex..<source.endIndex, in: source)
+            for (ruleIndex, rule) in rules.enumerated() {
+                let symbol = try NSRegularExpression(pattern: rule.symbol)
+                for match in symbol.matches(in: source, range: whole) {
+                    guard let range = Range(match.range, in: source)
+                    else { continue }
+                    let name = String(source[range])
+                    guard !name.hasSuffix("_t"), !exemptNames.contains(name)
+                    else { continue }
+                    let prefix = source[source.startIndex..<range.lowerBound]
+                    if prefix.range(
+                        of: rule.wrapper, options: .regularExpression
+                    ) != nil {
+                        checkedPerRule[ruleIndex] += 1
+                        continue
+                    }
+                    let line = prefix.reduce(1) { $1 == "\n" ? $0 + 1 : $0 }
+                    let lineStart = prefix.lastIndex(of: "\n")
+                        .map(source.index(after:)) ?? source.startIndex
+                    let text = source[lineStart...].prefix { $0 != "\n" }
+                        .trimmingCharacters(in: .whitespaces)
+                    unchecked.append(
+                        "\(path):\(line)  \(name)  —  " + text.prefix(90)
+                    )
+                }
             }
+        }
+        for (index, rule) in rules.enumerated() {
             XCTAssertGreaterThanOrEqual(
-                checked, rule.floor,
-                "found \(checked) wrapped \(rule.name) symbols — fewer than "
-                    + "the \(rule.floor) the spawn path names, so this rule "
-                    + "has gone vacuous"
+                checkedPerRule[index], rule.floor,
+                "found \(checkedPerRule[index]) wrapped \(rule.name) symbols "
+                    + "repo-wide — fewer than the \(rule.floor) that exist, so "
+                    + "this rule has gone vacuous"
             )
         }
         XCTAssertEqual(
             unchecked, [],
-            "an unchecked allocation in the spawn path spawns a silently "
-                + "different child: a dropped adddup2 leaves git's stdout "
-                + "elsewhere and a dropped strdup truncates argv, and in both "
-                + "cases the child exits 0 and its output is accepted"
+            "an unchecked allocation on a process-launch path spawns a "
+                + "silently different child: a dropped adddup2 leaves git's "
+                + "stdout elsewhere and a dropped strdup TRUNCATES argv, and "
+                + "in both cases the child exits 0 and its output is accepted"
         )
     }
 

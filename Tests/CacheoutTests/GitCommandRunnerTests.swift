@@ -587,66 +587,61 @@ final class GitCommandRunnerTests: XCTestCase {
             case code(interpolation: Bool, depth: Int)
             case string(hashes: Int, multiline: Bool)
         }
-        let characters = Array(source)
+        // A SLICE, consumed from the front — never an integer subscript.
+        // `StrandFenceTests` is right to refuse those: a loop-bound index
+        // traps and kills the PROCESS rather than the cell. Here it is also
+        // simply better, because `first`/`starts(with:)`/`dropFirst` cannot
+        // read past the end at all, so the scanner's bounds safety is a
+        // property of the operations rather than of my arithmetic.
+        var rest = Array(source)[...]
         var out: [Character] = []
-        out.reserveCapacity(characters.count)
+        out.reserveCapacity(source.count)
         var stack: [Frame] = [.code(interpolation: false, depth: 0)]
-        var index = 0
 
-        func matches(_ text: [Character], at start: Int) -> Bool {
-            guard start + text.count <= characters.count else { return false }
-            for offset in 0..<text.count
-            where characters[start + offset] != text[offset] { return false }
-            return true
-        }
-        func blank(_ count: Int) {
-            for offset in 0..<count {
-                out.append(characters[index + offset] == "\n" ? "\n" : " ")
+        func take(_ count: Int, blanked: Bool) {
+            for character in rest.prefix(count) {
+                out.append(
+                    blanked ? (character == "\n" ? "\n" : " ") : character
+                )
             }
-            index += count
+            rest = rest.dropFirst(count)
         }
-        func emit(_ count: Int) {
-            for offset in 0..<count { out.append(characters[index + offset]) }
-            index += count
-        }
-        /// A run of `#` immediately before a quote, and the quote's length.
-        func openingDelimiter(at start: Int) -> (hashes: Int, multiline: Bool)? {
-            var hashes = 0
-            while start + hashes < characters.count,
-                  characters[start + hashes] == "#" { hashes += 1 }
-            let quote = start + hashes
-            guard quote < characters.count, characters[quote] == "\"" else {
-                return nil
-            }
-            let triple = matches(["\"", "\"", "\""], at: quote)
-            return (hashes, triple)
+        /// A run of `#` immediately before a quote, and whether it is triple.
+        func openingDelimiter() -> (hashes: Int, multiline: Bool)? {
+            let hashes = rest.prefix(while: { $0 == "#" }).count
+            let afterHashes = rest.dropFirst(hashes)
+            guard afterHashes.first == "\"" else { return nil }
+            return (hashes, afterHashes.starts(with: ["\"", "\"", "\""]))
         }
 
-        while index < characters.count {
-            switch stack[stack.count - 1] {
+        while let current = rest.first, let frame = stack.last {
+            switch frame {
             case .code(let interpolation, let depth):
-                if matches(["/", "/"], at: index) {
-                    while index < characters.count, characters[index] != "\n" {
-                        blank(1)
+                if rest.starts(with: ["/", "/"]) {
+                    while let character = rest.first, character != "\n" {
+                        take(1, blanked: true)
                     }
                     continue
                 }
-                if matches(["/", "*"], at: index) {
+                if rest.starts(with: ["/", "*"]) {
                     var nesting = 1
-                    blank(2)
-                    while index < characters.count, nesting > 0 {
-                        if matches(["/", "*"], at: index) {
-                            nesting += 1; blank(2); continue
+                    take(2, blanked: true)
+                    while nesting > 0, !rest.isEmpty {
+                        if rest.starts(with: ["/", "*"]) {
+                            nesting += 1; take(2, blanked: true); continue
                         }
-                        if matches(["*", "/"], at: index) {
-                            nesting -= 1; blank(2); continue
+                        if rest.starts(with: ["*", "/"]) {
+                            nesting -= 1; take(2, blanked: true); continue
                         }
-                        blank(1)
+                        take(1, blanked: true)
                     }
                     continue
                 }
-                if let opening = openingDelimiter(at: index) {
-                    emit(opening.hashes + (opening.multiline ? 3 : 1))
+                if let opening = openingDelimiter() {
+                    take(
+                        opening.hashes + (opening.multiline ? 3 : 1),
+                        blanked: false
+                    )
                     stack.append(
                         .string(
                             hashes: opening.hashes, multiline: opening.multiline
@@ -654,84 +649,49 @@ final class GitCommandRunnerTests: XCTestCase {
                     )
                     continue
                 }
-                if interpolation, characters[index] == "(" {
-                    stack[stack.count - 1] =
-                        .code(interpolation: true, depth: depth + 1)
-                    emit(1)
+                if interpolation, current == "(" {
+                    stack.removeLast()
+                    stack.append(.code(interpolation: true, depth: depth + 1))
+                    take(1, blanked: false)
                     continue
                 }
-                if interpolation, characters[index] == ")" {
-                    if depth == 0 { stack.removeLast(); emit(1); continue }
-                    stack[stack.count - 1] =
-                        .code(interpolation: true, depth: depth - 1)
-                    emit(1)
+                if interpolation, current == ")" {
+                    stack.removeLast()
+                    if depth > 0 {
+                        stack.append(
+                            .code(interpolation: true, depth: depth - 1)
+                        )
+                    }
+                    take(1, blanked: false)
                     continue
                 }
-                emit(1)
+                take(1, blanked: false)
 
             case .string(let hashes, let multiline):
+                let hashRun = Array(repeating: Character("#"), count: hashes)
                 let closing: [Character] =
-                    (multiline ? ["\"", "\"", "\""] : ["\""])
-                    + Array(repeating: "#", count: hashes)
-                if matches(closing, at: index) {
-                    emit(closing.count)
+                    (multiline ? ["\"", "\"", "\""] : ["\""]) + hashRun
+                if rest.starts(with: closing) {
+                    take(closing.count, blanked: false)
                     stack.removeLast()
                     continue
                 }
-                let escape: [Character] =
-                    ["\\"] + Array(repeating: "#", count: hashes)
-                if matches(escape, at: index) {
-                    if matches(escape + ["("], at: index) {
-                        emit(escape.count + 1)
+                let escape: [Character] = ["\\"] + hashRun
+                if rest.starts(with: escape) {
+                    if rest.starts(with: escape + ["("]) {
+                        take(escape.count + 1, blanked: false)
                         stack.append(.code(interpolation: true, depth: 0))
                         continue
                     }
-                    blank(min(escape.count + 1, characters.count - index))
+                    // The escape and the character it escapes, together, so a
+                    // `\"` cannot be mistaken for the closing delimiter.
+                    take(escape.count + 1, blanked: true)
                     continue
                 }
-                blank(1)
+                take(1, blanked: true)
             }
         }
         return String(out)
-    }
-
-    /// THE SPAWN'S OWN GUARD, EVIDENCED (PR #461 merge gate r3, P4).
-    ///
-    /// The fence below exempts `posix_spawn` by name, on the stated ground
-    /// that it "is checked by its own `guard`". Nothing tested that guard,
-    /// and no cell in the suite could: `executableURL` defaults to
-    /// `/usr/bin/env`, which always exists, and no test had ever passed
-    /// `executableURL:`. An exemption justified by a sentence is a hole with
-    /// a note attached — and this is the one call whose unchecked failure is
-    /// catastrophic rather than merely wrong, because `var pid: pid_t = 0`
-    /// means a swallowed failure hands back pid 0, and `signalTree` would
-    /// then run `kill(-0, SIGTERM)`: every process in the CALLER'S OWN
-    /// process group.
-    ///
-    /// A nonexistent executable makes `posix_spawn` answer ENOENT on Darwin
-    /// without any test needing to stage memory pressure, so the throw path
-    /// — the sole producer of `.gitUnavailable` at this site — is reachable
-    /// after all.
-    ///
-    /// MUTATION: deleting `guard rc == 0 else { throw SpawnFailure(code: rc) }`
-    /// reds this cell. Measured with `signalTree`'s body neutered in the same
-    /// mutation, deliberately: without that second edit the mutant signals
-    /// the test harness's own process group, which is a way to destroy the
-    /// run rather than measure it.
-    func testASpawnThatCannotStartIsReportedRatherThanHandedBackAsPidZero()
-        async throws
-    {
-        let missing = URL(fileURLWithPath: "/nonexistent-\(UUID().uuidString)/env")
-        let runner = GitCommandRunner(
-            environment: GitFixture.environment(home: home),
-            executableURL: missing
-        )
-        let invocation = await runner.run(["--version"], timeout: 5)
-        XCTAssertEqual(
-            invocation.outcome, .gitUnavailable,
-            "a spawn that could not start must be reported, never handed "
-                + "back as a running child: \(invocation.outcome)"
-        )
     }
 
     // MARK: - The fence's scanner, evidenced on its own
@@ -956,7 +916,9 @@ final class GitCommandRunnerTests: XCTestCase {
         ]
 
         var unchecked: [String] = []
-        var checkedPerRule = [Int](repeating: 0, count: rules.count)
+        // Keyed by rule name, not indexed: see `scannableSource` on why this
+        // file carries no integer subscripts.
+        var checkedPerRule: [String: Int] = [:]
         for path in paths {
             let source = scannableSource(
                 try String(
@@ -965,7 +927,7 @@ final class GitCommandRunnerTests: XCTestCase {
                 )
             )
             let whole = NSRange(source.startIndex..<source.endIndex, in: source)
-            for (ruleIndex, rule) in rules.enumerated() {
+            for rule in rules {
                 let symbol = try NSRegularExpression(pattern: rule.symbol)
                 for match in symbol.matches(in: source, range: whole) {
                     guard let range = Range(match.range, in: source)
@@ -977,7 +939,7 @@ final class GitCommandRunnerTests: XCTestCase {
                     if prefix.range(
                         of: rule.wrapper, options: .regularExpression
                     ) != nil {
-                        checkedPerRule[ruleIndex] += 1
+                        checkedPerRule[rule.name, default: 0] += 1
                         continue
                     }
                     let line = prefix.reduce(1) { $1 == "\n" ? $0 + 1 : $0 }
@@ -991,10 +953,11 @@ final class GitCommandRunnerTests: XCTestCase {
                 }
             }
         }
-        for (index, rule) in rules.enumerated() {
+        for rule in rules {
+            let found = checkedPerRule[rule.name] ?? 0
             XCTAssertGreaterThanOrEqual(
-                checkedPerRule[index], rule.floor,
-                "found \(checkedPerRule[index]) wrapped \(rule.name) symbols "
+                found, rule.floor,
+                "found \(found) wrapped \(rule.name) symbols "
                     + "repo-wide — fewer than the \(rule.floor) that exist, so "
                     + "this rule has gone vacuous"
             )

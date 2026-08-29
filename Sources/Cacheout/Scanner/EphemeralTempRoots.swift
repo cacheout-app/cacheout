@@ -140,7 +140,7 @@
 /// ones, at the same construction time; fn-4.11 converged them onto this
 /// file's rule — `DevRootsStore.resolve`'s probe pass
 /// (`DevRootsStore.swift:342-352`), `suppressingAliasShadows`' probe
-/// (`SpaceScanner.swift:2088-2106`), and the container-root policy
+/// (`SpaceScanner.swift:2102-2120`), and the container-root policy
 /// (`PathGuard.validateContainerRoot`) all now probe as spelled and read a
 /// symlink leaf's own content, and the fold itself was hoisted to
 /// `FileSystemIdentityProvider.lexicalTargetPath` (this file's
@@ -189,7 +189,7 @@
 /// fix and a relocation: the 2 of those 5 that `resolve` never made were
 /// `suppressingAliasShadows` canonicalizing and probing the same root in the
 /// cross-scanner union — measured against the union as it then stood; since
-/// fn-4.11 its probe (`SpaceScanner.swift:2088-2106`) runs its own
+/// fn-4.11 its probe (`SpaceScanner.swift:2102-2120`) runs its own
 /// kernel-table preflight first, so even a kept mounted root is no longer
 /// contacted there.
 ///
@@ -221,7 +221,7 @@
 /// itself a real directory (`lstat` leaf, no follow) — since fn-4.11 the
 /// same as-spelled-first probe the dev-root resolution
 /// (`DevRootsStore.swift:342-352`) and `suppressingAliasShadows`
-/// (`SpaceScanner.swift:2088-2106`) run: none of the three resolves a
+/// (`SpaceScanner.swift:2102-2120`) run: none of the three resolves a
 /// non-directory leaf. The two halves that consume the probe have
 /// different precedents — do not read this as one pattern copied whole from
 /// either:
@@ -590,7 +590,7 @@ enum EphemeralTempRoots {
         //
         // The root is DROPPED, not kept-and-skipped, and that difference is
         // the fix: a kept root reaches the runtime's cross-scanner union,
-        // whose probe (`SpaceScanner.swift:2088-2106`) — at the time of
+        // whose probe (`SpaceScanner.swift:2102-2120`) — at the time of
         // this fix — canonicalized and probed it, the remaining 2 of those
         // 5, still during construction (since fn-4.11 the union preflights
         // the same kernel table itself, a second line this drop no longer

@@ -850,6 +850,11 @@ struct GitWorktreeAdminMapper {
         worktreePaths.reserveCapacity(gated.count)
         for entry in gated {
             let backlink = entry.appendingPathComponent("gitdir")
+            // As at the performer's pointer read: "unreadable" is transient
+            // for every cause but one — a back-link past
+            // `gitPointerByteLimit` is past a fixed constant, and the
+            // `.incomplete` this returns is reported with a re-scan remedy
+            // that cannot clear it (merge gate r4, P6).
             guard let contents = identity.smallRegularFileText(
                 at: backlink,
                 limit: FileSystemIdentityProvider.gitPointerByteLimit

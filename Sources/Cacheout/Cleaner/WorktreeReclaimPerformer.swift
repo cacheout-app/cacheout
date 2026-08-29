@@ -1722,6 +1722,12 @@ struct WorktreeReclaimPerformer {
             + "instant, so whether it is registered again could not be "
             + "established — nothing was pruned. Re-scan once that path is "
             + "settled."
+        // ONE CAUSE HERE IS PERMANENT, and `ambiguous` says "re-scan" (merge
+        // gate r4, P6): every other way this guard fails is transient, but a
+        // pointer file past `gitPointerByteLimit` is past a fixed constant,
+        // so re-scanning cannot change the answer. Disclosed rather than
+        // given its own message, because no git writes a 64 KiB `.git` file
+        // and splitting the vocabulary for it would cost more than it buys.
         guard kind == .kind(.regularFile),
               let pointerText = provider.smallRegularFileText(
                   at: dotGit,

@@ -5931,7 +5931,19 @@ extension CacheCleanerTests {
     /// bytes. Contents mode has always bound first; only this arm was
     /// backwards.
     ///
-    /// MUTATION: move the binding back below `sizer.measure` and this reds.
+    /// MUTATION: move the binding back below `sizer.measure` and this reds
+    /// 3/3, on "the stranger installed during the measurement was DELETED"
+    /// plus a success entry and zero errors.
+    ///
+    /// CORRECTION to this cell's own first description (PR #461 merge gate
+    /// r4, P8): the mutant does NOT credit the original tree's bytes. The
+    /// entry it produces is `exactBytes: 0, estimatedUpToBytes: 0` — measured
+    /// — because the sizer's size read lands after the rename, so there is
+    /// nothing left to count. The defect is unchanged and no smaller: a
+    /// stranger nobody inspected is destroyed and reported as SUCCESS. Only
+    /// the bytes half of the story was wrong, and a wrong detail in an
+    /// evidence note is how the next round is sent looking in the wrong
+    /// place.
     func testItemModeTargetSwappedDuringTheMeasurementIsRefused()
         async throws
     {

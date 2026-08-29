@@ -207,7 +207,7 @@ final class SourceAnchorIntegrityTests: XCTestCase {
          "private static func suppressingAliasShadows("),
         ("SpaceScanner.swift:2089-2151",
          "private static func suppressingAliasShadows("),
-        ("SpaceScanner.swift:2088-2106",
+        ("SpaceScanner.swift:2102-2120",
          "let probed = roots.map {"),
         ("SpaceScanner.swift:2130-2133",
          "Two real-directory spellings of one location are"),
@@ -353,6 +353,22 @@ final class SourceAnchorIntegrityTests: XCTestCase {
             sites.count, 40,
             "the check must actually have found anchors, not zero of them"
         )
+        // RESIDUAL, disclosed precisely (PR #461 merge gate r4, P7): this
+        // check asks only whether the excerpt lies SOMEWHERE inside the cited
+        // range, so a range wider than the drift hides the drift. That is not
+        // hypothetical — it is how the SpaceScanner probe anchor (then
+        // spelled with the 2088-2106 range, now :2102-2120) shipped rotted
+        // through the very commit whose job was repointing anchors:
+        // the content moved +14, the 19-line range still contained it, and
+        // line 2088 had become a doc-comment continuation. Six citing sites
+        // pointed at the wrong place while this cell stayed green.
+        //
+        // THE KNOWN FIX, deliberately not taken here: carry the excerpt's
+        // expected OFFSET within the range and assert it exactly, so any
+        // shift reds. Measured across the 58 rows, offsets legitimately run
+        // 0 to 58, so no fixed tolerance works and the offsets must be
+        // recorded per row — a schema migration that belongs in its own
+        // increment, reviewed on its own, not bolted onto a review-fix round.
         XCTAssertEqual(
             offenders, [],
             "an anchor whose cited line no longer holds what the comment says "

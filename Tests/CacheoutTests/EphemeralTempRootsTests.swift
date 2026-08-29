@@ -719,7 +719,7 @@ final class EphemeralTempRootsTests: XCTestCase {
     /// THE FIX AT `production()` SCOPE — the half a drop-vs-keep decision
     /// turns on. A root KEPT here reaches the runtime's cross-scanner
     /// union, whose probe (`SpaceScannerRuntime.suppressingAliasShadows`,
-    /// `SpaceScanner.swift:2088-2106`) — as it stood when this cell landed —
+    /// `SpaceScanner.swift:2102-2120`) — as it stood when this cell landed —
     /// canonicalized and probed every root it was given, still during
     /// construction, so the block would simply have moved one function
     /// along. Measured against this fixture before the preflight existed:

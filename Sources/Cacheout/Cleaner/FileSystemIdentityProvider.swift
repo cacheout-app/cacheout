@@ -565,9 +565,25 @@ class FileSystemIdentityProvider {
     /// `gitdir`, `commondir`, a `.git` pointer — is tens of bytes; a repo
     /// `config` can legitimately reach a few kilobytes. Both are generous by
     /// orders of magnitude, and anything past them is refused, not truncated.
-    /// A real repository whose config exceeds this stays UNDISCOVERED, which
-    /// is the same silence every bare repository had before fn-4.28 — never a
-    /// refusal dressed as retryable.
+    /// THE TWO LIMITS DO NOT FAIL THE SAME WAY, and saying they did was
+    /// false (PR #461 merge gate r4, P6).
+    ///
+    /// `gitConfigByteLimit` is read on ONE path, `bareRepositoryGitDirectory`,
+    /// whose single caller treats nil as "not a bare repository". A config
+    /// past that limit leaves the repository merely UNDISCOVERED — the same
+    /// silence every bare repository had before fn-4.28, and no issue at all.
+    ///
+    /// `gitPointerByteLimit` is different at two of its call sites, and both
+    /// are refusals whose printed remedy is a RE-SCAN: a `.git` pointer past
+    /// the limit yields `WorktreeReclaimPerformer`'s `ambiguous` string
+    /// ("Re-scan once that path is settled"), and a `gitdir` back-link past it
+    /// yields `.incomplete` and then "the prunable set is not provably
+    /// complete". THE LIMIT IS A FIXED CONSTANT, so for that one cause a
+    /// retry can never differ — it is a permanent strand wearing a retryable
+    /// message, the class this project refuses everywhere else. It is kept
+    /// because the messages are shared with genuinely transient causes and a
+    /// 64 KiB pointer file is not a shape any git writes; it is disclosed
+    /// here, and at both sites, rather than implied away.
     static let gitPointerByteLimit = 64 * 1024
     static let gitConfigByteLimit = 1024 * 1024
 

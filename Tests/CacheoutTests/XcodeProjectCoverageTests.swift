@@ -21,8 +21,12 @@ import XCTest
 /// sweep untracked scratch files and make the verdict a property of the
 /// machine rather than of the repository.
 ///
-/// MUTATION: delete any file's entry from the project and this reds, naming
-/// it. Regenerating with `xcodegen generate` is the fix.
+/// MUTATION, measured on three shapes rather than asserted: removing the
+/// three files `1bf97cd` restored reds it naming all three; removing the four
+/// `ContentView.swift` lines reds it, where the substring version stayed
+/// GREEN masked by `SettingsContentView.swift`; removing the helper's
+/// `main.swift` reds it, where the substring version stayed GREEN masked by
+/// the app's `main.swift`. `xcodegen generate` is the fix in every case.
 final class XcodeProjectCoverageTests: XCTestCase {
 
     private var repositoryRoot: URL {
@@ -67,10 +71,49 @@ final class XcodeProjectCoverageTests: XCTestCase {
             "the project file does not look like a pbxproj at all"
         )
 
-        let absent = paths.filter { path in
-            guard let name = path.split(separator: "/").last else { return false }
-            return !project.contains(String(name))
+        // MEMBERSHIP OF A SOURCES PHASE, not "this basename occurs
+        // somewhere in the file" (PR #461 gate r5, P4). The first version
+        // asked `project.contains(name)`, and its own claim that deleting any
+        // entry would red it was measured FALSE twice: `ContentView.swift` is
+        // a substring of `SettingsContentView.swift`, and `main.swift` exists
+        // twice (the app and the helper daemon), so each masked the other's
+        // absence. Those two are the app's root view and the helper's entry
+        // point — the files whose absence breaks the bundle hardest were
+        // precisely the ones the fence could not see. It passed for the three
+        // files it was written for, which is why the vacuity was invisible.
+        //
+        // xcodegen emits `/* <name> in Sources */` TWICE per membership —
+        // once declaring the `PBXBuildFile` and once listing it in the
+        // phase's `files` array — and only the second ends in a comma. The
+        // first version of this counter matched both, so a basename carried
+        // by N files yielded 2N markers and the `found < N` test could never
+        // fire; removing one of the two `main.swift` memberships left three
+        // markers against a requirement of two and stayed GREEN. Measured,
+        // not reasoned: that mutation is M2 in the list above.
+        //
+        // The `/* ` prefix stops a longer basename from satisfying a shorter
+        // one; the trailing comma counts memberships rather than mentions; a
+        // basename carried by N tracked files needs N of them. More than N is
+        // fine — a file may legitimately belong to several targets.
+        var required: [String: Int] = [:]
+        for path in paths {
+            guard let name = path.split(separator: "/").last else { continue }
+            required[String(name), default: 0] += 1
         }
+        let absent = required.compactMap { name, count -> String? in
+            let marker = "/* \(name) in Sources */,"
+            var found = 0
+            var cursor = project.startIndex
+            while let hit = project.range(
+                of: marker, range: cursor..<project.endIndex
+            ) {
+                found += 1
+                cursor = hit.upperBound
+            }
+            guard found < count else { return nil }
+            return "\(name): \(count) tracked, \(found) in a Sources phase"
+        }.sorted()
+
         XCTAssertEqual(
             absent, [],
             "these tracked sources are not in the checked-in Xcode project, "

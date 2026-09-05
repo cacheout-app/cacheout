@@ -55,7 +55,6 @@
 		727ABDA98B04DB2BDBF95A7E /* ProjectTreeWalker.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0D6F28962ECA37ED73C427 /* ProjectTreeWalker.swift */; };
 		73556E20E1B969F7691B4E5F /* CompressorTracker.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5542F20E653D5B668DD6D7B5 /* CompressorTracker.swift */; };
 		7531D4525815B4CBE5DE47A5 /* Tier2Interventions.swift in Sources */ = {isa = PBXBuildFile; fileRef = EFF2C42D456B268FFEB2B2A2 /* Tier2Interventions.swift */; };
-		799ABF8B31749CDAC143F3A3 /* MenuBarIconTemplate.tiff in Resources */ = {isa = PBXBuildFile; fileRef = F534DE2DBFFD04550F22DC8D /* MenuBarIconTemplate.tiff */; };
 		7AC6F10091DC9AE8B85F8978 /* RecommendationEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7004867F08F19EC37A2D7D1B /* RecommendationEngine.swift */; };
 		7E2D87C22D7802A0920CE4A5 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5F3EBD840FD250F9ECDF9CD3 /* ContentView.swift */; };
 		831914EDB297F234B74D1F31 /* DaemonConfig.swift in Sources */ = {isa = PBXBuildFile; fileRef = 288A2658F275BE37E0BFC89F /* DaemonConfig.swift */; };
@@ -69,7 +68,6 @@
 		92A6F1116614F5CA0D52D274 /* SettingsContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 17099F0406144C6E7D4167F6 /* SettingsContentView.swift */; };
 		92C323EAE2B2AB8160F35390 /* ProcessMemoryScanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1F589EF6B33B9A8AFF13CC1D /* ProcessMemoryScanner.swift */; };
 		94AC3E7501D21B51BD1E1544 /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4ABC54EFDB276894C2D33CC7 /* SettingsView.swift */; };
-		95FAC42382B2F7BBA2089744 /* MenuBarIcon.tiff in Resources */ = {isa = PBXBuildFile; fileRef = 36C9423892BDE0AC771BD2FB /* MenuBarIcon.tiff */; };
 		9855CAAA9DD59948D9C7A6BB /* TrashDisposal.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0FC1792C9B3F7FB3C935C003 /* TrashDisposal.swift */; };
 		987BF1F1F29312B8F2CA516C /* EphemeralTempScanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = 89FA2F192993DAFC4F865A81 /* EphemeralTempScanner.swift */; };
 		9891100B0B90E4B88DBE923E /* CacheCleaner.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1230916736A41CCED07F35CA /* CacheCleaner.swift */; };
@@ -224,7 +222,6 @@
 		31021E29ABA33ED7576488CC /* com.cacheout.memhelper.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = com.cacheout.memhelper.plist; sourceTree = "<group>"; };
 		3453E554A2EF5BB26F884A37 /* CacheCategory.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CacheCategory.swift; sourceTree = "<group>"; };
 		3484E5F5A3B45839B0F1C493 /* MemlimitWorkaround.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MemlimitWorkaround.swift; sourceTree = "<group>"; };
-		36C9423892BDE0AC771BD2FB /* MenuBarIcon.tiff */ = {isa = PBXFileReference; lastKnownFileType = image.tiff; path = MenuBarIcon.tiff; sourceTree = "<group>"; };
 		379987CF5B79ABDF997B7DC1 /* WorktreeReclaimPerformer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorktreeReclaimPerformer.swift; sourceTree = "<group>"; };
 		3D8D2747B5292A1718AEAA39 /* memorystatus_private.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = memorystatus_private.h; sourceTree = "<group>"; };
 		406A840A809552F909991D62 /* OrphanedCachesScanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OrphanedCachesScanner.swift; sourceTree = "<group>"; };
@@ -305,7 +302,6 @@
 		F3746399EBD05A9B8148C269 /* CacheoutHelper */ = {isa = PBXFileReference; includeInIndex = 0; path = CacheoutHelper; sourceTree = BUILT_PRODUCTS_DIR; };
 		F3D52BB647F9033DA027C575 /* BuildArtifactRules.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BuildArtifactRules.swift; sourceTree = "<group>"; };
 		F4FE1C5ACE094C9E0D28D952 /* ProcessesView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProcessesView.swift; sourceTree = "<group>"; };
-		F534DE2DBFFD04550F22DC8D /* MenuBarIconTemplate.tiff */ = {isa = PBXFileReference; lastKnownFileType = image.tiff; path = MenuBarIconTemplate.tiff; sourceTree = "<group>"; };
 		F688400B8AEE0FDF8B652DC5 /* libCacheoutHelperLib.a */ = {isa = PBXFileReference; explicitFileType = archive.ar; includeInIndex = 0; path = libCacheoutHelperLib.a; sourceTree = BUILT_PRODUCTS_DIR; };
 		FA7E1439306A3E5BC7C6B605 /* module.modulemap */ = {isa = PBXFileReference; lastKnownFileType = "sourcecode.module-map"; path = module.modulemap; sourceTree = "<group>"; };
 		FED4BAA64240E602A3BE1582 /* MemoryMonitor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MemoryMonitor.swift; sourceTree = "<group>"; };
@@ -474,10 +470,8 @@
 				80855509D976D7EF366BE2D3 /* Cacheout.icns */,
 				31021E29ABA33ED7576488CC /* com.cacheout.memhelper.plist */,
 				81CBB3E0AA0BE770CB32CB41 /* MenuBarIcon.png */,
-				36C9423892BDE0AC771BD2FB /* MenuBarIcon.tiff */,
 				CF6AD4F1A744AED70CBEEA1E /* MenuBarIcon@2x.png */,
 				B878A98009FCF82EC164CFFD /* MenuBarIconTemplate.png */,
-				F534DE2DBFFD04550F22DC8D /* MenuBarIconTemplate.tiff */,
 				C2F1CB3E9DBF1A54A53FF14E /* MenuBarIconTemplate@2x.png */,
 			);
 			name = Resources;
@@ -736,10 +730,8 @@
 			files = (
 				660C0769D0EA95681A0C0ACC /* Cacheout.icns in Resources */,
 				BFC4EC7202CD43FF5889034D /* MenuBarIcon.png in Resources */,
-				95FAC42382B2F7BBA2089744 /* MenuBarIcon.tiff in Resources */,
 				FF1746761E4FB32AD9F2AF2A /* MenuBarIcon@2x.png in Resources */,
 				A43CF960F06EEC4A6F9C4C1D /* MenuBarIconTemplate.png in Resources */,
-				799ABF8B31749CDAC143F3A3 /* MenuBarIconTemplate.tiff in Resources */,
 				5FA0E107B7F164B17063917B /* MenuBarIconTemplate@2x.png in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

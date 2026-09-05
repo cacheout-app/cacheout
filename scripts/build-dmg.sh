@@ -36,10 +36,25 @@ rm -rf "${BUILD_DIR}"
 mkdir -p "${DIST_DIR}"
 
 # ─── Step 2: Regenerate Xcode project ───────────────────────
-if command -v xcodegen &>/dev/null; then
-    echo "--- Regenerating xcodeproj ---"
-    xcodegen generate 2>&1
+# FAIL CLOSED (PR #461 codex r4). This used to regenerate only when xcodegen
+# happened to be installed and otherwise build the checked-in project — which
+# is a GENERATED artifact and had silently gone stale: three tracked sources
+# were missing from it, two of them deletion primitives, and the file's last
+# change was a merge. On a machine without xcodegen the release build would
+# then fail to resolve those symbols, which is a confusing compile error deep
+# inside xcodebuild rather than a statement of what is wrong.
+#
+# `XcodeProjectCoverageTests` keeps the checked-in copy honest; this keeps the
+# release path from ever building a project nobody regenerated.
+if ! command -v xcodegen &>/dev/null; then
+    echo "❌ xcodegen is not installed, and Cacheout.xcodeproj is GENERATED" >&2
+    echo "   from project.yml — building the checked-in copy risks shipping" >&2
+    echo "   a project that is missing sources added since it was written." >&2
+    echo "   Install it:  brew install xcodegen" >&2
+    exit 1
 fi
+echo "--- Regenerating xcodeproj ---"
+xcodegen generate 2>&1
 
 # ─── Step 3: Release build via xcodebuild ───────────────────
 echo "--- Building release ---"

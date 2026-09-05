@@ -40,6 +40,7 @@
 		5134AD93B1D55612B74BDFD1 /* Categories.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6E4F0D56D0D9FFBD5157574E /* Categories.swift */; };
 		5194782EBC470C5E5765E5FC /* DaemonSnapshot.swift in Sources */ = {isa = PBXBuildFile; fileRef = 76C8538BE4D7AD7ACDECC254 /* DaemonSnapshot.swift */; };
 		527DC90002648CDE1543783F /* WorktreeStalenessAssessor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6BAD54210BDEE35F2FB38595 /* WorktreeStalenessAssessor.swift */; };
+		53E3B1C34CEDF9D83BFA27F3 /* DepthSafeRemoval.swift in Sources */ = {isa = PBXBuildFile; fileRef = BF1B76AB2C9E48955C8C0478 /* DepthSafeRemoval.swift */; };
 		53FDF117C05781F8D27938BA /* AutopilotPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 82ABA28C5E88782DD93E42A1 /* AutopilotPolicy.swift */; };
 		5416ABC78819DF413373498E /* StatusSocket.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2BD6365309839A8FF2A6A271 /* StatusSocket.swift */; };
 		572BD228B36DEA32CEBB9585 /* Sparkle in Frameworks */ = {isa = PBXBuildFile; productRef = F14689CFA3D53EC0E6D1A853 /* Sparkle */; };
@@ -62,12 +63,14 @@
 		851B3BADDDAD69082F653698 /* Tier1Interventions.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8067629D06F1595B2EE0D303 /* Tier1Interventions.swift */; };
 		891B86013ED51C1A0D0DC224 /* CLIHandler.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7F41F0CC63176858101D3C2A /* CLIHandler.swift */; };
 		8A841F032EAFF999B9A27E03 /* BuildArtifactRules.swift in Sources */ = {isa = PBXBuildFile; fileRef = F3D52BB647F9033DA027C575 /* BuildArtifactRules.swift */; };
+		8B83E8AF403D1750AE891FDF /* FirstWinsRendezvous.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0A64C83C9152A0ED36C6C4C6 /* FirstWinsRendezvous.swift */; };
 		8C9412CAD5C695C33BD45D30 /* FileSystemIdentityProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = 00ED87E5A2D4D49E6C748016 /* FileSystemIdentityProvider.swift */; };
 		8E20D5C7DA9239C12CAC2763 /* InterventionRegistry.swift in Sources */ = {isa = PBXBuildFile; fileRef = BACE6F298FE6C8E7A2F71EE5 /* InterventionRegistry.swift */; };
 		92A6F1116614F5CA0D52D274 /* SettingsContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 17099F0406144C6E7D4167F6 /* SettingsContentView.swift */; };
 		92C323EAE2B2AB8160F35390 /* ProcessMemoryScanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1F589EF6B33B9A8AFF13CC1D /* ProcessMemoryScanner.swift */; };
 		94AC3E7501D21B51BD1E1544 /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4ABC54EFDB276894C2D33CC7 /* SettingsView.swift */; };
 		95FAC42382B2F7BBA2089744 /* MenuBarIcon.tiff in Resources */ = {isa = PBXBuildFile; fileRef = 36C9423892BDE0AC771BD2FB /* MenuBarIcon.tiff */; };
+		9855CAAA9DD59948D9C7A6BB /* TrashDisposal.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0FC1792C9B3F7FB3C935C003 /* TrashDisposal.swift */; };
 		987BF1F1F29312B8F2CA516C /* EphemeralTempScanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = 89FA2F192993DAFC4F865A81 /* EphemeralTempScanner.swift */; };
 		9891100B0B90E4B88DBE923E /* CacheCleaner.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1230916736A41CCED07F35CA /* CacheCleaner.swift */; };
 		99FDCC1360ACB7298594FFB1 /* EphemeralTempRoots.swift in Sources */ = {isa = PBXBuildFile; fileRef = 528D3A07085FFADB1D465CF5 /* EphemeralTempRoots.swift */; };
@@ -204,6 +207,8 @@
 		018266894D1ABCCD444E8F2F /* InterventionExecutor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InterventionExecutor.swift; sourceTree = "<group>"; };
 		04E251ACDD348227547A0EEB /* MemoryHelperProtocol.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MemoryHelperProtocol.swift; sourceTree = "<group>"; };
 		08069DE63A5D0EDBBD1E9C4F /* OnboardingView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OnboardingView.swift; sourceTree = "<group>"; };
+		0A64C83C9152A0ED36C6C4C6 /* FirstWinsRendezvous.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FirstWinsRendezvous.swift; sourceTree = "<group>"; };
+		0FC1792C9B3F7FB3C935C003 /* TrashDisposal.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TrashDisposal.swift; sourceTree = "<group>"; };
 		10C54ACA50BA3F2B5FB5F2B7 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		1230916736A41CCED07F35CA /* CacheCleaner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CacheCleaner.swift; sourceTree = "<group>"; };
 		14FAD15AA744620E0BEFE581 /* GitCommandRunner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GitCommandRunner.swift; sourceTree = "<group>"; };
@@ -277,6 +282,7 @@
 		B878A98009FCF82EC164CFFD /* MenuBarIconTemplate.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = MenuBarIconTemplate.png; sourceTree = "<group>"; };
 		BACE6F298FE6C8E7A2F71EE5 /* InterventionRegistry.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InterventionRegistry.swift; sourceTree = "<group>"; };
 		BC4E35BBC87E2364C890D8EB /* ScanResult.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScanResult.swift; sourceTree = "<group>"; };
+		BF1B76AB2C9E48955C8C0478 /* DepthSafeRemoval.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DepthSafeRemoval.swift; sourceTree = "<group>"; };
 		BF1FDC6594E076F20AACD291 /* DiskInfo.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DiskInfo.swift; sourceTree = "<group>"; };
 		C2777F1CA3C53361B0F68626 /* CategoryRow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CategoryRow.swift; sourceTree = "<group>"; };
 		C2F1CB3E9DBF1A54A53FF14E /* MenuBarIconTemplate@2x.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "MenuBarIconTemplate@2x.png"; sourceTree = "<group>"; };
@@ -401,6 +407,7 @@
 			children = (
 				3453E554A2EF5BB26F884A37 /* CacheCategory.swift */,
 				BF1FDC6594E076F20AACD291 /* DiskInfo.swift */,
+				0A64C83C9152A0ED36C6C4C6 /* FirstWinsRendezvous.swift */,
 				2A736F34AD05200EDE9972AA /* SaturatingArithmetic.swift */,
 				BC4E35BBC87E2364C890D8EB /* ScanResult.swift */,
 			);
@@ -411,8 +418,10 @@
 			isa = PBXGroup;
 			children = (
 				1230916736A41CCED07F35CA /* CacheCleaner.swift */,
+				BF1B76AB2C9E48955C8C0478 /* DepthSafeRemoval.swift */,
 				00ED87E5A2D4D49E6C748016 /* FileSystemIdentityProvider.swift */,
 				B415391F406F0415AE007308 /* PathGuard.swift */,
+				0FC1792C9B3F7FB3C935C003 /* TrashDisposal.swift */,
 				379987CF5B79ABDF997B7DC1 /* WorktreeReclaimPerformer.swift */,
 			);
 			path = Cleaner;
@@ -808,6 +817,7 @@
 				831914EDB297F234B74D1F31 /* DaemonConfig.swift in Sources */,
 				21B8805BBCDC4176650C2E6B /* DaemonMode.swift in Sources */,
 				5194782EBC470C5E5765E5FC /* DaemonSnapshot.swift in Sources */,
+				53E3B1C34CEDF9D83BFA27F3 /* DepthSafeRemoval.swift in Sources */,
 				360994D378D4BD1EB7ADC15C /* DevRootsStore.swift in Sources */,
 				439C12251FD58C4CEA9A1BB2 /* DirectorySizer.swift in Sources */,
 				D6A6853C267993B9FB084206 /* DiskInfo.swift in Sources */,
@@ -815,6 +825,7 @@
 				99FDCC1360ACB7298594FFB1 /* EphemeralTempRoots.swift in Sources */,
 				987BF1F1F29312B8F2CA516C /* EphemeralTempScanner.swift in Sources */,
 				8C9412CAD5C695C33BD45D30 /* FileSystemIdentityProvider.swift in Sources */,
+				8B83E8AF403D1750AE891FDF /* FirstWinsRendezvous.swift in Sources */,
 				249C9634CFBAD37F324B7B43 /* Formatters.swift in Sources */,
 				DB3D6FA8B8C895D201EAA115 /* GitCommandRunner.swift in Sources */,
 				07C439BB8299EED3B6E1782F /* GitWorktreeInventory.swift in Sources */,
@@ -855,6 +866,7 @@
 				851B3BADDDAD69082F653698 /* Tier1Interventions.swift in Sources */,
 				7531D4525815B4CBE5DE47A5 /* Tier2Interventions.swift in Sources */,
 				AF9392A8DFC710E864BE6466 /* Tier3Interventions.swift in Sources */,
+				9855CAAA9DD59948D9C7A6BB /* TrashDisposal.swift in Sources */,
 				C277F5DC011FC0CC51B6B6E3 /* ValuablesDetector.swift in Sources */,
 				F7C935653D7E8085572FF2E2 /* WebhookAlerter.swift in Sources */,
 				A0358BB924BC7F234052EC60 /* WorktreeReclaimPerformer.swift in Sources */,

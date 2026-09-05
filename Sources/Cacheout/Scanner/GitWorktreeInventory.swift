@@ -417,7 +417,8 @@ struct GitWorktreeGitdirResolver {
         // fix is descriptor-relative validation bound to the walk's open
         // directory, which means adding identity to that event and threading
         // it through both scanners that consume it. Deferred deliberately as
-        // its own change rather than smuggled into a review round.
+        // its own change rather than smuggled into a review round, and FILED
+        // so it cannot be lost: fn-5-stale-git-worktree-scanner.7.
         guard identity.probeKind(of: directory) == .kind(.directory) else {
             return nil
         }

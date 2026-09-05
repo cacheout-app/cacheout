@@ -2644,6 +2644,73 @@ final class GitWorktreeScannerTests: XCTestCase {
         try assertNonMalformed(outcome, from: scanner)
     }
 
+    /// **THE BARE ARM CARRIED NO WITNESS** (PR #461 codex r4).
+    ///
+    /// The linked arm has carried an `AdminWitness` — path AND identity, as
+    /// of the instant the walk observed it — since PR #460 r17. The bare arm,
+    /// added later in fn-4.28, kept only a URL, and `repositoryGroups` then
+    /// canonicalized that URL unbound. `canonicalize` is `realpath`, which
+    /// resolves every component: on a replacement it both FOLLOWS the
+    /// stranger and can block on it, and the same stored path then becomes
+    /// the `listingTarget`, putting `git worktree list` on a repository
+    /// outside the configured dev root.
+    ///
+    /// Driven through `repositoryGroups` directly rather than through a whole
+    /// scan. A first attempt drove it with a provider that drifted its
+    /// answers mid-scan, and it FAILED HONESTLY: something earlier in the
+    /// scan already asks that path for its identity, so the capture and the
+    /// re-check both saw the drifted value and agreed. Timing a race through
+    /// two unknown call sites proves less than calling the function with the
+    /// two states it must distinguish.
+    ///
+    /// MUTATION: drop the witness re-check before `provider.canonicalize` and
+    /// the drift arm reds while the control stays green.
+    func testABareDiscoveryWhoseDirectoryDriftedIsNotGrouped() throws {
+        let bare = dev.appendingPathComponent("repo.git")
+        let seed = try makeRepositoryIgnoringPayloads(
+            at: base.appendingPathComponent("seed")
+        )
+        XCTAssertEqual(
+            try GitFixture.git(
+                ["clone", "--bare", seed.path, bare.path], home: home
+            ).status, 0, "bare clone failed"
+        )
+
+        let provider = FileSystemIdentityProvider()
+        let resolver = GitWorktreeGitdirResolver(identity: provider)
+        let truth = try XCTUnwrap(provider.identity(of: bare))
+
+        func groups(
+            witness: FileSystemIdentityProvider.Identity
+        ) -> [GitWorktreeScanner.RepositoryGroup] {
+            GitWorktreeScanner.repositoryGroups(
+                from: [GitWorktreeDiscovery(
+                    directory: bare, kind: .bareRepository,
+                    bareWitness: .init(entryPath: bare.path, identity: witness)
+                )],
+                resolver: resolver, provider: provider
+            )
+        }
+
+        // CONTROL: with the identity it was actually proved at, it groups.
+        // Without this, an empty result below would prove nothing.
+        XCTAssertEqual(
+            groups(witness: truth).count, 1,
+            "the fixture must group when the witness matches, or the refusal "
+                + "below is not the drift's"
+        )
+
+        let drifted = FileSystemIdentityProvider.Identity(
+            device: truth.device, inode: truth.inode &+ 1
+        )
+        XCTAssertTrue(
+            groups(witness: drifted).isEmpty,
+            "a bare directory that is no longer the object the bare-shape "
+                + "proof accepted was still grouped, so realpath would follow "
+                + "the replacement and list it"
+        )
+    }
+
     /// THE CASE THE PRUNE TIER EXISTS FOR (fn-4.28): a BARE repository whose
     /// linked checkouts are ALL gone. Discovery used to key entirely on an
     /// entry named `.git`, and a bare repository has none — so once its last

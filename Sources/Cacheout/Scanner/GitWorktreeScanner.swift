@@ -246,17 +246,30 @@ struct GitWorktreeDiscovery: Equatable, Sendable {
     /// That admin entry's identity at the SAME instant. `nil` when the
     /// pointer did not resolve or the `lstat` failed then.
     let adminWitness: AdminWitness?
+    /// BARE repositories only: the validated directory's identity at the
+    /// instant the bare-shape proof accepted it (PR #461 codex r4).
+    ///
+    /// The linked arm has carried a witness since PR #460 r17 for exactly
+    /// this reason; the bare arm, added later in fn-4.28, kept only a URL.
+    /// Grouping then canonicalized that URL unbound, so a directory renamed
+    /// and replaced between the walk consumer returning and grouping was
+    /// followed by `realpath` and became the `listingTarget` — putting
+    /// `git worktree list` on a repository outside the configured root, or
+    /// blocking on an unresponsive replacement.
+    let bareWitness: AdminWitness?
 
     init(
         directory: URL,
         kind: GitWorktreeDiscoveryKind,
         adminDirectory: URL? = nil,
-        adminWitness: AdminWitness? = nil
+        adminWitness: AdminWitness? = nil,
+        bareWitness: AdminWitness? = nil
     ) {
         self.directory = directory
         self.kind = kind
         self.adminDirectory = adminDirectory
         self.adminWitness = adminWitness
+        self.bareWitness = bareWitness
     }
 }
 
@@ -601,8 +614,18 @@ struct GitWorktreeScanner: @unchecked Sendable {
                ($0.name == "refs" || $0.name == "reftable") && $0.kind == .directory
            }),
            resolver.bareRepositoryGitDirectory(at: event.directory) != nil {
+            // The identity AS OF THE PROOF, carried the way the linked arm
+            // carries its admin witness. Grouping re-checks it before
+            // canonicalizing, so the path it resolves is the object this
+            // proof accepted rather than whatever now answers to the name.
+            let witness = provider.identity(of: event.directory).map {
+                GitWorktreeDiscovery.AdminWitness(
+                    entryPath: event.directory.path, identity: $0
+                )
+            }
             discoveries.append(GitWorktreeDiscovery(
-                directory: event.directory, kind: .bareRepository
+                directory: event.directory, kind: .bareRepository,
+                bareWitness: witness
             ))
         }
         return []
@@ -701,6 +724,17 @@ struct GitWorktreeScanner: @unchecked Sendable {
                 // canonicalizes `<dir>/.git`, so a bare parent reached both
                 // ways (its own shape AND a live checkout's `gitdir:`
                 // pointer) names ONE group and pays for ONE listing.
+                // RE-PROVED BEFORE `realpath` TOUCHES IT (PR #461 codex
+                // r4). `canonicalize` resolves every component, so on a
+                // replacement it both follows the stranger and can block on
+                // it. A discovery whose directory is no longer the object
+                // the bare-shape proof accepted contributes nothing —
+                // the same silent non-discovery this arm already takes when
+                // a pointer fails to resolve, and the safe direction.
+                guard let witness = discovery.bareWitness,
+                      provider.identity(of: discovery.directory)
+                          == witness.identity
+                else { continue }
                 gitDirectory = provider.canonicalize(discovery.directory)
             }
             guard let gitDirectory else { continue }

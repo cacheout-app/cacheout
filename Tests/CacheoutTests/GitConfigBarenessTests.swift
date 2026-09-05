@@ -94,6 +94,57 @@ final class GitConfigBarenessTests: XCTestCase {
         XCTAssertFalse(bare("bare = true\n"), "no section: not core.bare")
     }
 
+    /// **AN INCLUDE CAN OVERRIDE core.bare, SO WE REFUSE TO GUESS**
+    /// (PR #461 codex r3).
+    ///
+    /// `[core] bare = true` followed by `[include] path = …` whose included
+    /// file sets `core.bare = false` is a NON-bare repository to git. Reading
+    /// the included file is not available to this scanner, so an include that
+    /// could reach `core.bare` makes the answer "not bare".
+    ///
+    /// Getting this wrong is not a silent miss: the directory is admitted as
+    /// `.bareRepository`, git's own listing then disagrees, `crossValidate`
+    /// fails, and a recurring `unreadable` issue is published for a healthy
+    /// repository the scanner intends not to cover.
+    ///
+    /// MUTATION, measured: delete the include guard and exactly THREE cells
+    /// red — this one, `…AnIncludeIfIsRefusedTheSameWay` and
+    /// `…AnIncludeBeforeTheValueIsAlsoRefused`. The fourth,
+    /// `…AnIncludeSectionWithoutAPathDoesNotSuppressBareness`, stays green,
+    /// which is what shows the guard is keyed on the `path` key that git
+    /// actually acts on rather than on the section name alone.
+    func testAnIncludeThatCouldOverrideBarenessIsRefused() {
+        XCTAssertFalse(bare("""
+        [core]
+        \tbare = true
+        [include]
+        \tpath = ../shared.config
+        """))
+    }
+
+    func testAnIncludeIfIsRefusedTheSameWay() {
+        XCTAssertFalse(bare("""
+        [core]
+        \tbare = true
+        [includeIf "gitdir:~/work/"]
+        \tpath = ~/work/.gitconfig
+        """))
+    }
+
+    /// Conservative in the safe direction: an include BEFORE the explicit
+    /// value is refused too, even though git would let the later explicit
+    /// `true` win. That costs a silent non-discovery, never a false claim.
+    func testAnIncludeBeforeTheValueIsAlsoRefused() {
+        XCTAssertFalse(bare("[include]\n\tpath = x\n[core]\n\tbare = true\n"))
+    }
+
+    /// But only a REAL include directive counts — `path` is the only key git
+    /// acts on, so an include section without one pulls in nothing and must
+    /// not suppress a genuine answer.
+    func testAnIncludeSectionWithoutAPathDoesNotSuppressBareness() {
+        XCTAssertTrue(bare("[include]\n\tcomment = none\n[core]\n\tbare = true\n"))
+    }
+
     /// THE DISCLOSED RESIDUAL, PINNED so it cannot change in silence. Only
     /// git's writer spelling of the value counts; these three leave the
     /// repository undiscovered, which is the same silence every bare

@@ -450,11 +450,18 @@ struct GitWorktreeGitdirResolver {
     /// `unreadable` issue on every scan, for a repository shape this scanner
     /// deliberately does not cover.
     ///
-    /// RESIDUAL, unchanged and still disclosed: only git's own writer
-    /// spelling of the VALUE counts. `bare = yes`, a valueless `bare` key
-    /// (which git reads as true) and an `include.path` indirection all leave
-    /// the repository undiscovered — the same silence every bare repository
-    /// had before fn-4.28, never a refusal dressed as retryable.
+    /// RESIDUAL: only git's own writer spelling of the VALUE counts.
+    /// `bare = yes` and a valueless `bare` key (which git reads as true)
+    /// leave the repository undiscovered — the same silence every bare
+    /// repository had before fn-4.28, never a refusal dressed as retryable.
+    ///
+    /// THAT LIST USED TO NAME `include.path` TOO, AND WAS WRONG ABOUT IT
+    /// (PR #461 codex r3). It only considered the under-discovery direction.
+    /// An include does not merely fail to make a repository bare — it can
+    /// make a repository that LOOKS bare not bare, and the old code then
+    /// declared it bare, which is the OVER-discovery direction and the
+    /// harmful one. Includes are now failed closed below, so the claim is
+    /// true by construction rather than by accident.
     static func declaresBare(_ configContents: String) -> Bool {
         var section = ""
         var subsection: String?
@@ -477,6 +484,27 @@ struct GitWorktreeGitdirResolver {
             else { continue }
             let key = line[..<equals]
                 .trimmingCharacters(in: .whitespaces).lowercased()
+            // AN INCLUDE CAN OVERRIDE core.bare, AND WE WILL NOT FOLLOW IT
+            // (PR #461 codex r3). `[include] path = …` and
+            // `[includeIf "…"] path = …` pull in another file whose
+            // `core.bare` git applies at the point of inclusion, so a primary
+            // that says `bare = true` can be a NON-bare repository. Reading
+            // that file is not available to this scanner: it would mean
+            // following an untrusted indirection out of a directory nothing
+            // admitted, with `~` expansion, relative resolution, `includeIf`
+            // conditions, recursion and cycles — the same class of
+            // indirection the metadata reads refuse by opening `O_NOFOLLOW`.
+            //
+            // So fail closed: an include that could reach `core.bare` makes
+            // this "not bare". That is the UNDER-discovery direction, which
+            // costs a silent non-discovery; declaring bare wrongly is the
+            // OVER-discovery direction, which admits the directory and then
+            // fails `crossValidate` against git's own non-bare listing,
+            // publishing a recurring `unreadable` issue for a healthy
+            // repository this scanner intends not to cover.
+            if section == "include" || section == "includeif", key == "path" {
+                return false
+            }
             guard section == "core", subsection == nil, key == "bare"
             else { continue }
             var value = line[line.index(after: equals)...]

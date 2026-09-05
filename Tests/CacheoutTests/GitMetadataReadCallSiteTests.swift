@@ -31,8 +31,10 @@ import XCTest
 /// different callers, and that is an argument for expecting them to be
 /// correct, not evidence that they are.
 ///
-/// Both cells carry a CONTROL that must resolve with nothing swapped. The
-/// second one earned it: its first version answered nil because the fixture
+/// Both cells carry a CONTROL that must resolve with nothing swapped — and
+/// that was FALSE when first written: only the second had one, and the claim
+/// stood here unchecked until a merge gate read it (r5, P5). The second one
+/// earned it: its first version answered nil because the fixture
 /// wrote a `gitdir:` prefix into the admin's back-link file, where real git
 /// writes a bare path — so the cell was green, vacuous, and would have
 /// reported the read as guarded when nothing had been read at all.
@@ -96,6 +98,21 @@ final class GitMetadataReadCallSiteTests: XCTestCase {
         // that follows the link succeeds and the repository is admitted.
         let decoy = base.appendingPathComponent("decoy-HEAD")
         try write("ref: refs/heads/main\n", to: decoy)
+
+        // CONTROL FIRST. The class doc claimed both cells carried one; this
+        // cell did not (PR #461 gate r5, P5). Without it, a later edit to the
+        // hand-built HEAD/config/objects/refs fixture turns this cell
+        // green-and-vacuous with nothing to catch it — the same fixture rot
+        // the sibling cell already earned its control for.
+        let control = SwapToSymlinkAfterProbe()
+        control.watched = "nothing"
+        control.decoy = decoy
+        XCTAssertNotNil(
+            GitWorktreeGitdirResolver(identity: control)
+                .bareRepositoryGitDirectory(at: repo),
+            "the fixture must be accepted when nothing is swapped, or the "
+                + "refusal below would not be the symlink's"
+        )
 
         let provider = SwapToSymlinkAfterProbe()
         provider.watched = "HEAD"

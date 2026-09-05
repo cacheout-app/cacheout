@@ -657,6 +657,15 @@ struct GitWorktreeScanner: @unchecked Sendable {
     /// during the validation is refused, so the identity carried forward is
     /// the identity of the object whose metadata was actually read.
     ///
+    /// ORDERING NOTE, disclosed (PR #461 gate r5): the first `identity(of:)`
+    /// here is the RAW provider, and it runs BEFORE the resolver's TCC gate.
+    /// Prior to the bracket that lstat happened only after the gate had
+    /// passed. An `lstat` is outside the doctrine sentence this file states
+    /// for protected paths ("opened, enumerated, read, or realpath'd
+    /// through"), so it remains in policy — but it is a real ordering change
+    /// on the TCC path, made by an identity fix, and it should not have to be
+    /// rediscovered from the diff.
+    ///
     /// RESIDUAL: this is bracketed, not descriptor-bound. An object swapped
     /// out and back inside the bracket is indistinguishable by inode, and
     /// the reads inside `bareRepositoryGitDirectory` still resolve by path.

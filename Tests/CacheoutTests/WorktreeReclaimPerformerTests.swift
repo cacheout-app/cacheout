@@ -851,6 +851,78 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         )
     }
 
+    /// **THE OTHER TWO CLEAN-TIME ARMS** (PR #461 gate r5, P3).
+    ///
+    /// `e80694e` split three clean-time messages on
+    /// `unavailabilityIsDefinitive`, and pinned ONE of them. The gate
+    /// collapsed the other two back to the pre-fix wording and the FULL
+    /// 1713-cell suite stayed green — so two of the three guards were
+    /// unevidenced, and the commit's "MUTATION 2 … RED 3/3" reads as though
+    /// it covered the change when it covered a third of it.
+    ///
+    /// The registry arm needs the parent-repo resolve to SUCCEED first, or
+    /// the refusal comes from the arm above it and this pins nothing.
+    ///
+    /// MUTATION: collapse either ternary and its cell reds.
+    func testATransientRegistryReadDoesNotTellTheUserToInstallGit()
+        async throws
+    {
+        let repository = try makeRepository(named: "repo")
+        let worktree = try addWorktree(named: "wt", branch: "feature", in: repository)
+        let plan = staleplan(
+            worktree: worktree, membership: try membership(of: worktree, in: repository)
+        )
+        // Only the REGISTRY listing is unavailable; everything before it runs
+        // for real, so the refusal is attributable to this arm alone.
+        let runner = InterceptingGitRunner(wrapping: realRunner()) { arguments, _ in
+            arguments.contains("list") ? .gitUnavailable : nil
+        }
+        runner.scriptedUnavailabilityIsDefinitive = false
+        let outcome = await perform(
+            item(plan), plan: plan, with: makePerformer(runner: runner)
+        )
+
+        XCTAssertNil(outcome.entry, "the refusal is unchanged: nothing removed")
+        let message = try XCTUnwrap(outcome.errors.first?.message)
+        XCTAssertTrue(
+            message.contains("registry could be re-read")
+                || message.contains("registry of"),
+            "this cell must reach the REGISTRY arm, not one above it: "
+                + "\(message)"
+        )
+        XCTAssertFalse(
+            message.contains("Retry once git is installed"),
+            "a transient launch failure told the user to install a git that "
+                + "is already installed: \(message)"
+        )
+    }
+
+    /// The prune tier's oracle arm, same split. Its sibling table cell
+    /// asserts the DEFINITIVE wording, which is why collapsing the ternary
+    /// left the suite green.
+    func testATransientOracleFailureDoesNotReadAsAMissingGit() async throws {
+        let fixture = try makePruneFixture(orphans: ["gone-transient"], suffix: "-transient")
+        let orphan = try XCTUnwrapElement(fixture.admin, 0)
+        let plan = prunePlan(membership: fixture.membership, disclosed: [orphan])
+        let runner = InterceptingGitRunner(wrapping: realRunner()) { arguments, index in
+            guard arguments.contains("list"), index == 1 else { return nil }
+            return .gitUnavailable
+        }
+        runner.scriptedUnavailabilityIsDefinitive = false
+        let outcome = await perform(
+            item(plan, id: "prune"), plan: plan,
+            with: makePerformer(runner: runner)
+        )
+
+        XCTAssertNil(outcome.entry, "a failed prune reports no row")
+        let message = try XCTUnwrap(outcome.errors.first?.message)
+        XCTAssertTrue(
+            message.contains("not a missing tool"),
+            "the message must name which cause it was: \(message)"
+        )
+        XCTAssertTrue(fm.fileExists(atPath: orphan.path))
+    }
+
     /// THE WHOLE DELETE-TIME SEQUENCE, pinned as a SEQUENCE, with the r5
     /// shape: witness → R0/R1/R1b/R2 → last gate → prune recompute → R0.
     ///

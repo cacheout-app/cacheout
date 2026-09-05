@@ -101,12 +101,20 @@ create_bundle() {
     #   tiffutil -cathidpicheck MenuBarIcon.png MenuBarIcon@2x.png \
     #            -out MenuBarIcon.tiff
     local MENUBAR_RES_SRC="$PROJECT_DIR/Sources/Cacheout/Resources"
+    # FAIL CLOSED (PR #461 gate r5). This warned and CONTINUED, producing an
+    # app with no menubar icon and a zero exit status — the shape that shipped
+    # v2.1.0 broken. Since 205b187 excluded the prebuilt tiffs from the Xcode
+    # resources phase (Xcode generates its own via TiffUtil), THIS is the only
+    # consumer of the checked-in copies, so the fail-open became load-bearing
+    # exactly when it stopped being redundant.
     for tiff in MenuBarIcon.tiff MenuBarIconTemplate.tiff; do
         if [ -f "$MENUBAR_RES_SRC/$tiff" ]; then
             cp "$MENUBAR_RES_SRC/$tiff" "$DEST_DIR/$APP_BUNDLE/Contents/Resources/$tiff"
         else
-            echo "⚠️  $tiff missing — regenerate with:"
-            echo "    tiffutil -cathidpicheck ${tiff%.tiff}.png ${tiff%.tiff}@2x.png -out $tiff"
+            echo "❌ $tiff missing — the bundle would ship without a menubar" >&2
+            echo "   icon. Regenerate it and re-run:" >&2
+            echo "   tiffutil -cathidpicheck ${tiff%.tiff}.png ${tiff%.tiff}@2x.png -out $tiff" >&2
+            exit 1
         fi
     done
     echo "   ✓ Menubar icon TIFFs embedded"

@@ -808,6 +808,49 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         XCTAssertTrue(fm.fileExists(atPath: worktree.path))
     }
 
+    /// **THE REMEDY MUST MATCH THE CAUSE** (PR #461 codex r3).
+    ///
+    /// Identical to the cell above except that the unavailability is
+    /// TRANSIENT — a launch that failed under momentary pressure, which since
+    /// this PR's spawn hardening includes a failed `strdup`. The refusal is
+    /// right either way and nothing is removed, but "Retry once git is
+    /// installed" is a false instruction when git IS installed. Three clean-
+    /// time sites share this ternary; this one pins it.
+    ///
+    /// MUTATION: collapse the ternary back to the single "installed" wording
+    /// and this cell reds while its definitive sibling stays green.
+    func testATransientLaunchFailureAtTheGateDoesNotTellTheUserToInstallGit()
+        async throws
+    {
+        let repository = try makeRepository(named: "repo")
+        let worktree = try addWorktree(named: "wt", branch: "feature", in: repository)
+        let plan = staleplan(
+            worktree: worktree, membership: try membership(of: worktree, in: repository)
+        )
+        let runner = InterceptingGitRunner(wrapping: UnreachableGitRunner()) { _, _ in
+            .gitUnavailable
+        }
+        runner.scriptedUnavailabilityIsDefinitive = false
+        let outcome = await perform(
+            item(plan), plan: plan, with: makePerformer(runner: runner)
+        )
+
+        XCTAssertNil(outcome.entry, "the refusal is unchanged: nothing removed")
+        let message = try XCTUnwrap(outcome.errors.first?.message)
+        XCTAssertFalse(
+            message.contains("Retry once git is installed"),
+            "a transient launch failure told the user to install a git that "
+                + "is already installed: \(message)"
+        )
+        XCTAssertTrue(
+            message.contains("not a missing tool"),
+            "the message must name which cause it was: \(message)"
+        )
+        XCTAssertTrue(
+            fm.fileExists(atPath: worktree.path), "the tree still survives"
+        )
+    }
+
     /// THE WHOLE DELETE-TIME SEQUENCE, pinned as a SEQUENCE, with the r5
     /// shape: witness → R0/R1/R1b/R2 → last gate → prune recompute → R0.
     ///
@@ -6558,6 +6601,10 @@ final class InterceptingGitRunner: GitCommandRunning, @unchecked Sendable {
 
     private let wrapped: any GitCommandRunning
     private let intercept: Interception
+    /// Whether a scripted `.gitUnavailable` is the definitive absent-tool
+    /// answer (the default, and what every pre-r3 cell means) or a transient
+    /// launch failure, which carries different user-facing wording.
+    var scriptedUnavailabilityIsDefinitive = true
     private let lock = NSLock()
     private var recorded: [GitCommandInvocation] = []
     private var recordedTimeouts: [TimeInterval] = []
@@ -6601,12 +6648,18 @@ final class InterceptingGitRunner: GitCommandRunning, @unchecked Sendable {
             // classified and passed. The environment is left empty on this
             // path deliberately — env assertions belong to the delegated
             // (real) invocations, never to a fabricated record.
+            // A scripted `.gitUnavailable` means the DEFINITIVE answer —
+            // `/usr/bin/env` exit 127, the tool genuinely absent — which is
+            // what every cell written before PR #461 codex r3 meant by it.
+            // The transient launch failure is a separate, weaker answer with
+            // its own wording, driven by `scriptedUnavailabilityIsDefinitive`.
             invocation = GitCommandInvocation(
                 profile: GitSafetyProfile.classify(arguments),
                 argv: ["git", "-c", GitCommandRunner.fsmonitorNeutralization]
                     + arguments,
                 environment: [:],
-                outcome: scripted
+                outcome: scripted,
+                unavailabilityIsDefinitive: scriptedUnavailabilityIsDefinitive
             )
         } else {
             invocation = await wrapped.run(arguments, timeout: timeout)

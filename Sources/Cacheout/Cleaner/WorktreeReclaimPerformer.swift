@@ -2205,11 +2205,20 @@ struct WorktreeReclaimPerformer {
                     + "removed. Retry when the machine is less busy."
             )
         case .gitUnavailable:
+            // THE REMEDY MUST MATCH THE CAUSE (PR #461 codex r3). The refusal
+            // is right either way — nothing was removed — but "install git"
+            // is a false instruction when git IS installed and the launch
+            // merely failed under momentary pressure (ENOMEM/EAGAIN/EMFILE,
+            // and since this PR's spawn hardening, a failed `strdup` too).
             return .refuse(
                 tag: "parent-repo-unresolvable",
                 detail: "refused: git became unavailable before the parent "
                     + "repository could be re-resolved — nothing was removed. "
-                    + "Retry once git is installed and reachable."
+                    + (resolved.unavailabilityIsDefinitive
+                        ? "Retry once git is installed and reachable."
+                        : "git could not be launched (a transient failure, "
+                            + "not a missing tool); retry when the machine is "
+                            + "less busy.")
             )
         }
         guard let line = WorktreeStalenessAssessor.firstLine(of: stdout),
@@ -2279,11 +2288,16 @@ struct WorktreeReclaimPerformer {
                     + "removed. Retry when the machine is less busy."
             )
         case .gitUnavailable:
+            // Same cause split as the parent-repo arm above.
             return .refuse(
                 tag: "worktree-registry-unreadable",
                 detail: "refused: git became unavailable before the worktree "
-                    + "registry could be re-read — nothing was removed. Retry "
-                    + "once git is installed and reachable."
+                    + "registry could be re-read — nothing was removed. "
+                    + (listing.unavailabilityIsDefinitive
+                        ? "Retry once git is installed and reachable."
+                        : "git could not be launched (a transient failure, "
+                            + "not a missing tool); retry when the machine is "
+                            + "less busy.")
             )
         }
         guard let inventory = GitWorktreeInventory.parse(stdout) else {
@@ -3301,7 +3315,14 @@ struct WorktreeReclaimPerformer {
                 "the porcelain oracle timed out after \(Self.seconds(gitTimeout))s"
             )
         case .gitUnavailable:
-            return .failed("git is unavailable at clean time")
+            // Same cause split: "unavailable" without qualification reads as
+            // "not installed", which a transient launch failure is not.
+            return .failed(
+                listing.unavailabilityIsDefinitive
+                    ? "git is unavailable at clean time"
+                    : "git could not be launched at clean time (a transient "
+                        + "failure, not a missing tool)"
+            )
         }
 
         guard let inventory = GitWorktreeInventory.parse(stdout) else {

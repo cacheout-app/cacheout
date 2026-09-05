@@ -474,7 +474,11 @@ struct GitWorktreeScanner: @unchecked Sendable {
                 // indistinguishable from a clean machine, so EVERY item is
                 // withdrawn and the unavailability is published instead. The
                 // runner's availability verdict is instance-cached, so no
-                // further repository could succeed anyway.
+                // further repository could succeed anyway — and since codex
+                // r3 that reasoning is sound, because only a DEFINITIVE
+                // unavailability reaches here. A transient launch failure is
+                // reported per repository and the scan continues; it is not
+                // cached, so the next repository genuinely can succeed.
                 observeAssessments(log)
                 issues.append(Self.toolUnavailableIssue)
                 return ScanOutcome(items: [], errors: issues)
@@ -881,6 +885,31 @@ struct GitWorktreeScanner: @unchecked Sendable {
             ))
             return .processed
         case .gitUnavailable:
+            // TRANSIENT LAUNCH FAILURE IS NOT A MISSING TOOL (PR #461 codex
+            // r3). `.gitUnavailable` carries two causes and only one is
+            // permanent: `/usr/bin/env` answering 127 means git is genuinely
+            // not on PATH, while a throwing launch is ENOMEM/EAGAIN/EMFILE
+            // under momentary pressure — and since this PR made every spawn
+            // allocation checked, an out-of-memory `strdup` arrives here too.
+            //
+            // Propagating the transient case withdrew the WHOLE scan and
+            // published `.toolUnavailable`, telling the user to install a git
+            // that is already installed. It also made the caller's own
+            // justification false: that branch withdraws everything because
+            // "the runner's availability verdict is instance-cached, so no
+            // further repository could succeed anyway" — but a NON-definitive
+            // verdict is deliberately not cached, so the next repository can
+            // succeed. Only the definitive answer may withdraw the scan.
+            guard listing.unavailabilityIsDefinitive else {
+                issues.append(ScanIssue(
+                    url: listingTarget, kind: .unreadable,
+                    detail: "git could not be launched for this repository — "
+                        + "a transient launch failure, not a missing tool "
+                        + "(git was never proven absent) — so no worktrees of "
+                        + "it were assessed. Re-scan to try again."
+                ))
+                return .processed
+            }
             return .gitUnavailable
         }
 

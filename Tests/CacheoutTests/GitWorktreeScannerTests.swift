@@ -125,6 +125,12 @@ private final class ScriptedGitRunner: GitCommandRunning, @unchecked Sendable {
     var show: GitCommandOutcome = .success(stdout: Data("1614834367\n".utf8))
     /// When set, EVERY invocation answers with it (the unavailable case).
     var forcedOutcome: GitCommandOutcome?
+    /// Whether a forced `.gitUnavailable` is the DEFINITIVE `env`-exit-127
+    /// answer or a transient launch failure. Defaults to definitive, which is
+    /// what every cell written before PR #461 codex r3 meant by "the tool is
+    /// unavailable"; the transient arm is a separate, weaker answer that must
+    /// not withdraw a scan.
+    var forcedUnavailabilityIsDefinitive = true
 
     private let lock = NSLock()
     private var recorded: [[String]] = []
@@ -148,7 +154,8 @@ private final class ScriptedGitRunner: GitCommandRunning, @unchecked Sendable {
         return GitCommandInvocation(
             profile: GitSafetyProfile.classify(arguments),
             argv: ["git"] + arguments, environment: [:],
-            outcome: forcedOutcome ?? outcome(for: arguments)
+            outcome: forcedOutcome ?? outcome(for: arguments),
+            unavailabilityIsDefinitive: forcedUnavailabilityIsDefinitive
         )
     }
 
@@ -552,6 +559,102 @@ final class GitWorktreeScannerTests: XCTestCase {
         case .malformed(_, let issue):
             XCTFail("outcome malformed: \(issue.detail)", file: file, line: line)
         }
+    }
+
+    // MARK: - Transient launch failure is not a missing tool (codex r3)
+
+    /// **A TRANSIENT LAUNCH FAILURE MUST NOT WITHDRAW THE SCAN.**
+    ///
+    /// `.gitUnavailable` carries two causes and only one is permanent:
+    /// `/usr/bin/env` answering 127 means git is genuinely not on PATH, while
+    /// a throwing launch is ENOMEM/EAGAIN/EMFILE under momentary pressure —
+    /// and since this PR made every spawn allocation checked, a failed
+    /// `strdup` arrives here too. `unavailabilityIsDefinitive` has recorded
+    /// that distinction since PR #460 r21 and this consumer ignored it,
+    /// withdrawing every result and telling the user to install a git that is
+    /// already installed.
+    ///
+    /// The withdrawal branch also justifies itself with "the runner's
+    /// availability verdict is instance-cached, so no further repository could
+    /// succeed anyway" — which is false for the transient case precisely
+    /// because a non-definitive verdict is deliberately NOT cached.
+    ///
+    /// MUTATION: drop the `guard listing.unavailabilityIsDefinitive` in
+    /// `GitWorktreeScanner` and this cell reds.
+    func testATransientLaunchFailureIsReportedPerRepositoryNotAsAMissingTool()
+        async throws
+    {
+        let repository = try makeRepositoryIgnoringPayloads(
+            at: dev.appendingPathComponent("repo")
+        )
+        _ = try addWorktree(
+            of: repository,
+            at: dev.appendingPathComponent("wt/feature"),
+            branch: "feature"
+        )
+
+        let runner = ScriptedGitRunner()
+        runner.forcedOutcome = .gitUnavailable
+        runner.forcedUnavailabilityIsDefinitive = false
+
+        let outcome = await makeScanner(runner: runner)
+            .scan(context: ScanContext(trigger: .userInitiated))
+
+        // VACUITY: the listing must actually have been attempted, or the
+        // arm this cell watches was never reached.
+        XCTAssertFalse(
+            runner.requests.isEmpty,
+            "no git invocation was attempted, so nothing exercised the "
+                + "unavailable arm at all"
+        )
+        XCTAssertFalse(
+            outcome.errors.contains { $0.kind == .toolUnavailable },
+            "a transient launch failure was published as a MISSING TOOL, "
+                + "withdrawing the scan: \(outcome.errors)"
+        )
+        let transient = outcome.errors.filter { $0.kind == .unreadable }
+        XCTAssertFalse(
+            transient.isEmpty,
+            "the repository must still be reported, per repository: "
+                + "\(outcome.errors)"
+        )
+        XCTAssertTrue(
+            transient.contains { ($0.detail ?? "").contains("not a missing tool") },
+            "the detail must say which cause it was: \(transient)"
+        )
+    }
+
+    /// CONTROL: the DEFINITIVE answer still withdraws everything. Without
+    /// this, the cell above could pass because the withdrawal never happens
+    /// at all any more.
+    func testADefinitiveUnavailabilityStillWithdrawsTheWholeScan() async throws
+    {
+        let repository = try makeRepositoryIgnoringPayloads(
+            at: dev.appendingPathComponent("repo")
+        )
+        _ = try addWorktree(
+            of: repository,
+            at: dev.appendingPathComponent("wt/feature"),
+            branch: "feature"
+        )
+
+        let runner = ScriptedGitRunner()
+        runner.forcedOutcome = .gitUnavailable
+        runner.forcedUnavailabilityIsDefinitive = true
+
+        let outcome = await makeScanner(runner: runner)
+            .scan(context: ScanContext(trigger: .userInitiated))
+
+        XCTAssertTrue(
+            outcome.items.isEmpty,
+            "a tool-less scan reporting findings is indistinguishable from a "
+                + "clean machine: \(outcome.items)"
+        )
+        XCTAssertTrue(
+            outcome.errors.contains { $0.kind == .toolUnavailable },
+            "the definitive answer must still publish tool-unavailable: "
+                + "\(outcome.errors)"
+        )
     }
 
     // MARK: - R7: discovery

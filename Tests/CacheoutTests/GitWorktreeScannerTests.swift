@@ -2644,6 +2644,82 @@ final class GitWorktreeScannerTests: XCTestCase {
         try assertNonMalformed(outcome, from: scanner)
     }
 
+    /// Returns a DIFFERENT identity on the Nth answer for the watched path,
+    /// modelling a replacement that lands partway through validation.
+    private final class IdentitySwapsOnNthAnswer: FileSystemIdentityProvider {
+        var watchedPath = ""
+        var swapOn = 2
+        private(set) var answers = 0
+
+        override func identity(of url: URL) -> Identity? {
+            let real = super.identity(of: url)
+            guard url.path == watchedPath, let real else { return real }
+            answers += 1
+            guard answers >= swapOn else { return real }
+            return Identity(device: real.device, inode: real.inode &+ 1)
+        }
+    }
+
+    /// **THE WITNESS WAS CAPTURED AFTER THE PROOF** (PR #461 codex r5).
+    ///
+    /// The r4 fix carried a bare witness so grouping could re-prove the
+    /// directory before `realpath` touched it. But it captured that identity
+    /// AFTER `bareRepositoryGitDirectory` returned, so a replacement landing
+    /// in the gap was recorded as the witness — and grouping then agreed with
+    /// itself about the STRANGER and canonicalized it into a `git -C` target
+    /// outside the configured root. Closing one window by opening a narrower
+    /// one is not closing it.
+    ///
+    /// The capture now brackets the proof: before, validate, unchanged after.
+    ///
+    /// MUTATION: drop either half of the bracket in `bareWitness` and the
+    /// swap arm below reds while the control stays green.
+    func testAReplacementDuringValidationYieldsNoBareWitness() throws {
+        let bare = dev.appendingPathComponent("repo.git")
+        let seed = try makeRepositoryIgnoringPayloads(
+            at: base.appendingPathComponent("seed")
+        )
+        XCTAssertEqual(
+            try GitFixture.git(
+                ["clone", "--bare", seed.path, bare.path], home: home
+            ).status, 0, "bare clone failed"
+        )
+
+        // CONTROL: a provider that never swaps must produce a witness, or the
+        // nil below would not be the swap's doing.
+        let steady = IdentitySwapsOnNthAnswer()
+        steady.watchedPath = bare.path
+        steady.swapOn = .max
+        XCTAssertNotNil(
+            GitWorktreeScanner.bareWitness(
+                for: bare,
+                resolver: GitWorktreeGitdirResolver(identity: steady),
+                provider: steady
+            ),
+            "the fixture must witness a healthy bare repository"
+        )
+
+        // The replacement lands after the capture: the answer CHANGES between
+        // the two ends of the bracket.
+        let swapping = IdentitySwapsOnNthAnswer()
+        swapping.watchedPath = bare.path
+        swapping.swapOn = 2
+        XCTAssertNil(
+            GitWorktreeScanner.bareWitness(
+                for: bare,
+                resolver: GitWorktreeGitdirResolver(identity: swapping),
+                provider: swapping
+            ),
+            "a directory replaced during validation was witnessed as though "
+                + "it were the object whose metadata had just been read"
+        )
+        XCTAssertGreaterThanOrEqual(
+            swapping.answers, 2,
+            "the bracket asked only \(swapping.answers) time(s) — a capture "
+                + "that is never re-checked is not a bracket"
+        )
+    }
+
     /// **THE BARE ARM CARRIED NO WITNESS** (PR #461 codex r4).
     ///
     /// The linked arm has carried an `AdminWitness` — path AND identity, as

@@ -613,22 +613,48 @@ struct GitWorktreeScanner: @unchecked Sendable {
            event.entries.contains(where: {
                ($0.name == "refs" || $0.name == "reftable") && $0.kind == .directory
            }),
-           resolver.bareRepositoryGitDirectory(at: event.directory) != nil {
-            // The identity AS OF THE PROOF, carried the way the linked arm
-            // carries its admin witness. Grouping re-checks it before
-            // canonicalizing, so the path it resolves is the object this
-            // proof accepted rather than whatever now answers to the name.
-            let witness = provider.identity(of: event.directory).map {
-                GitWorktreeDiscovery.AdminWitness(
-                    entryPath: event.directory.path, identity: $0
-                )
-            }
+           let witness = Self.bareWitness(
+               for: event.directory, resolver: resolver, provider: provider
+           ) {
             discoveries.append(GitWorktreeDiscovery(
                 directory: event.directory, kind: .bareRepository,
                 bareWitness: witness
             ))
         }
         return []
+    }
+
+    /// The bare-shape proof AND the identity of the object it proved,
+    /// bracketed so the two cannot be about different objects.
+    ///
+    /// The first version captured the identity AFTER
+    /// `bareRepositoryGitDirectory` returned (PR #461 codex r5). A
+    /// replacement landing in that gap was recorded as the witness, so
+    /// grouping's re-check then agreed with itself about the STRANGER and
+    /// canonicalized it into a `git -C` target outside the configured root.
+    /// Closing one window by opening a narrower one is not closing it.
+    ///
+    /// Capture BEFORE, validate, require UNCHANGED after: any replacement
+    /// during the validation is refused, so the identity carried forward is
+    /// the identity of the object whose metadata was actually read.
+    ///
+    /// RESIDUAL: this is bracketed, not descriptor-bound. An object swapped
+    /// out and back inside the bracket is indistinguishable by inode, and
+    /// the reads inside `bareRepositoryGitDirectory` still resolve by path.
+    /// A descriptor-bound identity is the complete answer and is filed as
+    /// fn-5-stale-git-worktree-scanner.7.
+    static func bareWitness(
+        for directory: URL,
+        resolver: GitWorktreeGitdirResolver,
+        provider: FileSystemIdentityProvider
+    ) -> GitWorktreeDiscovery.AdminWitness? {
+        guard let before = provider.identity(of: directory),
+              resolver.bareRepositoryGitDirectory(at: directory) != nil,
+              provider.identity(of: directory) == before
+        else { return nil }
+        return GitWorktreeDiscovery.AdminWitness(
+            entryPath: directory.path, identity: before
+        )
     }
 
     // MARK: - Repository grouping (the PRE-FETCH half of the fetch-once rule)

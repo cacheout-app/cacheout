@@ -482,6 +482,45 @@ final class GitWorktreeInventoryTests: XCTestCase {
     }
 
     /// CONTROL for every refusal arm below: the intact hand-built shape IS
+    /// **THE DIRECTORY ITSELF IS A CLAIM** (PR #461 codex r3).
+    ///
+    /// Every read below is `directory/<name>`, and the `O_NOFOLLOW` on those
+    /// reads protects only the LEAF — path resolution walks through a
+    /// symlinked `directory` before the leaf is ever opened. The caller
+    /// reaches this validation from a walk that produced its entries
+    /// earlier, so a directory renamed away and replaced with a symlink in
+    /// between was validated, and could then aim `git worktree list` at a
+    /// repository outside the configured root.
+    ///
+    /// The control proves the fixture is otherwise acceptable, so the
+    /// refusal is attributable to the symlink and not to the target's shape.
+    ///
+    /// MUTATION: delete the `probeKind(of: directory)` guard and this reds.
+    func testASymlinkedDirectoryIsNeverValidatedAsABareRepository() throws {
+        let real = try makeHandBuiltBare(named: "real.git")
+
+        // CONTROL: the target is a repository this proof accepts.
+        XCTAssertNotNil(
+            GitWorktreeGitdirResolver().bareRepositoryGitDirectory(at: real),
+            "the fixture's target must be acceptable, or the refusal below "
+                + "would not be the symlink's"
+        )
+
+        let link = real.deletingLastPathComponent()
+            .appendingPathComponent("link.git")
+        try? FileManager.default.removeItem(at: link)
+        try FileManager.default.createSymbolicLink(
+            at: link, withDestinationURL: real
+        )
+
+        XCTAssertNil(
+            GitWorktreeGitdirResolver().bareRepositoryGitDirectory(at: link),
+            "a symlink standing where the walker enumerated a directory was "
+                + "followed, and its target's HEAD/config were read as if "
+                + "they were the walked directory's own"
+        )
+    }
+
     /// accepted, so each refusal is attributable to the one requirement its
     /// arm forged, never to the fixture's own reasons.
     func testBareShapeProofAcceptsTheIntactShapeAndARealBareClone() async throws {

@@ -398,6 +398,29 @@ struct GitWorktreeGitdirResolver {
     /// silent non-discovery every bare repository had before fn-4.28, never
     /// a refusal dressed as retryable.
     func bareRepositoryGitDirectory(at directory: URL) -> URL? {
+        // THE DIRECTORY ITSELF IS A CLAIM, AND IT WAS NEVER CHECKED
+        // (PR #461 codex r3). Everything below reads `directory/<name>`, and
+        // the `O_NOFOLLOW` on those reads protects only the LEAF: if
+        // `directory` is a symlink, path resolution walks through it before
+        // the leaf is ever opened, so `HEAD` and `config` are read from
+        // wherever the link points. The caller reaches here from a walk that
+        // produced `event.entries` earlier, so a directory renamed away and
+        // replaced with a symlink in between was validated — and could then
+        // put `git worktree list` against a repository outside the configured
+        // root, or block on an unresponsive replacement.
+        //
+        // RESIDUAL, and it is the larger half: this closes the SYMLINK
+        // replacement, not the identity question. A replacement that is
+        // itself a real directory still passes, because `ProjectTreeEvent`
+        // carries only a URL — no identity, no descriptor — so nothing here
+        // can prove this is the directory the walker enumerated. The complete
+        // fix is descriptor-relative validation bound to the walk's open
+        // directory, which means adding identity to that event and threading
+        // it through both scanners that consume it. Deferred deliberately as
+        // its own change rather than smuggled into a review round.
+        guard identity.probeKind(of: directory) == .kind(.directory) else {
+            return nil
+        }
         let head = directory.appendingPathComponent("HEAD")
         guard identity.probeKind(of: head) == .kind(.regularFile),
               let headContents = identity.smallRegularFileText(

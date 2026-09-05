@@ -657,6 +657,127 @@ final class GitWorktreeScannerTests: XCTestCase {
         )
     }
 
+    // MARK: - The -C target is proven where it is used (codex r5)
+
+    /// Swaps a checkout for a repository OUTSIDE the declared root, at the
+    /// moment git is first invoked — the window between grouping's re-check
+    /// and the subprocess, which widens with every repository processed
+    /// before this one.
+    private final class SwapAtFirstGitInvocation: GitCommandRunning, @unchecked Sendable {
+        private let wrapped: any GitCommandRunning
+        let victim: URL
+        let stranger: URL
+        let stash: URL
+        private let lock = NSLock()
+        private var argvs: [[String]] = []
+        private(set) var swapped = false
+
+        init(
+            wrapping wrapped: any GitCommandRunning,
+            victim: URL, stranger: URL, stash: URL
+        ) {
+            self.wrapped = wrapped
+            self.victim = victim
+            self.stranger = stranger
+            self.stash = stash
+        }
+
+        var defaultTimeout: TimeInterval { wrapped.defaultTimeout }
+        var requests: [[String]] {
+            lock.lock(); defer { lock.unlock() }; return argvs
+        }
+
+        func run(
+            _ arguments: [String], timeout: TimeInterval
+        ) async -> GitCommandInvocation {
+            lock.lock()
+            argvs.append(arguments)
+            // Swap the victim while an EARLIER repository is being processed:
+            // the window this cell exists for is the one that grows with the
+            // repository count, so the trigger must be a git call that is NOT
+            // about the victim. Swapping on the victim's own call would fire
+            // after its check had already passed and prove nothing.
+            let mentionsVictim = arguments.contains { $0.contains(victim.path) }
+            let first = !swapped && !mentionsVictim
+            if first { swapped = true }
+            lock.unlock()
+            if first {
+                try? FileManager.default.moveItem(at: victim, to: stash)
+                try? FileManager.default.createSymbolicLink(
+                    at: victim, withDestinationURL: stranger
+                )
+            }
+            return await wrapped.run(arguments, timeout: timeout)
+        }
+    }
+
+    /// **THE `git -C` TARGET WAS NEVER PROVEN** (PR #461 codex r5).
+    ///
+    /// r4 made grouping re-prove a bare discovery's identity before
+    /// `canonicalize`. That binds `realpath` and nothing else: the SAME
+    /// unproven URL was then carried on as `listingTarget` and handed to
+    /// `git -C`, with the rest of the grouping loop, every earlier group's
+    /// full processing, two deferral checks and an admin-container
+    /// enumeration in between — a window that GROWS with the repository
+    /// count, which is the exact shape this file condemns elsewhere.
+    ///
+    /// And the MAIN-CHECKOUT arm carried no witness at all, which mattered
+    /// most because `listingTarget` PREFERS a main checkout. That case was
+    /// worse than the bare one: a replacement's own porcelain record
+    /// cross-validates against its own canonicalized git directory, so the
+    /// two agree and the scan proceeds in SILENCE — git run against a
+    /// repository outside every configured root, zero issues published.
+    ///
+    /// Driven through a whole scan, with the git runner as the swap seam.
+    /// An earlier round concluded that driving the seam directly proves more
+    /// than timing a race through call sites; that generalisation was too
+    /// strong, and this fixture is the counter-example — the direct-drive
+    /// cells pinned their guards correctly and could not see past them.
+    ///
+    /// MUTATION: drop the `targetWitness` re-check before `listingTarget` and
+    /// this reds — the stranger is listed and, for a main checkout, silently.
+    func testAReplacedCheckoutIsNeverHandedToGitAsATarget() async throws {
+        // TWO repositories, because the window is the time spent processing
+        // the OTHER one.
+        let first = try makeRepositoryIgnoringPayloads(
+            at: dev.appendingPathComponent("first")
+        )
+        _ = try addWorktree(
+            of: first, at: dev.appendingPathComponent("wt/one"), branch: "one"
+        )
+        let victim = try makeRepositoryIgnoringPayloads(
+            at: dev.appendingPathComponent("victim")
+        )
+        _ = try addWorktree(
+            of: victim, at: dev.appendingPathComponent("wt/two"), branch: "two"
+        )
+        // A repository OUTSIDE every declared root.
+        let stranger = try makeRepositoryIgnoringPayloads(
+            at: base.appendingPathComponent("stranger")
+        )
+
+        let runner = SwapAtFirstGitInvocation(
+            wrapping: makeRunner(), victim: victim, stranger: stranger,
+            stash: base.appendingPathComponent("stashed-repo")
+        )
+        let outcome = await makeScanner(runner: runner)
+            .scan(context: ScanContext(trigger: .userInitiated))
+
+        XCTAssertTrue(runner.swapped, "the fixture never fired the swap")
+        XCTAssertNil(
+            runner.requests.first { argv in
+                argv.contains { $0.contains(stranger.lastPathComponent) }
+            },
+            "git was aimed at a repository outside every configured root: "
+                + "\(runner.requests)"
+        )
+        XCTAssertFalse(
+            outcome.errors.isEmpty,
+            "a checkout replaced before git could run against it must be "
+                + "REPORTED, not dropped in silence"
+        )
+    }
+
     // MARK: - R7: discovery
 
     func testHiddenParentWorktreeNestedDeepIsDiscoveredAndBindsTheVerbatimRoot()
@@ -2672,7 +2793,7 @@ final class GitWorktreeScannerTests: XCTestCase {
     ///
     /// The capture now brackets the proof: before, validate, unchanged after.
     ///
-    /// MUTATION: drop either half of the bracket in `bareWitness` and the
+    /// MUTATION: drop either half of the bracket in `bareDirectoryWitness` and the
     /// swap arm below reds while the control stays green.
     func testAReplacementDuringValidationYieldsNoBareWitness() throws {
         let bare = dev.appendingPathComponent("repo.git")
@@ -2691,7 +2812,7 @@ final class GitWorktreeScannerTests: XCTestCase {
         steady.watchedPath = bare.path
         steady.swapOn = .max
         XCTAssertNotNil(
-            GitWorktreeScanner.bareWitness(
+            GitWorktreeScanner.bareDirectoryWitness(
                 for: bare,
                 resolver: GitWorktreeGitdirResolver(identity: steady),
                 provider: steady
@@ -2705,7 +2826,7 @@ final class GitWorktreeScannerTests: XCTestCase {
         swapping.watchedPath = bare.path
         swapping.swapOn = 2
         XCTAssertNil(
-            GitWorktreeScanner.bareWitness(
+            GitWorktreeScanner.bareDirectoryWitness(
                 for: bare,
                 resolver: GitWorktreeGitdirResolver(identity: swapping),
                 provider: swapping
@@ -2762,7 +2883,7 @@ final class GitWorktreeScannerTests: XCTestCase {
             GitWorktreeScanner.repositoryGroups(
                 from: [GitWorktreeDiscovery(
                     directory: bare, kind: .bareRepository,
-                    bareWitness: .init(entryPath: bare.path, identity: witness)
+                    directoryWitness: .init(entryPath: bare.path, identity: witness)
                 )],
                 resolver: resolver, provider: provider
             )

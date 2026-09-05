@@ -246,30 +246,30 @@ struct GitWorktreeDiscovery: Equatable, Sendable {
     /// That admin entry's identity at the SAME instant. `nil` when the
     /// pointer did not resolve or the `lstat` failed then.
     let adminWitness: AdminWitness?
-    /// BARE repositories only: the validated directory's identity at the
-    /// instant the bare-shape proof accepted it (PR #461 codex r4).
+    /// THE DISCOVERED DIRECTORY's identity, as of the instant this scanner
+    /// accepted it — a bare repository's at the moment its bare-shape proof
+    /// passed, a main checkout's at the moment the walk observed its `.git`.
     ///
-    /// The linked arm has carried a witness since PR #460 r17 for exactly
-    /// this reason; the bare arm, added later in fn-4.28, kept only a URL.
-    /// Grouping then canonicalized that URL unbound, so a directory renamed
-    /// and replaced between the walk consumer returning and grouping was
-    /// followed by `realpath` and became the `listingTarget` — putting
-    /// `git worktree list` on a repository outside the configured root, or
-    /// blocking on an unresponsive replacement.
-    let bareWitness: AdminWitness?
+    /// EVERY arm carries one (PR #461 codex r5). The linked arm has since
+    /// PR #460 r17; r4 gave the bare arm one; and the MAIN-CHECKOUT arm had
+    /// none at all, which mattered most because `listingTarget` PREFERS a
+    /// main checkout, so the unproven URL was the one that most often
+    /// decided where `git -C` ran. Fixing the arm a reviewer named and
+    /// leaving its sibling is how that survived two rounds.
+    let directoryWitness: AdminWitness?
 
     init(
         directory: URL,
         kind: GitWorktreeDiscoveryKind,
         adminDirectory: URL? = nil,
         adminWitness: AdminWitness? = nil,
-        bareWitness: AdminWitness? = nil
+        directoryWitness: AdminWitness? = nil
     ) {
         self.directory = directory
         self.kind = kind
         self.adminDirectory = adminDirectory
         self.adminWitness = adminWitness
-        self.bareWitness = bareWitness
+        self.directoryWitness = directoryWitness
     }
 }
 
@@ -566,8 +566,16 @@ struct GitWorktreeScanner: @unchecked Sendable {
             // so it is not a checkout as far as this scanner is concerned).
             switch entry.kind {
             case .directory:
+                // The same witness the other two arms carry, taken at the
+                // instant the walk observed this `.git` (PR #461 codex r5).
                 discoveries.append(GitWorktreeDiscovery(
-                    directory: event.directory, kind: .mainCheckout
+                    directory: event.directory, kind: .mainCheckout,
+                    directoryWitness: provider.identity(of: event.directory)
+                        .map {
+                            GitWorktreeDiscovery.AdminWitness(
+                                entryPath: event.directory.path, identity: $0
+                            )
+                        }
                 ))
             case .regularFile:
                 let admin = resolver.adminDirectory(forWorktreeAt: event.directory)
@@ -582,7 +590,18 @@ struct GitWorktreeScanner: @unchecked Sendable {
                 }
                 discoveries.append(GitWorktreeDiscovery(
                     directory: event.directory, kind: .linkedWorktree,
-                    adminDirectory: admin, adminWitness: witness
+                    adminDirectory: admin, adminWitness: witness,
+                    // Its ADMIN entry has been witnessed since PR #460 r17;
+                    // its own DIRECTORY had not been, and `listingTarget`
+                    // falls back to a linked worktree when a repository has
+                    // no main checkout (PR #461 codex r5). Two witnesses
+                    // about two different objects.
+                    directoryWitness: provider.identity(of: event.directory)
+                        .map {
+                            GitWorktreeDiscovery.AdminWitness(
+                                entryPath: event.directory.path, identity: $0
+                            )
+                        }
                 ))
             case .symlink, .other:
                 continue
@@ -613,12 +632,12 @@ struct GitWorktreeScanner: @unchecked Sendable {
            event.entries.contains(where: {
                ($0.name == "refs" || $0.name == "reftable") && $0.kind == .directory
            }),
-           let witness = Self.bareWitness(
+           let witness = Self.bareDirectoryWitness(
                for: event.directory, resolver: resolver, provider: provider
            ) {
             discoveries.append(GitWorktreeDiscovery(
                 directory: event.directory, kind: .bareRepository,
-                bareWitness: witness
+                directoryWitness: witness
             ))
         }
         return []
@@ -643,7 +662,7 @@ struct GitWorktreeScanner: @unchecked Sendable {
     /// the reads inside `bareRepositoryGitDirectory` still resolve by path.
     /// A descriptor-bound identity is the complete answer and is filed as
     /// fn-5-stale-git-worktree-scanner.7.
-    static func bareWitness(
+    static func bareDirectoryWitness(
         for directory: URL,
         resolver: GitWorktreeGitdirResolver,
         provider: FileSystemIdentityProvider
@@ -729,6 +748,18 @@ struct GitWorktreeScanner: @unchecked Sendable {
                 // repository's git directory — an observation, not a
                 // reconstruction (and cross-validated against the porcelain
                 // first record before anything is derived from it).
+                //
+                // RE-PROVED FIRST, on the same terms as the bare arm below
+                // (PR #461 codex r5). This arm canonicalized an unbound URL,
+                // which is bit-for-bit what r4 fixed for bare — and it is
+                // worse here, because a replacement's own porcelain record
+                // cross-validates against its own canonicalized git
+                // directory, so the two AGREE and the scan proceeds in
+                // silence.
+                guard let witness = discovery.directoryWitness,
+                      provider.identity(of: discovery.directory)
+                          == witness.identity
+                else { continue }
                 gitDirectory = provider.canonicalize(
                     discovery.directory.appendingPathComponent(".git")
                 )
@@ -757,7 +788,7 @@ struct GitWorktreeScanner: @unchecked Sendable {
                 // the bare-shape proof accepted contributes nothing —
                 // the same silent non-discovery this arm already takes when
                 // a pointer fails to resolve, and the safe direction.
-                guard let witness = discovery.bareWitness,
+                guard let witness = discovery.directoryWitness,
                       provider.identity(of: discovery.directory)
                           == witness.identity
                 else { continue }
@@ -871,10 +902,35 @@ struct GitWorktreeScanner: @unchecked Sendable {
         // bare repositories a discovery of their own, a linked worktree —
         // is used instead (`git -C <bare> worktree list` is the documented
         // bare workflow).
-        guard let listingTarget = (reachable.first { $0.kind == .mainCheckout }
-                                   ?? reachable.first)?.directory else {
+        guard let chosen = reachable.first(where: { $0.kind == .mainCheckout })
+            ?? reachable.first else {
             return .processed // every reachable checkout is protected — deferred
         }
+        // RE-PROVED HERE, WHERE THE PATH BECOMES A `git -C` ARGUMENT
+        // (PR #461 codex r5). Grouping's re-check binds `canonicalize` and
+        // nothing else: between it and this line the scanner runs the rest of
+        // the grouping loop, every EARLIER group's full processing (each
+        // awaiting git subprocesses), two deferral checks and an admin-
+        // container enumeration. That window is unbounded and GROWS with the
+        // repository count — the very shape this file condemns for r16 — and
+        // a replacement landing in it put `git worktree list` on a repository
+        // outside every configured root.
+        //
+        // Reported, not skipped in silence: a scan that quietly drops a
+        // repository is indistinguishable from one that found nothing there.
+        guard let targetWitness = chosen.directoryWitness,
+              provider.identity(of: chosen.directory) == targetWitness.identity
+        else {
+            issues.append(ScanIssue(
+                url: chosen.directory, kind: .unreadable,
+                detail: "this checkout is no longer the object the scan "
+                    + "discovered — it was replaced before git could be run "
+                    + "against it, so no worktrees of it were assessed. "
+                    + "Re-scan to see what is there now"
+            ))
+            return .processed
+        }
+        let listingTarget = chosen.directory
 
         // (a2) THE WALK-INDEPENDENT PRE-LISTING WITNESSES (PR #460 codex
         //      r17, W1). The walk and the porcelain listing are two

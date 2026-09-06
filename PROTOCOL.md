@@ -246,8 +246,8 @@ refreshes.
   "scanner_errors": [
     {
       "scanner_id": "build_artifacts",
-      "kind": "container_refused",
-      "detail": "dev root is not a usable container: the filesystem root",
+      "kind": "policy_refused_root",
+      "detail": "configured dev root refused: the filesystem root",
       "path": "/"
     },
     {
@@ -292,7 +292,7 @@ refreshes.
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `scanner_id` | string | yes | Which scanner reported (or failed validation) |
-| `kind` | string | yes | One of: `"container_refused"`, `"mounted_volume_root"`, `"mounted_volume_root_at_registration"`, `"policy_refused_root"`, `"symlink_root"`, `"non_directory_root"`, `"tcc_denied"`, `"permission_denied"`, `"unreadable"`, `"enumeration_truncated"`, `"config_invalid"`, `"tool_unavailable"`, `"malformed_outcome"`, `"scan_did_not_finish"`. The list is EXTENSIBLE — consumers must tolerate unknown kinds |
+| `kind` | string | yes | One of: `"container_refused"`, `"mounted_volume_root"`, `"mounted_volume_root_at_registration"`, `"policy_refused_root"`, `"mutation_scope_refused"`, `"symlink_root"`, `"non_directory_root"`, `"tcc_denied"`, `"permission_denied"`, `"unreadable"`, `"enumeration_truncated"`, `"config_invalid"`, `"tool_unavailable"`, `"malformed_outcome"`, `"scan_did_not_finish"`. The list is EXTENSIBLE — consumers must tolerate unknown kinds |
 | `detail` | string | yes | Human-readable description |
 | `path` | string | conditional | Present for the FILESYSTEM kinds; ABSENT for the NON-FILESYSTEM kinds — `"malformed_outcome"`, `"config_invalid"`, `"tool_unavailable"` and `"scan_did_not_finish"` — where no filesystem location exists and a fake path is therefore never invented |
 | `grant_hint` | string | no | Present only when `kind == "tcc_denied"` — the same user-side remedy (Full Disk Access) as category and `scanner_items` rows, since macOS denies CLI processes silently |
@@ -309,16 +309,18 @@ scan outcome while the corrupt value persists — the fallback is never
 silent. It carries no `path` because a config parse failure has no honest
 filesystem location. A configured root that was REJECTED by policy (the
 filesystem root, a volume root/mount point, `$HOME`) is a different thing
-and reports honestly WITH its offending path, under `container_refused` for
-the dev-root scanners and under `policy_refused_root` for `ephemeral_tmp`.
+and reports honestly WITH its offending path, under `policy_refused_root`
+for every scanner that resolves configured roots (dev-root scanners since
+fn-4.12; `ephemeral_tmp` since PR #459).
 
 A `mounted_volume_root` row means a REGISTERED root has another volume
 mounted exactly at its path, so whatever is there belongs to that volume
 rather than to the root. It is deliberately NOT `container_refused`: the
 root is configured and admissible, nothing rejected it, and the condition is
 one the user clears — eject or unmount the volume, then re-scan. Emitted
-today by `ephemeral_tmp`, which answers from the kernel's mount table before
-any syscall touches the root.
+today by `ephemeral_tmp` and (since fn-4.12) by the dev-root walk behind
+`build_artifacts`/`git_worktrees`; each answers from the kernel's mount
+table, re-read every scan, before any syscall touches the root.
 
 A `mounted_volume_root_at_registration` row means the same condition was
 already true when the runtime was CONSTRUCTED, so that root was never
@@ -336,18 +338,33 @@ deliberately NOT `container_refused`: a scanner builds its guard from its
 own roots, so a root that reaches this refusal was configured, and
 `container_refused` reads as "you did not configure this". `detail` names
 the clause that fired; there is no single remedy across the clauses.
-Emitted today by `ephemeral_tmp`, whose roots (`/private/tmp` and the two
-per-user `confstr` containers) are not user-configurable at all.
+Emitted today by `ephemeral_tmp` (whose roots — `/private/tmp` and the two
+per-user `confstr` containers — are not user-configurable at all) and,
+since fn-4.12, by dev-root resolution and the dev-root walk behind
+`build_artifacts`/`git_worktrees`, which previously spelled the same
+refusals `container_refused` against their own contradicting details.
+
+A `mutation_scope_refused` row means a DISCOVERED deletable candidate (a
+git worktree, or a repository's orphaned worktree admin data) was withheld
+because the destructive git operation's whole mutation scope — the paths
+git itself would modify plus the parent repository whose records name them
+— is not contained in ONE configured dev root. The candidate itself is
+often INSIDE a configured root, which is why this is deliberately NOT
+`container_refused`: that kind's fixed row label ("not a configured search
+root") was a false diagnosis for these producers. `path` names the withheld
+candidate; `detail` names which path broke the containment. No remedy is
+claimed — where the out-of-scope data sits is the user's layout. Emitted
+today by `git_worktrees` (fn-4.12).
 
 A `non_directory_root` row means a search root EXISTS and is not a symlink,
 but is not a directory either — a regular file, FIFO, socket or device
 stands where a directory is required, and nothing was traversed. It is
 deliberately NOT `symlink_root`: that kind renders as the fixed sentence
 "symlinked — not searched", which sends the user hunting for a link that is
-not there. `detail` names the object's actual kind. Emitted today by
-`ephemeral_tmp`, whose `symlink_root` is therefore now a symlink and
-nothing else; the other scanners still spell both conditions
-`symlink_root`.
+not there. `detail` names the object's actual kind. Emitted by every scanner with a
+root gate (`ephemeral_tmp` since PR #459; the dev-root walk,
+`orphaned_caches` and dev-root resolution since fn-4.12), so `symlink_root`
+now means a symlink and nothing else, everywhere it is emitted.
 
 A `tool_unavailable` row means the scan could not run an external tool it
 depends on, so it produced NO results — today: `git_worktrees` could not

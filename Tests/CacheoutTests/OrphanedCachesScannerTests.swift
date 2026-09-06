@@ -96,6 +96,108 @@ final class OrphanedCachesScannerTests: XCTestCase {
         return count
     }
 
+    /// The SET of descriptor numbers this process holds, by the same
+    /// allocation-free `fcntl(F_GETFD)` probe as `heldDescriptorCount` —
+    /// the identity form the climb cell's churn classifier needs (fn-4.16):
+    /// a fd that was open at the walk's start and closed by its end names
+    /// ITSELF, where a bare count only says "something moved".
+    private func heldDescriptorSet() -> Set<Int32> {
+        var limits = rlimit()
+        guard getrlimit(RLIMIT_NOFILE, &limits) == 0 else { return [] }
+        let ceiling = Int32(clamping: min(limits.rlim_cur, 65_536))
+        var held: Set<Int32> = []
+        for descriptor in 0..<ceiling where fcntl(descriptor, F_GETFD) >= 0 {
+            held.insert(descriptor)
+        }
+        return held
+    }
+
+    /// One full run of the climb fixture's walk, every kernel sample taken
+    /// TWICE so a sample that ambient process activity moved during the
+    /// sampling is marked tainted rather than believed (fn-4.16).
+    private struct ClimbAttempt {
+        var reanchors = 0
+        var peakMeasured = 0
+        var peakCensus = 0
+        var disagreements: [String] = []
+        var sequence: [String] = []
+        var complete = false
+        var obstructions = ""
+        var beforeSet: Set<Int32> = []
+        var afterSet: Set<Int32> = []
+        /// Descriptors open at the start and gone by the end: something in
+        /// this PROCESS closed them while the walk ran, and it was not the
+        /// walk (the walk only closes what it opened after `beforeSet`).
+        var vanished: Set<Int32> { beforeSet.subtracting(afterSet) }
+        /// Descriptors held at the end that were not held at the start —
+        /// a leak, unless ambient activity opened and kept them.
+        var appeared: Set<Int32> { afterSet.subtracting(beforeSet) }
+        /// The kernel cross-check is attributable only when nothing
+        /// vanished: churn that nets to zero by the attempt's end is
+        /// invisible here, which is why one set-clean disagreement is a
+        /// SUSPECT and only a second one convicts the census (see the
+        /// cell's header).
+        var ambientChurn: Bool { !vanished.isEmpty }
+        var midClimbSamples: Int {
+            sequence.indices.filter { index in
+                index + 2 < sequence.count
+                    && sequence[index] == "pop"
+                    && sequence[index + 1] == "census"
+                    && sequence[index + 2] == "reanchor"
+            }.count
+        }
+    }
+
+    /// Run the bounded walk over the climb fixture once and record what the
+    /// kernel and the census each said. `onFirstCensus` runs synchronously
+    /// on the walk's own thread just before the first census sample is
+    /// read — the deterministic injection point the churn cell uses.
+    private func runClimbAttempt(
+        entry: URL, window: Int, onFirstCensus: (() -> Void)? = nil
+    ) -> ClimbAttempt {
+        var attempt = ClimbAttempt()
+        var firstCensusSeen = false
+        attempt.beforeSet = heldDescriptorSet()
+        let baseline = attempt.beforeSet.count
+        let probe = OrphanedCachesScanner.boundedUserDataShapeWalk(
+            at: entry, provider: FileSystemIdentityProvider(),
+            entryLimit: OrphanedCachesScanner.defaultProbeEntryLimit,
+            descriptorWindow: window
+        ) { event in
+            switch event {
+            case .didReanchor:
+                attempt.reanchors += 1
+                attempt.sequence.append("reanchor")
+            case .willPop: attempt.sequence.append("pop")
+            case .willDescend: attempt.sequence.append("descend")
+            case .didEnumerate: attempt.sequence.append("enumerate")
+            // Deliberately NOT in the sequence: the mid-climb detector keys
+            // on pop/census/reanchor ADJACENCY, and bookkeeping is emitted
+            // on descent and after a pop's climb has already finished —
+            // never between a climb's own steps.
+            case .frameBookkeeping: break
+            case .descriptorCensus(let live, let transient, _):
+                if !firstCensusSeen {
+                    firstCensusSeen = true
+                    onFirstCensus?()
+                }
+                attempt.sequence.append("census")
+                let measured = self.heldDescriptorCount() - baseline
+                attempt.peakCensus = max(attempt.peakCensus, live + transient)
+                attempt.peakMeasured = max(attempt.peakMeasured, measured)
+                if measured != live + transient {
+                    attempt.disagreements.append(
+                        "census \(live)+\(transient) vs measured \(measured)"
+                    )
+                }
+            }
+        }
+        attempt.complete = probe.complete
+        attempt.obstructions = "\(probe.obstructions)"
+        attempt.afterSet = heldDescriptorSet()
+        return attempt
+    }
+
     /// Run `body` and assert it leaked no descriptors. `SecureDirectory`'s
     /// `deinit` is what makes this pass on `break walk` and early-refusal
     /// paths alike; this is the enforcement, not review vigilance.
@@ -659,6 +761,27 @@ final class OrphanedCachesScannerTests: XCTestCase {
         XCTAssertEqual(outcome.errors.first?.url?.path, cachesRoot.path)
     }
 
+    func testRegularFileSweepRootYieldsNonDirectoryRootIssue() async throws {
+        try fm.removeItem(at: cachesRoot)
+        _ = try writeFile(cachesRoot)
+
+        let scanner = makeScanner()
+        let outcome = await scanner.scan(
+            context: ScanContext(trigger: .userInitiated)
+        )
+        XCTAssertTrue(outcome.items.isEmpty)
+        XCTAssertEqual(outcome.errors.count, 1)
+        // `.nonDirectoryRoot`, NOT `.symlinkRoot` (fn-4.12): the
+        // kind-derived GUI label under `.symlinkRoot` read "symlinked —
+        // not searched" for a regular file standing at the sweep root.
+        XCTAssertEqual(outcome.errors.first?.kind, .nonDirectoryRoot)
+        XCTAssertEqual(outcome.errors.first?.url?.path, cachesRoot.path)
+        XCTAssertTrue(
+            outcome.errors.first?.detail.contains("regular file") == true,
+            "the detail names the real kind: \(outcome.errors)"
+        )
+    }
+
     func testUnreadableSweepRootYieldsClassifiedIssueNotEmptySuccess() async throws {
         try XCTSkipIf(geteuid() == 0, "root ignores permission bits")
         try writeFile(cachesRoot.appendingPathComponent("f.bin"))
@@ -742,7 +865,7 @@ final class OrphanedCachesScannerTests: XCTestCase {
 
         let scanner = makeScanner()
         let runtime = try makeRuntime([scanner])
-        let session = runtime.scanValidatedSession(
+        let session = await runtime.scanValidatedSession(
             context: ScanContext(trigger: .userInitiated)
         )
         var items: [ReclaimableItem] = []
@@ -1070,7 +1193,7 @@ final class OrphanedCachesScannerTests: XCTestCase {
     private func scanSession(
         _ runtime: SpaceScannerRuntime
     ) async -> (items: [ReclaimableItem], snapshot: ContainerSnapshot) {
-        let session = runtime.scanValidatedSession(
+        let session = await runtime.scanValidatedSession(
             context: ScanContext(trigger: .userInitiated)
         )
         var items: [ReclaimableItem] = []
@@ -1171,7 +1294,7 @@ final class OrphanedCachesScannerTests: XCTestCase {
         let runtime = try makeRuntime([DelegatingGatedSweepScanner(
             inner: makeScanner(), gate: gate
         )])
-        let session = runtime.scanValidatedSession(
+        let session = await runtime.scanValidatedSession(
             context: ScanContext(trigger: .userInitiated)
         )
         try fm.removeItem(at: cachesRoot)
@@ -2777,6 +2900,43 @@ final class OrphanedCachesScannerTests: XCTestCase {
     /// the frame stack. Sampled mid-climb, which no census taken after the
     /// climb finished could ever see.
     func testDescriptorPeakDuringAReAnchorClimb() throws {
+        // ## WHY ATTEMPTS, AND WHAT EACH ONE MAY BLAME (fn-4.16)
+        //
+        // The census (walk-local bookkeeping) is cross-checked against the
+        // kernel (process-wide `fcntl` sweep). Those are DIFFERENT
+        // quantities: the suite is ONE process, and a sibling cell's
+        // deferred cleanup — a `StatusSocket` accept handler's
+        // `defer close(fd)` on a GCD thread, a Process reaper tearing down
+        // pipes — can close descriptors while this walk runs. Measured on
+        // main before this rewrite: ~1 failing suite run in 5, every
+        // failure of the form `census 2+1 vs measured -8` — the kernel
+        // count DROPPED, which no walk that only closes what it opened can
+        // produce. Alone, the old cell was green 20/20 runs: the
+        // disagreement needed a sibling's churn. Neither the census nor
+        // the kernel was wrong; the cell's EXCLUSIVITY assumption was.
+        //
+        // So each attempt now classifies itself, three ways:
+        //
+        // - descriptors APPEARED and stayed → a leak; fail at once, on any
+        //   attempt — a leak outlives churn and can never be dressed as it.
+        // - descriptors VANISHED → ambient churn, the cross-check is
+        //   unattributable; retry, up to 5 attempts. A retry CAN differ:
+        //   the churn is a sibling's transient cleanup, not a
+        //   deterministic bound.
+        // - sets clean but the census disagreed with the kernel → SUSPECT.
+        //   One suspect could still be ambient churn that netted to zero
+        //   inside the attempt (open + close between the snapshots), so it
+        //   earns a retry; a SECOND set-clean disagreement is not credibly
+        //   coincidence twice and convicts the census. A census that is
+        //   actually wrong disagrees on EVERY attempt, so this fails by
+        //   attempt 2 — mutation-measured: transient over-counted by one
+        //   reddened 8 of 8 runs.
+        //
+        // The walk's own invariants (completion, a forced climb, an
+        // observed mid-climb peak, the census-side window bound) hold on
+        // EVERY attempt, churn or not.
+        // `testAmbientDescriptorChurnIsDetectedNotBlamedOnTheCensus`
+        // manufactures the churn deterministically and pins the classifier.
         let entry = cachesRoot.appendingPathComponent("com.example.Climb")
         var here = entry
         let depth = 8
@@ -2787,70 +2947,138 @@ final class OrphanedCachesScannerTests: XCTestCase {
         }
 
         let window = 2   // the floor: every pop past it must climb
-        var reanchors = 0
-        var peakMeasured = 0
-        var peakCensus = 0
-        var disagreements: [String] = []
-        // The event SEQUENCE, so "was a sample taken while the climb was in
-        // flight" is decided by position rather than by hope: a mid-climb
-        // census lands strictly between the pop that started the climb and
-        // the re-anchor that ended it.
-        var sequence: [String] = []
-        let before = heldDescriptorCount()
-        let probe = OrphanedCachesScanner.boundedUserDataShapeWalk(
-            at: entry, provider: FileSystemIdentityProvider(),
-            entryLimit: OrphanedCachesScanner.defaultProbeEntryLimit,
-            descriptorWindow: window
-        ) { event in
-            switch event {
-            case .didReanchor:
-                reanchors += 1
-                sequence.append("reanchor")
-            case .willPop: sequence.append("pop")
-            case .willDescend: sequence.append("descend")
-            case .didEnumerate: sequence.append("enumerate")
-            // Deliberately NOT in the sequence: the mid-climb detector below
-            // keys on pop/census/reanchor ADJACENCY, and bookkeeping is
-            // emitted on descent and after a pop's climb has already
-            // finished — never between a climb's own steps.
-            case .frameBookkeeping: break
-            case .descriptorCensus(let live, let transient, _):
-                sequence.append("census")
-                let measured = self.heldDescriptorCount() - before
-                peakCensus = max(peakCensus, live + transient)
-                peakMeasured = max(peakMeasured, measured)
-                if measured != live + transient {
-                    disagreements.append(
-                        "census \(live)+\(transient) vs measured \(measured)"
-                    )
-                }
+        var churnEvidence: [String] = []
+        var suspectAttempts: [String] = []
+        for attemptNumber in 1...5 {
+            let run = runClimbAttempt(entry: entry, window: window)
+
+            // The walk's own claims, kernel-free — asserted every attempt.
+            XCTAssertTrue(run.complete, run.obstructions)
+            XCTAssertGreaterThan(run.reanchors, 0,
+                                 "the fixture never forced a climb")
+            XCTAssertGreaterThan(
+                run.midClimbSamples, 0,
+                "not one sample was taken WHILE a climb held its extra "
+                    + "descriptors — the peak of the climb is unobserved: "
+                    + "\(run.sequence.prefix(24))"
+            )
+            XCTAssertLessThanOrEqual(
+                run.peakCensus, min(depth + 1, window) + 2,
+                "a climb must stay inside min(depth + 1, W) + 2"
+            )
+
+            // A leak outlives the attempt, so it can never be dressed as
+            // churn: fail now, whatever else this attempt saw.
+            XCTAssertEqual(
+                run.appeared, [],
+                "descriptors held after the walk that were not held "
+                    + "before it — the walk (or something started during "
+                    + "it) failed to release them"
+            )
+
+            if run.ambientChurn {
+                churnEvidence.append(
+                    "attempt \(attemptNumber): vanished \(run.vanished.sorted()), "
+                        + "\(run.disagreements.count) disagreement(s)"
+                )
+                continue
+            }
+
+            if !run.disagreements.isEmpty {
+                suspectAttempts.append(
+                    "attempt \(attemptNumber): \(run.disagreements)"
+                )
+                XCTAssertLessThan(
+                    suspectAttempts.count, 2,
+                    "the census disagreed with the kernel on two set-clean "
+                        + "attempts — ambient churn netting to zero twice "
+                        + "is not credible, the census is wrong: "
+                        + "\(suspectAttempts)"
+                )
+                if suspectAttempts.count >= 2 { return }
+                continue
+            }
+
+            // CLEAN: the process's fd table was the walk's alone, the
+            // kernel cross-check is attributable, and it agreed sample by
+            // sample; the peaks must meet too.
+            XCTAssertEqual(run.peakMeasured, run.peakCensus,
+                           "the census must reach the measured peak")
+            return
+        }
+        XCTFail(
+            "no attributable attempt in 5 — the kernel cross-check could "
+                + "not be brought to a verdict. Churn: \(churnEvidence); "
+                + "suspect: \(suspectAttempts)"
+        )
+    }
+
+    /// The fn-4.16 diagnosis, pinned as a cell: close eight held
+    /// descriptors from inside the walk's first census instant — exactly
+    /// the shape a sibling cell's deferred cleanup produces — and the
+    /// classifier must convict AMBIENT CHURN, not the census. The old
+    /// cell's `disagreements == []` assertion failed exactly here; this
+    /// cell also asserts the disagreements DO appear, so the manufactured
+    /// churn is proven to reproduce the original failure rather than
+    /// tiptoe around it.
+    func testAmbientDescriptorChurnIsDetectedNotBlamedOnTheCensus() throws {
+        let entry = cachesRoot.appendingPathComponent("com.example.ChurnClimb")
+        var here = entry
+        let depth = 8
+        for level in 0..<depth {
+            try mkdir(here.appendingPathComponent("keep\(level)"))
+            here = here.appendingPathComponent("down")
+            try mkdir(here)
+        }
+
+        // Held BEFORE the attempt's first snapshot, closed mid-walk.
+        var planted: [Int32] = []
+        for _ in 0..<8 {
+            let fd = open("/dev/null", O_RDONLY | O_CLOEXEC)
+            XCTAssertGreaterThanOrEqual(fd, 0, "open(/dev/null) errno \(errno)")
+            planted.append(fd)
+        }
+        var closedByChurn = false
+        defer {
+            if !closedByChurn {
+                for fd in planted where fd >= 0 { close(fd) }
             }
         }
 
-        XCTAssertTrue(probe.complete, "\(probe.obstructions)")
-        XCTAssertGreaterThan(reanchors, 0, "the fixture never forced a climb")
-        XCTAssertEqual(disagreements, [],
-                       "the census disagreed with the kernel: \(disagreements)")
-        let midClimbSamples = sequence.indices.filter { index in
-            index + 2 < sequence.count
-                && sequence[index] == "pop"
-                && sequence[index + 1] == "census"
-                && sequence[index + 2] == "reanchor"
-        }.count
-        XCTAssertGreaterThan(
-            midClimbSamples, 0,
-            "not one sample was taken WHILE a climb held its extra "
-                + "descriptors — the peak of the climb is unobserved: "
-                + "\(sequence.prefix(24))"
+        let run = runClimbAttempt(entry: entry, window: 2, onFirstCensus: {
+            // Synchronous on the walk's own thread: by the time the first
+            // sample is read, the eight are gone — the most adversarial
+            // placement, every subsequent sample sees the dropped count.
+            for fd in planted where fd >= 0 { close(fd) }
+            closedByChurn = true
+        })
+
+        XCTAssertTrue(run.complete, run.obstructions)
+        XCTAssertGreaterThan(run.reanchors, 0,
+                             "the fixture never forced a climb")
+        // The manufactured churn reproduces the original failure shape …
+        XCTAssertFalse(
+            run.disagreements.isEmpty,
+            "closing eight held descriptors mid-walk must pull the "
+                + "process-wide count below the walk-local census — the "
+                + "pre-fn-4.16 cell failed exactly on this evidence"
         )
-        XCTAssertEqual(peakMeasured, peakCensus,
-                       "the census must reach the measured peak")
+        // … and the classifier convicts the churn, naming the descriptors.
+        XCTAssertTrue(run.ambientChurn,
+                      "eight vanished descriptors went unclassified")
+        let plantedSet = Set(planted.filter { $0 >= 0 })
+        XCTAssertTrue(
+            run.vanished.isSuperset(of: plantedSet),
+            "the vanished set \(run.vanished.sorted()) must name the "
+                + "planted descriptors \(plantedSet.sorted())"
+        )
+        // The walk's OWN claims are untouched by ambient churn.
         XCTAssertLessThanOrEqual(
-            peakMeasured, min(depth + 1, window) + 2,
+            run.peakCensus, min(depth + 1, 2) + 2,
             "a climb must stay inside min(depth + 1, W) + 2"
         )
-        XCTAssertEqual(heldDescriptorCount(), before,
-                       "and every one of them is released")
+        XCTAssertEqual(run.appeared, [],
+                       "nothing new may be held after the walk")
     }
 
     /// `descriptorWindow` is a PERFORMANCE knob: shrinking it to 3 must not

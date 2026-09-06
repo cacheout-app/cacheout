@@ -86,4 +86,58 @@ enum TestSocketClient {
             return (written, written < 0 ? errno : 0)
         }
     }
+
+    /// Read `StatusSocket`'s newline-terminated reply WHOLE — loop until the
+    /// `\n` that ends the line, EOF, or a full buffer (fn-4.14).
+    ///
+    /// ## WHY A LOOP: THE FLAKY READ WAS A SHORT READ
+    ///
+    /// The protocol is newline-delimited (`StatusSocket.writeJsonLine` appends
+    /// `"\n"` and the SERVER's read side loops until it sees `0x0A`), but both
+    /// test clients did a SINGLE `read(2)` on a `SOCK_STREAM` socket — which
+    /// has NO message boundaries. A reply delivered to the kernel in more than
+    /// one segment hands the first segment to that single `read`, and the
+    /// caller parses TRUNCATED JSON. Not a timeout (the client read blocks
+    /// with no `SO_RCVTIMEO` of its own) and not a lost race with the server's
+    /// `close` (close does not discard delivered bytes): a SHORT READ, one the
+    /// protocol's own framing already tells us how to finish.
+    /// `StatusSocketIntegrationTests.testSegmentedReplyIsReadWholeNotFirstSegment`
+    /// drives this loop against a server that writes in two spaced segments;
+    /// under a single `read(2)` that fixture's reply comes back truncated
+    /// (measured red 10 of 10 runs), under this loop it comes back whole.
+    ///
+    /// Historically the truncated string then met
+    /// `try JSONSerialization.jsonObject(…) as! [String: Any]`, and a trapping
+    /// cast KILLS the xctest process — the fn-4.14 strand class — which is why
+    /// the callers now unwrap with `XCTUnwrap` and `StrandFenceTests` fences
+    /// `as!` out of test sources entirely.
+    static func readNewlineTerminatedReply(
+        from fd: Int32, capacity: Int = 65536
+    ) throws -> String {
+        var buffer = [UInt8](repeating: 0, count: capacity)
+        var total = 0
+        while total < buffer.count {
+            let n = buffer.withUnsafeMutableBufferPointer { raw -> Int in
+                guard let base = raw.baseAddress else { return -1 }
+                return Darwin.read(fd, base + total, raw.count - total)
+            }
+            if n < 0 {
+                throw NSError(
+                    domain: "TestSocketClient", code: Int(errno),
+                    userInfo: [NSLocalizedDescriptionKey:
+                                "read() failed: errno \(errno)"]
+                )
+            }
+            if n == 0 { break }   // EOF: the server closed after its reply.
+            total += n
+            if buffer[0..<total].contains(0x0A) { break }
+        }
+        guard total > 0 else {
+            throw NSError(
+                domain: "TestSocketClient", code: -1,
+                userInfo: [NSLocalizedDescriptionKey: "No response"]
+            )
+        }
+        return String(bytes: buffer[0..<total], encoding: .utf8) ?? ""
+    }
 }

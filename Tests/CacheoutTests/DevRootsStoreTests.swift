@@ -118,7 +118,7 @@ final class DevRootsStoreTests: XCTestCase {
 
     // MARK: - R16: store-layer attack fixtures
 
-    func testPersistedFilesystemRootExcludedWithFrozenContainerRefused() throws {
+    func testPersistedFilesystemRootExcludedWithPolicyRefusedRoot() throws {
         let original: Any = ["/"]
         persist(original)
 
@@ -128,9 +128,11 @@ final class DevRootsStoreTests: XCTestCase {
                        "a persisted `/` must never be registered or walked")
         XCTAssertEqual(resolution.issues.count, 1)
         let issue = try XCTUnwrap(resolution.issues.first)
-        XCTAssertEqual(issue.kind, .containerRefused,
-                       "policy-rejected roots keep the FROZEN kind")
-        XCTAssertEqual(issue.kind.wireString, "container_refused")
+        XCTAssertEqual(issue.kind, .policyRefusedRoot,
+                       "a policy-rejected root IS configured (fn-4.12): the "
+                       + "kind-derived GUI label under `.containerRefused` "
+                       + "said the opposite of the detail")
+        XCTAssertEqual(issue.kind.wireString, "policy_refused_root")
         XCTAssertEqual(issue.url?.path, "/",
                        "a policy rejection carries its offending path honestly")
         assertStoredUnchanged(original)
@@ -146,8 +148,9 @@ final class DevRootsStoreTests: XCTestCase {
         let resolution = makeStore().effectiveRoots(home: fixtureHome)
 
         XCTAssertEqual(resolution.keptRoots, [],
-                       "canonicalize-before-check: an alias of / is /")
-        XCTAssertEqual(resolution.issues.map(\.kind), [.containerRefused])
+                       "an alias of / names / — read from the link's own "
+                       + "content since fn-4.11, never by resolving it")
+        XCTAssertEqual(resolution.issues.map(\.kind), [.policyRefusedRoot])
         XCTAssertEqual(resolution.issues.first?.url?.path, alias.path,
                        "the issue names the DECLARED offending spelling")
     }
@@ -163,7 +166,7 @@ final class DevRootsStoreTests: XCTestCase {
             .effectiveRoots(home: fixtureHome)
 
         XCTAssertEqual(resolution.keptRoots, [])
-        XCTAssertEqual(resolution.issues.map(\.kind), [.containerRefused])
+        XCTAssertEqual(resolution.issues.map(\.kind), [.policyRefusedRoot])
     }
 
     func testPersistedHomeExcludedInDirectAndAliasSpellings() throws {
@@ -174,10 +177,11 @@ final class DevRootsStoreTests: XCTestCase {
         let resolution = makeStore().effectiveRoots(home: fixtureHome)
 
         XCTAssertEqual(resolution.keptRoots, [],
-                       "$HOME must be excluded by inode identity in EVERY "
-                       + "spelling")
+                       "$HOME must be excluded in EVERY spelling — by inode "
+                       + "identity when spelled directly, by the link's own "
+                       + "content when aliased (fn-4.11)")
         XCTAssertEqual(resolution.issues.map(\.kind),
-                       [.containerRefused, .containerRefused])
+                       [.policyRefusedRoot, .policyRefusedRoot])
         XCTAssertEqual(resolution.issues.map { $0.url?.path },
                        [fixtureHome.path, alias.path])
     }
@@ -207,7 +211,7 @@ final class DevRootsStoreTests: XCTestCase {
         XCTAssertEqual(resolution.keptRoots.map(\.path), [good.path],
                        "a dangerous string in a VALID array is rejected "
                        + "individually; the rest of the list survives")
-        XCTAssertEqual(resolution.issues.map(\.kind), [.containerRefused])
+        XCTAssertEqual(resolution.issues.map(\.kind), [.policyRefusedRoot])
     }
 
     // MARK: - R8/R16: guarded parsing + mixed-corrupt semantics
@@ -245,7 +249,7 @@ final class DevRootsStoreTests: XCTestCase {
         // THE pinned attack cell: [true, "/"]. The array shape is invalid,
         // so the WHOLE value is a parse failure — seeds in effect, ONE
         // config_invalid issue, and the embedded "/" never reaches the kept
-        // set (the visible parse issue covers it; no containerRefused row
+        // set (the visible parse issue covers it; no per-root refusal row
         // is fabricated for a value that was never accepted as config).
         let original: Any = [true, "/"]
         persist(original)
@@ -420,6 +424,144 @@ final class DevRootsStoreTests: XCTestCase {
         XCTAssertEqual(resolution.issues, [])
     }
 
+    // MARK: - fn-4.11: resolution never names a symlink root's destination
+
+    /// FAILS THE TEST on any call naming the forbidden DESTINATION or
+    /// anything below it, and on any LEAF-FOLLOWING operation on a listed
+    /// alias spelling (`canonicalize`/`realPath`/`isMountPoint` — `realpath(3)`
+    /// resolves the link, `statfs(2)` follows it). `lstat`/`readlink`-class
+    /// calls on the alias itself stay legal: they read the link's own entry
+    /// and content, never the destination.
+    private final class DestinationForbiddingProvider:
+        FileSystemIdentityProvider, @unchecked Sendable
+    {
+        var forbiddenDestination = ""
+        var aliasSpellings: Set<String> = []
+        private let fail: (String) -> Void
+
+        init(fail: @escaping (String) -> Void) {
+            self.fail = fail
+            super.init()
+        }
+
+        private func forbid(_ method: String, _ path: String) {
+            guard !forbiddenDestination.isEmpty,
+                  path == forbiddenDestination
+                    || path.hasPrefix(forbiddenDestination + "/")
+            else { return }
+            fail("\(method) made first contact with the destination: \(path)")
+        }
+        private func forbidFollow(_ method: String, _ path: String) {
+            forbid(method, path)
+            if aliasSpellings.contains(path) {
+                fail("\(method) is a leaf-following resolution of the alias "
+                    + "spelling itself: \(path)")
+            }
+        }
+
+        override func realPath(of path: String) -> String? {
+            forbidFollow("realPath", path)
+            let out = super.realPath(of: path)
+            if let out { forbid("realPath output", out) }
+            return out
+        }
+        override func canonicalize(_ url: URL) -> URL {
+            forbidFollow("canonicalize", url.path)
+            return super.canonicalize(url)
+        }
+        override func isMountPoint(_ url: URL) -> Bool {
+            forbidFollow("isMountPoint", url.path)
+            return super.isMountPoint(url)
+        }
+        override func probeKind(of url: URL) -> KindProbe {
+            forbid("probeKind", url.path)
+            return super.probeKind(of: url)
+        }
+        override func identity(of url: URL) -> Identity? {
+            forbid("identity", url.path)
+            return super.identity(of: url)
+        }
+        override func symlinkTarget(of url: URL) -> String? {
+            forbid("symlinkTarget", url.path)
+            return super.symlinkTarget(of: url)
+        }
+        override func canEnumerateDirectory(_ url: URL) -> Bool {
+            forbidFollow("canEnumerateDirectory", url.path)
+            return super.canEnumerateDirectory(url)
+        }
+        override func ownerProbe(of url: URL) -> OwnerProbe {
+            forbid("ownerProbe", url.path)
+            return super.ownerProbe(of: url)
+        }
+        override func leafMetadata(of url: URL) -> LeafMetadata? {
+            forbid("leafMetadata", url.path)
+            return super.leafMetadata(of: url)
+        }
+        override func linkCount(of url: URL) -> UInt64? {
+            forbid("linkCount", url.path)
+            return super.linkCount(of: url)
+        }
+    }
+
+    /// fn-4.11: `effectiveRoots` runs synchronously inside runtime
+    /// construction on the main thread, and a persisted dev root is a path
+    /// the app does not control — a same-UID process can aim it at an
+    /// unresponsive mounted volume. The old shape canonicalized every root
+    /// (policy first, probe pair second), so a symlink root's DESTINATION
+    /// was named — and could block launch — before any window existed. Both
+    /// alias shapes are kept verbatim with ZERO destination contact.
+    func testResolutionNeverContactsASymlinkDevRootsDestination() throws {
+        let destination = base.appendingPathComponent("quarantined-dest")
+        try mkdir(destination)
+        let alias = base.appendingPathComponent("alias-to-dest")
+        try fm.createSymbolicLink(at: alias, withDestinationURL: destination)
+        let dangling = base.appendingPathComponent("dangling-alias")
+        try fm.createSymbolicLink(
+            at: dangling,
+            withDestinationURL: destination.appendingPathComponent("gone")
+        )
+        persist([alias.path, dangling.path])
+
+        let provider = DestinationForbiddingProvider(fail: { XCTFail($0) })
+        provider.forbiddenDestination = destination.path
+        provider.aliasSpellings = [alias.path, dangling.path]
+
+        let resolution = makeStore(provider: provider)
+            .effectiveRoots(home: fixtureHome)
+        XCTAssertEqual(resolution.keptRoots.map(\.path),
+                       [alias.path, dangling.path],
+                       "nothing declared covers these leaves — they pass "
+                       + "through verbatim for the walk-time gate to class")
+        XCTAssertEqual(resolution.issues, [])
+    }
+
+    /// fn-4.11's recorded residual, pinned the way fn-6 pins its own
+    /// (`testAliasWrittenThroughAThirdSpellingKeepsBothRootsRatherThanGuessing`):
+    /// the drop decision compares the link's CONTENT against spellings the
+    /// resolution already holds — it never resolves the destination, so a
+    /// target written through a spelling nobody declared matches nothing and
+    /// BOTH roots are kept rather than guessed about. The alias stays
+    /// fail-closed in its own right: never walkable, never admissible.
+    func testAliasNamingItsTargetThroughAThirdSpellingKeepsBothRoots() throws {
+        let real = base.appendingPathComponent("real-root")
+        try mkdir(real)
+        let alias = base.appendingPathComponent("alias-root")
+        // A case-variant spelling: on the default case-insensitive volume
+        // the link RESOLVES onto the real root (the old full-resolution key
+        // dropped it); lexically it matches nothing anyone declared.
+        try fm.createSymbolicLink(
+            at: alias,
+            withDestinationURL: base.appendingPathComponent("REAL-ROOT")
+        )
+        persist([alias.path, real.path])
+
+        let resolution = makeStore().effectiveRoots(home: fixtureHome)
+        XCTAssertEqual(resolution.keptRoots.map(\.path),
+                       [alias.path, real.path],
+                       "a name compare must keep both rather than guess")
+        XCTAssertEqual(resolution.issues, [])
+    }
+
     func testNestedRealRootsBothKeptNoKeepAncestorDrop() throws {
         // D7: path ancestry is NEVER traversal equivalence — an ancestor's
         // depth-8 walk does not reach what a nested root's own depth-8
@@ -505,7 +647,7 @@ final class DevRootsStoreTests: XCTestCase {
 
         XCTAssertEqual(resolution.keptRoots.map(\.path), [good.path],
                        "the CLI replacement path runs the SAME policy")
-        XCTAssertEqual(resolution.issues.map(\.kind), [.containerRefused])
+        XCTAssertEqual(resolution.issues.map(\.kind), [.policyRefusedRoot])
         XCTAssertNil(storedValue,
                      "a per-invocation replacement is NEVER persisted")
     }

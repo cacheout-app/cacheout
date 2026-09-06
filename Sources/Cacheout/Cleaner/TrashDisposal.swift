@@ -687,14 +687,25 @@ enum TrashDisposal {
             }
         }
 
-        /// WHAT TO DO NEXT — A CLOSED SET (PR #460 codex r18, E).
+        /// WHAT TO DO NEXT — A CLOSED SET (PR #460 codex r18, E), AND
+        /// NOTHING BUT A SELECTOR (fn-4.22).
         ///
         /// The remedy used to be the one clause with no constraint on it at
         /// all: `contract(for: .theRemedyForThisRefusal)` had no `all` and no
         /// `any`, so it was free text bounded by two word lists, and
         /// `rescan`'s wording was shared by five of the six causes anyway.
-        /// It is an enumeration now, so "a remedy nobody wrote down" is not
-        /// a thing that can be said.
+        /// r18 made it an enumeration — but left the WORDS on the enum as a
+        /// `text` property whose only check compared the rendered clause
+        /// against the enum's OWN text, a tautology any prose satisfies.
+        /// MEASURED for fn-4.22's task: appending a placing claim ("The item
+        /// the Trash took is safe in the Trash.") to a remedy wording passed
+        /// the whole fence.
+        ///
+        /// So the enum now carries NO text at all. The remedy's wordings
+        /// live in `sentence(for:path:landed:remedy:)` with every other
+        /// proposition's — the one wording table the fence pins BYTE-EXACT —
+        /// and a remedy clause is exactly as unrepresentable-without-a-pin-
+        /// edit as any other clause.
         enum Remedy: String, CaseIterable, Sendable {
             /// The disposal was refused; the state on disk may have moved, so
             /// the only sound next step is to look again.
@@ -702,16 +713,6 @@ enum TrashDisposal {
             /// …and for the one cause where the Trash itself is what could
             /// not be pinned down, the disposal that does not need it.
             case usePermanentDeleteInstead
-
-            var text: String {
-                switch self {
-                case .rescan:
-                    return "Refused; re-scan required."
-                case .usePermanentDeleteInstead:
-                    return "Use permanent delete (turn off Move to Trash) for "
-                        + "a disposal that proves the folder it acts on."
-                }
-            }
         }
 
         /// `default`-less, like every other per-cause table here.
@@ -757,6 +758,25 @@ enum TrashDisposal {
         static let openingFacts: Set<Established> = [
             .theDisposalWasNotProvedToHaveMovedTheItem,
             .theLandingWasNotReported,
+        ]
+
+        /// THE RETIRED PROPOSITIONS — established by NO arm, spoken by
+        /// nobody, kept nameable so the fence can assert exactly that
+        /// (fn-4.22).
+        ///
+        /// This set used to live only in the TEST, where it could not know
+        /// about a case added after it — a new proposition simply skipped
+        /// every retired-case assertion. It is a production declaration now,
+        /// and the fence DERIVES the unspoken set from `established(for:)`
+        /// over every cause and requires it to equal this one: a new case
+        /// claimed by no cause must be added HERE (a visible retirement,
+        /// whose sentence must be nil), and a new case claimed by any cause
+        /// must survive the byte-exact vocabulary pin. Either way the fence
+        /// notices the extension without having predicted it.
+        static let retired: Set<Established> = [
+            .theTrashHoldsWhatItTook,
+            .nothingWasFreedOnDisk,
+            .theTargetWasReplaced,
         ]
 
         /// **THE ONE WORDING OF ONE PROPOSITION** — and the reason the
@@ -807,22 +827,30 @@ enum TrashDisposal {
         /// (a), (d), (e) and (f) go with the text inspection they belonged
         /// to.
         ///
-        /// ## THE RESIDUAL, WHICH IS REAL AND IS THE POINT OF THE SHAPE
+        /// ## THE RESIDUAL, DISCLOSED BY MECHANISM (fn-4.22)
         ///
-        /// Someone can still write a sentence HERE that asserts more than the
-        /// proposition it is filed under — this table is where the semantic
-        /// judgement now lives, and no test can check it. What changed is its
-        /// SIZE and its SHAPE: it is one wording per proposition, fourteen of
-        /// them, in one `default`-less `switch`, reviewed once and shared by
-        /// every cause — rather than one wording per (cause × clause),
-        /// written afresh at each of six call sites, which is where all nine
-        /// of this branch's false sentences were written. It is a smaller
-        /// surface that a reviewer can read end to end, not a proof.
+        /// Every wording in this switch — the remedy wordings included — is
+        /// pinned BYTE-EXACT by
+        /// `TrashDisposalHopProofTests.testTheVocabularyAndEveryWordingArePinnedSoExtensionFailsClosed`,
+        /// so editing a sentence here, grafting a clause into one, or adding
+        /// an `Established` case at all is a red cell until the pin is
+        /// re-stated in the fence's own diff. What survives that, stated as
+        /// mechanisms rather than as "some wordings may pass":
         ///
-        /// The second residual is unchanged and equally real: an author can
-        /// edit `established(for:)` to admit a proposition the code path does
-        /// not prove. That table is the derivation, and E3 found it already
-        /// wrong about its own code in the commit that introduced it.
+        /// 1. **A coordinated edit**: change a wording here AND its pin in
+        ///    the same commit. The fence cannot judge whether the new
+        ///    sentence asserts more than its proposition — that is a
+        ///    semantic judgement — it can only force the sentence to appear
+        ///    verbatim in the fence's diff, where a reviewer reads it. The
+        ///    same holds for the wordings as originally pinned: the pin
+        ///    freezes what was reviewed, it does not prove it.
+        /// 2. **The derivation table**: an author can edit
+        ///    `established(for:)` to admit a proposition the code path does
+        ///    not prove — E3 found that table already wrong about its own
+        ///    code in the commit that introduced it. `placesTheItem(_:)`
+        ///    narrows this for placing propositions (the fixture cells that
+        ///    MEASURED where the item is assert their cause establishes no
+        ///    placing fact), and nothing narrows it for the rest.
         ///
         /// `nil` means "this proposition is never spoken": the three no arm
         /// establishes, and any fact whose payload this cause does not carry
@@ -884,7 +912,17 @@ enum TrashDisposal {
                 // qualifier is load-bearing and has been attacked twice.
                 return "No entry was written and nothing was reported freed."
             case .theRemedyForThisRefusal:
-                return remedy.text
+                // The remedy WORDS live here, not on `Remedy` (fn-4.22):
+                // this switch is inside the one wording table the fence pins
+                // byte-exact, so a remedy clause can no longer be edited
+                // past a check that compared it with itself.
+                switch remedy {
+                case .rescan:
+                    return "Refused; re-scan required."
+                case .usePermanentDeleteInstead:
+                    return "Use permanent delete (turn off Move to Trash) for "
+                        + "a disposal that proves the folder it acts on."
+                }
             case .theTrashHoldsWhatItTook, .nothingWasFreedOnDisk,
                  .theTargetWasReplaced:
                 // NO ARM ESTABLISHES THESE, so they are never spoken. Each

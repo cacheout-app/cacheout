@@ -566,13 +566,16 @@ candidate land in `ScanOutcome.errors`. `Kind` is EXTENSIBLE — never write
 consumers that assume the case list is closed. Wire strings (frozen):
 `container_refused`, `mounted_volume_root`,
 `mounted_volume_root_at_registration`, `policy_refused_root`,
-`symlink_root`, `non_directory_root`, `tcc_denied`, `permission_denied`,
-`unreadable`, `enumeration_truncated`, `config_invalid`, `tool_unavailable`,
-`malformed_outcome`. `.malformedOutcome` is
-synthesized ONLY by the runtime's validation, never by scanners.
-`.configInvalid`, `.toolUnavailable` and `.malformedOutcome` are the
-NON-FILESYSTEM kinds: their `url` is nil and the wire row therefore carries
-no `path`.
+`mutation_scope_refused`, `symlink_root`, `non_directory_root`,
+`tcc_denied`, `permission_denied`, `unreadable`, `enumeration_truncated`,
+`config_invalid`, `tool_unavailable`, `malformed_outcome`,
+`scan_did_not_finish` (the last was missing here until fn-4.12 — this list
+rots; PROTOCOL.md's `kind` row is the tested one). `.malformedOutcome` is
+synthesized ONLY by the runtime's validation, never by scanners;
+`.scanDidNotFinish` only by the runtime's session watchdog.
+`.configInvalid`, `.toolUnavailable`, `.malformedOutcome` and
+`.scanDidNotFinish` are the NON-FILESYSTEM kinds: their `url` is nil and
+the wire row therefore carries no `path`.
 `mounted_volume_root` is a registered root with another volume mounted at
 it — NOT a refusal of the root, and clearable by unmounting (added PR #459
 review r11; the GUI's visible row label is derived from the kind alone, so
@@ -583,7 +586,18 @@ close the two siblings of that same defect on `ephemeral_tmp`: a scanner
 builds its `PathGuard` from its own roots, so a root the policy refuses was
 configured and `container_refused`'s label was false for every firing; and
 `symlink_root`'s label ("symlinked — not searched") was false for a root
-replaced by a regular file, FIFO, socket or device.
+replaced by a regular file, FIFO, socket or device. fn-4.12 swept the SAME
+audit over every other producer: dev-root resolution and the dev-root walk
+now emit `policy_refused_root`/`mounted_volume_root`/`non_directory_root`
+for the conditions they used to flatten into `container_refused` and
+`symlink_root`; the orphaned-caches sweep root splits
+`symlink_root`/`non_directory_root` the same way; and
+`mutation_scope_refused` (new kind, fn-4.12) carries `git_worktrees`'
+containment refusals, whose candidates ARE inside a configured root.
+A bare-errno EPERM no longer reports as `tcc_denied` anywhere — only a
+Cocoa-chain-proven EPERM does (`DirectorySizer.classifyDenial`); raw-probe
+EPERM reports neutral `unreadable`, so the `tcc_denied` grant hint is never
+printed on a guess.
 `config_invalid` was missing from this list while the binary could emit it
 (fixed in PR #459 review r2; `DocumentedContractTests` only reads
 PROTOCOL.md, which did list it, so nothing caught the drift).

@@ -96,10 +96,12 @@
 /// the resolver-carried admin container all lie inside the SAME declared dev
 /// root — the parent alone may EQUAL the root (a
 /// dev root that IS a repository is legal), everything else is a STRICT
-/// descendant. A worktree outside every root, or a parent/admin container
-/// outside the worktree's root, becomes a `.containerRefused` issue and NEVER
-/// an item (D3: no display-only admission exists, and emitting one malforms
-/// the whole outcome).
+/// descendant. A worktree outside every root becomes a `.containerRefused`
+/// issue; a parent/admin container outside the worktree's root becomes a
+/// `.mutationScopeRefused` one (fn-4.12 — that worktree IS inside a
+/// configured root, so the old kind's label was false for it). NEVER an item
+/// either way (D3: no display-only admission exists, and emitting one
+/// malforms the whole outcome).
 ///
 /// Because `GitWorktreeReclaimPlan.violation` checks containment LEXICALLY on
 /// the verbatim spellings (a second resolution at validation time would race
@@ -132,15 +134,17 @@ import os
 /// can name a path under a TCC-protected ancestor. The path is unknowable
 /// before the pointer is read, so the gate cannot precede the resolution — it
 /// is applied INSIDE it, by making the deferred paths look like they are not
-/// there. The resolver probes each pointer target before it opens anything, so
-/// on an automatic scan nothing under a protected ancestor is ever opened,
-/// enumerated or read.
-///
-/// What DOES still happen on a deferred path is `canonicalize` — `realpath(3)`,
-/// the same operation fn-4's pinned protected-root classification performs on a
-/// protected root before skipping it (`ProjectTreeWalker.isProtectedRoot`
-/// canonicalizes first, by design). The house doctrine already draws the line
-/// there, and this wrapper does not move it.
+/// there. The resolver probes each pointer target before it opens — and,
+/// since fn-4.26, before it CANONICALIZES — anything: `realpath(3)` traverses
+/// every component it resolves, so the probe-then-canonicalize order is what
+/// keeps an automatic scan from walking a protected path while ruling it
+/// untouchable. (This doc used to claim a pre-gate `canonicalize` was fine
+/// because `ProjectTreeWalker.isProtectedRoot` "canonicalizes first, by
+/// design" — that predicate now classifies a directly-protected spelling
+/// LEXICALLY before it ever canonicalizes, so neither side dereferences such
+/// a path, and the line the claim leaned on no longer exists.) On an
+/// automatic scan nothing under a protected ancestor is opened, enumerated,
+/// read, or realpath'd through.
 ///
 /// `.absent` rather than `.failed` deliberately: a policy deferral is not a
 /// problem to report (the walker skips a vanished entry quietly for the same
@@ -182,7 +186,14 @@ private final class DeferringIdentityProvider: FileSystemIdentityProvider {
 
     // Path arithmetic is delegated UNCHANGED so an injected test provider's
     // aliasing still flows through (and so the deferral above is the only
-    // behavioural difference).
+    // behavioural difference). SAFE only because of ORDER (fn-4.26): the
+    // resolver asks `probeKind` — which the deferral intercepts — for every
+    // pointer-derived path BEFORE it canonicalizes it, and the deferral
+    // predicate itself classifies directly-protected spellings lexically. A
+    // caller that canonicalized first would traverse the protected path
+    // through this very pass-through; that ordering is pinned red by
+    // `testAutomaticScanNeverRealpathsThroughAProtectedAdminDirectory` and
+    // the resolver-level deferral cells.
     override func realPath(of path: String) -> String? { wrapped.realPath(of: path) }
 
     override func canonicalize(_ url: URL) -> URL { wrapped.canonicalize(url) }
@@ -190,8 +201,10 @@ private final class DeferringIdentityProvider: FileSystemIdentityProvider {
 
 // MARK: - Discovery
 
-/// What a `.git` entry proved about the directory that holds it. Both kinds
-/// come from ONE lstat no-follow probe the walker already performed.
+/// What a walk event proved about the directory it describes. The first two
+/// kinds come from ONE lstat no-follow probe of a `.git` entry the walker
+/// already performed; the third from the resolver's bare-shape proof over a
+/// directory that has no `.git` entry at all.
 enum GitWorktreeDiscoveryKind: Equatable, Sendable {
     /// `.git` is a DIRECTORY — the holder is a main checkout, and that
     /// directory IS the repository's git directory.
@@ -199,6 +212,13 @@ enum GitWorktreeDiscoveryKind: Equatable, Sendable {
     /// `.git` is a regular FILE — the holder is a linked worktree whose
     /// pointer the fn-5.1 resolver validates bidirectionally.
     case linkedWorktree
+    /// The directory has NO `.git` entry and IS a git directory itself: the
+    /// bare-repository shape, proved by the resolver's
+    /// `bareRepositoryGitDirectory` (fn-4.28). Without this kind a bare
+    /// parent whose checkouts were all deleted was never discovered, and the
+    /// prune tier never ran for exactly the all-checkouts-gone case it
+    /// exists to reclaim.
+    case bareRepository
 }
 
 /// One directory the walk proved to be a checkout, in walk order.
@@ -226,17 +246,30 @@ struct GitWorktreeDiscovery: Equatable, Sendable {
     /// That admin entry's identity at the SAME instant. `nil` when the
     /// pointer did not resolve or the `lstat` failed then.
     let adminWitness: AdminWitness?
+    /// THE DISCOVERED DIRECTORY's identity, as of the instant this scanner
+    /// accepted it — a bare repository's at the moment its bare-shape proof
+    /// passed, a main checkout's at the moment the walk observed its `.git`.
+    ///
+    /// EVERY arm carries one (PR #461 codex r5). The linked arm has since
+    /// PR #460 r17; r4 gave the bare arm one; and the MAIN-CHECKOUT arm had
+    /// none at all, which mattered most because `listingTarget` PREFERS a
+    /// main checkout, so the unproven URL was the one that most often
+    /// decided where `git -C` ran. Fixing the arm a reviewer named and
+    /// leaving its sibling is how that survived two rounds.
+    let directoryWitness: AdminWitness?
 
     init(
         directory: URL,
         kind: GitWorktreeDiscoveryKind,
         adminDirectory: URL? = nil,
-        adminWitness: AdminWitness? = nil
+        adminWitness: AdminWitness? = nil,
+        directoryWitness: AdminWitness? = nil
     ) {
         self.directory = directory
         self.kind = kind
         self.adminDirectory = adminDirectory
         self.adminWitness = adminWitness
+        self.directoryWitness = directoryWitness
     }
 }
 
@@ -379,6 +412,34 @@ struct GitWorktreeScanner: @unchecked Sendable {
         // prunes NOTHING (the walker's own `.git` hard prune is the only prune
         // this scanner needs, and a name-based skip list is the anti-pattern
         // that made the field case invisible).
+        //
+        // YES, `BuildArtifactsScanner.scan` walks the same kept roots
+        // (fn-4.18, Codex PR #460 P2: "nearly double filesystem I/O and
+        // latency"). MEASURED before designing anything, and the claim is
+        // CORRECTED, not inherited — the numbers and their pinned facts live
+        // in DevTreeWalkMeasurementTests. The two walks are asymmetric: the
+        // build walk prunes every matched artifact directory while this one
+        // deliberately descends everything (nested repositories are its
+        // quarry), so on an artifact-bearing tree the duplicated enumeration
+        // is only their intersection — 249 of 11544 entry probes (2.2%) on
+        // the measured tree. A fused walk must carry THIS walk's unpruned
+        // reach, and the build scanner pays its sizing census either way.
+        // True doubling exists only on a tree with no artifacts and no
+        // repository, where a whole walk measured single-digit milliseconds.
+        //
+        // WHY THE FAN-IN IS RECORDED RATHER THAN BUILT: the walker already
+        // takes N consumers, but a shared walk must be PER SCAN SESSION —
+        // the witness this consumer captures is walk-instant and is what the
+        // whole r16/r17 re-proof chain hangs off, so it can never be served
+        // from an earlier session's walk. Scanners run concurrently in the
+        // session task group, are also scanned individually (the GUI's and
+        // CLI's scanner filters), and nothing at the `SpaceScanner` boundary
+        // names a session for two `scan(context:)` calls to rendezvous on —
+        // coalescing on accidental concurrency would make the walk count
+        // timing-dependent in the safety path. Buying the measured 2% would
+        // therefore mean rewriting the protocol's "a scanner does its own
+        // I/O" contract, which the task's own boundary forbids: recorded,
+        // with the numbers, and stopped (fn-4.18).
         var discoveries: [GitWorktreeDiscovery] = []
         let walker = ProjectTreeWalker(
             home: home, pathGuard: pathGuard, provider: provider
@@ -426,7 +487,11 @@ struct GitWorktreeScanner: @unchecked Sendable {
                 // indistinguishable from a clean machine, so EVERY item is
                 // withdrawn and the unavailability is published instead. The
                 // runner's availability verdict is instance-cached, so no
-                // further repository could succeed anyway.
+                // further repository could succeed anyway — and since codex
+                // r3 that reasoning is sound, because only a DEFINITIVE
+                // unavailability reaches here. A transient launch failure is
+                // reported per repository and the scan continues; it is not
+                // cached, so the next repository genuinely can succeed.
                 observeAssessments(log)
                 issues.append(Self.toolUnavailableIssue)
                 return ScanOutcome(items: [], errors: issues)
@@ -501,8 +566,16 @@ struct GitWorktreeScanner: @unchecked Sendable {
             // so it is not a checkout as far as this scanner is concerned).
             switch entry.kind {
             case .directory:
+                // The same witness the other two arms carry, taken at the
+                // instant the walk observed this `.git` (PR #461 codex r5).
                 discoveries.append(GitWorktreeDiscovery(
-                    directory: event.directory, kind: .mainCheckout
+                    directory: event.directory, kind: .mainCheckout,
+                    directoryWitness: provider.identity(of: event.directory)
+                        .map {
+                            GitWorktreeDiscovery.AdminWitness(
+                                entryPath: event.directory.path, identity: $0
+                            )
+                        }
                 ))
             case .regularFile:
                 let admin = resolver.adminDirectory(forWorktreeAt: event.directory)
@@ -517,13 +590,99 @@ struct GitWorktreeScanner: @unchecked Sendable {
                 }
                 discoveries.append(GitWorktreeDiscovery(
                     directory: event.directory, kind: .linkedWorktree,
-                    adminDirectory: admin, adminWitness: witness
+                    adminDirectory: admin, adminWitness: witness,
+                    // Its ADMIN entry has been witnessed since PR #460 r17;
+                    // its own DIRECTORY had not been, and `listingTarget`
+                    // falls back to a linked worktree when a repository has
+                    // no main checkout (PR #461 codex r5). Two witnesses
+                    // about two different objects.
+                    directoryWitness: provider.identity(of: event.directory)
+                        .map {
+                            GitWorktreeDiscovery.AdminWitness(
+                                entryPath: event.directory.path, identity: $0
+                            )
+                        }
                 ))
             case .symlink, .other:
                 continue
             }
         }
+
+        // THE BARE BRANCH (fn-4.28). A bare repository stores `HEAD`,
+        // `objects` and its refs backend directly at its root, with no
+        // `.git` entry — so once its linked checkouts are all deleted,
+        // nothing above could discover it and the prune tier never ran for
+        // exactly the all-checkouts-gone case it exists for.
+        //
+        // The event's OWN lstat'd entries are the cost gate: only a
+        // directory that already shows the full bare shape — and no `.git`
+        // entry of ANY kind, because a directory holding one is a checkout
+        // or nothing — pays for the resolver's proof, which re-probes every
+        // component through the (possibly deferring) provider and reads
+        // `HEAD` and `config` only behind their `probeKind` gates. A
+        // directory that merely LOOKS bare fails that proof and contributes
+        // nothing: no discovery, no issue, no git subprocess.
+        if !event.entries.contains(where: { $0.name == ".git" }),
+           event.entries.contains(where: {
+               $0.name == "HEAD" && $0.kind == .regularFile
+           }),
+           event.entries.contains(where: {
+               $0.name == "objects" && $0.kind == .directory
+           }),
+           event.entries.contains(where: {
+               ($0.name == "refs" || $0.name == "reftable") && $0.kind == .directory
+           }),
+           let witness = Self.bareDirectoryWitness(
+               for: event.directory, resolver: resolver, provider: provider
+           ) {
+            discoveries.append(GitWorktreeDiscovery(
+                directory: event.directory, kind: .bareRepository,
+                directoryWitness: witness
+            ))
+        }
         return []
+    }
+
+    /// The bare-shape proof AND the identity of the object it proved,
+    /// bracketed so the two cannot be about different objects.
+    ///
+    /// The first version captured the identity AFTER
+    /// `bareRepositoryGitDirectory` returned (PR #461 codex r5). A
+    /// replacement landing in that gap was recorded as the witness, so
+    /// grouping's re-check then agreed with itself about the STRANGER and
+    /// canonicalized it into a `git -C` target outside the configured root.
+    /// Closing one window by opening a narrower one is not closing it.
+    ///
+    /// Capture BEFORE, validate, require UNCHANGED after: any replacement
+    /// during the validation is refused, so the identity carried forward is
+    /// the identity of the object whose metadata was actually read.
+    ///
+    /// ORDERING NOTE, disclosed (PR #461 gate r5): the first `identity(of:)`
+    /// here is the RAW provider, and it runs BEFORE the resolver's TCC gate.
+    /// Prior to the bracket that lstat happened only after the gate had
+    /// passed. An `lstat` is outside the doctrine sentence this file states
+    /// for protected paths ("opened, enumerated, read, or realpath'd
+    /// through"), so it remains in policy — but it is a real ordering change
+    /// on the TCC path, made by an identity fix, and it should not have to be
+    /// rediscovered from the diff.
+    ///
+    /// RESIDUAL: this is bracketed, not descriptor-bound. An object swapped
+    /// out and back inside the bracket is indistinguishable by inode, and
+    /// the reads inside `bareRepositoryGitDirectory` still resolve by path.
+    /// A descriptor-bound identity is the complete answer and is filed as
+    /// fn-5-stale-git-worktree-scanner.7.
+    static func bareDirectoryWitness(
+        for directory: URL,
+        resolver: GitWorktreeGitdirResolver,
+        provider: FileSystemIdentityProvider
+    ) -> GitWorktreeDiscovery.AdminWitness? {
+        guard let before = provider.identity(of: directory),
+              resolver.bareRepositoryGitDirectory(at: directory) != nil,
+              provider.identity(of: directory) == before
+        else { return nil }
+        return GitWorktreeDiscovery.AdminWitness(
+            entryPath: directory.path, identity: before
+        )
     }
 
     // MARK: - Repository grouping (the PRE-FETCH half of the fetch-once rule)
@@ -598,6 +757,18 @@ struct GitWorktreeScanner: @unchecked Sendable {
                 // repository's git directory — an observation, not a
                 // reconstruction (and cross-validated against the porcelain
                 // first record before anything is derived from it).
+                //
+                // RE-PROVED FIRST, on the same terms as the bare arm below
+                // (PR #461 codex r5). This arm canonicalized an unbound URL,
+                // which is bit-for-bit what r4 fixed for bare — and it is
+                // worse here, because a replacement's own porcelain record
+                // cross-validates against its own canonicalized git
+                // directory, so the two AGREE and the scan proceeds in
+                // silence.
+                guard let witness = discovery.directoryWitness,
+                      provider.identity(of: discovery.directory)
+                          == witness.identity
+                else { continue }
                 gitDirectory = provider.canonicalize(
                     discovery.directory.appendingPathComponent(".git")
                 )
@@ -612,6 +783,25 @@ struct GitWorktreeScanner: @unchecked Sendable {
                 }
                 gitDirectory = discovery.adminDirectory
                     .flatMap { resolver.commonGitDirectory(forAdminDirectory: $0) }
+            case .bareRepository:
+                // The directory ITSELF is the git directory — the resolver's
+                // bare-shape proof said so in the walk consumer (fn-4.28).
+                // Canonicalized exactly as the main-checkout arm
+                // canonicalizes `<dir>/.git`, so a bare parent reached both
+                // ways (its own shape AND a live checkout's `gitdir:`
+                // pointer) names ONE group and pays for ONE listing.
+                // RE-PROVED BEFORE `realpath` TOUCHES IT (PR #461 codex
+                // r4). `canonicalize` resolves every component, so on a
+                // replacement it both follows the stranger and can block on
+                // it. A discovery whose directory is no longer the object
+                // the bare-shape proof accepted contributes nothing —
+                // the same silent non-discovery this arm already takes when
+                // a pointer fails to resolve, and the safe direction.
+                guard let witness = discovery.directoryWitness,
+                      provider.identity(of: discovery.directory)
+                          == witness.identity
+                else { continue }
+                gitDirectory = provider.canonicalize(discovery.directory)
             }
             guard let gitDirectory else { continue }
             let key = gitDirectory.path
@@ -717,11 +907,39 @@ struct GitWorktreeScanner: @unchecked Sendable {
             !isDeferred($0.directory, context: context)
         }
         // A main checkout is the friendliest `-C` target; a bare parent has
-        // none, so its linked worktree is used instead.
-        guard let listingTarget = (reachable.first { $0.kind == .mainCheckout }
-                                   ?? reachable.first)?.directory else {
+        // none, so its own discovered directory — or, before fn-4.28 gave
+        // bare repositories a discovery of their own, a linked worktree —
+        // is used instead (`git -C <bare> worktree list` is the documented
+        // bare workflow).
+        guard let chosen = reachable.first(where: { $0.kind == .mainCheckout })
+            ?? reachable.first else {
             return .processed // every reachable checkout is protected — deferred
         }
+        // RE-PROVED HERE, WHERE THE PATH BECOMES A `git -C` ARGUMENT
+        // (PR #461 codex r5). Grouping's re-check binds `canonicalize` and
+        // nothing else: between it and this line the scanner runs the rest of
+        // the grouping loop, every EARLIER group's full processing (each
+        // awaiting git subprocesses), two deferral checks and an admin-
+        // container enumeration. That window is unbounded and GROWS with the
+        // repository count — the very shape this file condemns for r16 — and
+        // a replacement landing in it put `git worktree list` on a repository
+        // outside every configured root.
+        //
+        // Reported, not skipped in silence: a scan that quietly drops a
+        // repository is indistinguishable from one that found nothing there.
+        guard let targetWitness = chosen.directoryWitness,
+              provider.identity(of: chosen.directory) == targetWitness.identity
+        else {
+            issues.append(ScanIssue(
+                url: chosen.directory, kind: .unreadable,
+                detail: "this checkout is no longer the object the scan "
+                    + "discovered — it was replaced before git could be run "
+                    + "against it, so no worktrees of it were assessed. "
+                    + "Re-scan to see what is there now"
+            ))
+            return .processed
+        }
+        let listingTarget = chosen.directory
 
         // (a2) THE WALK-INDEPENDENT PRE-LISTING WITNESSES (PR #460 codex
         //      r17, W1). The walk and the porcelain listing are two
@@ -792,6 +1010,31 @@ struct GitWorktreeScanner: @unchecked Sendable {
             ))
             return .processed
         case .gitUnavailable:
+            // TRANSIENT LAUNCH FAILURE IS NOT A MISSING TOOL (PR #461 codex
+            // r3). `.gitUnavailable` carries two causes and only one is
+            // permanent: `/usr/bin/env` answering 127 means git is genuinely
+            // not on PATH, while a throwing launch is ENOMEM/EAGAIN/EMFILE
+            // under momentary pressure — and since this PR made every spawn
+            // allocation checked, an out-of-memory `strdup` arrives here too.
+            //
+            // Propagating the transient case withdrew the WHOLE scan and
+            // published `.toolUnavailable`, telling the user to install a git
+            // that is already installed. It also made the caller's own
+            // justification false: that branch withdraws everything because
+            // "the runner's availability verdict is instance-cached, so no
+            // further repository could succeed anyway" — but a NON-definitive
+            // verdict is deliberately not cached, so the next repository can
+            // succeed. Only the definitive answer may withdraw the scan.
+            guard listing.unavailabilityIsDefinitive else {
+                issues.append(ScanIssue(
+                    url: listingTarget, kind: .unreadable,
+                    detail: "git could not be launched for this repository — "
+                        + "a transient launch failure, not a missing tool "
+                        + "(git was never proven absent) — so no worktrees of "
+                        + "it were assessed. Re-scan to try again."
+                ))
+                return .processed
+            }
             return .gitUnavailable
         }
 
@@ -993,6 +1236,12 @@ struct GitWorktreeScanner: @unchecked Sendable {
         // path outside every root is exactly what the secondary gate exists to
         // limit, and no assessment of it could change the answer.
         guard !rootsStrictlyContaining(worktreeIdentity, in: bindings).isEmpty else {
+            // `.containerRefused` is TRUE here and stays (fn-4.12 producer
+            // audit): its fixed GUI label — "not a configured search root"
+            // — is exactly this worktree's condition, sitting outside every
+            // configured root. The containment arms below are the ones that
+            // moved (`.mutationScopeRefused`): their candidates ARE inside
+            // a configured root, so that same sentence was false there.
             issues.append(ScanIssue(
                 url: record.path, kind: .containerRefused,
                 detail: "registered worktree '\(record.path.path)' is outside "
@@ -1094,8 +1343,12 @@ struct GitWorktreeScanner: @unchecked Sendable {
         )
         guard case .bound(let root, let parent, let strict) = scope else {
             if case .unbound(let reason) = scope {
+                // `.mutationScopeRefused`, NOT `.containerRefused`
+                // (fn-4.12): this worktree IS inside a configured dev root
+                // — the detail's first clause has always said so — while
+                // the old kind's fixed GUI label said the opposite.
                 issues.append(ScanIssue(
-                    url: record.path, kind: .containerRefused,
+                    url: record.path, kind: .mutationScopeRefused,
                     detail: "worktree '\(record.path.path)' is inside a "
                         + "configured dev root but \(reason) — git mutates the "
                         + "parent repository's admin data, so the whole "
@@ -1453,8 +1706,13 @@ struct GitWorktreeScanner: @unchecked Sendable {
         )
         guard case .bound(let root, let parent, let strict) = scope else {
             if case .unbound(let reason) = scope {
+                // `.mutationScopeRefused` (fn-4.12): the withheld candidate
+                // is the repository's admin data, not a search root, and
+                // `.containerRefused`'s fixed GUI label ("not a configured
+                // search root") diagnosed the wrong thing — the refusal is
+                // the prune's mutation scope, which `reason` names.
                 issues.append(ScanIssue(
-                    url: parentRepoWorkingDir, kind: .containerRefused,
+                    url: parentRepoWorkingDir, kind: .mutationScopeRefused,
                     detail: "orphaned worktree admin data in this repository "
                         + "cannot be offered for pruning because \(reason) — "
                         + "the whole mutation scope must share one declared "
@@ -1768,9 +2026,11 @@ struct GitWorktreeScanner: @unchecked Sendable {
     ///
     /// So on `.automatic` the resolver runs on a provider that reports every
     /// deferred path as ABSENT. The resolver is fail-closed by construction —
-    /// it `probeKind`s each pointer target BEFORE reading it — so the deferral
-    /// lands before any `open`, and the worktree simply attributes nowhere
-    /// (silent, exactly like every other policy skip).
+    /// it `probeKind`s each pointer target BEFORE reading it, and (fn-4.26)
+    /// before CANONICALIZING it, `realpath(3)` being a traversal of its own —
+    /// so the deferral lands before any `open` and before any dereference,
+    /// and the worktree simply attributes nowhere (silent, exactly like every
+    /// other policy skip).
     private func identityProvider(for context: ScanContext) -> FileSystemIdentityProvider {
         guard !context.includeProtectedRoots else { return provider }
         let home = self.home

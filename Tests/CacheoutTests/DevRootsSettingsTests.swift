@@ -17,7 +17,8 @@ import XCTest
 ///   duplicate: `/`, a volume root, `$HOME`, and symlink aliases of each are
 ///   REFUSED inline while `~/Documents` and `~/Documents/dev` are ACCEPTED;
 /// - `CacheoutViewModel.devRootRows` — the declared list with the
-///   `.containerRefused` detail of any policy-rejected persisted root;
+///   `.policyRefusedRoot` detail of any policy-rejected persisted root
+///   (fn-4.12; `.containerRefused` before that);
 /// - `ScanIssueRowPresentation` — the visible per-root error row: a denied
 ///   root with its grant-access affordance, a refused configured root, and
 ///   the PATH-LESS `.configInvalid` parse failure (no invented path).
@@ -399,13 +400,17 @@ final class DevRootsSettingsTests: XCTestCase {
 
         let refused = ScanIssueRowPresentation(
             issue: ScanIssue(
-                url: URL(fileURLWithPath: "/"), kind: .containerRefused,
+                // The kind `DevRootsStore` emits for this detail since
+                // fn-4.12 — the row and the tooltip agree that the root IS
+                // configured.
+                url: URL(fileURLWithPath: "/"), kind: .policyRefusedRoot,
                 detail: "configured dev root refused: …"
             ),
             home: fixtureHome
         )
         XCTAssertEqual(refused.location, "/", "the row NAMES the root")
-        XCTAssertEqual(refused.label, "not a configured search root")
+        XCTAssertEqual(refused.label,
+                       "refused by the search-root safety policy")
         XCTAssertFalse(refused.showsSettingsLink,
                        "no settings link that cannot help")
 
@@ -490,12 +495,11 @@ final class DevRootsSettingsTests: XCTestCase {
     ///
     /// The two kinds are asserted TOGETHER and must differ in both halves:
     /// the mounted row states the condition AND its remedy, and the refusal
-    /// row is left exactly as it was, because `DevRootsStore` (a
-    /// policy-rejected persisted root) and `ProjectTreeWalker` (a scan-time
-    /// admission refusal) still render through it. `EphemeralTempScanner`'s
-    /// own `admitSearchRoot` catch was the THIRD such producer until PR #459
-    /// codex r13 moved it to `.policyRefusedRoot`; the cell below is that
-    /// half.
+    /// row keeps its label for the ONE producer left on it (fn-4.12):
+    /// `GitWorktreeScanner`'s worktree-outside-every-root arm, where "not a
+    /// configured search root" is exactly the condition. `DevRootsStore`
+    /// and `ProjectTreeWalker` moved to `.policyRefusedRoot` in fn-4.12,
+    /// the same move `EphemeralTempScanner` made in PR #459 codex r13.
     func testAMountedRootRowStatesTheConditionAndTheRemedyRefusalRowUnchanged() throws {
         let root = URL(fileURLWithPath: "/private/tmp")
         let mounted = ScanIssueRowPresentation(
@@ -524,8 +528,9 @@ final class DevRootsSettingsTests: XCTestCase {
         XCTAssertFalse(mounted.showsSettingsLink,
                        "Full Disk Access cannot unmount a volume")
 
-        // The OTHER producers of `.containerRefused` are untouched: same
-        // kind, same fixed label as before this change.
+        // `.containerRefused` keeps its fixed label for its remaining
+        // producer (fn-4.12: `GitWorktreeScanner`'s outside-every-root arm,
+        // where the sentence IS the condition).
         let refusal = ScanIssueRowPresentation(
             issue: ScanIssue(
                 url: root, kind: .containerRefused, detail: "refused: …"
@@ -591,10 +596,12 @@ final class DevRootsSettingsTests: XCTestCase {
     ///
     /// Both halves are pinned in both directions: the new labels are exact,
     /// and the two OLD kinds still render exactly what they rendered before
-    /// — `.symlinkRoot` is still produced by four other call sites
-    /// (`EphemeralTempRoots`, `DevRootsStore`, `ProjectTreeWalker`,
-    /// `OrphanedCachesScanner`) and `.containerRefused` by two
-    /// (`DevRootsStore`, `ProjectTreeWalker`).
+    /// — `.symlinkRoot` still means "a symlink stands there" at every
+    /// producer (fn-4.12 narrowed `ProjectTreeWalker` and
+    /// `OrphanedCachesScanner` to symlinks only, as PR #459 did the temp
+    /// scanner; `EphemeralTempRoots`' and `DevRootsStore`'s alias arms were
+    /// symlink-only by construction) and `.containerRefused` keeps its one
+    /// remaining producer (`GitWorktreeScanner`'s outside-every-root arm).
     func testNonDirectoryAndPolicyRefusedRootsGetTheirOwnVisibleSentences() throws {
         let root = URL(fileURLWithPath: "/private/tmp")
 
@@ -664,6 +671,55 @@ final class DevRootsSettingsTests: XCTestCase {
                           "two conditions, two sentences")
     }
 
+    /// THE fn-4.12 SIBLING on the SAME derivation: the git-worktree
+    /// containment refusals' own kind. Pinned in both directions — the new
+    /// label is exact and claims no remedy, and `.containerRefused` (still
+    /// carried by the outside-every-root arm) keeps its old sentence,
+    /// distinct from this one.
+    func testMutationScopeRefusedGetsItsOwnVisibleSentence() throws {
+        let worktree = fixtureHome
+            .appendingPathComponent("Documents/GitHub/wt-feature")
+
+        let scopeRefused = ScanIssueRowPresentation(
+            issue: ScanIssue(
+                url: worktree, kind: .mutationScopeRefused,
+                detail: "worktree 'wt-feature' is inside a configured dev "
+                    + "root but the parent repository is outside every "
+                    + "declared root — git mutates the parent repository's "
+                    + "admin data, so the whole mutation scope must share "
+                    + "one declared root"
+            ),
+            home: fixtureHome
+        )
+        XCTAssertEqual(scopeRefused.location, "~/Documents/GitHub/wt-feature",
+                       "the row NAMES the withheld candidate")
+        XCTAssertEqual(
+            scopeRefused.label,
+            "git cleanup is not contained in one dev root — not offered"
+        )
+        XCTAssertFalse(
+            scopeRefused.label.contains("not a configured search root"),
+            "the candidate IS inside a configured root — asserting the "
+                + "opposite was the defect"
+        )
+        XCTAssertFalse(scopeRefused.showsSettingsLink,
+                       "no settings link that cannot help")
+        XCTAssertEqual(ScanIssue.Kind.mutationScopeRefused.wireString,
+                       "mutation_scope_refused")
+
+        let outsideEveryRoot = ScanIssueRowPresentation(
+            issue: ScanIssue(
+                url: worktree, kind: .containerRefused,
+                detail: "registered worktree is outside every configured "
+                    + "dev root"
+            ),
+            home: fixtureHome
+        )
+        XCTAssertEqual(outsideEveryRoot.label, "not a configured search root")
+        XCTAssertNotEqual(outsideEveryRoot.label, scopeRefused.label,
+                          "two conditions, two sentences")
+    }
+
     /// END TO END through the REAL scanner: a policy-rejected persisted root
     /// and a corrupt stored value both reach the GUI section as VISIBLE
     /// issue rows — never a zero-byte item row, never an empty section.
@@ -685,8 +741,10 @@ final class DevRootsSettingsTests: XCTestCase {
             home: fixtureHome,
             devRoots: DevRootsResolution(
                 keptRoots: resolution.keptRoots,
+                // The shape `DevRootsStore` actually emits since fn-4.12 —
+                // `.policyRefusedRoot`, because the root IS configured.
                 issues: resolution.issues + [ScanIssue(
-                    url: URL(fileURLWithPath: "/"), kind: .containerRefused,
+                    url: URL(fileURLWithPath: "/"), kind: .policyRefusedRoot,
                     detail: "configured dev root refused: filesystem root"
                 )]
             ),
@@ -709,14 +767,15 @@ final class DevRootsSettingsTests: XCTestCase {
 
         let kinds = section.issues.map(\.kind)
         XCTAssertTrue(kinds.contains(.configInvalid), "\(kinds)")
-        XCTAssertTrue(kinds.contains(.containerRefused), "\(kinds)")
+        XCTAssertTrue(kinds.contains(.policyRefusedRoot), "\(kinds)")
         let rows = section.issues.map {
             ScanIssueRowPresentation(issue: $0, home: fixtureHome)
         }
         XCTAssertTrue(rows.contains { $0.location == "Scanner output" })
         XCTAssertTrue(rows.contains {
-            $0.location == "/" && $0.label == "not a configured search root"
-        })
+            $0.location == "/"
+                && $0.label == "refused by the search-root safety policy"
+        }, "the row states the TRUE condition (fn-4.12)")
     }
 }
 

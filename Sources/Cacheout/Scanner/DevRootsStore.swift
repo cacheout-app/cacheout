@@ -31,8 +31,8 @@ struct DevRootsResolution: Equatable, Sendable {
     /// walker's `originRoot` carry these verbatim; validator origin binding
     /// needs them).
     let keptRoots: [URL]
-    /// Classified config issues: policy-rejected roots as the frozen
-    /// `.containerRefused` (with the offending declared path), whole-value
+    /// Classified config issues: policy-rejected roots as
+    /// `.policyRefusedRoot` (offending declared path; fn-4.12), whole-value
     /// parse failures as `.configInvalid` (url nil — no honest filesystem
     /// path exists).
     let issues: [ScanIssue]
@@ -258,26 +258,30 @@ struct DevRootsStore {
 
     /// The R16 pipeline over already-formed declared URLs:
     ///
-    /// 1. **Container-root admission policy** on EVERY root, canonicalized
-    ///    before the check (the shared `PathGuard.validateContainerRoot` —
-    ///    ONE definition, epic R16). Rejected roots are EXCLUDED from the
-    ///    kept set and carried as frozen `.containerRefused` issues with
-    ///    their offending declared path.
+    /// 1. **Container-root admission policy** on EVERY root (the shared
+    ///    `PathGuard.validateContainerRoot` — ONE definition, epic R16;
+    ///    since fn-4.11 it answers from the as-spelled probe, the kernel
+    ///    mount table, and — for a symlink leaf — the link's own content,
+    ///    never the destination). Rejected roots are EXCLUDED from the
+    ///    kept set and carried as `.policyRefusedRoot` issues with their
+    ///    offending declared path (fn-4.12 — these roots ARE configured).
     /// 2. **Exact-canonical-duplicate dedupe ONLY** (no keep-ancestor drop,
     ///    D7 — nested real roots remain independent walks). TWO values per
-    ///    root: a normalized comparison KEY (canonical path — symlinks and
-    ///    `..` resolved) used ONLY for duplicate comparison, and the
-    ///    ORIGINAL declared URL preserved untouched in the kept set. Only
-    ///    roots proven real directories by lstat NO-FOLLOW on the LEAF
-    ///    participate (symlinked ANCESTORS are legal — `/var` → `/private/
-    ///    var` — and resolve into the key); symlink-LEAF, absent, and
-    ///    non-directory roots are SET ASIDE and pass through verbatim —
-    ///    the walk-time per-root gates classify them (symlink/non-directory
-    ///    → classified issue; absent → honest no-item omission).
-    /// 3. **Alias suppression**: a set-aside root that resolves ONTO a kept
-    ///    real-directory root is DROPPED with a classified issue instead of
-    ///    passing through (see below) — the one case where "set aside"
-    ///    would break the root it aliases rather than merely itself.
+    ///    root: a normalized comparison KEY (canonical path — the leaf a
+    ///    real directory, so nothing foreign is resolved) used ONLY for
+    ///    duplicate comparison, and the ORIGINAL declared URL preserved
+    ///    untouched in the kept set. Only roots proven real directories by
+    ///    lstat NO-FOLLOW on the LEAF participate (symlinked ANCESTORS are
+    ///    legal — `/var` → `/private/var` — and resolve into the key);
+    ///    symlink-LEAF, absent, and non-directory roots are SET ASIDE and
+    ///    pass through verbatim — the walk-time per-root gates classify
+    ///    them (symlink/non-directory → classified issue; absent → honest
+    ///    no-item omission).
+    /// 3. **Alias suppression**: a set-aside root whose own link content
+    ///    NAMES a kept real-directory root is DROPPED with a classified
+    ///    issue instead of passing through (see below) — the one case where
+    ///    "set aside" would break the root it aliases rather than merely
+    ///    itself.
     ///    THIS LIST ONLY, by construction: dev roots resolve before any
     ///    runtime exists, so a dev root aliasing ANOTHER SCANNER's root
     ///    (`~/Library/Caches`, registered by the orphaned-caches sweep) is
@@ -291,9 +295,11 @@ struct DevRootsStore {
     ) -> DevRootsResolution {
         var issues = parseIssues
 
-        // (1) Policy — on the CANONICAL root (alias doctrine): a symlink
-        // alias of `/`, of a volume root, or of $HOME is caught here because
-        // the policy canonicalizes before checking.
+        // (1) Policy (alias doctrine): a symlink alias of `/`, of a mounted
+        // volume root, or of $HOME is caught here from the link's own
+        // CONTENT — the policy probes as spelled and never resolves a
+        // symlink leaf's destination (fn-4.11; the canonical check still
+        // runs for every non-symlink spelling).
         var admissible: [URL] = []
         for declared in declaredRoots {
             do {
@@ -304,53 +310,88 @@ struct DevRootsStore {
             } catch {
                 let reason = (error as? LocalizedError)?.errorDescription
                     ?? String(describing: error)
+                // `.policyRefusedRoot`, NOT `.containerRefused` (fn-4.12):
+                // this root IS configured — the detail below has always
+                // said so — and the GUI derives the visible row label from
+                // the kind alone, so the old kind rendered "not a
+                // configured search root" against a tooltip saying the
+                // opposite. WHICH policy clause refused rides the reason.
                 issues.append(ScanIssue(
                     url: declared,
-                    kind: .containerRefused,
+                    kind: .policyRefusedRoot,
                     detail: "configured dev root refused: \(reason)"
                 ))
             }
         }
 
-        // Probed ONCE per surviving root: the canonical comparison KEY, and
-        // whether the DECLARED spelling is itself a real directory (leaf
-        // lstat no-follow). The key resolves the leaf — it is a comparison
+        // Probed ONCE per surviving root, AS SPELLED FIRST (fn-4.11): the
+        // no-follow leaf lstat decides directory-ness, and only a spelling
+        // PROVEN a real directory is `realpath(3)`'d for its canonical
+        // comparison KEY — the resolved leaf then IS the directory the
+        // lstat touched, so no symlink destination is ever named. A
+        // symlink-leaf spelling contributes what its own CONTENT names
+        // instead (`FileSystemIdentityProvider.lexicalAliasTarget` — one
+        // `readlink(2)` + string folding, the fn-6 technique), which walks
+        // the link's ancestors and reads its data block but never contacts
+        // the destination. The previous shape canonicalized EVERY root here
+        // — leaf included — so a persisted symlink root aimed at an
+        // unresponsive mounted volume blocked runtime construction on the
+        // main thread before any window existed. The key is a comparison
         // value ONLY and never reaches the kept set, so the
         // `resolveTargetKeepingLeaf` doctrine is untouched.
-        let probed = admissible.map { declared in
-            (declared: declared,
-             key: provider.canonicalize(declared).path,
-             isDirectory: provider.probeKind(of: declared) == .kind(.directory))
+        let probed = admissible.map {
+            declared -> (declared: URL, key: String?, aliasTarget: String?) in
+            switch provider.probeKind(of: declared) {
+            case .kind(.directory):
+                return (declared, provider.canonicalize(declared).path, nil)
+            case .kind(.symlink):
+                return (declared, nil, provider.lexicalAliasTarget(of: declared))
+            default:
+                return (declared, nil, nil)
+            }
         }
-        // The canonical locations a REAL-DIRECTORY spelling already covers.
-        // A set-aside root resolving onto one of these is a redundant ALIAS
-        // of it — and an ACTIVELY HARMFUL one: `PathGuard.matchConfiguredRoot`
-        // resolves both spellings, returns the FIRST configured root that
-        // matches, and `admitContainer`'s no-follow gate then refuses THAT
-        // spelling without trying the real root behind it — so an alias
-        // declared first makes every item the real root discovered fail to
-        // clean with `containerUnavailable`.
-        let coveredByRealDirectory = Set(
-            probed.lazy.filter(\.isDirectory).map(\.key)
-        )
+        // The spellings a REAL-DIRECTORY root already covers — its canonical
+        // key and its declared path, each mapped to the covering root's
+        // declared path. A set-aside root whose link content NAMES one of
+        // these is a redundant ALIAS of it — and an ACTIVELY HARMFUL one:
+        // `PathGuard.matchConfiguredRoot` resolves both spellings, returns
+        // the FIRST configured root that matches, and `admitContainer`'s
+        // no-follow gate then refuses THAT spelling without trying the real
+        // root behind it — so an alias declared first makes every item the
+        // real root discovered fail to clean with `containerUnavailable`.
+        // The comparison is by NAME, never by resolution: a target written
+        // through a third spelling matches nothing and the alias passes
+        // through verbatim (the recorded fn-4.11 residual, pinned by
+        // `testAliasNamingItsTargetThroughAThirdSpellingKeepsBothRoots`).
+        var coveredByRealDirectory: [String: String] = [:]
+        for root in probed {
+            guard let key = root.key else { continue }
+            if coveredByRealDirectory[key] == nil {
+                coveredByRealDirectory[key] = root.declared.path
+            }
+            if coveredByRealDirectory[root.declared.path] == nil {
+                coveredByRealDirectory[root.declared.path] = root.declared.path
+            }
+        }
 
         var kept: [URL] = []
         var seenCanonicalKeys = Set<String>()
         for root in probed {
             // (2) Exact-canonical-duplicate dedupe — real directories only.
-            guard root.isDirectory else {
+            guard let key = root.key else {
                 // (3) Alias suppression. Dropping is strictly fail-CLOSED:
                 // the alias could never be walked (the walker's lstat root
                 // gate refuses it) nor admitted as a container, so it
                 // contributes nothing but the shadow. Never a silent drop —
                 // the same `.symlinkRoot` kind the walk-time gate would have
                 // produced, naming the root that already covers it.
-                if coveredByRealDirectory.contains(root.key) {
+                if let target = root.aliasTarget,
+                   let covering = coveredByRealDirectory[target] {
                     issues.append(ScanIssue(
                         url: root.declared,
                         kind: .symlinkRoot,
                         detail: "configured dev root is not a real directory "
-                            + "and aliases \(root.key), which is configured "
+                            + "and aliases \(covering), which is configured "
                             + "separately — the alias was dropped"
                     ))
                     continue
@@ -358,7 +399,7 @@ struct DevRootsStore {
                 kept.append(root.declared)
                 continue
             }
-            guard seenCanonicalKeys.insert(root.key).inserted else {
+            guard seenCanonicalKeys.insert(key).inserted else {
                 continue // exact duplicate of an earlier declared root
             }
             kept.append(root.declared)

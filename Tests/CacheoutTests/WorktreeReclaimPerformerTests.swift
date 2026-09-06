@@ -808,6 +808,121 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
         XCTAssertTrue(fm.fileExists(atPath: worktree.path))
     }
 
+    /// **THE REMEDY MUST MATCH THE CAUSE** (PR #461 codex r3).
+    ///
+    /// Identical to the cell above except that the unavailability is
+    /// TRANSIENT — a launch that failed under momentary pressure, which since
+    /// this PR's spawn hardening includes a failed `strdup`. The refusal is
+    /// right either way and nothing is removed, but "Retry once git is
+    /// installed" is a false instruction when git IS installed. Three clean-
+    /// time sites share this ternary; this one pins it.
+    ///
+    /// MUTATION: collapse the ternary back to the single "installed" wording
+    /// and this cell reds while its definitive sibling stays green.
+    func testATransientLaunchFailureAtTheGateDoesNotTellTheUserToInstallGit()
+        async throws
+    {
+        let repository = try makeRepository(named: "repo")
+        let worktree = try addWorktree(named: "wt", branch: "feature", in: repository)
+        let plan = staleplan(
+            worktree: worktree, membership: try membership(of: worktree, in: repository)
+        )
+        let runner = InterceptingGitRunner(wrapping: UnreachableGitRunner()) { _, _ in
+            .gitUnavailable
+        }
+        runner.scriptedUnavailabilityIsDefinitive = false
+        let outcome = await perform(
+            item(plan), plan: plan, with: makePerformer(runner: runner)
+        )
+
+        XCTAssertNil(outcome.entry, "the refusal is unchanged: nothing removed")
+        let message = try XCTUnwrap(outcome.errors.first?.message)
+        XCTAssertFalse(
+            message.contains("Retry once git is installed"),
+            "a transient launch failure told the user to install a git that "
+                + "is already installed: \(message)"
+        )
+        XCTAssertTrue(
+            message.contains("not a missing tool"),
+            "the message must name which cause it was: \(message)"
+        )
+        XCTAssertTrue(
+            fm.fileExists(atPath: worktree.path), "the tree still survives"
+        )
+    }
+
+    /// **THE OTHER TWO CLEAN-TIME ARMS** (PR #461 gate r5, P3).
+    ///
+    /// `e80694e` split three clean-time messages on
+    /// `unavailabilityIsDefinitive`, and pinned ONE of them. The gate
+    /// collapsed the other two back to the pre-fix wording and the FULL
+    /// 1713-cell suite stayed green — so two of the three guards were
+    /// unevidenced, and the commit's "MUTATION 2 … RED 3/3" reads as though
+    /// it covered the change when it covered a third of it.
+    ///
+    /// The registry arm needs the parent-repo resolve to SUCCEED first, or
+    /// the refusal comes from the arm above it and this pins nothing.
+    ///
+    /// MUTATION: collapse either ternary and its cell reds.
+    func testATransientRegistryReadDoesNotTellTheUserToInstallGit()
+        async throws
+    {
+        let repository = try makeRepository(named: "repo")
+        let worktree = try addWorktree(named: "wt", branch: "feature", in: repository)
+        let plan = staleplan(
+            worktree: worktree, membership: try membership(of: worktree, in: repository)
+        )
+        // Only the REGISTRY listing is unavailable; everything before it runs
+        // for real, so the refusal is attributable to this arm alone.
+        let runner = InterceptingGitRunner(wrapping: realRunner()) { arguments, _ in
+            arguments.contains("list") ? .gitUnavailable : nil
+        }
+        runner.scriptedUnavailabilityIsDefinitive = false
+        let outcome = await perform(
+            item(plan), plan: plan, with: makePerformer(runner: runner)
+        )
+
+        XCTAssertNil(outcome.entry, "the refusal is unchanged: nothing removed")
+        let message = try XCTUnwrap(outcome.errors.first?.message)
+        XCTAssertTrue(
+            message.contains("registry could be re-read")
+                || message.contains("registry of"),
+            "this cell must reach the REGISTRY arm, not one above it: "
+                + "\(message)"
+        )
+        XCTAssertFalse(
+            message.contains("Retry once git is installed"),
+            "a transient launch failure told the user to install a git that "
+                + "is already installed: \(message)"
+        )
+    }
+
+    /// The prune tier's oracle arm, same split. Its sibling table cell
+    /// asserts the DEFINITIVE wording, which is why collapsing the ternary
+    /// left the suite green.
+    func testATransientOracleFailureDoesNotReadAsAMissingGit() async throws {
+        let fixture = try makePruneFixture(orphans: ["gone-transient"], suffix: "-transient")
+        let orphan = try XCTUnwrapElement(fixture.admin, 0)
+        let plan = prunePlan(membership: fixture.membership, disclosed: [orphan])
+        let runner = InterceptingGitRunner(wrapping: realRunner()) { arguments, index in
+            guard arguments.contains("list"), index == 1 else { return nil }
+            return .gitUnavailable
+        }
+        runner.scriptedUnavailabilityIsDefinitive = false
+        let outcome = await perform(
+            item(plan, id: "prune"), plan: plan,
+            with: makePerformer(runner: runner)
+        )
+
+        XCTAssertNil(outcome.entry, "a failed prune reports no row")
+        let message = try XCTUnwrap(outcome.errors.first?.message)
+        XCTAssertTrue(
+            message.contains("not a missing tool"),
+            "the message must name which cause it was: \(message)"
+        )
+        XCTAssertTrue(fm.fileExists(atPath: orphan.path))
+    }
+
     /// THE WHOLE DELETE-TIME SEQUENCE, pinned as a SEQUENCE, with the r5
     /// shape: witness → R0/R1/R1b/R2 → last gate → prune recompute → R0.
     ///
@@ -5239,6 +5354,90 @@ final class WorktreeReclaimPerformerTests: XCTestCase {
                      "the refusal precedes the prune")
     }
 
+    // MARK: - fn-4.15: a CANCELLED (partial) measurement fails closed
+
+    /// The worktree arm: a measure that stopped on cancellation swept only
+    /// part of the tree, so the mount doctrine downstream would be judging
+    /// an unswept remainder — the performer must refuse, not proceed.
+    /// Simulated at the sizer seam (like the mount cell above) because the
+    /// report's `cancelled` flag IS the production sizer's marking; the
+    /// sizer-side cells in `DirectorySizerTests` prove the real walk sets it.
+    ///
+    /// MUTATION: delete the `report.cancelled` arm in the worktree path —
+    /// RED here (the removal proceeds and the worktree is gone).
+    func testACancelledMeasurementRefusesTheWorktreeRemoval() async throws {
+        let repository = try makeRepository(named: "repo-cancel")
+        let worktree = try addWorktree(
+            named: "wt-cancel", branch: "feature", in: repository
+        )
+        let membership = try membership(of: worktree, in: repository)
+        let plan = staleplan(worktree: worktree, membership: membership)
+
+        let runner = InterceptingGitRunner(wrapping: realRunner())
+        let refusals = RefusalLog()
+        let performer = makePerformer(
+            runner: runner,
+            measure: { url, _, _ in
+                var report = SizeReport()
+                if url.path == worktree.path { report.cancelled = true }
+                return report
+            },
+            refusals: refusals
+        )
+        let outcome = await perform(item(plan), plan: plan, with: performer)
+
+        XCTAssertNil(outcome.entry, "a partial measurement credits nothing")
+        let message = try XCTUnwrap(outcome.errors.first?.message)
+        XCTAssertTrue(message.contains("cancelled"), message)
+        // WHICH refusal fired — the tag separates this arm from the mount
+        // arm and from a seam refusal collapsing into the generic catch.
+        XCTAssertEqual(refusals.tags, ["measurement_cancelled"])
+        // Honest retryability: cancellation is a caller act, so the message
+        // must SAY a retry can differ — never read as permanent.
+        XCTAssertTrue(message.contains("not permanent"), message)
+        XCTAssertTrue(fm.fileExists(atPath: worktree.path),
+                      "refused, not deleted")
+        XCTAssertNil(runner.argvs.first { $0.contains("remove") },
+                     "the refusal precedes any destructive git")
+    }
+
+    /// The admin-prune arm: same rule, before any claim registration and
+    /// before the prune.
+    ///
+    /// MUTATION: delete the `report.cancelled` arm in the prune path — RED
+    /// here (the directory is removed and a row emitted).
+    func testACancelledMeasurementRefusesTheAdminPruneBeforeClaims()
+        async throws
+    {
+        let fixture = try makePruneFixture(orphans: ["gone"])
+        let orphan = try XCTUnwrapElement(fixture.admin, 0)
+        let plan = prunePlan(membership: fixture.membership, disclosed: [orphan])
+        let runner = InterceptingGitRunner(wrapping: realRunner())
+        let refusals = RefusalLog()
+        let performer = makePerformer(
+            runner: runner,
+            measure: { url, _, _ in
+                var report = SizeReport()
+                if url.path == orphan.path { report.cancelled = true }
+                return report
+            },
+            refusals: refusals
+        )
+        let outcome = await perform(
+            item(plan, id: "prune"), plan: plan, with: performer
+        )
+
+        XCTAssertNil(outcome.entry)
+        let message = try XCTUnwrap(outcome.errors.first?.message)
+        XCTAssertTrue(message.contains("cancelled"), message)
+        XCTAssertTrue(message.contains("nothing was pruned"), message)
+        XCTAssertTrue(message.contains("not permanent"), message)
+        XCTAssertEqual(refusals.tags, ["measurement_cancelled"])
+        XCTAssertTrue(fm.fileExists(atPath: orphan.path),
+                      "refused, not pruned")
+        XCTAssertNil(runner.argvs.first { $0.contains("prune") },
+                     "the refusal precedes the prune")
+    }
 
     /// A DELETE-TIME MEASUREMENT THAT COULD NOT READ THROUGH THE DIRECTORY
     /// REFUSES THE WHOLE PRUNE (PR #460 codex r18, C6).
@@ -6474,6 +6673,10 @@ final class InterceptingGitRunner: GitCommandRunning, @unchecked Sendable {
 
     private let wrapped: any GitCommandRunning
     private let intercept: Interception
+    /// Whether a scripted `.gitUnavailable` is the definitive absent-tool
+    /// answer (the default, and what every pre-r3 cell means) or a transient
+    /// launch failure, which carries different user-facing wording.
+    var scriptedUnavailabilityIsDefinitive = true
     private let lock = NSLock()
     private var recorded: [GitCommandInvocation] = []
     private var recordedTimeouts: [TimeInterval] = []
@@ -6517,12 +6720,18 @@ final class InterceptingGitRunner: GitCommandRunning, @unchecked Sendable {
             // classified and passed. The environment is left empty on this
             // path deliberately — env assertions belong to the delegated
             // (real) invocations, never to a fabricated record.
+            // A scripted `.gitUnavailable` means the DEFINITIVE answer —
+            // `/usr/bin/env` exit 127, the tool genuinely absent — which is
+            // what every cell written before PR #461 codex r3 meant by it.
+            // The transient launch failure is a separate, weaker answer with
+            // its own wording, driven by `scriptedUnavailabilityIsDefinitive`.
             invocation = GitCommandInvocation(
                 profile: GitSafetyProfile.classify(arguments),
                 argv: ["git", "-c", GitCommandRunner.fsmonitorNeutralization]
                     + arguments,
                 environment: [:],
-                outcome: scripted
+                outcome: scripted,
+                unavailabilityIsDefinitive: scriptedUnavailabilityIsDefinitive
             )
         } else {
             invocation = await wrapped.run(arguments, timeout: timeout)

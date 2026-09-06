@@ -151,7 +151,12 @@ struct CategoryAdmissionPolicy {
 /// a visible refusal naming the unmount remedy. A mount landing between
 /// this table read and a capture that already passed is the accepted
 /// racing residual — the capture's own lstat can then block; no table
-/// re-read closes it.
+/// re-read closes it, but since fn-4.19 that block costs the session its
+/// CAPTURE DEADLINE rather than parking it: `captureBounded` runs the
+/// whole loop off the calling thread under a wall-clock budget, and an
+/// expiry is reported by the session, never swallowed (a root INSIDE a
+/// hung mount — which the table preflight cannot see — is covered by the
+/// same budget).
 struct ContainerSnapshot: Sendable {
 
     private let identities: [String: FileSystemIdentityProvider.Identity]
@@ -180,6 +185,75 @@ struct ContainerSnapshot: Sendable {
             }
         }
         return ContainerSnapshot(identities: identities)
+    }
+
+    /// A snapshot that captured NOTHING. Admits no container — every
+    /// delete-time lookup misses, which is the same fail-closed refusal an
+    /// absent root gets — and exists so the session a timed-out capture
+    /// produces (`scanValidatedSession`, fn-4.19) can still carry the
+    /// non-optional snapshot its shape requires without inventing an
+    /// identity nobody read.
+    static let empty = ContainerSnapshot(identities: [:])
+
+    /// The bounded capture's result. `.captured` and `.timedOut` are kept
+    /// apart — the `BoundedDiskInfo.Outcome` discipline — so a cell cannot
+    /// pass one while asserting the other.
+    enum BoundedCapture: Sendable {
+        case captured(ContainerSnapshot)
+        case timedOut
+    }
+
+    /// `capture(roots:provider:)` under a wall-clock budget, OFF the calling
+    /// thread — the `BoundedDiskInfo.current(within:)` shape (PR #460 codex
+    /// r14, V2-1) applied to the capture fn-4.19 measured freezing the app:
+    /// the synchronous loop ran on the MainActor's thread and each root's
+    /// `lstat` was first contact with whatever answers for that path, so a
+    /// hung network mount or unresponsive FUSE volume under ANY session root
+    /// — including a root INSIDE a mount, which the `mountPointPaths()`
+    /// preflight cannot see — froze the app unbounded and unreported
+    /// (measured: a 6 s blocking `identity(of:)` gave a 6.03 s `scan` with
+    /// `isMainThread == true`).
+    ///
+    /// The loop now runs in a detached task racing a `ScanSessionClock`
+    /// timer — off the cooperative pool, because a `Task.sleep` deadline
+    /// cannot resume while the pool is the thing that is starved — and the
+    /// caller resumes on its own executor with whichever arrives first. The
+    /// detached band is `.utility`, the SAME band-separation decision the
+    /// session producer takes and for the same reason (PR #460 codex r13,
+    /// B): this is scan work, and cooperative-pool width is per-band, so a
+    /// saturated consumer band (the shape
+    /// `testScanIsNotParkedByItsOwnDiskInfoPreambleWhenTheBandIsSaturated`
+    /// drives) cannot stop the capture from even STARTING — measured in that
+    /// cell: with the band unspecified here, the capture queued behind the
+    /// holders and the scan rode this budget instead of finishing. A
+    /// saturated `.utility` band (concurrent sessions' own walks) is the
+    /// residual the timer still covers: “cannot start” reports exactly like
+    /// “started and hung”.
+    ///
+    /// WHAT IS NOT CLOSED, stated rather than glossed: a losing capture is
+    /// ABANDONED, not cancelled — `lstat` takes no deadline, so its thread
+    /// stays parked until the volume answers, exactly as `BoundedDiskInfo`
+    /// leaks its losing fetch. The bound converts the hang into a report; it
+    /// cannot cure the hang. CAN A RETRY DIFFER? Yes — a mount answers or
+    /// is unmounted, a saturated band frees — which is what makes reporting
+    /// the expiry as retryable honest (`scanValidatedSession` says how it is
+    /// reported).
+    static func captureBounded(
+        roots: [URL], provider: FileSystemIdentityProvider,
+        within budget: Duration
+    ) async -> BoundedCapture {
+        let rendezvous = FirstWinsRendezvous<BoundedCapture>()
+        let timer = ScanSessionClock.schedule(after: budget) {
+            rendezvous.settle(.timedOut)
+        }
+        Task.detached(priority: .utility) {
+            rendezvous.settle(
+                .captured(capture(roots: roots, provider: provider))
+            )
+        }
+        let outcome = await rendezvous.wait()
+        timer.cancel()
+        return outcome
     }
 
     /// The captured identity for a registered root's declared path spelling;
@@ -633,9 +707,31 @@ final class PathGuard {
     /// The ONE shared container-root admission policy: may `url` serve as a
     /// configured CONTAINER root (a dev root) at all? Rejects the dangerous
     /// containers — the filesystem root `/`, any volume root / mount point,
-    /// and `$HOME` itself — each in canonical AND alias spellings (the URL
-    /// is canonicalized BEFORE the check, so a symlink alias of `/` or of
-    /// home is caught; the `$HOME` check is inode identity).
+    /// and `$HOME` itself — each in canonical AND alias spellings.
+    ///
+    /// THE GATE ANSWERS BEFORE `realpath` (fn-4.11 — the fn-4.26 order at
+    /// this policy's scope). This runs synchronously inside runtime
+    /// construction, on the main thread, on paths the app does not control:
+    /// a same-UID process can point a persisted dev root at an unresponsive
+    /// mounted volume, and the previous canonicalize-first shape made
+    /// `realpath(3)` — a traversal of everything it resolves, destination
+    /// included — the app's first contact with that volume, freezing launch
+    /// before any window existed. So:
+    ///
+    /// 1. KERNEL-TABLE PREFLIGHT (`mountPointPaths` — `getfsstat(MNT_NOWAIT)`,
+    ///    no filesystem contact): a `url` that IS an over-mounted path is
+    ///    refused with the same `.deniedVolumeRoot` the canonical check
+    ///    reaches for a healthy mount, and with ZERO calls naming it —
+    ///    `lstat` or `realpath` OF a mount point is served by the mounted
+    ///    filesystem (the r15 finding's mechanism). `/` is exempt: always in
+    ///    the table, not foreign, and it keeps `.deniedFilesystemRoot`.
+    /// 2. PROBE AS SPELLED (`lstat`, no follow). Only a SYMLINK leaf can
+    ///    make `realpath(3)` name a destination the spelling never wrote;
+    ///    every other kind resolves over objects the probe or the parent
+    ///    chain already touched, so those take the canonical check below
+    ///    unchanged — same verdicts, same error paths.
+    /// 3. A symlink leaf takes `symlinkContainerRootDenyCheck` — the deny
+    ///    core re-stated over the link's own CONTENT, never its destination.
     ///
     /// This is `denyCheck`'s core MINUS the protected-first-level-children
     /// clause: `~/Documents` and `~/Documents/dev` are LEGAL dev roots (the
@@ -648,11 +744,69 @@ final class PathGuard {
     static func validateContainerRoot(
         _ url: URL, home: URL, provider: FileSystemIdentityProvider
     ) throws {
-        try coreDenyCheck(
-            provider.canonicalize(url),
-            resolvedHome: provider.canonicalize(home),
-            provider: provider
+        let mounted = Set(provider.mountPointPaths())
+        if url.path != "/", mounted.contains(url.path) {
+            throw PathGuardError.deniedVolumeRoot(path: url.path)
+        }
+        guard provider.probeKind(of: url) == .kind(.symlink) else {
+            try coreDenyCheck(
+                provider.canonicalize(url),
+                resolvedHome: provider.canonicalize(home),
+                provider: provider
+            )
+            return
+        }
+        try symlinkContainerRootDenyCheck(
+            url, home: home, provider: provider, mountTable: mounted
         )
+    }
+
+    /// The container-root deny core for a SYMLINK-LEAF spelling, decided
+    /// WITHOUT naming the destination (fn-4.11): one `readlink(2)` of the
+    /// link itself plus lexical folding at the link's parent-canonical
+    /// position (the fn-6 `EphemeralTempRoots` technique —
+    /// `FileSystemIdentityProvider.lexicalTargetPath` is the shared fold),
+    /// compared against `/`, the kernel mount table, and both spellings of
+    /// `$HOME`.
+    ///
+    /// What ACCEPTANCE means here is unchanged in effect: a symlink leaf can
+    /// never be walked (the walker's no-follow root gate refuses it), never
+    /// admits at delete time (`admitContainer`'s no-follow reality gate),
+    /// and is visibly classified at scan time — acceptance only defers its
+    /// classification to gates that already hold it inadmissible.
+    ///
+    /// RESIDUALS at measured scope, each fail-CLOSED for deletion by those
+    /// same gates: (a) content that names `/`, `$HOME` or a mount through a
+    /// spelling this fold cannot equate — a second symlink hop, a case or
+    /// normalization variant, an unresolved `/var`-style alias — is ACCEPTED
+    /// here where the old full resolution refused it; (b) a volume root
+    /// visible only to the device-id signal is not refused (never a real
+    /// mount — the table names every real mount; the signal exists for
+    /// injected test devices and the firmlink case, whose mounts the table
+    /// also names); (c) unreadable or empty link content classifies as
+    /// naming nothing — the old `canonicalize` ENOENT-fallback accepted
+    /// exactly the same way.
+    private static func symlinkContainerRootDenyCheck(
+        _ url: URL, home: URL, provider: FileSystemIdentityProvider,
+        mountTable: Set<String>
+    ) throws {
+        guard let content = provider.symlinkTarget(of: url) else { return }
+        let position = provider.canonicalize(url.deletingLastPathComponent())
+            .appendingPathComponent(url.lastPathComponent)
+        guard let target = FileSystemIdentityProvider.lexicalTargetPath(
+            ofLink: position, content: content
+        ) else {
+            // Non-empty content with no foldable target: `/` itself, or
+            // `..`s that walk off the root — both NAME the filesystem root,
+            // and this is the same refusal the resolved spelling carried.
+            throw PathGuardError.deniedFilesystemRoot(path: "/")
+        }
+        if mountTable.contains(target) {
+            throw PathGuardError.deniedVolumeRoot(path: target)
+        }
+        if target == home.path || target == provider.canonicalize(home).path {
+            throw PathGuardError.deniedHomeDirectory(path: target)
+        }
     }
 
     // MARK: - Deny list

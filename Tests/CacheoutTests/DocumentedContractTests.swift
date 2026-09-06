@@ -460,6 +460,7 @@ final class DocumentedContractTests: XCTestCase {
         let allKinds: [ScanIssue.Kind] = [
             .containerRefused, .mountedVolumeRoot,
             .mountedVolumeRootAtRegistration, .policyRefusedRoot,
+            .mutationScopeRefused,
             .symlinkRoot, .nonDirectoryRoot, .tccDenied,
             .permissionDenied,
             .unreadable, .enumerationTruncated, .configInvalid,
@@ -1295,6 +1296,69 @@ final class DocumentedContractTests: XCTestCase {
             requiresPreDeleteRevalidation: true
         )
     }
+    // MARK: - Retired-primitive fence (fn-4.20)
+
+    /// **NO BARE `waitUntilExit()` IN PRODUCTION** — the grep gate the
+    /// fn-4.20 acceptance demands, as a cell rather than a review habit.
+    ///
+    /// `Process.waitUntilExit()` was retired from this codebase after being
+    /// measured missing its termination wakeup under concurrent reaping
+    /// (macOS 26, ~12-25% of spawns under load — the comment on
+    /// `Process.waitForExit(within:)` in CacheCategory.swift carries the
+    /// measurement). Every production wait is the bounded poll; the LAST
+    /// surviving call sites (dockerPrune, and the two post-SIGKILL reaps in
+    /// Tier2Interventions the fn-4.20 spec's "last one" claim had not
+    /// counted) were converted at fn-4.20.
+    ///
+    /// TWO-LAYER SHAPE: the narrow layer scans every non-comment line of
+    /// every `Sources/**.swift` for the call and must find ZERO; comment
+    /// lines are deliberately allowed to mention it, because the retirement
+    /// is documented BY those comments and a fence that banned the name
+    /// outright would erase its own rationale. TEST sources are OUT OF
+    /// SCOPE by the task spec (their ~13 sites reap fixture children whose
+    /// exit already happened; filed separately if the gate is extended).
+    ///
+    /// MUTATION (proved red, fn-4 round 2): restoring the bare
+    /// `process.waitUntilExit()` in `dockerPrune`'s raced task reds THIS
+    /// cell — deliberately, because the behavioral expiry cell alone would
+    /// stay green there (the outer race still bounds the whole
+    /// interaction), which is exactly why the fence is its own cell.
+    func testNoBareWaitUntilExitRemainsInProductionSources() throws {
+        let sourcesRoot = repoRoot.appendingPathComponent("Sources")
+        let enumerator = try XCTUnwrap(FileManager.default.enumerator(
+            at: sourcesRoot, includingPropertiesForKeys: nil
+        ))
+        var scanned = 0
+        var offenders: [String] = []
+        for case let url as URL in enumerator
+        where url.pathExtension == "swift" {
+            scanned += 1
+            let text = try String(contentsOf: url, encoding: .utf8)
+            for (index, line) in text
+                .components(separatedBy: "\n").enumerated()
+            {
+                guard line.contains("waitUntilExit()") else { continue }
+                let trimmed = line.trimmingCharacters(in: CharacterSet.whitespaces)
+                // Comment lines may NAME the retired primitive — they are
+                // where its retirement is documented.
+                guard !trimmed.hasPrefix("//") else { continue }
+                offenders.append(
+                    "\(url.lastPathComponent):\(index + 1): \(trimmed)"
+                )
+            }
+        }
+        XCTAssertGreaterThan(
+            scanned, 20,
+            "the walk found implausibly few Swift files — the fence is "
+                + "scanning the wrong root, not proving absence"
+        )
+        XCTAssertEqual(
+            offenders, [],
+            "bare waitUntilExit() calls in production Sources — use "
+                + "Process.waitForExit(within:) (CacheCategory.swift) "
+                + "instead: \(offenders)"
+        )
+    }
 }
 
 /// The documented recipe, hashed. The INDEPENDENCE that matters is the
@@ -1308,6 +1372,7 @@ private enum DocumentedToken {
             .map { String(format: "%02x", $0) }
             .joined()
     }
+
 }
 
 // MARK: - The worked retry example, executed

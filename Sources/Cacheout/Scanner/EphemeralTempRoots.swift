@@ -51,7 +51,7 @@
 /// ROOT, not a comparison value. `realpath(3)` resolves the leaf too, so a
 /// symlink standing where `C`/`T` should be would silently register its
 /// DESTINATION as a temp root — and the container-root policy only refuses
-/// `/`, volume roots and `$HOME` itself (`PathGuard.swift:370` says so in
+/// `/`, volume roots and `$HOME` itself (`PathGuard.swift:444` says so in
 /// as many words: "`~/Documents` can be a container while `admitDeletionRoot`
 /// refuses it"), so an arbitrary directory would be admitted, walked, listed
 /// as cache-container payload and deleted. Keeping the leaf means the
@@ -110,7 +110,7 @@
 /// thread while building its `@StateObject`
 /// (`CacheoutApp.swift:58` → `CacheoutViewModel.production()` →
 /// `CacheoutViewModel.swift:563` → `SpaceScannerRuntime.production`,
-/// `SpaceScanner.swift:2129`), long
+/// `SpaceScanner.swift:2267`), long
 /// before any trigger or `participates(in:)` gate exists to consult. The main
 /// thread is not an inference: `CacheoutViewModel` is `@MainActor`
 /// (`CacheoutViewModel.swift:264`), so its `production()` factory cannot be
@@ -134,32 +134,33 @@
 /// name, against the spellings resolution already holds. That is strictly
 /// weaker than an inode comparison, and the residual is recorded below.
 ///
-/// This is where the file DIVERGES from the two dev-root precedents it
-/// otherwise follows: `DevRootsStore.swift:322` and
-/// `SpaceScannerRuntime.suppressingAliasShadows`' probe pair
-/// (`SpaceScanner.swift:1992-1996`)
-/// both still build their comparison key with `provider.canonicalize`, on
-/// every root including non-directory ones, at the same construction time.
-/// Neither has been changed here.
+/// This technique is no longer this file's alone. When it landed here (PR
+/// #459 codex r12) the two dev-root precedents still built their comparison
+/// key with `provider.canonicalize`, on every root including non-directory
+/// ones, at the same construction time; fn-4.11 converged them onto this
+/// file's rule — `DevRootsStore.resolve`'s probe pass
+/// (`DevRootsStore.swift:342-352`), `suppressingAliasShadows`' probe
+/// (`SpaceScanner.swift:2102-2120`), and the container-root policy
+/// (`PathGuard.validateContainerRoot`) all now probe as spelled and read a
+/// symlink leaf's own content, and the fold itself was hoisted to
+/// `FileSystemIdentityProvider.lexicalTargetPath` (this file's
+/// `lexicalTargetPath` delegates to it).
 ///
-/// ### RESIDUAL, at measured scope: the SECTION TITLE is about THIS FILE
+/// ### The r12 residual is CLOSED (fn-4.11), and the history is kept
 ///
-/// It is not a claim about `production()` as a whole, and the difference is
-/// measured. A symlink root this resolution cannot place is KEPT, so it
-/// reaches the runtime's cross-scanner union and
-/// `suppressingAliasShadows`' probe pair (`SpaceScanner.swift:1992-1996`)
-/// canonicalizes it there — one leaf-following
-/// `realpath(3)` on the destination, still during construction. Measured
-/// through the shipped `??` arm with the same fixture, before and after this
-/// change: leaf-following canonicalizations of a symlinked `C` went 2 → 1,
-/// and `production()` under a 0.75 s stall on calls naming the destination
-/// went 3.02 s → 0.76 s. Replacing that one line's `provider.canonicalize(
-/// root).path` with `root.path` takes both to 0 and 0.0026 s, which is how
-/// the surviving contact was attributed — NOT a proposed fix: that key is
-/// what suppresses a shadowing alias ACROSS scanners
-/// (`suppressingAliasShadows`' doc, `SpaceScanner.swift:1941-1952`), and
-/// weakening it trades one hazard for
-/// another. Closing it needs its own change, on fn-4.5's contract.
+/// This section used to record the one surviving contact: a symlink root
+/// this resolution could not place was KEPT, and the union's probe pair
+/// canonicalized it there — one leaf-following `realpath(3)` on the
+/// destination, still during construction (measured then: leaf-following
+/// canonicalizations of a symlinked `C` went 2 → 1 with this file's fix,
+/// 3.02 s → 0.76 s under an injected 0.75 s stall; neutering the union's
+/// key line took it to 0 and 0.0026 s, which ATTRIBUTED the survivor —
+/// `SpaceScanner.swift`'s alias-suppression key). fn-4.11 closed it by
+/// changing that key's derivation, not by weakening the suppression: the
+/// union now compares a symlink root's folded link content by NAME
+/// (`suppressingAliasShadows`, `SpaceScanner.swift:2089`), pinned by
+/// `testProductionNeverContactsASymlinkDevRootsDestination` with an
+/// instrumented provider that fails on any call naming the destination.
 ///
 /// ## Nor is a root that IS a mount contacted (PR #459 codex r15)
 ///
@@ -187,9 +188,10 @@
 /// DROPPED, not kept-and-skipped, and that is the whole difference between a
 /// fix and a relocation: the 2 of those 5 that `resolve` never made were
 /// `suppressingAliasShadows` canonicalizing and probing the same root in the
-/// cross-scanner union (`suppressingAliasShadows`' probe pair,
-/// `SpaceScanner.swift:1992-1996`), which every KEPT
-/// root reaches.
+/// cross-scanner union — measured against the union as it then stood; since
+/// fn-4.11 its probe (`SpaceScanner.swift:2102-2120`) runs its own
+/// kernel-table preflight first, so even a kept mounted root is no longer
+/// contacted there.
 ///
 /// ### RESIDUAL, at measured scope: three cases this does not cover
 ///
@@ -203,11 +205,12 @@
 ///   confstr spelling like `/var/folders/<bucket>/C`. Not the case in the
 ///   finding, and not half-guarded here.
 /// - A declared root that is a SYMLINK to a mounted volume. The table names
-///   the mount, not the link, so the link is kept — and the r12 residual
-///   above is then the contact: `suppressingAliasShadows` canonicalizes it,
-///   naming the destination. Re-measured at this tip: `production()` makes
-///   exactly 1 call naming the destination and takes 0.76 s under the same
-///   injected 0.75 s stall. Same out-of-scope line, same fn-4.5 contract.
+///   the mount, not the link, so the link is kept — and until fn-4.11 the
+///   union's probe then canonicalized it, naming the destination (measured
+///   then: exactly 1 such call, 0.76 s under the injected 0.75 s stall).
+///   CLOSED with the r12 residual above: the union reads the link's own
+///   content instead, and the shared container-root policy additionally
+///   refuses a dev-root link whose content names a table mount.
 ///
 /// `confstr(3)` itself is upstream of all of this by necessity — it is what
 /// produces the path, so no table check can precede it.
@@ -215,20 +218,20 @@
 /// ## De-dupe and alias suppression — two halves, cited one at a time
 ///
 /// One value is probed per declared root: whether the DECLARED spelling is
-/// itself a real directory (`lstat` leaf, no follow), which is the
-/// `isDirectory` half of the probe pair at `DevRootsStore.swift:320-324` and
-/// `suppressingAliasShadows`' probe pair (`SpaceScanner.swift:1992-1996`).
-/// The `key:` half of that pair is deliberately
-/// NOT taken (see above). The two halves that consume the probe have
+/// itself a real directory (`lstat` leaf, no follow) — since fn-4.11 the
+/// same as-spelled-first probe the dev-root resolution
+/// (`DevRootsStore.swift:342-352`) and `suppressingAliasShadows`
+/// (`SpaceScanner.swift:2102-2120`) run: none of the three resolves a
+/// non-directory leaf. The two halves that consume the probe have
 /// different precedents — do not read this as one pattern copied whole from
 /// either:
 ///
 /// - **De-dupe** — real directories only: a real-directory spelling of a
 ///   location already kept is dropped. Precedent is `DevRootsStore.swift`
-///   alone (:361-364, `seenCanonicalKeys.insert`).
+///   alone (:396-398, `seenCanonicalKeys.insert`).
 ///   `SpaceScannerRuntime.suppressingAliasShadows` does NOT do this half — it
 ///   deliberately DECLINES it, and `suppressingAliasShadows`
-///   (`SpaceScanner.swift:2002-2005`) says so:
+///   (`SpaceScanner.swift:2130-2133`) says so:
 ///   "Two real-directory spellings of one location are NOT touched: both pass
 ///   the reality gate, so neither shadows the other, and dropping either would
 ///   change which declared spelling the identity binding keys off for no
@@ -237,7 +240,8 @@
 ///
 ///   The comparison here is INODE identity (`sameLocation`) of the declared
 ///   spellings, where that precedent compares canonical paths as STRINGS
-///   (`DevRootsStore.swift:322` builds `.path`). Comparing the declared
+///   (`DevRootsStore.swift:346` builds `.path` — real directories only,
+///   fn-4.11). Comparing the declared
 ///   spellings is sound only because both sides are real DIRECTORIES, whose
 ///   parent chain resolution already made them canonical: measured on this
 ///   machine (Darwin 25.5), `realpath(dir)` and `realpath(parent) + "/" +
@@ -263,22 +267,23 @@
 ///   real root is worse than useless — `PathGuard.matchConfiguredRoot`
 ///   returns the FIRST configured root that matches and `admitContainer`
 ///   refuses THAT spelling without trying the real one behind it.
-///   `DevRootsStore.swift:326-332` names that shape "ACTIVELY HARMFUL";
-///   `suppressingAliasShadows`' doc (`SpaceScanner.swift:1941-1952`)
+///   `DevRootsStore.swift:353-361` names that shape "ACTIVELY HARMFUL";
+///   `suppressingAliasShadows`' doc (`SpaceScanner.swift:2010-2021`)
 ///   records the breakage it caused when the
 ///   shadowed root came from another scanner.
 ///
-///   BOTH files do this half — `DevRootsStore.swift:333-335` + :341-357 and
-///   `suppressingAliasShadows` (`SpaceScanner.swift:1964-2004`) — but only
+///   BOTH files do this half — `DevRootsStore.swift:366-375` + :379-401 and
+///   `suppressingAliasShadows` (`SpaceScanner.swift:2089-2151`) — since
+///   fn-4.11 by THIS file's name-compare rule in all three — but only
 ///   `DevRootsStore` classifies the
-///   drop. `suppressingAliasShadows` returns roots plus their canonical keys
-///   and NO issue channel of its own (`SpaceScanner.swift:1987-1989`; the
+///   drop. `suppressingAliasShadows` returns roots plus their comparison keys
+///   and NO issue channel of its own (`SpaceScanner.swift:2089-2091`; the
 ///   "bare `[URL]`" this sentence used to say stopped being true when the
 ///   keys were carried out of the same probe, PR #460 codex r4);
-///   `suppressingAliasShadows`' doc (`SpaceScanner.swift:1981-1986`)
+///   `suppressingAliasShadows`' doc (`SpaceScanner.swift:2083-2088`)
 ///   records what
 ///   reports its drops instead. The `.symlinkRoot` issue raised here follows
-///   `DevRootsStore.swift:349-355`, not that function.
+///   `DevRootsStore.swift:390-396`, not that function.
 ///
 /// A non-directory spelling that NOTHING else covers passes through verbatim:
 /// scan time is where absence and denial are told apart, and the no-follow
@@ -572,7 +577,7 @@ enum EphemeralTempRoots {
         // syscall blocks. And this is CONSTRUCTION, not scan time:
         // `EphemeralTempRoots.resolve` runs inside
         // `SpaceScannerRuntime.production`
-        // (`SpaceScannerRuntime.production` (`SpaceScanner.swift:2129`)), which
+        // (`SpaceScannerRuntime.production` (`SpaceScanner.swift:2267`)), which
         // the GUI calls from `CacheoutViewModel.production`
         // (`CacheoutViewModel.swift:555-574`) at the `@MainActor` view
         // model's construction (`CacheoutApp.swift:58`), so the block lands
@@ -585,9 +590,11 @@ enum EphemeralTempRoots {
         //
         // The root is DROPPED, not kept-and-skipped, and that difference is
         // the fix: a kept root reaches the runtime's cross-scanner union,
-        // where `suppressingAliasShadows`' probe pair
-        // (`SpaceScanner.swift:1992-1996`) canonicalizes and probes it —
-        // the remaining 2 of those 5 — still during construction. Dropping
+        // whose probe (`SpaceScanner.swift:2102-2120`) — at the time of
+        // this fix — canonicalized and probed it, the remaining 2 of those
+        // 5, still during construction (since fn-4.11 the union preflights
+        // the same kernel table itself, a second line this drop no longer
+        // relies on). Dropping
         // is also fail-CLOSED in the same shape as alias suppression: the
         // root could not have been scanned (fn-6.2's own arm refuses it) and
         // nothing under it can be admitted for deletion.
@@ -698,32 +705,19 @@ enum EphemeralTempRoots {
     }
 
     /// `content` as an absolute path, folded LEXICALLY — no syscall of any
-    /// kind. A relative target is joined to the link's own directory (already
-    /// parent-canonical, since `declared` came from `resolvedRoot`); `.` is
-    /// dropped and `..` pops a component in the STRING, because popping it
-    /// against the filesystem is precisely the resolution this avoids.
-    ///
-    /// `nil` for anything that is not a usable comparison subject: empty
-    /// content, a `..` that walks off the root, and a target of `/` itself.
+    /// kind. Since fn-4.11 this is a delegation:
+    /// `FileSystemIdentityProvider.lexicalTargetPath` is the ONE folding
+    /// rule (this file's r12 original, hoisted so the dev-root resolution,
+    /// the cross-scanner union, and the container-root policy share it).
+    /// The name stays because this file's callers and cells anchor on it —
+    /// and the contract is unchanged: a relative target joins the link's own
+    /// directory (already parent-canonical here, since `declared` came from
+    /// `resolvedRoot`); `nil` for anything that is not a usable comparison
+    /// subject (empty content, a `..` that walks off the root, `/` itself).
     static func lexicalTargetPath(ofLink link: URL, content: String) -> String? {
-        guard !content.isEmpty else { return nil }
-        let joined = content.hasPrefix("/")
-            ? content
-            : link.deletingLastPathComponent().path + "/" + content
-        var components: [String] = []
-        for component in joined.split(separator: "/") {
-            switch component {
-            case ".":
-                continue
-            case "..":
-                guard !components.isEmpty else { return nil }
-                components.removeLast()
-            default:
-                components.append(String(component))
-            }
-        }
-        guard !components.isEmpty else { return nil }
-        return "/" + components.joined(separator: "/")
+        FileSystemIdentityProvider.lexicalTargetPath(
+            ofLink: link, content: content
+        )
     }
 
     /// The raw, un-normalized path for a source — `nil` when a confstr

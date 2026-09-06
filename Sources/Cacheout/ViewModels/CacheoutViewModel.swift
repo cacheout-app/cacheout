@@ -1329,15 +1329,16 @@ class CacheoutViewModel: ObservableObject {
     }
 
     /// Pure row derivation (XCTest asserts on this directly): one row per
-    /// DECLARED path, carrying the refusal detail of the `.containerRefused`
-    /// issue that names it — a policy-rejected persisted root is visible in
-    /// the editor exactly as it is visible in the scan results (R16).
+    /// DECLARED path, carrying the refusal detail of the `.policyRefusedRoot`
+    /// issue that names it (fn-4.12; `.containerRefused` before that) — a
+    /// policy-rejected persisted root is visible in the editor exactly as it
+    /// is visible in the scan results (R16).
     nonisolated static func devRootRows(
         declaredPaths: [String], issues: [ScanIssue], home: URL
     ) -> [DevRootRowModel] {
         let refusalsByPath = Dictionary(
             issues
-                .filter { $0.kind == .containerRefused }
+                .filter { $0.kind == .policyRefusedRoot }
                 .compactMap { issue -> (String, String)? in
                     guard let url = issue.url else { return nil }
                     return (url.standardizedFileURL.path, issue.detail)
@@ -1527,7 +1528,7 @@ class CacheoutViewModel: ObservableObject {
             diskInfo = fetched
         }
 
-        let session = sessionRuntime.scanValidatedSession(
+        let session = await sessionRuntime.scanValidatedSession(
             scannerIDs: participating,
             context: context
         )
@@ -1818,69 +1819,200 @@ class CacheoutViewModel: ObservableObject {
     @Published var isDockerPruning = false
     @Published var lastDockerPruneResult: String?
 
+    /// THE STATED BOUND on one prune attempt (fn-4.20). Ten minutes is the
+    /// `ScanSessionBounds.production` philosophy applied to a subprocess: a
+    /// `docker system prune` over a large image store legitimately runs for
+    /// minutes, so the bound exists to convert "never" into "reported",
+    /// not to hurry a big prune — and a prune that legitimately needs
+    /// longer than this has a different problem.
+    static let dockerPruneDefaultBudget: Duration = .seconds(600)
+
+    /// TEST SEAMS — production reads the defaults. The budget so a cell can
+    /// prove the expiry path in milliseconds; the command so a cell can
+    /// substitute a wedged or scripted child for the real docker CLI.
+    var dockerPruneBudget: Duration = CacheoutViewModel.dockerPruneDefaultBudget
+    var dockerPruneCommand: [String] = ["docker", "system", "prune", "-f"]
+
+    /// What one prune attempt produced. `.finished` carries the child's own
+    /// exit status INCLUDING failures — a completed failure and a timeout
+    /// are kept apart (the `BoundedDiskInfo.Outcome` discipline) so a cell
+    /// cannot pass one while asserting the other.
+    private enum DockerPruneOutcome: Sendable {
+        case finished(status: Int32, output: String)
+        case launchFailed
+        case timedOut
+    }
+
     func dockerPrune() async {
         isDockerPruning = true
+        // Released on EVERY path out of this method — and since fn-4.20
+        // every path RETURNS: the child interaction below is raced against
+        // its budget, so the defer can no longer be postponed forever by a
+        // docker CLI that never exits.
         defer { isDockerPruning = false }
 
-        let process = Process()
+        // A `ClaimedProcess`, not a `Process`: it owns the child and never
+        // hands it out, so nothing below this line can start the prune except
+        // through the claim (PR #461 merge gate r3, P1 — the gate restored
+        // the two-statement launch here and all 1667 cells stayed green,
+        // because the claim's window was closed in the TYPE and unlatched at
+        // this, its only call site). There is no `process` in scope now, so
+        // that shape does not compile.
         let pipe = Pipe()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        process.arguments = ["docker", "system", "prune", "-f"]
-        process.standardOutput = pipe
-        process.standardError = pipe
         // Real home is correct here: the view model has no injected-home
         // seam — docker prune is a production-only action on the real
         // account (unlike CacheCleaner/CacheCategory subprocesses, which
         // pin HOME to their injected home).
-        process.environment = [
-            "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin",
-            "HOME": FileManager.default.homeDirectoryForCurrentUser.path
-        ]
+        let child = ClaimedProcess(
+            executableURL: URL(fileURLWithPath: "/usr/bin/env"),
+            arguments: dockerPruneCommand,
+            environment: [
+                "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin",
+                "HOME": FileManager.default.homeDirectoryForCurrentUser.path
+            ],
+            standardOutput: pipe,
+            standardError: pipe
+        )
 
-        do {
-            // RECORDED, NOT FIXED (PR #460 codex r13). This wait is
-            // UNBOUNDED, and it is the one primitive this repo replaced
-            // everywhere else: `Process.waitUntilExit()` can miss its
-            // termination wakeup under concurrent reaping (see
-            // `Process.waitForExit(within:)` in CacheCategory.swift, which
-            // exists for that and is used by CacheCleaner and the category
-            // subprocesses). Here it sits behind a `readToEnd()` on a
-            // cooperative worker, so a docker CLI that never exits holds the
-            // worker AND latches `isDockerPruning` true for the life of the
-            // app — the button never re-enables. Pre-existing on
-            // origin/main, unrelated to this PR's scanners, and left to its
-            // own change: the fix is `waitForExit(within:)` plus a
-            // termination policy, which is a product decision about how long
-            // a prune may take.
-            let result = try await Task.detached { () -> (Int32, String) in
-                try process.run()
-                let data = try pipe.fileHandleForReading.readToEnd() ?? Data()
-                process.waitUntilExit()
-                let output = String(data: data, encoding: .utf8) ?? ""
-                return (process.terminationStatus, output)
-            }.value
-
-            if result.0 == 0 {
-                // Extract "Total reclaimed space:" line
-                if let line = result.1.components(separatedBy: "\n")
-                    .first(where: { $0.contains("reclaimed") }) {
-                    lastDockerPruneResult = line.trimmingCharacters(in: .whitespaces)
-                } else {
-                    lastDockerPruneResult = "Docker pruned successfully"
-                }
-            } else {
-                let lowerOutput = result.1.lowercased()
-                if lowerOutput.contains("cannot connect") ||
-                   lowerOutput.contains("is the docker daemon running") ||
-                   lowerOutput.contains("connection refused") ||
-                   lowerOutput.contains("no such file or directory") {
-                    lastDockerPruneResult = "Docker must be running to prune"
-                } else {
-                    lastDockerPruneResult = "Docker prune failed — is Docker running?"
-                }
+        // BOUNDED, AND BOUNDED AS A WHOLE (fn-4.20; through fn-4 round 1
+        // this was RECORDED, NOT FIXED at PR #460 codex r13). The old body
+        // did `readToEnd()` then a bare `process.waitUntilExit()` in a
+        // detached task and awaited its value: unbounded, on a cooperative
+        // worker, and the one surviving production call site of the
+        // primitive this repo retired everywhere else after measuring it
+        // miss its termination wakeup under concurrent reaping
+        // (`Process.waitForExit(within:)`, CacheCategory.swift). A docker
+        // CLI that never exited held the worker AND latched
+        // `isDockerPruning` true for the life of the app.
+        //
+        // AND THE WAIT WAS NOT THE ONLY PARK — the task-spec question
+        // "can `readToEnd()` park too?" answers YES: it blocks until EOF,
+        // and EOF needs every write end of the pipe closed, so a wedged
+        // child that keeps its descriptors open parks the read BEFORE any
+        // wait is reached. Bounding only the wait would have moved the
+        // strand one line up. That is why the budget races the WHOLE child
+        // interaction (spawn → drain → bounded wait) through
+        // `FirstWinsRendezvous` on `ScanSessionClock` — off the cooperative
+        // pool, where a `Task.sleep` deadline cannot be starved — while the
+        // interaction itself still ends in `waitForExit(within:)`, never
+        // the retired primitive.
+        let budget = dockerPruneBudget
+        let waitSeconds = Double(budget.components.seconds)
+            + Double(budget.components.attoseconds) / 1e18
+        let rendezvous = FirstWinsRendezvous<DockerPruneOutcome>()
+        // THE LAUNCH IS CLAIMED, NOT ASSUMED (PR #461 codex r1, P1). The
+        // timer settling `.timedOut` does not stop a detached task that has
+        // not been scheduled yet, and the starvation this off-pool timer
+        // exists to survive is precisely what keeps it queued: the timeout
+        // branch would see `isRunning == false`, report truthfully that
+        // nothing is running, re-enable the button — and the task would then
+        // launch an unowned destructive prune, free to overlap the retry the
+        // user was just invited to make. Both sides decide through one lock.
+        //
+        // RESIDUAL, disclosed (merge gate r2): `begin` performs the launch
+        // UNDER the claim's lock — that is the whole mechanism — so the timer
+        // body below blocks on that lock for the duration of the spawn, and
+        // it runs on `ScanSessionClock`'s single shared serial queue. No
+        // deadlock cycle exists (nothing the child's launch waits on is
+        // dispatched to that queue), but for a fork/exec's worth of time —
+        // milliseconds, more under load — every other bound scheduled there
+        // is delayed, and a `.timedOut` settle overshoots its budget by the
+        // same amount. Not fixable by releasing the lock earlier: releasing
+        // it is exactly the window this type exists to close.
+        let timer = ScanSessionClock.schedule(after: budget) {
+            child.abandon()
+            rendezvous.settle(.timedOut)
+        }
+        Task.detached {
+            // ONE ACT, and the only act available: `start()` decides and
+            // launches under one lock, and the child is not reachable any
+            // other way (PR #461 merge gate r3, P1).
+            do {
+                guard try child.start() else { return }
+            } catch {
+                rendezvous.settle(.launchFailed)
+                return
             }
-        } catch {
+            let data = (try? pipe.fileHandleForReading.readToEnd()) ?? Data()
+            // EOF does not prove exit (a child can close its descriptors
+            // and live on), so the exit is still awaited — bounded, and by
+            // the SAME figure: the outer timer started first, so on a
+            // wedged child it is the timer that settles, and this poll can
+            // never outlive the budget by more than its own scheduling.
+            guard child.waitForExit(within: waitSeconds) else {
+                rendezvous.settle(.timedOut)
+                return
+            }
+            rendezvous.settle(.finished(
+                status: child.terminationStatus,
+                output: String(data: data, encoding: .utf8) ?? ""
+            ))
+        }
+        let outcome = await rendezvous.wait()
+        timer.cancel()
+
+        switch outcome {
+        case .finished(let status, let output) where status == 0:
+            // Extract "Total reclaimed space:" line
+            if let line = output.components(separatedBy: "\n")
+                .first(where: { $0.contains("reclaimed") }) {
+                lastDockerPruneResult = line.trimmingCharacters(in: .whitespaces)
+            } else {
+                lastDockerPruneResult = "Docker pruned successfully"
+            }
+        case .finished(_, let output):
+            let lowerOutput = output.lowercased()
+            if lowerOutput.contains("cannot connect") ||
+               lowerOutput.contains("is the docker daemon running") ||
+               lowerOutput.contains("connection refused") ||
+               lowerOutput.contains("no such file or directory") {
+                lastDockerPruneResult = "Docker must be running to prune"
+            } else {
+                lastDockerPruneResult = "Docker prune failed — is Docker running?"
+            }
+        case .launchFailed:
             lastDockerPruneResult = "Docker not found"
+        case .timedOut:
+            // REPORTED, NOT SWALLOWED — and the abandonment is disclosed
+            // rather than dressed as a kill: SIGTERM is best-effort (docker
+            // forwards it; a child that ignores it keeps running, and its
+            // reader thread stays parked until the pipe closes — the same
+            // abandonment residual `BoundedDiskInfo` carries). CAN A RETRY
+            // DIFFER? Yes: the causes — a daemon mid-restart, a huge layer
+            // delete, a wedged Docker Desktop — are all transient, so
+            // "check Docker and retry" is a real remedy, not a strand
+            // dressed as one.
+            // TWO TIMEOUTS, AND THE MESSAGE MUST NOT CLAIM THE OTHER ONE
+            // (PR #461 merge gate). `abandon()` above already decided which
+            // this is, and because `begin` performs the launch under the same
+            // lock, `didStart` is now a fact rather than a guess about a
+            // statement that may not have run yet.
+            //
+            // BOTH ARMS ARE PINNED, and the r2 note that stood here claiming
+            // otherwise was false in both halves (merge gate r3, P5). It said
+            // the wordings had no cell and that pinning them would need the
+            // strings hoisted into production API; in fact
+            // `testDockerPruneExpiresReportsAndReleasesTheButton` already
+            // pinned this arm, and
+            // `testAPruneThatNeverStartedSaysSoAndClaimsNothingWasStopped`
+            // now pins the other — both by reading `lastDockerPruneResult`,
+            // published state those cells already consume, with nothing
+            // hoisted. A residual is recorded so a future round need not
+            // rediscover it; that one would have sent a future round hunting
+            // for a cell thirty lines away in a file it already reads, and
+            // licensed a swap of these two messages as "uncovered".
+            if child.didStart {
+                if child.isRunning { child.terminate() }
+                lastDockerPruneResult = "Docker prune did not finish within "
+                    + "\(budget) — asked it to stop; check Docker and retry"
+            } else {
+                // Nothing was launched, so nothing was asked to stop. Saying
+                // otherwise is the false-message class this project retires
+                // everywhere else; the remedy is still real, because the
+                // cause (a starved pool, a busy daemon) is transient.
+                lastDockerPruneResult = "Docker prune did not start within "
+                    + "\(budget) — nothing was run; check Docker and retry"
+            }
         }
 
         // Refresh disk info after prune — THE TWIN OF `scan`'s fetch, and
@@ -1888,10 +2020,10 @@ class CacheoutViewModel: ObservableObject {
         // bounds this one either: `isDockerPruning` is released by the
         // `defer` at the top of this method, which does not run until this
         // await returns, so an unstarted detached fetch latched the button
-        // disabled exactly the way the prune's own unbounded
-        // `waitUntilExit()` does. On `.timedOut` the header keeps the
-        // figures it had, `lastDockerPruneResult` (already set above) still
-        // reaches the user, and the next scan refreshes.
+        // disabled exactly the way the prune's own then-unbounded
+        // `waitUntilExit()` did before fn-4.20. On `.timedOut` the header
+        // keeps the figures it had, `lastDockerPruneResult` (already set
+        // above) still reaches the user, and the next scan refreshes.
         if case .fetched(let fetched) = await BoundedDiskInfo.current(
             within: diskInfoBudget
         ) {
@@ -1963,8 +2095,8 @@ class CacheoutViewModel: ObservableObject {
         // below — COUNTED, `grep -n 'isCleaning ='`). No watchdog, no
         // timeout and no view ever clears it. So a clean that never returns
         // latches BOTH the clean path and the scan path shut for the life of
-        // the app, exactly as `dockerPrune`'s unbounded `waitUntilExit()`
-        // latches its own button.
+        // the app, exactly as `dockerPrune`'s formerly unbounded wait
+        // latched its own button before fn-4.20.
         //
         // NOT BOUNDED, deliberately, and this is the product decision: a
         // deletion cannot be abandoned. `removefile`/`trashItem` keep running

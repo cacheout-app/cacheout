@@ -76,10 +76,14 @@
 ///   NodeModulesScanner anti-pattern R2 bans — it made monorepo
 ///   `packages/build/...` invisible).
 ///
-/// ## Failure classification (epic R12)
+/// ## Failure classification (epic R12; fn-4.12 bare-errno alignment)
 /// Per-root enumeration/probe failures use the FROZEN `ScanIssue.Kind`
-/// taxonomy: EPERM → `.tccDenied`, EACCES → `.permissionDenied` (the
-/// `DirectorySizer.classifyDenial` precedent), anything else `.unreadable`.
+/// taxonomy: EACCES → `.permissionDenied`; a BARE EPERM is NEUTRAL
+/// `.unreadable` — this walk is raw-syscall throughout, and a raw errno
+/// carries no provenance, so `.tccDenied` is never assertable from here
+/// (`DirectorySizer.denial(forFailedProbe:errno:)` is the shared rule; the
+/// chain-proven Cocoa arm in `classifyDenial` is what CAN assert TCC).
+/// Anything else `.unreadable`.
 /// `.malformedOutcome` is NEVER authored here (reserved to the validator).
 /// TCC PROTECTION of a configured root is prefix-under-protected-ancestor on
 /// the CANONICAL root path (a user-added `~/Documents/GitHub` is protected
@@ -115,6 +119,22 @@ struct ProjectTreeWalker {
     /// emitted event has `depth == maxDepth` (its entries are still listed;
     /// none are descended).
     static let defaultMaxDepth = 8
+
+    /// The HARD ceiling `walk` clamps any caller-supplied `maxDepth` to
+    /// (fn-4.13). `visit` recurses once per level, and the cooperative
+    /// pool's small thread stack breaks that recursion long before any
+    /// filesystem limit does — MEASURED through the real `visit` on the
+    /// real executor (`Task.detached`, mkdirat-chain fixture): a walk at
+    /// depth 256 survives; depth 288 kills the process with signal 10, a
+    /// guard-page hit, no refusal anyone can act on. 128 leaves a 2x margin
+    /// under the measured floor of the crash band (257..288) while sitting
+    /// 16x above `defaultMaxDepth` — every production caller passes the
+    /// default, so this clamp changes no shipped behavior; it exists so a
+    /// test seam or a future caller cannot turn a parameter into a crash.
+    /// DETERMINISTIC by design and disclosed here rather than at runtime:
+    /// levels past the clamp are simply outside the walk's budget, exactly
+    /// as levels past `maxDepth` always were.
+    static let stackSafeMaxDepthCeiling = 128
 
     /// Home-relative first-level ancestors macOS gates behind a TCC consent
     /// prompt. Protection of an ARBITRARY configured root is decided by
@@ -152,17 +172,47 @@ struct ProjectTreeWalker {
 
     // MARK: - TCC-protected-root determination (R12)
 
-    /// Is `root` gated behind a macOS TCC consent prompt? True iff the
-    /// CANONICAL root path is equal to or under a canonical protected
-    /// ancestor (`home/Documents`, `home/Desktop`, `home/Downloads`) —
-    /// prefix by `pathComponents`, never string `hasPrefix`, never basename:
-    /// `~/Documents/GitHub` is protected because `Documents` is; a directory
-    /// merely NAMED `Documents` outside home is not; an alias spelling that
-    /// resolves INTO `~/Documents` through a symlinked ancestor is protected
-    /// as `~/Documents`.
+    /// Is `root` gated behind a macOS TCC consent prompt? True iff the root
+    /// is equal to or under a protected ancestor (`home/Documents`,
+    /// `home/Desktop`, `home/Downloads`) — prefix by `pathComponents`, never
+    /// string `hasPrefix`, never basename: `~/Documents/GitHub` is protected
+    /// because `Documents` is; a directory merely NAMED `Documents` outside
+    /// home is not; an alias spelling that resolves INTO `~/Documents`
+    /// through a symlinked ancestor is protected as `~/Documents`.
+    ///
+    /// TWO STAGES, and the ORDER is load-bearing (fn-4.26): this predicate
+    /// IS the TCC gates' classification, so it must answer for a
+    /// directly-protected spelling without dereferencing it — `realpath(3)`
+    /// traverses every component it resolves, and the previous
+    /// canonicalize-first body performed that traversal on exactly the paths
+    /// it was about to rule untouchable.
+    ///
+    /// 1. LEXICAL — the spelling as given, `.`/`..` folded with no
+    ///    filesystem access, against the spelled ancestors. A match
+    ///    classifies protected with NOTHING dereferenced. A spelling under a
+    ///    protected ancestor that a symlink would resolve elsewhere now
+    ///    classifies protected too — fail-closed, and every caller's
+    ///    true-arm is a silent skip or deferral, never a mutation.
+    /// 2. CANONICAL — only for spellings stage 1 could not match: the alias
+    ///    shapes (a symlinked ancestor, a case/NFD respelling) classify on
+    ///    the canonical path exactly as before. The argument handed to
+    ///    `canonicalize` here is never a directly-protected spelling; an
+    ///    ALIAS argument's resolution does still traverse its target — the
+    ///    disclosed residual, and not one the worktree resolver's pointer
+    ///    chase can reach (its targets arrive spelled by git, and stage 1
+    ///    answers for those).
     static func isProtectedRoot(
         _ root: URL, home: URL, provider: FileSystemIdentityProvider
     ) -> Bool {
+        let spelled = root.standardizedFileURL.pathComponents
+        for name in tccProtectedAncestorNames {
+            let ancestor = home.appendingPathComponent(name)
+                .standardizedFileURL.pathComponents
+            if spelled.count >= ancestor.count,
+               Array(spelled.prefix(ancestor.count)) == ancestor {
+                return true
+            }
+        }
         let rootComponents = provider.canonicalize(root).pathComponents
         for name in tccProtectedAncestorNames {
             let ancestor = provider
@@ -227,13 +277,95 @@ struct ProjectTreeWalker {
         didAnchorRoot: ((URL, SecureDirectory) -> Void)? = nil
     ) -> [ScanIssue] {
         var issues: [ScanIssue] = []
+        // The stack-safe clamp (fn-4.13) — see `stackSafeMaxDepthCeiling`.
+        let maxDepth = min(maxDepth, Self.stackSafeMaxDepthCeiling)
+        // ONE kernel mount-table read per walk (fn-4.12) — the per-root
+        // mount gate below answers from this harvest, so every root of one
+        // walk is judged against the same table.
+        let mountTable = Set(provider.mountPointPaths())
 
         for root in roots {
             if Task.isCancelled { break }
 
+            // THE TCC GATE MOVED BELOW THE TABLE (PR #461 merge gate).
+            // `isProtectedRoot`'s stage 2 canonicalizes, and `realpath(3)` on
+            // a hung hard mount blocks uninterruptibly in the kernel — so on
+            // an automatic scan (`includeProtectedRoots` false for every
+            // non-userInitiated trigger) the protected check was the FIRST
+            // contact with the root, and the walk hung there before the table
+            // could answer. The previous round moved the `probeKind` below
+            // the table and asserted the hang was unreachable; it was not,
+            // because `probeKind` was never the only way the root gets
+            // touched. The table is memory, so it answers before any code
+            // that can touch the filesystem at all.
+            //
+            // MOUNT FIRST, AND NOW ACTUALLY FIRST (PR #461 codex r1). The
+            // paragraph below has said MOUNT FIRST since fn-4.12 while the
+            // root probe ran above it, so an unresponsive mounted volume was
+            // `lstat`ed before the guard that exists to avoid touching it:
+            // the walk hung, the `.mountedVolumeRoot` issue was never
+            // emitted, and the session reached its watchdog leaving a blocked
+            // worker behind. The comment described the contract; the order
+            // did not honour it. The kernel table is memory — it costs no
+            // filesystem call — so asking it first is free.
+            //
+            // MOUNT FIRST (fn-4.12, the `EphemeralTempScanner` shape): a
+            // kernel-table mount standing at a configured root is a
+            // CONDITION of the machine, not a refusal of the root, and it
+            // is the one condition here whose remedy a re-scan can honor —
+            // this gate re-reads the table every walk, so "unmount, then
+            // re-scan" is true. Decided from the kernel's own spelling,
+            // before admission, so the guard's `.deniedVolumeRoot` clause
+            // never converts it into a generic policy sentence. A mount the
+            // table names under a DIFFERENT spelling of this root falls
+            // through to the guard and is refused there — as policy, which
+            // is also true.
+            //
+            // RESIDUAL, disclosed rather than smoothed over (merge gate r2):
+            // this order CHANGES what a root that is both TCC-protected and
+            // mounted reports on a background scan. It used to be skipped in
+            // silence by the gate below; it now says `.mountedVolumeRoot`.
+            // That is the honest answer — the volume, not privacy, is why its
+            // contents are not ours to walk — but it is a user-visible change,
+            // and its printed remedy is only half true for such a root: eject
+            // it and the NEXT scan reaches the TCC gate and skips it silently
+            // again, with no second issue to explain the disappearance.
+            if mountTable.contains(root.path) {
+                issues.append(ScanIssue(
+                    url: root, kind: .mountedVolumeRoot,
+                    detail: "configured dev root is a mounted volume — not "
+                        + "scanned; its contents belong to that volume. "
+                        + "Eject or unmount it, then re-scan"
+                ))
+                continue
+            }
+
             // TCC policy gate (R9/R12): a background rescan must never be
             // the thing that fires a macOS privacy prompt. Prefix-under-
             // protected-ancestor on the CANONICAL root — never basename.
+            //
+            // Asked AFTER the table, which removes the one ordering in which
+            // this gate's own `canonicalize` was the first contact with a
+            // root that IS a mount point. It does NOT make the hang
+            // impossible, and the note that stood here saying so was wrong
+            // (merge gate r3, P7): `mountTable.contains(root.path)` is exact
+            // membership against mount POINTS, so a root INSIDE a mounted
+            // volume — `<volume>/dev` — never matches, and stage 2's
+            // `realpath(3)` below is then first contact with a path on that
+            // volume. Measured order for such a root, background arm:
+            // canonicalize -> realPath -> probeKind, issues [].
+            //
+            // WHERE THAT CASE IS ACTUALLY COVERED, and it is not here: by the
+            // session's wall-clock bound, the same answer `captureBounded`
+            // gives for a container root inside a hung mount (SpaceScanner's
+            // note at the capture says the table preflight never covered it
+            // either). Both walker callers are `SpaceScanner` conformers, so
+            // a blocked `realpath` is converted into `.scanDidNotFinish` with
+            // the ledger concluded `.boundFired`. The same residual applies
+            // verbatim: the bound converts the hang into a REPORT, it does
+            // not cure it — `realpath` takes no deadline, so its thread stays
+            // parked until the volume answers. CAN A RETRY DIFFER? Yes: the
+            // volume answers, or it is unmounted.
             if !includeProtectedRoots,
                Self.isProtectedRoot(root, home: home, provider: provider) {
                 continue
@@ -241,18 +373,37 @@ struct ProjectTreeWalker {
 
             // ABSENT root: honest no-item omission — machines differ, and
             // the seeds routinely include roots that do not exist. No issue,
-            // no events (epic registration-time story).
+            // no events (epic registration-time story). Asked AFTER the
+            // mount table, so a root that IS a mount point is never probed —
+            // NOT, as this note used to claim, because that makes the hang
+            // impossible; see the TCC gate above for the root-inside-a-volume
+            // case and where it is really bounded.
             let rootProbe = provider.probeKind(of: root)
             if rootProbe == .absent { continue }
 
             // Container admission BEFORE any traversal — the SCAN-TIME
             // read-only mode (fn-3.4 round 9): no snapshot, and this token
             // cannot delete. Refusal → classified issue, root never walked.
+            // TWO kinds by WHICH clause refused (fn-4.12): production
+            // callers walk the very roots their guard was built from, so a
+            // refusal there is a POLICY verdict on a configured root —
+            // `.policyRefusedRoot`, because `.containerRefused`'s fixed GUI
+            // label ("not a configured search root") was false for it. But
+            // `roots:` is a parameter: a root the guard does NOT know
+            // (`.notAConfiguredContainer`) keeps `.containerRefused`, whose
+            // label is exactly that condition — one kind per truth, decided
+            // by the typed error, never by message text.
             do {
                 _ = try pathGuard.admitSearchRoot(root)
             } catch {
+                let kind: ScanIssue.Kind
+                if case PathGuardError.notAConfiguredContainer = error {
+                    kind = .containerRefused
+                } else {
+                    kind = .policyRefusedRoot
+                }
                 issues.append(ScanIssue(
-                    url: root, kind: .containerRefused,
+                    url: root, kind: kind,
                     detail: error.localizedDescription
                 ))
                 continue
@@ -262,17 +413,32 @@ struct ProjectTreeWalker {
             // real target may sit anywhere — but symlinked ANCESTORS already
             // resolved through the lstat, so `/var`-style alias roots pass).
             // A root we cannot even lstat is a classified, visible failure.
+            // TWO kinds by what actually stands there (fn-4.12, the PR #459
+            // codex r13 split): `.symlinkRoot`'s single GUI label is the
+            // fixed sentence "symlinked — not searched", so a regular file,
+            // FIFO, socket or device must carry `.nonDirectoryRoot` instead
+            // of sending the user hunting for a link that is not there.
             switch rootProbe {
             case .kind(.directory):
                 break
             case .failed(let code):
                 issues.append(Self.issue(forFailedProbe: root, errno: code))
                 continue
-            case .kind, .absent:
+            case .kind(.symlink):
                 issues.append(ScanIssue(
                     url: root, kind: .symlinkRoot,
-                    detail: "dev root is not a real directory"
+                    detail: "dev root is a symlink — never traversed"
                 ))
+                continue
+            case .kind(let kind):
+                issues.append(ScanIssue(
+                    url: root, kind: .nonDirectoryRoot,
+                    detail: "dev root is not a real directory "
+                        + "(\(Self.describe(kind))) — never traversed"
+                ))
+                continue
+            case .absent:
+                // Unreachable belt: absence already continued above.
                 continue
             }
 
@@ -393,9 +559,9 @@ struct ProjectTreeWalker {
                     // mid-walk deletion race, quiet by contract.
                     continue
                 case .failed(let code):
-                    // Classified by errno (EPERM → TCC, EACCES →
-                    // permission) — never a silent zero (R12). No kind was
-                    // proven, so the child is not listed.
+                    // Classified by errno (EACCES → permission; bare EPERM
+                    // is NEUTRAL, fn-4.12) — never a silent zero (R12). No
+                    // kind was proven, so the child is not listed.
                     issues.append(Self.issue(forFailedProbe: child, errno: code))
                 case .kind(let kind, let identity, _):
                     vetted[name] = identity
@@ -626,35 +792,63 @@ struct ProjectTreeWalker {
         // `overlongDescendantPathBytes` now feeds the row's SIZE CAVEAT only
         // — the refusal it used to drive was retired with its premise.
         case .metadata, .other, .unaddressablePath: kind = .unreadable
+        // The sizer's entry cap (fn-4.15). This walker never runs the sizer's
+        // enumeration, so the arm is unreachable today; it maps to the
+        // taxonomy's truncation kind so a future sizer-fed path stays honest.
+        case .enumerationCapped: kind = .enumerationTruncated
         }
         return ScanIssue(url: denial.url, kind: kind, detail: denial.detail)
     }
 
-    /// Classify a failed lstat probe by errno (EPERM → TCC, EACCES → BSD
-    /// permissions) — same taxonomy as the sizer's denial classification.
+    /// Classify a failed lstat probe by errno — the shared raw-errno rule
+    /// (`DirectorySizer.denial(forFailedProbe:errno:)`): EACCES → BSD
+    /// permissions; a BARE EPERM is NEUTRAL (see the sizer's rule doc).
     private static func issue(
         forFailedProbe url: URL, errno code: Int32
     ) -> ScanIssue {
         issue(from: DirectorySizer.denial(forFailedProbe: url, errno: code))
     }
 
-    /// Classify a failed directory OPEN by errno, on the SAME frozen
-    /// taxonomy: EPERM → `.tccDenied`, EACCES → `.permissionDenied`,
-    /// everything else (notably ENOTDIR — a name that is no longer a
-    /// directory) → `.unreadable`.
+    /// Classify a failed directory OPEN by errno, on the SAME rule as the
+    /// probe classifier above: EACCES → `.permissionDenied`; a BARE EPERM
+    /// is NEUTRAL `.unreadable` (fn-4.12 — an `openat`/`open` errno carries
+    /// no provenance, so neither a privacy denial nor a filesystem refusal
+    /// may be asserted; the EPERM arm here claimed `.tccDenied` and, with
+    /// it, the GUI's "Grant access…" remedy link, on a guess); everything
+    /// else (notably ENOTDIR — a name that is no longer a directory) →
+    /// `.unreadable`.
     private static func issue(
         forFailedOpen url: URL, errno code: Int32
     ) -> ScanIssue {
         let kind: ScanIssue.Kind
+        var caveat = ""
         switch code {
-        case EPERM: kind = .tccDenied
+        case EPERM:
+            kind = .unreadable
+            caveat = " — the cause could not be established (a privacy "
+                + "denial and a filesystem refusal are indistinguishable "
+                + "in a bare errno)"
         case EACCES: kind = .permissionDenied
         default: kind = .unreadable
         }
         return ScanIssue(
             url: url, kind: kind,
             detail: "directory open failed: "
-                + String(cString: strerror(code))
+                + String(cString: strerror(code)) + caveat
         )
+    }
+
+    /// The house spelling for a non-directory root's real kind — the same
+    /// wording `EphemeralTempScanner`/`OrphanedCachesScanner.describe` use,
+    /// so one condition reads identically across scanners.
+    private static func describe(
+        _ kind: FileSystemIdentityProvider.FileKind
+    ) -> String {
+        switch kind {
+        case .regularFile: return "regular file"
+        case .directory: return "directory"
+        case .symlink: return "symlink"
+        case .other: return "special file"
+        }
     }
 }

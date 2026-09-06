@@ -28,6 +28,15 @@ targets:
       - path: Sources/Cacheout/Resources
         excludes:
           - com.cacheout.memhelper.plist
+          # The `.tiff` files are CHECKED IN for the SPM path, which copies
+          # them verbatim (`scripts/bundle.sh`), but Xcode GENERATES a `.tiff`
+          # of its own from each `@1x`/`@2x` PNG pair via TiffUtil. Including
+          # both made two commands produce the same output and xcodebuild
+          # refused the build outright — "Multiple commands produce
+          # .../MenuBarIcon.tiff" — before compiling a single source. Xcode
+          # builds its own from the PNGs, so the prebuilt copies are excluded
+          # HERE and left on disk for bundle.sh.
+          - "*.tiff"
         buildPhase: resources
     dependencies:
       - target: CacheoutShared

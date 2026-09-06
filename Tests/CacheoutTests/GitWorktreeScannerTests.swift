@@ -12,7 +12,9 @@
 /// 3. **Containment (D13)** — the worktree, its parent repository and the
 ///    resolver-carried admin container inside ONE declared root, with the
 ///    parent alone allowed to EQUAL it; everything else is a
-///    `.containerRefused` issue and never an item.
+///    `.containerRefused` issue (outside EVERY root) or a
+///    `.mutationScopeRefused` one (inside a root, scope unbound — fn-4.12)
+///    and never an item.
 /// 4. **The two TCC gates** — protected roots and protected SECONDARY paths
 ///    are skipped SILENTLY on automatic scans and walked when the user asks,
 ///    while genuine denials stay visible in both.
@@ -123,6 +125,12 @@ private final class ScriptedGitRunner: GitCommandRunning, @unchecked Sendable {
     var show: GitCommandOutcome = .success(stdout: Data("1614834367\n".utf8))
     /// When set, EVERY invocation answers with it (the unavailable case).
     var forcedOutcome: GitCommandOutcome?
+    /// Whether a forced `.gitUnavailable` is the DEFINITIVE `env`-exit-127
+    /// answer or a transient launch failure. Defaults to definitive, which is
+    /// what every cell written before PR #461 codex r3 meant by "the tool is
+    /// unavailable"; the transient arm is a separate, weaker answer that must
+    /// not withdraw a scan.
+    var forcedUnavailabilityIsDefinitive = true
 
     private let lock = NSLock()
     private var recorded: [[String]] = []
@@ -146,7 +154,8 @@ private final class ScriptedGitRunner: GitCommandRunning, @unchecked Sendable {
         return GitCommandInvocation(
             profile: GitSafetyProfile.classify(arguments),
             argv: ["git"] + arguments, environment: [:],
-            outcome: forcedOutcome ?? outcome(for: arguments)
+            outcome: forcedOutcome ?? outcome(for: arguments),
+            unavailabilityIsDefinitive: forcedUnavailabilityIsDefinitive
         )
     }
 
@@ -198,15 +207,34 @@ private final class MountPointInjectingProvider: FileSystemIdentityProvider {
 
 /// Records every lstat PROBE (the operation that precedes every read the
 /// resolver and the mapper perform) so a test can prove nothing under a
-/// protected ancestor was ever inspected.
+/// protected ancestor was ever inspected — and every `realpath(3)` ARGUMENT
+/// (fn-4.26), because `realpath` is not a probe: it traverses every component
+/// it resolves, so canonicalizing a protected path is itself the access the
+/// deferral exists to prevent, and counting probes alone left it invisible.
+/// `canonicalize` funnels through `realPath(of:)`, so recording the one seam
+/// counts both.
 private final class ProbeRecordingProvider: FileSystemIdentityProvider {
     private let lock = NSLock()
     private var probed: [String] = []
+    private var realpathed: [String] = []
 
     var probedPaths: [String] {
         lock.lock()
         defer { lock.unlock() }
         return probed
+    }
+
+    var realPathArguments: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return realpathed
+    }
+
+    override func realPath(of path: String) -> String? {
+        lock.lock()
+        realpathed.append(path)
+        lock.unlock()
+        return super.realPath(of: path)
     }
 
     override func probeKind(of url: URL) -> KindProbe {
@@ -531,6 +559,223 @@ final class GitWorktreeScannerTests: XCTestCase {
         case .malformed(_, let issue):
             XCTFail("outcome malformed: \(issue.detail)", file: file, line: line)
         }
+    }
+
+    // MARK: - Transient launch failure is not a missing tool (codex r3)
+
+    /// **A TRANSIENT LAUNCH FAILURE MUST NOT WITHDRAW THE SCAN.**
+    ///
+    /// `.gitUnavailable` carries two causes and only one is permanent:
+    /// `/usr/bin/env` answering 127 means git is genuinely not on PATH, while
+    /// a throwing launch is ENOMEM/EAGAIN/EMFILE under momentary pressure —
+    /// and since this PR made every spawn allocation checked, a failed
+    /// `strdup` arrives here too. `unavailabilityIsDefinitive` has recorded
+    /// that distinction since PR #460 r21 and this consumer ignored it,
+    /// withdrawing every result and telling the user to install a git that is
+    /// already installed.
+    ///
+    /// The withdrawal branch also justifies itself with "the runner's
+    /// availability verdict is instance-cached, so no further repository could
+    /// succeed anyway" — which is false for the transient case precisely
+    /// because a non-definitive verdict is deliberately NOT cached.
+    ///
+    /// MUTATION: drop the `guard listing.unavailabilityIsDefinitive` in
+    /// `GitWorktreeScanner` and this cell reds.
+    func testATransientLaunchFailureIsReportedPerRepositoryNotAsAMissingTool()
+        async throws
+    {
+        let repository = try makeRepositoryIgnoringPayloads(
+            at: dev.appendingPathComponent("repo")
+        )
+        _ = try addWorktree(
+            of: repository,
+            at: dev.appendingPathComponent("wt/feature"),
+            branch: "feature"
+        )
+
+        let runner = ScriptedGitRunner()
+        runner.forcedOutcome = .gitUnavailable
+        runner.forcedUnavailabilityIsDefinitive = false
+
+        let outcome = await makeScanner(runner: runner)
+            .scan(context: ScanContext(trigger: .userInitiated))
+
+        // VACUITY: the listing must actually have been attempted, or the
+        // arm this cell watches was never reached.
+        XCTAssertFalse(
+            runner.requests.isEmpty,
+            "no git invocation was attempted, so nothing exercised the "
+                + "unavailable arm at all"
+        )
+        XCTAssertFalse(
+            outcome.errors.contains { $0.kind == .toolUnavailable },
+            "a transient launch failure was published as a MISSING TOOL, "
+                + "withdrawing the scan: \(outcome.errors)"
+        )
+        let transient = outcome.errors.filter { $0.kind == .unreadable }
+        XCTAssertFalse(
+            transient.isEmpty,
+            "the repository must still be reported, per repository: "
+                + "\(outcome.errors)"
+        )
+        XCTAssertTrue(
+            transient.contains { ($0.detail ?? "").contains("not a missing tool") },
+            "the detail must say which cause it was: \(transient)"
+        )
+    }
+
+    /// CONTROL: the DEFINITIVE answer still withdraws everything. Without
+    /// this, the cell above could pass because the withdrawal never happens
+    /// at all any more.
+    func testADefinitiveUnavailabilityStillWithdrawsTheWholeScan() async throws
+    {
+        let repository = try makeRepositoryIgnoringPayloads(
+            at: dev.appendingPathComponent("repo")
+        )
+        _ = try addWorktree(
+            of: repository,
+            at: dev.appendingPathComponent("wt/feature"),
+            branch: "feature"
+        )
+
+        let runner = ScriptedGitRunner()
+        runner.forcedOutcome = .gitUnavailable
+        runner.forcedUnavailabilityIsDefinitive = true
+
+        let outcome = await makeScanner(runner: runner)
+            .scan(context: ScanContext(trigger: .userInitiated))
+
+        XCTAssertTrue(
+            outcome.items.isEmpty,
+            "a tool-less scan reporting findings is indistinguishable from a "
+                + "clean machine: \(outcome.items)"
+        )
+        XCTAssertTrue(
+            outcome.errors.contains { $0.kind == .toolUnavailable },
+            "the definitive answer must still publish tool-unavailable: "
+                + "\(outcome.errors)"
+        )
+    }
+
+    // MARK: - The -C target is proven where it is used (codex r5)
+
+    /// Swaps a checkout for a repository OUTSIDE the declared root, at the
+    /// moment git is first invoked — the window between grouping's re-check
+    /// and the subprocess, which widens with every repository processed
+    /// before this one.
+    private final class SwapAtFirstGitInvocation: GitCommandRunning, @unchecked Sendable {
+        private let wrapped: any GitCommandRunning
+        let victim: URL
+        let stranger: URL
+        let stash: URL
+        private let lock = NSLock()
+        private var argvs: [[String]] = []
+        private(set) var swapped = false
+
+        init(
+            wrapping wrapped: any GitCommandRunning,
+            victim: URL, stranger: URL, stash: URL
+        ) {
+            self.wrapped = wrapped
+            self.victim = victim
+            self.stranger = stranger
+            self.stash = stash
+        }
+
+        var defaultTimeout: TimeInterval { wrapped.defaultTimeout }
+        var requests: [[String]] {
+            lock.lock(); defer { lock.unlock() }; return argvs
+        }
+
+        func run(
+            _ arguments: [String], timeout: TimeInterval
+        ) async -> GitCommandInvocation {
+            lock.lock()
+            argvs.append(arguments)
+            // Swap the victim while an EARLIER repository is being processed:
+            // the window this cell exists for is the one that grows with the
+            // repository count, so the trigger must be a git call that is NOT
+            // about the victim. Swapping on the victim's own call would fire
+            // after its check had already passed and prove nothing.
+            let mentionsVictim = arguments.contains { $0.contains(victim.path) }
+            let first = !swapped && !mentionsVictim
+            if first { swapped = true }
+            lock.unlock()
+            if first {
+                try? FileManager.default.moveItem(at: victim, to: stash)
+                try? FileManager.default.createSymbolicLink(
+                    at: victim, withDestinationURL: stranger
+                )
+            }
+            return await wrapped.run(arguments, timeout: timeout)
+        }
+    }
+
+    /// **THE `git -C` TARGET WAS NEVER PROVEN** (PR #461 codex r5).
+    ///
+    /// r4 made grouping re-prove a bare discovery's identity before
+    /// `canonicalize`. That binds `realpath` and nothing else: the SAME
+    /// unproven URL was then carried on as `listingTarget` and handed to
+    /// `git -C`, with the rest of the grouping loop, every earlier group's
+    /// full processing, two deferral checks and an admin-container
+    /// enumeration in between — a window that GROWS with the repository
+    /// count, which is the exact shape this file condemns elsewhere.
+    ///
+    /// And the MAIN-CHECKOUT arm carried no witness at all, which mattered
+    /// most because `listingTarget` PREFERS a main checkout. That case was
+    /// worse than the bare one: a replacement's own porcelain record
+    /// cross-validates against its own canonicalized git directory, so the
+    /// two agree and the scan proceeds in SILENCE — git run against a
+    /// repository outside every configured root, zero issues published.
+    ///
+    /// Driven through a whole scan, with the git runner as the swap seam.
+    /// An earlier round concluded that driving the seam directly proves more
+    /// than timing a race through call sites; that generalisation was too
+    /// strong, and this fixture is the counter-example — the direct-drive
+    /// cells pinned their guards correctly and could not see past them.
+    ///
+    /// MUTATION: drop the `targetWitness` re-check before `listingTarget` and
+    /// this reds — the stranger is listed and, for a main checkout, silently.
+    func testAReplacedCheckoutIsNeverHandedToGitAsATarget() async throws {
+        // TWO repositories, because the window is the time spent processing
+        // the OTHER one.
+        let first = try makeRepositoryIgnoringPayloads(
+            at: dev.appendingPathComponent("first")
+        )
+        _ = try addWorktree(
+            of: first, at: dev.appendingPathComponent("wt/one"), branch: "one"
+        )
+        let victim = try makeRepositoryIgnoringPayloads(
+            at: dev.appendingPathComponent("victim")
+        )
+        _ = try addWorktree(
+            of: victim, at: dev.appendingPathComponent("wt/two"), branch: "two"
+        )
+        // A repository OUTSIDE every declared root.
+        let stranger = try makeRepositoryIgnoringPayloads(
+            at: base.appendingPathComponent("stranger")
+        )
+
+        let runner = SwapAtFirstGitInvocation(
+            wrapping: makeRunner(), victim: victim, stranger: stranger,
+            stash: base.appendingPathComponent("stashed-repo")
+        )
+        let outcome = await makeScanner(runner: runner)
+            .scan(context: ScanContext(trigger: .userInitiated))
+
+        XCTAssertTrue(runner.swapped, "the fixture never fired the swap")
+        XCTAssertNil(
+            runner.requests.first { argv in
+                argv.contains { $0.contains(stranger.lastPathComponent) }
+            },
+            "git was aimed at a repository outside every configured root: "
+                + "\(runner.requests)"
+        )
+        XCTAssertFalse(
+            outcome.errors.isEmpty,
+            "a checkout replaced before git could run against it must be "
+                + "REPORTED, not dropped in silence"
+        )
     }
 
     // MARK: - R7: discovery
@@ -2520,6 +2765,318 @@ final class GitWorktreeScannerTests: XCTestCase {
         try assertNonMalformed(outcome, from: scanner)
     }
 
+    /// Returns a DIFFERENT identity on the Nth answer for the watched path,
+    /// modelling a replacement that lands partway through validation.
+    private final class IdentitySwapsOnNthAnswer: FileSystemIdentityProvider {
+        var watchedPath = ""
+        var swapOn = 2
+        private(set) var answers = 0
+
+        override func identity(of url: URL) -> Identity? {
+            let real = super.identity(of: url)
+            guard url.path == watchedPath, let real else { return real }
+            answers += 1
+            guard answers >= swapOn else { return real }
+            return Identity(device: real.device, inode: real.inode &+ 1)
+        }
+    }
+
+    /// **THE WITNESS WAS CAPTURED AFTER THE PROOF** (PR #461 codex r5).
+    ///
+    /// The r4 fix carried a bare witness so grouping could re-prove the
+    /// directory before `realpath` touched it. But it captured that identity
+    /// AFTER `bareRepositoryGitDirectory` returned, so a replacement landing
+    /// in the gap was recorded as the witness — and grouping then agreed with
+    /// itself about the STRANGER and canonicalized it into a `git -C` target
+    /// outside the configured root. Closing one window by opening a narrower
+    /// one is not closing it.
+    ///
+    /// The capture now brackets the proof: before, validate, unchanged after.
+    ///
+    /// MUTATION: drop either half of the bracket in `bareDirectoryWitness` and the
+    /// swap arm below reds while the control stays green.
+    func testAReplacementDuringValidationYieldsNoBareWitness() throws {
+        let bare = dev.appendingPathComponent("repo.git")
+        let seed = try makeRepositoryIgnoringPayloads(
+            at: base.appendingPathComponent("seed")
+        )
+        XCTAssertEqual(
+            try GitFixture.git(
+                ["clone", "--bare", seed.path, bare.path], home: home
+            ).status, 0, "bare clone failed"
+        )
+
+        // CONTROL: a provider that never swaps must produce a witness, or the
+        // nil below would not be the swap's doing.
+        let steady = IdentitySwapsOnNthAnswer()
+        steady.watchedPath = bare.path
+        steady.swapOn = .max
+        XCTAssertNotNil(
+            GitWorktreeScanner.bareDirectoryWitness(
+                for: bare,
+                resolver: GitWorktreeGitdirResolver(identity: steady),
+                provider: steady
+            ),
+            "the fixture must witness a healthy bare repository"
+        )
+
+        // The replacement lands after the capture: the answer CHANGES between
+        // the two ends of the bracket.
+        let swapping = IdentitySwapsOnNthAnswer()
+        swapping.watchedPath = bare.path
+        swapping.swapOn = 2
+        XCTAssertNil(
+            GitWorktreeScanner.bareDirectoryWitness(
+                for: bare,
+                resolver: GitWorktreeGitdirResolver(identity: swapping),
+                provider: swapping
+            ),
+            "a directory replaced during validation was witnessed as though "
+                + "it were the object whose metadata had just been read"
+        )
+        XCTAssertGreaterThanOrEqual(
+            swapping.answers, 2,
+            "the bracket asked only \(swapping.answers) time(s) — a capture "
+                + "that is never re-checked is not a bracket"
+        )
+    }
+
+    /// **THE BARE ARM CARRIED NO WITNESS** (PR #461 codex r4).
+    ///
+    /// The linked arm has carried an `AdminWitness` — path AND identity, as
+    /// of the instant the walk observed it — since PR #460 r17. The bare arm,
+    /// added later in fn-4.28, kept only a URL, and `repositoryGroups` then
+    /// canonicalized that URL unbound. `canonicalize` is `realpath`, which
+    /// resolves every component: on a replacement it both FOLLOWS the
+    /// stranger and can block on it, and the same stored path then becomes
+    /// the `listingTarget`, putting `git worktree list` on a repository
+    /// outside the configured dev root.
+    ///
+    /// Driven through `repositoryGroups` directly rather than through a whole
+    /// scan. A first attempt drove it with a provider that drifted its
+    /// answers mid-scan, and it FAILED HONESTLY: something earlier in the
+    /// scan already asks that path for its identity, so the capture and the
+    /// re-check both saw the drifted value and agreed. Timing a race through
+    /// two unknown call sites proves less than calling the function with the
+    /// two states it must distinguish.
+    ///
+    /// MUTATION: drop the witness re-check before `provider.canonicalize` and
+    /// the drift arm reds while the control stays green.
+    func testABareDiscoveryWhoseDirectoryDriftedIsNotGrouped() throws {
+        let bare = dev.appendingPathComponent("repo.git")
+        let seed = try makeRepositoryIgnoringPayloads(
+            at: base.appendingPathComponent("seed")
+        )
+        XCTAssertEqual(
+            try GitFixture.git(
+                ["clone", "--bare", seed.path, bare.path], home: home
+            ).status, 0, "bare clone failed"
+        )
+
+        let provider = FileSystemIdentityProvider()
+        let resolver = GitWorktreeGitdirResolver(identity: provider)
+        let truth = try XCTUnwrap(provider.identity(of: bare))
+
+        func groups(
+            witness: FileSystemIdentityProvider.Identity
+        ) -> [GitWorktreeScanner.RepositoryGroup] {
+            GitWorktreeScanner.repositoryGroups(
+                from: [GitWorktreeDiscovery(
+                    directory: bare, kind: .bareRepository,
+                    directoryWitness: .init(entryPath: bare.path, identity: witness)
+                )],
+                resolver: resolver, provider: provider
+            )
+        }
+
+        // CONTROL: with the identity it was actually proved at, it groups.
+        // Without this, an empty result below would prove nothing.
+        XCTAssertEqual(
+            groups(witness: truth).count, 1,
+            "the fixture must group when the witness matches, or the refusal "
+                + "below is not the drift's"
+        )
+
+        let drifted = FileSystemIdentityProvider.Identity(
+            device: truth.device, inode: truth.inode &+ 1
+        )
+        XCTAssertTrue(
+            groups(witness: drifted).isEmpty,
+            "a bare directory that is no longer the object the bare-shape "
+                + "proof accepted was still grouped, so realpath would follow "
+                + "the replacement and list it"
+        )
+    }
+
+    /// THE CASE THE PRUNE TIER EXISTS FOR (fn-4.28): a BARE repository whose
+    /// linked checkouts are ALL gone. Discovery used to key entirely on an
+    /// entry named `.git`, and a bare repository has none — so once its last
+    /// checkout was deleted, no repository group formed and the prune tier
+    /// never ran for exactly the all-checkouts-gone case it reclaims.
+    ///
+    /// MUTATION (the named red cell the task requires): remove the bare
+    /// branch of `GitWorktreeScanner.consume` (or have
+    /// `bareRepositoryGitDirectory` return nil) — no group forms, no prune
+    /// item is published, and the unwrap below fails.
+    func testABareRepositoryWhoseCheckoutsAreAllGoneIsDiscoveredForPruning()
+        async throws
+    {
+        let bare = dev.appendingPathComponent("repo.git")
+        let seed = try makeRepositoryIgnoringPayloads(
+            at: base.appendingPathComponent("seed")
+        )
+        XCTAssertEqual(
+            try GitFixture.git(
+                ["clone", "--bare", seed.path, bare.path], home: home
+            ).status, 0, "bare clone failed"
+        )
+        let gone = try addWorktree(
+            of: bare, at: dev.appendingPathComponent("bare-wt"), branch: "feature"
+        )
+        try fm.removeItem(at: gone)
+
+        let scanner = makeScanner()
+        let outcome = await scanner.scan(context: ScanContext(trigger: .userInitiated))
+
+        let pruneItem = try XCTUnwrap(
+            outcome.items.first { (try? plan(of: $0).mode) == .pruneOrphanedAdmin },
+            "a bare repository with every checkout gone must still be "
+                + "discovered and offered: \(outcome.errors.map(\.detail))"
+        )
+        let reclaim = try plan(of: pruneItem)
+        XCTAssertEqual(
+            reclaim.parentRepoWorkingDir.resolvingSymlinksInPath().path,
+            bare.resolvingSymlinksInPath().path,
+            "the bare repository directory itself is the `-C` target"
+        )
+        XCTAssertEqual(
+            reclaim.parentAdminContainer.resolvingSymlinksInPath().path,
+            bare.appendingPathComponent("worktrees").resolvingSymlinksInPath().path
+        )
+        XCTAssertEqual(reclaim.disclosedAdminDirectories.count, 1)
+        XCTAssertTrue(
+            pruneItem.evidence.contains(gone.lastPathComponent),
+            "the disclosure names the gone checkout: \(pruneItem.evidence)"
+        )
+
+        // ONE-TO-ONE MAPPING, proved on the bare path with a cell rather
+        // than by argument: the offered set is the SHARED mapper's answer
+        // for the same container and the same porcelain records.
+        let listed = try GitFixture.git(
+            GitWorktreeOracle.listArguments(forRepositoryAt: bare), home: home
+        )
+        XCTAssertEqual(listed.status, 0)
+        let inventory = try XCTUnwrap(GitWorktreeInventory.parse(listed.stdout))
+        let verdict = GitWorktreeAdminMapper().map(
+            prunableRecordsIn: inventory.entries,
+            adminContainer: reclaim.parentAdminContainer
+        )
+        guard case .complete(let expected) = verdict else {
+            return XCTFail("the shared mapper refused the fixture: \(verdict)")
+        }
+        XCTAssertEqual(
+            Set(reclaim.disclosedAdminDirectories.map(\.path)),
+            Set(expected.map(\.path)),
+            "the offered removal set is not the shared mapper's answer"
+        )
+        try assertNonMalformed(outcome, from: scanner)
+    }
+
+    /// The detached-HEAD preservation guard applies to the BARE discovery
+    /// path too — proved with a cell, not by argument (fn-4.28): a bare
+    /// repository whose only gone checkout was detached at a commit no ref
+    /// reaches gets NO prune item and a visible issue naming the commit.
+    func testABareRepositoryWithADetachedOrphanSuppressesThePrune() async throws {
+        let bare = dev.appendingPathComponent("repo.git")
+        let seed = try makeRepositoryIgnoringPayloads(
+            at: base.appendingPathComponent("seed")
+        )
+        XCTAssertEqual(
+            try GitFixture.git(
+                ["clone", "--bare", seed.path, bare.path], home: home
+            ).status, 0
+        )
+        let detached = try addDetachedOrphan(
+            of: bare, at: dev.appendingPathComponent("detached-gone")
+        )
+
+        let scanner = makeScanner()
+        let outcome = await scanner.scan(context: ScanContext(trigger: .userInitiated))
+
+        XCTAssertTrue(
+            outcome.items.isEmpty,
+            "no prune item may ship while a commit hangs off the bare "
+                + "repository's admin directory: \(outcome.items.map(\.displayName))"
+        )
+        let issue = try XCTUnwrap(
+            outcome.errors.first { $0.kind == .unreadable },
+            "the suppression must be VISIBLE: \(outcome.errors)"
+        )
+        XCTAssertTrue(
+            issue.detail.contains(String(detached.commit.prefix(12))),
+            "the issue must name the commit at risk: \(issue.detail)"
+        )
+        try assertNonMalformed(outcome, from: scanner)
+    }
+
+    /// A directory that merely LOOKS bare — the right entry NAMES with the
+    /// right lstat kinds, but a HEAD no git would accept — must not be
+    /// admitted: no item, no issue, and NO git subprocess ever spent on it.
+    func testADirectoryThatMerelyLooksBareIsNeverAdmitted() async throws {
+        let fake = dev.appendingPathComponent("fake.git")
+        try fm.createDirectory(
+            at: fake.appendingPathComponent("objects"), withIntermediateDirectories: true
+        )
+        try fm.createDirectory(
+            at: fake.appendingPathComponent("refs"), withIntermediateDirectories: true
+        )
+        try "not a head at all\n".write(
+            to: fake.appendingPathComponent("HEAD"), atomically: true, encoding: .utf8
+        )
+        try "[core]\n\tbare = true\n".write(
+            to: fake.appendingPathComponent("config"), atomically: true, encoding: .utf8
+        )
+
+        let runner = RecordingGitRunner(wrapping: makeRunner())
+        let scanner = makeScanner(runner: runner)
+        let outcome = await scanner.scan(context: ScanContext(trigger: .userInitiated))
+
+        XCTAssertTrue(outcome.items.isEmpty, "\(outcome.items.map(\.displayName))")
+        XCTAssertTrue(outcome.errors.isEmpty, "\(outcome.errors.map(\.detail))")
+        XCTAssertTrue(
+            runner.requests.isEmpty,
+            "an unproved shape must never reach git: \(runner.requests)"
+        )
+    }
+
+    /// A bare repository with a LIVE checkout is ONE group and ONE listing
+    /// however it is reached — the bare discovery joins the group the
+    /// checkout's `.git` pointer names, it never forks a second listing.
+    func testABareRepositoryAndItsLiveCheckoutShareOneListing() async throws {
+        let bare = dev.appendingPathComponent("repo.git")
+        let seed = try makeRepositoryIgnoringPayloads(
+            at: base.appendingPathComponent("seed")
+        )
+        XCTAssertEqual(
+            try GitFixture.git(
+                ["clone", "--bare", seed.path, bare.path], home: home
+            ).status, 0
+        )
+        try addWorktree(
+            of: bare, at: dev.appendingPathComponent("bare-wt"), branch: "feature"
+        )
+
+        let runner = RecordingGitRunner(wrapping: makeRunner())
+        let scanner = makeScanner(runner: runner)
+        let outcome = await scanner.scan(context: ScanContext(trigger: .userInitiated))
+
+        XCTAssertEqual(
+            runner.listings.count, 1,
+            "one repository, one porcelain listing: \(runner.listings)"
+        )
+        try assertNonMalformed(outcome, from: scanner)
+    }
+
     func testDevRootThatIsARepositoryEmitsWithTheParentEqualToTheRoot()
         async throws
     {
@@ -2596,7 +3153,10 @@ final class GitWorktreeScannerTests: XCTestCase {
         let outcome = await scanner.scan(context: ScanContext(trigger: .userInitiated))
 
         XCTAssertTrue(outcome.items.isEmpty, "D13 forbids the deletable item")
-        let issue = try XCTUnwrap(outcome.errors.first { $0.kind == .containerRefused })
+        // `.mutationScopeRefused` since fn-4.12: this worktree IS inside a
+        // configured dev root — `.containerRefused`'s label ("not a
+        // configured search root") was a false diagnosis for it.
+        let issue = try XCTUnwrap(outcome.errors.first { $0.kind == .mutationScopeRefused })
         XCTAssertTrue(
             issue.detail.contains("parent repository"),
             "the refusal must name the parent-outside cause; got: \(issue.detail)"
@@ -2842,8 +3402,11 @@ final class GitWorktreeScannerTests: XCTestCase {
             provider.failingPaths = [denied.path]
             let scanner = makeScanner(provider: provider)
             let outcome = await scanner.scan(context: ScanContext(trigger: trigger))
+            // `.unreadable` since fn-4.12: the injected failure is a raw
+            // lstat EPERM, and a bare errno cannot establish TCC — the
+            // point of THIS cell is that the denial stays VISIBLE.
             XCTAssertTrue(
-                outcome.errors.contains { $0.kind == .tccDenied && $0.url?.path == denied.path },
+                outcome.errors.contains { $0.kind == .unreadable && $0.url?.path == denied.path },
                 "a genuine denial must stay visible under \(trigger): \(outcome.errors)"
             )
         }
@@ -3072,8 +3635,74 @@ final class GitWorktreeScannerTests: XCTestCase {
             "a user-initiated scan follows the pointer"
         )
         XCTAssertTrue(user.items.isEmpty, "the admin container is outside every root")
-        XCTAssertTrue(user.errors.contains { $0.kind == .containerRefused })
+        XCTAssertTrue(user.errors.contains { $0.kind == .mutationScopeRefused },
+                      "fn-4.12: the worktree is inside a root; the SCOPE is "
+                          + "what fails — \(user.errors)")
         try assertNonMalformed(user, from: userScanner)
+    }
+
+    func testAutomaticScanNeverRealpathsThroughAProtectedAdminDirectory()
+        async throws
+    {
+        // The cell above proves nothing under the protected git directory was
+        // ever PROBED — but `realpath(3)` is not a probe, and the resolver
+        // used to `canonicalize` a worktree's `gitdir:` pointer target BEFORE
+        // its first gated `probeKind`, while the deferral predicate itself
+        // canonicalized the path it was classifying. So a background scan
+        // traversed the protected path with the probe cell green (fn-4.26,
+        // PR #460 codex). This cell counts the DEREFERENCE itself, on the
+        // injected provider.
+        let protectedHome = base.appendingPathComponent("protected-home")
+        let gitDirectory = protectedHome.appendingPathComponent("Documents/repo.git")
+        let workingTree = dev.appendingPathComponent("wd")
+        let worktree = dev.appendingPathComponent("wt")
+        try makeSplitRepository(
+            gitDirectory: gitDirectory, workingTree: workingTree, worktree: worktree
+        )
+        let listing = Self.porcelain([
+            ["worktree \(workingTree.path)", "HEAD \(String(repeating: "a", count: 40))", "branch refs/heads/main"],
+            ["worktree \(worktree.path)", "HEAD \(String(repeating: "a", count: 40))", "branch refs/heads/feature"],
+        ])
+
+        // Both spellings, exactly as the probe cell matches them: the `/var`
+        // alias the fixture rides and its canonical `/private/var` form.
+        let protectedPrefixes = [
+            gitDirectory.path,
+            FileSystemIdentityProvider().canonicalize(gitDirectory).path,
+        ]
+        func protectedRealpaths(_ provider: ProbeRecordingProvider) -> [String] {
+            provider.realPathArguments.filter { path in
+                protectedPrefixes.contains { path.hasPrefix($0) }
+            }
+        }
+
+        let automaticProvider = ProbeRecordingProvider()
+        let automaticRunner = ScriptedGitRunner(listing: listing)
+        let automatic = await makeScanner(
+            runner: automaticRunner, provider: automaticProvider, home: protectedHome
+        ).scan(context: ScanContext(trigger: .automatic))
+        XCTAssertTrue(automatic.items.isEmpty)
+        XCTAssertTrue(automatic.errors.isEmpty, "a deferral is silent: \(automatic.errors)")
+        XCTAssertEqual(
+            protectedRealpaths(automaticProvider), [],
+            "an automatic scan realpath'd THROUGH the protected git directory "
+                + "— the gate must answer before any dereference"
+        )
+
+        // POSITIVE control: the very same fixture under a user-initiated scan
+        // DOES realpath through it (the deferral is policy, not a
+        // capability) — without this the zero above would be vacuous.
+        let userProvider = ProbeRecordingProvider()
+        let user = await makeScanner(
+            runner: ScriptedGitRunner(listing: listing), provider: userProvider,
+            home: protectedHome
+        ).scan(context: ScanContext(trigger: .userInitiated))
+        XCTAssertFalse(
+            protectedRealpaths(userProvider).isEmpty,
+            "a user-initiated scan resolves the pointer — the counting seam is live"
+        )
+        XCTAssertTrue(user.errors.contains { $0.kind == .mutationScopeRefused },
+                      "fn-4.12: the scope refusal, as in the probe cell above")
     }
 
     func testFirstRecordAuthorityWinsWhenTheGitDirsParentIsNotTheWorkingTree()

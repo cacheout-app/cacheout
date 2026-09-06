@@ -540,20 +540,29 @@ struct BuildArtifactsScanner: @unchecked Sendable {
     }
 
     /// A one-denial report for a containment impediment, classified on the
-    /// SAME frozen taxonomy every other denial uses (EPERM → TCC, EACCES →
-    /// BSD permissions, everything else a metadata failure).
+    /// SAME rule every raw-errno probe uses (fn-4.12,
+    /// `DirectorySizer.denial(forFailedProbe:errno:)`): EACCES → BSD
+    /// permissions; a BARE EPERM is NEUTRAL `.metadata` — the errno here
+    /// comes from a raw `openat`, which carries no provenance, so `.tcc`
+    /// (and the `.tccDenied` grant link it becomes on the item row) may not
+    /// be asserted from it; everything else a metadata failure.
     private static func obstruction(
         at url: URL, errno code: Int32 = EIO, detail: String
     ) -> SizeReport {
         var report = SizeReport()
         let kind: SizeDenial.Kind
+        var caveat = ""
         switch code {
-        case EPERM: kind = .tcc
+        case EPERM:
+            kind = .metadata
+            caveat = " — the cause could not be established (a privacy "
+                + "denial and a filesystem refusal are indistinguishable "
+                + "in a bare errno)"
         case EACCES: kind = .permission
         default: kind = .metadata
         }
         report.denials.append(
-            SizeDenial(url: url, kind: kind, detail: detail)
+            SizeDenial(url: url, kind: kind, detail: detail + caveat)
         )
         return report
     }
@@ -722,11 +731,12 @@ struct BuildArtifactsScanner: @unchecked Sendable {
     ///   descendant (review r3). The house rule VERBATIM, no third notion
     ///   invented: device-id change against the ANCESTOR, plus the `statfs`
     ///   mount-root check that catches the same-`st_dev` firmlink mounts a
-    ///   device comparison is blind to (`DirectorySizer.swift:354-359`,
-    ///   `ProjectTreeWalker.swift:529-532`, `ValuablesDetector.swift`). The sizer
+    ///   device comparison is blind to (`DirectorySizer.swift:448-453`,
+    ///   `ProjectTreeWalker.swift:695-698`, `ValuablesDetector.swift`). The sizer
     ///   records the boundary and skips its subtree uncounted; the cleaner
     ///   refuses any tree containing one whole
-    ///   (`CacheCleaner.deleteGuardedChild`:1151 and `removeGuardedItem`:1371).
+    ///   (`deleteGuardedChild`, `CacheCleaner.swift:1210`, and
+    ///   `removeGuardedItem`, `CacheCleaner.swift:1543`).
     /// - **AN UNENUMERABLE DIRECTORY** on that same chain — the ancestor
     ///   itself, or any directory strictly between it and the descendant
     ///   (review r7). Mode `0111` is the field shape: SEARCHABLE, so a root
@@ -1035,7 +1045,8 @@ struct BuildArtifactsScanner: @unchecked Sendable {
 
     /// DELETE-TIME REVALIDATION entry point (fn-4.8 wires it into the
     /// cleaner's chokepoint seam), following the
-    /// `OrphanedCachesScanner.preDeleteUserDataProbe` precedent (`:571`)
+    /// `OrphanedCachesScanner.preDeleteUserDataProbe` precedent
+    /// (`OrphanedCachesScanner.swift:816`)
     /// exactly: the SAME bounded core with the PRODUCTION caps, so scan-time
     /// and delete-time inspection bounds cannot drift. Reports the CURRENT
     /// probe's valuables (canonical order) + completeness — fn-4.8 compares

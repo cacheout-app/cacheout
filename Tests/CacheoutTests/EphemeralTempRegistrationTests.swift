@@ -989,7 +989,7 @@ final class EphemeralTempRegistrationTests: XCTestCase {
     ) async -> (items: [String: [ReclaimableItem]],
                 snapshot: ContainerSnapshot) {
         let everyScanner: Set<String>? = nil
-        let session = runtime.scanValidatedSession(
+        let session = await runtime.scanValidatedSession(
             scannerIDs: everyScanner,
             context: ScanContext(trigger: .userInitiated)
         )
@@ -1019,7 +1019,7 @@ final class EphemeralTempRegistrationTests: XCTestCase {
         _ runtime: SpaceScannerRuntime, path: String
     ) async throws -> (scanners: [String], bytes: Set<Int64>) {
         let everyScanner: Set<String>? = nil
-        let session = runtime.scanValidatedSession(
+        let session = await runtime.scanValidatedSession(
             scannerIDs: everyScanner,
             context: ScanContext(trigger: .userInitiated)
         )
@@ -1517,7 +1517,7 @@ final class EphemeralTempRegistrationTests: XCTestCase {
 
         for trigger in [ScanTrigger.userInitiated, .automatic] {
             let everyScanner: Set<String>? = nil
-            let session = runtime.scanValidatedSession(
+            let session = await runtime.scanValidatedSession(
                 scannerIDs: everyScanner,
                 context: ScanContext(trigger: trigger)
             )
@@ -1689,7 +1689,7 @@ final class EphemeralTempRegistrationTests: XCTestCase {
         let runtime = try makeRuntime([gated, companion], provider: provider)
 
         provider.arm()
-        let deferredSession = runtime.scanValidatedSession(
+        let deferredSession = await runtime.scanValidatedSession(
             context: ScanContext(trigger: .automatic)
         )
         for await _ in deferredSession.events {}
@@ -1708,7 +1708,7 @@ final class EphemeralTempRegistrationTests: XCTestCase {
         )
 
         provider.arm()
-        let liveSession = runtime.scanValidatedSession(
+        let liveSession = await runtime.scanValidatedSession(
             context: ScanContext(trigger: .userInitiated)
         )
         for await _ in liveSession.events {}
@@ -1739,7 +1739,7 @@ final class EphemeralTempRegistrationTests: XCTestCase {
         let runtime = try makeRuntime([outside, inside], provider: provider)
 
         provider.arm()
-        let session = runtime.scanValidatedSession(
+        let session = await runtime.scanValidatedSession(
             scannerIDs: ["fixture_inside"],
             context: ScanContext(trigger: .userInitiated)
         )
@@ -1798,7 +1798,7 @@ final class EphemeralTempRegistrationTests: XCTestCase {
             "both spellings must survive into the union, in this order"
         )
 
-        let session = runtime.scanValidatedSession(
+        let session = await runtime.scanValidatedSession(
             context: ScanContext(trigger: .automatic)
         )
         for await _ in session.events {}

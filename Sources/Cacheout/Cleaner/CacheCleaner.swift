@@ -343,7 +343,16 @@ actor CacheCleaner {
     ) {
         self.home = home
         self.provider = provider
-        self.sizer = DirectorySizer(provider: provider)
+        // UNCAPPED on purpose (fn-4.15): this is the DELETE-TIME verification
+        // sizer, and the mount-doctrine consumers below read the report's
+        // `mountBoundaries` as "the whole tree was swept" — a capped walk
+        // could not claim that, so a cap here would have to fail closed, and
+        // a deterministic cap that blocks deletion is a permanent strand
+        // (the same tree re-measures to the same cap forever). The pass
+        // stays bounded by the tree the caller is about to delete over the
+        // same entries anyway, and it is cancellable per entry; a CANCELLED
+        // (partial) report is refused by every consumer, not consumed.
+        self.sizer = DirectorySizer(provider: provider, entryCap: nil)
         self.pathGuard = PathGuard(
             home: home, containerRoots: containerRoots, provider: provider
         )
@@ -798,11 +807,16 @@ actor CacheCleaner {
         // revalidator does not consider applicable (a sweep entry whose
         // classifier declined the clean promise, which reaches a deletion
         // ONLY through conscious per-item confirmation against DISPLAYED
-        // caution evidence). Neither has an inspection verdict to bind a
-        // disposal to, so neither gets one — the guards they rest on are the
-        // container admission, the containment chain, the deny list and the
-        // mount doctrine. This is not a way to skip the binding; it is the
-        // absence of anything to bind to.
+        // caution evidence). Neither has an inspection VERDICT to bind a
+        // disposal to, so neither gets one. The sentence that used to
+        // continue here — the guards they rest on are the container
+        // admission, the containment chain, the deny list and the mount
+        // doctrine, full stop — under-claimed since fn-4.21: a verdict is
+        // not the only bindable thing, and the deletion now also binds the
+        // OBJECT standing at the name when it first reads it
+        // (`removeGuardedItem`'s `boundTarget`; `deleteGuardedChild`'s
+        // `boundChild`). What `.unestablished` withholds is any promise
+        // about the object's CONTENT — only a revalidator can make one.
         guard let revalidator = preDeleteRevalidators[item.scannerID]
         else { return .proceed(inspected: .unestablished) }
         guard item.requiresPreDeleteRevalidation
@@ -1127,11 +1141,40 @@ actor CacheCleaner {
             return .failed(error.localizedDescription)
         }
 
-        // Already gone = skip. Decided by OUR probe: an absent leaf yields an
-        // EMPTY SizeReport indistinguishable from an empty directory, so
-        // "already gone" must never be inferred from the report.
-        if provider.probeKind(of: child) == .absent {
+        // THE LEAF BINDING, TAKEN AT THE PIPELINE'S FIRST READ OF THE CHILD
+        // (fn-4.21). Contents mode runs no probe, so no VERDICT about this
+        // child exists — but an OBJECT does, and this is the moment the
+        // pipeline first reads it, so this is where what-is-measured and
+        // what-is-destroyed must be pinned to each other. The child's kind
+        // and inode are read by `TrashDisposal.boundLeaf` under the SAME
+        // admitted container the removal is later proved against (the r18
+        // `BoundObject` shape, through the same function, so two readings
+        // cannot disagree), and the permanent arm below re-proves the pair
+        // on the far side of the queue hop. Measured before this binding
+        // existed, on the deterministic swap cell: a stranger renamed onto
+        // the child's own path after the measurement was destroyed with
+        // `expecting: nil` and the measured tree's 4096 bytes reported
+        // freed, `errors=[]`
+        // (`testContentsModeChildSwappedInsideTheWindowIsRefused`).
+        //
+        // It also answers "already gone = skip", and answers it from a
+        // descriptor-relative read rather than a path `lstat`: an absent
+        // leaf yields an EMPTY SizeReport indistinguishable from an empty
+        // directory, so "already gone" must never be inferred from the
+        // report — and an ENOENT here (the leaf, or the whole enumerated
+        // root, vanished since the listing) is the same skip the path probe
+        // used to produce.
+        let boundChild: FileSystemIdentityProvider.ChildFacts
+        do {
+            boundChild = try TrashDisposal.boundLeaf(
+                of: child, containedIn: admittedParent, provider: provider
+            )
+        } catch let failure as DepthSafeRemoval.Failure
+            where failure.cause == .posix(ENOENT)
+        {
             return .skippedAlreadyGone
+        } catch {
+            return refusedChild(error, child: child, label: label)
         }
 
         // Measure → register (Phase 1) BEFORE deletion. Known inodes
@@ -1141,6 +1184,20 @@ actor CacheCleaner {
             at: child, mode: .deletionTarget,
             knownInodes: await registry.knownIdentities
         )
+
+        // A CANCELLED measurement is a PARTIAL one (fn-4.15): the mount
+        // check below is only sound over a report that swept the whole tree,
+        // and a partial claims registration would under-account. Fail closed
+        // — and say honestly that a retry CAN differ (cancellation is a
+        // caller act, never a property of this tree). Bound where the fact
+        // is first read: this is the first consumer of `report`.
+        if report.cancelled {
+            let detail = "\(child.path): measurement was cancelled before "
+                + "the tree was fully inspected — refused, not deleted "
+                + "(cleaning again re-measures; this refusal is not permanent)"
+            logRefusal(label: label, tag: "measurement_cancelled", detail: detail)
+            return .failed(detail)
+        }
 
         // ANY mount boundary in the measured tree — the child itself, or a
         // mounted subtree nested anywhere beneath it — refuses the deletion.
@@ -1181,6 +1238,21 @@ actor CacheCleaner {
                 // container, binds the child under that descriptor, and
                 // proves what the disposal actually took on the far side of
                 // a call it cannot be given a descriptor for.
+                //
+                // RESIDUAL, STATED RATHER THAN IMPLIED (fn-4.21): this
+                // binding is taken at the DISPOSAL'S entry, not at the
+                // pipeline's first read of the child the way the permanent
+                // arm's now is — `boundChild` above is deliberately NOT
+                // handed to it. A child swapped between the measurement and
+                // this call is therefore admitted (`.whateverStandsThere`)
+                // and MOVED, with the measured bytes reported. What bounds
+                // that residual is the disposal itself: the move is into the
+                // user's REVERSIBLE Trash and the after-proof + rollback
+                // hold, so the cost is a recoverable wrong entry — never the
+                // unrecoverable destruction the permanent arm's binding
+                // exists to refuse. Feeding `boundChild` through would need
+                // a new `LeafAdmission` shape and its own cells; recorded at
+                // fn-4.21 as out of that task's five-site scope.
                 try await TrashDisposal.dispose(
                     child, containedIn: admittedParent, provider: provider,
                     via: { try await self.trash($0, provingImmediatelyBefore: $1) }
@@ -1189,56 +1261,85 @@ actor CacheCleaner {
                 // NO INSPECTION VERDICT TO BIND TO, and the call site says
                 // so. Contents mode runs no user-data probe (only the
                 // orphaned-caches sweep carries a clean promise), so there
-                // is no inspected object here — which is precisely why the
-                // CONTAINER binding below is not optional for this arm: with
-                // `expecting: nil` there is nothing else that can notice the
-                // folder these children were enumerated from being swapped.
+                // is no inspected object here — `expecting: nil` is a
+                // statement of that absence, never a licence. The CONTAINER
+                // binding is not optional for this arm, and since fn-4.21 it
+                // is not alone: what `nil` leaves unproved — WHICH OBJECT
+                // stands at the child's name — is carried by `boundChild`,
+                // captured at this pipeline's first read of the child.
+                //
+                // The claim that stood here — "every proposition this arm
+                // carries is the container binding, and `DepthSafeRemoval`
+                // re-proves exactly that on the far side, so nothing further
+                // crosses the hop" — was the same reasoning PR #460 r18
+                // measured FALSE for the worktree seam, and it was false
+                // here the same way: measured on the deterministic swap
+                // cell, a stranger renamed onto the child's path inside the
+                // window was destroyed with the measured tree's bytes
+                // reported. So this arm's OWN proposition — the leaf it
+                // measured is the leaf it destroys — rides across in the
+                // proof closure, re-read by the SAME `boundLeaf` under the
+                // SAME admitted container immediately before the removal.
                 try await Self.removeItemConcurrently(
                     at: child, expecting: nil, provider: provider,
                     containedIn: admittedParent,
-                    // NOTHING FURTHER TO PROVE PAST THE HOP, STATED RATHER
-                    // THAN DEFAULTED (PR #460 codex r7, D1). Every
-                    // proposition this arm carries is the container binding,
-                    // and `DepthSafeRemoval` re-proves exactly that from a
-                    // descriptor on the far side. The worktree arm passes a
-                    // real closure because it carries three propositions —
-                    // which checkout, the lock, HEAD — that live outside that
-                    // file's vocabulary.
-                    provingImmediatelyBefore: LastInstantProof.nothingFurther.run
+                    provingImmediatelyBefore: Self.provedStillTheBoundLeaf(
+                        boundChild, at: child,
+                        containedIn: admittedParent, provider: provider
+                    )
                 )
             }
         } catch {
-            if error is PathGuardError {
-                logRefusal(
-                    label: label, tag: Self.refusalTag(error),
-                    detail: "\(child.path): \(error.localizedDescription)"
-                )
-            } else if let failure = error as? DepthSafeRemoval.Failure,
-                      failure.cause == .notTheAdmittedContainer {
-                // The category root these children were enumerated from was
-                // replaced under the loop. Same tag item mode uses for the
-                // same event, so the cleanup log has ONE word for it.
-                logRefusal(
-                    label: label, tag: "container-drift",
-                    detail: "\(child.path): \(error.localizedDescription)"
-                )
-            } else if let failure = error as? TrashDisposal.Failure {
-                // The swap landed inside `trashItem`'s own resolution, so it
-                // was caught AFTER the move and undone. Same event as the one
-                // above, one disposal over — and the same tag item mode uses
-                // for it, INCLUDING the container case (r13).
-                logRefusal(
-                    label: label, tag: Self.trashRefusalTag(failure),
-                    detail: "\(child.path): \(error.localizedDescription)"
-                )
-            }
             // Failed deletions never accept — their registrations remain for
             // siblings to transfer later (R8).
-            return .failed(error.localizedDescription)
+            return refusedChild(error, child: child, label: label)
         }
 
         // Phase 2: transfer canonical bytes exactly once, after success only.
         return .accepted(await registry.acceptSuccessful(token))
+    }
+
+    /// ONE place that turns a throw from the guarded-child pipeline into the
+    /// child's outcome (fn-4.21) — the binding's refusal and the deletion's
+    /// refusal must not be able to word or tag the same event differently.
+    private func refusedChild(
+        _ error: Error, child: URL, label: String
+    ) -> ChildOutcome {
+        if error is PathGuardError {
+            logRefusal(
+                label: label, tag: Self.refusalTag(error),
+                detail: "\(child.path): \(error.localizedDescription)"
+            )
+        } else if let failure = error as? DepthSafeRemoval.Failure,
+                  failure.cause == .notTheInspectedObject {
+            // The child at this name is not the object this pipeline bound
+            // when it first read it (fn-4.21's leaf binding, or a leaf
+            // binding one disposal down). Same tag item mode uses for the
+            // same event, so the log has ONE word for a swapped LEAF.
+            logRefusal(
+                label: label, tag: "content-drift",
+                detail: "\(child.path): \(error.localizedDescription)"
+            )
+        } else if let failure = error as? DepthSafeRemoval.Failure,
+                  failure.cause == .notTheAdmittedContainer {
+            // The category root these children were enumerated from was
+            // replaced under the loop. Same tag item mode uses for the
+            // same event, so the cleanup log has ONE word for it.
+            logRefusal(
+                label: label, tag: "container-drift",
+                detail: "\(child.path): \(error.localizedDescription)"
+            )
+        } else if let failure = error as? TrashDisposal.Failure {
+            // The swap landed inside `trashItem`'s own resolution, so it
+            // was caught AFTER the move and undone. Same event as the one
+            // above, one disposal over — and the same tag item mode uses
+            // for it, INCLUDING the container case (r13).
+            logRefusal(
+                label: label, tag: Self.trashRefusalTag(failure),
+                detail: "\(child.path): \(error.localizedDescription)"
+            )
+        }
+        return .failed(error.localizedDescription)
     }
 
     // MARK: - Item mode (.removeItem, R15)
@@ -1364,15 +1465,75 @@ actor CacheCleaner {
             return (nil, [Self.itemError(item, error.localizedDescription)])
         }
 
-        // Deliberately NO already-gone skip here (the frozen ENOENT
-        // asymmetry): a missing ("ghost") target surfaces as an ITEM-KEYED
-        // error — its absent leaf measures as an empty report and the
-        // deletion below reports the ENOENT. The ENOENT skip exists ONLY
-        // for category children in contents mode.
-        let report = sizer.measure(
-            at: target, mode: .deletionTarget,
-            knownInodes: await registry.knownIdentities
-        )
+        do {
+            // BOUND BEFORE MEASURED — the order contents mode has always
+            // used, and item mode had backwards (PR #461 codex r2).
+            //
+            // The leaf binding used to be taken AFTER `sizer.measure`. For a
+            // permanently deleted item whose scanner registers no
+            // revalidator — every shipped scanner without one — that left a
+            // window the whole measurement wide: rename the target away and
+            // install a stranger at the same name, and the binding recorded
+            // the STRANGER. The far-side proof then succeeded (it proved the
+            // stranger against itself), the stranger was destroyed, and the
+            // report credited the ORIGINAL tree's bytes. Measuring one object
+            // and binding another is exactly the "a path is not an identity"
+            // class, arrived at through ordering rather than through a path
+            // check.
+            //
+            // `admittedParent` moves up with it, because the leaf is read
+            // under that descriptor. Taken here it covers strictly MORE than
+            // it did — everything after the capture is what the binding
+            // covers, and the measurement is now inside that.
+            //
+            // Taken UNCONDITIONALLY, unlike the verdict-shaped binding below.
+            // `probedObject` cannot be hoisted with it: the revalidation seam
+            // must run AFTER the mount-boundary check, so it is not known
+            // yet. The cost is one extra descriptor open for items that DO
+            // carry a verdict, and one behaviour change for them, stated
+            // rather than glossed: a ghost target now raises its ENOENT here
+            // instead of at the removal. That is the same frozen-ENOENT
+            // reasoning this arm already recorded — the removal's own leaf
+            // open would have raised the identical
+            // `Failure(.posix(ENOENT))` a moment later — now applying to
+            // both arms instead of one.
+            let admittedParent = try DepthSafeRemoval.admittedParent(
+                directory: target.deletingLastPathComponent(),
+                displayPath: target.path, provider: provider
+            )
+            // `try?`, and the fallback below is why. A leaf that cannot be
+            // bound HERE — the ghost target, an unreadable one — must keep
+            // raising its failure at the ORIGINAL point, with the original
+            // error identity: the absent-target arms pin their refusal
+            // MESSAGE precisely so a fixture "cannot silently degrade into
+            // testing the other arm", and a hard `try` here re-tagged them.
+            // This binding therefore only ever ADDS a refusal; it never moves
+            // one.
+            let preMeasureLeaf = try? TrashDisposal.boundLeaf(
+                of: target, containedIn: admittedParent, provider: provider
+            )
+
+            // Deliberately NO already-gone skip here (the frozen ENOENT
+            // asymmetry): a missing ("ghost") target surfaces as an
+            // ITEM-KEYED error. The ENOENT skip exists ONLY for category
+            // children in contents mode.
+            let report = sizer.measure(
+                at: target, mode: .deletionTarget,
+                knownInodes: await registry.knownIdentities
+            )
+
+        // A CANCELLED measurement is a PARTIAL one (fn-4.15) — same
+        // fail-closed rule as the category-child arm above, for the same two
+        // reasons (an unswept mount check, an under-registered claim set),
+        // and the same honest retryability: a new clean re-measures.
+        if report.cancelled {
+            let detail = "\(target.path): measurement was cancelled before "
+                + "the tree was fully inspected — refused, not deleted "
+                + "(cleaning again re-measures; this refusal is not permanent)"
+            logRefusal(label: item.displayName, tag: "measurement_cancelled",
+                       detail: detail)
+            return (nil, [Self.itemError(item, detail)])
+        }
 
         // Same mount doctrine as category children (R15): a boundary
         // anywhere in the measured tree refuses the deletion —
@@ -1429,9 +1590,8 @@ actor CacheCleaner {
             probedObject = inspected == .unestablished ? nil : inspected
         }
 
-        let token = await registry.registerObservations(report.claims)
+            let token = await registry.registerObservations(report.claims)
 
-        do {
             // WHICH FOLDER HOLDS THIS ITEM — READ FROM A DESCRIPTOR, HERE,
             // ON THIS SIDE OF THE QUEUE HOP (PR #458 review — the P1).
             //
@@ -1445,15 +1605,70 @@ actor CacheCleaner {
             // `<dev-root>/proj/node_modules` shape the directory the deletion
             // actually opens (`proj`) is bound by nothing at all.
             //
-            // Taken FIRST, before the rechecks below, because everything
-            // after the capture is what the binding covers; taken last it
-            // would cover only the hop. It fails closed and costs nothing to
-            // do so — the removal performs the identical open a moment later,
-            // so an open that fails here would have failed there.
-            let admittedParent = try DepthSafeRemoval.admittedParent(
-                directory: target.deletingLastPathComponent(),
-                displayPath: target.path, provider: provider
-            )
+            // Taken FIRST — and since the codex r2 fix above, taken before
+            // the MEASUREMENT too, which is where it now lives. This note
+            // stays here because this is where a reader looks for it.
+            //
+            // WITH NO LEAF VERDICT, BIND WHAT STANDS AT THE NAME (fn-4.21).
+            // When `probedObject` is nil no inspection ran, and until this
+            // binding existed the permanent arm's leaf open was proved
+            // against NOTHING — the same "the container binding is what
+            // covers the leaf" reasoning r18 measured false for the worktree
+            // seam, measured false here too: a stranger renamed onto the
+            // target's path after the rechecks below was destroyed with
+            // success reported
+            // (`testItemModeNilProbeTargetSwappedInsideTheWindowIsRefused`).
+            // So the object is read HERE — kind+inode under the container
+            // descriptor just proved, before the rechecks the binding must
+            // cover — and re-proved by the same read on the far side of the
+            // hop. What it pins is delete-time standing, not scan-time
+            // content: only a revalidator can promise content, and a scanner
+            // that registers none has nothing content-shaped to bind
+            // (`preDeleteOutcome`'s `.unestablished`).
+            //
+            // An ENOENT here is the ghost target's frozen behaviour, one
+            // read earlier: the removal's own leaf open would have raised
+            // the identical `Failure(.posix(ENOENT))` a moment later.
+            // When a verdict DOES exist, the verdict is the leaf binding —
+            // it travels in `expecting:` and is proved against the opened
+            // inode by the removal itself, so no second binding is taken.
+            // The binding taken BEFORE the measurement, so the object whose
+            // bytes were counted is the object the removal must prove.
+            //
+            // AND WHEN NOTHING COULD BE BOUND THEN, NOTHING MAY BE DELETED
+            // NOW (PR #461 merge gate r4, P4). The `??` that stood here read
+            // the leaf again at the original point and used whatever it
+            // found, and its comment claimed that read was "same call, same
+            // point, same failure". The third clause was false: the re-read
+            // can SUCCEED, on an object that arrived AFTER the measurement.
+            // Nothing inspected it, nothing measured it, and binding it
+            // proved it against itself — so it was destroyed and the item
+            // reported SUCCESS with no error at all. Measured live, on a
+            // ghost target with a no-revalidator scanner, before this fix.
+            //
+            // The re-read still happens, because a still-absent leaf must
+            // raise its ENOENT at the original point with the original
+            // identity — the absent-target arms pin that message so a
+            // fixture "cannot silently degrade into testing the other arm".
+            // What changes is what a SUCCESSFUL re-read means: it is a drift
+            // event, not a target.
+            let boundTarget: FileSystemIdentityProvider.ChildFacts?
+            if probedObject != nil {
+                boundTarget = nil
+            } else if let bound = preMeasureLeaf {
+                boundTarget = bound
+            } else {
+                // Throws the original failure when the leaf is still absent
+                // or still unbindable; returns only when something now
+                // stands where nothing stood.
+                _ = try TrashDisposal.boundLeaf(
+                    of: target, containedIn: admittedParent,
+                    provider: provider
+                )
+                throw DepthSafeRemoval.Failure(
+                    path: target.path, cause: .notTheInspectedObject, depth: 0
+                )
+            }
             // TOCTOU narrowing, immediately pre-delete: the SAME no-follow
             // + snapshot-identity admission re-runs (a container swapped
             // between the checks above and here is refused), then the
@@ -1528,6 +1743,18 @@ actor CacheCleaner {
                     // disposal binds the leaf under it. Once it does, this arm
                     // rolls back like the other one — which is the second
                     // reason the old note was wrong about itself.
+                    //
+                    // RESIDUAL, STATED (fn-4.21): `boundTarget`, captured
+                    // before the rechecks, is deliberately NOT handed to
+                    // this arm — the disposal re-binds at its own entry, so
+                    // a target swapped between the capture and here is
+                    // admitted and MOVED. Same bound as contents mode's
+                    // Trash arm, for the same reason: the move is into the
+                    // reversible Trash under the after-proof + rollback, so
+                    // the residual's cost is a recoverable wrong entry, and
+                    // closing it needs a new `LeafAdmission` shape with its
+                    // own cells — recorded at fn-4.21 as out of that task's
+                    // five-site scope.
                     try await TrashDisposal.dispose(
                         target, containedIn: admittedParent,
                         provider: provider,
@@ -1546,13 +1773,46 @@ actor CacheCleaner {
                 try await Self.removeItemConcurrently(
                     at: target, expecting: probedObject, provider: provider,
                     containedIn: admittedParent,
-                    // NOTHING FURTHER TO PROVE PAST THE HOP (PR #460 codex r7,
-                    // D1): this arm's two propositions are the container
-                    // binding and `probedObject`, and `DepthSafeRemoval`
-                    // re-proves BOTH from descriptors on the far side.
-                    provingImmediatelyBefore: LastInstantProof.nothingFurther.run
+                    // WHAT CROSSES THE HOP DEPENDS ON WHICH BINDING THIS ARM
+                    // HOLDS (fn-4.21; the claim that stood here — "this
+                    // arm's two propositions are the container binding and
+                    // `probedObject`, re-proved on the far side" — was true
+                    // only when `probedObject` existed, and its nil case was
+                    // the defect). With a verdict, the removal re-proves
+                    // container AND leaf itself and nothing further rides
+                    // across. With none, the leaf proposition is
+                    // `boundTarget`, which only this caller can state — so
+                    // it rides across and is re-proved immediately before
+                    // the removal, the same way the worktree seam carries
+                    // its own propositions.
+                    provingImmediatelyBefore: boundTarget.map {
+                        Self.provedStillTheBoundLeaf(
+                            $0, at: target,
+                            containedIn: admittedParent, provider: provider
+                        )
+                    } ?? LastInstantProof.nothingFurther.run
                 )
             }
+            // ACCEPTED ONLY HERE, inside the same `do` as everything it
+            // accounts for: the token moved in with the block when the leaf
+            // binding was hoisted above the measurement (PR #461 codex r2),
+            // and a failure on any path above still reaches the catch with
+            // the token abandoned.
+            let accepted = await registry.acceptSuccessful(token)
+            logCleanup(
+                label: "\(item.scannerID)/\(item.displayName)",
+                bytesFreed: accepted.exactBytes + accepted.estimatedUpToBytes
+            )
+            return (
+                CleanupReport.Entry(
+                    itemID: item.id, scannerID: item.scannerID,
+                    displayName: item.displayName,
+                    exactBytes: accepted.exactBytes,
+                    estimatedUpToBytes: accepted.estimatedUpToBytes,
+                    disposal: moveToTrash ? .trash : .permanent
+                ),
+                []
+            )
         } catch {
             if error is PathGuardError {
                 logRefusal(
@@ -1602,22 +1862,6 @@ actor CacheCleaner {
             // is produced, and no bytes are reported.
             return (nil, [Self.itemError(item, error.localizedDescription)])
         }
-
-        let accepted = await registry.acceptSuccessful(token)
-        logCleanup(
-            label: "\(item.scannerID)/\(item.displayName)",
-            bytesFreed: accepted.exactBytes + accepted.estimatedUpToBytes
-        )
-        return (
-            CleanupReport.Entry(
-                itemID: item.id, scannerID: item.scannerID,
-                displayName: item.displayName,
-                exactBytes: accepted.exactBytes,
-                estimatedUpToBytes: accepted.estimatedUpToBytes,
-                disposal: moveToTrash ? .trash : .permanent
-            ),
-            []
-        )
     }
 
     // MARK: - Composite item mode (.gitWorktreeReclaim, fn-5.4)
@@ -1898,6 +2142,40 @@ actor CacheCleaner {
                 } catch {
                     continuation.resume(throwing: error)
                 }
+            }
+        }
+    }
+
+    /// THE LEAF BINDING'S FAR SIDE, SPELLED ONCE (fn-4.21). For a deletion
+    /// with NO inspection verdict (`expecting: nil` — all of contents mode,
+    /// and every item whose scanner registers no revalidator), the caller
+    /// binds WHAT STANDS AT THE NAME when it first reads it
+    /// (`TrashDisposal.boundLeaf` under the proved container) and this
+    /// closure re-reads it THE SAME WAY, under the SAME `admittedParent`,
+    /// on the far side of the queue hop, immediately before the removal.
+    ///
+    /// This is the r18 mechanism (`WorktreeReclaimPerformer.BoundObject`,
+    /// re-proved in its `LastInstantProof`; `TrashDisposal.disposeBoundLeaf`,
+    /// step 2), reached through the same function — one reading on each side
+    /// of the hop, produced identically, so the two cannot disagree about
+    /// what the object IS. A difference is a swap inside the window and
+    /// nothing else, and it throws the SAME `.notTheInspectedObject` the
+    /// verdict-carrying arms throw for the same event, so the report and the
+    /// log word it identically (`content-drift`).
+    nonisolated private static func provedStillTheBoundLeaf(
+        _ bound: FileSystemIdentityProvider.ChildFacts,
+        at target: URL,
+        containedIn admittedParent: DepthSafeRemoval.AdmittedParent,
+        provider: FileSystemIdentityProvider
+    ) -> () throws -> Void {
+        {
+            let atTheInstant = try TrashDisposal.boundLeaf(
+                of: target, containedIn: admittedParent, provider: provider
+            )
+            guard atTheInstant == bound else {
+                throw DepthSafeRemoval.Failure(
+                    path: target.path, cause: .notTheInspectedObject, depth: 0
+                )
             }
         }
     }

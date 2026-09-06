@@ -29,9 +29,9 @@
 ///   `git_worktree_reclaim` — `.commands` and `.gitWorktreeReclaim`
 ///   serialize ONLY their kind; argv arrays and plan paths never reach any
 ///   wire.
-/// - `ScanIssue.Kind`: `container_refused` | `symlink_root` | `tcc_denied` |
-///   `permission_denied` | `unreadable` | `config_invalid` |
-///   `tool_unavailable` | `malformed_outcome`.
+/// - `ScanIssue.Kind`: FROZEN wire strings, case-by-case, on the enum's own
+///   `wireString` and in PROTOCOL.md's `kind` row — EXTENSIBLE, consumers
+///   tolerate unknown kinds (the list that stood here rotted; fn-4.12).
 /// - Item ids: full 64-char lowercase-hex SHA-256 over the UTF-8 bytes of
 ///   `scannerID + "\0" + canonicalPath` (`ReclaimableItem.stableID`).
 
@@ -836,7 +836,17 @@ struct ScanIssue: Equatable, Sendable {
     /// consumers that assume the case list is closed. Generalizes the
     /// retired `NodeModulesScanIssue.Kind` scanner-agnostically.
     enum Kind: Equatable, Sendable {
-        /// `PathGuard.admitContainer` refused the search root.
+        /// A path that is genuinely NOT a configured search root — which is
+        /// the fixed sentence the GUI derives from this kind, so that is the
+        /// ONE condition allowed to carry it (fn-4.12 producer audit). Its
+        /// live producer is `GitWorktreeScanner`'s discovered-worktree arm
+        /// (a registered worktree sitting outside EVERY configured dev
+        /// root). The refusals that used to ride this kind while their own
+        /// `detail` said "configured … refused" moved to
+        /// `.policyRefusedRoot`/`.mountedVolumeRoot` (`DevRootsStore`,
+        /// `ProjectTreeWalker`) and `.mutationScopeRefused`
+        /// (`GitWorktreeScanner`'s containment arms). The WIRE string is
+        /// frozen; only the producer set narrowed.
         case containerRefused
         /// A REGISTERED search root that the kernel's mount table names as a
         /// mount point: another volume stands at that path, so what is there
@@ -881,6 +891,20 @@ struct ScanIssue: Equatable, Sendable {
         /// remedy is claimed in the label because the causes do not share
         /// one. A FILESYSTEM kind: `url` names the refused root.
         case policyRefusedRoot
+        /// A DISCOVERED deletable candidate withheld because the destructive
+        /// git operation's whole MUTATION SCOPE — the paths git itself would
+        /// modify (the worktree, the admin directories) PLUS the parent
+        /// repository whose records name them — is not contained in ONE
+        /// configured dev root (`GitWorktreeScanner.mutationScope`, D13).
+        /// The candidate itself is often INSIDE a configured root — which is
+        /// exactly why `.containerRefused` ("not a configured search root")
+        /// was a false diagnosis for these producers and this is its own
+        /// kind (fn-4.12): the GUI's visible row label derives from the kind
+        /// alone. The label claims no remedy — where the out-of-scope data
+        /// sits is the user's layout — and `detail` names which path broke
+        /// the containment. A FILESYSTEM kind: `url` names the candidate
+        /// whose removal was withheld.
+        case mutationScopeRefused
         /// The search root is a SYMLINK — and only a symlink. Its target may
         /// sit anywhere, so the no-follow root gate never traverses it.
         ///
@@ -927,7 +951,7 @@ struct ScanIssue: Equatable, Sendable {
         /// kind: a config parse failure has no honest filesystem path, so
         /// `url` is nil and a fake path is never invented. (Policy-REJECTED
         /// configured roots are NOT this kind — they carry their offending
-        /// path honestly under the frozen `.containerRefused`.)
+        /// path honestly under `.policyRefusedRoot`, fn-4.12.)
         case configInvalid
         /// An EXTERNAL TOOL a scanner depends on is unavailable (fn-5, D12
         /// revised — e.g. `git` missing from the runner's fixed PATH, or its
@@ -980,6 +1004,7 @@ struct ScanIssue: Equatable, Sendable {
             case .mountedVolumeRootAtRegistration:
                 return "mounted_volume_root_at_registration"
             case .policyRefusedRoot: return "policy_refused_root"
+            case .mutationScopeRefused: return "mutation_scope_refused"
             case .symlinkRoot: return "symlink_root"
             case .nonDirectoryRoot: return "non_directory_root"
             case .tccDenied: return "tcc_denied"
@@ -1375,14 +1400,43 @@ struct ScanSessionBounds: Sendable {
     /// wind down before `untilProducerFinishes()` stops waiting for it. See
     /// that method for what is given up when this one expires.
     let producerWindDownGrace: Duration
+    /// How long the PRE-SESSION container-identity capture
+    /// (`ContainerSnapshot.captureBounded`, fn-4.19) may take before the
+    /// session is concluded `.boundFired` with NOTHING scanned. Its own
+    /// bound and not `eventDeadline`'s, because the two cover different
+    /// work: the capture is a handful of `lstat`s (microseconds when every
+    /// volume answers — a hung network mount or unresponsive FUSE
+    /// filesystem under a session root is what spends it), while the event
+    /// deadline covers whole filesystem walks. See `scanValidatedSession`
+    /// for what a session whose capture timed out reports.
+    let captureDeadline: Duration
+
+    /// `captureDeadline` defaults here so the FIXTURE constructions across
+    /// the suite — none of which wedge the capture unless they inject a
+    /// bound of their own — keep their two-argument spelling. Ten seconds is
+    /// the `default` philosophy applied to a microseconds-scale operation:
+    /// it never fails a capture for being SLOW, only for being ABANDONED.
+    init(
+        eventDeadline: Duration,
+        producerWindDownGrace: Duration,
+        captureDeadline: Duration = .seconds(10)
+    ) {
+        self.eventDeadline = eventDeadline
+        self.producerWindDownGrace = producerWindDownGrace
+        self.captureDeadline = captureDeadline
+    }
 
     /// What the SHIPPED composition runs under — `production(…)` is the
     /// only construction in the repo that names it. Ten minutes is far above
     /// any measured scan of a real machine; it exists to convert "never"
     /// into "reported", and a scan that legitimately needs longer than this
-    /// has a different problem.
+    /// has a different problem. The capture deadline is thirty seconds by
+    /// the same rule: four orders of magnitude above a healthy capture,
+    /// short enough that a scan stalled on a dead mount reports within the
+    /// time a user will actually wait for a spinner.
     static let production = ScanSessionBounds(
-        eventDeadline: .seconds(600), producerWindDownGrace: .seconds(30)
+        eventDeadline: .seconds(600), producerWindDownGrace: .seconds(30),
+        captureDeadline: .seconds(30)
     )
 
     /// WHAT A COMPOSITION THAT DID NOT NAME A BOUND GETS, and why it is not
@@ -1417,13 +1471,27 @@ struct ScanSessionBounds: Sendable {
 /// the pool's every worker is held by a scanner blocked in a syscall, which
 /// is the exact wedge the bound exists to convert into a report.
 ///
-/// The queue is DEDICATED and SERIAL, and nothing blocking may ever be
-/// scheduled on it. Every body it runs is non-suspending and microseconds
-/// long — yield into an unbounded `AsyncStream`, `finish()`, `Task.cancel()`,
+/// The queue is DEDICATED and SERIAL, and nothing blocking may be scheduled
+/// on it. Every body it runs is non-suspending and microseconds long — yield
+/// into an unbounded `AsyncStream`, `finish()`, `Task.cancel()`,
 /// `OneShotGate.open()` (which resumes continuations by ENQUEUEING them, it
 /// does not run them inline). That is what makes one serial queue safe for
 /// every concurrent session on the machine; put a blocking call in one of
-/// these bodies and you would stall every other session's deadline behind it.
+/// these bodies and you stall every other session's deadline behind it.
+///
+/// ONE BODY BREAKS THIS, KNOWINGLY (PR #461 merge gate r3, P6 — recorded
+/// HERE because this is the site a future round reads to answer "may I block
+/// in this body?", and until r3 the answer here was an unqualified no while
+/// the exception lived a thousand lines away). `CacheoutViewModel.dockerPrune`
+/// schedules `LaunchClaim.abandon()` on this queue, and `abandon()` blocks on
+/// the claim's lock, which `begin` holds across a `Process.run()` — a
+/// fork/exec, milliseconds, more under load. It is deliberate: releasing that
+/// lock earlier is precisely the window `LaunchClaim` exists to close. No
+/// deadlock cycle exists, but for that interval every other bound scheduled
+/// here — `DiskInfo`, `PathGuard`, the wind-down grace, the event-deadline
+/// watchdog — is delayed, and that prune's own `.timedOut` settle overshoots
+/// its budget by the same amount. A SECOND such body would not be acceptable
+/// on this reasoning; this one is the exception, not a precedent.
 enum ScanSessionClock {
     static let queue = DispatchQueue(
         label: "app.cacheout.scan-session-bounds"
@@ -1794,10 +1862,12 @@ struct SpaceScannerRuntime {
     let scanners: [any SpaceScanner]
     /// UNION of every scanner's declared `trustedContainerRoots`, in
     /// registration order, deduplicated by path — and with SHADOWING
-    /// ALIASES suppressed (`suppressingAliasShadows`): at most one spelling
-    /// per canonical location survives whenever any of them is a real
-    /// directory, so first-match root matching can never return an unusable
-    /// spelling of a location another scanner registered usably.
+    /// ALIASES suppressed (`suppressingAliasShadows`): an unusable spelling
+    /// whose own link content names a surviving real-directory spelling is
+    /// dropped, so first-match root matching can never return such an
+    /// unusable spelling of a location another scanner registered usably
+    /// (comparison is by NAME since fn-4.11 — the residual is recorded on
+    /// that function).
     let trustedContainerRoots: [URL]
 
     /// PER-SCANNER declared container roots, captured at registration
@@ -1809,11 +1879,14 @@ struct SpaceScannerRuntime {
     /// union.
     private let declaredContainerRoots: [String: [URL]]
 
-    /// DECLARED path -> canonical path, for every root any scanner declared
+    /// DECLARED path -> comparison key, for every root any scanner declared
     /// (union survivors and alias-suppressed drops alike), captured at
-    /// registration from `suppressingAliasShadows`' single probe pass.
-    /// Read ONLY by `sessionContainerRoots`, which uses it to decide the
-    /// snapshot's capture set without a session-time realpath.
+    /// registration from `suppressingAliasShadows`' single probe pass: the
+    /// canonical path for a proven real directory, the folded link content
+    /// or parent-canonical leaf-kept spelling otherwise (fn-4.11 — nothing
+    /// here follows a symlink leaf). Read ONLY by `sessionContainerRoots`,
+    /// which uses it to decide the snapshot's capture set without a
+    /// session-time realpath.
     private let containerRootCanonicalKeys: [String: String]
 
     /// The AUTHORITATIVE category registry, keyed by slug — registered at
@@ -1966,17 +2039,46 @@ struct SpaceScannerRuntime {
     ///
     /// - a dropped spelling is never a real directory, so `admitContainer`'s
     ///   gate (2) refused it, and the walker refuses it as a root;
-    /// - it is dropped ONLY when a real-directory spelling of the SAME
-    ///   canonical location survives — and root matching is by canonical
-    ///   identity, so every claim the alias could have matched still matches
-    ///   the covering root, which additionally passes the gate;
+    /// - it is dropped ONLY when its own link content NAMES a surviving
+    ///   real-directory spelling (by that root's canonical key or declared
+    ///   path) — and delete-time root matching is by canonical identity, so
+    ///   every claim the alias could have matched still matches the covering
+    ///   root, which additionally passes the gate;
     /// - a claim spelled AS the alias stays refused: gate (2) checks the
     ///   caller's own spelling too.
     ///
+    /// PROBED AS SPELLED FIRST (fn-4.11 — the fn-4.26 order at the union's
+    /// scope). This probe runs at CONSTRUCTION, on the main thread, and the
+    /// old shape canonicalized EVERY root — leaf included — so a symlink
+    /// root here (a dev root a same-UID process re-aimed, or fn-6's
+    /// symlinked temp root when its own resolution could not place it) made
+    /// `realpath(3)` name the DESTINATION, and an unresponsive volume there
+    /// froze launch. Now only a spelling PROVEN a real directory by the
+    /// no-follow lstat is canonicalized (the resolved leaf then IS the
+    /// object the lstat touched); a symlink leaf contributes what its own
+    /// CONTENT names (`FileSystemIdentityProvider.lexicalAliasTarget` — one
+    /// `readlink(2)` + string folding, the fn-6 technique), compared by
+    /// NAME against the real-directory spellings this union holds. A root
+    /// the kernel mount table names is not probed at all (the r15 shape —
+    /// `lstat` OF a mount point is served by the mounted filesystem): kept
+    /// verbatim, and still fail-closed, because delete-time root matching
+    /// skips over-mounted configured roots from the same table.
+    ///
+    /// RESIDUAL at measured scope: the name compare misses a target written
+    /// through a THIRD spelling (a second link hop, a case variant, an
+    /// unresolved `/var`-style alias of the covering root's declared
+    /// spelling) — such an alias is KEPT, where the old full resolution
+    /// dropped it, and it can then sit ahead of the root it shadows for
+    /// first-match root matching (the fn-4.5 breakage, at that narrowed
+    /// scope). The same trade fn-6.1 records for its own resolution
+    /// (`testAliasWrittenThroughAThirdSpellingKeepsBothRootsRatherThanGuessing`):
+    /// closing it requires resolving the destination, which is the exact
+    /// contact this function must not make.
+    ///
     /// The `resolveTargetKeepingLeaf` doctrine is preserved exactly as
-    /// `DevRootsStore` preserves it: the leaf-resolving canonical path is a
-    /// comparison KEY only and never reaches the returned union — every
-    /// surviving entry is the verbatim spelling its scanner declared.
+    /// `DevRootsStore` preserves it: every comparison value is a KEY only
+    /// and never reaches the returned union — every surviving entry is the
+    /// verbatim spelling its scanner declared.
     ///
     /// Nothing is silently lost: a dropped root is unusable in its own right,
     /// and the scanner that declared it still declares it
@@ -1987,43 +2089,79 @@ struct SpaceScannerRuntime {
     private static func suppressingAliasShadows(
         in roots: [URL], provider: FileSystemIdentityProvider
     ) -> (roots: [URL], canonicalKeys: [String: String]) {
-        // Probed ONCE per root: the canonical comparison KEY, and whether the
-        // DECLARED spelling is itself a real directory (leaf lstat no-follow)
-        // — the same probe pair, with the same meaning, as fn-4.1's dev-root
-        // resolution.
-        let probed = roots.map { root in
-            (declared: root,
-             key: provider.canonicalize(root).path,
-             isDirectory: provider.probeKind(of: root) == .kind(.directory))
+        let mounted = Set(provider.mountPointPaths())
+        // Probed ONCE per root, as spelled first (see the doc above): the
+        // canonical KEY for proven real directories, the folded link
+        // content for symlink leaves, nothing for a root the mount table
+        // names. `mapKey` is what `canonicalKeys` carries when neither a
+        // canonical key nor a covering root applies: the folded content
+        // when the link has one, else the parent-canonical leaf-kept
+        // spelling (`resolveTargetKeepingLeaf` — ancestors only), so two
+        // scanners' spellings of one location still land on one key
+        // without any leaf-following resolution.
+        let probed = roots.map {
+            root -> (declared: URL, key: String?, aliasTarget: String?,
+                     mapKey: String) in
+            if mounted.contains(root.path) {
+                return (root, nil, nil, root.path)
+            }
+            switch provider.probeKind(of: root) {
+            case .kind(.directory):
+                let key = provider.canonicalize(root).path
+                return (root, key, nil, key)
+            case .kind(.symlink):
+                let target = provider.lexicalAliasTarget(of: root)
+                return (root, nil, target,
+                        target ?? provider.resolveTargetKeepingLeaf(root).path)
+            case .kind(.regularFile), .kind(.other), .absent, .failed:
+                return (root, nil, nil,
+                        provider.resolveTargetKeepingLeaf(root).path)
+            }
         }
-        let coveredByRealDirectory = Set(
-            probed.lazy.filter(\.isDirectory).map(\.key)
-        )
+        // The spellings a REAL-DIRECTORY root already covers — its
+        // canonical key and its declared path. An alias's folded link
+        // content is compared against THESE STRINGS, never resolved.
+        var coveredByRealDirectory = Set<String>()
+        for root in probed {
+            guard let key = root.key else { continue }
+            coveredByRealDirectory.insert(key)
+            coveredByRealDirectory.insert(root.declared.path)
+        }
         // Two real-directory spellings of one location are NOT touched: both
         // pass the reality gate, so neither shadows the other, and dropping
         // either would change which declared spelling the identity binding
         // keys off for no safety gain.
-        return (
-            roots: probed
-                .filter { $0.isDirectory || !coveredByRealDirectory.contains($0.key) }
-                .map(\.declared),
-            // THE SAME PROBE'S KEYS, carried out rather than recomputed (PR
-            // #459 codex r16). `sessionContainerRoots` needs to know which
-            // union entries a participating scanner's declared root can
-            // MATCH, and matching is by canonical identity
-            // (`PathGuard.matchConfiguredRoot`, PathGuard.swift:462-469), not
-            // by spelling. Re-canonicalizing at session time would pay this
-            // construction's realpath bill again — per session, per trigger,
-            // on exactly the roots the participation gate exists to leave
-            // alone. Keyed by DECLARED path and kept for every declared root
-            // including the ones dropped above: a participating scanner whose
-            // own spelling was suppressed still reaches the covering entry
-            // through this map.
-            canonicalKeys: Dictionary(
-                probed.map { ($0.declared.path, $0.key) },
-                uniquingKeysWith: { first, _ in first }
-            )
-        )
+        var union: [URL] = []
+        // THE SAME PROBE'S KEYS, carried out rather than recomputed (PR
+        // #459 codex r16). `sessionContainerRoots` needs to know which
+        // union entries a participating scanner's declared root can MATCH,
+        // and matching is by canonical identity
+        // (`PathGuard.matchConfiguredRoot`, PathGuard.swift:536-543), not
+        // by spelling. Re-deriving them at session time would pay this
+        // construction's probe bill again — per session, per trigger, on
+        // exactly the roots the participation gate exists to leave alone.
+        // Keyed by DECLARED path and kept for every declared root including
+        // the ones dropped below. A DROPPED spelling's entry is the NAME its
+        // content folded to, not the covering root's canonical key — fn-4.11
+        // retired that link on measured evidence (deleting it left every
+        // cell green): a scanner can produce no admissible claim through a
+        // spelling the reality gates refuse (the walker's root gate never
+        // walks it, scan-time origin binding is to the scanner's own
+        // declaration, and `admitContainer`'s gate (2) refuses the alias
+        // spelling itself), so pulling the covering entry into the capture
+        // set for such a participant was exactly the over-capture the r16
+        // narrowing exists to avoid.
+        var canonicalKeys: [String: String] = [:]
+        for root in probed {
+            canonicalKeys[root.declared.path] = root.key ?? root.mapKey
+            if root.key == nil,
+               let target = root.aliasTarget,
+               coveredByRealDirectory.contains(target) {
+                continue // the shadowing alias — dropped from the union
+            }
+            union.append(root.declared)
+        }
+        return (roots: union, canonicalKeys: canonicalKeys)
     }
 
     /// The production registry — the single place scanners are registered.
@@ -3018,7 +3156,7 @@ struct SpaceScannerRuntime {
     ///
     /// WHY IT CANNOT STRAND A LATER CLEAN. Omission from the snapshot is
     /// fail-closed: `PathGuard.admitContainer` refuses a root it cannot find
-    /// there (PathGuard.swift:400-403). Both consumers already refuse the
+    /// there (PathGuard.swift:474-477). Both consumers already refuse the
     /// same items for an independent reason:
     ///
     /// - the ViewModel gates every destructive path on the scanner's
@@ -3026,10 +3164,10 @@ struct SpaceScannerRuntime {
     ///   (`isBlockedFromDestructivePaths`, CacheoutViewModel.swift:610-614).
     ///   A non-participating scanner delivers no event, so its retained rows
     ///   keep the older generation while adoption moves on
-    ///   (CacheoutViewModel.swift:1487-1488) — they are already
+    ///   (CacheoutViewModel.swift:1488-1489) — they are already
     ///   visible-but-non-cleanable before this filter sees them;
     /// - the CLI resolves the items it cleans FROM the same collected
-    ///   session (CLIHandler.swift:2123 and :2442 pass that session's
+    ///   session (CLIHandler.swift:2125 and :2444 pass that session's
     ///   snapshot), so it can only ever hold items a participating scanner
     ///   produced.
     ///
@@ -3040,15 +3178,19 @@ struct SpaceScannerRuntime {
     ///
     /// WHY CANONICAL KEYS AND NOT JUST PATHS. Delete-time root matching is by
     /// canonical identity over the whole union, returning the FIRST match
-    /// (PathGuard.swift:462-469), and the snapshot is keyed by THAT root's
+    /// (PathGuard.swift:536-543), and the snapshot is keyed by THAT root's
     /// declared spelling. So a participating scanner's claim can legitimately
     /// key off a union entry only a NON-participating scanner declared — an
-    /// alias spelling of the same location, including the case where the
-    /// participating scanner's own spelling was dropped by
-    /// `suppressingAliasShadows`. Filtering by declared path alone would have
-    /// turned those admissions into `containerUnavailable`; the registration
-    /// -captured `containerRootCanonicalKeys` pull the covering entry in
-    /// without a session-time realpath.
+    /// alias spelling of the same location, both spellings real directories
+    /// (the ancestor-symlink case
+    /// `testAParticipatingScannersAliasedRootIsStillCaptured` stages).
+    /// Filtering by declared path alone would have turned those admissions
+    /// into `containerUnavailable`; the registration-captured
+    /// `containerRootCanonicalKeys` pull the covering entry in without a
+    /// session-time realpath. (This paragraph once also claimed the link
+    /// held for a spelling `suppressingAliasShadows` DROPPED — retired in
+    /// fn-4.11: a dropped spelling supports no admissible claim, so its map
+    /// entry deliberately links nothing; see that function.)
     private func sessionContainerRoots(
         for selected: [any SpaceScanner]
     ) -> [URL] {
@@ -3087,8 +3229,10 @@ struct SpaceScannerRuntime {
     func scanValidated(
         scannerIDs: Set<String>? = nil,
         context: ScanContext
-    ) -> AsyncStream<ValidatedScannerEvent> {
-        scanValidatedSession(scannerIDs: scannerIDs, context: context).events
+    ) async -> AsyncStream<ValidatedScannerEvent> {
+        await scanValidatedSession(
+            scannerIDs: scannerIDs, context: context
+        ).events
     }
 
     /// `scanValidated` plus the producer's REAL completion (additive over
@@ -3099,10 +3243,18 @@ struct SpaceScannerRuntime {
     /// keeps its "scanning" guard honest until the walk has actually
     /// stopped, instead of releasing it while an orphaned traversal is
     /// still reading the same trees.
+    /// ASYNC SINCE fn-4.19, and the await is the fix: the container-identity
+    /// capture used to run synchronously inside this call, which
+    /// `CacheoutViewModel.scan` reaches on the MainActor — so every session
+    /// root's `lstat` ran ON THE MAIN THREAD, before any bound existed. The
+    /// method is nonisolated, so an async caller hops off its actor to run
+    /// it, and the capture itself is bounded (`captureDeadline`) with its
+    /// expiry reported through the session's own `.scanDidNotFinish`
+    /// vocabulary — see below.
     func scanValidatedSession(
         scannerIDs: Set<String>? = nil,
         context: ScanContext
-    ) -> ValidatedScanSession {
+    ) async -> ValidatedScanSession {
         // TWO independent filters, and the second is the PROTOCOL's rather
         // than the caller's (PR #459 review r2). `scannerIDs` is what the
         // caller asked for; `participates(in:)` is what the scanner will
@@ -3131,50 +3283,57 @@ struct SpaceScannerRuntime {
         // lstat (PR #459 review r6 codex C2 — that lstat is first contact
         // with the mounted filesystem).
         //
-        // RECORDED, NOT FIXED, AND NOT COVERED BY THE BOUND BELOW (PR #460
-        // codex r13). This capture is SYNCHRONOUS — `ContainerSnapshot
-        // .capture` reads the mount table and then runs `provider
-        // .identity(of:)`, an `lstat`, for every remaining session container
-        // root — and `CacheoutViewModel.scan` calls this method without an
-        // `await`, on the MainActor. So it runs ON THE MAIN THREAD, and it
-        // runs BEFORE the stream, the producer, the watchdog and the grace
-        // timer exist: a hung network mount or unresponsive FUSE volume
-        // freezes the app here, unbounded and unreported, with no
-        // `.scanDidNotFinish` possible because nothing is armed yet. r12's
-        // verifier measured a 6.03 s `scan` with `isMainThread == true` from
-        // a 6 s blocking `identity(of:)`; verified here as a code path
-        // rather than re-measured — the loop is straight-line synchronous
-        // and this call site has no suspension point before it. The
-        // `mountPointPaths()` preflight does NOT close it: it skips roots
-        // that ARE mount points, and a root INSIDE a hung mount is still
-        // lstat'ed. Pre-existing on origin/main; its own task.
+        // AND IT IS BOUNDED, OFF THE CALLING THREAD (fn-4.19; through fn-4
+        // round 1 this was RECORDED, NOT FIXED). The capture is synchronous
+        // filesystem work — the mount-table read plus one `lstat` per
+        // remaining session container root — and it ran inline in this
+        // then-synchronous method, which `CacheoutViewModel.scan` reaches
+        // from the MainActor: a hung network mount or unresponsive FUSE
+        // volume under ANY session root froze the app here, unbounded and
+        // unreported, with no `.scanDidNotFinish` possible because nothing
+        // was armed yet (r12's verifier measured a 6.03 s `scan` with
+        // `isMainThread == true` from a 6 s blocking `identity(of:)`; the
+        // `mountPointPaths()` preflight never covered a root INSIDE a hung
+        // mount). `captureBounded` runs the loop in a detached task racing a
+        // `ScanSessionClock` timer — the `BoundedDiskInfo` shape, and the
+        // same off-the-pool clock every session bound uses.
         //
-        // IT IS NOT THE ONLY PRE-SESSION WAIT, and reading it as "the one
-        // place the bound cannot reach" is what let a second one sit
-        // undisclosed for two rounds (PR #460 codex r14, V2-1).
-        // `CacheoutViewModel.scan`'s header refresh also runs after the
-        // in-progress guard and before this method is called; it is now
-        // bounded on its own clock (`BoundedDiskInfo`), which is the shape a
-        // fix for THIS site would take too — a wall-clock budget of its own,
-        // since the session's cannot be armed yet. What stops that here and
-        // not there is the disposition: an abandoned header fetch costs a
-        // stale figure, while an abandoned container snapshot would leave the
-        // session with no identity baseline to admit deletes against, so
-        // giving up on it needs a product decision about what the scan then
-        // reports.
-        let snapshot = ContainerSnapshot.capture(
-            roots: sessionContainerRoots(for: selected), provider: provider
+        // WHAT AN EXPIRED CAPTURE REPORTS — the product decision the r13
+        // record said this fix would owe. An abandoned capture leaves the
+        // session with NO identity baseline to admit deletes against, so
+        // proceeding to scan would publish items that delete-time admission
+        // must refuse wholesale — a scan-shaped success whose cleaning
+        // silently fails is the erasure class this project refuses. The
+        // session therefore runs NO scanner and reports every selected one
+        // through the vocabulary consumers already fail closed on: one
+        // `.scanDidNotFinish` per scanner, the ledger concluded
+        // `.boundFired` (so `didExceedBounds` is true and the GUI declines
+        // adoption; the CLI's target-scoped refusal reads the same rows),
+        // and a detail that names the capture and the retryable causes. CAN
+        // A RETRY DIFFER? Yes — the causes are a stalled volume or a
+        // starved band, both transient — so the re-scan remedy the label
+        // names is real, and this is a bound, not a deterministic strand.
+        // THE SESSION'S WALL-CLOCK BOUNDS (PR #460 codex r12, D2) — see
+        // `ScanSessionBounds` for the mechanism and the decision. Everything
+        // the watchdog needs is captured HERE, before any task starts — and
+        // since fn-4.19 the capture below spends the first of them.
+        let bounds = sessionBounds
+        let selectedIDs = selected.map(\.id)
+        let capture = await ContainerSnapshot.captureBounded(
+            roots: sessionContainerRoots(for: selected), provider: provider,
+            within: bounds.captureDeadline
         )
+        guard case .captured(let snapshot) = capture else {
+            return Self.captureTimedOutSession(
+                selectedIDs: selectedIDs, captureDeadline: bounds.captureDeadline,
+                windDownGrace: bounds.producerWindDownGrace
+            )
+        }
         let registeredCategories = self.registeredCategories
         let declaredContainerRoots = self.declaredContainerRoots
         let preDeleteRevalidators = self.preDeleteRevalidators
         let (events, continuation) =
             AsyncStream<ValidatedScannerEvent>.makeStream()
-        // THE SESSION'S WALL-CLOCK BOUNDS (PR #460 codex r12, D2) — see
-        // `ScanSessionBounds` for the mechanism and the decision. Everything
-        // the watchdog needs is captured HERE, before any task starts.
-        let bounds = sessionBounds
-        let selectedIDs = selected.map(\.id)
         let ledger = ScanSessionLedger()
         let woundDown = OneShotGate()
         // THE PRODUCER RUNS IN A LOWER PRIORITY BAND THAN ITS CONSUMER, and
@@ -3300,6 +3459,55 @@ struct SpaceScannerRuntime {
             snapshot: snapshot, events: events, producer: task,
             ledger: ledger, woundDown: woundDown,
             windDownGrace: bounds.producerWindDownGrace
+        )
+    }
+
+    /// The session a TIMED-OUT container-identity capture produces
+    /// (fn-4.19): nothing scanned, everything said so. One
+    /// `.scanDidNotFinish` per selected scanner — the kind's contract holds
+    /// exactly (nothing was rejected: nothing ARRIVED, and a retry can
+    /// genuinely differ) — with a detail naming the capture rather than the
+    /// walk, the ledger concluded `.boundFired` so `didExceedBounds` reads
+    /// true, and the EMPTY snapshot, which admits no container (the same
+    /// fail-closed refusal an omitted root has always produced).
+    ///
+    /// The stream is fully buffered before it is returned (`makeStream`'s
+    /// unbounded default), the producer is a completed no-op, and the
+    /// wind-down gate opens immediately — `untilProducerFinishes()` returns
+    /// on the spot, because there is no walk to wind down.
+    private static func captureTimedOutSession(
+        selectedIDs: [String], captureDeadline: Duration,
+        windDownGrace: Duration
+    ) -> ValidatedScanSession {
+        let (events, continuation) =
+            AsyncStream<ValidatedScannerEvent>.makeStream()
+        let ledger = ScanSessionLedger()
+        let woundDown = OneShotGate()
+        // The same atomic step the watchdog takes, for the same reason: the
+        // conclusion and the reported set are decided together. This is the
+        // first touch of a fresh ledger, so the missing set is every
+        // selected scanner.
+        let missing = ledger.conclude(.boundFired, selected: selectedIDs) ?? []
+        for id in missing {
+            continuation.yield(.malformed(
+                scannerID: id,
+                ScanIssue(
+                    url: nil, kind: .scanDidNotFinish,
+                    detail: "the container-identity capture did not finish "
+                        + "within \(captureDeadline); no scanner ran and "
+                        + "nothing from this session was used — a volume "
+                        + "that stopped answering (a hung network mount or "
+                        + "unresponsive FUSE filesystem under a scanned "
+                        + "location) can cause this, and a re-scan after it "
+                        + "answers or is unmounted can succeed"
+                )
+            ))
+        }
+        continuation.finish()
+        woundDown.open()
+        return ValidatedScanSession(
+            snapshot: .empty, events: events, producer: Task {},
+            ledger: ledger, woundDown: woundDown, windDownGrace: windDownGrace
         )
     }
 

@@ -314,6 +314,15 @@ struct ScanIssueRowPresentation: Equatable {
         // which clause fired, in the tooltip.
         case .policyRefusedRoot:
             return "refused by the search-root safety policy"
+        // A DISCOVERED candidate (a git worktree, or a repository's admin
+        // data), not a root: git's cleanup would modify paths that do not
+        // all sit inside ONE configured dev root, so no removal is offered
+        // (fn-4.12). Under `.containerRefused` this row read "not a
+        // configured search root" while the producer's own `detail` said
+        // "inside a configured dev root". No remedy is claimed — where the
+        // out-of-scope data sits is the user's layout; `detail` names it.
+        case .mutationScopeRefused:
+            return "git cleanup is not contained in one dev root — not offered"
         case .symlinkRoot: return "symlinked — not searched"
         // Not a symlink and not a directory (PR #459 codex r13): a regular
         // file, FIFO, socket or device stands there. Under `.symlinkRoot`

@@ -140,7 +140,7 @@
 /// this machine, `st_dev` is identical for literally every path INCLUDING
 /// `/` and `/System/Volumes/Data`, so the device comparison is blind to
 /// exactly the APFS firmlink split it was partly meant to catch. The two
-/// path-based signals the sizer (`DirectorySizer.swift:261-272,354-359`) and the
+/// path-based signals the sizer (`DirectorySizer.swift:322-337,448-453`) and the
 /// project walker already use are retained beside it — they are the seam
 /// hermetic tests inject through, and they can only ever push the answer
 /// toward refusal. There is still exactly ONE notion of "mount boundary" in
@@ -162,8 +162,8 @@
 /// which means network round trips, spin-up, and privacy-sensitive access to
 /// a filesystem the user never pointed this scanner at. And it buys nothing:
 /// an artifact dir containing a boundary is `.denied` at scan time and
-/// refused whole by the cleaner (`CacheCleaner.deleteGuardedChild`:1151 and
-/// `CacheCleaner.removeGuardedItem`:1371), so no
+/// refused whole by the cleaner (`deleteGuardedChild`, `CacheCleaner.swift:1210`,
+/// and `removeGuardedItem`, `CacheCleaner.swift:1543`), so no
 /// valuable found past the mount could ever change an outcome.
 ///
 /// UNCROSSED ⇒ INCOMPLETE, never "clean": the honest report is "we did not
@@ -939,7 +939,7 @@ enum ValuablesDetector {
         descriptorWindow: Int? = nil
     ) -> ValuablesDisclosure {
         // MOUNT BOUNDARY AT THE ROOT. The sizer applies these signals to its
-        // OWN root (`DirectorySizer.swift:261-272`) and declines to enumerate; the
+        // OWN root (`DirectorySizer.swift:322-337`) and declines to enumerate; the
         // probe must decline identically, or the delete-time face — which has
         // no size report to consult — would read a whole mounted volume.
         // Nothing beneath is opened: not one entry of a foreign filesystem is

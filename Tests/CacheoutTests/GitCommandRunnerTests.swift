@@ -551,6 +551,687 @@ final class GitCommandRunnerTests: XCTestCase {
         )
     }
 
+    /// Repo root from this file's own path — the idiom
+    /// `SourceAnchorIntegrityTests` uses, so a moved test file cannot make
+    /// the fence below silently scan nothing.
+    private var repositoryRoot: URL {
+        URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+    }
+
+    /// Swift source with every comment blanked and every string literal's
+    /// CONTENTS blanked — but INTERPOLATED EXPRESSIONS kept verbatim —
+    /// newlines and therefore line numbering preserved.
+    ///
+    /// Three rebuilds of this fence were defeated through its scanner, so it
+    /// is now a real lexer rather than a pair of flags, and it has its own
+    /// cells (`ScannableSourceTests`).
+    ///
+    /// - Comments, because a trailing `// try require(` laundered a bare call
+    ///   as checked, and a block comment between a wrapper and its operand
+    ///   reads as a missing wrapper.
+    /// - String contents, because `let note = "try require("` in front of a
+    ///   bare call laundered it the same way.
+    /// - But NOT interpolations: blanking those was itself an escape (merge
+    ///   gate r4, P2). `_ = "\(posix_spawn_file_actions_addclose(&a, 5))"`
+    ///   compiles, runs, and was invisible to every rule.
+    /// - Raw (`#"…"#`, `##"…"##`) and multiline (`"""`) literals are modelled,
+    ///   because refusing files that contain them is not available: the fence
+    ///   must cover `CLIHandler.swift`, which has both. In `#"\"#` the
+    ///   backslash is NOT an escape, and a scanner that assumes it is stays
+    ///   "inside a string" for the rest of the file (merge gate r3, P2).
+    func scannableSource(_ source: String) -> String {
+        enum Frame {
+            case code(interpolation: Bool, depth: Int)
+            case string(hashes: Int, multiline: Bool)
+        }
+        // A SLICE, consumed from the front — never an integer subscript.
+        // `StrandFenceTests` is right to refuse those: a loop-bound index
+        // traps and kills the PROCESS rather than the cell. Here it is also
+        // simply better, because `first`/`starts(with:)`/`dropFirst` cannot
+        // read past the end at all, so the scanner's bounds safety is a
+        // property of the operations rather than of my arithmetic.
+        var rest = Array(source)[...]
+        var out: [Character] = []
+        out.reserveCapacity(source.count)
+        var stack: [Frame] = [.code(interpolation: false, depth: 0)]
+
+        func take(_ count: Int, blanked: Bool) {
+            for character in rest.prefix(count) {
+                out.append(
+                    blanked ? (character == "\n" ? "\n" : " ") : character
+                )
+            }
+            rest = rest.dropFirst(count)
+        }
+        /// A run of `#` immediately before a quote, and whether it is triple.
+        func openingDelimiter() -> (hashes: Int, multiline: Bool)? {
+            let hashes = rest.prefix(while: { $0 == "#" }).count
+            let afterHashes = rest.dropFirst(hashes)
+            guard afterHashes.first == "\"" else { return nil }
+            return (hashes, afterHashes.starts(with: ["\"", "\"", "\""]))
+        }
+
+        while let current = rest.first, let frame = stack.last {
+            switch frame {
+            case .code(let interpolation, let depth):
+                if rest.starts(with: ["/", "/"]) {
+                    while let character = rest.first, character != "\n" {
+                        take(1, blanked: true)
+                    }
+                    continue
+                }
+                if rest.starts(with: ["/", "*"]) {
+                    var nesting = 1
+                    take(2, blanked: true)
+                    while nesting > 0, !rest.isEmpty {
+                        if rest.starts(with: ["/", "*"]) {
+                            nesting += 1; take(2, blanked: true); continue
+                        }
+                        if rest.starts(with: ["*", "/"]) {
+                            nesting -= 1; take(2, blanked: true); continue
+                        }
+                        take(1, blanked: true)
+                    }
+                    continue
+                }
+                if let opening = openingDelimiter() {
+                    take(
+                        opening.hashes + (opening.multiline ? 3 : 1),
+                        blanked: false
+                    )
+                    stack.append(
+                        .string(
+                            hashes: opening.hashes, multiline: opening.multiline
+                        )
+                    )
+                    continue
+                }
+                if interpolation, current == "(" {
+                    stack.removeLast()
+                    stack.append(.code(interpolation: true, depth: depth + 1))
+                    take(1, blanked: false)
+                    continue
+                }
+                if interpolation, current == ")" {
+                    stack.removeLast()
+                    if depth > 0 {
+                        stack.append(
+                            .code(interpolation: true, depth: depth - 1)
+                        )
+                    }
+                    take(1, blanked: false)
+                    continue
+                }
+                take(1, blanked: false)
+
+            case .string(let hashes, let multiline):
+                let hashRun = Array(repeating: Character("#"), count: hashes)
+                let closing: [Character] =
+                    (multiline ? ["\"", "\"", "\""] : ["\""]) + hashRun
+                if rest.starts(with: closing) {
+                    take(closing.count, blanked: false)
+                    stack.removeLast()
+                    continue
+                }
+                let escape: [Character] = ["\\"] + hashRun
+                if rest.starts(with: escape) {
+                    if rest.starts(with: escape + ["("]) {
+                        take(escape.count + 1, blanked: false)
+                        stack.append(.code(interpolation: true, depth: 0))
+                        continue
+                    }
+                    // The escape and the character it escapes, together, so a
+                    // `\"` cannot be mistaken for the closing delimiter.
+                    take(escape.count + 1, blanked: true)
+                    continue
+                }
+                take(1, blanked: true)
+            }
+        }
+        return String(out)
+    }
+
+    // MARK: - The fence's scanner, evidenced on its own
+
+    /// `scannableSource` is load-bearing: three of the five fence rebuilds
+    /// were defeated THROUGH it, not around it. So it has cells.
+    ///
+    /// Newline count is asserted everywhere because the fence reports line
+    /// numbers from it; a scanner that eats a newline sends a reader to the
+    /// wrong line, which is the anchor-rot failure in another costume.
+    func testTheScannerBlanksCommentsAndKeepsLineNumbering() {
+        let source = "let a = 1 // try require(\nlet b = 2\n"
+        let scanned = scannableSource(source)
+        XCTAssertFalse(scanned.contains("try require("))
+        XCTAssertTrue(scanned.contains("let a = 1"))
+        XCTAssertTrue(scanned.contains("let b = 2"))
+        XCTAssertEqual(
+            scanned.filter { $0 == "\n" }.count,
+            source.filter { $0 == "\n" }.count
+        )
+    }
+
+    func testTheScannerBlanksNestedBlockComments() {
+        let source = "a /* outer /* inner try require( */ still */ b\n"
+        let scanned = scannableSource(source)
+        XCTAssertFalse(scanned.contains("try require("))
+        XCTAssertFalse(scanned.contains("still"))
+        XCTAssertTrue(scanned.contains("a "))
+        XCTAssertTrue(scanned.contains(" b"))
+    }
+
+    func testTheScannerBlanksStringContentsButKeepsTheDelimiters() {
+        let scanned = scannableSource("let n = \"try require(\"\n")
+        XCTAssertFalse(scanned.contains("try require("))
+        XCTAssertTrue(scanned.contains("let n = \"") )
+    }
+
+    /// THE r4 P2 ESCAPE. Blanking string CONTENTS also blanked interpolated
+    /// EXPRESSIONS, so a real call written inside `"\( … )"` was invisible to
+    /// every rule — it compiled, it ran, and the fence stayed green.
+    func testTheScannerKeepsInterpolatedExpressionsVerbatim() {
+        let scanned = scannableSource(
+            "_ = \"\\(posix_spawn_file_actions_addclose(&a, 5))\"\n"
+        )
+        XCTAssertTrue(
+            scanned.contains("posix_spawn_file_actions_addclose"),
+            "an interpolated call is CODE and must reach the rules: \(scanned)"
+        )
+    }
+
+    func testTheScannerHandlesNestedInterpolationParens() {
+        let scanned = scannableSource(
+            "_ = \"\\(f(g(1), h(2)))\" + \"tail\"\n"
+        )
+        XCTAssertTrue(scanned.contains("f(g(1), h(2))"))
+        XCTAssertFalse(
+            scanned.contains("tail"),
+            "the scanner lost the string frame after the interpolation closed"
+        )
+    }
+
+    /// THE r3 P2 ESCAPE. In `#"\"#` the backslash is NOT an escape. A scanner
+    /// that assumes it is swallows the closing quote and stays "inside a
+    /// string" for the rest of the file — after which no comment is ever
+    /// blanked and comment-laundering works again.
+    func testARawLiteralWithATrailingBackslashDoesNotDesyncTheScanner() {
+        let source = ##"""
+        let marker = #""#
+        let after = 1 // try require(
+        posix_spawnattr_setpgroup(&a, 0)
+        """##
+        let scanned = scannableSource(source)
+        XCTAssertFalse(
+            scanned.contains("try require("),
+            "the comment after a raw literal was not blanked — the scanner "
+                + "is still inside the string: \(scanned)"
+        )
+        XCTAssertTrue(
+            scanned.contains("posix_spawnattr_setpgroup"),
+            "and the code after it must still be visible to the rules"
+        )
+    }
+
+    func testAMultilineLiteralHidesItsContentsAndItsSlashes() {
+        let source = ##"""
+        let text = """
+        // try require(
+        posix_spawnattr_setpgroup
+        """
+        let after = 2
+        """##
+        let scanned = scannableSource(source)
+        XCTAssertFalse(scanned.contains("try require("))
+        XCTAssertFalse(
+            scanned.contains("posix_spawnattr_setpgroup"),
+            "a symbol NAMED inside a multiline string is not a call"
+        )
+        XCTAssertTrue(scanned.contains("let after = 2"))
+        XCTAssertEqual(
+            scanned.filter { $0 == "\n" }.count,
+            source.filter { $0 == "\n" }.count
+        )
+    }
+
+    func testAnEscapedQuoteDoesNotEndAPlainString() {
+        let scanned = scannableSource(
+            "let s = \"a\\\"b\" ; posix_spawnattr_setpgroup(&a, 0)\n"
+        )
+        XCTAssertTrue(
+            scanned.contains("posix_spawnattr_setpgroup"),
+            "the string frame did not close at the real delimiter: \(scanned)"
+        )
+    }
+
+    /// EVERY ALLOCATION ON A PROCESS-LAUNCH PATH IS CHECKED — asserted over
+    /// the source, REPO-WIDE, because the failure cannot be staged from
+    /// outside (PR #461 codex r1/r2, rebuilt five times by the merge gate).
+    ///
+    /// The defect: `posix_spawn_file_actions_*`, `posix_spawnattr_*` and the
+    /// C-string duplicators all ALLOCATE, so under transient pressure they
+    /// answer ENOMEM or nil — and discarding that answer is not a lost
+    /// message, it is a SILENTLY DIFFERENT CHILD. A dropped `adddup2` leaves
+    /// git's stdout attached to whatever descriptor 1 already was: git exits
+    /// 0, the drain sees EOF, and the EMPTY buffer is accepted as a complete
+    /// answer. A dropped `strdup` is worse, because nil is argv's TERMINATOR:
+    /// the command is truncated at that element and a DIFFERENT program runs.
+    ///
+    /// WHY REPO-WIDE, and this is the fifth rebuild's whole point. Rebuild 3
+    /// keyed on a CALL, so a local alias walked past. Rebuild 4 keyed on the
+    /// SYMBOL but scanned one function's BODY, so the alias hoisted to type
+    /// scope. Rebuild 5 scanned one FILE — and the merge gate found the
+    /// identical unchecked `map { strdup($0) }` alive in `CLIHandler`'s
+    /// `execv` re-exec path, one file out (r4, P1), on the shipped Homebrew
+    /// install route. Each widening was met by moving one scope out, so the
+    /// scope is now every Swift file the repository tracks. There is nowhere
+    /// left to move.
+    ///
+    /// NEGATIVE RESULT, recorded rather than worked around: no behavioural
+    /// cell can stage these. `launch` builds its own descriptors, and
+    /// `adddup2` does not validate that a descriptor is OPEN at setup time,
+    /// so a closed pipe throws from `fileDescriptor` one layer earlier
+    /// instead of reaching the guard. Staging real ENOMEM is not available to
+    /// a test. (The spawn's OWN guard IS reachable — see the cell above.)
+    ///
+    /// Exemptions are by property or by name, never by pattern: identifiers
+    /// ending `_t` are types, the two `destroy` calls run in `defer` with
+    /// nothing to report to, and `posix_spawn` itself is checked by its own
+    /// `guard`, which now has a cell.
+    ///
+    /// RESIDUAL on the destroy exemption, disclosed: it is by NAME and the
+    /// fence never checks the call is in a `defer`, so a destroy placed
+    /// before the spawn is green. Kept, because the alternative is a
+    /// `defer`-proximity spelling test — the thing this fence exists not to
+    /// be.
+    ///
+    /// ACKNOWLEDGED LIMITS, all failing closed: a symbol reached through
+    /// `dlsym` or `@_silgen_name` by STRING is outside what any source fence
+    /// can see; and renaming a wrapper (`require`, `duplicate`) reds this
+    /// cell, which is correct — the fence cannot know a new name is a checker.
+    ///
+    /// MUTATION: drop any wrapper back to a bare call and this reds, naming
+    /// `<file>:<line>` and the offending line.
+    func testEverySpawnSetupCallIsChecked() throws {
+        // The repository's OWN file list, not the machine's: a `find` here
+        // would make the verdict a property of whatever is lying around
+        // untracked (the lesson of 8a38e3f's markdown gate).
+        let list = Process()
+        list.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        list.arguments = [
+            "git", "-C", repositoryRoot.path, "ls-files", "-z", "--",
+            "Sources/*.swift",
+        ]
+        let out = Pipe()
+        list.standardOutput = out
+        try list.run()
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        list.waitUntilExit()
+        XCTAssertEqual(list.terminationStatus, 0, "git ls-files failed")
+        let paths = String(decoding: data, as: UTF8.self)
+            .split(separator: "\0").map(String.init).sorted()
+        XCTAssertGreaterThan(
+            paths.count, 50,
+            "the file listing came back with \(paths.count) entries — the "
+                + "fence is scanning almost nothing"
+        )
+        for required in [
+            "Sources/Cacheout/Scanner/GitCommandRunner.swift",
+            "Sources/Cacheout/CLIHandler.swift",
+        ] {
+            XCTAssertTrue(
+                paths.contains(required),
+                "\(required) is not in the scanned set, and it is one of the "
+                    + "two files that actually holds a guarded allocation"
+            )
+        }
+
+        // Each rule: the symbols it guards, the wrapper each must be the
+        // direct operand of, and how many the repository must contain. The
+        // wrapper patterns tolerate any whitespace and an optional module
+        // qualifier (`Darwin.posix_spawnattr_setpgroup` is correct code that
+        // rebuild 4 flagged as unchecked — merge gate r3, P8).
+        let qualifier = #"(?:[A-Za-z_][A-Za-z0-9_]*\s*\.\s*)?"#
+        // A FAMILY, not a name. Rebuild 5's rule matched `strdup` alone under
+        // a heading that said "every allocation", so `strndup`, `malloc` and
+        // `calloc` all walked past it (merge gate r4, P3).
+        let allocators =
+            #"\b(?:strdup|strndup|malloc|calloc|realloc|reallocf|valloc|aligned_alloc)\b"#
+        let rules: [(name: String, symbol: String, wrapper: String, floor: Int)] = [
+            (
+                "spawn setup", #"\bposix_spawn[A-Za-z0-9_]*\b"#,
+                #"try\s+require\s*\(\s*"# + qualifier + "$", 7
+            ),
+            (
+                "C allocation", allocators,
+                #"(?:guard|if)\s+let\s+[A-Za-z_][A-Za-z0-9_]*\s*=\s*"#
+                    + qualifier + "$", 2
+            ),
+        ]
+        let exemptNames: Set<String> = [
+            "posix_spawn_file_actions_destroy", "posix_spawnattr_destroy",
+            "posix_spawn",
+        ]
+
+        var unchecked: [String] = []
+        // Keyed by rule name, not indexed: see `scannableSource` on why this
+        // file carries no integer subscripts.
+        var checkedPerRule: [String: Int] = [:]
+        for path in paths {
+            let source = scannableSource(
+                try String(
+                    contentsOf: repositoryRoot.appendingPathComponent(path),
+                    encoding: .utf8
+                )
+            )
+            let whole = NSRange(source.startIndex..<source.endIndex, in: source)
+            for rule in rules {
+                let symbol = try NSRegularExpression(pattern: rule.symbol)
+                for match in symbol.matches(in: source, range: whole) {
+                    guard let range = Range(match.range, in: source)
+                    else { continue }
+                    let name = String(source[range])
+                    guard !name.hasSuffix("_t"), !exemptNames.contains(name)
+                    else { continue }
+                    let prefix = source[source.startIndex..<range.lowerBound]
+                    if prefix.range(
+                        of: rule.wrapper, options: .regularExpression
+                    ) != nil {
+                        checkedPerRule[rule.name, default: 0] += 1
+                        continue
+                    }
+                    let line = prefix.reduce(1) { $1 == "\n" ? $0 + 1 : $0 }
+                    let lineStart = prefix.lastIndex(of: "\n")
+                        .map(source.index(after:)) ?? source.startIndex
+                    let text = source[lineStart...].prefix { $0 != "\n" }
+                        .trimmingCharacters(in: .whitespaces)
+                    unchecked.append(
+                        "\(path):\(line)  \(name)  —  " + text.prefix(90)
+                    )
+                }
+            }
+        }
+        for rule in rules {
+            let found = checkedPerRule[rule.name] ?? 0
+            XCTAssertGreaterThanOrEqual(
+                found, rule.floor,
+                "found \(found) wrapped \(rule.name) symbols "
+                    + "repo-wide — fewer than the \(rule.floor) that exist, so "
+                    + "this rule has gone vacuous"
+            )
+        }
+        XCTAssertEqual(
+            unchecked, [],
+            "an unchecked allocation on a process-launch path spawns a "
+                + "silently different child: a dropped adddup2 leaves git's "
+                + "stdout elsewhere and a dropped strdup TRUNCATES argv, and "
+                + "in both cases the child exits 0 and its output is accepted"
+        )
+    }
+
+    /// child's process group with `getpgid` AFTER launch, so the group fact
+    /// was contingent on observing a LIVE leader — a git that spawned a
+    /// helper and exited left `group == nil`, and the termination protocol
+    /// then signalled only the corpse's pid while the descendant ran on.
+    /// `SpawnedProcess.launch` establishes the group at CREATION
+    /// (`POSIX_SPAWN_SETPGROUP`): the group id IS the pid, leader dead or
+    /// alive, and nothing about signalling is conditional on liveness.
+    ///
+    /// The fixture is the defect's exact shape: the leader records its pid,
+    /// spawns a TERM-immune descendant that holds the inherited stdout, and
+    /// exits 0 — so by the time any signal is sent, the leader is LONG dead
+    /// (asserted below, not assumed). The runner's join arm answers
+    /// `.timeout` and the descendant must die BY PID anyway, which only the
+    /// group — established at spawn — can reach.
+    ///
+    /// MUTATION (fn-4.27 acceptance): restoring post-launch discovery —
+    /// `signalTree` consulting `getpgid(pid)` and requiring `== pid` before
+    /// group-signalling, r18's semantics — turns THIS cell red 8/8 (the
+    /// leader is provably reaped before `terminate`, so discovery always
+    /// fails and the descendant survives), while the unmutated cell is
+    /// green 8/8. Recorded in the fn-4.27 commit.
+    func testALeaderThatExitsImmediatelyStillHasItsDescendantReapedByPid()
+        async throws
+    {
+        let stubs = base.appendingPathComponent("stubs-exited-leader")
+        let leaderPidFile = base.appendingPathComponent("leader.pid")
+        let descendantPidFile = base.appendingPathComponent("exited-leader-descendant.pid")
+        _ = try GitFixture.makeStubGit(in: stubs, body: """
+        export PATH=/bin:/usr/bin
+        echo $$ > "\(leaderPidFile.path)"
+        ( trap '' TERM; exec sleep 300 ) &
+        echo $! > "\(descendantPidFile.path)"
+        exit 0
+        """)
+        // HYGIENE: whatever this test spawns dies with it, mutation or not.
+        defer {
+            if let pid = recordedPid(at: descendantPidFile), pid > 0 {
+                kill(pid, SIGKILL)
+            }
+        }
+        let runner = GitCommandRunner(
+            environment: stubEnvironment(pathDirectories: [stubs]),
+            defaultTimeout: 30,
+            terminationGrace: 0.5,
+            drainJoinBudget: 0.5
+        )
+        let invocation = await runner.run(["status", "--porcelain"], timeout: 20)
+
+        // WHICH arm fired: the leader exited normally, so this is the
+        // unfinished-drain refusal — never the expiry arm, never `.success`.
+        XCTAssertEqual(invocation.outcome, .timeout)
+
+        let leader = try XCTUnwrap(recordedPid(at: leaderPidFile))
+        let descendant = try XCTUnwrap(recordedPid(at: descendantPidFile))
+        XCTAssertNotEqual(leader, descendant)
+        // The PRECONDITION the cell exists for, asserted rather than
+        // assumed: the leader was already unsignallable when the runner
+        // answered — a group fact discovered from a live leader could not
+        // have existed here.
+        XCTAssertNotEqual(
+            kill(leader, 0), 0,
+            "the leader must already be gone — this cell is about signalling "
+                + "AFTER the leader's death"
+        )
+        XCTAssertTrue(
+            waitUntil(5) { kill(descendant, 0) != 0 },
+            "the descendant must be reaped BY PID after .timeout — only the "
+                + "spawn-established group can reach it once the leader is dead"
+        )
+    }
+
+    // MARK: - A hard read error is not EOF (fn-4.24)
+
+    /// Serial call counter for the drain factory seam. `execute` builds its
+    /// drains on ONE thread in a pinned source order, and a runner's first
+    /// `run` makes exactly four: the availability probe's stdout (1) and
+    /// stderr (2), then the command's stdout (3) and stderr (4). Locked
+    /// anyway so the cell asserts the count without a data-race caveat.
+    private final class DrainBuildCounter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value = 0
+        func next() -> Int {
+            lock.lock()
+            defer { lock.unlock() }
+            value += 1
+            return value
+        }
+        var count: Int {
+            lock.lock()
+            defer { lock.unlock() }
+            return value
+        }
+    }
+
+    /// A `PipeDrain` whose `read(2)` fails HARD on the first call: a
+    /// directory descriptor, `EISDIR` (errno 21) — the reproduction the task
+    /// spec measured (PR #460 round 18, runner scope).
+    private func drainOverADirectoryDescriptor(named name: String) throws -> PipeDrain {
+        let directory = base.appendingPathComponent(name)
+        try fm.createDirectory(at: directory, withIntermediateDirectories: true)
+        let descriptor = open(directory.path, O_RDONLY)
+        XCTAssertGreaterThanOrEqual(
+            descriptor, 0, "opening a directory read-only cannot fail here"
+        )
+        return PipeDrain(
+            readingFrom: FileHandle(fileDescriptor: descriptor, closeOnDealloc: false)
+        )
+    }
+
+    /// The drain-level half of fn-4.24, with its EOF control.
+    ///
+    /// DEFECT (measured before the fix): a drain whose `read(2)` died hard
+    /// ended EXACTLY like EOF — `finished` signalled, `join(within:)` true,
+    /// nothing recorded — so `execute` had no fact to read and shipped the
+    /// partial buffer as `.success`. The cell asserts WHICH failure ended
+    /// the drain (EISDIR, not merely "some refusal"), and the control shows
+    /// a genuine EOF records nothing, so the two endings are distinguishable.
+    func testADrainThatDiedOnAHardReadErrorRecordsTheErrnoInsteadOfPosingAsEOF() throws {
+        let drain = try drainOverADirectoryDescriptor(named: "read-error-target")
+        drain.start()
+        XCTAssertTrue(
+            drain.join(within: 5),
+            "a hard read error must still END the drain — polling a broken "
+                + "descriptor would spin forever"
+        )
+        XCTAssertEqual(
+            drain.terminalReadFailure, EISDIR,
+            "the drain died on EISDIR; a died-on-error ending that records "
+                + "nothing is indistinguishable from EOF, which is what let "
+                + "a partial buffer ship as `.success` (fn-4.24)"
+        )
+        XCTAssertEqual(
+            drain.closeAndCapture(), Data(),
+            "no byte was ever readable from a directory descriptor"
+        )
+
+        // CONTROL: a drain that reaches genuine EOF records NO failure —
+        // otherwise the execute gate would refuse every healthy invocation
+        // and the cell above could be passing for the wrong reason.
+        let pipe = Pipe()
+        let eofDrain = PipeDrain(pipe: pipe)
+        eofDrain.start()
+        try pipe.fileHandleForWriting.write(contentsOf: Data("complete\n".utf8))
+        try pipe.fileHandleForWriting.close()
+        XCTAssertTrue(eofDrain.join(within: 5), "EOF must end the control drain")
+        XCTAssertNil(
+            eofDrain.terminalReadFailure,
+            "a clean EOF is not a read failure; recording one here would "
+                + "turn every healthy run into a refusal"
+        )
+        XCTAssertEqual(eofDrain.closeAndCapture(), Data("complete\n".utf8))
+    }
+
+    /// The execute-boundary half of fn-4.24, stdout arm: git exits 0, the
+    /// STDOUT drain dies on a hard read error (a real EISDIR descriptor via
+    /// the factory seam), and the invocation must be `.timeout` — never a
+    /// `.success` whose short stdout a porcelain parser will count as a
+    /// repository with fewer worktrees.
+    ///
+    /// CONTROL FIRST: the same stub through default drains is a plain
+    /// `.success` carrying the expected bytes, so the refusal below cannot
+    /// be the fixture refusing for reasons of its own. And the refusal is
+    /// pinned to the read-failure GATE, not the join guard: a died-on-error
+    /// drain joins within milliseconds, and the mutation run that deletes
+    /// the gate turns exactly this cell green-to-red via `.success`.
+    func testAHardStdoutReadErrorAfterANormalExitIsRefusedNotShippedAsSuccess() async throws {
+        let stubs = base.appendingPathComponent("stubs-stdout-read-error")
+        _ = try GitFixture.makeStubGit(in: stubs, body: """
+        echo "worktree /tmp/x"
+        exit 0
+        """)
+
+        let control = GitCommandRunner(
+            environment: stubEnvironment(pathDirectories: [stubs]),
+            defaultTimeout: 30
+        )
+        let controlRun = await control.run(["worktree", "list"], timeout: 20)
+        guard case .success(let stdout) = controlRun.outcome else {
+            return XCTFail(
+                "CONTROL: the stub itself must succeed through default "
+                    + "drains, got \(controlRun.outcome)"
+            )
+        }
+        XCTAssertTrue(
+            String(decoding: stdout, as: UTF8.self).contains("worktree /tmp/x"),
+            "CONTROL: the stub's stdout must arrive intact"
+        )
+
+        let calls = DrainBuildCounter()
+        // Built OUTSIDE the factory closure: the closure cannot throw, and
+        // the strand fence rightly forbids `try!` in a test source.
+        let broken = try drainOverADirectoryDescriptor(named: "broken-stdout-fd")
+        let runner = GitCommandRunner(
+            environment: stubEnvironment(pathDirectories: [stubs]),
+            defaultTimeout: 30,
+            drainFactory: { pipe in
+                // Call 3 is the COMMAND'S stdout drain; the probe (1, 2) and
+                // the command's stderr (4) stay healthy.
+                if calls.next() == 3 { return broken }
+                return PipeDrain(pipe: pipe)
+            }
+        )
+        let invocation = await runner.run(["worktree", "list"], timeout: 20)
+        XCTAssertEqual(
+            calls.count, 4,
+            "the factory must have built the probe's two drains and the "
+                + "command's two — a different count means the broken drain "
+                + "was not the command's stdout"
+        )
+        XCTAssertEqual(
+            invocation.outcome, .timeout,
+            "a stdout drain that died on a hard read error must be refused "
+                + "at the execute boundary; before fn-4.24 it ended like EOF "
+                + "and the truncated buffer shipped as `.success` — a "
+                + "porcelain listing with fewer worktrees"
+        )
+    }
+
+    /// The stderr arm of the same gate: a truncated stderr is a truncated
+    /// answer too (on the failure path it is THE answer), so either drain
+    /// dying on a hard read error refuses the invocation.
+    func testAHardStderrReadErrorAfterANormalExitIsRefusedNotShippedAsSuccess() async throws {
+        let stubs = base.appendingPathComponent("stubs-stderr-read-error")
+        _ = try GitFixture.makeStubGit(in: stubs, body: """
+        echo "worktree /tmp/x"
+        exit 0
+        """)
+
+        let control = GitCommandRunner(
+            environment: stubEnvironment(pathDirectories: [stubs]),
+            defaultTimeout: 30
+        )
+        let controlRun = await control.run(["worktree", "list"], timeout: 20)
+        guard case .success = controlRun.outcome else {
+            return XCTFail(
+                "CONTROL: the stub itself must succeed through default "
+                    + "drains, got \(controlRun.outcome)"
+            )
+        }
+
+        let calls = DrainBuildCounter()
+        let broken = try drainOverADirectoryDescriptor(named: "broken-stderr-fd")
+        let runner = GitCommandRunner(
+            environment: stubEnvironment(pathDirectories: [stubs]),
+            defaultTimeout: 30,
+            drainFactory: { pipe in
+                // Call 4 is the COMMAND'S stderr drain.
+                if calls.next() == 4 { return broken }
+                return PipeDrain(pipe: pipe)
+            }
+        )
+        let invocation = await runner.run(["worktree", "list"], timeout: 20)
+        XCTAssertEqual(calls.count, 4, "probe (2) + command (2) drains")
+        XCTAssertEqual(
+            invocation.outcome, .timeout,
+            "a stderr drain that died on a hard read error must refuse the "
+                + "invocation exactly like the stdout arm — fail closed on "
+                + "either stream"
+        )
+    }
+
     // MARK: - The drain's lock: bounded turns, and a closer nobody barges past
 
     /// A shell that starts `count` writers on the pipe's write end and then

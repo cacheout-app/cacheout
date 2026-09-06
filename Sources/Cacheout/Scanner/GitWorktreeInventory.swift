@@ -318,6 +318,23 @@ struct GitWorktreeGitdirResolver {
               let pointer = pointerPath(inFileAt: dotGit, relativeTo: worktreePath)
         else { return nil }
 
+        // THE GATE READS THE POINTER FIRST, AS SPELLED (fn-4.26). On an
+        // `.automatic` scan the injected provider answers `.absent` for a
+        // deferred (TCC-protected) target — and its predicate classifies a
+        // directly-protected spelling lexically — so `canonicalize` below,
+        // which is `realpath(3)` and therefore itself a traversal of every
+        // component it resolves, runs only on a target the gate permitted.
+        // The previous order canonicalized first, which walked the protected
+        // path before the deferral could answer. No verdict changed: the
+        // kinds that pass here are exactly the ones the canonical probe
+        // below could still map onto a directory (a directory spelling, or a
+        // symlink to one); every other kind, absence, and probe failure
+        // produced nil AFTER the traversal — now before it.
+        switch identity.probeKind(of: pointer) {
+        case .kind(.directory), .kind(.symlink): break
+        default: return nil
+        }
+
         let adminDirectory = identity.canonicalize(pointer)
         guard identity.probeKind(of: adminDirectory) == .kind(.directory),
               adminDirectory.deletingLastPathComponent().lastPathComponent
@@ -326,13 +343,262 @@ struct GitWorktreeGitdirResolver {
 
         // BACK-LINK: the admin directory must point back at THIS worktree's
         // `.git` file. One-way, stale, and forged pointers all stop here.
+        //
+        // The back-link TARGET is data too, and `sameLocation`'s fallback
+        // canonicalizes BOTH sides when either identity is missing — which a
+        // deferred side always is — so the same gate answers for it before
+        // the comparison (fn-4.26). A deferred target could never have
+        // verified anyway: `dotGit` demonstrably exists, and a comparison of
+        // an existing file against an untouchable one proves nothing.
+        // Absence and probe failure fail exactly as they did before — the
+        // fallback comparison they used to reach could not answer true for a
+        // target that is not there while `dotGit` is.
         let backlinkFile = adminDirectory.appendingPathComponent("gitdir")
         guard identity.probeKind(of: backlinkFile) == .kind(.regularFile),
               let backlinkTarget = pathContents(of: backlinkFile, relativeTo: adminDirectory),
+              case .kind = identity.probeKind(of: backlinkTarget),
               identity.sameLocation(backlinkTarget, dotGit)
         else { return nil }
 
         return adminDirectory
+    }
+
+    /// The BARE-repository proof (fn-4.28): is this directory a bare
+    /// repository git itself would accept? `nil` = fail closed.
+    ///
+    /// Discovery keys on an entry named `.git`, and a bare repository has
+    /// none — so a bare parent whose checkouts were ALL deleted used to name
+    /// no group and the prune tier never ran for exactly the case it exists
+    /// for. This proof is the discovery half of closing that gap; the
+    /// listing half stays with `crossValidate`, whose bare branch requires
+    /// git's OWN porcelain first record to declare the same directory bare
+    /// before anything downstream is derived from it.
+    ///
+    /// WHAT IS REQUIRED, all probed through the injected identity provider
+    /// (so the TCC deferral answers first, exactly as it does for the
+    /// `gitdir:` pointer reads above), and each read only AFTER its
+    /// `probeKind` gate:
+    ///
+    /// - `HEAD`, a regular file — never a symlink — whose content is a shape
+    ///   git's own `validate_headref` accepts: a `ref: refs/…` symref or a
+    ///   40/64-hex detached object id;
+    /// - `objects`, a directory;
+    /// - a refs backend: `refs` a directory, or the reftable layout's
+    ///   `reftable` directory;
+    /// - `config`, a regular file that DECLARES bareness the way git's own
+    ///   writer spells it (a `bare = true` line). A git directory that backs
+    ///   a working tree elsewhere (`--separate-git-dir`) carries the same
+    ///   HEAD/objects/refs shape with `bare = false`, and admitting it here
+    ///   would publish a cross-validation issue on every scan for a healthy
+    ///   repository this scanner deliberately does not cover.
+    ///
+    /// RESIDUAL, disclosed rather than implied: a bare repository whose
+    /// config spells bareness any way other than git's writer (`bare = yes`,
+    /// an include, no config file at all) stays undiscovered — the same
+    /// silent non-discovery every bare repository had before fn-4.28, never
+    /// a refusal dressed as retryable.
+    func bareRepositoryGitDirectory(at directory: URL) -> URL? {
+        // THE DIRECTORY ITSELF IS A CLAIM, AND IT WAS NEVER CHECKED
+        // (PR #461 codex r3). Everything below reads `directory/<name>`, and
+        // the `O_NOFOLLOW` on those reads protects only the LEAF: if
+        // `directory` is a symlink, path resolution walks through it before
+        // the leaf is ever opened, so `HEAD` and `config` are read from
+        // wherever the link points. The caller reaches here from a walk that
+        // produced `event.entries` earlier, so a directory renamed away and
+        // replaced with a symlink in between was validated — and could then
+        // put `git worktree list` against a repository outside the configured
+        // root, or block on an unresponsive replacement.
+        //
+        // RESIDUAL, and it is the larger half: this closes the SYMLINK
+        // replacement, not the identity question. A replacement that is
+        // itself a real directory still passes, because `ProjectTreeEvent`
+        // carries only a URL — no identity, no descriptor — so nothing here
+        // can prove this is the directory the walker enumerated. The complete
+        // fix is descriptor-relative validation bound to the walk's open
+        // directory, which means adding identity to that event and threading
+        // it through both scanners that consume it. Deferred deliberately as
+        // its own change rather than smuggled into a review round, and FILED
+        // so it cannot be lost: fn-5-stale-git-worktree-scanner.7.
+        guard identity.probeKind(of: directory) == .kind(.directory) else {
+            return nil
+        }
+        let head = directory.appendingPathComponent("HEAD")
+        guard identity.probeKind(of: head) == .kind(.regularFile),
+              let headContents = identity.smallRegularFileText(
+                  at: head, limit: FileSystemIdentityProvider.gitPointerByteLimit
+              ),
+              Self.isAcceptableHeadContent(headContents)
+        else { return nil }
+        guard identity.probeKind(of: directory.appendingPathComponent("objects"))
+            == .kind(.directory)
+        else { return nil }
+        let hasRefs = identity.probeKind(of: directory.appendingPathComponent("refs"))
+            == .kind(.directory)
+        let hasReftable = identity.probeKind(of: directory.appendingPathComponent("reftable"))
+            == .kind(.directory)
+        guard hasRefs || hasReftable else { return nil }
+        let config = directory.appendingPathComponent("config")
+        guard identity.probeKind(of: config) == .kind(.regularFile),
+              let configContents = identity.smallRegularFileText(
+                  at: config, limit: FileSystemIdentityProvider.gitConfigByteLimit
+              ),
+              Self.declaresBare(configContents)
+        else { return nil }
+        return directory
+    }
+
+    /// The HEAD shapes git's `validate_headref` accepts: `ref: refs/…`
+    /// naming a non-empty ref, or a detached 40-hex (SHA-1) / 64-hex
+    /// (SHA-256) object id.
+    static func isAcceptableHeadContent(_ contents: String) -> Bool {
+        let trimmed = contents.trimmingCharacters(in: .whitespacesAndNewlines)
+        let symrefPrefix = "ref: refs/"
+        if trimmed.hasPrefix(symrefPrefix) {
+            return trimmed.count > symrefPrefix.count
+        }
+        guard trimmed.count == 40 || trimmed.count == 64 else { return false }
+        return trimmed.allSatisfy { $0.isHexDigit && ($0.isNumber || $0.isLowercase) }
+    }
+
+    /// The EFFECTIVE `core.bare`, resolved the way git resolves it: section
+    /// context is honoured and the LAST value wins.
+    ///
+    /// The first version matched any line whose key was `bare`, anywhere in
+    /// the file (PR #461 codex r2). Two shapes broke it, and git reads both
+    /// the other way: a healthy `--separate-git-dir` repository carrying
+    /// `core.bare = false` PLUS an unrelated section with its own `bare` key
+    /// was admitted as bare, and an early `core.bare = true` later overridden
+    /// by `false` stayed admitted. Admitting one is not a harmless
+    /// over-discovery — the scanner then runs `worktree list` against a
+    /// healthy non-bare admin directory and publishes a cross-validation
+    /// `unreadable` issue on every scan, for a repository shape this scanner
+    /// deliberately does not cover.
+    ///
+    /// RESIDUAL: only git's own writer spelling of the VALUE counts.
+    /// `bare = yes` and a valueless `bare` key (which git reads as true)
+    /// leave the repository undiscovered — the same silence every bare
+    /// repository had before fn-4.28, never a refusal dressed as retryable.
+    ///
+    /// THAT LIST USED TO NAME `include.path` TOO, AND WAS WRONG ABOUT IT
+    /// (PR #461 codex r3). It only considered the under-discovery direction.
+    /// An include does not merely fail to make a repository bare — it can
+    /// make a repository that LOOKS bare not bare, and the old code then
+    /// declared it bare, which is the OVER-discovery direction and the
+    /// harmful one. Includes are now failed closed below, so the claim is
+    /// true by construction rather than by accident.
+    static func declaresBare(_ configContents: String) -> Bool {
+        var section = ""
+        var subsection: String?
+        var effective: String?
+        for rawLine in configContents.split(
+            whereSeparator: \.isNewline
+        ) {
+            var line = Substring(Self.withoutComment(rawLine))
+                .drop(while: { $0 == " " || $0 == "\t" })
+            if line.first == "[" {
+                guard let close = line.firstIndex(of: "]") else { continue }
+                (section, subsection) = Self.sectionName(
+                    line[line.index(after: line.startIndex)..<close]
+                )
+                // git allows a variable on the section header's own line.
+                line = line[line.index(after: close)...]
+                    .drop(while: { $0 == " " || $0 == "\t" })
+            }
+            guard !line.isEmpty else { continue }
+            // A VALUELESS KEY IS TRUE TO GIT. `[extensions]\n\tworktreeConfig`
+            // with no `=` enables the extension, and the loop below only
+            // reads `key = value` lines — so the one spelling that turns the
+            // override on with the fewest characters must be caught before
+            // the `=` requirement drops it (PR #461 codex r4).
+            guard let equals = line.firstIndex(of: "=") else {
+                let bare = line.trimmingCharacters(in: .whitespaces).lowercased()
+                if section == "extensions", subsection == nil,
+                   bare == "worktreeconfig" {
+                    return false
+                }
+                continue
+            }
+            let key = line[..<equals]
+                .trimmingCharacters(in: .whitespaces).lowercased()
+            var value = line[line.index(after: equals)...]
+                .trimmingCharacters(in: .whitespaces).lowercased()
+            if value.count >= 2, value.hasPrefix("\""), value.hasSuffix("\"") {
+                value = String(value.dropFirst().dropLast())
+            }
+            // AN INCLUDE CAN OVERRIDE core.bare, AND WE WILL NOT FOLLOW IT
+            // (PR #461 codex r3). `[include] path = …` and
+            // `[includeIf "…"] path = …` pull in another file whose
+            // `core.bare` git applies at the point of inclusion, so a primary
+            // that says `bare = true` can be a NON-bare repository. Reading
+            // that file is not available to this scanner: it would mean
+            // following an untrusted indirection out of a directory nothing
+            // admitted, with `~` expansion, relative resolution, `includeIf`
+            // conditions, recursion and cycles — the same class of
+            // indirection the metadata reads refuse by opening `O_NOFOLLOW`.
+            //
+            // So fail closed: an include that could reach `core.bare` makes
+            // this "not bare". That is the UNDER-discovery direction, which
+            // costs a silent non-discovery; declaring bare wrongly is the
+            // OVER-discovery direction, which admits the directory and then
+            // fails `crossValidate` against git's own non-bare listing,
+            // publishing a recurring `unreadable` issue for a healthy
+            // repository this scanner intends not to cover.
+            if section == "include" || section == "includeif", key == "path" {
+                return false
+            }
+            // A WORKTREE-SCOPED CONFIG CAN OVERRIDE core.bare TOO (PR #461
+            // codex r4). With `extensions.worktreeConfig` enabled, git reads
+            // `config.worktree` AFTER the primary config, so a primary
+            // `bare = true` can be turned off there. Same shape as the
+            // include above, same answer: this scanner does not chase a
+            // second file, so the extension being ON makes the answer "not
+            // bare". Every spelling git reads as true counts — being generous
+            // about what enables the extension is the FAIL-CLOSED direction.
+            if section == "extensions", subsection == nil,
+               key == "worktreeconfig",
+               ["true", "yes", "on", "1"].contains(value) {
+                return false
+            }
+            guard section == "core", subsection == nil, key == "bare"
+            else { continue }
+            // LAST WINS, which is the whole point: an override must be able
+            // to turn bareness OFF, not merely fail to turn it on.
+            effective = value
+        }
+        return effective == "true"
+    }
+
+    /// The line with any unquoted `#`/`;` comment removed. Quoted because a
+    /// git config VALUE may legitimately contain either character.
+    private static func withoutComment(_ line: Substring) -> String {
+        var out = ""
+        var quoted = false
+        var escaped = false
+        for character in line {
+            if escaped { out.append(character); escaped = false; continue }
+            if character == "\\" { out.append(character); escaped = true; continue }
+            if character == "\"" { quoted.toggle(); out.append(character); continue }
+            if !quoted, character == "#" || character == ";" { break }
+            out.append(character)
+        }
+        return out
+    }
+
+    /// `[core]` -> ("core", nil); `[core "sub"]` -> ("core", "sub"). Section
+    /// names are case-insensitive in git, subsection names are not — and a
+    /// subsection makes the key `core.sub.bare`, which is NOT `core.bare`.
+    private static func sectionName(
+        _ header: Substring
+    ) -> (String, String?) {
+        guard let quote = header.firstIndex(of: "\"") else {
+            return (
+                header.trimmingCharacters(in: .whitespaces).lowercased(), nil
+            )
+        }
+        let name = header[..<quote]
+            .trimmingCharacters(in: .whitespaces).lowercased()
+        let rest = header[header.index(after: quote)...]
+        return (name, String(rest.prefix(while: { $0 != "\"" })))
     }
 
     /// The repository's COMMON git directory, via the admin directory's
@@ -343,6 +609,15 @@ struct GitWorktreeGitdirResolver {
         guard identity.probeKind(of: commonDirFile) == .kind(.regularFile),
               let target = pathContents(of: commonDirFile, relativeTo: adminDirectory)
         else { return nil }
+        // The same first-read gate as `adminDirectory(forWorktreeAt:)`
+        // (fn-4.26): a `commondir` is usually the relative `../..`, but the
+        // file's content is DATA — an absolute spelling into a deferred
+        // location must be answered by the gate before `realpath(3)` walks
+        // it. Verdicts are unchanged for every non-deferred shape.
+        switch identity.probeKind(of: target) {
+        case .kind(.directory), .kind(.symlink): break
+        default: return nil
+        }
         let resolved = identity.canonicalize(target)
         guard identity.probeKind(of: resolved) == .kind(.directory) else { return nil }
         return resolved
@@ -392,6 +667,17 @@ struct GitWorktreeGitdirResolver {
         case .kind(.regularFile):
             guard let pointer = pointerPath(inFileAt: dotGit, relativeTo: mainRecord.path)
             else { return false }
+            // The same first-read gate (fn-4.26): `sameLocation`'s fallback
+            // canonicalizes BOTH sides when either identity is missing — and
+            // a deferred side always is — so the gate answers for the
+            // pointer target before the comparison. Worse than the
+            // traversal, the fallback's canonical PATH equality would have
+            // answered true for a deferred target, validating a repository
+            // the scan was told not to touch. A genuinely absent target
+            // could never compare equal to `parentGitDir`, which was probed
+            // a directory moments ago — failing closed changes no reachable
+            // verdict.
+            guard case .kind = identity.probeKind(of: pointer) else { return false }
             return identity.sameLocation(pointer, parentGitDir)
         default:
             return false
@@ -403,7 +689,9 @@ struct GitWorktreeGitdirResolver {
     /// Read a `gitdir: <path>` pointer file. Relative targets resolve
     /// against `base`.
     private func pointerPath(inFileAt url: URL, relativeTo base: URL) -> URL? {
-        guard let contents = try? String(contentsOf: url, encoding: .utf8) else { return nil }
+        guard let contents = identity.smallRegularFileText(
+            at: url, limit: FileSystemIdentityProvider.gitPointerByteLimit
+        ) else { return nil }
         let trimmed = contents.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.hasPrefix(Self.gitdirPrefix) else { return nil }
         let target = String(trimmed.dropFirst(Self.gitdirPrefix.count))
@@ -415,7 +703,9 @@ struct GitWorktreeGitdirResolver {
     /// Read a bare path file (`gitdir`, `commondir`). Relative targets
     /// resolve against `base`.
     private func pathContents(of url: URL, relativeTo base: URL) -> URL? {
-        guard let contents = try? String(contentsOf: url, encoding: .utf8) else { return nil }
+        guard let contents = identity.smallRegularFileText(
+            at: url, limit: FileSystemIdentityProvider.gitPointerByteLimit
+        ) else { return nil }
         let trimmed = contents.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
         return resolve(trimmed, relativeTo: base)
@@ -637,7 +927,15 @@ struct GitWorktreeAdminMapper {
         worktreePaths.reserveCapacity(gated.count)
         for entry in gated {
             let backlink = entry.appendingPathComponent("gitdir")
-            guard let contents = try? String(contentsOf: backlink, encoding: .utf8) else {
+            // As at the performer's pointer read: "unreadable" is transient
+            // for every cause but one — a back-link past
+            // `gitPointerByteLimit` is past a fixed constant, and the
+            // `.incomplete` this returns is reported with a re-scan remedy
+            // that cannot clear it (merge gate r4, P6).
+            guard let contents = identity.smallRegularFileText(
+                at: backlink,
+                limit: FileSystemIdentityProvider.gitPointerByteLimit
+            ) else {
                 return .incomplete(
                     reason: "admin entry \(entry.path) gitdir file is unreadable"
                 )

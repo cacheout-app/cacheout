@@ -695,6 +695,18 @@ struct WorktreeReclaimPerformer {
         let report = measure(
             worktreePath, .deletionTarget, await registry.knownIdentities
         )
+        // (3b) A CANCELLED measurement is a PARTIAL one (fn-4.15): the
+        // mount doctrine below is only sound over a report that swept the
+        // whole tree. Fail closed, first consumer of the report — and the
+        // refusal is honestly retryable (a new clean re-measures).
+        if report.cancelled {
+            let detail = "\(worktreePath.path): measurement was cancelled "
+                + "before the tree was fully inspected — refused, not "
+                + "deleted (cleaning again re-measures; this refusal is not "
+                + "permanent)"
+            logRefusal("measurement_cancelled", detail)
+            return failure(item, detail, tag: nil)
+        }
         // (4) Mount doctrine (`removeGuardedItem` parity): a boundary at the
         // target or nested anywhere beneath it refuses the deletion — the
         // removal would recurse straight through an inner mount.
@@ -1198,6 +1210,18 @@ struct WorktreeReclaimPerformer {
             let report = measure(
                 directory, .deletionTarget, await registry.knownIdentities
             )
+            // (4b) A CANCELLED measurement is a PARTIAL one (fn-4.15) —
+            // same fail-closed rule as the worktree arm, before any claim
+            // is registered; honestly retryable.
+            if report.cancelled {
+                let detail = "refused: measurement of affected admin "
+                    + "directory \(directory.path) was cancelled before the "
+                    + "tree was fully inspected — nothing was pruned "
+                    + "(cleaning again re-measures; this refusal is not "
+                    + "permanent)"
+                logRefusal("measurement_cancelled", detail)
+                return failure(item, detail, tag: nil)
+            }
             // (5) MOUNT DOCTRINE (epic round 9): the removal is a
             // RECURSIVE filesystem mutation over these directories, so the
             // boundary-bearing-recursive-delete rule applies exactly as it
@@ -1667,8 +1691,10 @@ struct WorktreeReclaimPerformer {
     /// prunable, so the next scan simply stops offering it.
     private func revivedCheckoutRefusal(for adminDirectory: URL) -> String? {
         let backlink = adminDirectory.appendingPathComponent("gitdir")
-        guard let backlinkText = try? String(contentsOf: backlink, encoding: .utf8)
-        else { return nil }
+        guard let backlinkText = provider.smallRegularFileText(
+            at: backlink,
+            limit: FileSystemIdentityProvider.gitPointerByteLimit
+        ) else { return nil }
         guard let dotGit = Self.gitdirTarget(
             backlinkText, relativeTo: adminDirectory, prefixed: false
         ) else { return nil }
@@ -1696,8 +1722,17 @@ struct WorktreeReclaimPerformer {
             + "instant, so whether it is registered again could not be "
             + "established — nothing was pruned. Re-scan once that path is "
             + "settled."
+        // ONE CAUSE HERE IS PERMANENT, and `ambiguous` says "re-scan" (merge
+        // gate r4, P6): every other way this guard fails is transient, but a
+        // pointer file past `gitPointerByteLimit` is past a fixed constant,
+        // so re-scanning cannot change the answer. Disclosed rather than
+        // given its own message, because no git writes a 64 KiB `.git` file
+        // and splitting the vocabulary for it would cost more than it buys.
         guard kind == .kind(.regularFile),
-              let pointerText = try? String(contentsOf: dotGit, encoding: .utf8),
+              let pointerText = provider.smallRegularFileText(
+                  at: dotGit,
+                  limit: FileSystemIdentityProvider.gitPointerByteLimit
+              ),
               let named = Self.gitdirTarget(
                   pointerText, relativeTo: dotGit.deletingLastPathComponent(),
                   prefixed: true
@@ -2170,11 +2205,20 @@ struct WorktreeReclaimPerformer {
                     + "removed. Retry when the machine is less busy."
             )
         case .gitUnavailable:
+            // THE REMEDY MUST MATCH THE CAUSE (PR #461 codex r3). The refusal
+            // is right either way — nothing was removed — but "install git"
+            // is a false instruction when git IS installed and the launch
+            // merely failed under momentary pressure (ENOMEM/EAGAIN/EMFILE,
+            // and since this PR's spawn hardening, a failed `strdup` too).
             return .refuse(
                 tag: "parent-repo-unresolvable",
                 detail: "refused: git became unavailable before the parent "
                     + "repository could be re-resolved — nothing was removed. "
-                    + "Retry once git is installed and reachable."
+                    + (resolved.unavailabilityIsDefinitive
+                        ? "Retry once git is installed and reachable."
+                        : "git could not be launched (a transient failure, "
+                            + "not a missing tool); retry when the machine is "
+                            + "less busy.")
             )
         }
         guard let line = WorktreeStalenessAssessor.firstLine(of: stdout),
@@ -2244,11 +2288,16 @@ struct WorktreeReclaimPerformer {
                     + "removed. Retry when the machine is less busy."
             )
         case .gitUnavailable:
+            // Same cause split as the parent-repo arm above.
             return .refuse(
                 tag: "worktree-registry-unreadable",
                 detail: "refused: git became unavailable before the worktree "
-                    + "registry could be re-read — nothing was removed. Retry "
-                    + "once git is installed and reachable."
+                    + "registry could be re-read — nothing was removed. "
+                    + (listing.unavailabilityIsDefinitive
+                        ? "Retry once git is installed and reachable."
+                        : "git could not be launched (a transient failure, "
+                            + "not a missing tool); retry when the machine is "
+                            + "less busy.")
             )
         }
         guard let inventory = GitWorktreeInventory.parse(stdout) else {
@@ -2990,10 +3039,15 @@ struct WorktreeReclaimPerformer {
         adminEntry: URL, substrate: HeadWitness.Substrate
     ) -> HeadWitness? {
         let file = adminEntry.appendingPathComponent(substrate.relativePath)
-        guard provider.probeKind(of: file) == .kind(.regularFile),
-              let identity = provider.identity(of: file),
-              let bytes = try? Data(contentsOf: file)
-        else { return nil }
+        // ONE DESCRIPTOR for kind, identity AND bytes (PR #461 codex r2).
+        // The three path reads this replaces resolved `file` three times, so
+        // the witness could pair one object's inode with another's bytes —
+        // and this witness is what the reclaim proves the far side against.
+        guard let found = provider.smallRegularFile(
+            at: file, limit: FileSystemIdentityProvider.gitPointerByteLimit
+        ) else { return nil }
+        let identity = found.identity
+        let bytes = found.bytes
         return HeadWitness(
             substrate: substrate, identity: identity, bytes: bytes
         )
@@ -3261,7 +3315,14 @@ struct WorktreeReclaimPerformer {
                 "the porcelain oracle timed out after \(Self.seconds(gitTimeout))s"
             )
         case .gitUnavailable:
-            return .failed("git is unavailable at clean time")
+            // Same cause split: "unavailable" without qualification reads as
+            // "not installed", which a transient launch failure is not.
+            return .failed(
+                listing.unavailabilityIsDefinitive
+                    ? "git is unavailable at clean time"
+                    : "git could not be launched at clean time (a transient "
+                        + "failure, not a missing tool)"
+            )
         }
 
         guard let inventory = GitWorktreeInventory.parse(stdout) else {

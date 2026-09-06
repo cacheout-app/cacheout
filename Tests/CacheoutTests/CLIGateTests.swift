@@ -945,11 +945,13 @@ final class CLIGateTests: XCTestCase {
                        exact + (row["estimated_up_to_bytes"] as? Int64 ?? 0),
                        "size_bytes stays the compatibility component sum")
 
-        // R12/R16: the classified config issue is VISIBLE on the wire.
+        // R12/R16: the classified config issue is VISIBLE on the wire —
+        // `policy_refused_root` since fn-4.12 (the root IS configured; the
+        // old `container_refused` label said the opposite).
         let errors = try XCTUnwrap(envelope["scanner_errors"] as? [[String: Any]])
         let refusals = errors.filter {
             $0["scanner_id"] as? String == "build_artifacts"
-                && $0["kind"] as? String == "container_refused"
+                && $0["kind"] as? String == "policy_refused_root"
         }
         XCTAssertEqual(refusals.count, 1, "\(errors)")
         XCTAssertEqual(try XCTUnwrapElement(refusals, 0)["path"] as? String, "/")
@@ -1135,7 +1137,8 @@ final class CLIGateTests: XCTestCase {
         // row builder (the count was stale at "seven" before PR #459 codex
         // r11 — `enumeration_truncated` and `config_invalid` had already
         // landed; codex r13 added two more, r15 one; the fn-5 merge added
-        // `tool_unavailable`) — exact rows: the nine
+        // `tool_unavailable`; fn-4.12 added
+        // `mutation_scope_refused`) — exact rows: the ten
         // non-TCC filesystem kinds below carry
         // their real `path`; `tcc_denied` carries its path AND, ALONE, a
         // `grant_hint` (macOS denies CLI processes silently, so the row must
@@ -1157,6 +1160,10 @@ final class CLIGateTests: XCTestCase {
             // splitting the two conditions `container_refused` and
             // `symlink_root` were mis-labelling on `ephemeral_tmp`.
             (.policyRefusedRoot, "policy_refused_root"),
+            // ADDED fn-4.12 — the git-worktree containment refusals, whose
+            // candidates ARE inside a configured root, so
+            // `container_refused` was a false diagnosis for them.
+            (.mutationScopeRefused, "mutation_scope_refused"),
             (.symlinkRoot, "symlink_root"),
             (.nonDirectoryRoot, "non_directory_root"),
             (.permissionDenied, "permission_denied"),

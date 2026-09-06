@@ -102,21 +102,32 @@ final class SourceAnchorIntegrityTests: XCTestCase {
     /// Every anchor in the tree, with a fragment of the text it cites.
     /// Sorted; one entry per DISTINCT anchor however many places cite it.
     static let anchorExpectations: [(anchor: String, excerpt: String)] = [
-        ("BuildArtifactsScanner.swift:1405-1406",
+        // The two CacheCleaner mount-refusal arms, cited from THREE files —
+        // this pair went stale twice in two rounds (r1 gate, r2 gate) because
+        // the citations were spelled `function`:line, which the anchor
+        // pattern cannot see. Canonically spelled and pinned so the third
+        // drift is a red cell, not a gate finding (fn-4 r2 gate).
+        ("CacheCleaner.swift:1210",
+         "child.path): mount boundary at"),
+        ("CacheCleaner.swift:1543",
+         "target.path): mount boundary at"),
+        ("OrphanedCachesScanner.swift:816",
+         "static func preDeleteUserDataProbe("),
+        ("BuildArtifactsScanner.swift:1416-1417",
          "deletable && report.logicalBytes > report.measur"),
         ("BuildArtifactsScanner.swift:378-382",
          "this walk's per-root classified issues. Candidat"),
         ("CLIHandler.swift:206",
          "orphanedCachesThresholds: sweepThresholds, devRo"),
-        ("CLIHandler.swift:2123",
+        ("CLIHandler.swift:2125",
          "One invocation, one session (R9): the cleaner ho"),
         ("CLIHandler.swift:426-438",
          "orphanedCachesThresholds: OrphanedCacheClassifie"),
-        ("CacheCleaner.swift:514",
+        ("CacheCleaner.swift:523",
          "if let entry = outcome.entry { entries.append(en"),
         ("CacheoutApp.swift:58",
          "@StateObject private var viewModel = CacheoutVie"),
-        ("CacheoutViewModel.swift:1487-1488",
+        ("CacheoutViewModel.swift:1488-1489",
          "never report (the runtime invokes only the named"),
         ("CacheoutViewModel.swift:264",
          "@MainActor"),
@@ -132,21 +143,21 @@ final class SourceAnchorIntegrityTests: XCTestCase {
          "private static func removeTree("),
         ("DevRootsStore.swift:28-38",
          "walker's `originRoot` carry these verbatim; vali"),
-        ("DevRootsStore.swift:320-324",
-         "isDirectory: provider.probeKind(of: declared) =="),
-        ("DevRootsStore.swift:322",
-         "key: provider.canonicalize(declared).path,"),
-        ("DevRootsStore.swift:326-332",
-         "of it — and an ACTIVELY HARMFUL one: `PathGuard."),
-        ("DevRootsStore.swift:333-335",
-         "let coveredByRealDirectory = Set("),
-        ("DevRootsStore.swift:349-355",
+        ("DevRootsStore.swift:342-352",
+         "switch provider.probeKind(of: declared) {"),
+        ("DevRootsStore.swift:346",
+         "provider.canonicalize(declared).path"),
+        ("DevRootsStore.swift:353-361",
+         "and an ACTIVELY HARMFUL one:"),
+        ("DevRootsStore.swift:366-375",
+         "var coveredByRealDirectory: [String: String] = [:]"),
+        ("DevRootsStore.swift:390-396",
          "issues.append(ScanIssue("),
-        ("DirectorySizer.swift:261-272",
+        ("DirectorySizer.swift:322-337",
          "provider.isMountPoint(resolved)"),
-        ("DirectorySizer.swift:354-359",
+        ("DirectorySizer.swift:448-453",
          "provider.isMountPoint(itemURL)"),
-        ("DirectorySizer.swift:483",
+        ("DirectorySizer.swift:575",
          "case .some(Int(EPERM)):"),
         ("DirectorySizer.swift:50-52",
          "- `.scanRoot`: the root is fully resolved via th"),
@@ -172,33 +183,35 @@ final class SourceAnchorIntegrityTests: XCTestCase {
          "A failed read mid-directory: the rest is unprove"),
         ("PathGuard.swift:165-176",
          "refuses non-directory containers, so a link iden"),
-        ("PathGuard.swift:350-361",
+        ("PathGuard.swift:424-435",
          "throw PathGuardError.outsideCategoryPolicy(path:"),
-        ("PathGuard.swift:370",
+        ("PathGuard.swift:444",
          "`~/Documents` can be a container while `admitDel"),
-        ("PathGuard.swift:400-403",
+        ("PathGuard.swift:474-477",
          "(2) No-follow reality gate on BOTH spellings: th"),
         ("PathGuard.swift:45",
          "compared as `pathComponents` arrays (never `hasP"),
-        ("PathGuard.swift:462-469",
+        ("PathGuard.swift:536-543",
          "The filesystem root `/` is exempt from both: it"),
-        ("ProjectTreeWalker.swift:529-532",
+        ("ProjectTreeWalker.swift:695-698",
          "|| provider.isMountPoint(provider.canonicalize(c"),
-        ("SpaceScanner.swift:1941-1952",
+        ("SpaceScanner.swift:2010-2021",
          "no-follow reality gate to THAT spelling and refu"),
         ("SpaceScanner.swift:143",
          "`[\"git\", \"-C\", <parentRepoWorkingDir>, \"worktree"),
-        ("SpaceScanner.swift:1981-1986",
+        ("SpaceScanner.swift:2083-2088",
          "Nothing is silently lost: a dropped root is unus"),
-        ("SpaceScanner.swift:1987-1989",
+        ("SpaceScanner.swift:2089",
          "private static func suppressingAliasShadows("),
-        ("SpaceScanner.swift:1964-2004",
+        ("SpaceScanner.swift:2089-2091",
          "private static func suppressingAliasShadows("),
-        ("SpaceScanner.swift:1992-1996",
-         "let probed = roots.map { root in"),
-        ("SpaceScanner.swift:2002-2005",
+        ("SpaceScanner.swift:2089-2151",
+         "private static func suppressingAliasShadows("),
+        ("SpaceScanner.swift:2102-2120",
+         "let probed = roots.map {"),
+        ("SpaceScanner.swift:2130-2133",
          "Two real-directory spellings of one location are"),
-        ("SpaceScanner.swift:2129",
+        ("SpaceScanner.swift:2267",
          "static func production("),
         ("SpaceScanner.swift:40-51",
          "(Documents, Desktop, …) are enumerated ONLY for"),
@@ -340,6 +353,22 @@ final class SourceAnchorIntegrityTests: XCTestCase {
             sites.count, 40,
             "the check must actually have found anchors, not zero of them"
         )
+        // RESIDUAL, disclosed precisely (PR #461 merge gate r4, P7): this
+        // check asks only whether the excerpt lies SOMEWHERE inside the cited
+        // range, so a range wider than the drift hides the drift. That is not
+        // hypothetical — it is how the SpaceScanner probe anchor (then
+        // spelled with the 2088-2106 range, now :2102-2120) shipped rotted
+        // through the very commit whose job was repointing anchors:
+        // the content moved +14, the 19-line range still contained it, and
+        // line 2088 had become a doc-comment continuation. Six citing sites
+        // pointed at the wrong place while this cell stayed green.
+        //
+        // THE KNOWN FIX, deliberately not taken here: carry the excerpt's
+        // expected OFFSET within the range and assert it exactly, so any
+        // shift reds. Measured across the 58 rows, offsets legitimately run
+        // 0 to 58, so no fixed tolerance works and the offsets must be
+        // recorded per row — a schema migration that belongs in its own
+        // increment, reviewed on its own, not bolted onto a review-fix round.
         XCTAssertEqual(
             offenders, [],
             "an anchor whose cited line no longer holds what the comment says "

@@ -95,7 +95,7 @@ struct XCTUnwrapElementFailure: Error, CustomStringConvertible {
 /// precisely where a regression puts a second one.
 ///
 /// PROVEN BY MUTATION (PR #460 codex r9's review, D3): appending the entry
-/// twice at `CacheCleaner.swift:514` — `if let entry = outcome.entry {
+/// twice at `CacheCleaner.swift:523` — `if let entry = outcome.entry {
 /// entries.append(entry) }`, the shape of SCANNERS-ROADMAP defect D1 — let
 /// the correct cell fire and survive, and then trapped a LATER cell and took
 /// the rest of the run with it.

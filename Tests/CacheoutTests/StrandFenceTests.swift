@@ -104,7 +104,7 @@ import XCTest
 ///    puts a second one.
 ///
 ///    MEASURED AT THIS COMMIT'S PARENT, by mutating ONE production line —
-///    `Sources/Cacheout/Cleaner/CacheCleaner.swift:514`, `if let entry =
+///    `Sources/Cacheout/Cleaner/CacheCleaner.swift:523`, `if let entry =
 ///    outcome.entry { entries.append(entry) }`, appended twice, which is the
 ///    shape of SCANNERS-ROADMAP defect D1. With the old constructor at
 ///    `CacheCleanerTests:1385` the run died with `Fatal error: Duplicate
@@ -229,9 +229,20 @@ import XCTest
 ///   `testNoLoopBoundIndexSubscriptCanStrandTheRun` covers exactly that
 ///   subset — **7 hits on 5 lines**, not 117 — and its own header states
 ///   both its limits and how that figure was taken.
-/// - **`as!`, `precondition` and its `…Failure` spelling, `fatalError`,
-///   arithmetic overflow, out-of-range `Range` subscripts,
-///   `Array(repeating:count:)` with a negative count** — not scanned at all.
+/// - **`as!`, `preconditionFailure`, `fatalError`** — FENCED as statement
+///   traps since fn-4.14, no longer merely counted. The precipitating strand
+///   (PR #459 r15): `StatusSocketIntegrationTests.testNegativeTopNRejected`
+///   parsed a socket reply with `try JSONSerialization.jsonObject(…) as!
+///   [String: Any]`, and one garbled read killed the whole xctest process
+///   mid-run while the last tally in the log still read `0 failures`. The
+///   casts were converted to `XCTUnwrap` (PR #460 r3) — which left the CLASS
+///   unfenced: a fixer could reintroduce one with the suite green. All three
+///   occur ZERO times in test code at this commit, so the arms cost no
+///   allowance; a future legitimate occurrence has none to hide behind and
+///   must argue its case here.
+/// - **bare `precondition`, arithmetic overflow, out-of-range `Range`
+///   subscripts, `Array(repeating:count:)` with a negative count** — not
+///   scanned at all.
 ///
 ///   WHAT THIS BULLET USED TO SAY, AND WHY IT WAS WITHDRAWN (PR #460 codex
 ///   r11, D3). It said "No occurrence of any of them has stranded a run
@@ -246,7 +257,8 @@ import XCTest
 ///   than about the product. Both are converted to `try XCTUnwrap` in the
 ///   same commit as this paragraph, so each fails ONE cell.
 ///
-///   WHAT IS LEFT, COUNTED RATHER THAN ASSERTED. At this commit
+///   WHAT IS LEFT, COUNTED RATHER THAN ASSERTED — and, for the three now
+///   fenced above, the zero the arms were added against. At this commit
 ///
 ///       grep -rnE '\bprecondition\(|\bpreconditionFailure\(|\bfatalError\(|[^A-Za-z0-9_] as! ' \
 ///           Tests --include='*.swift'
@@ -402,10 +414,18 @@ final class StrandFenceTests: XCTestCase {
     /// that provably ARE array reads — the index name is loop-bound to an
     /// integer — is fenced by
     /// `testNoLoopBoundIndexSubscriptCanStrandTheRun` (r8, D1).
+    /// `as!`, `preconditionFailure`, `fatalError` (fn-4.14) — the trapping
+    /// cast is the shape that killed a run at PR #459 r15 (see the header
+    /// bullet), and the other two are unconditional kills by definition. All
+    /// three occur zero times in test code, so there is no allowance list to
+    /// rot: the first reintroduction is the first offender.
     private static let statementTraps: [(name: String, pattern: String)] = [
         ("try!", #"\btry!"#),
         ("literal-integer subscript",
          #"[A-Za-z0-9_\)\]]\s*\[\s*[0-9]+\s*\]"#),
+        ("as!", #"\bas!"#),
+        ("preconditionFailure", #"\bpreconditionFailure\s*\("#),
+        ("fatalError", #"\bfatalError\s*\("#),
     ]
 
     func testNoTrappingConstructAnywhereInATestSourceCanStrandTheRun() throws {

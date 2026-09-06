@@ -734,7 +734,7 @@ final class OrphanedCachesSweepTests: XCTestCase {
         }
     }
 
-    func testSyntheticEPERMEntryClassifiesAsTCCDistinctFromEACCES() throws {
+    func testSyntheticEPERMEntryClassifiesNeutrallyDistinctFromEACCES() throws {
         let entry = cachesRoot.appendingPathComponent("tcc-locked")
         try mkdir(entry)
 
@@ -744,9 +744,19 @@ final class OrphanedCachesSweepTests: XCTestCase {
         let facts = factsByName(makeScanner(provider: provider))
         let denied = try XCTUnwrap(facts["tcc-locked"])
 
-        XCTAssertEqual(denied.denials.first?.kind, .tcc,
-                       "EPERM classifies as TCC — distinct from the EACCES case")
-        XCTAssertEqual(denied.denials.first?.kind.scanErrorKind, .tccDenied)
+        // NEUTRAL since fn-4.12: this probe is a raw lstat, and a bare
+        // EPERM carries no provenance — `.tcc`, and the `.tccDenied` grant
+        // hint downstream of it, may not be asserted from a guess. The
+        // denial stays VISIBLE (distinct from EACCES's `.permission`), and
+        // its detail says why no cause is named.
+        XCTAssertEqual(denied.denials.first?.kind, .metadata,
+                       "bare EPERM is neutral — never `.tcc` (fn-4.12)")
+        XCTAssertTrue(
+            denied.denials.first?.detail
+                .contains("could not be established") == true,
+            "\(denied.denials)"
+        )
+        XCTAssertEqual(denied.denials.first?.kind.scanErrorKind, .other)
         XCTAssertFalse(denied.userDataProbeComplete, "fail closed on probe failure")
     }
 

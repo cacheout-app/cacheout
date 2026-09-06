@@ -534,7 +534,7 @@ final class SpaceScannerIntegrationTests: XCTestCase {
         _ runtime: SpaceScannerRuntime, scannerIDs: Set<String>?,
         file: StaticString = #filePath, line: UInt = #line
     ) async -> (outcomes: [String: ScanOutcome], snapshot: ContainerSnapshot) {
-        let session = runtime.scanValidatedSession(
+        let session = await runtime.scanValidatedSession(
             scannerIDs: scannerIDs, context: ScanContext(trigger: .userInitiated)
         )
         var outcomes: [String: ScanOutcome] = [:]
@@ -959,6 +959,176 @@ final class SpaceScannerIntegrationTests: XCTestCase {
                 "the alias spelling is not a usable container in its own right"
             )
         }
+    }
+
+    // MARK: - fn-4.11: construction never names a symlink root's destination
+
+    /// FAILS THE TEST on any call naming the forbidden DESTINATION or
+    /// anything below it, and on any LEAF-FOLLOWING operation on a listed
+    /// alias spelling (`canonicalize`/`realPath`/`isMountPoint` — `realpath(3)`
+    /// resolves the link, `statfs(2)` follows it). `lstat`/`readlink`-class
+    /// calls on the alias itself stay legal: they read the link's own entry
+    /// and content, never the destination. `mountPointPaths()` is injectable
+    /// for the union-preflight cell.
+    private final class DestinationForbiddingProvider:
+        FileSystemIdentityProvider, @unchecked Sendable
+    {
+        var forbiddenDestination = ""
+        var aliasSpellings: Set<String> = []
+        var injectedMountPoints: [String]?
+        private let fail: (String) -> Void
+
+        init(fail: @escaping (String) -> Void) {
+            self.fail = fail
+            super.init()
+        }
+
+        override func mountPointPaths() -> [String] {
+            injectedMountPoints ?? super.mountPointPaths()
+        }
+
+        private func forbid(_ method: String, _ path: String) {
+            guard !forbiddenDestination.isEmpty,
+                  path == forbiddenDestination
+                    || path.hasPrefix(forbiddenDestination + "/")
+            else { return }
+            fail("\(method) made first contact with the destination: \(path)")
+        }
+        private func forbidFollow(_ method: String, _ path: String) {
+            forbid(method, path)
+            if aliasSpellings.contains(path) {
+                fail("\(method) is a leaf-following resolution of the alias "
+                    + "spelling itself: \(path)")
+            }
+        }
+
+        override func realPath(of path: String) -> String? {
+            forbidFollow("realPath", path)
+            let out = super.realPath(of: path)
+            if let out { forbid("realPath output", out) }
+            return out
+        }
+        override func canonicalize(_ url: URL) -> URL {
+            forbidFollow("canonicalize", url.path)
+            return super.canonicalize(url)
+        }
+        override func isMountPoint(_ url: URL) -> Bool {
+            forbidFollow("isMountPoint", url.path)
+            return super.isMountPoint(url)
+        }
+        override func probeKind(of url: URL) -> KindProbe {
+            forbid("probeKind", url.path)
+            return super.probeKind(of: url)
+        }
+        override func identity(of url: URL) -> Identity? {
+            forbid("identity", url.path)
+            return super.identity(of: url)
+        }
+        override func symlinkTarget(of url: URL) -> String? {
+            forbid("symlinkTarget", url.path)
+            return super.symlinkTarget(of: url)
+        }
+        override func canEnumerateDirectory(_ url: URL) -> Bool {
+            forbidFollow("canEnumerateDirectory", url.path)
+            return super.canEnumerateDirectory(url)
+        }
+        override func ownerProbe(of url: URL) -> OwnerProbe {
+            forbid("ownerProbe", url.path)
+            return super.ownerProbe(of: url)
+        }
+        override func leafMetadata(of url: URL) -> LeafMetadata? {
+            forbid("leafMetadata", url.path)
+            return super.leafMetadata(of: url)
+        }
+        override func linkCount(of url: URL) -> UInt64? {
+            forbid("linkCount", url.path)
+            return super.linkCount(of: url)
+        }
+    }
+
+    /// THE fn-4.11 CELL, at the scope the spec names: no syscall reaches a
+    /// symlink root's DESTINATION during `SpaceScannerRuntime.production()`.
+    /// The whole launch path runs under the instrumented provider — the
+    /// persisted store's policy pass (`PathGuard.validateContainerRoot`),
+    /// `DevRootsStore.resolve`'s probe pass, and the runtime union's
+    /// `suppressingAliasShadows` — with a resolving alias AND a dangling one
+    /// (whose old `realpath(3)` fallback walked the destination's parent
+    /// chain). Before fn-4.11 the first contact was the policy pass'
+    /// `canonicalize`, on the main thread, before any window existed.
+    func testProductionNeverContactsASymlinkDevRootsDestination() throws {
+        let destination = base.appendingPathComponent("quarantined-dest")
+        try fm.createDirectory(at: destination, withIntermediateDirectories: true)
+        let alias = base.appendingPathComponent("dev-alias-to-dest")
+        try fm.createSymbolicLink(at: alias, withDestinationURL: destination)
+        let dangling = base.appendingPathComponent("dev-dangling-alias")
+        try fm.createSymbolicLink(
+            at: dangling,
+            withDestinationURL: destination.appendingPathComponent("gone")
+        )
+        let provider = DestinationForbiddingProvider(fail: { XCTFail($0) })
+        provider.forbiddenDestination = destination.path
+        provider.aliasSpellings = [alias.path, dangling.path]
+
+        // The persisted-store arm, not a hand-built resolution: policy and
+        // probe pass both run under the instrumented provider.
+        defaults.set([alias.path, dangling.path],
+                     forKey: DevRootsStore.devRootsKey)
+        let resolution = DevRootsStore(defaults: defaults, provider: provider)
+            .effectiveRoots(home: fixtureHome)
+        XCTAssertEqual(resolution.keptRoots.map(\.path),
+                       [alias.path, dangling.path],
+                       "both aliases pass through verbatim for the walk-time "
+                       + "gate to classify")
+        XCTAssertEqual(resolution.issues, [])
+
+        let runtime = SpaceScannerRuntime.production(
+            home: fixtureHome,
+            provider: provider,
+            devRoots: resolution,
+            ephemeralTempConfstrPath: { _ in nil }
+        )
+        let unionPaths = runtime.trustedContainerRoots.map(\.path)
+        XCTAssertTrue(unionPaths.contains(alias.path),
+                      "the un-covered alias survives verbatim: \(unionPaths)")
+        XCTAssertTrue(unionPaths.contains(dangling.path), "\(unionPaths)")
+    }
+
+    /// fn-4.11 at the UNION's scope, in the r15 shape: a registered root
+    /// that IS an over-mounted path is never probed by
+    /// `suppressingAliasShadows` — `lstat` or `realpath` OF a mount point is
+    /// served by the mounted (possibly unresponsive) filesystem, and this
+    /// probe runs at construction on the main thread. The root is kept
+    /// VERBATIM and stays fail-closed: delete-time root matching already
+    /// skips over-mounted configured roots (`matchConfiguredRoot`'s
+    /// kernel-table preflight).
+    func testAnOverMountedRegisteredRootIsNeverProbedByTheUnion() throws {
+        let mountedRoot = base.appendingPathComponent("dead-mount")
+        // NOT created — nothing may touch it, not even the kind probe.
+        let healthy = base.appendingPathComponent("healthy-root")
+        try fm.createDirectory(at: healthy, withIntermediateDirectories: true)
+        let provider = DestinationForbiddingProvider(fail: { XCTFail($0) })
+        provider.forbiddenDestination = mountedRoot.path
+        provider.injectedMountPoints = [mountedRoot.path]
+
+        let runtime = try SpaceScannerRuntime(
+            scanners: [
+                OutcomeFixtureScanner(
+                    id: "fixture_mounted_root",
+                    trustedContainerRoots: [mountedRoot],
+                    provide: { ScanOutcome(items: [], errors: []) }
+                ),
+                OutcomeFixtureScanner(
+                    id: "fixture_healthy_root",
+                    trustedContainerRoots: [healthy],
+                    provide: { ScanOutcome(items: [], errors: []) }
+                ),
+            ],
+            categories: [], home: fixtureHome, provider: provider
+        )
+        XCTAssertEqual(runtime.trustedContainerRoots.map(\.path),
+                       [mountedRoot.path, healthy.path],
+                       "kept verbatim, never probed — the healthy sibling "
+                       + "is probed as before")
     }
 
     /// R17/R6 ordering, proven at the product boundary: a valuable-bearing

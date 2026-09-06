@@ -504,10 +504,27 @@ struct GitWorktreeGitdirResolver {
                 line = line[line.index(after: close)...]
                     .drop(while: { $0 == " " || $0 == "\t" })
             }
-            guard !line.isEmpty, let equals = line.firstIndex(of: "=")
-            else { continue }
+            guard !line.isEmpty else { continue }
+            // A VALUELESS KEY IS TRUE TO GIT. `[extensions]\n\tworktreeConfig`
+            // with no `=` enables the extension, and the loop below only
+            // reads `key = value` lines — so the one spelling that turns the
+            // override on with the fewest characters must be caught before
+            // the `=` requirement drops it (PR #461 codex r4).
+            guard let equals = line.firstIndex(of: "=") else {
+                let bare = line.trimmingCharacters(in: .whitespaces).lowercased()
+                if section == "extensions", subsection == nil,
+                   bare == "worktreeconfig" {
+                    return false
+                }
+                continue
+            }
             let key = line[..<equals]
                 .trimmingCharacters(in: .whitespaces).lowercased()
+            var value = line[line.index(after: equals)...]
+                .trimmingCharacters(in: .whitespaces).lowercased()
+            if value.count >= 2, value.hasPrefix("\""), value.hasSuffix("\"") {
+                value = String(value.dropFirst().dropLast())
+            }
             // AN INCLUDE CAN OVERRIDE core.bare, AND WE WILL NOT FOLLOW IT
             // (PR #461 codex r3). `[include] path = …` and
             // `[includeIf "…"] path = …` pull in another file whose
@@ -529,13 +546,21 @@ struct GitWorktreeGitdirResolver {
             if section == "include" || section == "includeif", key == "path" {
                 return false
             }
+            // A WORKTREE-SCOPED CONFIG CAN OVERRIDE core.bare TOO (PR #461
+            // codex r4). With `extensions.worktreeConfig` enabled, git reads
+            // `config.worktree` AFTER the primary config, so a primary
+            // `bare = true` can be turned off there. Same shape as the
+            // include above, same answer: this scanner does not chase a
+            // second file, so the extension being ON makes the answer "not
+            // bare". Every spelling git reads as true counts — being generous
+            // about what enables the extension is the FAIL-CLOSED direction.
+            if section == "extensions", subsection == nil,
+               key == "worktreeconfig",
+               ["true", "yes", "on", "1"].contains(value) {
+                return false
+            }
             guard section == "core", subsection == nil, key == "bare"
             else { continue }
-            var value = line[line.index(after: equals)...]
-                .trimmingCharacters(in: .whitespaces).lowercased()
-            if value.count >= 2, value.hasPrefix("\""), value.hasSuffix("\"") {
-                value = String(value.dropFirst().dropLast())
-            }
             // LAST WINS, which is the whole point: an override must be able
             // to turn bareness OFF, not merely fail to turn it on.
             effective = value

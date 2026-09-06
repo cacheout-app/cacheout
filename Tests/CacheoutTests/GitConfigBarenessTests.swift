@@ -145,6 +145,49 @@ final class GitConfigBarenessTests: XCTestCase {
         XCTAssertTrue(bare("[include]\n\tcomment = none\n[core]\n\tbare = true\n"))
     }
 
+    /// **`extensions.worktreeConfig` LETS `config.worktree` OVERRIDE core.bare**
+    /// (PR #461 codex r4). With the extension on, git reads a second file
+    /// after the primary, so `bare = true` here can be `bare = false` there.
+    /// Same shape as an include, same answer: the extension being ON makes
+    /// the answer "not bare", and every spelling git reads as true counts,
+    /// including the valueless key the `=`-only loop used to skip.
+    ///
+    /// MUTATION, measured: delete the extensions guard (both the valued arm
+    /// and the valueless arm) and exactly THREE cells red — this one,
+    /// `…EverySpellingGitReadsAsTrue…` (all five of its spellings) and
+    /// `…AValuelessWorktreeConfigKey…` — 7 assertions, 3/3 runs. The
+    /// `false`-and-subsection cell stays green, which is what shows the
+    /// guard is keyed on the value and the exact section rather than on the
+    /// key name alone. (A first draft of this note said "four"; there are
+    /// three refusal cells, and the count is now the measured one.)
+    func testAnEnabledWorktreeConfigExtensionRefusesBareness() {
+        XCTAssertFalse(bare("[core]\n\tbare = true\n[extensions]\n\tworktreeConfig = true\n"))
+    }
+
+    func testEverySpellingGitReadsAsTrueEnablesTheExtension() {
+        for spelling in ["yes", "on", "1", "TRUE", "\"true\""] {
+            XCTAssertFalse(
+                bare("[extensions]\n\tworktreeConfig = \(spelling)\n[core]\n\tbare = true\n"),
+                "git reads `\(spelling)` as true, so the extension is on"
+            )
+        }
+    }
+
+    /// A key with no `=` is TRUE to git. The parse loop only reads
+    /// `key = value` lines, so this spelling had to be caught before the
+    /// `=` requirement dropped it.
+    func testAValuelessWorktreeConfigKeyIsTrueAndRefuses() {
+        XCTAssertFalse(bare("[extensions]\n\tworktreeConfig\n[core]\n\tbare = true\n"))
+    }
+
+    func testTheExtensionSetToFalseDoesNotSuppressBareness() {
+        XCTAssertTrue(bare("[extensions]\n\tworktreeConfig = false\n[core]\n\tbare = true\n"))
+        XCTAssertTrue(
+            bare("[extensions \"other\"]\n\tworktreeConfig = true\n[core]\n\tbare = true\n"),
+            "a subsection is not the extensions section"
+        )
+    }
+
     /// THE DISCLOSED RESIDUAL, PINNED so it cannot change in silence. Only
     /// git's writer spelling of the value counts; these three leave the
     /// repository undiscovered, which is the same silence every bare

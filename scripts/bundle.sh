@@ -102,8 +102,11 @@ create_bundle() {
     #            -out MenuBarIcon.tiff
     local MENUBAR_RES_SRC="$PROJECT_DIR/Sources/Cacheout/Resources"
     # FAIL CLOSED (PR #461 gate r5). This warned and CONTINUED, producing an
-    # app with no menubar icon and a zero exit status — the shape that shipped
-    # v2.1.0 broken. Since 205b187 excluded the prebuilt tiffs from the Xcode
+    # app without ITS menubar icon and a zero exit status — the shape that
+    # shipped v2.1.0 broken. ("Its", precisely: CacheoutApp falls back to the
+    # SF Symbol externaldrive.fill when the tiff is absent, so the bundle
+    # shows a generic drive glyph rather than nothing. The first draft of
+    # this note said "no menubar icon", which the code does not do.) Since 205b187 excluded the prebuilt tiffs from the Xcode
     # resources phase (Xcode generates its own via TiffUtil), THIS is the only
     # consumer of the checked-in copies, so the fail-open became load-bearing
     # exactly when it stopped being redundant.
